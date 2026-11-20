@@ -2,7 +2,8 @@
 # (archives, executables, carved files, shaders, textures, models, audio, reports that quote game data)
 reports/
 work/
-assets/
+/assets/*
+!/assets/logo.webp
 carve/
 *.rpf
 *.ttpf

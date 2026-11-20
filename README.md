@@ -1,5 +1,10 @@
 <h1 align="center">
   <br>
+  <a>
+  <img src="assets/logo.webp" alt="Leonida" width="200">
+</a>
+
+  <br>
   <b>Leonida</b>
   <br>
 </h1>
