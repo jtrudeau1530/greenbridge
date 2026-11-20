@@ -71,8 +71,40 @@ int main(int argc, char** argv) {
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+    // Optional features some translated shaders need (enabled only when the device has them):
+    // raw barycentric reads (BaryCoordKHR), POPS ordering (pixel interlock), non-constant texel offsets (maintenance8).
+    auto vkEnumerateDeviceExtensionProperties = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        gipa(inst, "vkEnumerateDeviceExtensionProperties"));
+    uint32_t en = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr);
+    std::vector<VkExtensionProperties> exts(en);
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, exts.data());
+    auto has = [&](const char* e) {
+        for (auto& x : exts) if (!std::strcmp(x.extensionName, e)) return true;
+        return false;
+    };
+    std::vector<const char*> enable;
+    void* chain = nullptr;
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+    VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+        enable.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+        bary.fragmentShaderBarycentric = VK_TRUE; bary.pNext = chain; chain = &bary;
+    }
+    if (has(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+        enable.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+        lock.fragmentShaderPixelInterlock = VK_TRUE; lock.pNext = chain; chain = &lock;
+    }
+    if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+        enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+        m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
+    }
+    for (auto e : enable) std::fprintf(stderr, "enabled %s\n", e);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
+    dci.pNext = chain;
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
