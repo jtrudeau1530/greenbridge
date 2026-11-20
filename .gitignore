@@ -3,7 +3,7 @@
 reports/
 work/
 /assets/*
-!/assets/logo.webp
+!/assets/logo.png
 carve/
 *.rpf
 *.ttpf

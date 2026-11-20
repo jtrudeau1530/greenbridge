@@ -1,7 +1,7 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/logo.webp" alt="Leonida" width="200">
+  <img src="assets/logo.png" alt="Leonida" width="200">
 </a>
 
   <br>
@@ -125,6 +125,7 @@ pull requests.
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (MIT): GFX10 resource-descriptor layout (`tools/gfx10_formats.json`),
   and the ACO/RADV rules used as reference for 16-bit results and shader system registers.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
+- Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
 
 Grand Theft Auto and all related names are trademarks of their owners. This project is not affiliated with or
