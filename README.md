@@ -41,7 +41,7 @@ work on booting can start as soon as one is available to a developer.
 |---|---|
 | Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
-| Shaders: RDNA2 → SPIR-V translation | ⚠️ ~97% of vertex/pixel shaders pass `spirv-val`. Compute, mesh and geometry shaders not yet translated |
+| Shaders: RDNA2 → SPIR-V translation | ⚠️ 97.4% of vertex/pixel shaders (13,971) translate and pass `spirv-val`. Compute, mesh and geometry shaders not yet translated |
 | Shader translator checked on a real GPU | ⚠️ Vertex fetch, texture sampling, exports and ALU ops checked on one GPU |
 | Models (OBJ with real names, UVs, material references) | ✅ Exported. Not all layouts are decoded yet |
 | Texture dictionaries and world texture pools (DDS) | ✅ Exported. Some pool entries (BCPack) are skipped |

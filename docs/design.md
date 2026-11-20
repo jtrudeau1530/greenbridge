@@ -155,10 +155,10 @@ target and dumps the floats. Test shaders are in `<work>\gputest`.
 ### Translator status and runtime contract
 
 Full corpus (verified pixel-shader inputs incl. front face, ACO-confirmed 16-bit semantics, `vcc_hi` as an SGPR,
-code-embedded data via `s_getpc_b64`, global memory, exact packed-f16 modifiers): **13,925 of 26,503 shaders
-translated, all passing `spirv-val`** (Vulkan 1.2). That's **97.1% of all vertex and pixel shaders** (13,925 of
-14,337). The remaining ~410 VS/PS: 321 PS with unexplained system inputs (rejected on purpose), 14 `v_med3_f16`,
-14 `v_movrels_b32` (relative register indexing), 10 whose embedded data can't be re-anchored, and a few rare
+code-embedded data via `s_getpc_b64`, global memory, exact packed-f16 modifiers): **13,971 of 26,503 shaders
+translated, all passing `spirv-val`** (Vulkan 1.2), with SDWA selects honoured. That's **97.4% of all vertex and pixel shaders** (13,971 of
+14,337). The remaining 366 VS/PS: 321 PS with unexplained system inputs (rejected on purpose), 10 that use `src_pops_exiting_wave_id`,
+10 whose embedded data can't be re-anchored, 8 `v_fma_f16` with op_sel, 4 `image_sample_o`, and a few rare
 operands. GPU re-test on the final SPIR-V: `VS_Passthrough` exact, texture test within RTZ f16 rounding, 400/400
 arithmetic-only PS finite and deterministic. 319 pixel shaders are deliberately rejected because they read unexplained system-input registers (raw
 barycentrics and so on). GPU re-test against the final SPIR-V: `VS_Passthrough` exact, texture test within RTZ f16
