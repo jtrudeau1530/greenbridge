@@ -28,7 +28,7 @@
 <div id="banner"></div>
 <div id="help">
   <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
-  <kbd>F</kbd> wireframe · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>Esc</kbd> release mouse
+  <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>Esc</kbd> release mouse
 </div>
 <div id="start">Click to fly</div>
 
@@ -136,8 +136,9 @@ addEventListener("mousemove", e => {
 addEventListener("wheel", e => { speed = THREE.MathUtils.clamp(speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1, 3000); }, { passive: true });
 addEventListener("keydown", e => {
   keys.add(e.code);
-  if (e.code === "KeyF") wire = !wire, applyWire();
-  if (e.code === "KeyG") showBounds = !showBounds, boundsGroup.visible = showBounds;
+  if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
+  if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
+  if (e.code === "KeyG" && !e.repeat) showBounds = !showBounds, boundsGroup.visible = showBounds;
   if (e.code === "KeyR") camera.position.fromArray(world.spawn);
 });
 addEventListener("keyup", e => keys.delete(e.code));
@@ -146,11 +147,43 @@ addEventListener("blur", () => keys.clear());
 // ---------- chunk streaming ----------
 const LOAD_R = 1400, UNLOAD_R = 2000, MAX_INFLIGHT = 4;
 const loader = new GLTFLoader();
-const live = new Map(); let inflight = 0, wire = false, showBounds = false, failed = 0;
+const live = new Map(); let inflight = 0, wire = false, clay = false, showBounds = false, failed = 0;
+const clayMat = new THREE.MeshStandardMaterial({ color: 0xb8c0ca, roughness: 0.85, wireframe: wire, side: THREE.DoubleSide });
 const boundsGroup = new THREE.Group(); boundsGroup.visible = false; scene.add(boundsGroup);
-function applyWire(root) {
+function applyClay(root) {
+  clayMat.wireframe = wire;
   (root ? [root] : [...live.values()].map(c => c.obj).filter(Boolean)).forEach(o =>
-    o.traverse(n => { if (n.material) [].concat(n.material).forEach(m => m.wireframe = wire); }));
+    o.traverse(n => {
+      if (!n.isMesh || !n.material) return;
+      if (n.userData.origMaterial === undefined) n.userData.origMaterial = n.material;
+      n.material = clay ? clayMat : n.userData.origMaterial;
+    }));
+}
+function applyWire(root) {
+  clayMat.wireframe = wire;
+  (root ? [root] : [...live.values()].map(c => c.obj).filter(Boolean)).forEach(o =>
+    o.traverse(n => {
+      const orig = n.userData?.origMaterial;
+      if (orig) [].concat(orig).forEach(m => m.wireframe = wire);
+      if (n.material && n.material !== orig) [].concat(n.material).forEach(m => m.wireframe = wire);
+    }));
+}
+function disposeObject(obj) {
+  const disposedGeo = new Set(), disposedMat = new Set(), disposedTex = new Set();
+  obj.traverse(n => {
+    if (n.geometry && !disposedGeo.has(n.geometry)) { disposedGeo.add(n.geometry); n.geometry.dispose(); }
+    if (n.isInstancedMesh && typeof n.dispose === "function") n.dispose();
+    const allMats = [].concat(n.material || [], n.userData?.origMaterial || []);
+    for (const m of allMats) {
+      if (!m || m === clayMat || disposedMat.has(m)) continue;
+      disposedMat.add(m);
+      for (const v of Object.values(m)) {
+        if (v && v.isTexture && !disposedTex.has(v)) { disposedTex.add(v); v.dispose(); }
+      }
+      m.dispose();
+    }
+    if (n.userData) delete n.userData.origMaterial;
+  });
 }
 function dist(c, p) {
   const b = c.bounds;
@@ -159,7 +192,10 @@ function dist(c, p) {
 }
 function drop(id) {
   const c = live.get(id); if (!c) return;
-  if (c.obj) { scene.remove(c.obj); c.obj.traverse(n => { n.geometry?.dispose(); [].concat(n.material || []).forEach(m => { m.map?.dispose(); m.dispose(); }); }); }
+  if (c.obj) {
+    scene.remove(c.obj);
+    disposeObject(c.obj);
+  }
   live.delete(id);
 }
 function stream() {
@@ -169,10 +205,13 @@ function stream() {
   for (const def of want) {
     if (inflight >= MAX_INFLIGHT) break;
     const entry = { def, obj: null }; live.set(def.id, entry);
-    if (def.test) { entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyWire(entry.obj); continue; }
+    if (def.test) { entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyClay(entry.obj); applyWire(entry.obj); continue; }
     inflight++;
-    loader.load(def.url, g => { inflight--; if (live.get(def.id) !== entry) return; entry.obj = g.scene; scene.add(g.scene); applyWire(g.scene); },
-      undefined, () => { inflight--; failed++; });
+    loader.load(def.url, g => {
+      inflight--;
+      if (live.get(def.id) !== entry) { disposeObject(g.scene); return; }
+      entry.obj = g.scene; scene.add(g.scene); applyClay(g.scene); applyWire(g.scene);
+    }, undefined, () => { inflight--; failed++; });
   }
 }
 
@@ -180,8 +219,9 @@ function stream() {
 const world = await loadWorld();
 camera.position.fromArray(world.spawn);
 const banner = document.getElementById("banner");
-if (world.test) banner.innerHTML = "<b>TEST TERRAIN</b>: generated in the browser. No game geometry has been decoded yet. " +
-  "Put <code>world/world.json</code> and .glb chunks beside this page to view real data.";
+if (world.test) banner.innerHTML = "<b>TEST TERRAIN</b>: generated in the browser. No <code>world/world.json</code> found.<br>" +
+  "Build chunks with <code>python -I tools/world_build.py &lt;work&gt;\\assets --out &lt;work&gt;\\world</code> and serve with " +
+  "<code>python -I viewer/serve.py --world &lt;work&gt;\\world</code>.";
 else banner.classList.add("hidden");
 for (const c of world.chunks) {
   const b = c.bounds, box = new THREE.Box3(new THREE.Vector3(b[0], b[1], b[2]), new THREE.Vector3(b[3], b[4], b[5]));
