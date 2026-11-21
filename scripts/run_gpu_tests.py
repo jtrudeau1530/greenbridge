@@ -834,6 +834,7 @@ def run_suite(a, work: str) -> int:
                 "ps_f16_const": (0xAAAA3D00, 0x38005555, 0xAAAA3800, 0x3F000000),
                 "ps_f16_const2": (0x42003D00, 0x3D004200, 0xAAAABC00, 3),
                 "ps_f16_pack": (0x34003C00, 0x38003400, 0x34000000, 0x44004200),
+                "ps_sff_imm": (2, 1, 20, 16),                  # SHADER-46: s_ff0/s_ff1 of an immediate
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
