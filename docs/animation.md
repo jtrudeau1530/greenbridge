@@ -126,8 +126,9 @@ start-of-stream tables.
 
 ### Skeleton and bone names
 
-A full-corpus prefix scan found 31 distinct `SKEL_*` tokens, 170 occurrences, in the first 4 KiB of the streams.
-Two forms were seen in carved samples:
+A full-corpus prefix scan found 31 distinct `SKEL_*` tokens, 170 occurrences, in the first 4 KiB of the streams;
+the count includes fragments. The four full-name streams give the 30-name union below. Two forms were seen in
+carved samples:
 
 - a plain NUL-terminated bone list (896-byte stream), and
 - a front-coded table (2,064 bytes) whose entries are length-prefixed name fragments plus parent indices.
@@ -164,7 +165,7 @@ The leading u32 is 2 or 3; the next four bytes are constant. Stored 18,168,950 b
 bitstreams rather than zlib streams. The 24-byte header has five small fields after the type, but their meaning
 is not established; no name is stored in the stream.
 
-### Tail `RBF0` rig metadata
+### Tail `RBF0` rig-set manager
 
 The last 21 streams appear to be one logical `RBF0` blob split into 64 KiB blocks (20 × 65,536 plus 37,716
 bytes); the first block ends mid-path (`...anim/rig`) and the next starts `/canonical/...`:
@@ -173,33 +174,105 @@ bytes); the first block ends mid-path (`...anim/rig`) and the next starts `/cano
 52 42 46 30 fb ff 01 00 00 00 15 00  "rage__crRigSetManager"
 ```
 
-They hold 58,391 stored / 1,348,436 inflated bytes and 20,224 printable runs of at least 6 bytes (4,819
-distinct). The readable
-content is a rig-set manager, not clip keyframes:
+They hold 58,391 stored / 1,348,436 inflated bytes. The blob is a rig-set manager, not clip keyframes. Parsing
+the `03 60` key strings, `fd ff` value strings and `ff ff 06 00`/`ff ff 07 00` field markers gives:
 
-| Lowercase token | Occurrences | Distinct |
+| Measure | Value |
+|---|---:|
+| Rig-set keys | 1,126 |
+| Source → rig entries | 6,677 |
+| Distinct rig paths | 3,669 |
+| Distinct names (rig sets + rigs) | 4,795 |
+| Empty rig sets | 56 (object 53, vehicle 3) |
+| Rig-set categories | ped 664, vehicle 346, object 115, system 1 |
+| Max entries / distinct rigs in one set | 45 / 41 |
+| Entries with a group string | 6,677 (16 distinct groups) |
+
+Source entries, with distinct rig paths in each source:
+
+| Source | Entries | Distinct rigs |
 |---|---:|---:|
-| `anim/rigset/` paths | 1,126 | 1,126 |
-| `anim/rig/` paths | 6,677 | 3,669 |
-| `generated@source` | 3,616 | 1 |
-| `pipelined@source` | 2,135 | 1 |
-| `canonical@source` | 888 | 1 |
-| `deformation` | 4,217 | 6 |
-| `pose.` | 253 | 6 |
-| `ped/` paths | 4,828 | 1,974 |
-| `vehicle/` paths | 2,691 | 2,567 |
-| `prop/` paths | 79 | 79 |
-| `facial` | 164 | 5 |
-| `motion` | 150 | 1 |
-| `bone`, `SKEL_`, `clip` | 0 | 0 |
+| `generated@source` | 3,616 | 1,188 |
+| `pipelined@source` | 2,135 | 1,931 |
+| `canonical@source` | 888 | 534 |
+| `canonical@legacy` | 38 | 16 |
 
-Counts are case-sensitive lowercase matches. Case-insensitively, `bone` is 4/2 and `skel` is 2/1, all inside two
-rig path names; `clip` stays 0. `facial` and `motion` also appear capitalised in a few path names.
+Every distinct rig appears under exactly one source category. Every source tag is followed by exactly one rig
+key before the next source (0 exceptions), and every entry is assigned to a rig-set by its offset.
 
-Schema field names include `rage__crRigSetManager`, `RigSet`, `Item`, `Entries`, `Dictionary`, `Priority`, `key`,
-`canonical@legacy`, `canonical@source`, `generated@source`, `pipelined@source`, `deformation`, `facial`,
-`identity` and `pose.ragdoll.post`. This is the likely rig-set → rig mapping table. It is the strongest lead for
-joining animation paths to skeletons, and it was missing from the `rpf9_carve` index because of the tail overread.
+The first rig-set block starts at 0x0045. The tag/length layout is visible directly:
+
+```
+0x0045  03 60 03 00 "key"
+0x004c  1f 00 <31-byte rig-set path>
+0x009a  fd ff 11 00 00 00 "canonical@source" 00
+0x00b1  ff ff 06 00 03 00 "Rig" ...
+0x00c0  fd ff 30 00 00 00 <48-byte rig path> 00
+0x00f6  ff ff 07 00 05 00 "Group" ...
+0x0107  fd ff 05 00 00 00 "pose" 00
+0x0112  ff ff 08 10 08 00 "Priority" ...  a0 0f 00 00
+```
+
+- Rig-set key: `03 60` + u16 length + ASCII (no NUL). The first block is special and puts the schema name `key`
+  before the first path; the following 1,125 blocks use `02 00 00 00 00 00 01 00 03 60` + u16 length + path.
+- Entry: `fd ff` + u32 length including NUL + source, then `ff ff 06 00` (Rig), the rig key in the same
+  `fd ff` form, `ff ff 07 00` (Group), and the group string in the same form. A `ff ff 08 10` field and a mostly
+  zero u32 follow; the field semantics are not mapped.
+- A non-empty rig-set ends with six `ff` bytes (1,070 occurrences). An empty rig-set has
+  `04 00` + six zero bytes + four `ff` bytes and no entry (56 occurrences).
+- The group names are the rig's channel/group field; the observed values are `deformation` (2,169),
+  `deformation[2]` (1,702), `identity` (1,109), `pose` (938), `pose.ragdoll.post` (160), `facial` (152), and
+  ten smaller values.
+
+Mapping to the name tables:
+
+- The 2,298 distinct `pack:/...` paths resolve to a stored joaat32 stem hash for **1,901** names (82.7%);
+  **401** stay unresolved. By occurrence, 3,229 of 3,637 (88.8%) match, and 248 of 273 name tables are complete.
+- The RBF0 names do **not** overlap the clip/anim/motion namespace: direct name overlap is 0 and stem-hash
+  overlap with the 2,298 paths is 0.
+- None of the 4,795 RBF0 names stores its joaat32 anywhere in the blob (0 matches); the rig-set and rig keys are
+  name strings, not a hash table. A decoder must carry the names forward.
+
+### Bone tables and motion matchers
+
+Four small resources carry bone names. One is a standalone name list; three are motion-matcher resources that
+embed a bone table and a `pack:/...motionmatcher` path:
+
+| Offset | Inflated | Distinct names | Occurrences | Confirmed joaat32 hashes | Kind |
+|---|---:|---:|---:|---:|---|
+| `0x101a32160` | 896 | 28 | 68 | 0 | standalone name list |
+| `0x101c379a0` | 4,272 | 28 | 55 | 14 | motion matcher |
+| `0x101c41d50` | 2,064 | 15 | 15 | 8 | motion matcher |
+| `0x101ea66c0` | 2,848 | 30 | 50 | 19 | motion matcher |
+
+The three motion matcher streams contain four distinct `pack:/...motionmatcher` paths. The union of all four
+streams is 30 names (28 `SKEL_*` and 2 `PH_*`); 19 of the 30 have a confirmed stored joaat32; 11 do not. The
+standalone 896-byte stream has no hash table.
+
+The 2,064-byte stream shows the embedded record layout most clearly: header `0f 00 e0 00 0c 00 16 00`, eight
+0x30-byte records from 0x0528 to 0x0678, a u32 hash at +0x10, a parent-index array at 0x06d0, bind-pose floats
+from 0x0100, the full name list at 0x0750, and a `pack:/...motionmatcher` path at 0x04a0:
+
+```
+0x0528  0c 00 01 00 00 00 00 00 00 00 00 00 19 de 33 81 0b 00 00 00
+0x0558  0c 00 00 00 06 00 01 00 00 00 00 00 00 00 00 00 55 a9 3f 2b 03 00 00 00
+```
+
+All 8 of its +0x10 hashes match joaat32 of full names in its own 0x0750 list. The 2,848-byte stream has a
+14-entry pointer table at 0x0000 (targets in the `0x5005xxxx` range), records at 0x02d0, and two motionmatcher
+paths at 0x0210 and 0x0290; 19 of its 30 names hash-confirm. The 4,272-byte stream has 28 names and 14 hashes.
+
+This is a measured **clip → bone-table binding for the four motionmatcher paths**: the path and the bone table
+are in the same stream. It is not a rig → skeleton link for RBF0:
+
+- RBF0 contains no `SKEL_` token and no lowercase `bone`/`skeleton` string; the only `Bones`/`Skel` text is
+  inside two rig path names.
+- 0 of the 3,669 rigs and 0 of the 1,126 rig sets match any of the 30 bone names or any of the 19 confirmed
+  hashes.
+- The four motionmatcher paths are not in the 2,298 `.clip`/`.anim`/`.motion` name-table paths.
+
+So RBF0 gives rig-set → source → rig, and the motion matcher resources show how a clip can carry its own bone
+table. The link from an RBF0 rig to that table is still missing; it is the main unresolved binding.
 
 ### Magics not found
 
@@ -210,9 +283,10 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
 
 ## Readable, compressed and still opaque
 
-- **Readable:** all 273 name tables (2,298 paths), 31 distinct `SKEL_*` tokens, the `0DRP` version/page count, 1,371
-  type-hash headers, 1,781 clip-stream headers, and the 4,819 distinct strings in the `RBF0` rig metadata. Some
-  `MoVE` and zero-prefixed pages expose counts and float arrays directly.
+- **Readable:** all 273 name tables (2,298 paths), the `0DRP` version/page count, 1,371 type-hash headers,
+  1,781 clip-stream headers, the RBF0 mapping (1,126 rig sets / 6,677 entries / 3,669 rigs), one standalone
+  bone-name list, and three motion matcher streams with embedded bone tables (30-name union; 19 confirmed bone
+  hashes). Some `MoVE` and zero-prefixed pages expose counts and float arrays directly.
 - **Outer compression:** the only compression this work inverts is the RPF9 zlib framing. Inflating the 130,470
   streams accounts for the 11.59 GB above.
 - **No nested zlib:** in eight sampled zero-prefixed pages, none of the `78 01/5E/9C/DA` byte pairs started a
@@ -222,7 +296,10 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
   sampled positions.
   No Oodle signature is known from these bytes; none is guessed.
 - **Still opaque:** high-entropy blocks inside `other` and zero-prefixed pages (4 KiB blocks up to 7.96
-  bits/byte), the 1,781 packed clip streams, and the fields of `MoVE` beyond the version and size hint.
+  bits/byte), the 1,781 packed clip streams, the fields of `MoVE` beyond the version and size hint, the 56 empty
+  rig sets, the RBF0 numeric fields, and the rig→skeleton link (0 measured matches). Of the 30 bone names, 19
+  have a confirmed stored hash and 11 do not; the four motionmatcher paths bind to embedded tables, but not to
+  an RBF0 rig.
 
 ## Cross-check with the model and XML work
 
@@ -249,7 +326,8 @@ The bytes support **new RAGE resource pages**, not the GTA V `YCD`/`RSC7` family
 - RPF9 container, `0DRP` page directories with `0x50xxxxxx` virtual pointers and page counts.
 - `pack:/...` path tables with 16-byte-aligned names and 16-byte hash/pointer records.
 - `SKEL_*` bone tables in plain and front-coded forms.
-- `RBF0` rig-set metadata (`rage__crRigSetManager`) mapping rig-set paths to canonical/generated/pipelined rigs.
+- `RBF0` rig-set metadata (`rage__crRigSetManager`): 1,126 rig sets, 6,677 source→rig entries and 3,669 distinct
+  rigs, with source tags and group strings. The rig→skeleton key is not in RBF0 or the skeleton streams.
 - `MoVE` (version 19) and the 2/3 clip streams as the animation payloads; neither is zlib inside the page.
 - No `YCD`, `YDD`, `YLD`, `YFD`, `RSC7` or `RSC8` at any stream start.
 
@@ -262,29 +340,35 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
   decoded, and the marker is not proven to be animation-specific.
 - `MoVE` is named like motion data, but its fields beyond the version and size hint are unmapped.
 - The 2/3 streams are packed bitstreams with a constant four-byte prefix. No clip has been decoded.
-- The `RBF0` rig-set manager is readable strings and schema field names. Its value encoding (indices, hashes,
-  parent links) is not parsed yet.
+- The `RBF0` rig-set/rig/group entries are parsed. The numeric fields, the schema type table and the
+  rig→skeleton reference are not; the measured skeleton match is 0.
+- The three motion matcher streams embed bone tables, but whether those define a full skeleton or only the
+  motion-matching bones is not established. 19 of 30 names have a confirmed hash.
 
 ## What a future decoder needs
 
-1. **Parse the `RBF0` rig-set manager first.** It is 1.35 MB, has an explicit schema name
-   (`rage__crRigSetManager`) and 4,819 readable rig/rig-set paths. Extract the rig-set → rig entries and the
-   channel names (`deformation`, `facial`, `pose.*`). That is the missing rig-set mapping; combined with the
-   `SKEL_*` bone tables it gives bone order. Without a rig entry, a clip has no skeleton binding.
-2. **Group streams into resources.** The TOC is encrypted, so use the `0DRP` page header: count at +0x20,
+1. **Use the parsed RBF0 rig mapping.** It is 1,126 rig sets, 6,677 source→rig entries and 3,669 distinct rigs;
+   56 rig sets are empty. The key/tag layout is above. The field after `ff ff 08 10` and the rest of the schema
+   still need mapping.
+2. **Resolve rig → skeleton.** None of the 3,669 rigs or 1,126 rig sets matches a stored skeleton name or one of
+   the 19 confirmed bone hashes. Three motion matcher streams bind four paths to embedded bone tables (30-name
+   union; parent indices and bind data in the 2,064-byte example). Parse those records to learn the clip→bone
+   binding, then find how an RBF0 rig points at the same table. The missing key is likely a separate rig asset
+   or an unparsed numeric field, not these pages. Do not infer it from the category names.
+3. **Group streams into resources.** The TOC is encrypted, so use the `0DRP` page header: count at +0x20,
    pointers at +0x08 and +0x28..+0x40, four u16 values at +0x48. The sampled layout places page headers among
    zero-prefixed pages; a logical resource can span several streams. Do not assume one stream is one file.
-3. **Parse the name/hash tables.** Names are NUL-terminated and 16-byte aligned; the name hash is joaat32 of
+4. **Parse the name/hash tables.** Names are NUL-terminated and 16-byte aligned; the name hash is joaat32 of
    the stem (path without `pack:/` and without the final extension). The record stride varies (16 or 32 bytes in
    sampled tables), so do not assume one layout. The recurring `0x98e1750c` needs a meaning before it can be
    used as a type or source id.
-4. **Join rigs to clips, then decode a known clip.** Pick one `.clip` name table entry, follow its pointer into
-   the page, and use the rig entry for its bone order. The 24-byte header and the packed bitstream are the
-   blocking unknowns. `MoVE` (version 19, size hint at +0x14) is a second, separate format; map its fields only
-   after a known payload decodes.
-5. **Keep the compression boundary explicit.** Outer RPF9 zlib is understood. Do not add a zlib pass inside a
+5. **Join rigs to clips, then decode a known clip.** Pick one `.clip` name table entry, follow its pointer into
+   the page, and use the rig entry for its rig identity. The rig→skeleton key still has to come from step 2.
+   The 24-byte header and the packed bitstream are the blocking unknowns. `MoVE` (version 19, size hint at
+   +0x14) is a second, separate format; map its fields only after a known payload decodes.
+6. **Keep the compression boundary explicit.** Outer RPF9 zlib is understood. Do not add a zlib pass inside a
    page without evidence; the sampled pages had no valid nested stream.
-6. **Re-run the model cross-check with the full export.** The current 1,350-model data.rpf manifest has bone
+7. **Re-run the model cross-check with the full export.** The current 1,350-model data.rpf manifest has bone
    bindings but no bone names or hashes. The full 155,598-model export plus the `RBF0` rig table is needed to
    match skeletons to models.
 

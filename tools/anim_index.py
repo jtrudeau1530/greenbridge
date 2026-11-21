@@ -11,8 +11,14 @@ size hint; `RBF0` with its first schema name; name tables with their first path 
 Usage:
     python -I anim_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES] [--quiet]
     python -I anim_index.py <carved-dir> <out.csv|out.json> [--quiet]
+    python -I anim_index.py <archive.rpf> <out.json> --rigs <rigs.json>
+
+`--rigs` additionally joins the RBF0 stream with its 64 KiB continuation blocks and writes the rig-set/rig entries
+and plain `SKEL_` bone names to its own JSON. It stops at the next known container signature or a gap.
 """
 import argparse
+import bisect
+import collections
 import csv
 import json
 import mmap
@@ -25,8 +31,15 @@ import zlib
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 PACK_NAMES = re.compile(rb"pack:/[^\x00]{1,200}")
-SKEL_NAMES = re.compile(rb"SKEL_[A-Za-z0-9_]{1,100}")
+SKEL_NAMES = re.compile(rb"(?:SKEL_|PH_)[A-Za-z0-9_]{1,100}")
 COLUMNS = ["offset", "stored", "size", "signature", "version", "name", "count", "detail"]
+RBF0_SOURCES = ("canonical@source", "generated@source", "pipelined@source", "canonical@legacy")
+STOP_SIGNATURES = {"rbf0", "page-directory", "name-table", "move", "psin", "typehash", "clip-stream",
+                   "skeleton-names", "bink2"}
+
+
+def _u16(data, at):
+    return struct.unpack_from("<H", data, at)[0] if len(data) >= at + 2 else None
 
 
 def _u32(data, at):
@@ -97,6 +110,210 @@ def classify(data, offset, stored):
     else:
         record["signature"] = "raw:" + data[:4].hex()
     return record
+
+
+def _u16_string(data, at):
+    """Short length-prefixed ASCII string, as used by RBF0 rig-set keys and schema names."""
+    n = _u16(data, at)
+    if n is None or not 1 <= n <= 300:
+        return None
+    raw = data[at + 2:at + 2 + n]
+    if len(raw) != n or not raw or not all(32 <= c < 127 for c in raw):
+        return None
+    return raw.decode("ascii")
+
+
+def _fd_string(data, at):
+    """`fd ff` + u32 length (including NUL) + ASCII value, as used by RBF0 rig fields."""
+    if data[at:at + 2] != b"\xfd\xff":
+        return None
+    n = _u32(data, at + 2)
+    if n is None or not 1 <= n <= 300:
+        return None
+    raw = data[at + 6:at + 6 + n]
+    if raw.endswith(b"\x00"):
+        raw = raw[:-1]
+    if not raw or not all(32 <= c < 127 for c in raw):
+        return None
+    return raw.decode("ascii")
+
+
+def joaat32(text):
+    """Jenkins one-at-a-time, lowercased, as used for animation path and bone name hashes."""
+    h = 0
+    for c in text.lower().encode("latin-1", "replace"):
+        h = (h + c) & 0xFFFFFFFF
+        h = (h + (h << 10)) & 0xFFFFFFFF
+        h ^= h >> 6
+    h = (h + (h << 3)) & 0xFFFFFFFF
+    h ^= h >> 11
+    return (h + (h << 15)) & 0xFFFFFFFF
+
+
+def parse_skel_names(data, offset=0):
+    """Read the full bone names out of a plain `SKEL_` stream. Front-coded tables are not decoded."""
+    names = [m.group().decode("ascii", "replace") for m in SKEL_NAMES.finditer(data)]
+    distinct = sorted(set(names))
+    hashes = sum(1 for n in distinct if struct.pack("<I", joaat32(n)) in data)
+    return {"offset": offset, "occurrences": len(names), "distinct": len(distinct),
+            "hashes_confirmed": hashes, "names": distinct}
+
+
+def parse_rbf0(data, offset=0):
+    """Parse the RBF0 rig-set manager without decoding its schema.
+
+    Rig-set keys are `03 60` + u16 length + ASCII. Entries are `fd ff` + u32 length + a source tag, then the
+    `ff ff 06 00` field marker, a rig key (`fd ff` + u32 length), `ff ff 07 00`, and a group string. Each source
+    is followed by exactly one rig key; rig-set blocks end with six `ff` bytes or (when empty) four `ff` bytes.
+    """
+    if data[:4] != b"RBF0":
+        raise ValueError("not an RBF0 blob")
+    rigsets = sorted({(i, s) for i in range(len(data) - 4)
+                      if (s := _u16_string(data, i)) and s.startswith("anim/rigset/")})
+    sources, rigs = [], []
+    for i in range(len(data) - 6):
+        s = _fd_string(data, i)
+        if s in RBF0_SOURCES:
+            sources.append((i, s))
+        elif s and s.startswith("anim/rig/"):
+            rigs.append((i, s))
+    if not rigsets:
+        raise ValueError("no anim/rigset/ keys found")
+    rig_offsets = [i for i, _ in rigs]
+    rigset_offsets = [i for i, _ in rigsets]
+    rows = [{"key": key, "offset": pos, "entries": []} for pos, key in rigsets]
+    for n, (source_at, source) in enumerate(sources):
+        j = bisect.bisect_left(rig_offsets, source_at)
+        if j >= len(rigs):
+            continue
+        rig_at, rig = rigs[j]
+        k = bisect.bisect_right(rigset_offsets, source_at) - 1
+        if k < 0:
+            continue
+        end = sources[n + 1][0] if n + 1 < len(sources) else len(data)
+        group = ""
+        p = rig_at + 6 + len(rig) + 1
+        while p < end:
+            candidate = _fd_string(data, p)
+            if candidate is not None:
+                if not candidate.startswith("anim/"):
+                    group = candidate
+                break
+            p += 1
+        rows[k]["entries"].append({"source": source, "rig": rig, "group": group,
+                                   "source_offset": source_at, "rig_offset": rig_at})
+    for row in rows:
+        row["distinct_rigs"] = len({e["rig"] for e in row["entries"]})
+    stored = set(struct.unpack_from("<I", data, i)[0] for i in range(0, len(data) - 3))
+    rig_names = {e["rig"] for row in rows for e in row["entries"]}
+    names = {row["key"] for row in rows} | rig_names
+    stored_hashes = sum(1 for n in names if struct.pack("<I", joaat32(n)) in stored)
+    entries = [e for row in rows for e in row["entries"]]
+    by_source = {}
+    for source in RBF0_SOURCES:
+        selected = [e for e in entries if e["source"] == source]
+        by_source[source] = {"entries": len(selected), "distinct_rigs": len({e["rig"] for e in selected})}
+    groups = collections.Counter(e["group"] for e in entries if e["group"])
+    return {
+        "header": {"magic": "RBF0", "word_0x04": _u16(data, 4), "schema": _u16_string(data, 0x0A),
+                   "bytes": len(data), "offset": offset},
+        "summary": {
+            "rigsets": len(rows),
+            "entries": len(entries),
+            "distinct_rigs": len(rig_names),
+            "distinct_names": len(names),
+            "empty_rigsets": sum(1 for row in rows if not row["entries"]),
+            "entries_with_group": sum(1 for e in entries if e["group"]),
+            "rigset_categories": dict(collections.Counter(row["key"].split("/")[2] for row in rows)),
+            "sources": by_source,
+            "groups": dict(groups),
+            "stored_name_hashes": stored_hashes,
+            "max_entries_per_rigset": max((len(row["entries"]) for row in rows), default=0),
+            "max_distinct_rigs_per_rigset": max((row["distinct_rigs"] for row in rows), default=0),
+        },
+        "rigsets": rows,
+    }
+
+
+def _inflate_row(archive, row):
+    with open(archive, "rb") as f:
+        f.seek(row["offset"])
+        return zlib.decompress(f.read(row["stored"]))
+
+
+def collect_rbf0(archive, rows):
+    """Join the RBF0 stream with its 64 KiB continuation blocks. Stops at a known signature or a gap."""
+    start = next((i for i, r in enumerate(rows) if r["signature"] == "rbf0"), None)
+    if start is None:
+        return None
+    blob = bytearray(_inflate_row(archive, rows[start]))
+    previous_end = rows[start]["offset"] + rows[start]["stored"]
+    for row in rows[start + 1:]:
+        if len(blob) >= 8 * 1024 * 1024 or row["offset"] > previous_end + 16:
+            break
+        if row["signature"] in STOP_SIGNATURES or row["size"] > 65536:
+            break
+        blob += _inflate_row(archive, row)
+        previous_end = row["offset"] + row["stored"]
+    return bytes(blob)
+
+
+def collect_skeletons(archive, rows):
+    """Standalone `SKEL_` streams plus small resources (motion matchers) that embed bone tables."""
+    out = []
+    for row in rows:
+        if row["signature"] == "skeleton-names" or (row["size"] <= 16384 and row["signature"].startswith("raw:")):
+            data = _inflate_row(archive, row)
+            if b"SKEL_" in data or b"PH_" in data:
+                record = parse_skel_names(data, row["offset"])
+                record["kind"] = ("plain-bone-table" if row["signature"] == "skeleton-names"
+                                  else ("motion-matcher" if b"motionmatcher" in data else "bone-table"))
+                if record["distinct"] or record["hashes_confirmed"]:
+                    out.append(record)
+    return out
+
+
+def collect_skeletons_dir(path):
+    out = []
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        if not os.path.isfile(full) or os.path.getsize(full) > 16384:
+            continue
+        with open(full, "rb") as f:
+            data = f.read()
+        if b"SKEL_" in data or b"PH_" in data:
+            m = re.match(r"([0-9a-fA-F]{6,})", name)
+            record = parse_skel_names(data, int(m.group(1), 16) if m else 0)
+            record["kind"] = "motion-matcher" if b"motionmatcher" in data else "bone-table"
+            if record["distinct"] or record["hashes_confirmed"]:
+                out.append(record)
+    return out
+
+
+def collect_rbf0_dir(path):
+    """The same continuation rule for a carved directory sorted by offset."""
+    entries = []
+    for name in os.listdir(path):
+        full = os.path.join(path, name)
+        if not os.path.isfile(full):
+            continue
+        m = re.match(r"([0-9a-fA-F]{6,})", name)
+        offset = int(m.group(1), 16) if m else len(entries)
+        with open(full, "rb") as f:
+            entries.append((offset, name, f.read()))
+    entries.sort(key=lambda e: e[0])
+    first = next((i for i, (_, _, data) in enumerate(entries) if data[:4] == b"RBF0"), None)
+    if first is None:
+        return None
+    blob = bytearray(entries[first][2])
+    previous_end = entries[first][0] + len(entries[first][2])
+    for offset, _, data in entries[first + 1:]:
+        sign = classify(data, offset, len(data))["signature"]
+        if len(blob) >= 8 * 1024 * 1024 or offset > previous_end + 16 or sign in STOP_SIGNATURES or len(data) > 65536:
+            break
+        blob += data
+        previous_end = offset + len(data)
+    return bytes(blob)
 
 
 def _gap(gap):
@@ -234,6 +451,7 @@ def main():
     ap.add_argument("out", help="output path ending in .csv or .json")
     ap.add_argument("--start", type=lambda s: int(s, 0), help="first byte to scan (default: the RPF data start)")
     ap.add_argument("--limit", type=lambda s: int(s, 0), help="number of bytes to scan")
+    ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     if os.path.isdir(a.source):
@@ -244,6 +462,18 @@ def main():
                 print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
         rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
     write_output(a.out, rows, summary)
+    if a.rigs:
+        if os.path.isdir(a.source):
+            blob = collect_rbf0_dir(a.source)
+            skeletons = collect_skeletons_dir(a.source)
+        else:
+            blob = collect_rbf0(a.source, rows)
+            skeletons = collect_skeletons(a.source, rows)
+        if blob is None:
+            print("no RBF0 stream found; --rigs needs the archive or carved folder that contains it", file=sys.stderr)
+            return 2
+        with open(a.rigs, "w", encoding="utf-8") as f:
+            json.dump({"rbf0": parse_rbf0(blob), "skeletons": skeletons}, f, indent=1)
     top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
     print(json.dumps({k: summary[k] for k in
                       ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",
