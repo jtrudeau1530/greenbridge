@@ -1,0 +1,138 @@
+"""Tests for tools/spirv_stubs.py and graphics pipeline metadata in tools/rdna2spirv.py.
+
+Runs with the standard library only (no GPU required):
+    python -I tests/test_spirv_stubs.py
+When spirv-val is on PATH, every generated stub is also validated with spirv-val --target-env vulkan1.2.
+"""
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+import rdna2spirv  # noqa: E402
+import spirv_stubs  # noqa: E402
+
+
+def decode_spirv_words(data):
+    assert len(data) >= 20 and len(data) % 4 == 0
+    words = list(struct.unpack(f"<{len(data) // 4}I", data))
+    magic, version, _gen, bound, schema = words[:5]
+    assert magic == spirv_stubs.SPIRV_MAGIC
+    assert version == spirv_stubs.SPIRV_VERSION_1_0
+    assert bound > 1
+    assert schema == 0
+    insts = []
+    i = 5
+    while i < len(words):
+        wc = words[i] >> 16
+        op = words[i] & 0xFFFF
+        assert wc >= 1 and i + wc <= len(words)
+        insts.append((op, words[i + 1 : i + wc]))
+        i += wc
+    return bound, insts
+
+
+class SpirvStubsTests(unittest.TestCase):
+    def _maybe_spirv_val(self, data):
+        val = shutil.which("spirv-val")
+        if not val:
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "stub.spv")
+            with open(p, "wb") as f:
+                f.write(data)
+            r = subprocess.run([val, "--target-env", "vulkan1.2", p], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, f"spirv-val failed:\n{r.stderr}")
+
+    def test_stub_name_canonical(self):
+        self.assertEqual(spirv_stubs.stub_name("vs", []), "vs_empty.spv")
+        self.assertEqual(spirv_stubs.stub_name("vs", [3, 0, 1, 0]), "vs_0_1_3.spv")
+        self.assertEqual(spirv_stubs.stub_name("ps", []), "ps_empty.spv")
+        self.assertEqual(spirv_stubs.stub_name("ps", [2, 1]), "ps_1_2.spv")
+
+    def test_vs_stubs_decode_and_validate(self):
+        for locs in ([], [0], [0, 2, 5]):
+            data = spirv_stubs.build_vs_stub(locs)
+            _, insts = decode_spirv_words(data)
+            decs = [args for op, args in insts if op == spirv_stubs.OP_DECORATE]
+            # BuiltIn Position + one Location decoration per unique output location.
+            self.assertTrue(any(d[1:] == [spirv_stubs.DEC_BUILTIN, spirv_stubs.BUILTIN_POSITION] for d in decs))
+            got_locs = sorted(d[2] for d in decs if len(d) == 3 and d[1] == spirv_stubs.DEC_LOCATION)
+            self.assertEqual(got_locs, sorted(locs))
+            self._maybe_spirv_val(data)
+
+    def test_ps_stubs_decode_and_validate(self):
+        for locs, flat in (([], []), ([0], []), ([0, 1, 4], [1])):
+            data = spirv_stubs.build_ps_stub(locs, flat_locations=flat)
+            _, insts = decode_spirv_words(data)
+            # Must declare OriginUpperLeft.
+            modes = [args for op, args in insts if op == spirv_stubs.OP_EXECUTION_MODE]
+            self.assertTrue(any(m[1] == spirv_stubs.MODE_ORIGIN_UPPER_LEFT for m in modes))
+            decs = [args for op, args in insts if op == spirv_stubs.OP_DECORATE]
+            # Location 0 output + each input location.
+            got_locs = sorted(d[2] for d in decs if len(d) == 3 and d[1] == spirv_stubs.DEC_LOCATION)
+            self.assertEqual(got_locs, sorted([0] + list(locs)))
+            flat_decs = [d for d in decs if len(d) == 2 and d[1] == spirv_stubs.DEC_FLAT]
+            self.assertEqual(len(flat_decs), len(flat))
+            self._maybe_spirv_val(data)
+
+    def test_required_stubs_and_deduplication(self):
+        index = {
+            "cs_a": {"stage": "cs"},
+            "ps_a": {"stage": "ps", "inputs": [0, 1], "outputs": [0]},
+            "ps_b": {"stage": "ps", "inputs": [1, 0], "outputs": [0, 1]},  # same VS stub as ps_a
+            "ps_c": {"stage": "ps", "outputs": [0]},
+            "vs_a": {"stage": "vs", "outputs": [0, 1]},
+            "ms_a": {"stage": "ms", "params": [0, 1]},  # same PS stub as vs_a
+            "gs_a": {"stage": "gs", "gs_inputs": [0, 1], "gs_outputs": [0, 1],
+                     "gs_input_locations": [1], "gs_output_locations": [1]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            written = spirv_stubs.generate_for_index(tmp, index)
+            self.assertEqual(written, ["ps_0_1.spv", "ps_1.spv", "vs_empty.spv", "vs_0_1.spv", "vs_1.spv"])
+            for fname in written:
+                path = os.path.join(tmp, "stubs", fname)
+                self.assertTrue(os.path.isfile(path))
+                with open(path, "rb") as f:
+                    self._maybe_spirv_val(f.read())
+
+            # CLI smoke test on index.json.
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                json.dump(index, f)
+            self.assertEqual(spirv_stubs.main([tmp]), 0)
+
+
+class ShaderMetaTests(unittest.TestCase):
+    def test_shader_meta_graphics_fields(self):
+        # PS with flat + interpolated inputs and depth write.
+        g = rdna2spirv.Gen("ps")
+        g.inputs = {"%in_0": 0, "%in_1": 1}
+        g.interpolated = {"%in_1"}
+        g.outputs = {"%out_0": "mrt0", "%out_2": "mrt2"}
+        g.writes_depth = True
+        m = rdna2spirv.shader_meta(g, "OpCapability Shader\n")
+        self.assertEqual(m["stage"], "ps")
+        self.assertEqual(m["inputs"], [0, 1])
+        self.assertEqual(m["outputs"], [0, 2])
+        self.assertTrue(m["writes_depth"])
+
+        # GS separating BuiltIn Position (sv == 1) from Location registers.
+        gg = rdna2spirv.Gen("gs")
+        gg.gs = {"in": [(0, 1), (1, 0), (3, 0)], "out": [(0, 1), (2, 0)], "nreg": 2, "maxv": 4}
+        mg = rdna2spirv.shader_meta(gg, "OpCapability Geometry\n")
+        self.assertEqual(mg["gs_inputs"], [0, 1, 3])
+        self.assertEqual(mg["gs_outputs"], [0, 2])
+        self.assertEqual(mg["gs_input_locations"], [1, 3])
+        self.assertEqual(mg["gs_output_locations"], [2])
+        self.assertIn("geometryShader", mg["features"])
+
+
+if __name__ == "__main__":
+    unittest.main()
