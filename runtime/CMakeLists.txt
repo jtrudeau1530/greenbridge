@@ -135,6 +135,21 @@ if(BUILD_TESTING)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
+  if(WIN32)
+    # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
+    add_executable(bink_decode_test
+      test/bink_decode_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+    )
+    target_compile_definitions(bink_decode_test PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(bink_decode_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_link_options(bink_decode_test PRIVATE /OPT:NOREF)
+    target_link_libraries(bink_decode_test PRIVATE psapi)
+    add_test(NAME bink_decode COMMAND bink_decode_test)
+  endif()
 endif()
 
 if(WIN32)
