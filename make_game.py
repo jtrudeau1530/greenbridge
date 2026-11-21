@@ -581,10 +581,13 @@ def main() -> int:
         return 0
     out = os.path.abspath(a.out or default_out())
     work = os.path.abspath(a.work or os.path.join(out, "work"))
+    # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.
+    real_game = os.path.normcase(os.path.realpath(game))
     for p in (out, work):
         try:
             # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
-            inside = os.path.commonpath([os.path.normcase(p), os.path.normcase(game)]) == os.path.normcase(game)
+            real_destination = os.path.normcase(os.path.realpath(p))
+            inside = os.path.commonpath([real_destination, real_game]) == real_game
         except ValueError:          # different drives
             inside = False
         if inside:
