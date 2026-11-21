@@ -457,11 +457,11 @@ The full corpus:
 | BC4 | 77 | 1 | 77 |
 
 The record's block count is `N/k`; the `k > 1` cases are a subset of the 131,072-, 262,144-
-and 524,288-block chunks, consistent with `k` equal streams. No BC1 or BC4 chunk failed the
-check. BC3 and BC5 use `0xdb` (`K = 2`), but the record is constant in only 7/35 and 39/333
-chunks (BC5: 36 at `N`, 3 at `N/4`); BC6H and BC7 had no matching constant lane 1 for
-`K` in {2, 4, 8, 16, 32}. The exact result is therefore a BC1/BC4 header check, not a general
-BCPack header parser.
+and 524,288-block chunks, consistent with `k` equal streams. No BC1 or BC4 first record failed
+the check. BC3 and BC5 use `0xdb` (`K = 2`), but the first lane-1 record matches the constant
+model in only 7/35 and 39/333 chunks (BC5: 36 at `N`, 3 at `N/4`); BC6H and BC7 had no matching
+constant lane 1 for `K` in {2, 4, 8, 16, 32}. The exact result is therefore a BC1/BC4 header
+check, not a general BCPack header parser.
 
 Padding is zero-filled: every padding run starts with zero bytes (checked `min(16, pad)` bytes
 of all 108,229 padded BCPack chunks: 102,368 BC1, 35 BC3, 76 BC4, 332 BC5, 268 BC6H, 5,150
@@ -496,10 +496,10 @@ tables above and the container descriptors are the readable facts.
 
 ### Entropy framing and the pixel subset
 
-The public MDU tables and a research lockstep lane schedule reproduce the entropy layer
-without guessing pixel semantics. The test set is 200 textures whose mip 0 is exactly one BC1
-BCPack chunk and whose mip 1 is fully zlib/raw, in store order. All 200 chunks passed the hard
-check:
+The public MDU tables and a research lockstep lane schedule reproduce the entropy layer on the
+200-chunk test set without guessing pixel semantics. The set is 200 textures whose mip 0 is
+exactly one BC1 BCPack chunk and whose mip 1 is fully zlib/raw, in store order. All 200 chunks
+passed the hard check:
 
 - all 12 lanes finished with exactly `N` symbols;
 - every lane ended at `L`, `L >> 8` or `L >> 16`;
@@ -507,9 +507,9 @@ check:
 
 This is a byte-exact convergence check of the entropy layer; it does not identify the endpoint
 or index semantics. A public research repository, [`bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs)
-(MIT OR Apache-2.0), publishes candidate BC1 endpoint and index rules. An independent run of
-that code on the same 200 chunks gives (PSNR: each 2×2 mip0 quadrant against the mip1 pixel at
-that position):
+(MIT OR Apache-2.0), publishes candidate BC1 endpoint and index rules. An independent
+implementation of that rule, using the public MDU tables and its published codebook, on the
+same 200 chunks gives (PSNR: each 2×2 mip0 quadrant against the mip1 pixel at that position):
 
 | Subset | Chunks | Candidate BC1 vs mip 1 (PSNR) | Flat mip 1 |
 |---|---:|---|---:|
@@ -518,14 +518,14 @@ that position):
 | two or more | 116 | not decoded | — |
 
 This is **mip consistency, not a byte-exact decode**. The 160 chunks with a pre-start reference
-need the fixed 256-slot predictor window; the research branches fit only part of it and the
-full table is not published. The 40 clean chunks agree with mip 1 at 31–46 dB, which is strong
-evidence the candidate rule is close; this is not a held-out score, and mip 1 is a downsampled
-image, not the source blocks. No plaintext BCPack/BC block pair was found publicly. The
-repository's own `master` (commit `3534739`, read 2026-11-21) claims BC1 decodes at 36.6 dB
-median on held-out textures and says 621 of 3,276 pair textures are fully known; the gap is
-the unpublished window and the unresolved codebook entries, not a byte-exact validation. The
-code is not adopted here.
+need the fixed 256-slot predictor window for a full decode; the research branches fit only
+part of it and the full table is not published. The 40 clean chunks agree with mip 1 at 31–46
+dB, which is strong evidence the candidate rule is close; this is not a held-out score, and
+mip 1 is a downsampled image, not the source blocks. No plaintext BCPack/BC block pair was
+found publicly. The repository's own `master` (commit `3534739`, read 2026-11-21) claims BC1
+decodes at 36.6 dB median on held-out textures and says 621 of 3,276 pair textures are fully
+known; the gap is the unpublished window and the unresolved codebook entries, not a
+byte-exact validation. The code is not adopted here.
 
 A decoder still needs:
 
@@ -646,6 +646,12 @@ per-mip downsample error. `export` writes a full BC chain only when every source
 zlib/raw. The tool writes no texture data. `tests/test_tex_headers.py` tests the layout rule
 on synthetic headers and `tests/test_ttpf_mips.py` builds a synthetic RDS5 pool, so neither
 test needs game files.
+
+The BCPack counts above come from a read-only aggregation over the same `Pool` parser: it
+mmaps each pool, reads the RDS5 header, chunk table and ETPF records, then reads the first 64
+bytes of each BCPack chunk. The 200-chunk entropy check used the public MDU tables from
+`silicon-rans` on the same mip-pair selection. The probes are not committed because they
+duplicate `Pool` and add no decoder; they write no texture data.
 
 The BCPack counts above come from a read-only aggregation over the same `Pool` parser: it
 mmaps each pool, reads the RDS5 header, chunk table and ETPF records, then reads the first 64
