@@ -92,8 +92,9 @@ def check_mesh_v5(data):
         for y in range(3):
             for x in range(2):
                 pixel = next(pixels)
-                expected = x + 2*y + 6*z
-                want = (expected, expected, expected, 1)
+                # v5 = linear group index * NumThreads + lane (#209); the shader records lanes 0, 1 and 31 of 32
+                g = x + 2*y + 6*z
+                want = (32 * g, 32 * g + 1, 32 * g + 31, 1)
                 if pixel != want:
                     errors.append(f"({x},{y},{z}): got {pixel}, expected {want}")
     return f"{len(errors)}/24 mismatches; first {errors[0]}" if errors else ""

@@ -1,5 +1,6 @@
 ; One full-screen triangle per mesh workgroup. RGB records incoming v5 from local lanes 0, 1 and 31.
-; With --mesh-group-readback 2 3 4, pixel g = x + 2*y + 6*z must be (g, g, g, 1) under the workgroup-index model.
+; With --mesh-group-readback 2 3 4, pixel g = x + 2*y + 6*z must be (32g, 32g+1, 32g+31, 1): v5 = group index *
+; NumThreads + lane (#209; the game's mesh entry shifts v5 right by 7 on lane 0 with 128 threads).
 ; Stencil selects the workgroup independently of its color. PSV0: 32 threads, 128 bytes LDS, 3 vertices, 1 triangle.
 v_mbcnt_lo_u32_b32 v0, -1, 0
 ; Exchange through group memory so the probe also works when a host subgroup has fewer than 32 lanes.

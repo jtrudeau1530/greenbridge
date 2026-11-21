@@ -134,7 +134,7 @@ class Wave64Checks(unittest.TestCase):
 
 class MeshWorkgroupChecks(unittest.TestCase):
     def test_every_group_has_its_own_pixel(self):
-        pixels = [struct.pack("<4f", value, value, value, 1) for value in range(24)]
+        pixels = [struct.pack("<4f", 32 * g, 32 * g + 1, 32 * g + 31, 1) for g in range(24)]   # #209's v5
         self.assertEqual(check.check_mesh_v5(b"".join(pixels)), "")
         pixels[6], pixels[2] = pixels[2], pixels[6]
         self.assertIn("2/24 mismatches; first (0,1,0)", check.check_mesh_v5(b"".join(pixels)))
