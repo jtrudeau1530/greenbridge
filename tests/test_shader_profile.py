@@ -270,6 +270,27 @@ class TestCommandLineEndToEnd(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def run_profile(self):
+        out_json = os.path.join(self.tmp.name, "custom_profile.json")
+        cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "shader_profile.py"), self.disasm_dir, "--out", out_json]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"CLI failed: {res.stderr}")
+        with open(out_json, encoding="utf-8") as f:
+            return res.stdout, json.load(f, parse_constant=self.fail)
+
+    def test_cli_alu_without_memory_writes_null(self):
+        with open(os.path.join(self.disasm_dir, "ps_001.s"), "w", encoding="utf-8") as f:
+            f.write("\tv_mov_b32 v0, 1.0\n\ts_endpgm\n")
+        _, data = self.run_profile()
+        self.assertEqual(data["categories"]["alu"], 1)
+        self.assertEqual(data["categories"]["memory"], 0)
+        self.assertIsNone(data["ratios"]["alu_to_memory"])
+
+    def test_cli_empty_corpus(self):
+        _, data = self.run_profile()
+        self.assertEqual(data["shaders"], 0)
+        self.assertEqual(data["ratios"]["alu_to_memory"], 0.0)
+
     def test_cli_execution_and_json_output(self):
         s1 = (
             "; ps_001 code 0x0..0x20\n"
@@ -291,18 +312,11 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         with open(os.path.join(self.disasm_dir, "vs_002.s"), "w", encoding="utf-8") as f:
             f.write(s2)
 
-        out_json = os.path.join(self.tmp.name, "custom_profile.json")
-        cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "shader_profile.py"), self.disasm_dir, "--out", out_json]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, f"CLI failed: {res.stderr}")
-        self.assertIn("2 shaders", res.stdout)
-        self.assertIn("ALU:", res.stdout)
-        self.assertIn("Memory:", res.stdout)
-        self.assertIn("Branch:", res.stdout)
-
-        self.assertTrue(os.path.isfile(out_json))
-        with open(out_json, encoding="utf-8") as f:
-            data = json.load(f)
+        stdout, data = self.run_profile()
+        self.assertIn("2 shaders", stdout)
+        self.assertIn("ALU:", stdout)
+        self.assertIn("Memory:", stdout)
+        self.assertIn("Branch:", stdout)
 
         self.assertEqual(data["shaders"], 2)
         self.assertIn("families", data)
@@ -320,6 +334,7 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         ratios = data["ratios"]
         self.assertGreater(ratios["alu_ratio"], 0.0)
         self.assertGreater(ratios["memory_ratio"], 0.0)
+        self.assertEqual(ratios["alu_to_memory"], 2.0)
 
 
 if __name__ == "__main__":

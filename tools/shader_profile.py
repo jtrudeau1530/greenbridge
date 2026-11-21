@@ -6,6 +6,7 @@ Usage:
 Counts each mnemonic (number of shaders using it and total occurrences), groups them by encoding family,
 classifies instructions (ALU vs memory vs branch), computes operation ratios, tracks register footprints,
 and lists the dwords LLVM couldn't decode (likely Xbox-specific instructions) with how many shaders contain them.
+In the JSON report, ratios.alu_to_memory is null when the corpus has ALU instructions and no memory instructions.
 """
 import argparse
 import json
@@ -221,6 +222,8 @@ def main():
         fam[family(m)][1] += c
     cats = count_categories(occ)
     ratios = compute_ratios(cats)
+    if ratios["alu_to_memory"] == float("inf"):
+        ratios["alu_to_memory"] = None
     out = {"shaders": n, "mnemonics": len(occ),
            "families": {k: {"mnemonics": v[0], "occurrences": v[1]} for k, v in sorted(fam.items())},
            "categories": cats,
@@ -228,7 +231,7 @@ def main():
            "by_mnemonic": [{"m": m, "shaders": users[m], "count": occ[m]} for m, _ in users.most_common()]}
     path = a.out or os.path.join(a.src, "..", "profile.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=1)
+        json.dump(out, f, indent=1, allow_nan=False)
     print(f"{n} shaders, {len(occ)} distinct mnemonics -> {os.path.abspath(path)}")
     for k, v in sorted(fam.items(), key=lambda kv: -kv[1][1]):
         print(f"  {k:8} {v[0]:4} mnemonics {v[1]:>12,} uses")
