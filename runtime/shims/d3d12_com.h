@@ -1,5 +1,5 @@
 // D3D12 COM objects over the Vulkan backend (src/vulkan_backend.h): command allocator, graphics command list,
-// command queue and fence. Their vtables are the Windows SDK's (ID3D12GraphicsCommandList7, ID3D12CommandQueue,
+// command queue and fence. Their vtables are the Windows SDK's (ID3D12GraphicsCommandList8, ID3D12CommandQueue,
 // ID3D12CommandAllocator, ID3D12Fence1); every method not implemented here is a generated stub that reports its
 // name once (tools/gen_d3d12_stubs.py). The Xbox-specific slots measured for the device do not apply to these
 // interfaces as far as is known; docs/d3d12_vulkan.md section 3.1 lists what is still unverified.
@@ -55,6 +55,11 @@ VkImage vulkan_image(ID3D12Resource* resource);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
+
+// The front/back stencil references last recorded by ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef on
+// `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
+// not one of this module's command lists.
+bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
