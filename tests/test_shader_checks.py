@@ -1,6 +1,7 @@
 """Exercise the synthetic Vulkan test runner without a Vulkan device."""
 import contextlib
 import io
+import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -122,6 +123,51 @@ class Wave64Checks(unittest.TestCase):
         status, out = self.run_checks(unsupported, unsupported, missing_ballot=True)
         self.assertEqual(status, 1, out)
         self.assertIn("missing cs_wave64_ballot.spv", out)
+
+
+class PixelDeviceLimits(unittest.TestCase):
+    """pixel_test with a fake harness: the device's limits decide SKIP instead of a failure."""
+
+    def run_pixel(self, name, code, out, data=b""):
+        def harness(_tool, _vs, _fs, raw, env=None):
+            if data:
+                Path(raw).write_bytes(data)
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp) / "spirv"
+            spirv.mkdir()
+            (spirv / f"{name}.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                return check.pixel_test(tmp, str(spirv), name)
+
+    @staticmethod
+    def bitmask_pixels(subgroup):
+        lanes = min(subgroup, 32)
+        return b"".join(struct.pack("<4I", i % lanes, (i % lanes) ^ 9, (((i % lanes) & 5) | 16) ^ 1, 0)
+                        for i in range(64 * 64))
+
+    def test_shader_needing_missing_barycentrics_skips(self):
+        problem = self.run_pixel("ps_bary", 77,
+                                 "unsupported: ps_bary.spv reads BaryCoordKHR and the device has no "
+                                 "VK_KHR_fragment_shader_barycentric\n")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("BaryCoordKHR", problem)
+
+    def test_other_harness_errors_still_fail(self):
+        problem = self.run_pixel("ps_ops", 1, "FAILED vkCreateDevice -> -9\n")
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("vk_harness failed", problem)
+
+    def test_bitmask_perm_skips_below_32_lanes(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(8))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("narrower than 32 lanes", problem)
+
+    def test_bitmask_perm_is_judged_at_32_lanes(self):
+        out = "device: fake (subgroup 32..32)\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
 
 
 if __name__ == "__main__":

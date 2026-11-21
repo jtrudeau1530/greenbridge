@@ -6,6 +6,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +87,25 @@ int main(int argc, char** argv) {
         for (auto& x : exts) if (!std::strcmp(x.extensionName, e)) return true;
         return false;
     };
+    // A translated pixel shader that reads BaryCoordKHR aborts the driver when the device lacks barycentrics
+    // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
+    // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
+    const std::vector<uint32_t> fs_code = read_spv(argv[2]);
+    bool needs_barycentric = false;
+    for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
+        const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
+        if (!words) break;
+        if (op == 17 && fs_code[i + 1] == 5284) {        // OpCapability FragmentBarycentricKHR
+            needs_barycentric = true;
+            break;
+        }
+        i += words;
+    }
+    if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+        std::fprintf(stderr, "unsupported: %s reads BaryCoordKHR and the device has no %s\n",
+                     argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+        return 77;
+    }
     std::vector<const char*> enable;
     void* chain = nullptr;
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};

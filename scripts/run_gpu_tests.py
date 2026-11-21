@@ -534,6 +534,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=gfx_env)
+            if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
+                results.append((name, None, "SKIP (unsupported device)"))
+                continue
             if rc != 0:
                 results.append((name, False, msg))
                 continue
@@ -553,7 +556,11 @@ def run_suite(a, work: str) -> int:
             elif name == "ps_bary":
                 ok, detail = check_bary(raw)
             elif name == "ps_bitmask_perm":
-                ok, detail = check_bitmask_perm(raw)
+                m = re.search(r"subgroup \d+\.\.(\d+)", msg)
+                if m and int(m.group(1)) < 32:
+                    ok, detail = None, f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)"
+                else:
+                    ok, detail = check_bitmask_perm(raw)
             elif name == "ps_uniform_branch":
                 ok, detail = check_uniform_branch(raw)
             elif name == "ps_flat":
