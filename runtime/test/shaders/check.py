@@ -18,6 +18,7 @@ from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
+UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_wavemask", "1", "wavemask"),
            ("cs_bvh", "1", "bvh")]
@@ -95,6 +96,7 @@ def main():
     spirv = os.path.join(sys.argv[1], "spirv")
     tools = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, "..", "..", "build")
     results = []
+    unsupported = []
     for name, groups, expect in COMPUTE:
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"), groups, expect)
         m = re.search(r"(\d+) mismatches", out)
@@ -106,14 +108,19 @@ def main():
         results.append((name, "" if code == 0 and got == want else failure(code, out, 2)))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
+        if code == UNSUPPORTED:
+            unsupported.append((name, re.search(r"unsupported: .*", out).group(0)))
+            continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
     for name, problem in results:
         print(f"{name:20} {'ok' if not problem else problem}")
+    for name, reason in unsupported:
+        print(f"{name:20} skipped, {reason}")
     failed = sum(bool(p) for _, p in results)
-    print(f"{len(results) - failed} of {len(results)} pass")
+    print(f"{len(results) - failed} of {len(results)} pass" + (f", {len(unsupported)} skipped" if unsupported else ""))
     return 1 if failed else 0
 
 
