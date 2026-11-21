@@ -220,6 +220,31 @@ def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
 
 
+def dump_words(msg: str) -> list[int] | None:
+    """The eight words of vk_compute_test's "out[0..7] = ..." line, or None unless it is eight decimal words (as in
+    check.py): trailing text, a missing word or a non-number is a malformed dump, not a result."""
+    m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)
+    return [int(x) for x in m.group(1).split()] if m else None
+
+
+def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
+                  hexwords: bool = False) -> tuple[bool | None, str]:
+    """Judge one vk_compute_test "dump" run: (True, words), (False, why), or (None, why) when the device can't run it.
+    wave64: it was run with --require-wave64, so exit 77 is a skip and the 64-wide confirmation must be printed.
+    partial: a group smaller than a wave, run at subgroup size 64 without full subgroups; skipped when the device
+    reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size."""
+    no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
+    if (wave64 and rc == 77) or (no64 and rc == 0):
+        return None, "SKIP (no 64-wide compute subgroup on this device)"
+    if rc == 0 and wave64 and "compute subgroup size: 64" not in msg.splitlines():
+        return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    words = dump_words(msg)
+    if rc != 0 or words is None:
+        return False, msg
+    vals = words[:len(want)]
+    return vals == want, " ".join((hex if hexwords else str)(x) for x in vals)
+
+
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
     px = read_raw_u32(raw_path)
     if len(px) != 64 * 64:
@@ -482,8 +507,8 @@ def run_suite(a, work: str) -> int:
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
             want = [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
-            dump = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
-            vals = [int(x) for x in dump.partition("=")[2].split()[:len(want)]] if dump else []
+            words = dump_words(msg)
+            vals = words[:len(want)] if words else []
             results.append((name, rc == 0 and vals == want,
                             " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_wavemask":
@@ -534,17 +559,9 @@ def run_suite(a, work: str) -> int:
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
-            dump_line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
-            no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
-            if (wave64 and rc == 77) or (no64 and rc == 0):
-                results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
-            elif rc == 0 and dump_line:
-                vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
-                ok = vals == want
-                fmt = hex if name in ("cs_store", "cs_smem_soffset_imm") else str
-                results.append((name, ok, " ".join(fmt(x) for x in vals)))
-            else:
-                results.append((name, False, msg))
+            ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
+                                       hexwords=name in ("cs_store", "cs_smem_soffset_imm"))
+            results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
