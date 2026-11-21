@@ -77,6 +77,24 @@ def test_unsupported_instruction_is_reported_not_guessed(make_shader):
         shader.translate()
 
 
+@pytest.mark.parametrize("d16", [False, True], ids=["f32", "d16"])
+def test_depth_compare_sample_result_width(make_shader, d16):
+    """image_sample_c_lz returns one value: f32 bits, or with d16 an f16 in the low half like every other d16 sample
+    result. Written as f32 bits under d16, every compare result would read back as 0 (1.0 = 0x3f800000)."""
+    shader = make_shader("v_mov_b32 v0, 0.5\nv_mov_b32 v1, 0.5\nv_mov_b32 v2, 0.25\n"
+                         "image_sample_c_lz v4, v[0:2], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D"
+                         + (" d16" if d16 else "") + "\nexp mrt0 v4, v4, v4, v4 done vm\ns_endpgm\n", "ps_dref")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    dref = re.search(r"^\s*(%\w+) = OpImageSampleDrefExplicitLod %float ", spvasm, re.M)
+    assert dref, "the depth compare sample is missing"
+    d = re.escape(dref.group(1))
+    as_f16 = re.search(rf"^\s*(%\w+) = OpCompositeConstruct %v2float {d} %f0\n\s*%\w+ = OpExtInst %uint %glsl "
+                       r"PackHalf2x16 \1$", spvasm, re.M)
+    as_f32 = re.search(rf"^\s*%\w+ = OpBitcast %uint {d}$", spvasm, re.M)
+    assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
+
+
 def test_unknown_stage_is_rejected(make_shader):
     shader = make_shader(program("v_mov_b32 v0, 1.0"), name="xx_test")
     with pytest.raises(rdna2spirv.Unsupported):
