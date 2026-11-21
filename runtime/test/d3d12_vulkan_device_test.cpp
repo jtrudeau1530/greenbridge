@@ -317,8 +317,10 @@ D3D12_RESOURCE_DESC reserved_desc(D3D12_RESOURCE_DIMENSION dimension, UINT64 wid
 // GetResourceTiling against the PC runtime, for the same reserved resources. What D3D12 defines must match: the
 // tile shape, the standard and packed mip counts, every standard mip's tile counts and its start within its array
 // slice, the start of slice 0's packed tiles, and the number of standard tiles. How many tiles the packed mips
-// take is the driver's choice (src/resource_tiling.h), and with it the slice size and the total. Returns the
-// number of mismatches, or -1 without a host D3D12 device with tiled resources.
+// take is the driver's choice (src/resource_tiling.h), and with it the slice size and the total. A layout the host
+// refuses is skipped (drivers differ in what they accept); one the host accepts and ours refuses is a mismatch.
+// Returns the number of mismatches, or -1 without a host D3D12 device with tiled resources or with every layout
+// skipped.
 int compare_tiling(ID3D12Device* ours) {
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
@@ -359,7 +361,7 @@ int compare_tiling(ID3D12Device* ours) {
         D3D12_TILE_SHAPE shape{};
         D3D12_SUBRESOURCE_TILING subresources[64]{};
     };
-    int mismatches = 0;
+    int mismatches = 0, compared = 0;
     const auto report = [&](int index, const char* what, UINT a, UINT b) {
         if (mismatches++ < 24) std::fprintf(stderr, "tiling case %d %s: ours %u host %u\n", index, what, a, b);
     };
@@ -367,11 +369,24 @@ int compare_tiling(ID3D12Device* ours) {
         const D3D12_RESOURCE_DESC& desc = cases[index];
         if (desc.Dimension == T3 && !volumes) continue;
         Ref<ID3D12Resource> a, b;
-        if (FAILED(ours->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a.p))) ||
-            FAILED(host->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&b.p)))) {
-            report(index, "creation (1 = ours failed)", a.p ? 0 : 1, b.p ? 0 : 1);
+        const HRESULT ours_hr =
+            ours->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a.p));
+        const HRESULT host_hr =
+            host->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&b.p));
+        if (FAILED(host_hr)) {
+            // Which reserved resources a PC driver accepts varies: an RTX 3090 on driver 616.56 refuses texture
+            // arrays whose mips reach the packed tail (cases 2, 6 and 8, at tier 3), an RTX 5070 on 621.01 accepts
+            // them. The console is the reference for what the layer accepts, not the host, so there is nothing to
+            // compare here.
+            std::printf("GetResourceTiling case %d: the host runtime refuses it (0x%08lx), skipped\n", index,
+                        static_cast<unsigned long>(host_hr));
             continue;
         }
+        if (FAILED(ours_hr)) {
+            report(index, "creation refused by ours, accepted by the host (HRESULT low word)", ours_hr & 0xffff, 0);
+            continue;
+        }
+        ++compared;
         Tiling x, y;
         ours->GetResourceTiling(a.p, &x.total, &x.packed, &x.shape, &x.count, 0, x.subresources);
         host->GetResourceTiling(b.p, &y.total, &y.packed, &y.shape, &y.count, 0, y.subresources);
@@ -408,7 +423,7 @@ int compare_tiling(ID3D12Device* ours) {
                 report(index, "standard subresource", i, 0);
         }
     }
-    return mismatches;
+    return compared ? mismatches : -1;
 }
 
 }  // namespace
@@ -511,7 +526,8 @@ int main() {
         EXPECT(allocation_mismatches <= 0);
         const int tiling_mismatches = compare_tiling(device.p);
         if (tiling_mismatches < 0)
-            std::printf("GetResourceTiling: no host D3D12 device with tiled resources to compare with, skipped\n");
+            std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
+                        "skipped\n");
         EXPECT(tiling_mismatches <= 0);
 
         // Command objects; their GetDevice is the proxy, never the inner device.

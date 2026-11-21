@@ -707,7 +707,9 @@ The trace will enumerate them.
   - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip is packed from the first
     one smaller than a tile on any axis), each standard mip's tile counts, and the tile order (each array slice holds
     its standard mips, then its packed tiles). The test compares all of these with the PC runtime for 18
-    buffer, 2D, array, block-compressed and volume layouts. How many tiles the packed mips take is the driver's
+    buffer, 2D, array, block-compressed and volume layouts, and skips a layout the host refuses: which ones a PC
+    driver accepts varies (an RTX 3090 on driver 616.56, at tier 3, refuses texture arrays whose mips reach the
+    packed tail, measured by @CharlyRien in #295; an RTX 5070 on 621.01 accepts them). How many tiles the packed mips take is the driver's
     choice: here it is their tight linear size in whole tiles; the PC runtime on an RTX 5070 reported one tile more
     for 1000x300 and 100x100 RGBA8 and a 128^3 R8 volume, and the same count for the other layouts probed. Two
     further measured differences: on array slices after the first, the PC runtime
