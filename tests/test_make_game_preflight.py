@@ -308,6 +308,14 @@ class ToolchainDetectionTest(PreflightTestBase):
 
 
 class PreflightPrerequisiteTest(PreflightTestBase):
+    def setUp(self):
+        super().setUp()
+        # preflight runs `dotnet --list-sdks` (#223). Follow the test's faked shutil.which instead: the SDK counts as
+        # installed exactly when the test says dotnet is on PATH, so no real dotnet is needed and none is consulted.
+        patcher = mock.patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_preflight_success_all_tools_present_and_space_sufficient(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             with mock.patch("sys.version_info", (3, 11, 0)), \
