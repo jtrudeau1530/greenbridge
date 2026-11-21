@@ -30,10 +30,11 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
-WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm")
+WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
-            ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48])]
+            ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
+            ("cs_wqm_w64", [20, 4, 12, 8, 1, 0, 15728895, 20]), ("cs_wqm_w32", [12, 1, 4, 0, 8, 15728880, 4, 32])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
@@ -59,7 +60,7 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000)}
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch", "ps_wqm"))
 
 
 def run(*cmd, env=None):
@@ -260,6 +261,11 @@ def pixel_test(tools, spirv, name):
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"
+    if name == "ps_wqm":                               # (wqm, own, wqm, own) per pixel, ps_wqm.asm
+        w = int(n ** 0.5)
+        wrong = sum(p != (int(i % w % 4 < 2 and i // w % 4 >= 2), int(i % w % 4 == 1 and i // w % 4 == 2)) * 2 for i, p in
+                    enumerate(px))
+        return "" if not wrong else f"{wrong} of {n} pixels differ from the whole-quad expectation"
     if name == "ps_uniform_branch":                    # (s5, own VCC bit): 8 wherever the bit is set, never 7 there
         c = collections.Counter((a, b) for a, b, _, _ in px)
         fine = c[(8, 1)] and c[(8, 0)] and c[(7, 0)] and set(c) <= {(8, 1), (8, 0), (7, 0)}

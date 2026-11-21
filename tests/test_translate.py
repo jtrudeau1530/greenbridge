@@ -399,6 +399,45 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
     ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
 
 
+WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
+WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
+
+
+def test_wqm_on_a_lane_mask_gathers_the_quad_and_votes_scc(make_shader, monkeypatch):
+    """s_wqm on a lane mask ORs the lane's bit with its quad's (two OpGroupNonUniformQuadSwap, horizontal then
+    vertical) and SCC is the wave-wide any. Emulated, the four lanes of the quad come through %x_buf instead."""
+    shader = make_shader(WQM_MASK, name="cs_wqm_mask_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpCapability GroupNonUniformQuad" in asm
+    assert asm.count("OpGroupNonUniformQuadSwap %uint %c3") == 2
+    assert re.search(r"OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c0\n(?:.*\n)*?.*OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c1\n", asm)
+    assert "OpGroupNonUniformAny" in asm                   # SCC: any bit of the result in the wave
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    emulated = shader.translate()
+    shader.validate(emulated)
+    assert "OpGroupNonUniform" not in emulated and "GroupNonUniformQuad" not in emulated
+    assert "%x_buf" in emulated
+
+
+def test_wqm_on_data_is_a_bit_operation(make_shader):
+    """A register that is not a lane mask is data: the bits are computed in the lane, no subgroup operation."""
+    shader = make_shader(WQM_DATA, name="cs_wqm_data_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpGroupNonUniform" not in asm
+    assert "OpBitwiseAnd %uint" in asm and "%c" in asm
+    assert "GroupNonUniformQuad" not in asm
+
+
+def test_wqm_in_a_pixel_shader_uses_the_fragment_quad(make_shader):
+    shader = make_shader("v_cmp_gt_u32_e32 vcc_lo, 1, v0\ns_wqm_b32 s8, vcc_lo\nv_cndmask_b32_e64 v6, 0, 1, s8\n"
+                         "exp mrt0 v6, v6, v6, v6 done vm\ns_endpgm\n", name="ps_wqm_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert asm.count("OpGroupNonUniformQuadSwap") == 2 and "OpCapability GroupNonUniformQuad" in asm
+
+
 EMULATE_SAMPLES = [p for p in SAMPLES if os.path.basename(p).startswith(("cs_", "ms_"))]
 
 

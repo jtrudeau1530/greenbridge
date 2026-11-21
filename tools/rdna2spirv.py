@@ -102,6 +102,7 @@ class Gen:
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
         self.uses_ballot = False       # wave mask ballot (OpGroupNonUniformBallot)
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
+        self.uses_quad = False         # s_wqm on a lane mask (OpGroupNonUniformQuadSwap)
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
         self.cur_masks = {}
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
@@ -1656,6 +1657,95 @@ class Gen:
         self.emit(f"{hi} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {hi_in}")
         return lo, hi
 
+    def quad_any(self, v):
+        """This lane's value after whole-quad mode: all ones if any of the 4 lanes of its quad (4n .. 4n+3 of the
+        wave) has `v` non-zero, else 0. A quad never crosses the 32/32 half of a wave64, so a 32-wide subgroup is
+        exact. Without emulation the subgroup's quad ops do it (the invocations of a quad are 4 consecutive subgroup
+        invocations; in a fragment shader the 2x2 quad, which on hardware is also 4 consecutive lanes); emulated, the
+        four lanes' values are read through the exchange buffer."""
+        b = self.tmp()
+        self.emit(f"{b} = OpSelect %uint {self.tmp_bool_nz(v)} {self.cu(1)} {self.cu(0)}")
+        if self.emulate:
+            lane, base = self.wave_lane(), self.tmp()
+            self.emit(f"{base} = OpBitwiseAnd %uint {lane} {self.cu(0xFFFFFFFC)}")
+            read = self.x_round(data=b)[0]
+            acc = None
+            for k in range(4):
+                i = self.tmp()
+                self.emit(f"{i} = OpIAdd %uint {base} {self.cu(k)}")
+                w = read(i)
+                if acc is None:
+                    acc = w
+                else:
+                    o = self.tmp()
+                    self.emit(f"{o} = OpBitwiseOr %uint {acc} {w}")
+                    acc = o
+        else:
+            self.uses_subgroup = self.uses_quad = True
+            acc = b
+            for d in (0, 1):                      # horizontal, then vertical neighbour
+                sw, o = self.tmp(), self.tmp()
+                self.emit(f"{sw} = OpGroupNonUniformQuadSwap %uint {self.cu(3)} {acc} {self.cu(d)}")
+                self.emit(f"{o} = OpBitwiseOr %uint {acc} {sw}")
+                acc = o
+        r = self.tmp()
+        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(acc)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        return r
+
+    def wqm_word(self, w):
+        """s_wqm on 32 bits of plain data: each group of 4 bits becomes 1111 if any of its bits is set."""
+        acc = w
+        for k in (1, 2, 3):
+            x, o = self.tmp(), self.tmp()
+            self.emit(f"{x} = OpShiftRightLogical %uint {w} {self.cu(k)}")
+            self.emit(f"{o} = OpBitwiseOr %uint {acc} {x}")
+            acc = o
+        m, r = self.tmp(), self.tmp()
+        self.emit(f"{m} = OpBitwiseAnd %uint {acc} {self.cu(0x11111111)}")
+        self.emit(f"{r} = OpIMul %uint {m} {self.cu(15)}")
+        return r
+
+    def wqm(self, op, a):
+        """s_wqm_b32 / s_wqm_b64: D = every quad (4 consecutive bits) of S0 that has a bit set becomes 1111;
+        SCC = D != 0. A lane mask is one bit per lane here (this lane's), so the quad's bits are gathered with
+        quad_any and SCC is the wave-wide any. Anything else is data and is computed on the bits."""
+        if self.holds_lane_mask(a[1]):
+            r = self.quad_any(self.mask_src(a[1]))
+            self.mask_dst(a[0], r)
+            self.scc_from_mask(r)
+            return
+        src = a[1]
+        if op.endswith("b64") and src["k"] == "sgpr" and src.get("n") == 2:
+            words = [self.load_reg("sgpr", src["r"]), self.load_reg("sgpr", src["r"] + 1)]
+        elif op.endswith("b64") and src["k"] == "imm":
+            words = [self.cu(src["v"] & 0xFFFFFFFF), self.cu((src["v"] >> 32) & 0xFFFFFFFF)]
+        else:
+            words = [self.src_u(src)] + ([self.cu(0)] if op.endswith("b64") else [])
+        res = [self.wqm_word(w) for w in words]
+        d = a[0]
+        if d["k"] == "sgpr":
+            self.store_reg("sgpr", d["r"], res[0])
+            if len(res) == 2:
+                self.store_reg("sgpr", d["r"] + 1, res[1])
+        else:
+            # EXEC / VCC filled from data: this lane takes its own bit of the result.
+            lane = self.wave_lane()
+            sh, b, pick = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            word = res[0]
+            if len(res) == 2:
+                hi, word = self.tmp(), self.tmp()
+                self.emit(f"{hi} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                self.emit(f"{word} = OpSelect %uint {hi} {res[1]} {res[0]}")
+            self.emit(f"{b} = OpBitFieldUExtract %uint {word} {sh} {self.cu(1)}")
+            self.emit(f"{pick} = OpSelect %uint {self.tmp_bool_nz(b)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            self.mask_dst(d, pick)
+        nz = res[0]
+        if len(res) == 2:
+            nz = self.tmp()
+            self.emit(f"{nz} = OpBitwiseOr %uint {res[0]} {res[1]}")
+        self.scc_nonzero(nz)
+
     def lane_bits(self, b):
         """This lane's bool as its bit of a 64-lane mask: (lanes 0-31 word, lanes 32-63 word), one of them 0."""
         lane = self.wave_lane()
@@ -3041,11 +3131,7 @@ class Gen:
                 self.emit(f"{b} = {'OpULessThan' if 'min' in op else 'OpUGreaterThan'} %bool {x} {y}")
                 self.set_scc(b)
         elif op in ("s_wqm_b64", "s_wqm_b32"):
-            # Whole-quad mode: a lane becomes active if any lane of its 2x2 quad is. One lane per invocation can't
-            # see its neighbours, so this is the identity (APPROXIMATION: helper lanes stay as they were).
-            v = self.mask_src(a[1])
-            self.mask_dst(a[0], v)
-            self.scc_from_mask(v)
+            self.wqm(op, a)
         elif op == "v_fma_mix_f32":
             # Each source is f32, or (op_sel_hi bit set) an f16 from the low/high half chosen by op_sel.
             sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
@@ -4816,7 +4902,7 @@ def assemble(gen):
         # No subgroup operation is left (x_round does them through %x_buf), so none of their capabilities.
         if any("OpGroupNonUniform" in l or "%sg_lane" in l for b in gen.blocks + list(gen.x_segs.values()) for l in b):
             raise Unsupported("wave64 emulation: a subgroup operation is left")
-        gen.uses_subgroup = gen.uses_vote = gen.uses_ballot = gen.uses_wave_bits = False
+        gen.uses_subgroup = gen.uses_vote = gen.uses_ballot = gen.uses_wave_bits = gen.uses_quad = False
         x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
         x_zero = x_sink - x_mask           # mask and schedule words: zeroed before the first round
         x_threads = (gen.cs or gen.ms)["size"]
@@ -4877,6 +4963,8 @@ def assemble(gen):
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformBallot") if c not in caps]
     if gen.uses_wave_bits:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformArithmetic") if c not in caps]
+    if gen.uses_quad:
+        caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
     if gen.uses_f64:
         caps.append("Float64")
     if gen.uses_store_views:
