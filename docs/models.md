@@ -1,27 +1,47 @@
 # Model recovery
 
-Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the upstream
-`rpf9-explorer` changes needed to recover the models it currently drops.
+Pre-fix measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
+upstream `rpf9-explorer` fix that closes it. The fix is validated but not merged yet.
 
-The short version: the exporter does not reject any vertex or index layout in the tested archives.
-It drops valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
+Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
+dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
 `48557ea`.
 
 ## Upstream status
 
 [Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
-fix is already under review in
-[rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1), so this page records the
-measured gap and independent evidence, not a competing patch. PR #1 reports 190,792 of 190,792
-recognized candidates decoded across the ten archives configured in Leonida, including 169
-candidates rejected by the previous scan (also verified after archive readback).
+fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is at head
+`c3708fb` and has now been independently validated on the package in the scopes below. It is
+awaiting upstream merge and a submodule pin bump. This page records the pre-PR gap, the independent
+validation, and the scope caveat; it is not a competing patch.
 
-That count and the counts below are different scopes. Issue #29 is a full ten-archive run against
-its own recognized-candidate set and covers primary-LOD geometry. The counts below are independent
-`rpf9dump` runs at submodule `48557ea`: `data.rpf` plus a 0-8 GiB sample of `levels.rpf`, over the
-page-scan candidate set, and the exporter writes every recovered drawable/LOD variant. The 963 and
-2,564 hidden rejects are therefore not a contradiction of 190,792; they measure the pre-fix gap in
-these scopes. Reconcile them after PR #1 merges and the pin is bumped.
+PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
+Leonida, including 169 previously rejected candidates (also verified after archive readback). That
+ten-archive total was not independently reproduced here. Issue #29's run uses its own
+recognized-candidate set and covers primary-LOD geometry; the pre-fix counts below use
+`rpf9dump`'s page-scan candidates and export every recovered drawable/LOD variant. The two sets are
+different scopes, not contradictory.
+
+## Independent validation
+
+Validated at PR #1 head `c3708fb` with .NET 8.0.428 on the real package:
+
+| Scope | Candidates | Recovered | Rejects | Readback |
+|---|---:|---:|---:|---:|
+| `data.rpf` full | 2,313 | 2,313 | 0 | 2,313 / 2,313 |
+| `common.rpf` | 0 | 0 | 0 | 0 / 0 |
+| `levels.rpf` 0-8 GiB | 28,748 | 28,748 | 0 | 28,748 / 28,748 |
+| `levels.rpf` 4-4.5 GiB | 4,010 | 4,010 | 0 | 4,010 / 4,010 |
+| `levels.rpf` 12-16 GiB | 10,429 | 10,429 | 0 | 10,429 / 10,429 |
+
+The `data.rpf` export reported `ok=2,313 fail=0 skip=0`, 2,313 unique OBJ names, and 0 duplicate
+stems. All 963 pre-PR misses were recovered, and all 1,350 pre-PR OBJs were byte-identical to their
+pre-PR versions. The PR smoke test passes; v1/v2 cache round-trip and two raw-segment entries were
+verified.
+
+Caveat: the full 76 GB `levels.rpf` and the other seven archives were not scanned, so the exact
+ten-archive 190,792/190,792 and 169/169 claims were not independently reproduced. No counterexample
+appeared in the tested scopes. A scoped validation comment was posted on PR #1.
 
 ## How the exporter works
 
@@ -46,7 +66,9 @@ model entry returned by the carver fails `RageModelDecoder.Decode`; `skip` is no
 mode. A printed `fail=0 skip=0` therefore means "no decoded entry failed", not "nothing was
 rejected".
 
-## Measured counts
+## Pre-fix measured counts
+
+Counts below are from submodule `48557ea` before the upstream fix:
 
 | Archive | Candidates | Recovered | Not recovered |
 |---|---:|---:|---:|
@@ -62,7 +84,7 @@ All counts come from the same package and the same `48557ea` submodule.
 The 2,313 candidates in `data.rpf` decode to 2,313 unique model names once the checks below are
 relaxed, so the 963 missing entries are valid models, not duplicate or false candidates.
 
-## Rejection classes
+## Pre-fix rejection classes
 
 Observed in `data.rpf` with the unmodified carver:
 
@@ -139,7 +161,7 @@ every decoded vertex against the geometry's own part bounds (`Core/RageModelDeco
 The deleted check compared each geometry with the drawable-level bounds, which is not a valid
 envelope for a drawable with multiple LOD models.
 
-Validated in a temp copy of Core through the real `RecoverAtOffsets` API:
+The narrow two-hunk experiment in a temp copy recovered:
 
 - `data.rpf`: 2,313 / 2,313 entries.
 - `levels.rpf` 4-4.5 GiB: 4,010 / 4,010 entries.
@@ -147,11 +169,13 @@ Validated in a temp copy of Core through the real `RecoverAtOffsets` API:
 
 The two remaining 8 GiB cases are not tag rejections: one graphics extent is 48 bytes larger than
 the assembled block and the next zlib stream starts 3,419 bytes past it; one model with 32
-geometries throws inside `ReadMesh`.
+geometries throws inside `ReadMesh`. PR #1's broader patch resolves both; at `c3708fb` the same
+sample has 0 rejects.
 
 ## Vertex and index tags
 
-The tested set contains 198,286 geometry records. No unhandled layout tag appears:
+The pre-fix tag survey (`data.rpf` plus the 0-8 GiB `levels.rpf` sample) contains 198,286 geometry
+records. No unhandled layout tag appears:
 
 | Item | Observed |
 |---|---|
@@ -167,8 +191,7 @@ The tested set contains 198,286 geometry records. No unhandled layout tag appear
 ## What to do next
 
 1. Merge [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1).
-2. Bump `third_party/rpf9-explorer` in this repository to the merged commit.
-3. Re-run `tools/rpf9dump models` on `data.rpf` and `levels.rpf`. The full `levels.rpf` has not been
-   measured.
-4. Reconcile the new counts with issue #29's 190,792 total, then update this page and the README
-   model status.
+2. Bump `third_party/rpf9-explorer` from `48557ea` to the merged commit.
+3. Re-run `tools/rpf9dump models` over the full ten-archive set configured in Leonida.
+4. Replace the sample numbers in this page with the full counts, and keep the README and issue #29
+   in sync.
