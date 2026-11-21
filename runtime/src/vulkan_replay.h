@@ -52,6 +52,7 @@ struct ResourceBinding {
     VkDeviceSize size = 0;             // its size in bytes
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
+    std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
 };
 
 struct VulkanAccess {
@@ -466,6 +467,7 @@ struct ReplayFunctions {
     PFN_vkCmdCopyBufferToImage copy_buffer_to_image = nullptr;
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
+    PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -494,6 +496,7 @@ struct Prepared {
     std::vector<VkBufferCopy> buffer_copies;
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
+    VkImageResolve resolve{};  // resolves
 };
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
@@ -614,7 +617,9 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         if (!copy_subresource(p.binding, copy.dst.subresource, dst) ||
             !copy_subresource(p.source, copy.src.subresource, src))
             return ReplayResult::invalid_subresource;
-        if (dst.aspectMask != src.aspectMask || p.binding.volume != p.source.volume) return ReplayResult::invalid_copy;
+        if (dst.aspectMask != src.aspectMask || p.binding.volume != p.source.volume ||
+            p.binding.samples != p.source.samples)
+            return ReplayResult::invalid_copy;
         const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
         const auto from_depth = std::max(1u, p.source.depth >> src.baseMipLevel);
         const auto to_depth = std::max(1u, p.binding.depth >> dst.baseMipLevel);
@@ -641,6 +646,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     if (!buffer.buffer) return ReplayResult::invalid_copy;
     VkImageSubresourceRange range{};
     if (!copy_subresource(image, texture.subresource, range)) return ReplayResult::invalid_subresource;
+    if (image.samples != 1) return ReplayResult::invalid_copy;  // multisampled textures have no footprint
     const BlockFormat format = block_format(image.format, range.aspectMask);
     if (!format.bytes || placed.row_pitch % format.bytes) return ReplayResult::unsupported;
     const VkExtent2D mip = mip_extent(image, range.baseMipLevel);
@@ -702,7 +708,7 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     const ResourceBinding &dst = p.binding, &src = p.source;
     if (!dst.image || !src.image || dst.width != src.width || dst.height != src.height ||
         dst.depth != src.depth || dst.volume != src.volume || dst.mip_levels != src.mip_levels ||
-        dst.array_layers != src.array_layers || dst.aspects != src.aspects ||
+        dst.array_layers != src.array_layers || dst.aspects != src.aspects || dst.samples != src.samples ||
         block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
         return ReplayResult::invalid_copy;
     for (const VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
@@ -715,6 +721,28 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     }
     p.range = {dst.aspects, 0, dst.mip_levels, 0, dst.array_layers};
     p.source_range = {src.aspects, 0, src.mip_levels, 0, src.array_layers};
+    return ReplayResult::success;
+}
+
+// ResolveSubresource through vkCmdResolveImage: a multisampled colour subresource into a single-sampled one of
+// the same size and format. Depth-stencil resolves, and resolves between two formats of a typeless family, are
+// not supported yet.
+inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared& p) {
+    VkImageSubresourceRange dst{}, src{};
+    if (!copy_subresource(p.binding, resolve.dst_subresource, dst) ||
+        !copy_subresource(p.source, resolve.src_subresource, src))
+        return ReplayResult::invalid_subresource;
+    if (p.source.samples <= 1 || p.binding.samples != 1 || p.binding.volume) return ReplayResult::invalid_copy;
+    const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
+    if (from.width != to.width || from.height != to.height) return ReplayResult::invalid_copy;
+    if (src.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || dst.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+        p.source.format != p.binding.format)
+        return ReplayResult::unsupported;
+    p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, {0, 0, 0},
+                 {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, {0, 0, 0},
+                 {from.width, from.height, 1}};
+    p.range = dst;
+    p.source_range = src;
     return ReplayResult::success;
 }
 
@@ -765,11 +793,12 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkIma
 
 } // namespace detail
 
-// Destination and source of a copy command.
+// Destination and source of a copy or resolve command.
 inline std::pair<ResourceId, ResourceId> copy_ids(const Command& command) {
     if (const auto* c = std::get_if<CopyBuffer>(&command)) return {c->dst, c->src};
     if (const auto* c = std::get_if<CopyTexture>(&command)) return {c->dst.resource, c->src.resource};
     if (const auto* c = std::get_if<CopyResource>(&command)) return {c->dst, c->src};
+    if (const auto* c = std::get_if<ResolveSubresource>(&command)) return {c->dst, c->src};
     return {0, 0};
 }
 
@@ -869,6 +898,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 result = detail::prepare_resource_copy(p);
             }
             if (result != ReplayResult::success) return result;
+        } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
+            if (!vk.resolve_image) return ReplayResult::unsupported;
+            const ResourceBinding* source = resolve(resolve_command->src);
+            if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
+            p.source = *source;
+            if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
+                return result;
         }
     }
     return ReplayResult::success;
@@ -1068,6 +1104,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
                                         std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
             }
+        } else if (std::holds_alternative<ResolveSubresource>(command)) {
+            // resolve_source and resolve_dest are the transfer layouts, as copy_source and copy_dest are.
+            const auto [dst_id, src_id] = copy_ids(command);
+            const VkImageLayout src_layout = detail::copy_layout(
+                vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+            const VkImageLayout dst_layout = detail::copy_layout(
+                vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+            vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
         }
     }
 }
