@@ -12,6 +12,7 @@
 //   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
 //   (x + 0.5) / 8) and a LESS_OR_EQUAL compare sampler at index 1; both of its results, f32 and d16, must be the
 //   1.0 or 0.0 the reference 0.5 gives against the texel each pixel reads.
+//   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
@@ -58,7 +59,8 @@ int main(int argc, char** argv) {
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
-    const bool dref = argc >= 2 && !std::strcmp(argv[1], "dref");
+    const bool dref_a16 = argc >= 2 && !std::strcmp(argv[1], "dref_a16");
+    const bool dref = dref_a16 || (argc >= 2 && !std::strcmp(argv[1], "dref"));
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
@@ -87,14 +89,15 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
+        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref_a16 ? "ps_sample_c_lz_a16.spv"
+                           : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
         const int out_arg = cube || dref ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
         return 2;
     }
     uint32_t tsharp[8] = {0x11111111, 0x22222222, 0x33333333, 0x44444444,

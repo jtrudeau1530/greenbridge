@@ -373,10 +373,15 @@ def bindless_test(tools, spirv):
     return "" if code == 0 and m and m.group(2) == "0" else failure(code, out, 3)
 
 
-def texture_gradient_a16_test(tools: str, spirv: str) -> str:
-    """Check every pixel of the mixed f32-gradient/a16-coordinate sample."""
+# Samples of the 8x8 gradient with a16 coordinates after whole-VGPR arguments (gradients, a bias, a clamp): every
+# pixel must be the texel its own (u, v) reads.
+GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16")
+
+
+def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_grad_a16") -> str:
+    """Check every pixel of one of the GRADIENT_TESTS samples."""
     vs = os.path.join(spirv, "vs_ids.spv")
-    fs = os.path.join(spirv, "ps_texture_grad_a16.spv")
+    fs = os.path.join(spirv, name + ".spv")
     with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw,
@@ -635,7 +640,8 @@ def main():
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
-    results.append(("ps_texture_grad_a16", texture_gradient_a16_test(tools, spirv)))
+    for name in GRADIENT_TESTS:
+        results.append((name, texture_gradient_a16_test(tools, spirv, name)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"
