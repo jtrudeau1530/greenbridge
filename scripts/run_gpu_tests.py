@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from compute_fixture import compute_header
-from check import Skip, mesh_v5_test
+from check import GATHER_WRAP, Skip, mesh_v5_test
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -561,6 +561,22 @@ def run_suite(a, work: str) -> int:
             except FileNotFoundError:
                 rc, msg = 1, f"missing {tool}"
             results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
+        elif name == "ps_gather_wrap":
+            # SHADER-36: image_gather4_l_o under wrap/mirror/clamp/mirror-once S#s; every pixel holds GATHER_WRAP.
+            tool = os.path.join(a.build, "vk_texture_test" + ext)
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            try:
+                p = subprocess.run([tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92", "c00000",
+                                    "14500000", "0"], capture_output=True, text=True, cwd=spirv_dir)
+                rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
+            except FileNotFoundError:
+                rc, msg = 1, f"missing {tool}"
+            bad = 4096
+            if rc == 0 and os.path.isfile(raw):
+                data = Path(raw).read_bytes()
+                bad = 4096 if len(data) != 64 * 64 * 16 else sum(q != GATHER_WRAP for q in struct.iter_unpack("<4f", data))
+            results.append((name, rc == 0 and bad == 0, "4096/4096 pixels exact" if bad == 0 else
+                            f"{bad} pixels differ from {GATHER_WRAP}: {msg.splitlines()[-1] if msg else ''}"))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids

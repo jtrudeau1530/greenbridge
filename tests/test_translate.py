@@ -420,3 +420,47 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
     assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
+
+
+# SHADER-36: image_gather4_l(_o) runs every texel of its 2x2 footprint through the S#'s CLAMP_X/CLAMP_Y.
+def _gather_l(s_word0, dynamic=False):
+    return program(
+        "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+        "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+        f"s_mov_b32 s16, {s_word0}\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        + ("s_add_u32 s16, s16, 0\n" if dynamic else "")
+        + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
+        "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
+
+
+@pytest.mark.parametrize("word0,ops", [
+    (0, ("OpSMod",)),                    # wrap x and y
+    (0x09, ("OpSMod", "OpSLessThan")),   # mirror x, wrap y
+    (0x1B, ("OpSGreaterThanEqual",)),    # mirror-once x, mirror y
+])
+def test_gather4_l_literal_sampler_uses_its_address_mode(word0, ops, make_shader):
+    shader = make_shader(_gather_l(word0))
+    text = shader.translate()
+    shader.validate(text)
+    assert all(op in text for op in ops)
+    assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
+
+
+def test_gather4_l_clamp_sampler_has_no_wrap_code(make_shader):
+    shader = make_shader(_gather_l(0x12))
+    text = shader.translate()
+    shader.validate(text)
+    assert "OpSMod" not in text
+
+
+def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
+    shader = make_shader(_gather_l(0x12, dynamic=True))
+    text = shader.translate()
+    shader.validate(text)
+    assert "OpBitFieldUExtract" in text and "OpSMod" in text
+
+
+@pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])
+def test_gather4_l_literal_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
+    with pytest.raises(rdna2spirv.Unsupported):
+        make_shader(_gather_l(word0)).translate()

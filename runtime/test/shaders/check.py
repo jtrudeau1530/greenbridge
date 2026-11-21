@@ -59,6 +59,9 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000)}
+# ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
+# texture); the expected channels are derived in the .asm header.
+GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
 
 
@@ -67,7 +70,7 @@ def run(*cmd, env=None):
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     except FileNotFoundError:
         tools = os.path.abspath(os.path.dirname(cmd[0]))
-        missing = [t + EXE for t in ("vk_compute_test", "vk_store_test", "vk_harness")
+        missing = [t + EXE for t in ("vk_compute_test", "vk_store_test", "vk_harness", "vk_texture_test")
                    if not os.path.isfile(os.path.join(tools, t + EXE))]
         sys.exit(f"Test programs not found in {tools}: {', '.join(missing)}\n"
                  "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
@@ -227,6 +230,22 @@ def pixels(tools, spirv, name, fmt):
     return list(struct.iter_unpack(fmt, data)), out
 
 
+def gather_wrap_test(tools, spirv):
+    """ps_gather_wrap through vk_texture_test: every one of the 64x64 pixels must hold GATHER_WRAP."""
+    shader = os.path.join(spirv, "ps_gather_wrap.spv")
+    if not os.path.isfile(shader):
+        return "missing ps_gather_wrap.spv"
+    with tempfile.TemporaryDirectory(prefix="leonida-gather-") as tmp:
+        raw = Path(tmp) / "gather.raw"
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"), shader, raw,
+                        "0", "92", "c00000", "14500000", "0")
+        data = raw.read_bytes() if code == 0 and raw.is_file() else b""
+    if len(data) != 64 * 64 * 16:
+        return failure(code, out, 3)
+    wrong = sum(p != GATHER_WRAP for p in struct.iter_unpack("<4f", data))
+    return "" if not wrong else f"{wrong} of 4096 pixels differ from {GATHER_WRAP}"
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
@@ -301,6 +320,7 @@ def main():
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
+    results.append(("ps_gather_wrap", gather_wrap_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"
