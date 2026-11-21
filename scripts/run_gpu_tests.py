@@ -27,6 +27,7 @@ from build import CLIP_CASES, clip_container
 from check import Skip, clip_test
 from compute_fixture import compute_header
 from check import CMPX_CLASS_WORDS, TEST_PROGRAMS, Skip, mesh_v5_test, not_found_message, pick_build_dir, start_failure
+from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -665,6 +666,20 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, f"SKIP ({reason})"))
             else:
                 results.append((name, rc == 0, lines[-1] if lines else ""))
+        elif name == "ps_texoff":
+            # Texel offsets: needs vk_texture_test's texture, sampler and descriptor table (vk_harness binds none),
+            # and VK_KHR_maintenance8 for the non-constant Offset; the tool exits 77 without it.
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            rc, msg = run_cmd([os.path.join(a.build, "vk_texture_test" + ext), vs_tri, spv, raw, *TEXOFF_ARGS],
+                              env=dict(os.environ, VKT_NEED_MAINTENANCE8="1"))
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                with open(raw, "rb") as f:
+                    problem, covered = texoff_problem(f.read(), msg)
+                results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids

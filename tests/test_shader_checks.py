@@ -272,5 +272,52 @@ class SeededPixelTests(unittest.TestCase):
 
 
 
+class TexelOffsetChecks(unittest.TestCase):
+    """ps_texoff (image_sample*_o, image_gather4_lz_o): the judgement of a dump, and the skip without maintenance8."""
+    LIMITS = "device: gpu\ntexel offset limits: -64..63, gather -32..31\n"
+
+    @staticmethod
+    def dump(words=check.texoff_words):
+        return b"".join(struct.pack("<4I", *words(i % 64, i // 64)) for i in range(64 * 64))
+
+    def test_hand_derived_words_of_the_asm_header(self):
+        self.assertEqual(check.texoff_words(0, 0), (0x00, 0x0761, 0x0000, 0x0000))
+        self.assertEqual(check.texoff_words(20, 50), (0x62, 0x0761, 0x1221, 0x5566))
+        self.assertEqual(check.texoff_words(63, 63), (0x77, 0x0761, 0x6776, 0x6677))
+
+    def test_expected_dump_passes_and_wrong_offsets_fail(self):
+        self.assertEqual(check.texoff_problem(self.dump(), self.LIMITS), ("", "offsets +16/-32 judged"))
+        for what, words in (
+            ("offset dropped", lambda x, y: (0x44, *check.texoff_words(x, y)[1:])),
+            ("x and y swapped", lambda x, y: (y >> 3 | x >> 3 << 4, *check.texoff_words(x, y)[1:])),
+            ("constant offset wrong", lambda x, y: (x >> 3 | y >> 3 << 4, 0x0744, *check.texoff_words(x, y)[2:])),
+            ("gather offset dropped", lambda x, y: (*check.texoff_words(x, y)[:2], 0x3443, 0x3344)),
+            ("descriptor miss", lambda x, y: (0x08, 0x0808, 0x8888, 0x0000)),
+        ):
+            with self.subTest(what):
+                self.assertIn("pixels differ", check.texoff_problem(self.dump(words), self.LIMITS)[0])
+        self.assertIn("pixel count", check.texoff_problem(self.dump()[:-16], self.LIMITS)[0])
+
+    def test_wide_offsets_are_judged_only_inside_the_device_limits(self):
+        wide_wrong = self.dump(lambda x, y: (x >> 3 | y >> 3 << 4, 0x4461, *check.texoff_words(x, y)[2:]))
+        self.assertIn("pixels differ", check.texoff_problem(wide_wrong, self.LIMITS)[0])
+        for out in ("texel offset limits: -8..7, gather -8..7\n", "no limits printed\n"):
+            problem, covered = check.texoff_problem(wide_wrong, out)
+            self.assertEqual(problem, "")
+            self.assertIn("not judged", covered)
+            self.assertIn("pixels differ", check.texoff_problem(self.dump(lambda x, y: (0x44, 0x0761, 0, 0)), out)[0])
+
+    def test_device_without_maintenance8_is_a_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_texoff.spv").touch()
+            answer = 77, "unsupported: VK_KHR_maintenance8 (non-constant texel Offset)\n"
+            with patch.object(check, "run", return_value=answer) as run:
+                result = check.pixel_test("tools", tmp, "ps_texoff")
+            self.assertEqual(run.call_args.kwargs["env"]["VKT_NEED_MAINTENANCE8"], "1")
+            self.assertIn("vk_texture_test", run.call_args.args[0])
+        self.assertIsInstance(result, check.Skip)
+        self.assertEqual(result, "SKIP (unsupported: VK_KHR_maintenance8 (non-constant texel Offset))")
+
+
 if __name__ == "__main__":
     unittest.main()
