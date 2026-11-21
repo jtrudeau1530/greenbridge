@@ -6,6 +6,10 @@ The test programs are vk_compute_test, vk_store_test and vk_harness (runtime/bui
 shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes 0-31, since a GPU
 with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
+The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
+too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
+to check a translator that emulates wave64 on them. ms_w64x_ballot is a mesh shader that build.py does not build:
+scripts/run_gpu_tests.py makes it (and fs_passthru.spv); here it runs when both .spv files are in <out dir>/spirv.
 """
 import collections
 import math
@@ -26,6 +30,21 @@ CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc0038
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48])]
+# Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
+W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
+W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
+              ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
+              ("cs_w64x_readfirstlane", [140, 140, 163, 132, 100, 105, 133, 48]),
+              ("cs_w64x_bpermute", [36, 316, 253, 218, 435, 225, 0, 442]),
+              ("cs_w64x_branch", [0, 0, 0, 0, 5, 5, 9, 9]),
+              ("cs_w64x_ballot", [2053, 2061, 2069, 2077, 2085, 2093, 2101, 2109]),
+              ("cs_w64x_wg128_branches", [121, 121, 343, 343, 14, 31, 19812, 22728]),   # 128-thread group
+              ("cs_w64x_lds_raw", [132, 137, 100, 108, 131, 101, 149, 118]),
+              ("cs_w64x_lds_war", [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031]),
+              ("cs_w64x_sbarrier", [605, 605, 686, 686, 3032, 3013, 3032, 3031]),         # 128-thread group
+              ("cs_w64x_load_ballot_load", [43, 74, 75, 42, 42, 18, 41, 32])]
+# A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
+W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820])]
 PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops": (0x48804300, 5, 7, 0xfffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xfffffffa, 7),
               "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
@@ -45,6 +64,31 @@ def failure(code, output, lines):
 
 class Skip(str):
     """A result that is neither a pass nor a failure: the device can't run the test."""
+
+
+def partial_wave_test(tools, spirv, name, expected_words):
+    """A group smaller than a wave: run with subgroup size 64 requested (no full subgroups); None if the device
+    has no 64-wide subgroup (unless LEONIDA_W64_EMULATE=1)."""
+    shader = os.path.join(spirv, name + ".spv")
+    if not os.path.isfile(shader):
+        return f"missing {name}.spv"
+    old = os.environ.get("VKC_SUBGROUP_SIZE")
+    os.environ["VKC_SUBGROUP_SIZE"] = "64"
+    try:
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump")
+    finally:
+        if old is None:
+            os.environ.pop("VKC_SUBGROUP_SIZE", None)
+        else:
+            os.environ["VKC_SUBGROUP_SIZE"] = old
+    if code != 0:
+        return failure(code, out, 2)
+    if not W64_EMULATED and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", out)):
+        return None
+    m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
+    if m and [int(x) for x in m.group(1).split()] == expected_words:
+        return ""
+    return failure(code, out, 2)
 
 
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None):
@@ -71,6 +115,30 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         if m and m.group(1) == "0":
             return ""
     return failure(code, out, 2)
+
+
+def mesh_w64x_test(tools, spirv, name):
+    """ms_w64x_ballot: ms_tri's picture, blue 0.5 only if the ballot/mbcnt compaction was exact across both halves."""
+    shader, fs = os.path.join(spirv, name + ".spv"), os.path.join(spirv, "fs_passthru.spv")
+    if not (os.path.isfile(shader) and os.path.isfile(fs)):
+        return Skip("SKIP (mesh shader: build it with scripts/run_gpu_tests.py, build.py does not)")
+    env = dict(os.environ, VKH_MESH="1")
+    if not W64_EMULATED:
+        env["VKH_SUBGROUP_SIZE"] = "64"
+    with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        r = subprocess.run([os.path.join(tools, "vk_harness" + EXE), shader, fs, raw], capture_output=True, text=True, env=env)
+        if r.returncode or not raw.is_file():
+            return failure(r.returncode, r.stdout + r.stderr, 2)
+        data = raw.read_bytes()
+    if len(data) != 64 * 64 * 16:
+        return "vk_harness returned an unexpected pixel count"
+    px = list(struct.iter_unpack("<4f", data))
+    if not W64_EMULATED and 64 not in [int(x) for x in re.findall(r"subgroup \d+\.\.(\d+)", r.stderr)]:
+        return None   # the device has no 64-wide subgroups
+    wrong = sum(abs(p[0] - ((i % 64) + .5) / 64) > 1e-3 or abs(p[1] - ((i // 64) + .5) / 64) > 1e-3
+                or abs(p[2] - .5) > 1e-3 or abs(p[3] - 1) > 1e-3 for i, p in enumerate(px))
+    return "" if not wrong else f"{wrong} of {len(px)} pixels differ (blue {px[0][2]:.3g} at pixel 0, want 0.5)"
 
 
 def pixels(tools, spirv, name, fmt):
@@ -128,10 +196,18 @@ def main():
     results = []
     for name, groups, expect in COMPUTE:
         results.append((name, compute_test(tools, spirv, name, groups, expect)))
-    results.append(("cs_wavemask", compute_test(tools, spirv, "cs_wavemask", "1", "wavemask", require_wave64=True)))
-    for name, want in CS_DUMPS:   # all but cs_store need a 64-wide subgroup (skipped where the GPU has none)
-        results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=name != "cs_store",
+    results.append(("cs_wavemask", compute_test(tools, spirv, "cs_wavemask", "1", "wavemask",
+                                                require_wave64=not W64_EMULATED)))
+    for name, want in CS_DUMPS:   # all but cs_store need a 64-wide subgroup unless wave64 is emulated
+        results.append((name, compute_test(tools, spirv, name, "1", "dump",
+                                           require_wave64=name != "cs_store" and not W64_EMULATED,
                                            expected_words=want)))
+    for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
+        results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
+                                           expected_words=want)))
+    for name, want in W64X_PARTIAL:
+        results.append((name, partial_wave_test(tools, spirv, name, want)))
+    results.append(("ms_w64x_ballot", mesh_w64x_test(tools, spirv, "ms_w64x_ballot")))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs

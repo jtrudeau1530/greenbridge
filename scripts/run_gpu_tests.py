@@ -63,6 +63,20 @@ def make_cs_fssm(rsrc2: int = 0x8088, lx: int = 64, ly: int = 1, lz: int = 1) ->
     return bytes(buf)
 
 
+def asm_group(asm_path: str) -> tuple[int, int, int]:
+    """Thread-group size from a leading "; group: X,Y,Z" comment in the .asm (default 64,1,1)."""
+    for ln in open(asm_path, encoding="utf-8").read().splitlines():
+        t = ln.strip()
+        if not t:
+            continue
+        if not t.startswith(";"):
+            break
+        m = re.match(r";\s*group:\s*(\d+),(\d+),(\d+)", t)
+        if m:
+            return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return 64, 1, 1
+
+
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     raw = open(asm_path, encoding="utf-8").read()
@@ -341,7 +355,7 @@ def run_suite(a, work: str) -> int:
                 (b"ISG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
                 (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
             ])
-        elif name == "ms_tri":
+        elif name in ("ms_tri", "ms_w64x_ballot"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
         else:
             dxbc = make_dxbc([])
@@ -349,11 +363,14 @@ def run_suite(a, work: str) -> int:
             f.write(dxbc)
         if name.startswith("cs_"):
             with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
-                f.write(make_cs_fssm())
+                f.write(make_cs_fssm(0x8088, *asm_group(os.path.join(SHADER_DIR, fname))))
         assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), os.path.join(disasm_dir, f"{name}.s"), name)
 
     # 2. Translate all .s -> .spv
-    rc, out = run_cmd([sys.executable, "-I", TRANSLATOR, disasm_dir, "--out", spirv_dir])
+    cmd = [sys.executable, "-I", TRANSLATOR, disasm_dir, "--out", spirv_dir]
+    if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 compute/mesh exact on any subgroup size
+        cmd.append("--wave64-emulate")
+    rc, out = run_cmd(cmd)
     print("=== rdna2spirv.py ===")
     print(out)
     if rc != 0:
@@ -397,7 +414,10 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl"):
+        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
+                      "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
+                      "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
+                      "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
@@ -405,14 +425,34 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_half_cmp": [1, 0, 1, 1],
                 "cs_wm_bfm64": [16, 8, 8, 40],
                 "cs_wm_scc_rfl": [55, 48],
+                # cross-half tests (derivations in each .asm); need exact wave64 or its emulation
+                "cs_w64x_readlane": [121, 121, 16, 97, 16, 100, 100, 121],
+                "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 4660, 99],
+                "cs_w64x_readfirstlane": [140, 140, 163, 132, 100, 105, 133, 48],
+                "cs_w64x_bpermute": [36, 316, 253, 218, 435, 225, 0, 442],
+                "cs_w64x_branch": [0, 0, 0, 0, 5, 5, 9, 9],
+                "cs_w64x_ballot": [2053, 2061, 2069, 2077, 2085, 2093, 2101, 2109],
+                "cs_w64x_wg128_branches": [121, 121, 343, 343, 14, 31, 19812, 22728],
+                "cs_w64x_lds_raw": [132, 137, 100, 108, 131, 101, 149, 118],
+                "cs_w64x_lds_war": [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031],
+                "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
+                "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
+                "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
             # check.py does, where the device has none (vk_compute_test exits 77) instead of reporting a failure.
-            wave64 = name != "cs_store"
+            # With LEONIDA_W64_EMULATE=1 they were translated with --wave64-emulate and run on any subgroup size.
+            # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
+            emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
+            partial = name == "cs_w64x_partial"
+            wave64 = name != "cs_store" and not emulated and not partial
+            if partial and not emulated:
+                cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
             dump_line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
-            if wave64 and rc == 77:
+            no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
+            if (wave64 and rc == 77) or (no64 and rc == 0):
                 results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
             elif rc == 0 and dump_line:
                 vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
@@ -465,12 +505,18 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_grad(raw, 0.0, 0.0)
                 results.append((name, ok, detail))
-        elif name == "ms_tri":
+        elif name in ("ms_tri", "ms_w64x_ballot"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_MESH="1")
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
+            # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
+            # the wave64 compute dumps are.
+            no64 = (name == "ms_w64x_ballot" and os.environ.get("LEONIDA_W64_EMULATE") != "1" and
+                    not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
             if rc != 0:
                 results.append((name, False, msg))
+            elif no64:
+                results.append((name, None, "SKIP (no 64-wide subgroup on this device)"))
             else:
                 ok, detail = check_grad(raw, 0.5, 1.0)
                 results.append((name, ok, detail))

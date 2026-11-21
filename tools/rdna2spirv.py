@@ -33,6 +33,7 @@ import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
+WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 
 # GFX10 buffer format codes (Mesa src/amd/registers/gfx10-rsrc.json, enum GFX10_FORMAT).
 import json as _json  # noqa: E402
@@ -114,6 +115,14 @@ class Gen:
         self.ms_alloc = False      # MS: s_sendmsg GS_ALLOC_REQ seen
         self.gs = None             # GS: {"in": [(reg, sv)], "out": [(reg, sv)], "nreg": n, "maxv": n}
         self.wave64 = False        # compiled for 64-lane waves (64-bit EXEC writes, exec_hi, v_mbcnt_hi, ...)
+        self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
+        self.x_seg = 0             # emulate: number of the next continuation segment (past the block numbers)
+        self.x_marks = []          # emulate: (index into body, segment) where a segment of the current block ends
+        self.x_segs = {}           # emulate: continuation segment -> its SPIR-V lines
+        self.x_spills = []         # emulate: (Function variable, pointer type) carrying a value across a round
+        self.x_ptr_types = {}      # emulate: value type -> Function pointer type declared for spills
+        self.x_dirty = set()       # emulate: (memory kind "lds"/"mem", "r"/"w") accessed since the last round
+        self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
         self.uses_storage3d = False
         self.uses_heap = False
         self.uses_codebase = False
@@ -493,7 +502,7 @@ class Gen:
         args = [int(x) for x in m.group(2).split(",")[1:]] if m and m.group(2) else []
         self.uses_subgroup = True
         lane = self.tmp()
-        self.emit(f"{lane} = OpLoad %uint %sg_lane")
+        self.sub_lane(lane)
         if kind == "BITMASK_PERM":
             # One character per lane-index bit, bit 4 first: p = keep, i = invert, 0 / 1 = force.
             # Source lane = ((lane & and_mask) | or_mask) ^ xor_mask, within each group of 32 lanes.
@@ -535,7 +544,7 @@ class Gen:
         else:
             raise Unsupported("ds_swizzle " + kind)
         v, r = self.src_u(a[1]), self.tmp()
-        self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {src}")
+        self.g_shuffle(r, v, src)
         self.dst(a[0], r)
 
     def buffer_load(self, op, a, mods):
@@ -707,8 +716,9 @@ class Gen:
             self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, old)
 
     def current_label_placeholder(self):
-        """Label of the block currently being emitted (needed for OpPhi). Blocks are opened by OpLabel lines."""
-        for line in reversed(self.body):
+        """Label of the block currently being emitted (needed for OpPhi). Blocks are opened by OpLabel lines;
+        under --wave64-emulate only those of the current segment count (an earlier one runs in another round)."""
+        for line in reversed(self.body[self.x_marks[-1][0] if self.x_marks else 0:]):
             s = line.strip()
             if s.endswith("= OpLabel"):
                 return s.split(" = ")[0]
@@ -1308,6 +1318,153 @@ class Gen:
             self.emit(f"{lane} = OpLoad %uint %sg_lane")
         return lane
 
+    # ---- wave64 emulation (--wave64-emulate) ----
+    # A wave64 compute or mesh shader runs exact on any subgroup size. Each lane is one invocation as usual, but no
+    # subgroup operation is used: everything a lane needs from the rest of its wave goes through a Workgroup buffer
+    # (%x_buf). The shader runs in rounds (assemble: the emulated scheduler). In a round every wave that isn't done
+    # or waiting at s_barrier runs one segment of its program; then the whole workgroup meets at one OpControlBarrier
+    # in uniform control flow. A cross-lane operation ends a segment after its lane has written its share, and the
+    # code after it runs in the next round, when every lane of the wave has. Buffer layout, L = x_lanes:
+    #   [0, 2L)              per-lane data, double-buffered by round parity (written in round r, read in r + 1)
+    #   [2L, 2L + 6W)        two mask words per wave, ORed atomically, 3 slots by round mod 3 (W = waves)
+    #   [2L + 6W, +6)        per round slot: lanes not done, lanes neither done nor waiting at s_barrier
+    #   last word            a sink for the stores of lanes that have nothing to reset
+    def x_sizes(self):
+        w = self.x_lanes // 64
+        mask = 2 * self.x_lanes
+        sched = mask + 6 * w
+        return w, mask, sched, sched + 6
+
+    def x_split(self):
+        """End the current segment here: the rest of the block runs as a new segment in the next round."""
+        seg = self.x_seg
+        self.x_seg += 1
+        self.emit(f"OpStore %pc {self.cu(seg)}")
+        self.x_marks.append((len(self.body), seg))
+        self.desc_cache.clear()
+        self.block_label = f"%blk{seg}"
+        self.x_dirty = set()
+
+    def x_word(self, idx):
+        p, v = self.tmp(), self.tmp()
+        self.emit(f"{p} = OpAccessChain %_ptr_WG_uint_x %x_buf {idx}")
+        self.emit(f"{v} = OpLoad %uint {p}")
+        return v
+
+    def x_mask_slot(self, it):
+        """Index of the wave's first mask word in the slot of round `it`."""
+        s, a, b, c = (self.tmp() for _ in range(4))
+        w, mask, _, _ = self.x_sizes()
+        self.emit(f"{s} = OpUMod %uint {it} {self.cu(3)}")
+        self.emit(f"{a} = OpIMul %uint {s} {self.cu(w)}")
+        self.emit(f"{b} = OpIAdd %uint {a} %x_wave")
+        self.emit(f"{c} = OpIMul %uint {b} {self.cu(2)}")
+        r = self.tmp()
+        self.emit(f"{r} = OpIAdd %uint {c} {self.cu(mask)}")
+        return r
+
+    def x_round(self, data=None, bits=None):
+        """One exchange: this lane's uint `data` goes to its slot, `bits` (lo, hi; None = nothing) are ORed into
+        the wave's two mask words. Returns (read, (lo, hi)): read(lane) loads `data` of a lane (0-63) of this wave,
+        and (lo, hi) is the OR over all 64 lanes. Both are only valid in the code emitted after this call, which
+        runs one round later."""
+        it = self.tmp()
+        self.emit(f"{it} = OpLoad %uint %x_it")
+        if data is not None:
+            par, base, i, p = (self.tmp() for _ in range(4))
+            self.emit(f"{par} = OpBitwiseAnd %uint {it} {self.cu(1)}")
+            self.emit(f"{base} = OpIMul %uint {par} {self.cu(self.x_lanes)}")
+            self.emit(f"{i} = OpIAdd %uint {base} %x_li")
+            self.emit(f"{p} = OpAccessChain %_ptr_WG_uint_x %x_buf {i}")
+            self.emit(f"OpStore {p} {data}")
+        if bits is not None:
+            m = self.x_mask_slot(it)
+            for k, b in enumerate(bits):
+                if b is None:
+                    continue
+                i, p, old = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{i} = OpIAdd %uint {m} {self.cu(k)}")
+                self.emit(f"{p} = OpAccessChain %_ptr_WG_uint_x %x_buf {i}")
+                self.emit(f"{old} = OpAtomicOr %uint {p} {self.cu(2)} {self.cu(0)} {b}")
+        self.x_split()
+        now, prev = self.tmp(), self.tmp()
+        self.emit(f"{now} = OpLoad %uint %x_it")
+        self.emit(f"{prev} = OpISub %uint {now} {self.cu(1)}")
+        res = None
+        if bits is not None:
+            m = self.x_mask_slot(prev)
+            hi_i = self.tmp()
+            self.emit(f"{hi_i} = OpIAdd %uint {m} {self.cu(1)}")
+            res = (self.x_word(m), self.x_word(hi_i))
+
+        def read(lane):
+            par, base, i = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{par} = OpBitwiseAnd %uint {prev} {self.cu(1)}")
+            self.emit(f"{base} = OpIMul %uint {par} {self.cu(self.x_lanes)}")
+            self.emit(f"{i} = OpIAdd %uint {base} %x_wbase")
+            j = self.tmp()
+            self.emit(f"{j} = OpIAdd %uint {i} {lane}")
+            return self.x_word(j)
+        return read, res
+
+    def x_memory_order(self, op):
+        """On hardware a wave's lanes run each instruction together: every lane's access of one instruction comes
+        before every lane's access of the next. Two halves of an emulated wave can be in different subgroups, so an
+        access that conflicts with an earlier one of the same segment (read after write, write after read, write
+        after write, on the same memory) waits for the next round, whose barrier orders the memory. Not ordered:
+        scalar loads (s_load / s_buffer_load) of memory the wave wrote, and sampling an image it wrote."""
+        if op in ("ds_swizzle_b32", "ds_bpermute_b32", "ds_permute_b32"):
+            return
+        if op.startswith("ds_"):
+            kind = "lds"
+        elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_store", "image_atomic")):
+            kind = "mem"
+        else:
+            return
+        store = "store" in op or op.startswith("ds_write")
+        reads = not store
+        writes = store or "atomic" in op or (kind == "lds" and not op.startswith("ds_read"))
+        if (kind, "w") in self.x_dirty or (writes and (kind, "r") in self.x_dirty):
+            self.x_split()
+        if reads:
+            self.x_dirty.add((kind, "r"))
+        if writes:
+            self.x_dirty.add((kind, "w"))
+
+    def g_vote(self, r, kind, b):
+        """r = OpGroupNonUniform{Any,All} of bool b over the wave."""
+        if not self.emulate:
+            self.emit(f"{r} = OpGroupNonUniform{kind} %bool {self.cu(3)} {b}")
+            return
+        if kind == "All":
+            nb = self.tmp()
+            self.emit(f"{nb} = OpLogicalNot %bool {b}")
+            b = nb
+        bit = self.tmp()
+        self.emit(f"{bit} = OpSelect %uint {b} {self.cu(1)} {self.cu(0)}")
+        lo = self.x_round(bits=(bit, None))[1][0]
+        self.emit(f"{r} = {'OpIEqual' if kind == 'All' else 'OpINotEqual'} %bool {lo} {self.cu(0)}")
+
+    def g_shuffle(self, r, v, src, zero_inactive=False):
+        """r = v of lane `src` of this wave (OpGroupNonUniformShuffle; emulated: any lane 0-63). zero_inactive:
+        a source lane that is off in EXEC gives 0 (ds_bpermute)."""
+        if not self.emulate:
+            self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {src}")
+            return
+        if zero_inactive:
+            z = self.tmp()
+            self.emit(f"{z} = OpSelect %uint {self.active_b()} {v} {self.cu(0)}")
+            v = z
+        read = self.x_round(data=v)[0]
+        self.emit(f"{r} = OpCopyObject %uint {read(src)}")
+
+    def sub_lane(self, r):
+        """r = the lane the subgroup shuffles above index: the subgroup lane, or the wave lane when emulated."""
+        if self.emulate:
+            self.emit(f"{r} = OpCopyObject %uint {self.wave_lane()}")
+        else:
+            self.emit(f"{r} = OpLoad %uint %sg_lane")
+
     def exec_half_write(self, half, val, const=None):
         """Write one 32-bit half of EXEC. In the per-lane model a lane is active iff its bit is set. A constant
         sets each lane from its own bit; a register value (mask representation: all-ones / zero per lane) sets
@@ -1364,7 +1521,7 @@ class Gen:
         bit, so that is a vote across the subgroup, as for s_cbranch_vccz. Taken per lane, the lanes of one wave
         could follow different s_cbranch_scc paths, which a hardware wave never does: it has one SCC."""
         any_, z = self.tmp(), self.tmp()
-        self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {self.tmp_bool_nz(v)}")
+        self.g_vote(any_, "Any", self.tmp_bool_nz(v))
         self.uses_vote = True
         self.emit(f"{z} = OpSelect %uint {any_} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpStore %scc {z}")
@@ -1412,7 +1569,7 @@ class Gen:
                 self.emit(f"{eff} = OpLogicalAnd %bool {in_h} {mine}")
             mine = eff
         r = self.tmp()
-        self.emit(f"{r} = OpGroupNonUniform{'All' if equal else 'Any'} %bool {self.cu(3)} {mine}")
+        self.g_vote(r, "All" if equal else "Any", mine)
         return r
 
     def holds_lane_mask(self, a):
@@ -1432,6 +1589,8 @@ class Gen:
         self.uses_subgroup = self.uses_wave_bits = True
         special = a["k"] == "special" and a.get("t", "").startswith("exec")
         mine = self.tmp_bool_nz(self.exec_value() if special else self.mask_src(a))
+        if self.emulate:
+            return self.x_round(bits=self.lane_bits(mine))[1]
         lane = self.wave_lane()
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
         self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")
@@ -1443,6 +1602,18 @@ class Gen:
         self.emit(f"{lo} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {lo_in}")
         self.emit(f"{hi} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {hi_in}")
         return lo, hi
+
+    def lane_bits(self, b):
+        """This lane's bool as its bit of a 64-lane mask: (lanes 0-31 word, lanes 32-63 word), one of them 0."""
+        lane = self.wave_lane()
+        low, sh, bit, v, lo_in, hi_in = (self.tmp() for _ in range(6))
+        self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")
+        self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+        self.emit(f"{bit} = OpShiftLeftLogical %uint {self.cu(1)} {sh}")
+        self.emit(f"{v} = OpSelect %uint {b} {bit} {self.cu(0)}")
+        self.emit(f"{lo_in} = OpSelect %uint {low} {v} {self.cu(0)}")
+        self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {v}")
+        return lo_in, hi_in
 
     def mask_src(self, a):
         """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane."""
@@ -1500,6 +1671,8 @@ class Gen:
         dst_sel; v_cmpx (GFX10) has no written destination operand."""
         self.cur_masks = self.lane_masks.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
+        if self.emulate:
+            self.x_memory_order(base_op(ins["op"]))
         if not ins["op"].endswith("_sdwa"):
             return self._insn(ins)
         op, mods = base_op(ins["op"]), ins["mods"]
@@ -1622,6 +1795,21 @@ class Gen:
                 # A lane mask that went through the vector unit (three SGPRs ORed with v_or3_b32, say). The
                 # hardware reads the first lane's copy of the whole mask; here the lane's own copy is its bit.
                 self.dst(a[0], self.src_u(a[1]))
+                return
+            if self.emulate:
+                # The wave's active lanes as two mask words and every lane's value, in one round.
+                v, act = self.src_u(a[1]), self.active_b()
+                lo_in, hi_in = self.lane_bits(act)
+                read, (lo, hi) = self.x_round(data=v, bits=(lo_in, hi_in))
+                lz, hz, l, h, h32, fh, first = (self.tmp() for _ in range(7))
+                self.emit(f"{lz} = OpINotEqual %bool {lo} {self.cu(0)}")
+                self.emit(f"{hz} = OpINotEqual %bool {hi} {self.cu(0)}")
+                self.emit(f"{l} = OpExtInst %uint %glsl FindILsb {lo}")
+                self.emit(f"{h} = OpExtInst %uint %glsl FindILsb {hi}")
+                self.emit(f"{h32} = OpIAdd %uint {h} {self.cu(32)}")
+                self.emit(f"{fh} = OpSelect %uint {hz} {h32} {self.cu(0)}")
+                self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
+                self.dst(a[0], read(first))
                 return
             self.uses_subgroup = self.uses_ballot = self.uses_vote = True
             v, act = self.src_u(a[1]), self.active_b()
@@ -1987,8 +2175,27 @@ class Gen:
             self.emit(f"{s1} = OpIAdd %uint {ad} {self.cu(off)}")
             self.emit(f"{ln} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
             self.emit(f"{ln2} = OpBitwiseAnd %uint {ln} {self.cu(31)}")
-            self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {dat} {ln2}")
-            self.uses_subgroup = True
+            if self.emulate:
+                # Wave64 runs it as two wave32s (RDNA ISA 10.4.4): lanes 32-63 read from their own half, and a
+                # source lane that is off in EXEC reads as 0.
+                half, src = self.tmp(), self.tmp()
+                self.emit(f"{half} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(32)}")
+                self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
+                self.g_shuffle(r, dat, src, zero_inactive=True)
+            elif self.wave64:
+                # Same on a 64-wide subgroup: the half's base comes from the subgroup lane (on a 32-wide one it
+                # is 0, as before). Until 2026-11-21 lanes 32-63 read lanes 0-31 there, and inactive sources
+                # kept their value. GPU-checked with cs_w64x_bpermute.
+                lane, half, src, z = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{lane} = OpLoad %uint %sg_lane")
+                self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
+                self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
+                self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {z} {src}")
+                self.uses_subgroup = True
+            else:
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {dat} {ln2}")
+                self.uses_subgroup = True
             self.dst(d, r)
         elif op.startswith("ds_") and self.stage == "gs":
             self.gs_ds(op, a, mods)
@@ -1998,6 +2205,11 @@ class Gen:
             # Workgroup execution barrier; AMD orders LDS through s_waitcnt before it, so include workgroup memory.
             if self.stage not in ("cs", "ms"):
                 raise Unsupported("s_barrier outside compute")
+            if self.emulate:
+                # The wave waits in the scheduler until every wave not done waits too (assemble).
+                self.emit("OpStore %x_bar %true")
+                self.x_split()
+                return
             self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x108)}")
         elif op == "v_readlane_b32":
             # sD = vS[lane]: a subgroup shuffle from that lane (the result is uniform).
@@ -2012,7 +2224,7 @@ class Gen:
             v, ln = self.src_u(a[1]), self.src_u(a[2])
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63)}")
-            self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {m}")
+            self.g_shuffle(r, v, m)
             self.dst(a[0], r)
         elif op == "v_writelane_b32":
             # vD[lane] = sS: only the named lane changes (independent of EXEC, as on hardware).
@@ -2022,7 +2234,11 @@ class Gen:
             if slot and slot[1:] in self.parked:        # somewhere a mask is fetched back from this lane: keep ours
                 self.store_reg("sgpr", self.parked[slot[1:]], val)
             me, m, eq, old, r = (self.tmp() for _ in range(5))
-            self.emit(f"{me} = OpLoad %uint %sg_lane")
+            if self.stage in ("cs", "ms"):
+                # The hardware lane: lanes 32-63 of a wave64 are lanes 0-31 of a second 32-wide subgroup.
+                self.emit(f"{me} = OpCopyObject %uint {self.wave_lane()}")
+            else:
+                self.emit(f"{me} = OpLoad %uint %sg_lane")
             self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63)}")
             self.emit(f"{eq} = OpIEqual %bool {me} {m}")
             p = self.tmp()
@@ -2041,7 +2257,7 @@ class Gen:
             self.uses_subgroup = True
             v, s1, s2 = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[3])
             lane, within, hi8, sh, nib1, nib2, nib, row, src = (self.tmp() for _ in range(9))
-            self.emit(f"{lane} = OpLoad %uint %sg_lane")
+            self.sub_lane(lane)
             self.emit(f"{within} = OpBitwiseAnd %uint {lane} {self.cu(15)}")
             self.emit(f"{hi8} = OpUGreaterThanEqual %bool {within} {self.cu(8)}")
             w7 = self.tmp()
@@ -2058,7 +2274,7 @@ class Gen:
                 self.emit(f"{row} = OpCopyObject %uint {half}")
             self.emit(f"{src} = OpBitwiseOr %uint {row} {nib}")
             r = self.tmp()
-            self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {src}")
+            self.g_shuffle(r, v, src)
             self.dst(a[0], r)
         elif op.startswith("buffer_load_dword"):
             self.buffer_load(op, a, mods)
@@ -4380,10 +4596,30 @@ def assemble(gen):
     cs = gen.stage == "cs"
     ms = gen.stage == "ms"
     gsx = gen.stage == "gs"
+    if gen.emulate:
+        # No subgroup operation is left (x_round does them through %x_buf), so none of their capabilities.
+        if any("OpGroupNonUniform" in l or "%sg_lane" in l for b in gen.blocks + list(gen.x_segs.values()) for l in b):
+            raise Unsupported("wave64 emulation: a subgroup operation is left")
+        gen.uses_subgroup = gen.uses_vote = gen.uses_ballot = gen.uses_wave_bits = False
+        x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
+        x_zero = x_sink - x_mask           # mask and schedule words: zeroed before the first round
+        x_threads = (gen.cs or gen.ms)["size"]
+        x_threads = x_threads[0] * x_threads[1] * x_threads[2]
+        sx, sy, _ = (gen.cs or gen.ms)["size"]
+        for v in (0, 1, 2, 3, 6, 31, 63, 0x948, x_mask, x_sched, x_sink, x_sink + 1, x_zero - 1, x_threads,
+                  x_waves, sx, sx * sy, 0xFFFFFFC0):
+            gen.cu(v)
+        x_missing = gen.x_lanes - x_threads          # lanes of a partial last wave that don't exist
+        for k in range(-(-max(x_zero, x_missing) // x_threads)):
+            gen.cu(k * x_threads)
+        if x_missing:
+            for v in (x_missing - 1, gen.x_lanes + x_threads):
+                gen.cu(v)
     model = "Vertex" if vs else "GLCompute" if cs else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
     iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts", "%ms_out_pos", "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)]) if ms else []) + (
+        ["%x_buf"] if gen.emulate else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         ((["%fmt_uint_mask", "%fmt_sint_mask"] +
           [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)]) if gen.uses_store_views else [])
@@ -4641,6 +4877,10 @@ def assemble(gen):
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
             gvars += ["%lds = OpVariable %_ptr_WG_lds Workgroup"]
+    if gen.emulate:
+        types += [f"%x_arr = OpTypeArray %uint {gen.cu(x_sink + 1)}",
+                  "%_ptr_WG_x_arr = OpTypePointer Workgroup %x_arr", "%_ptr_WG_uint_x = OpTypePointer Workgroup %uint"]
+        gvars += ["%x_buf = OpVariable %_ptr_WG_x_arr Workgroup"]
     if cs:
         types += ["%v3uint = OpTypeVector %uint 3", "%_ptr_Input_v3u = OpTypePointer Input %v3uint"]
         gvars += ["%wg_id = OpVariable %_ptr_Input_v3u Input", "%local_id = OpVariable %_ptr_Input_v3u Input"]
@@ -4701,6 +4941,10 @@ def assemble(gen):
           "%vcc_hi = OpVariable %_ptr_Function_uint Function %c0",
           "%scc = OpVariable %_ptr_Function_uint Function %c0",
           "%active = OpVariable %_ptr_Function_bool Function %true"]
+    if gen.emulate:
+        fn += ["%x_it = OpVariable %_ptr_Function_uint Function %c0",
+               "%x_bar = OpVariable %_ptr_Function_bool Function %false"]
+        fn += [f"{var} = OpVariable {ptr} Function" for var, ptr in gen.x_spills]
     # User data: s0..s31 are loaded at entry from a push-constant block (the driver's user-SGPR setup).
     if gen.uses_heap:
         gen.consts.setdefault(1, "%c1")
@@ -4785,9 +5029,13 @@ def assemble(gen):
                    f"%vinb{reg}_{c} = OpCopyObject %uint %vinc{reg}_{c}",
                    f"%vinp{reg}_{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(vg)}",
                    f"OpStore %vinp{reg}_{c} %vinb{reg}_{c}"]
+    # Spill pointers last: a spilled value's type may be declared anywhere above.
+    types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     out = hdr + dec + types + gvars + (gen.desc_fn or []) + fn
-    tree = cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED else None
+    tree = cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate else None
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
+    if gen.emulate:
+        gen.control_flow = "emulated wave64 rounds"
     if tree is not None:
         # Real loops and conditionals (cfg_structure): the blocks nested by dominance, each behind a test of %pc,
         # and every natural loop as a loop that repeats while %pc names its header.
@@ -4822,6 +5070,14 @@ def assemble(gen):
                                  f"OpBranchConditional {again} {head} {end}", f"{end} = OpLabel"])
 
         place(tree)
+    elif gen.emulate:
+        lines = x_scheduler(gen, x_threads)
+        body = []
+        for i, blines in sorted(list(enumerate(gen.blocks)) + list(gen.x_segs.items())):
+            body.append(f"%blk{i} = OpLabel")
+            body += blines
+            body.append("OpBranch %sw_merge")
+        body += x_scheduler_tail(gen)
     elif gen.blocks:
         # Dispatch loop: any CFG (forward/backward branches) in structured SPIR-V form. Used for the irreducible
         # graphs cfg_structure refuses (a loop with two entries), and with --dispatch-loop.
@@ -5302,9 +5558,13 @@ def translate(path):
         insns = [i for i in insns if base_op(i["op"]) != "s_swappc_b64"]
     user_limit = g.cs["user"] if g.cs else USER_SGPRS
     sys_sgprs = (3,) if stage in ("ms", "gs") else ()
+    if WAVE64_EMULATE and g.wave64 and stage in ("cs", "ms"):
+        g.emulate = True
+        size = (g.cs or g.ms)["size"]
+        g.x_lanes = -(-size[0] * size[1] * size[2] // 64) * 64
     insns = fold_far_branches(insns)
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
-    if not branchy:
+    if not branchy and not g.emulate:
         g.park_masks(([insns], [[]]))
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
@@ -5365,9 +5625,11 @@ def translate(path):
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
+    g.x_seg = len(blocks) + 1           # emulate: continuation segments are numbered after "done" (len(blocks))
     for n, blk in enumerate(blocks):
         g.body = []
         g.block_label = f"%blk{n}"
+        g.x_marks, g.x_dirty = [], set()
         g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
         term = None
         for ins in blk:
@@ -5400,11 +5662,154 @@ def translate(path):
                 g.emit(f"{r} = OpSelect %uint {cond} {g.cu(tgt)} {alt}")
                 g.emit(f"OpStore %pc {r}")
                 g.succ.append(list(dict.fromkeys([tgt] + ([fall] if fall is not None else []))))
-        g.blocks.append([l.strip() for l in g.body])
+        lines = [l.strip() for l in g.body]
+        if g.x_marks:
+            cuts = [0] + [i for i, _ in g.x_marks] + [len(lines)]
+            parts = x_spill(g, [lines[a:b] for a, b in zip(cuts, cuts[1:])])
+            g.blocks.append(parts[0])
+            for (_, seg), part in zip(g.x_marks, parts[1:]):
+                g.x_segs[seg] = part
+        else:
+            g.blocks.append(lines)
     assert succ == g.succ, "the lane-mask analysis ran on a different graph"
     g.body = []
     translate.last_gen = g
     return assemble(g)
+
+
+_DEF = re.compile(r"(%\w+) = (Op\w+)(?: (%\w+))?")
+
+
+def x_spill(g, parts):
+    """Emulated wave64: the segments of one block run in different rounds, i.e. in different cases of the
+    scheduler's switch and different loop iterations, so an SSA value defined in one and used in a later one
+    can't be referenced directly. It goes through a Function variable: stored at the end of the segment that
+    defines it and loaded, under a new id, at the top of each later segment that uses it."""
+    defs, out = {}, []
+    for k, part in enumerate(parts):
+        used = []
+        for line in part:
+            for ref in _ID_REF.findall(line):
+                if ref in defs and ref not in used:
+                    used.append(ref)
+        loads, rename = [], {}
+        for ref in used:
+            seg, typ, var = defs[ref]
+            if var is None:
+                if typ is None or typ.startswith("%_ptr"):
+                    raise Unsupported("wave64 emulation: a pointer lives across a round")
+                ptr = {"%uint": "%_ptr_Function_uint", "%bool": "%_ptr_Function_bool"}.get(typ)
+                if ptr is None:
+                    ptr = g.x_ptr_types.setdefault(typ, f"%_ptr_Function_x_{typ[1:]}")
+                var = f"%xs_{ref[1:]}"
+                g.x_spills.append((var, ptr))
+                out[seg].append(f"OpStore {var} {ref}")
+                defs[ref] = (seg, typ, var)
+            new = f"{ref}_r{k}"
+            loads.append(f"{new} = OpLoad {typ} {var}")
+            rename[ref] = new
+        body = [_ID_REF.sub(lambda t: rename.get(t.group(0), t.group(0)), l) for l in part] if rename else list(part)
+        out.append(loads + body)
+        for line in part:
+            m = _DEF.match(line)
+            if m and m.group(2) != "OpLabel":
+                defs[m.group(1)] = (k, m.group(3), None)
+    return out
+
+
+def x_scheduler(gen, threads):
+    """Emulated wave64: the head of the round loop (see Gen.x_round), up to the switch over %pc. The first two
+    lines are the Function variables %pc and %done, as for the dispatch loop.
+
+    Every invocation runs every round, so the loop and the barrier at its end are in uniform control flow. In a
+    round an invocation runs one segment unless it is done or waits at s_barrier. After the segment it adds
+    itself to the round's counts (not done; neither done nor waiting); after the barrier everyone reads the same
+    counts: no lane left ends the loop, and no lane left that isn't waiting releases the s_barrier."""
+    c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
+    x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
+    sx, sy, _ = (gen.cs or gen.ms)["size"]
+    L = ["%pc = OpVariable %_ptr_Function_uint Function %c0",
+         "%done = OpVariable %_ptr_Function_bool Function %false"]
+    # This invocation's place: index in the workgroup, lane and wave (the same split as Gen.wave_lane).
+    if gen.stage == "ms":
+        L += ["%x_li = OpLoad %uint %local_index"]
+    else:
+        L += ["%x_lid = OpLoad %v3uint %local_id", "%x_lx = OpCompositeExtract %uint %x_lid 0",
+              "%x_ly = OpCompositeExtract %uint %x_lid 1", "%x_lz = OpCompositeExtract %uint %x_lid 2",
+              f"%x_ly2 = OpIMul %uint %x_ly {c(sx)}", f"%x_lz2 = OpIMul %uint %x_lz {c(sx * sy)}",
+              "%x_lxy = OpIAdd %uint %x_lx %x_ly2", "%x_li = OpIAdd %uint %x_lxy %x_lz2"]
+    L += [f"%x_lane = OpBitwiseAnd %uint %x_li {c(63)}", f"%x_wave = OpShiftRightLogical %uint %x_li {c(6)}",
+          f"%x_wbase = OpBitwiseAnd %uint %x_li {c(0xFFFFFFC0)}"]
+    # Workgroup memory starts undefined: zero the mask and schedule words, every invocation a share of them.
+    zero = x_sink - x_mask
+    for k in range(-(-zero // threads)):
+        L += [f"%x_z{k} = OpIAdd %uint %x_li {c(k * threads)}",
+              f"%x_zm{k} = OpExtInst %uint %glsl UMin %x_z{k} {c(zero - 1)}",
+              f"%x_zi{k} = OpIAdd %uint %x_zm{k} {c(x_mask)}",
+              f"%x_zp{k} = OpAccessChain %_ptr_WG_uint_x %x_buf %x_zi{k}", f"OpStore %x_zp{k} {c(0)}"]
+    # A partial last wave: its missing lanes never write their data slots. They read as 0, as a lane that is
+    # off does for ds_bpermute (and v_readlane of a lane that doesn't exist has no defined value anyway).
+    missing = gen.x_lanes - threads
+    for k in range(-(-missing // threads) if missing else 0):
+        for par, base in ((0, threads), (1, gen.x_lanes + threads)):
+            L += [f"%x_y{k}_{par} = OpIAdd %uint %x_li {c(k * threads)}",
+                  f"%x_ym{k}_{par} = OpExtInst %uint %glsl UMin %x_y{k}_{par} {c(missing - 1)}",
+                  f"%x_yi{k}_{par} = OpIAdd %uint %x_ym{k}_{par} {c(base)}",
+                  f"%x_yp{k}_{par} = OpAccessChain %_ptr_WG_uint_x %x_buf %x_yi{k}_{par}",
+                  f"OpStore %x_yp{k}_{par} {c(0)}"]
+    L += [f"OpControlBarrier {c(2)} {c(2)} {c(0x948)}",
+          "OpBranch %loop_head", "%loop_head = OpLabel", "OpLoopMerge %loop_exit %loop_cont None",
+          "OpBranch %x_round", "%x_round = OpLabel",
+          "%x_itv = OpLoad %uint %x_it", f"%x_s = OpUMod %uint %x_itv {c(3)}",
+          # Free the slot of round + 1 for its writers. Its readers ran before the last barrier (round - 2 wrote
+          # it, round - 1 read it); its writers come after the next one. Lane 0 of each wave clears the wave's
+          # mask words, invocation 0 the counts; the others store to the sink word.
+          f"%x_n1 = OpIAdd %uint %x_itv {c(1)}", f"%x_sn = OpUMod %uint %x_n1 {c(3)}",
+          f"%x_m0 = OpIMul %uint %x_sn {c(x_waves)}", "%x_m1 = OpIAdd %uint %x_m0 %x_wave",
+          f"%x_m2 = OpIMul %uint %x_m1 {c(2)}", f"%x_m3 = OpIAdd %uint %x_m2 {c(x_mask)}",
+          f"%x_m4 = OpIAdd %uint %x_m3 {c(1)}", f"%x_ml = OpIEqual %bool %x_lane {c(0)}",
+          f"%x_m5 = OpSelect %uint %x_ml %x_m3 {c(x_sink)}", f"%x_m6 = OpSelect %uint %x_ml %x_m4 {c(x_sink)}",
+          "%x_mp5 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_m5", f"OpStore %x_mp5 {c(0)}",
+          "%x_mp6 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_m6", f"OpStore %x_mp6 {c(0)}",
+          f"%x_q0 = OpIMul %uint %x_sn {c(2)}", f"%x_q1 = OpIAdd %uint %x_q0 {c(x_sched)}",
+          f"%x_q2 = OpIAdd %uint %x_q1 {c(1)}", f"%x_ql = OpIEqual %bool %x_li {c(0)}",
+          f"%x_q3 = OpSelect %uint %x_ql %x_q1 {c(x_sink)}", f"%x_q4 = OpSelect %uint %x_ql %x_q2 {c(x_sink)}",
+          "%x_qp3 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q3", f"OpStore %x_qp3 {c(0)}",
+          "%x_qp4 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q4", f"OpStore %x_qp4 {c(0)}",
+          "%x_d = OpLoad %bool %done", "%x_b = OpLoad %bool %x_bar", "%x_nd = OpLogicalNot %bool %x_d",
+          "%x_nb = OpLogicalNot %bool %x_b", "%x_run = OpLogicalAnd %bool %x_nd %x_nb",
+          "OpSelectionMerge %x_ran None", "OpBranchConditional %x_run %dispatch %x_ran",
+          "%dispatch = OpLabel", "%pcv = OpLoad %uint %pc", "OpSelectionMerge %sw_merge None",
+          "OpSwitch %pcv %sw_default " + " ".join(f"{i} %blk{i}" for i in
+                                                  sorted(list(range(len(gen.blocks))) + list(gen.x_segs)))]
+    return L
+
+
+def x_scheduler_tail(gen):
+    """Emulated wave64: the end of a round, after the switch (see x_scheduler)."""
+    c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
+    _, _, x_sched, _ = gen.x_sizes()
+    return ["%sw_default = OpLabel", "OpStore %done %true", "OpBranch %sw_merge",
+            "%sw_merge = OpLabel", "OpBranch %x_ran", "%x_ran = OpLabel",
+            "%x_d2 = OpLoad %bool %done", "%x_b2 = OpLoad %bool %x_bar",
+            "%x_nd2 = OpLogicalNot %bool %x_d2", "%x_nb2 = OpLogicalNot %bool %x_b2",
+            "%x_w = OpLogicalAnd %bool %x_nd2 %x_nb2",
+            f"%x_c0 = OpSelect %uint %x_nd2 {c(1)} {c(0)}", f"%x_c1 = OpSelect %uint %x_w {c(1)} {c(0)}",
+            f"%x_s0 = OpIMul %uint %x_s {c(2)}", f"%x_s1 = OpIAdd %uint %x_s0 {c(x_sched)}",
+            f"%x_s2 = OpIAdd %uint %x_s1 {c(1)}",
+            "%x_p0 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_s1",
+            "%x_p1 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_s2",
+            f"%x_a0 = OpAtomicIAdd %uint %x_p0 {c(2)} {c(0)} %x_c0",
+            f"%x_a1 = OpAtomicIAdd %uint %x_p1 {c(2)} {c(0)} %x_c1",
+            "OpBranch %loop_cont", "%loop_cont = OpLabel",
+            # Workgroup, acquire-release, workgroup + uniform + image memory: also orders the stores a round made.
+            f"OpControlBarrier {c(2)} {c(2)} {c(0x948)}",
+            "%x_r0 = OpLoad %uint %x_p0", "%x_r1 = OpLoad %uint %x_p1",
+            f"%x_rel = OpIEqual %bool %x_r1 {c(0)}", "%x_b3 = OpLoad %bool %x_bar",
+            "%x_nrel = OpLogicalNot %bool %x_rel", "%x_b4 = OpLogicalAnd %bool %x_b3 %x_nrel",
+            "OpStore %x_bar %x_b4", f"%x_it1 = OpIAdd %uint %x_itv {c(1)}", "OpStore %x_it %x_it1",
+            f"%x_fin = OpIEqual %bool %x_r0 {c(0)}", "OpBranchConditional %x_fin %loop_exit %loop_head",
+            "%loop_exit = OpLabel"]
 
 
 BRANCHES = {"s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz",
@@ -5431,7 +5836,7 @@ def branch_condition(g, op):
     else:
         lane = g.active_b()
     any_ = g.tmp()
-    g.emit(f"{any_} = OpGroupNonUniformAny %bool {g.cu(3)} {lane}")
+    g.g_vote(any_, "Any", lane)
     g.uses_vote = True
     if op in ("s_cbranch_vccnz", "s_cbranch_execnz"):
         return any_
@@ -5475,7 +5880,11 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
          "subgroup_size": 64 if g.wave64 else 32,
          # 64-wide subgroups can only be requested for compute/mesh on RADV and NVIDIA; VS/PS/GS wave64
          # shaders must be treated as emulated (per-32-lane halves) until cross-half ops go through LDS.
-         "wave64_emulated": bool(g.wave64 and g.stage in ("vs", "ps", "gs"))}
+         "wave64_emulated": bool(g.wave64 and (g.stage in ("vs", "ps", "gs") or g.emulate))}
+    if g.emulate:
+        # Exact on any subgroup size: no subgroup operation, cross-lane data in %x_buf (workgroup memory).
+        m["wave64_exchange"] = "workgroup"
+        m["subgroup_size"] = None
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
     if g.uses_codebase:
@@ -5495,6 +5904,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["gs_output_locations"] = sorted(r for r, sv in g.gs["out"] if sv != 1)
     if g.uses_lds:
         m["lds_bytes"] = 4 * g.lds_dwords
+    if g.emulate:
+        m["lds_bytes"] = m.get("lds_bytes", 0) + 4 * (g.x_sizes()[3] + 1)     # + %x_buf
     if g.vertex_inputs:
         m["vertex_inputs"] = [{"location": r, "type": {1: "uint", 2: "sint"}.get(t, "float")} for r, t in g.vertex_inputs]
     if getattr(g, "vertex_signature", None):
@@ -5551,9 +5962,13 @@ def main():
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
     ap.add_argument("--dispatch-loop", action="store_true",
                     help="emit control flow the old way, as one loop around a switch (to compare with the default)")
+    ap.add_argument("--wave64-emulate", action="store_true",
+                    help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
+                         "cross-lane operations go through workgroup memory instead of subgroup operations")
     a = ap.parse_args()
-    global STRUCTURED
+    global STRUCTURED, WAVE64_EMULATE
     STRUCTURED = not a.dispatch_loop
+    WAVE64_EMULATE = a.wave64_emulate
     if a.merge:
         import glob as _gl, json as _js
         merged = {}
