@@ -72,8 +72,11 @@ def main() -> int:
             try:
                 chunks, p = [], s
                 while not d.eof and p < size:
-                    chunks.append(d.decompress(m[p:p + (1 << 20)]))
-                    p += 1 << 20
+                    chunk = m[p:p + (1 << 20)]
+                    if not chunk:
+                        break
+                    chunks.append(d.decompress(chunk))
+                    p += len(chunk)   # the slice can be short at EOF; advancing by 1 MiB overran it
                     if d.unused_data or d.eof:
                         break
                 out = b"".join(chunks) + d.flush()
