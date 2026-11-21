@@ -302,6 +302,23 @@ if(BUILD_TESTING)
     add_dependencies(bink_decode_test gta6rt_tls_host)
     add_test(NAME bink_decode COMMAND bink_decode_test)
 
+    # Optional: skips unless LEONIDA_GAME_DIR is set. Drives the package's FSR DLL on the Xbox-ABI device proxy.
+    if(D3D12_LIBRARY AND DXGI_LIBRARY)
+      add_executable(fsr_dispatch_test
+        test/fsr_dispatch_test.cpp
+        src/pe_loader.cpp
+        shims/registry.cpp
+        shims/xmem.cpp
+        shims/d3d12_xs.cpp
+        shims/d3d12_xs_device.cpp
+      )
+      target_compile_definitions(fsr_dispatch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+      target_compile_options(fsr_dispatch_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      target_link_options(fsr_dispatch_test PRIVATE /OPT:NOREF)
+      target_link_libraries(fsr_dispatch_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY} psapi)
+      add_test(NAME fsr_dispatch COMMAND fsr_dispatch_test)
+    endif()
+
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE_AUDIO are set.
     add_executable(bink_audio_test
       test/bink_audio_test.cpp

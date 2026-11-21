@@ -1310,6 +1310,24 @@ little-endian GUIDs from `d3d12.h`.
   `IID_ID3D12RootSignatureDeserializer` (0x047320), `IID_ID3D12PipelineState` (0x047330),
   `IID_ID3D12Heap` (0x047340), `IID_ID3D12RootSignature` (0x047350), `IID_ID3D12DescriptorHeap` (0x0472e0) and
   `IID_ID3D12CommandSignature` (0x047300). Again, presence ≠ use.
+- Run through the public FidelityFX API by `runtime/test/fsr_dispatch_test.cpp` (1.0.2.1, `rt::Loader` with static
+  TLS and unwind from #93, then `DllMain`; PC D3D12 device on an RTX 4090 behind the Xbox-ABI proxy). Measured:
+  - It maps with 0 unimplemented imports: `D3D12CreateRootSignatureDeserializer` and `XMemAlloc` /
+    `XMemFree` / `XMemGetWorkingSetStatistics` bind to the shims, 81 imports to host DLLs. Its TLS template is
+    8 bytes with no callbacks. `DllMain(DLL_PROCESS_ATTACH)` returns TRUE.
+  - `ffxConfigure(GLOBALDEBUG)` and the CPU-only upscale queries accept the **PC struct type ids**: the
+    Performance ratio is 2.0 and 3840x2160 Quality renders at 2560x1440. `GET_VERSIONS` for the upscaler lists one
+    provider, `0xf5a5ca1e01001001` "4.1.1".
+  - `ffxCreateContext` reports, through the message callback, that only one configuration is built in:
+    `maxUpscaleSize` 1920x1080 ("only the fixed-resolution Quality shader tables are included", so a 1280x720
+    render size), with `HIGH_DYNAMIC_RANGE`, `DEPTH_INVERTED` and `AUTO_EXPOSURE` all required. It also requires an
+    `ffxCreateContextDescUpscaleVersion` in the chain; 4.1.2 is rejected as invalid, 4.1.1 and 4.0.0 are accepted.
+  - With all of that, `ffxCreateContext` returns `FFX_API_RETURN_ERROR` with no message, no XMem allocation and no
+    call on the device proxy, for the PC DX12 backend descriptor (`0x2`), for the same `{header, device}` layout
+    under the Xbox backend id (`0x02000000`, `0x02000001`, `0x02000002`), and with no backend descriptor at all. So
+    the build does not recognise the PC backend descriptor, and the Xbox one (`FFX_API_BACKEND_ID_XBOX` is declared
+    in the public `ffx_api.h`, its descriptors are not) is unknown. Hypothesis: it is the GDK's Xbox D3D12 backend
+    descriptor; the executable's `ffxCreateContext` call site would show its type and layout.
 
 ### A.4 Other DLLs and the executable
 
