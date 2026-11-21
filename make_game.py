@@ -24,6 +24,7 @@ Stages, in order (each skips work that is already done, so a stopped build conti
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -274,7 +275,7 @@ def check(game: str, full: bool) -> dict:
 
 
 # ---------------------------------------------------------------- shaders
-def shaders(game: str, work: str, jobs: int) -> None:
+def shaders(game: str, work: str, jobs: int, emulate: bool = False) -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -313,17 +314,69 @@ def shaders(game: str, work: str, jobs: int) -> None:
         drop(translated)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
         mark_done(disassembled)
+    # The translation depends on --wave64-emulate, so the mode it was made with is kept beside it. A folder from
+    # before the file existed was translated without emulation.
+    mode_file = os.path.join(spirv, "wave64_emulate.txt")
+    want = "on" if emulate else "off"
+    if os.path.isfile(translated):
+        try:
+            with open(mode_file, encoding="utf-8") as f:
+                had = f.read().strip()
+        except OSError:
+            had = "off"
+        if had != want:
+            log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
+                "translating again")
+            drop(translated)
     if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
-        translate(disasm, spirv, jobs)
+        translate(disasm, spirv, jobs, emulate=emulate)
+        with open(mode_file, "w", encoding="utf-8") as f:
+            f.write(want + "\n")
     log("shaders: done")
 
 
 def mark_done(path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("shader_disasm.py finished\n")
+
+
+WAVE64_MODES = ("auto", "on", "off")
+
+
+def smallest_max_subgroup(vulkaninfo_text: str):
+    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
+    sizes = [int(n) for n in re.findall(r'maxSubgroupSize"?\s*[=:]\s*(\d+)', vulkaninfo_text)]
+    return min(sizes) if sizes else None
+
+
+def wave64_emulate(mode: str) -> bool:
+    """Whether to translate with --wave64-emulate (docs/design.md, "Wave64 emulation"). A wave64 compute or mesh
+    shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
+    size, at the cost of a workgroup barrier per segment. "auto" turns it on unless every Vulkan device reports
+    maxSubgroupSize >= 64, so a PC with both a 64-wide and a 32-wide GPU, or one vulkaninfo can't read, gets the
+    output that is exact on all of them."""
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    exe = shutil.which("vulkaninfo")
+    size = None
+    if exe:
+        try:
+            r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
+            size = smallest_max_subgroup(r.stdout)
+        except (OSError, subprocess.SubprocessError):
+            size = None
+    if size is None:
+        log("shaders: couldn't read the GPU's subgroup size from vulkaninfo: wave64 emulation on "
+            "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
+        return True
+    on = size < 64
+    log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
+    return on
 
 
 def drop(*paths: str) -> None:
@@ -333,16 +386,18 @@ def drop(*paths: str) -> None:
             os.remove(p)
 
 
-def translate(disasm: str, spirv: str, jobs: int) -> None:
+def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts."""
     os.makedirs(spirv, exist_ok=True)
     for f in os.listdir(spirv):  # parts from an earlier run with another --jobs would be merged in too
         if f.startswith("index.part") and f.endswith(".json"):
             os.remove(os.path.join(spirv, f))
     tool = os.path.join(TOOLS, "rdna2spirv.py")
-    log(f"  rdna2spirv.py {disasm} --out {spirv} --shard 0..{jobs - 1}/{jobs}")
+    extra = ["--wave64-emulate"] if emulate else []
+    log(f"  rdna2spirv.py {disasm} --out {spirv} --shard 0..{jobs - 1}/{jobs}" + "".join(" " + e for e in extra))
     # --no-asm: keep only the .spv modules; the .spvasm text would add ~35 GB for the corpus
-    procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm"])
+    procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm",
+                               *extra])
              for i in range(jobs)]
     bad = [f"shard {i} exited with {r}" for i, r in enumerate(p.wait() for p in procs) if r != 0]
     if bad:
@@ -508,6 +563,10 @@ def main() -> int:
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
+    ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",
+                    help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
+                         "32-wide GPUs: NVIDIA, Intel). auto (default) turns it on unless vulkaninfo shows that "
+                         "every GPU has 64-wide subgroups")
     a = ap.parse_args()
     below_normal()
     if a.find:
@@ -538,7 +597,7 @@ def main() -> int:
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
-        shaders(game, work, a.jobs)
+        shaders(game, work, a.jobs, emulate=wave64_emulate(a.wave64_emulate))
     if "assets" in stages:
         assets(game, work, a.wav, a.jobs)
     if "runtime" in stages:

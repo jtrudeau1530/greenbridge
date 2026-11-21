@@ -91,17 +91,18 @@ class ShaderStageResumeTest(unittest.TestCase):
         elif tool == "shader_disasm.py":
             os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
 
-    def fake_translate(self, disasm, spirv, jobs):
-        self.ran.append("translate")
+    def fake_translate(self, disasm, spirv, jobs, emulate=False):
+        self.ran.append("translate (emulated)" if emulate else "translate")
         self.touch(spirv, "index.json")
 
-    def run_stage(self):
+    def run_stage(self, emulate=None):
         self.ran = []
+        kw = {} if emulate is None else {"emulate": emulate}
         with mock.patch.object(make_game, "py", self.fake_py), \
                 mock.patch.object(make_game, "need", lambda *a: None), \
                 mock.patch.object(make_game, "translate", self.fake_translate), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.shaders(os.path.join(self.work, "game"), self.work, 2)
+            make_game.shaders(os.path.join(self.work, "game"), self.work, 2, **kw)
         return self.ran
 
     def test_fresh_folder_runs_every_step_then_nothing(self):
@@ -160,6 +161,38 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.touch(self.spirv, "index.json")
         self.assertEqual(self.run_stage(), ["translate"])
         self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "s0.s")))
+
+    # SHADER-11: the translation depends on --wave64-emulate, so a change of mode translates again.
+    def mode(self):
+        with open(os.path.join(self.spirv, "wave64_emulate.txt"), encoding="utf-8") as f:
+            return f.read().strip()
+
+    def test_the_mode_is_recorded_beside_the_translation(self):
+        self.run_stage(emulate=True)
+        self.assertEqual(self.mode(), "on")
+        self.run_stage(emulate=False)
+        self.assertEqual(self.mode(), "off")
+
+    def test_turning_emulation_on_translates_again_once(self):
+        self.run_stage(emulate=False)
+        self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
+        self.assertEqual(self.run_stage(emulate=True), [])
+
+    def test_turning_emulation_off_translates_again_once(self):
+        self.run_stage(emulate=True)
+        self.assertEqual(self.run_stage(emulate=False), ["translate"])
+        self.assertEqual(self.run_stage(emulate=False), [])
+
+    def test_a_folder_from_before_the_mode_file_counts_as_not_emulated(self):
+        self.run_stage(emulate=False)
+        os.remove(os.path.join(self.spirv, "wave64_emulate.txt"))
+        self.assertEqual(self.run_stage(emulate=False), [])  # nothing translated, so still no mode file
+        self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
+
+    def test_a_mode_change_does_not_redo_the_steps_before_translation(self):
+        self.run_stage(emulate=False)
+        self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
 
 
 if __name__ == "__main__":
