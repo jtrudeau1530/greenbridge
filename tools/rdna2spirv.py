@@ -5509,7 +5509,12 @@ def stage_of(name, path):
     return _STAGES.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
 
 
-WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
+# Wave64 markers in the instruction text. Besides EXEC/VCC forms, 64-bit lane-mask SOP1/SOP2 ops
+# (bcnt/ff/wqm/bfm) imply a 64-lane wave even when the mask lives in ordinary SGPR pairs (#210 part 2).
+WAVE64_RE = re.compile(
+    r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64|"
+    r"s_bcnt[01]_i32_b64|s_ff[01]_i32_b64|s_wqm_b64|s_bfm_b64"
+)
 
 
 def fold_far_branches(insns):

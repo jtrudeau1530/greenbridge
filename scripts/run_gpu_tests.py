@@ -496,6 +496,7 @@ def run_suite(a, work: str) -> int:
             else:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
+                      "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load"):
@@ -509,6 +510,7 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_half_cmp": [1, 0, 1, 1],
                 "cs_wm_bfm64": [16, 8, 8, 40],
                 "cs_wm_scc_rfl": [55, 48],
+                "cs_w64_mask_detect": [48],
                 # cross-half tests (derivations in each .asm); need exact wave64 or its emulation
                 "cs_w64x_readlane": [121, 121, 16, 97, 16, 100, 100, 121],
                 "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 4660, 99],
