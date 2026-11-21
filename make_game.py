@@ -363,32 +363,67 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):
         log("assets: audio banks")
         run([exe, "audio", os.path.join(game, "audio.rpf"), out])
-    if not os.path.isdir(os.path.join(out, "audio", "ogg")):
+    # The two audio steps below count as finished only by a marker written after they succeed: their folders are
+    # created first and exist after a stopped run too.
+    ogg = os.path.join(out, "audio", "ogg")
+    ogg_done = os.path.join(out, "audio", "ogg.done")
+    if not os.path.isfile(ogg_done):
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
-        py("awc_opus.py", os.path.join(out, "audio", "awc"), os.path.join(out, "audio", "ogg"))
+        py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg)
+        mark(ogg_done, "awc_opus.py")
     if wav:
-        ogg = os.path.join(out, "audio", "ogg")
         if not os.path.isdir(ogg):
             fail("assets: no Ogg Opus output to decode. The audio bank step must finish first (run the assets stage).")
         # Opt-in: lossless Ogg Opus -> 16-bit PCM WAV, several times larger. Existing WAVs are skipped.
         log("assets: audio Ogg Opus -> PCM WAV")
         py("audio_wav.py", ogg, "--out", os.path.join(out, "audio", "wav"), "--jobs", str(jobs))
     xma_dir = os.path.join(out, "audio", "xma")
-    if not os.path.isdir(xma_dir):
+    xma_done = os.path.join(out, "audio", "xma.done")
+    if not os.path.isfile(xma_done):
         log("assets: XMA2 streams")
         run([exe, "xma", os.path.join(game, "audio.rpf"), out])
-        ff = shutil.which("ffmpeg")
-        if ff:
-            log("assets: XMA2 -> PCM WAV (ffmpeg)")
-            for root, _, files in os.walk(xma_dir):
-                for f in files:
-                    if f.endswith(".xma.wav"):
-                        src = os.path.join(root, f)
-                        subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", src[:-8] + ".wav"])
-        else:
-            log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
+        mark(xma_done, "rpf9dump xma")
+    # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
+    ff = shutil.which("ffmpeg")
+    if ff:
+        decode_xma(ff, xma_dir)
+    else:
+        log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
     log("assets: done")
+
+
+def mark(path: str, what: str) -> None:
+    """Write a step's completion marker; call it only after the step succeeded."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{what} finished\n")
+
+
+def decode_xma(ff: str, xma_dir: str) -> None:
+    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
+    temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
+    todo = []
+    for root, _, files in os.walk(xma_dir):
+        for f in files:
+            if f.endswith(".xma.wav") and not os.path.isfile(os.path.join(root, f[:-8] + ".wav")):
+                todo.append(os.path.join(root, f))
+    if not todo:
+        return
+    log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
+    bad = []
+    for src in sorted(todo):
+        dst = src[:-8] + ".wav"
+        tmp = dst + ".part"
+        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp])
+        if r.returncode == 0 and os.path.isfile(tmp):
+            os.replace(tmp, dst)
+        else:
+            bad.append(src)
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+    if bad:
+        log(f"assets: ffmpeg could not decode {len(bad)} XMA2 stream(s), first {os.path.relpath(bad[0], xma_dir)}. "
+            "They stay as .xma.wav; the next run tries them again.")
 
 
 # ---------------------------------------------------------------- runtime
