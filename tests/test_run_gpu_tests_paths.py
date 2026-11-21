@@ -56,8 +56,10 @@ class RelativePaths(unittest.TestCase):
                     self.assertEqual(run_gpu_tests.main(), 0)
             finally:
                 os.chdir(old)
-            self.assertEqual(Path(seen["build"]), build.resolve())
-            self.assertEqual(Path(seen["work"]), (Path(tmp) / "work").resolve())
+            # Compare resolved paths: Windows can spell the temp directory with an 8.3 name (RUNNER~1).
+            for got, want in ((seen["build"], build), (seen["work"], Path(tmp) / "work")):
+                self.assertTrue(os.path.isabs(got), got)
+                self.assertEqual(Path(got).resolve(), want.resolve())
 
 
 if __name__ == "__main__":
