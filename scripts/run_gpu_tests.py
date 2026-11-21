@@ -220,6 +220,13 @@ def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
 
 
+def w64_emulated() -> bool:
+    # Wave64 emulation on: the suite runs every wave64 check without asking for a 64-wide
+    # subgroup, matching check.py (W64_EMULATED). Accepts "1"/"true"/"yes"/"on" and tolerates
+    # the trailing space cmd.exe's `set VAR=1 &` leaves in the value.
+    return (os.environ.get("LEONIDA_W64_EMULATE") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
     px = read_raw_u32(raw_path)
     if len(px) != 64 * 64:
@@ -425,7 +432,7 @@ def run_suite(a, work: str) -> int:
 
     # 2. Translate all .s -> .spv
     cmd = [sys.executable, "-I", TRANSLATOR, disasm_dir, "--out", spirv_dir]
-    if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 compute/mesh exact on any subgroup size
+    if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
         cmd.append("--wave64-emulate")
     rc, out = run_cmd(cmd)
     print("=== rdna2spirv.py ===")
@@ -493,6 +500,12 @@ def run_suite(a, work: str) -> int:
             emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
             args = [] if emulated else ["--require-wave64"]
             rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", *args], env=cs_env)
+            # Whole-wave mask test, as in check.py (require_wave64=not W64_EMULATED): ask for a 64-wide
+            # subgroup and skip where the device has none — unless wave64 is emulated, in which case it
+            # runs on any subgroup size (translated with --wave64-emulate) and passes on "0 mismatches".
+            emulated = w64_emulated()
+            rc, msg = run_cmd([vk_compute, spv, "1", "wavemask"] + (["--require-wave64"] if not emulated else []),
+                              env=cs_env)
             if not emulated and rc == 77:
                 results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
             elif not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
@@ -534,7 +547,7 @@ def run_suite(a, work: str) -> int:
             # check.py does, where the device has none (vk_compute_test exits 77) instead of reporting a failure.
             # With LEONIDA_W64_EMULATE=1 they were translated with --wave64-emulate and run on any subgroup size.
             # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
-            emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
+            emulated = w64_emulated()
             partial = name == "cs_w64x_partial"
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm") and not emulated and not partial
             if partial and not emulated:
@@ -642,7 +655,7 @@ def run_suite(a, work: str) -> int:
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
             # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
             # the wave64 compute dumps are.
-            no64 = (name == "ms_w64x_ballot" and os.environ.get("LEONIDA_W64_EMULATE") != "1" and
+            no64 = (name == "ms_w64x_ballot" and not w64_emulated() and
                     not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
