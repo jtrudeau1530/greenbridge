@@ -176,6 +176,32 @@ The existing `runtime/test` tools already expose the hard parts (device selectio
 descriptor setup, readback). The differential runner should call them rather than grow a second
 Vulkan stack.
 
+### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
+
+`cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`
+carries a small reference model written from the RDNA2 addressing rules (V# base and stride, MUBUF
+`soffset + offset + voffset + vindex * stride`, SMEM pointer/V# plus offsets, signed 12-bit `global_*`
+offsets, 32-bit buffer atomics) and compares it with the translation run in `spirv_mini_interp`. Both
+the exported words and the whole final memory are compared, so stores and atomics are checked too.
+
+```powershell
+python -I tools/mem_diff.py --programs 3000 --seed 1 [--family buffer_load] [--max-ops 4]
+python -I tools/mem_diff.py --self-test
+python -I tests/test_mem_diff.py
+```
+
+Families: `s_load`, `s_buffer_load`, `buffer_load`, `buffer_store`, `buffer_atomic`, `global`
+(dword loads/stores, `ubyte`/`sbyte`/`ushort`/`sshort`). Every access is generated in bounds and
+dword aligned (sub-dword loads at their natural alignment), with no format in word3: out-of-bounds
+results, `OOB_SELECT`, swizzling and the `s_buffer_load` alignment truncation depend on descriptor
+fields the translator does not model yet, so they need a GPU-confirmed rule before they are fuzzed.
+`spirv_mini_interp` gained `OpSConvert` and the 32-bit atomics on PhysicalStorageBuffer memory for
+this. Not covered yet: `buffer_load_format_*`/`tbuffer_load_format_*` (about 137,000 instructions in
+the corpus) and images.
+
+A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
+76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
