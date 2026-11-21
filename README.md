@@ -120,6 +120,10 @@ cmake --build runtime/build/linux --parallel
 
 Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
 
+`make_game.py` runs on Linux too, without the `runtime` stage, which builds on Windows only for now: without
+`--stages` it is left out, and asking for it fails before any work starts. The `pipelines` stage uses the
+`vk_pipeline_check` built above (`runtime/build/linux`, or `runtime/build`).
+
 ## How it works
 
 | Piece | What it does | Where |
