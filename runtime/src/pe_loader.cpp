@@ -281,6 +281,16 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     auto dot = spec.rfind('.');
     if (dot == std::string::npos || dot == 0 || dot + 1 >= spec.size()) return nullptr;
     const std::string module = spec.substr(0, dot), symbol = spec.substr(dot + 1);
+
+    // A forwarder can name a module the loader shims. Shims take precedence over a bundled or host copy, exactly as
+    // they do for a direct import in resolve(); without this, a forwarded xmem or d3d12_xs call becomes a failure thunk.
+    std::string shim_key = lower(module);
+    if (shim_key.size() < 4 || shim_key.compare(shim_key.size() - 4, 4, ".dll") != 0) shim_key += ".dll";
+    if (void* p = shims::find(shim_key, symbol)) {
+        binding = Binding::Shim;
+        return p;
+    }
+
     const bool by_ordinal = symbol.size() > 1 && symbol[0] == '#';
     uint32_t ordinal = 0;
     if (by_ordinal) {

@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "../shims/shims.h"
 #include "../src/pe_loader.h"
 
 namespace {
@@ -136,6 +137,12 @@ void* host_symbol(const char* dll, const char* name) {
     HMODULE h = GetModuleHandleA(dll);
     return h ? reinterpret_cast<void*>(GetProcAddress(h, name)) : nullptr;
 }
+
+// A shim table for the forwarder test, so the test does not depend on the real xmem shim. Registering it at startup
+// exercises the same registry a packaged module reaches.
+int g_test_shim_target = 0;
+void* test_shim_function() { return &g_test_shim_target; }
+SHIM_TABLE(test_forwarder_shim, {"testshim.dll", "F", reinterpret_cast<void*>(&test_shim_function)});
 
 // 0 when the image loaded, 1 when it was rejected. A crash here is a test failure, which is the point.
 int load(const std::filesystem::path& p, std::string& error) {
@@ -578,6 +585,22 @@ void test_forwarded_exports() {
             rt::Module& m = loader.load(importer);
             if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Unimplemented)
                 return failed(what, "a forwarder loop did not end as unimplemented");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "a forwarder to a shimmed module binds to the shim";
+        write_image_as(make_forwarder_image("testshim.F", 0x180000000), "prov_shim.dll");
+        auto importer = write_image_as(make_import_image("prov_shim.dll", "fwd"), "importer_shim.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(importer);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Shim)
+                return failed(what, "the import did not bind as a shim");
+            if (*reinterpret_cast<void**>(m.base + 0x1180) != reinterpret_cast<void*>(&test_shim_function))
+                return failed(what, "the address table does not hold the shim function");
             pass(what);
         } catch (const std::exception& e) {
             failed(what, e.what());
