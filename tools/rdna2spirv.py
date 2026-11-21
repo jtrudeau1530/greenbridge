@@ -2265,14 +2265,20 @@ class Gen:
             elif self.wave64:
                 # Same on a 64-wide subgroup: the half's base comes from the subgroup lane (on a 32-wide one it
                 # is 0, as before). Until 2026-11-21 lanes 32-63 read lanes 0-31 there, and inactive sources
-                # kept their value. GPU-checked with cs_w64x_bpermute.
+                # kept their value. GPU-checked with cs_w64x_bpermute. A shuffle from an invocation that isn't
+                # running (the missing lanes of a partial wave) is undefined in SPIR-V, and RADV returns stale
+                # registers; the ballot makes it read 0 like a lane that is off. GPU-checked with cs_w64x_partial.
                 lane, half, src, z = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{lane} = OpLoad %uint %sg_lane")
                 self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
                 self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
-                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {z} {src}")
-                self.uses_subgroup = True
+                bal, ex, sh = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
+                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {src}")
+                self.emit(f"{r} = OpSelect %uint {ex} {sh} {self.cu(0)}")
+                self.uses_subgroup = self.uses_ballot = True
             else:
                 self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {dat} {ln2}")
                 self.uses_subgroup = True

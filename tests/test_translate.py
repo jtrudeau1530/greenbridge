@@ -383,6 +383,22 @@ def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
     assert asm_vcc.count("OpBitCount %uint %c0") == 2
 
 
+def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader):
+    """Native wave64 ds_bpermute: a source lane missing from a partial wave must read 0, not an undefined shuffle."""
+    shader = make_shader("s_mov_b64 exec, -1\nv_lshlrev_b32_e32 v1, 2, v0\nds_bpermute_b32 v2, v1, v0\n"
+                         "s_waitcnt lgkmcnt(0)\ns_endpgm\n", name="cs_bperm64_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.wave64
+    assert re.search(
+        r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
+        r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \1 (%t\d+)\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \3\n\s*"
+        r"%t\d+ = OpSelect %uint \2 \4 %c0\n",
+        asm,
+    ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
+
+
 EMULATE_SAMPLES = [p for p in SAMPLES if os.path.basename(p).startswith(("cs_", "ms_"))]
 
 
