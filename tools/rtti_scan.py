@@ -20,7 +20,6 @@ import re
 import struct
 import sys
 
-import pefile
 
 
 def simple_name(mangled: str) -> str:
@@ -37,6 +36,7 @@ def main():
     ap.add_argument("image")
     ap.add_argument("--out")
     a = ap.parse_args()
+    import pefile  # only the CLI needs it; the helpers import without it
     pe = pefile.PE(a.image, fast_load=True)
     base = pe.OPTIONAL_HEADER.ImageBase
     img = pe.get_memory_mapped_image()
