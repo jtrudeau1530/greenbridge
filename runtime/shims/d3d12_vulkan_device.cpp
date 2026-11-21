@@ -565,26 +565,24 @@ struct DeviceState {
         return properties3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
     }
 
-    // The first memory type with `required`, preferring one that also has `preferred`. `chosen`, when given, receives
-    // the property flags of the type the memory came from.
+    // A memory type with `required`, preferring one that also has `preferred`, in a heap large enough for the
+    // allocation (leonida::memory_type_order). `chosen`, when given, receives the property flags of the type the
+    // memory came from.
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
                             bool device_address = false) const {
         VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        for (const VkMemoryPropertyFlags flags : {required | preferred, required}) {
-            for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
-                if (!(requirements.memoryTypeBits & (1u << i))) continue;
-                if ((memory.memoryTypes[i].propertyFlags & flags) != flags) continue;
-                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                if (device_address) allocate.pNext = &flags_info;
-                allocate.allocationSize = requirements.size;
-                allocate.memoryTypeIndex = i;
-                VkDeviceMemory out = VK_NULL_HANDLE;
-                if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
-                    if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
-                    return out;
-                }
+        for (const std::uint32_t i :
+             leonida::memory_type_order(memory, requirements.memoryTypeBits, required, preferred, requirements.size)) {
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            if (device_address) allocate.pNext = &flags_info;
+            allocate.allocationSize = requirements.size;
+            allocate.memoryTypeIndex = i;
+            VkDeviceMemory out = VK_NULL_HANDLE;
+            if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
+                if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
+                return out;
             }
         }
         return VK_NULL_HANDLE;

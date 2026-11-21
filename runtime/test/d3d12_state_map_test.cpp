@@ -4,7 +4,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "../src/vulkan_replay.h"
-#include "../src/vulkan_memory.h"  // resizable_bar
+#include "../src/vulkan_memory.h"  // resizable_bar, memory_type_order
 
 #ifdef _WIN32
 #include <windows.h>
@@ -417,6 +417,34 @@ int main() {
         CHECK(!resizable_bar(VkPhysicalDeviceMemoryProperties{}));
     }
 
-    std::printf("state map, enhanced barriers, subresource decoding, layout tracking and BAR detection OK\n");
+    // Memory type choice. Heaps as an RTX 3090 without Resizable BAR reports them: VRAM, system memory, and the
+    // 214 MiB BAR heap that holds the only DEVICE_LOCAL | HOST_VISIBLE type.
+    {
+        constexpr VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VkPhysicalDeviceMemoryProperties memory{};
+        memory.memoryHeapCount = 3;
+        memory.memoryHeaps[0] = {24ull << 30, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        memory.memoryHeaps[1] = {32ull << 30, 0};
+        memory.memoryHeaps[2] = {224395264, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        memory.memoryTypeCount = 4;
+        memory.memoryTypes[0] = {local, 0};
+        memory.memoryTypes[1] = {host, 1};
+        memory.memoryTypes[2] = {host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1};
+        memory.memoryTypes[3] = {local | host, 2};
+        using order = std::vector<std::uint32_t>;
+        constexpr VkDeviceSize mib = 1 << 20;
+        CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{1, 2}));     // the 256 MiB arena
+        CHECK(memory_type_order(memory, 0xF, host, local, 128 * mib) == (order{3, 1, 2}));  // fits the BAR heap
+        CHECK(memory_type_order(memory, 0xF, host, local, 224395264) == (order{3, 1, 2}));  // exactly fits
+        CHECK(memory_type_order(memory, 0x7, host, local, 128 * mib) == (order{1, 2}));     // type 3 not allowed
+        CHECK(memory_type_order(memory, 0xF, 0, local, 1 * mib) == (order{0, 3, 1, 2}));
+        CHECK(memory_type_order(memory, 0xF, host, local, 64ull << 30).empty());           // nothing that large
+        memory.memoryHeaps[2].size = 24ull << 30;                                         // Resizable BAR on
+        CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
+    }
+
+    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, BAR detection and memory "
+                "types OK\n");
     return 0;
 }
