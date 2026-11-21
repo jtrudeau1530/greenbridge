@@ -277,11 +277,20 @@ def shaders(game: str, work: str, jobs: int) -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
-    if not os.path.isfile(os.path.join(dxbc, "index.json")):
+    spirv = os.path.join(sh, "spirv")
+    # Each stage counts as finished only when the file it writes last is there, never because its folder exists
+    # or holds many files: a run stopped part-way leaves both. Re-running a stage drops the later stages' proof.
+    carved = os.path.join(dxbc, "index.json")             # shader_carve.py, renamed into place at the end
+    unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
+    disassembled = os.path.join(dxbc, "disasm.done")      # written here once shader_disasm.py exits with 0
+    translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
+    if not os.path.isfile(carved):
         log("shaders: carving shaders.rpf")
+        drop(unpacked, disassembled, translated)
         py("shader_carve.py", src, dxbc)
-    if not os.path.isdir(os.path.join(dxbc, "fssm")):
+    if not os.path.isfile(unpacked):
         log("shaders: unpacking native code")
+        drop(disassembled, translated)
         py("fssm_unpack.py", dxbc)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
@@ -290,19 +299,28 @@ def shaders(game: str, work: str, jobs: int) -> None:
     if os.path.isdir(old) and not os.path.isdir(disasm):
         log("shaders: moving disasm into the carve folder and translating again")
         os.rename(old, disasm)
-        shutil.rmtree(os.path.join(sh, "spirv"), ignore_errors=True)
-    if not os.path.isdir(disasm) or len(os.listdir(disasm)) < 1000:
+        shutil.rmtree(spirv, ignore_errors=True)
+    if not os.path.isfile(disassembled):
         need(os.environ.get("LLVM_MC", "llvm-mc"),
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's full path.")
         log("shaders: disassembling (gfx1013)")
+        drop(translated)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
-    spirv = os.path.join(sh, "spirv")
-    if not os.path.isdir(spirv) or len(os.listdir(spirv)) < 1000:
+        with open(disassembled, "w", encoding="utf-8") as f:
+            f.write("shader_disasm.py finished\n")
+    if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
         translate(disasm, spirv, jobs)
     log("shaders: done")
+
+
+def drop(*paths: str) -> None:
+    """Remove the files that mark later stages finished, so they run again on this stage's new output."""
+    for p in paths:
+        if os.path.isfile(p):
+            os.remove(p)
 
 
 def translate(disasm: str, spirv: str, jobs: int) -> None:
