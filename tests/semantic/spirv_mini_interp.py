@@ -24,6 +24,7 @@ bool is bool.
 import math
 import re
 import struct
+from fractions import Fraction
 
 MASK = 0xFFFFFFFF
 
@@ -69,6 +70,34 @@ def f32(x):
         return struct.unpack("<f", struct.pack("<f", x))[0]
     except OverflowError:
         return float("inf") if x > 0 else float("-inf")
+
+
+def fma_f32(x, y, z):
+    """x * y + z with one rounding to binary32 (round to nearest even), as GLSL.std.450 Fma on IEEE hardware.
+
+    The product and sum are exact rationals; rounding them through a double first could land on a binary32
+    midpoint and round the wrong way (for example (1 + 2**-12)**2 + 2**-70)."""
+    if not all(math.isfinite(v) for v in (x, y, z)):
+        return f32(x * y + z)                 # inf/NaN rules: Python's float arithmetic follows IEEE here
+    exact = Fraction(x) * Fraction(y) + Fraction(z)
+    if exact == 0:
+        product_zero = x == 0.0 or y == 0.0
+        negative = product_zero and math.copysign(1.0, x) * math.copysign(1.0, y) < 0 and math.copysign(1.0, z) < 0
+        return -0.0 if negative else 0.0
+    a = abs(exact)
+    e = a.numerator.bit_length() - a.denominator.bit_length()
+    if Fraction(2) ** e > a:
+        e -= 1
+    e = max(e, -126)                          # below the normal range the step is 2**-149
+    q = a / Fraction(2) ** (e - 23)
+    n = q.numerator // q.denominator
+    rem = q - n
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n & 1):
+        n += 1
+    r = math.ldexp(n, e - 23)
+    if r >= 2.0 ** 128:
+        r = math.inf
+    return f32(math.copysign(r, exact))
 
 
 def f32_bits(x):
@@ -635,6 +664,23 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
+        elif op == "OpFDiv":
+            x, y = val(a[1]), val(a[2])
+            if not (isinstance(x, float) and isinstance(y, float)):
+                raise UnsupportedConstruct("OpFDiv on non-float")
+            if y == 0.0:
+                raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")
+            if math.isinf(x) and math.isinf(y):
+                values[res] = math.nan
+            elif math.isnan(x) or math.isnan(y):
+                values[res] = math.nan
+            else:
+                values[res] = f32(x / y)        # x/inf is a signed zero, as in Python
+        elif op in ("OpIsNan", "OpIsInf"):
+            x = val(a[1])
+            if not isinstance(x, float):
+                raise UnsupportedConstruct(f"{op} on non-float")
+            values[res] = math.isnan(x) if op == "OpIsNan" else math.isinf(x)
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
             if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
@@ -686,13 +732,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name == "PackHalf2x16":
                 values[res] = float_to_half(args[0][0]) | (float_to_half(args[0][1]) << 16)
             elif name == "Fma":
-                # Exact product and sum in double, one rounding to binary32. Not a true fused operation in
-                # general, but exact for the f16-derived operands the tests use (see tests/semantic/README.md).
+                # Exact product and sum, one rounding to binary32 (fma_f32).
                 x, y, z = args
                 if isinstance(x, tuple):
-                    values[res] = tuple(f32(p * q + s) for p, q, s in zip(x, y, z))
+                    values[res] = tuple(fma_f32(p, q, s) for p, q, s in zip(x, y, z))
                 else:
-                    values[res] = f32(x * y + z)
+                    values[res] = fma_f32(x, y, z)
             elif name in ("Sin", "Cos"):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
@@ -705,9 +750,40 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
                 v = max(args[0], args[1])
                 values[res] = f32(v if name == "FMax" else min(v, args[2]))
+            elif name in ("Floor", "Ceil", "Trunc"):
+                x = args[0]
+                if not math.isfinite(x):
+                    values[res] = x
+                else:
+                    r = float({"Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc}[name](x))
+                    values[res] = math.copysign(r, x) if r == 0.0 else r      # keeps the sign of -0.5 -> -0.0
+            elif name in ("Exp2", "Log2", "Sqrt", "InverseSqrt"):
+                # Correctly rounded here; Vulkan allows a few ULP of error (tests compare exact results only for
+                # inputs whose result is exact). GLSL.std.450 leaves Log2 of x <= 0, Sqrt of x < 0 and
+                # InverseSqrt of x <= 0 undefined; those raise.
+                x = args[0]
+                if math.isnan(x):
+                    values[res] = x
+                elif name == "Exp2":
+                    if math.isinf(x):
+                        values[res] = math.inf if x > 0 else 0.0
+                    else:
+                        values[res] = f32(2.0 ** x) if x < 1024.0 else math.inf
+                elif (name == "Sqrt" and x < 0.0) or (name != "Sqrt" and x <= 0.0):
+                    raise UnsupportedConstruct(f"GLSL.std.450 {name} of {x!r} (undefined)")
+                elif math.isinf(x):
+                    values[res] = {"Log2": math.inf, "Sqrt": math.inf, "InverseSqrt": 0.0}[name]
+                elif name == "Log2":
+                    values[res] = f32(math.log2(x))
+                elif name == "Sqrt":
+                    values[res] = f32(math.sqrt(x))         # sqrt(-0.0) is -0.0
+                else:
+                    values[res] = f32(1.0 / math.sqrt(x))
             elif name == "RoundEven":
                 x = args[0]
-                values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
+                # round() breaks ties to even; it returns an int, so a zero result takes the operand's sign back
+                # (roundEven(-0.4) is -0.0).
+                values[res] = math.copysign(f32(float(round(x))), x) if math.isfinite(x) else x
             elif name in ("FMin", "FMax"):
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")

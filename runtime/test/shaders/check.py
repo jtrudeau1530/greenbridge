@@ -65,6 +65,7 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops6": (0xf800ffff, 0x01000010, 0x00800800, 0x8000fff0),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
+              "ps_f32_mods": (0xc0256a01, 0x3f800000, 0x41e00000, 0x3fc00000),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
               "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203)}

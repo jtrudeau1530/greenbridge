@@ -41,6 +41,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,
   `v_pk_lshlrev_b16`, `v_sin_f16` and `v_mul_legacy_f32`) and requires `test_ps_semantics.py` to fail for the
   matching shader.
+- `test_f32_valu.py` runs `ps_f32_mods` (`v_mac_f32` rounds the product before the add; VOP3 clamp and output
+  modifiers on `v_cvt_f32_ubyte*`/`u32`/`f16` and `v_rcp_iflag_f32`), found by `tools/f32_fuzz.py` (FUZZ-3), and
+  tests the interpreter's float operations against GLSL.std.450 (signed zeros, undefined inputs, a single-rounding
+  `Fma`).
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
 
@@ -49,8 +53,11 @@ Limits: single lane (or lanes in lockstep, one instruction per lane per round, t
 dynamic-bounds merge; no backward branches, loops, calls or switches), no texture access. PushConstant words,
 Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
 undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
-through a float op lose NaN payloads (Python floats), so expected output words avoid NaN bit patterns. `Fma` is
-computed in double precision then rounded to binary32 (exact for the f16-derived operands used). The `.asm`
+through a float op lose NaN payloads (Python floats), so expected output words avoid NaN bit patterns; a
+signalling NaN read back through `OpBitcast` comes out quieted. `Fma` is exact: the product and sum are rationals,
+rounded once to binary32. `Exp2`/`Log2`/`Sqrt`/`InverseSqrt` are correctly rounded (Vulkan allows a few ULP), and
+inputs GLSL.std.450 or SPIR-V leave undefined (`Log2` of x <= 0, `OpFDiv` by zero, `FMax` of NaN...) raise
+`UnsupportedConstruct`. The `.asm`
 sources are written for `llvm-mc -mcpu=gfx1013`; these tests do not assemble them, so assembler syntax is not
 checked here.
 To add a shader: put the `.asm` in `runtime/test/shaders/`, add it to `SHADERS` in `regen_fixtures.py`, regenerate,
