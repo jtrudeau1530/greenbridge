@@ -3367,15 +3367,36 @@ class Gen:
             self.emit(f"{r} = OpConvertUToF %float {m}")
             self.dst(a[0], self.tou(r))
         elif op in ("v_cvt_u32_f32", "v_cvt_i32_f32"):
-            x = self.src_f(a[1])
-            r = self.tmp()
+            # Compare binary32 words before converting: the raw SPIR-V conversion
+            # must only see a representable operand, even when its result is discarded.
+            bits = self.src_u(a[1])
+            zero = self.cu(0)
+            past_inf = self.cu(0x7F800001)
+            in_range, saturated, safe, converted, result = (self.tmp() for _ in range(5))
             if op == "v_cvt_u32_f32":
-                self.emit(f"{r} = OpConvertFToU %uint {x}")
+                positive = self.tmp()
+                self.emit(f"{in_range} = OpULessThan %bool {bits} {self.cu(0x4F800000)}")  # +2^32
+                # Positive overflow through +inf saturates. Negative values and NaNs give zero.
+                self.emit(f"{positive} = OpULessThan %bool {bits} {past_inf}")
+                self.emit(f"{saturated} = OpSelect %uint {positive} {self.cu(0xFFFFFFFF)} {zero}")
             else:
-                i = self.tmp()
-                self.emit(f"{i} = OpConvertFToS %int {x}")
-                self.emit(f"{r} = OpBitcast %uint {i}")
-            self.dst(a[0], r)
+                magnitude, negative, not_nan, bound = (self.tmp() for _ in range(4))
+                self.emit(f"{magnitude} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{in_range} = OpULessThan %bool {magnitude} {self.cu(0x4F000000)}")  # 2^31
+                self.emit(f"{negative} = OpINotEqual %bool {bits} {magnitude}")
+                self.emit(f"{not_nan} = OpULessThan %bool {magnitude} {past_inf}")
+                self.emit(f"{bound} = OpSelect %uint {negative} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{saturated} = OpSelect %uint {not_nan} {bound} {zero}")
+            self.emit(f"{safe} = OpSelect %uint {in_range} {bits} {zero}")
+            x = self.tof(safe)
+            if op == "v_cvt_u32_f32":
+                self.emit(f"{converted} = OpConvertFToU %uint {x}")
+            else:
+                signed = self.tmp()
+                self.emit(f"{signed} = OpConvertFToS %int {x}")
+                self.emit(f"{converted} = OpBitcast %uint {signed}")
+            self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
+            self.dst(a[0], result)
         elif op in U2 or op in S2:
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
