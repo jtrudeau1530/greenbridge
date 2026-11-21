@@ -49,9 +49,9 @@ work on booting can start as soon as one is available to a developer.
 | Shader translator checked on a real GPU | ⚠️ Vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches and compute (LDS, barriers, buffer stores) checked on one GPU |
 | Models (OBJ with real names, UVs, material references) | ✅ Exported. Not all layouts are decoded yet |
 | Texture dictionaries and world texture pools (DDS) | ✅ Exported. Some pool entries (BCPack) are skipped |
-| Audio banks (AWC: Opus, XMA2) | ✅ Exported whole: Opus repackaged as Ogg Opus, PCM as WAV, XMA2 decoded with ffmpeg. `--wav` also writes 16-bit PCM WAV |
+| Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
 | PE loader and import shims | ⚠️ Skeleton. Untested against the real executable |
-| Xbox D3D12 → Vulkan | ❌ Not started |
+| Xbox D3D12 → Vulkan | ⚠️ Design and clean-room `xmem`/`d3d12_xs` shims; no device/queue/command-list proxy yet ([plan](docs/d3d12_vulkan.md)) |
 | Booting, story mode, anything playable | ❌ No |
 
 ## How to build
@@ -83,9 +83,9 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
-  Windows build has no AMDGPU target: on Windows install `llvm-21` in WSL and set
-  `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see [docs/design.md](docs/design.md#disassembling-shaders)).
-  On Linux, `llvm-mc` on PATH is enough.
+  Windows build has no AMDGPU target: on Windows install `llvm-21` in WSL and set `LLVM_MC` to the whole command,
+  `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
+  [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough.
 - Visual Studio 2022 with **Desktop development with C++**, for the runtime stage.
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
@@ -129,7 +129,10 @@ Pass the directory containing `index.json` and the translated SPIR-V files to `v
 | Research tools | PE/RTTI inspection, raw carving, texture tiling probes, GPU test harnesses | `tools/`, `runtime/test/` |
 
 The translator's runtime contract (user SGPRs, push constants, memory model, bindless images, vertex fetch,
-system values) and all the format notes are in [docs/design.md](docs/design.md).
+system values) and all the format notes are in [docs/design.md](docs/design.md). The Xbox D3D12 plan is in
+[docs/d3d12_vulkan.md](docs/d3d12_vulkan.md). Audio bank formats and the export tools are in
+[docs/audio.md](docs/audio.md); [docs/related_projects.md](docs/related_projects.md) records the prior art we may
+read and the licence limits on it.
 
 ## Want to help?
 
