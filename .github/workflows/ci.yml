@@ -24,3 +24,15 @@ jobs:
         run: |
           bad=$(git ls-files | grep -iE '\.(rpf|ttpf|xvd|dxbc|fssm|spv|spvasm|dds|bk2|awc|exe|dll)$' || true)
           if [ -n "$bad" ]; then echo "Game or binary files tracked:"; echo "$bad"; exit 1; fi
+  semantic-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Translator semantic tests
+        run: python -m unittest discover -s tests/semantic -v
