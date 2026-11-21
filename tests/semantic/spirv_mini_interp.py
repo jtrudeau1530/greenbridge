@@ -8,7 +8,8 @@ Design rules (see tests/semantic/README.md):
     UnsupportedConstruct. Nothing is skipped or approximated silently, so a translator change that starts
     emitting something new makes the test error out instead of passing.
   * One invocation (one lane), or with run_workgroup several in lockstep, which meet only at
-    OpGroupNonUniformShuffle (the one subgroup operation modelled). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
+    OpGroupNonUniformShuffle and OpGroupNonUniformBallot (the subgroup operations modelled, with
+    BallotBitExtract). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
     branches the translator emits: OpBranch / OpBranchConditional to a later label plus OpPhi at the merge block.
     Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores use a flat
@@ -175,6 +176,8 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     or past `subgroup_size` is undefined in SPIR-V: `out_of_range="raise"` raises UndefinedResult;
     `out_of_range="wrap"` takes lane Id mod subgroup_size instead, a model of one observed driver behaviour
     and not of the specification (Leonida issue #94: on a 32-wide NVIDIA subgroup lane 40 read lane 8).
+    OpGroupNonUniformBallot sets bit l for each lane l of the caller's subgroup whose predicate is true (every
+    invocation of the workgroup is running).
     """
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
@@ -197,6 +200,12 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
         results = []
         for i in range(invocations):
             kind, _, _value, ident = pending[i]
+            if kind == "OpGroupNonUniformBallot":
+                # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
+                base = (i // subgroup_size) * subgroup_size
+                bits = sum(1 << l for l in range(subgroup_size) if pending[base + l][2])
+                results.append(tuple((bits >> (32 * w)) & MASK for w in range(4)))
+                continue
             if kind != "OpGroupNonUniformShuffle":
                 raise UnsupportedConstruct(kind)
             if not 0 <= ident < subgroup_size:
@@ -552,6 +561,18 @@ def _invocation(text, inputs, push_constants, memory):
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformShuffle other than a Subgroup-scope integer")
             values[res] = yield (op, pc - 1, val(a[2]), val(a[3]))
+        elif op == "OpGroupNonUniformBallot":
+            # OpGroupNonUniformBallot <uvec4 type> <scope> <bool predicate>
+            k = types.t[a[0]]
+            if k[0] != "vec" or k[2] != 4 or val(a[1]) != 3 or not isinstance(val(a[2]), bool):
+                raise UnsupportedConstruct("OpGroupNonUniformBallot other than a Subgroup-scope uvec4")
+            values[res] = yield (op, pc - 1, val(a[2]), None)
+        elif op == "OpGroupNonUniformBallotBitExtract":
+            # OpGroupNonUniformBallotBitExtract <bool> <scope> <uvec4 ballot> <index>: needs no other lane.
+            ballot, idx = val(a[2]), val(a[3])
+            if val(a[1]) != 3 or not 0 <= idx < 128:
+                raise UnsupportedConstruct("OpGroupNonUniformBallotBitExtract scope or index")
+            values[res] = bool((ballot[idx // 32] >> (idx % 32)) & 1)
         elif op == "OpLogicalAnd":
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, bool) and isinstance(y, bool)):

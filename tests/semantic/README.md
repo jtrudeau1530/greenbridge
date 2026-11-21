@@ -38,7 +38,7 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
 
-Limits: single lane (or lanes in lockstep that meet only at `OpGroupNonUniformShuffle`), forward-only structured control flow (the fragment-exit discard test and the compute
+Limits: single lane (or lanes in lockstep that meet only at `OpGroupNonUniformShuffle` and `OpGroupNonUniformBallot`), forward-only structured control flow (the fragment-exit discard test and the compute
 dynamic-bounds merge; no backward branches, loops, calls or switches), no texture access. PushConstant words,
 Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
 undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
