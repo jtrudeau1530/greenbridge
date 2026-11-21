@@ -1468,6 +1468,41 @@ class Gen:
                     "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o"):
             self.image_op(op, a, mods)
+        elif op in ("v_sin_f16", "v_cos_f16"):
+            u = self.src_u({**a[1], "neg": False, "abs": False})
+            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))
+            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
+            f = self.modify_f(f, a[1])
+            self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")
+            self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
+            r = self.clamp_mods(r, mods)
+            self.emit(f"{w2} = OpCompositeConstruct %v2float {r} %f0")
+            self.emit(f"{pk} = OpExtInst %uint %glsl PackHalf2x16 {w2}")
+            self.emit(f"{lo} = OpBitwiseAnd %uint {pk} {self.cu(0xFFFF)}")
+            self.write_lo16(a[0], lo)
+        elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
+            # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
+            def bits(name, default):
+                m = next((m for m in mods if m.startswith(name + ":")), None)
+                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+            sel, selhi = bits("op_sel", [0, 0]), bits("op_sel_hi", [1, 1])
+            sh_src, val_src = self.src_u(a[1]), self.src_u(a[2])
+            halves = []
+            for h, sl in ((0, sel), (1, selhi)):
+                amt, val, am, r16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(16 * sl[0])} {self.cu(4)}")
+                ext = "OpBitFieldSExtract" if op.endswith("i16") else "OpBitFieldUExtract"
+                self.emit(f"{val} = {ext} %uint {val_src} {self.cu(16 * sl[1])} {self.cu(16)}")
+                k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical",
+                     "v_pk_ashrrev_i16": "OpShiftRightArithmetic"}[op]
+                self.emit(f"{am} = {k} %uint {val} {amt}")
+                self.emit(f"{r16} = OpBitwiseAnd %uint {am} {self.cu(0xFFFF)}")
+                halves.append(r16)
+            hi, r = self.tmp(), self.tmp()
+            self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
+            self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
+            self.dst(a[0], r)
         elif op in ("v_sin_f32", "v_cos_f32"):
             # RDNA takes the angle in turns: sin(x * 2*pi).
             x = self.src_f(a[1])
@@ -1555,7 +1590,7 @@ class Gen:
                 self.emit(f"{z} = OpIEqual %bool {x} {self.cu(0)}")
                 self.emit(f"{r} = OpSelect %uint {z} {self.cu(0xFFFFFFFF)} {d}")
             self.dst(a[0], r)
-        elif op in ("image_get_resinfo", "image_load_mip", "image_store") or op in self.IMG_ATOMICS:
+        elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") or op in self.IMG_ATOMICS:
             self.image_misc(op, a, mods)
         elif op in ("v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32"):
             # Cube face selection (standard table): major axis Z if |z|>=|x| and |z|>=|y|, else Y if |y|>=|x|,
@@ -2009,6 +2044,9 @@ class Gen:
             lo = self.tmp()
             self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
             self.write_lo16(a[0], lo)  # GFX10: f16 ops keep the high half
+        elif op in ("v_add_nc_u16", "v_sub_nc_u16"):
+            # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept.
+            self._insn({**ins, "op": ("v_add_u16_e64" if op == "v_add_nc_u16" else "v_sub_u16_e64")})
         elif op in ("v_lshrrev_b16", "v_lshlrev_b16", "v_ashrrev_i16", "v_add_u16", "v_sub_u16", "v_subrev_u16",
                     "v_mul_lo_u16", "v_max_u16", "v_min_u16", "v_max_i16", "v_min_i16", "v_and_b16", "v_or_b16",
                     "v_xor_b16"):
@@ -2928,7 +2966,8 @@ class Gen:
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         d, base = a[0], a[1]
         # A single dword may also land in vcc_lo / m0 / vcc_hi (seen: s_buffer_load_dword vcc_lo, ...).
-        single_special = n == 1 and d["k"] == "special" and d["t"] in ("vcc_lo", "vcc", "m0", "vcc_hi")
+        single_special = (n == 1 and d["k"] == "special" and d["t"] in ("vcc_lo", "vcc", "m0", "vcc_hi")) or \
+            (n == 2 and d["k"] == "special" and d["t"] == "vcc")
         if (d["k"] != "sgpr" and not single_special) or base["k"] != "sgpr":
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
         lo, hi = self.load_reg("sgpr", base["r"]), self.load_reg("sgpr", base["r"] + 1)
@@ -2958,7 +2997,10 @@ class Gen:
             self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
             self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
             if single_special:
-                self.dst(d, v)
+                if n == 2:          # vcc pair: low dword -> vcc_lo, high dword -> vcc_hi
+                    self.dst({"k": "special", "t": "vcc_lo" if i == 0 else "vcc_hi"}, v)
+                else:
+                    self.dst(d, v)
             else:
                 self.store_reg("sgpr", d["r"] + i, v)
 
@@ -3474,9 +3516,31 @@ class Gen:
     def image_misc(self, op, a, mods):
         """image_get_resinfo / image_load_mip on 2D sampled images, image_atomic_umin on 2D r32ui storage images."""
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
-        is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and op in self.IMG_ATOMICS
+        is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and (op in self.IMG_ATOMICS or op == "image_atomic_cmpswap")
         if op == "image_store":
             self.image_store(a, mods, dim)
+            return
+        if op == "image_load_mip" and dim == "dim:SQ_RSRC_IMG_3D" and "d16" not in mods and "a16" not in mods:
+            # x, y, z, mip from a 3D sampled image (binding 6)
+            vdata, addr = a[0], self.addr_regs(a[1])
+            if len(addr) < 4:
+                raise Unsupported("image_load_mip coords")
+            idx = self.desc_lookup(self.sgpr_words(a[2], 8))
+            self.uses_tex_3d = True
+            ip, img, iv, res = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{ip} = OpAccessChain %_ptr_UC_img3 %images_3d {idx}")
+            self.emit(f"{img} = OpLoad %img3d {ip}")
+            xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:4]]
+            self.emit(f"{iv} = OpCompositeConstruct %v3int {xs[0]} {xs[1]} {xs[2]}")
+            self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {xs[3]}")
+            dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+            dmask, out = int(dm.split(":")[1], 0), 0
+            for c in range(4):
+                if dmask >> c & 1:
+                    comp = self.tmp()
+                    self.emit(f"{comp} = OpCompositeExtract %float {res} {c}")
+                    self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
+                    out += 1
             return
         if (dim != "dim:SQ_RSRC_IMG_2D" and not is3d_atomic) or "d16" in mods or "a16" in mods:
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
@@ -3493,6 +3557,20 @@ class Gen:
             self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg3 %simages3d {idx}")
             val = self.load_reg("vgpr", vdata["r"])
+            if op == "image_atomic_cmpswap":
+                cmpv = self.load_reg("vgpr", vdata["r"] + 1)
+                act = self.active_b()
+                do, end = self.tmp() + "_do", self.tmp() + "_end"
+                self.emit(f"OpSelectionMerge {end} None")
+                self.emit(f"OpBranchConditional {act} {do} {end}")
+                self.emit(f"{do} = OpLabel")
+                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
+                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
+                if "glc" in mods:
+                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+                self.emit(f"OpBranch {end}")
+                self.emit(f"{end} = OpLabel")
+                return
             spv, neutral = self.IMG_ATOMICS[op]
             self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
             self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
@@ -3503,7 +3581,7 @@ class Gen:
         if op == "image_store":
             self.image_store(a, mods, dim)
             return
-        if op in self.IMG_ATOMICS:
+        if op in self.IMG_ATOMICS or op == "image_atomic_cmpswap":
             # Storage image (2D r32ui). Atomics: vdata holds the operand; with 'glc' the pre-op value comes back.
             self.uses_storage = True
             coords = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:2]]
@@ -3526,6 +3604,22 @@ class Gen:
                 self.emit(f"OpBranch {lbl_end}")
                 self.emit(f"{lbl_end} = OpLabel")
                 self.uses_v4uint = True
+                return
+            if op == "image_atomic_cmpswap":
+                # vdata = (src, cmp): memory = (memory == cmp) ? src : memory; glc returns the old value.
+                cmpv = self.load_reg("vgpr", vdata["r"] + 1)
+                act = self.active_b()
+                do, end = self.tmp() + "_do", self.tmp() + "_end"
+                self.emit(f"OpSelectionMerge {end} None")
+                self.emit(f"OpBranchConditional {act} {do} {end}")
+                self.emit(f"{do} = OpLabel")               # inactive lanes don't touch memory
+                tp, old = self.tmp(), self.tmp()
+                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
+                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
+                if "glc" in mods:
+                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+                self.emit(f"OpBranch {end}")
+                self.emit(f"{end} = OpLabel")
                 return
             spv, neutral = self.IMG_ATOMICS[op]
             tp, old, safe = self.tmp(), self.tmp(), self.tmp()
@@ -4711,7 +4805,9 @@ def mesh_psv(path, name):
                 return None
             maxv, maxp = struct.unpack_from("<HH", r, 12)
             tx, ty, tz = struct.unpack_from("<III", r, 36)
-            return {"maxv": maxv, "maxp": maxp, "topology": r[27], "threads": tx * ty * tz, "size": (tx, ty, tz)}
+            shared, = struct.unpack_from("<I", r, 0)
+            return {"maxv": maxv, "maxp": maxp, "topology": r[27], "threads": tx * ty * tz, "size": (tx, ty, tz),
+                    "shared": shared}
     return None
 
 
@@ -4785,6 +4881,25 @@ def translate(path):
         if not (1 <= psv["threads"] <= 1024) or not (1 <= psv["maxv"] <= 256) or not (1 <= psv["maxp"] <= 512):
             raise Unsupported("mesh limits")
         g.ms = psv
+        # LDS: the declared group-shared size, grown to cover every constant offset the code uses.
+        need = (psv.get("shared", 0) + 3) // 4
+        for ins in insns:
+            if not ins["op"].startswith("ds_") or ins["op"].startswith(("ds_swizzle", "ds_bpermute")):
+                continue
+            for m in ins["mods"]:
+                k, _, v = m.partition(":")
+                if not v[:1].isdigit():
+                    continue
+                if k == "offset":
+                    need = max(need, int(v, 0) // 4 + 4)
+                elif k in ("offset0", "offset1"):
+                    need = max(need, int(v, 0) * (64 if "st64" in ins["op"] else 1) * 2 + 4)
+        n = 16
+        while n < need:
+            n *= 2
+        g.lds_dwords = min(n, 16384)
+        g.cu(g.lds_dwords)
+        g.cu(g.lds_dwords - 1)
         for i in (2, 3, 5, 6, 10, 12, 20, 24, 31, 63, 0x108, 0x1FF, 0xFFF, psv["maxv"], psv["maxp"]):   # used by assemble
             g.cu(i)
     if stage == "cs":
