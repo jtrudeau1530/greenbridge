@@ -189,6 +189,57 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(emulate=False), [])  # nothing translated, so still no mode file
         self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
 
+    # A kill between the merge (index.json appears) and the end of shaders() must not leave a finished folder
+    # whose mode is unknown or wrong.
+    def kill_after_merge(self, emulate):
+        def translate_then_die(disasm, spirv, jobs, emulate=False):
+            self.touch(spirv, "index.json")                 # rdna2spirv.py --merge finished ...
+            raise KeyboardInterrupt                         # ... and the PC died right after
+        with mock.patch.object(make_game, "py", self.fake_py), \
+                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "translate", translate_then_die), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            with self.assertRaises(KeyboardInterrupt):
+                make_game.shaders(os.path.join(self.work, "game"), self.work, 2, emulate=emulate)
+
+    def test_a_kill_right_after_the_merge_keeps_the_finished_emulated_translation(self):
+        self.kill_after_merge(emulate=True)
+        self.assertEqual(self.run_stage(emulate=True), [])      # hours of translation are not redone
+        self.assertEqual(self.mode(), "on")
+
+    def test_a_kill_right_after_an_emulated_merge_is_not_mistaken_for_a_native_translation(self):
+        self.kill_after_merge(emulate=True)
+        self.assertEqual(self.run_stage(emulate=False), ["translate"])   # off was asked for: native, not "off"
+
+    def test_a_kill_right_after_a_native_merge_counts_as_native(self):
+        self.kill_after_merge(emulate=False)
+        self.assertEqual(self.run_stage(emulate=False), [])
+        self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
+
+    # `auto` can answer differently from one run to the next (a GPU asleep or hidden, vulkaninfo missing): an
+    # emulated translation is exact on every GPU, so auto keeps it instead of translating the corpus again.
+    def run_auto(self, emulate):
+        self.ran = []
+        with mock.patch.object(make_game, "py", self.fake_py), \
+                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "translate", self.fake_translate), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            make_game.shaders(os.path.join(self.work, "game"), self.work, 2, emulate=emulate, keep_emulated=True)
+        return self.ran
+
+    def test_auto_keeps_an_emulated_translation_when_this_run_would_not_emulate(self):
+        self.run_stage(emulate=True)
+        self.assertEqual(self.run_auto(emulate=False), [])
+        self.assertEqual(self.mode(), "on")
+
+    def test_auto_still_translates_again_when_a_native_translation_needs_emulation(self):
+        self.run_stage(emulate=False)
+        self.assertEqual(self.run_auto(emulate=True), ["translate (emulated)"])
+
+    def test_an_explicit_off_still_translates_an_emulated_folder_again(self):
+        self.run_stage(emulate=True)
+        self.assertEqual(self.run_stage(emulate=False), ["translate"])
+
     def test_a_mode_change_does_not_redo_the_steps_before_translation(self):
         self.run_stage(emulate=False)
         self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
