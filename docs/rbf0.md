@@ -402,8 +402,9 @@ JSON carries one object per resource: `offset`, `size`, `chunks`, `layout`, `roo
 `attrs_declared`, `attributes`, ordered `content` and `end`; values carry `descriptor`, `type`, `payload_offset`,
 `size` and `value`; text nodes carry `length`, `nul_terminated`, `text` and `utf8_valid`.
 
-XML is a rendering, not a round-trip. Fixed tags avoid descriptor names that are not legal XML names:
-`<node name="...">`, `<attr>`, `<value>` and `<text>`. A string containing XML markup is escaped by the writer.
+XML is a rendering, not a round-trip. Fixed tags avoid descriptor names that cannot be used as XML element names:
+`<node name="...">`, `<attr>`, `<value>` and `<text>`. A string containing XML markup is escaped by the writer. The
+`<rbf0>` root carries `status` and, on failure, `error`.
 
 The decoder fails closed. An index beyond the current descriptor table, an unknown record type, a non-zero element
 header word, a close or text with no open element, and a truncated payload stop that resource with `status` `bad`

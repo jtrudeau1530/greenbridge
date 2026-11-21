@@ -504,8 +504,10 @@ def write_xml(directory, docs):
         root = ET.Element("rbf0", {
             "root": _xml_safe(doc["root_name"]), "layout": doc["layout"],
             "offset": f"0x{doc['offset']:x}",
-            "size": str(doc["size"]), "descriptors": str(doc["descriptor_count"]),
-            "status": doc["status"]})
+            "size": str(doc["size"]), "chunks": str(doc["chunks"]),
+            "descriptors": str(doc["descriptor_count"]), "status": doc["status"]})
+        if doc["error"]:
+            root.set("error", _xml_safe(doc["error"]))
         if doc["tree"] is not None:
             _xml_node(root, doc["tree"])
         tree = ET.ElementTree(root)
