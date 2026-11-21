@@ -11,10 +11,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime" / "test" 
 import check
 
 
+# The other wave64-only dump tests (#73's cs_wm_*): name -> expected out[] words.
+WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS if n not in ("cs_store", "cs_wave64_ballot")}
+
+
+TOTAL = 19 + len(WAVE64_DUMPS)   # every test check.py runs (19 = the compute, store and pixel tests)
+
+
 class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False):
         def harness(_tool, shader, *args):
             name = Path(shader).stem
+            if name in WAVE64_DUMPS:
+                self.assertIn("--require-wave64", args)
+                if wavemask[0] == 77:          # same device as cs_wavemask: no 64-wide subgroups
+                    return wavemask
+                words = (WAVE64_DUMPS[name] + [0] * 8)[:8]
+                return 0, "compute subgroup size: 64\nout[0..7] = " + " ".join(map(str, words)) + "\n"
             if name in ("cs_wavemask", "cs_wave64_ballot"):
                 self.assertIn("--require-wave64", args)
                 if name == "cs_wavemask":
@@ -32,6 +45,8 @@ class Wave64Checks(unittest.TestCase):
             spirv = Path(tmp) / "spirv"
             spirv.mkdir()
             (spirv / "cs_wavemask.spv").touch()
+            for name in WAVE64_DUMPS:
+                (spirv / f"{name}.spv").touch()
             if not missing_ballot:
                 (spirv / "cs_wave64_ballot.spv").touch()
             output = io.StringIO()
@@ -47,7 +62,7 @@ class Wave64Checks(unittest.TestCase):
         self.assertRegex(out, r"cs_wavemask +SKIP")
         self.assertRegex(out, r"cs_wave64_ballot +SKIP")
         self.assertRegex(out, r"cs_exec64 +ok")
-        self.assertIn("16 of 18 pass, 2 skipped", out)
+        self.assertIn(f"{TOTAL - 2 - len(WAVE64_DUMPS)} of {TOTAL} pass, {2 + len(WAVE64_DUMPS)} skipped", out)
 
     def test_full_wave_checks_pass_with_expected_results(self):
         status, out = self.run_checks(
@@ -56,7 +71,7 @@ class Wave64Checks(unittest.TestCase):
         )
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_wave64_ballot +ok")
-        self.assertIn("18 of 18 pass, 0 skipped", out)
+        self.assertIn(f"{TOTAL} of {TOTAL} pass, 0 skipped", out)
 
     def test_ballot_mismatches_and_harness_errors_fail(self):
         wavemask = 0, "compute subgroup size: 64\n0 mismatches\n"
@@ -70,7 +85,7 @@ class Wave64Checks(unittest.TestCase):
                 status, out = self.run_checks(wavemask, ballot)
                 self.assertEqual(status, 1, out)
                 self.assertRegex(out, rf"cs_wave64_ballot +{detail}")
-                self.assertIn("17 of 18 pass, 0 skipped", out)
+                self.assertIn(f"{TOTAL - 1} of {TOTAL} pass, 0 skipped", out)
 
     def test_missing_wave64_fixture_fails_even_on_wave32(self):
         unsupported = 77, "full 64-wide compute subgroups unavailable\n"

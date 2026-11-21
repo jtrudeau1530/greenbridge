@@ -40,7 +40,7 @@ MUTATIONS = [
      'OpExtInst %v2float %glsl Fma {vx} {vx} {srcs[2]}',
      "test_ps_ops"),
     ("v_fma_f16 ignores source op_sel half", TRANSLATOR,
-     'self.emit(f"{f} = OpCompositeExtract %float {v2} {osel[i]}")',
+     'self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")',
      'self.emit(f"{f} = OpCompositeExtract %float {v2} 0")',
      "test_ps_ops2"),
     ("v_subrev_co_ci_u32 drops operand swap", TRANSLATOR,
