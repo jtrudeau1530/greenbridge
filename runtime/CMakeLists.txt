@@ -54,6 +54,19 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(clear_commands_test test/clear_commands_test.cpp)
   add_test(NAME clear_commands COMMAND clear_commands_test)
+
+  if(WIN32)
+    # Loader tests. They build their own PE images, so they need neither the game nor any other input.
+    add_executable(loader_test
+      test/loader_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(loader_test PRIVATE /OPT:NOREF)
+    add_test(NAME loader COMMAND loader_test)
+  endif()
 endif()
 
 if(WIN32)
