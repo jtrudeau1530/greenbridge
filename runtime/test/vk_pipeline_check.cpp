@@ -4,8 +4,7 @@
 // 6; samplers 1; descriptor hash table 2; storage images 4, 7 and 8..19; push constants 144 bytes). Device features
 // the corpus needs are enabled when the GPU has them. Reports every failure; optionally saves the pipeline cache
 // so a first boot doesn't compile these again.
-#include <vulkan/vulkan.h>
-#include <windows.h>
+#include "vulkan_loader.h"
 
 #include <cstdio>
 #include <cstring>
@@ -51,8 +50,8 @@ int main(int argc, char** argv) {
     std::string dir = argv[1];
     auto index = read_index(dir + "/index.json");
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
-    HMODULE lib = LoadLibraryA("vulkan-1.dll");
-    gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(lib, "vkGetInstanceProcAddr"));
+    gipa = load_vulkan();
+    if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
     VkInstance inst = VK_NULL_HANDLE;
     LOADI(vkCreateInstance);

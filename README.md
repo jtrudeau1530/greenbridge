@@ -102,6 +102,18 @@ on `--jobs` processes (half the CPU threads by default).
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.
 
+### Vulkan diagnostics on Linux
+
+With CMake 3.24+, a C++20 compiler, and Vulkan development headers and loader installed:
+
+```sh
+cmake -S runtime -B runtime/build/linux
+cmake --build runtime/build/linux --parallel
+./runtime/build/linux/vk_pipeline_check /path/to/spirv
+```
+
+Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
+
 ## How it works
 
 | Piece | What it does | Where |

@@ -3,8 +3,7 @@
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
-#include <vulkan/vulkan.h>
-#include <windows.h>
+#include "vulkan_loader.h"
 
 #include <cmath>
 #include <cstdio>
@@ -29,9 +28,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     const uint32_t groups = uint32_t(atoi(argv[2]));
-    HMODULE lib = LoadLibraryA("vulkan-1.dll");
-    if (!lib) { std::fprintf(stderr, "no vulkan-1.dll\n"); return 1; }
-    gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(lib, "vkGetInstanceProcAddr"));
+    gipa = load_vulkan();
+    if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
     VkInstance inst = VK_NULL_HANDLE;
     LOADI(vkCreateInstance);

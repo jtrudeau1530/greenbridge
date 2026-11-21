@@ -3,8 +3,7 @@
 // The shader builds three T#s (word1 FORMAT = 56 rgba8 unorm, 20 r32 uint, 21 r32 sint) and stores to three 8x8
 // images. The translator picks the float / uint / sint view (set 0, bindings 8 / 9 / 10 for 2D) from the FORMAT
 // field, and the bindless index from the descriptor hash table (binding 2). Checks every texel.
-#include <vulkan/vulkan.h>
-#include <windows.h>
+#include "vulkan_loader.h"
 
 #include <cmath>
 #include <cstdio>
@@ -44,9 +43,8 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv\n"); return 2; }
-    HMODULE lib = LoadLibraryA("vulkan-1.dll");
-    if (!lib) { std::fprintf(stderr, "no vulkan-1.dll\n"); return 1; }
-    gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(lib, "vkGetInstanceProcAddr"));
+    gipa = load_vulkan();
+    if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
     VkInstance inst = VK_NULL_HANDLE;
     LOADI(vkCreateInstance);

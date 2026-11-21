@@ -7,8 +7,7 @@
 //
 //   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3>   (S# words as hex)
 #define VK_NO_PROTOTYPES
-#include <vulkan/vulkan.h>
-#include <windows.h>
+#include "vulkan_loader.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -63,8 +62,8 @@ int main(int argc, char** argv) {
                           0x55555555, 0x66666666, 0x77777777, 0x88888888};   // any 8 dwords; only the key matters
     const uint32_t tsharp_va = 256;
 
-    HMODULE lib = LoadLibraryA("vulkan-1.dll");
-    gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(lib, "vkGetInstanceProcAddr"));
+    gipa = load_vulkan();
+    if (!gipa) return 1;
     VkInstance inst = VK_NULL_HANDLE;
 #define LI(n) auto n = reinterpret_cast<PFN_##n>(gipa(inst, #n))
     LI(vkCreateInstance);

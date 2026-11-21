@@ -3,10 +3,8 @@
 //
 //   vk_harness <vs.spv> <fs.spv> <out.raw> [width height]
 //
-// Vulkan is loaded at runtime from vulkan-1.dll (no SDK import library needed).
 #define VK_NO_PROTOTYPES
-#include <vulkan/vulkan.h>
-#include <windows.h>
+#include "vulkan_loader.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,9 +37,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     uint32_t W = argc > 5 ? atoi(argv[4]) : 64, H = argc > 5 ? atoi(argv[5]) : 64;
-    HMODULE lib = LoadLibraryA("vulkan-1.dll");
-    if (!lib) { std::fprintf(stderr, "no vulkan-1.dll\n"); return 1; }
-    gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(lib, "vkGetInstanceProcAddr"));
+    gipa = load_vulkan();
+    if (!gipa) return 1;
     VkInstance inst = VK_NULL_HANDLE;
     LOADI(vkCreateInstance);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
