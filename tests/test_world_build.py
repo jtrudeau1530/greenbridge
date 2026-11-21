@@ -1227,6 +1227,115 @@ class WorldBuildTest(unittest.TestCase):
         cmd = [sys.executable, "-I", self.TOOL, assets_dir, "--out", out_dir, *extra_args]
         return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
+    @staticmethod
+    def _output_snapshot(directory):
+        snapshot = {}
+        for root, dirs, files in os.walk(directory):
+            for name in dirs:
+                snapshot[os.path.relpath(os.path.join(root, name), directory)] = None
+            for name in files:
+                path = os.path.join(root, name)
+                with open(path, "rb") as f:
+                    snapshot[os.path.relpath(path, directory)] = f.read()
+        return snapshot
+
+    def test_unusable_input_preserves_output_and_reports_failure(self):
+        cases = ("unrelated_directory", "corrupt_manifest", "invalid_schema", "empty_manifest",
+                 "missing_objs", "empty_geometry", "invalid_file_fields")
+        for existing_output in (False, True):
+            for case in cases:
+                with self.subTest(existing_output=existing_output, case=case), tempfile.TemporaryDirectory() as tmp:
+                    assets = os.path.join(tmp, "assets")
+                    output = os.path.join(tmp, "world")
+                    info = _write_synthetic_assets(assets, origin_overlap=False)
+                    if existing_output:
+                        world_build.build_world(assets, output, textures=False)
+                    before = self._output_snapshot(output)
+                    source = assets
+                    if case == "unrelated_directory":
+                        source = os.path.join(tmp, "wrong_input")
+                        os.mkdir(source)
+                    elif case in ("corrupt_manifest", "invalid_schema", "empty_manifest", "invalid_file_fields"):
+                        content = {
+                            "corrupt_manifest": "{broken",
+                            "invalid_schema": '{"Items": null}',
+                            "empty_manifest": '{"Items": []}',
+                            "invalid_file_fields": '{"Items": [{"File": ""}, {"File": 123}]}',
+                        }[case]
+                        with open(info["models_manifest_path"], "w", encoding="utf-8") as f:
+                            f.write(content)
+                    else:
+                        for root, _, files in os.walk(assets):
+                            for name in files:
+                                if name.endswith(".obj"):
+                                    path = os.path.join(root, name)
+                                    if case == "missing_objs":
+                                        os.remove(path)
+                                    else:
+                                        with open(path, "w", encoding="utf-8") as f:
+                                            f.write("# Synthetic OBJ without faces\nv 0 0 0\n")
+                    diagnostic = "No readable model manifests" if case in (
+                        "unrelated_directory", "corrupt_manifest", "invalid_schema") else "No usable models"
+                    with self.assertRaisesRegex(ValueError, diagnostic):
+                        world_build.build_world(source, output, textures=False)
+                    self.assertEqual(self._output_snapshot(output), before)
+                    result = self._run_cli(source, output, "--no-textures")
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("ERROR:", result.stderr)
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertIn(source, result.stderr)
+                    self.assertNotIn("world built:", result.stdout)
+                    self.assertEqual(self._output_snapshot(output), before)
+                    if not existing_output:
+                        self.assertFalse(os.path.exists(output))
+
+    def test_limit_zero_explicitly_replaces_world_with_empty_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            _write_synthetic_assets(assets, origin_overlap=False)
+            for cli in (False, True):
+                world_build.build_world(assets, output, textures=False)
+                empty_source = os.path.join(tmp, "empty_input")
+                os.makedirs(empty_source, exist_ok=True)
+                if cli:
+                    result = self._run_cli(empty_source, output, "--no-textures", "--limit", "0")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                else:
+                    world_build.build_world(empty_source, output, textures=False, limit=0)
+                with open(os.path.join(output, "world.json"), encoding="utf-8") as f:
+                    document = json.load(f)
+                self.assertEqual(document["stats"]["models"], 0)
+                self.assertEqual(document["chunks"], [])
+                self.assertEqual(os.listdir(os.path.join(output, "chunks")), [])
+
+    def test_limit_does_not_fall_back_to_unselected_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            info = _write_synthetic_assets(assets, origin_overlap=False)
+            world_build.build_world(assets, output, textures=False)
+            before = self._output_snapshot(output)
+            with open(info["models_manifest_path"], encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest["Items"].insert(0, {"File": "missing.obj"})
+            with open(info["models_manifest_path"], "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with self.assertRaisesRegex(ValueError, "1 selected manifest items"):
+                world_build.build_world(assets, output, textures=False, limit=1)
+            self.assertEqual(self._output_snapshot(output), before)
+
+    def test_mixed_input_still_builds_usable_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            info = _write_synthetic_assets(assets, origin_overlap=False)
+            with open(info["models_manifest_path"], encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest["Items"].append({"File": "missing.obj"})
+            with open(info["models_manifest_path"], "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            result = world_build.build_world(assets, output, textures=False, jobs=4)
+            self.assertEqual(result["stats"]["models"], 2)
+            self.assertEqual(len(result["chunks"]), 2)
+
     def test_discover_index_and_resolve_textures(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets_dir = os.path.join(tmp, "assets")
