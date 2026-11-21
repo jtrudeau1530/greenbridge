@@ -501,8 +501,9 @@ def run_suite(a, work: str) -> int:
                 "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],     # wave32: runs anywhere
             }
             want = cs_dump_wants[name]
-            # Every dump but cs_store and cs_smem_soffset_imm is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
-            # check.py does, where the device has none (vk_compute_test exits 77) instead of reporting a failure.
+            # Every dump but cs_store, cs_smem_soffset_imm and the wave32 cs_bpermute32 is a wave64 test: ask for a
+            # 64-wide subgroup and skip, as check.py does, where the device has none (vk_compute_test exits 77)
+            # instead of reporting a failure.
             # With LEONIDA_W64_EMULATE=1 they were translated with --wave64-emulate and run on any subgroup size.
             # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
             emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
