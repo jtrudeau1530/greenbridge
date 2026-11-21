@@ -18,7 +18,8 @@
   <a href="#how-it-works">How it works</a> |
   <a href="#want-to-help">Want to help?</a> |
   <a href="#credits">Credits</a> |
-  <a href="#license">License</a>
+  <a href="#license">License</a> |
+  <a href="https://discord.gg/rexed">Discord</a>
 </p>
 
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
@@ -31,6 +32,9 @@ happens **on your PC, from your own copy of the game**.
 > need your own copy, with its files already readable on disk. Nothing here decrypts or works around any protection.
 > Everything the build creates (the generated shaders, extracted assets, the runtime folder and your saves) comes
 > from your game and stays on your PC. Never share those files.
+
+Discord: https://discord.gg/rexed
+<br>
 
 ## Project status
 
