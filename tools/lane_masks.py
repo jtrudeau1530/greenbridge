@@ -89,6 +89,10 @@ def put(state, a, k):
         regs = [a["r"] + i for i in range(n)]
     elif a["k"] == "special" and a.get("t") in ("vcc", "vcc_lo"):
         regs = ["vcc"]
+    elif a["k"] == "special" and a.get("t") == "vcc_hi":
+        # A separate write to vcc_hi lands in %vcc_hi, so vcc no longer holds one lane mask.
+        state.pop("vcc", None)
+        return
     else:
         return
     for r in regs:

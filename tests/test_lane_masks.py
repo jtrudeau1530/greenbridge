@@ -134,6 +134,10 @@ def test_bfm64_and_half_kinds():
     got_vcc_data = L.analyse([[ins("s_buffer_load_dword", sp("vcc_lo"), s(0, 4), imm(0)),
                                ins("s_mov_b32", s(6), sp("vcc_lo")), ins("s_mov_b32", s(7), sp("vcc_hi")), use]], [[]])[0][id(use)]
     assert got_vcc_data == {}
+    # A separate write to vcc_hi ends vcc's life as a lane mask, so vcc_hi reads back as data.
+    got_vcc_hi = L.analyse([[vcmp, ins("s_mov_b32", sp("vcc_hi"), imm(0x1234)),
+                             ins("s_mov_b32", s(7), sp("vcc_hi")), use]], [[]])[0][id(use)]
+    assert got_vcc_hi == {}
     # Merging low half and high half yields generic MASK (unknown half -> keep both halves).
     got3 = L.analyse([[ins("s_nop")], [ins("s_mov_b32", s(6), sp("exec_lo"))],
                       [ins("s_mov_b32", s(6), sp("exec_hi"))], [use]], [[1, 2], [3], [3], []])[0][id(use)]
