@@ -55,7 +55,9 @@ def main() -> int:
                 if name.lower().endswith(".rpf"):
                     rows.append(probe(os.path.join(root, name)))
     except OSError as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        path = error.filename or a.game_dir
+        reason = error.strerror or str(error)
+        print(f"ERROR: {path}: {reason}", file=sys.stderr)
         return 2
     rows.sort(key=lambda r: -r["size"])
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
