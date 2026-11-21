@@ -119,7 +119,9 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
 `audio_manifest.json` is the bank index: each bank's `Path`, `Offset`, `Size`, and its `Streams` with `Index`,
-`Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`.
+`Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`. For streamed music,
+`Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
+interleaved sample count is divided by that channel count.
 
 `audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count, and trims to the Ogg
 Opus end granule. Existing `.wav` files are skipped, so a stopped run continues. With no `--out`, a directory writes
