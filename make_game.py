@@ -193,7 +193,7 @@ MIN_FREE_GB = {"shaders": 30, "assets": 300}
 def preflight(stages: list, work: str, wav: bool = False) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     missing = []
-    if wav and not shutil.which("ffmpeg"):
+    if wav and "assets" in stages and not shutil.which("ffmpeg"):
         missing.append("ffmpeg (needed for --wav): https://ffmpeg.org/download.html, then reopen the terminal")
     if sys.version_info < (3, 11):
         missing.append("Python 3.11 or newer: https://www.python.org/downloads/")
