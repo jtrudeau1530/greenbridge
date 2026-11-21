@@ -61,6 +61,16 @@ def _is_nan_bits(word):
     return exp == 0xFF and (word & 0x7FFFFF) != 0
 
 
+def _emit_perm(rng, dst, srcs):
+    """Half the cases pin the selector so bytes 8-13 (sign bits, 0x00, 0xff) are not left to chance."""
+    if rng.random() < 0.5:
+        sel = 0
+        for i in range(4):
+            sel |= rng.randrange(0, 16) << (8 * i)
+        return f"v_perm_b32 v{dst}, v{srcs[0]}, v{srcs[1]}, 0x{sel:08x}"
+    return f"v_perm_b32 v{dst}, v{srcs[0]}, v{srcs[1]}, v{srcs[2]}"
+
+
 def _op_templates():
     """(name, emitter) table owned by this runner. Emitters take
     (rng, dst, srcs) and return one assembly line (without leading tab)."""
@@ -95,7 +105,7 @@ def _op_templates():
         ("v_bfi_b32", lambda r, d, s: f"v_bfi_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
         ("v_alignbit_b32", lambda r, d, s: f"v_alignbit_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
         ("v_alignbyte_b32", lambda r, d, s: f"v_alignbyte_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
-        ("v_perm_b32", lambda r, d, s: f"v_perm_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_perm_b32", _emit_perm),
         ("v_med3_i32", lambda r, d, s: f"v_med3_i32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
         ("v_med3_u32", lambda r, d, s: f"v_med3_u32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
         ("s_add_u32", lambda r, d, s: f"s_add_u32 s{d}, s{s[0]}, s{s[1]}"),
