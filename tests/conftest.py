@@ -136,7 +136,7 @@ GS_TRI_DXBC = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF)]),  
 MS_TRI_DXBC = make_dxbc([mesh_psv0_chunk()])                                          # 128 threads, 64/64, triangles
 MS_CLIP_DXBC = make_dxbc([mesh_psv0_chunk(),
                           signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0x1)])])      # SV_Position + SV_ClipDistance.x
-SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC,
+SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC, "ms_wave_info_s3": MS_TRI_DXBC,
                "ms_v5_workgroup": make_dxbc([mesh_psv0_chunk(threads=(32, 1, 1), max_vertices=3,
                                                            max_primitives=1, group_shared=128)])}
 
