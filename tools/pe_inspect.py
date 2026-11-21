@@ -68,6 +68,8 @@ class PeImage:
         magic = struct.unpack_from("<H", data, opt)[0]
         if magic not in (0x10B, 0x20B):
             raise PeFormatError(f"unknown optional header magic 0x{magic:x}")
+        if opt + 72 > len(data):  # the fixed fields read below end with DllCharacteristics at +70
+            raise PeFormatError("truncated optional header")
         self.is64 = magic == 0x20B
         self.entry_rva = struct.unpack_from("<I", data, opt + 16)[0]
         self.image_base = struct.unpack_from("<Q" if self.is64 else "<I", data, opt + (24 if self.is64 else 28))[0]
@@ -199,7 +201,7 @@ def _exports(img: PeImage) -> list[str]:
      addr_names, addr_ordinals) = struct.unpack_from("<IIHHIIIIIII", img.data, at)
 
     named, names = set(), []
-    for i in range(name_count):
+    for i in range(min(name_count, MAX_ENTRIES)):
         name_at = img.offset(addr_names + i * 4)
         ord_at = img.offset(addr_ordinals + i * 2)
         if name_at is None or ord_at is None:
@@ -207,7 +209,7 @@ def _exports(img: PeImage) -> list[str]:
         symbol = img.string_at(struct.unpack_from("<I", img.data, name_at)[0])
         names.append(symbol if symbol is not None else "?")
         named.add(struct.unpack_from("<H", img.data, ord_at)[0])
-    for i in range(functions):
+    for i in range(min(functions, MAX_ENTRIES)):
         if i not in named:
             names.append(f"#{base + i}")
     return names
@@ -282,6 +284,15 @@ def classify_dll(name: str, game_dir: str | None) -> str:
 
 
 def inspect(path: str, game_dir: str | None) -> dict:
+    """The report for one image. A file cut off inside a table raises PeFormatError like any other bad image;
+    the struct.error it used to raise escaped main() and stopped a multi-file run at that file."""
+    try:
+        return _inspect(path, game_dir)
+    except struct.error as e:
+        raise PeFormatError(f"truncated or corrupt table: {e}") from None
+
+
+def _inspect(path: str, game_dir: str | None) -> dict:
     with open(path, "rb") as f:
         img = PeImage(f.read())
     sections = []

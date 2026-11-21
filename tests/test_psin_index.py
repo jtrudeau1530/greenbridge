@@ -124,6 +124,17 @@ class TestCli(unittest.TestCase):
             self.assertEqual(doc["summary"]["incomplete"], 1)
             self.assertEqual(doc["summary"]["section_tags"], {"CHKS": 1, "LSCH": 1})
 
+    def test_limit_below_one_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "00000001.bin")
+            with open(path, "wb") as f:
+                f.write(make_psin([("LSCH", b"")]))
+            for value in ("0", "-1"):
+                p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--limit", value],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2)
+                self.assertIn("must be at least 1", p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

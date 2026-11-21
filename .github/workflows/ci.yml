@@ -1,16 +1,54 @@
 name: CI
 on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  change-scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      docs-only: ${{ steps.paths.outputs.docs-only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check whether only documentation changed
+        id: paths
+        shell: pwsh
+        run: |
+          # A pull_request checkout is the test merge; its first parent is the PR base.
+          # Treat missing history, an empty diff, and renames out of code conservatively.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $docsOnly = $false
+          git diff --quiet "$env:GITHUB_SHA^1" "$env:GITHUB_SHA" --
+          if ($LASTEXITCODE -eq 1) {
+            git diff --quiet --no-renames "$env:GITHUB_SHA^1" "$env:GITHUB_SHA" -- . `
+              ':(exclude,top)README.md' ':(exclude,top)CONTRIBUTING.md' `
+              ':(exclude,top)AGENTS.md' ':(exclude,top)SECURITY.md' ':(exclude,top,glob)docs/**/*.md'
+            $docsOnly = $LASTEXITCODE -eq 0
+          }
+          "docs-only=$($docsOnly.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          exit 0 # GitHub's pwsh wrapper would otherwise forward git diff's status.
+
   check:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: "8.0.x"
       - name: Python tools compile
@@ -32,10 +70,12 @@ jobs:
           bad=$(git ls-files | grep -iE '\.(rpf|ttpf|xvd|dxbc|fssm|spv|spvasm|dds|bk2|awc|exe|dll)$' || true)
           if [ -n "$bad" ]; then echo "Game or binary files tracked:"; echo "$bad"; exit 1; fi
   translator-tests:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - name: Install llvm-mc and spirv-tools
@@ -46,23 +86,27 @@ jobs:
       - name: Translator tests
         run: python -m pytest tests -q --ignore=tests/semantic
   semantic-tests:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - name: Translator semantic tests
         run: python -m unittest discover -s tests/semantic -v
 
   viewer-tests:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
       - name: Viewer chunk streaming (synthetic, no browser or game data)

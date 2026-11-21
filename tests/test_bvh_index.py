@@ -2,6 +2,8 @@
 
     python -I tests/test_bvh_index.py
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -23,10 +25,15 @@ def bvh_payload(n=10, tag=bvh_index.TAG, end_delta=0):
     end = 0x140 + n * 64 + end_delta
     struct.pack_into("<I", b, 0x20, end)
     struct.pack_into("<I", b, 0x28, end - 0x100)
+    struct.pack_into("<I", b, 0x108, 0x9ABCDEF0)
+    struct.pack_into("<I", b, 0x10C, 7)
     struct.pack_into("<6f", b, 0x110, -1.5, -2.0, -3.0, 4.5, 5.0, 6.0)
-    struct.pack_into("<I", b, 0x130, 1234)
-    struct.pack_into("<I", b, 0x134, 567)
-    struct.pack_into("<i", b, 0x138, -89)
+    struct.pack_into("<I", b, 0x128, 0x1234)
+    struct.pack_into("<i", b, 0x12C, -5)
+    struct.pack_into("<I", b, 0x130, 0x136AC)
+    struct.pack_into("<I", b, 0x134, 0x80)
+    struct.pack_into("<I", b, 0x138, 0xFFFFAB40)
+    struct.pack_into("<I", b, 0x13C, 0x808C8A89)
     b[0x140:0x180] = b"\x81" * 64
     return bytes(b)
 
@@ -62,10 +69,37 @@ class ClassifyTest(unittest.TestCase):
         row = bvh_index.classify(bvh_payload(12), 0x140 + 12 * 64)
         self.assertEqual(row["kind"], "bvh4")
         self.assertEqual(row["node_count"], 12)
-        self.assertEqual(row["root_offset"], 0x140 + 12 * 64 - 0x100)
+        self.assertEqual(row["tail_offset"], 0x140 + 12 * 64 - 0x100)
         self.assertEqual(row["bounds_min"], [-1.5, -2.0, -3.0])
         self.assertEqual(row["bounds_max"], [4.5, 5.0, 6.0])
-        self.assertEqual(row["count_130"], 1234)
+        self.assertEqual(row["flags"], bvh_index.TAG)
+        self.assertEqual(row["version"], "0x81020006")
+        self.assertEqual(row["crc32"], 0x9ABCDEF0)
+        self.assertEqual(row["num_elements"], 7)
+        self.assertEqual(row["offset_to_nodes"], 0x1234)
+        self.assertEqual(row["offset_to_prim_remap"], -5)
+        self.assertEqual(row["root_node_ptr"], 0x136AC)
+        self.assertEqual((row["root_node_index"], row["root_node_type"]), (9941, 4))
+        self.assertEqual(row["root_node_type_name"], "box16")
+        self.assertEqual(row["offset_to_elements"], 0x80)
+        self.assertEqual(row["offset_to_parents"], 0xFFFFAB40)
+        self.assertEqual(row["compression_params"], 0x808C8A89)
+        self.assertTrue(row["dehydrated"])
+
+    def test_header_fields(self):
+        hdr = bvh_index.parse_header(bvh_payload(4))
+        self.assertIsNotNone(hdr)
+        self.assertEqual(hdr["node_count"], 4)
+        self.assertEqual(hdr["root_node_index"], 9941)
+        self.assertEqual(hdr["root_node_type"], 4)
+        self.assertEqual(hdr["root_node_type_name"], "box16")
+        self.assertTrue(hdr["bottom_level"])
+        self.assertFalse(hdr["compressed"])
+
+    def test_node_pointer(self):
+        self.assertEqual(bvh_index.decode_node_pointer(0x136AC),
+                         {"ptr": 0x136AC, "index": 9941, "type": 4, "name": "box16", "invalid": False})
+        self.assertEqual(bvh_index.decode_node_pointer(bvh_index.INVALID_NODE)["invalid"], True)
 
     def test_bvh4_chunk(self):
         b = bytearray(65536)
@@ -153,6 +187,40 @@ class ScanTest(unittest.TestCase):
         rows, summary = bvh_index.scan_dir(self.dir)
         self.assertEqual({r["kind"] for r in rows}, {"bvh4", "instance208", "raw"})
         self.assertEqual(summary[0]["streams"], 3)
+
+    def test_empty_and_short_archives_have_no_streams(self):
+        for name, data in (("empty.rpf", b""), ("short.rpf", b"9FPR")):
+            path = os.path.join(self.dir, name)
+            with open(path, "wb") as f:
+                f.write(data)
+            rows, summary = bvh_index.scan_rpf(path)
+            self.assertEqual(rows, [])
+            self.assertEqual((summary[0]["streams"], summary[0]["span"]), (0, 0))
+
+    def test_start_outside_the_archive_is_refused(self):
+        path = os.path.join(self.dir, "one.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        with self.assertRaises(ValueError):
+            bvh_index.scan_rpf(path, start=1 << 20)
+
+    def test_directory_keeps_good_archives_next_to_a_bad_one(self):
+        with open(os.path.join(self.dir, "a_good.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        with open(os.path.join(self.dir, "b_bad.rpf"), "wb") as f:
+            f.write(b"9FPR" + struct.pack("<I", 1 << 20))   # data start past the end of the file
+        rows, summaries = bvh_index.scan_dir(self.dir)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
+        self.assertEqual(len(summaries), 1)
+
+    def test_cli_rejects_a_limit_below_one(self):
+        path = os.path.join(self.dir, "one.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        for value in ("0", "-100"):
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
+                bvh_index.main([path, "--limit", value])
+            self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

@@ -142,6 +142,131 @@ def structure(succ):
     return emit(("l", 0) if 0 in bodies else ("b", 0))
 
 
+
+def _sccs(nodes, adj):
+    """Iterative Tarjan's algorithm over `nodes` with adjacency `adj`; returns SCCs with >= 2 nodes."""
+    index, low, on_stack, stack, out = {}, {}, set(), [], []
+    nxt = 0
+    for start in nodes:
+        if start in index:
+            continue
+        index[start] = low[start] = nxt
+        nxt += 1
+        stack.append(start)
+        on_stack.add(start)
+        call = [(start, iter(adj[start]))]
+        while call:
+            v, it = call[-1]
+            for w in it:
+                if w not in index:
+                    index[w] = low[w] = nxt
+                    nxt += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    call.append((w, iter(adj[w])))
+                    break
+                if w in on_stack and index[w] < low[v]:
+                    low[v] = index[w]
+            else:
+                if low[v] == index[v]:
+                    comp = []
+                    while True:
+                        x = stack.pop()
+                        on_stack.remove(x)
+                        comp.append(x)
+                        if x == v:
+                            break
+                    if len(comp) >= 2:
+                        out.append(set(comp))
+                call.pop()
+                if call:
+                    p = call[-1][0]
+                    if low[v] < low[p]:
+                        low[p] = low[v]
+    return out
+
+
+def split_irreducible(succ, max_factor=2, max_splits=64):
+    """Make an irreducible CFG reducible by controlled node splitting (cloning the closed region R reachable from a secondary entry e without passing through primary entry h
+    in an irreducible SCC, and redirecting e's external predecessors to clone[e]).
+
+    Returns `(new_succ, orig_of)` where `orig_of[b]` is the original block index that block `b` executes
+    and `new_succ[b]` preserves the exact positional successor order of `succ[orig_of[b]]`.
+    Returns `(succ, list(range(len(succ))))` unchanged if `succ` is already reducible, or `None` if
+    splitting would exceed `max_factor` * len(succ) blocks or `max_splits` duplications.
+    """
+    n0 = len(succ)
+    if n0 == 0:
+        return succ, []
+    max_blocks = min(int(n0 * max_factor), n0 + max_splits)
+    g = None
+    orig = None
+    while True:
+        cur = succ if g is None else g
+        rpo, back, preds = _order(cur)
+        idom, pos = _dominators(rpo, preds)
+
+        def dominates(a, b):
+            while pos[b] > pos[a]:
+                b = idom[b]
+            return a == b
+
+        if all(dominates(w, v) for v, w in back):
+            if g is None:
+                return succ, list(range(n0))
+            return g, orig
+        if g is None:
+            g = [list(s) for s in succ]
+            orig = list(range(n0))
+        if len(g) >= max_blocks:
+            return None
+
+        # Strip dominating back-edges so nested irreducible cycles inside reducible loops surface as SCCs.
+        adj = {v: [w for w in g[v] if not dominates(w, v)] for v in rpo}
+        sccs = _sccs(rpo, adj)
+        if not sccs:
+            return None
+        # Pick the smallest irreducible SCC (tie-break by earliest RPO position).
+        scc = min(sccs, key=lambda c: (len(c), min(pos[x] for x in c)))
+        entries = [x for x in scc if x == 0 or any(p not in scc for p in preds[x])]
+        # Choose a pair (h, e) of SCC entries (e != h, e != 0) minimizing |R|, where R is the closed region of
+        # SCC nodes reachable from e without passing through h. Cloning all of R at once keeps internal cycles
+        # inside the clone instead of re-entering the original SCC and unrolling infinitely.
+        best = None
+        for h in entries:
+            for e in entries:
+                if e == h or e == 0:
+                    continue
+                region = {e}
+                work = [e]
+                while work:
+                    u = work.pop()
+                    for w in g[u]:
+                        if w in scc and w != h and w not in region:
+                            region.add(w)
+                            work.append(w)
+                key = (len(region), pos[h], -pos[e])
+                if best is None or key < best[0]:
+                    best = (key, h, e, region)
+        if best is None:
+            return None
+        _, h, e, region = best
+        if len(g) + len(region) > max_blocks:
+            return None
+        # Order cloned nodes deterministically by RPO position.
+        reg_ordered = sorted(region, key=lambda x: pos[x])
+        clone_of = {}
+        for u in reg_ordered:
+            clone_of[u] = len(g)
+            orig.append(orig[u])
+            g.append([])
+        for u in reg_ordered:
+            g[clone_of[u]] = [clone_of[w] if w in clone_of else w for w in g[u]]
+        ext_preds = {p for p in preds[e] if p not in scc}
+        ce = clone_of[e]
+        for p in ext_preds:
+            g[p] = [ce if w == e else w for w in g[p]]
+
 def run(tree, choose, limit):
     """Interpret a tree: the blocks it executes, in order, stopping after `limit`. `choose(b)` gives the block
     that b goes to next (END to finish) and stands for whatever b stores in pc."""

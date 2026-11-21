@@ -55,6 +55,9 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 
+// Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
+bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
+
 // The maxPushConstantsSize in bytes of the Vulkan physical device behind `device`, or 0 if not a Vulkan device.
 std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 

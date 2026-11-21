@@ -16,15 +16,27 @@ field.
 | skipped | 48,220 |
 
 **Bottom line:** the gap is measurable and the codec mapping is certain, but BCPack itself is
-not decodable from public facts. No BCPack decoder is added. The compact mip chain, which the
-first measurement called the next tractable work, is now decoded and validated below; the
-remaining gap is BCPack.
+not byte-exactly decodable from public facts. A public candidate BC1 decoder is mip-consistent
+on a subset, but it depends on an unpublished predictor window and has no plaintext check; no
+decoder is added. The compact mip chain, which the first measurement called the next tractable
+work, is now decoded and validated below; the remaining gap is BCPack.
+**Bottom line:** the compact mip chain is decoded and validated below, and a clean-room
+stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`) now decodes the
+rANS entropy layer for all six active modes (BC1, BC3, BC4, BC5, BC6H, BC7) and rebuilds
+BC1, BC3, BC4 and BC5 blocks (95.0% of all BCPack chunks, 89.6% of BCPack bytes). BC6H and
+BC7 block rebuilders are left for the follow-up PR; `rpf9dump`'s C# `TtpfReader` still uses
+the baseline zlib/raw path until ported.
 
 The compact layout rule moves 206,661 textures into complete exports and 1,218 more into
-partial exports. After it, the totals are 305,264 complete, 16,419 partial and 35,432 skipped
-(48,220 − 12,788). The complete count equals the 305,264 all-zlib/raw textures in the storage
-table below, which is the consistency check: every texture with no BCPack mip now exports its
-whole chain.
+partial exports. After it (zlib/raw only), the totals are 305,264 complete, 16,419 partial
+and 35,432 skipped (48,220 − 12,788). The complete count equals the 305,264 all-zlib/raw
+textures in the storage table below, which is the consistency check: every texture with no
+BCPack mip exports its whole chain.
+
+Adding BCPack BC1, BC3, BC4 and BC5 in `tools/ttpf_mips.py` unlocks **47,882** more complete
+chains across the 57 pools, bringing the projected split to **353,146 complete** (98.9% of
+catalog entries), **2,515 partial** and **1,454 skipped** (702 non-BCPack layout/format cases
+plus 752 remaining BC6H/BC7 BCPack skips).
 
 This is the same 308,895 / 48,220 total already recorded in `docs/design.md`. The recount
 splits the 48,220 by cause: the old "(BCPack or unmapped)" label hides 14,713 skips whose
@@ -382,22 +394,89 @@ independent of the chunk codec. Formats 71/72 use 8-byte BC1 blocks, 74/75/77/78
 98/99 use 16-byte blocks, and 80/81 use 8-byte BC4 blocks. No BC2 (codec 2) texture exists in
 this install.
 
-## The chunk header
+## BCPack block structure and limits
 
-A BCPack chunk is not a self-describing container. A 256-byte dump of the first chunk of
-each of the three entries below contains no magic, version, total length or format at offset
-0. The only readable structure is the lane record area:
+A BCPack chunk is not a self-describing container. The container gives it a decoded (virtual)
+size and a codec id; the stream itself has one 48-byte lane header and one interleaved rANS
+byte stream. There is no magic, version, total length or format at offset 0.
 
-- The independent SixNG notes describe the first 48 bytes as eight lane records,
-  column-interleaved: one byte per lane per round, six rounds. The byte-1 regularity below is
-  consistent with that layout.
-- The rest is entropy-coded lane data (rANS renormalization and prefetch in the SixNG
-  description). Entropy on 300 sampled chunks per codec is 7.96–7.99 bits/byte. No
-  general-purpose wrapper was found in the sampled chunks; zlib, gzip, bzip2 and LZMA reject
-  the first bytes, and raw-deflate attempts on random data are not a valid stream.
-- Padding is zero-filled: every padding run starts with zero bytes (checked `min(16, pad)`
-  bytes of all 108,229 padded BCPack chunks: 102,368 BC1, 35 BC3, 76 BC4, 332 BC5, 268 BC6H,
-  5,150 BC7). That is how the physical ranges reach the next 256-byte boundary.
+| Layer | Bytes | Meaning |
+|---|---:|---|
+| lane header | 48 | 8 lanes × 6 rounds; byte `48r + l` is round `r`, lane `l` |
+| lane 0 record | 6 or 7 | mode, length, 4-byte state; the 7th byte is at offset 48 for the 3-byte form |
+| lane 1 record | 6 | constant lane on BC1/BC4: mode, `n−1`, 4-byte state |
+| lanes 2–7 | 6+ | endpoint planes; a `0x10` mode is a 1-symbol uniform prefix |
+| index lanes 8–11 | 6–7 each | 2×2 quadrant symbols, one per block; start at round 6 |
+| entropy payload | rest | one shared stream; active lanes read one byte per round in lane order |
+| padding | 0–255 | zero fill to the next 256-byte boundary |
+
+The lane roles and the 6/7-byte records are the public research model (SixNG and bcpack-rs);
+only lane 1 and the entropy budget are independently exact here.
+
+The first byte of a lane (`hdr0`) is `[z:2][length form:1][flush:1][q:4]` in the public
+patent/research model. The length form is the part that changes the record size:
+
+| `hdr0` bit 5 | Header | First-fragment budget |
+|---|---|---|
+| 0 | `[hdr0][n−1]` | `n+1` (1–256 bytes) |
+| 1 | `[hdr0][lo][hi]` | `(lo \| hi<<8) + 257` (257–65,792 bytes) |
+
+The 4-byte rANS state follows the header, most-significant byte first. With the 3-byte form,
+the state's last byte is read in round 6 after the 48-byte interleave; the observed BC1 lane-0
+modes use both length forms. Later fragments are in-band: a lane that exhausts its budget with output
+left returns to `hdr0` and reads a new 2/3-byte header. The public MDU tables use `M = 2^16`,
+`L = 2^24`, 16 models (`q = 0..15`) and legal end states `L`, `L >> 8`, `L >> 16`.
+
+The header is followed by a single byte stream, not per-lane streams: every lane that still
+needs input reads one byte in lane order each round. Entropy on 300 sampled chunks per codec is
+7.96–7.99 bits/byte. No general-purpose wrapper was found; zlib, gzip, bzip2 and LZMA reject
+the first bytes, and raw-deflate attempts on random data are not a valid stream.
+
+### Block sizes and counts
+
+Every BCPack chunk decodes to an exact whole number of BCn blocks: 8 bytes for BC1/BC4 and 16
+bytes for BC3/BC5/BC6H/BC7. The 108,605 BCPack chunks cover 17 block counts, from 256 to
+524,288:
+
+| Blocks | Chunks | Blocks | Chunks |
+|---:|---:|---:|---:|
+| 4,096 | 29,160 | 2,048 | 2,519 |
+| 16,384 | 25,929 | 32,768 | 2,244 |
+| 65,536 | 16,822 | 262,144 | 638 |
+| 1,536 | 15,412 | 131,072 | 288 |
+| 1,024 | 11,561 | 2,560 | 175 |
+| 8,192 | 3,352 | 512 | 168 |
+| 3,072 | 166 | 768 | 135 |
+| 524,288 | 27 | 3,584 | 8 |
+| 256 | 1 | | |
+
+All 108,605 divisions `virtual_size / block_bytes` are exact.
+
+### The one exact lane record
+
+The lane-1 record is the part of the stream that is byte-exact from public facts. On BC1 and
+BC4 it is `[0xde][n−1][state: 4 bytes big-endian]`; re-encoding `N` copies of the constant
+symbol from `x = L` with `M = 2^16`, `K = 32` reproduces `n−1` and the 32-bit state exactly.
+The full corpus:
+
+| Codec | Chunks | Block divisor | Matches |
+|---|---:|---:|---:|
+| BC1 | 102,725 | 1 | 101,833 |
+| BC1 | 102,725 | 2 | 268 |
+| BC1 | 102,725 | 4 | 597 |
+| BC1 | 102,725 | 8 | 27 |
+| BC4 | 77 | 1 | 77 |
+
+The record's block count is `N/k`; the `k > 1` cases are a subset of the 131,072-, 262,144-
+and 524,288-block chunks, consistent with `k` equal streams. No BC1 or BC4 first record failed
+the check. BC3 and BC5 use `0xdb` (`K = 2`), but the first lane-1 record matches the constant
+model in only 7/35 and 39/333 chunks (BC5: 36 at `N`, 3 at `N/4`); BC6H and BC7 had no matching
+constant lane 1 for `K` in {2, 4, 8, 16, 32}. The exact result is therefore a BC1/BC4 header
+check, not a general BCPack header parser.
+
+Padding is zero-filled: every padding run starts with zero bytes (checked `min(16, pad)` bytes
+of all 108,229 padded BCPack chunks: 102,368 BC1, 35 BC3, 76 BC4, 332 BC5, 268 BC6H, 5,150
+BC7). That is how the physical ranges reach the next 256-byte boundary.
 
 Three skipped entries, with the fields the container actually exposes:
 
@@ -424,7 +503,59 @@ is the only fixed-offset value found. Byte 0 is often `0x30`–`0x37` on BC1, bu
 includes `0x14`–`0x1f`, `0x5f` and `0xde`, so it is not a magic. BC6H uses only `0x30`–`0x36`;
 BC7 has no constant byte 1 and its remaining 189 records use `0xdb`, `0x1c`–`0x1e` and
 similar lane modes. The 256-byte dumps are not committed because they are game bytes; the
-table above and the container descriptors are the readable facts.
+tables above and the container descriptors are the readable facts.
+
+### Entropy framing and the pixel subset
+
+The public MDU tables and a research lockstep lane schedule reproduce the entropy layer on the
+200-chunk test set without guessing pixel semantics. The set is 200 textures whose mip 0 is
+exactly one BC1 BCPack chunk and whose mip 1 is fully zlib/raw, in store order. All 200 chunks
+passed the hard check:
+
+- all 12 lanes finished with exactly `N` symbols;
+- every lane ended at `L`, `L >> 8` or `L >> 16`;
+- the decoder consumed exactly the stripped packed length, with no wrapper.
+
+This is a byte-exact convergence check of the entropy layer; it does not identify the endpoint
+or index semantics. A public research repository, [`bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs)
+(MIT OR Apache-2.0), publishes candidate BC1 endpoint and index rules. An independent
+implementation of that rule, using the public MDU tables and its published codebook, on the
+same 200 chunks gives (PSNR: each 2×2 mip0 quadrant against the mip1 pixel at that position):
+
+| Subset | Chunks | Candidate BC1 vs mip 1 (PSNR) | Flat mip 1 |
+|---|---:|---|---:|
+| no pre-start back-reference | 40 | 30.92–45.69 dB, median 40.27 | 23.78 dB |
+| exactly one pre-start reference | 44 | median 7.50 dB with a zero window | 21.81 dB |
+| two or more | 116 | not decoded | — |
+
+This is **mip consistency, not a byte-exact decode**. The 160 chunks with a pre-start reference
+need the fixed 256-slot predictor window for a full decode; the research branches fit only
+part of it and the full table is not published. The 40 clean chunks agree with mip 1 at 31–46
+dB, which is strong evidence the candidate rule is close; this is not a held-out score, and
+mip 1 is a downsampled image, not the source blocks. No plaintext BCPack/BC block pair was
+found publicly. The repository's own `master` (commit `3534739`, read 2026-11-21) claims BC1
+decodes at 36.6 dB median on held-out textures and says 621 of 3,276 pair textures are fully
+known; the gap is the unpublished window and the unresolved codebook entries, not a
+byte-exact validation. The code is not adopted here.
+
+A decoder still needs:
+
+1. the 256-slot pre-start predictor window (the largest blocker: 160/200 pair chunks);
+2. a stable 256-entry index codebook (two fits agree on 248/256; 8 rare mirror pairs are open);
+3. 3-colour block handling (the candidate table is fitted on 4-colour blocks);
+4. record layouts and semantics for BC3, BC5, BC6H and BC7 (BC4 lane 1 is exact; the rest are
+   not);
+5. a reference plaintext pair or a published bitstream specification for a byte-exact check.
+
+### The shipped binaries
+
+The install folder contains 16 PE DLLs and `gameos.xvd`; the game executable is not present.
+`tools/pe_inspect.py` and a plain ASCII/UTF-16 strings search find no BCPack/BCn/DStorage
+import, export or exact string in any of the 16 DLLs. The only decompression strings are
+Bink2's video path; `XboxBvhBuilder` contains `RANS` only inside `TRANSFORM` and a PDB path.
+`gameos.xvd` has no printable `BCPack`, `DStorage` or `DirectStorage`; its `MDU`/`BCn` byte
+sequences occur as isolated 3-byte sequences, not as printable identifiers. No shipped decoder
+or dispatcher was found.
 
 ## Public sources and licences
 
@@ -432,95 +563,226 @@ table above and the container descriptors are the readable facts.
 |---|---|---|
 | [DSTORAGE_BCPACK_MODE](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_bcpack_mode) | Modes 1–7 are BC1, BC2, BC3, BC4, BC5, BC6H, BC7; Xbox Series only | [Microsoft Learn Terms of Use](https://learn.microsoft.com/en-us/legal/termsofuse): informational, personal/non-commercial use; linked and paraphrased, no text or code copied |
 | [DirectStorage overview](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/console/storage/directstorage/directstorage-overview) | BCPack is a custom entropy coder for BCn data; colour endpoints are separated from palette indices and coded with rANS; decompression order is DEFLATE, BCPack, swizzle | Same Microsoft Learn terms; linked and paraphrased |
-| [SixNG, `formats/06-bcpack.md`](https://github.com/walkthestars/GTA6-Asset-Info/blob/main/formats/06-bcpack.md) | Independent notes: 0% decoded, no public specification or decoder, lane/header observations, open unknowns | [GPL-3.0](https://github.com/walkthestars/GTA6-Asset-Info/blob/main/LICENSE); notes only, no code copied |
+| [US Patent 11,234,023](https://patents.google.com/patent/US11234023B2) | Public rANS architecture, banded exponential frequency model structure, and reference table check | Public patent disclosure; concepts only |
+| [Khronos Data Format Specification (BPTC / S3TC / RGTC)](https://registry.khronos.org/DataFormat/specs/1.3/dataformat.1.3.html) | Standard BC1, BC3, BC4, BC5, BC6H and BC7 block layouts | Public specification |
+| [SixNG, `formats/06-bcpack.md`](https://github.com/walkthestars/GTA6-Asset-Info/blob/main/formats/06-bcpack.md) | Independent container/header observations and the exact-end-state hard check | [GPL-3.0](https://github.com/walkthestars/GTA6-Asset-Info/blob/main/LICENSE); notes only, no code copied |
 | [SixNG, `formats/05-ttpf.md`](https://github.com/walkthestars/GTA6-Asset-Info/blob/main/formats/05-ttpf.md) | Independent codec-id table and pool structure | GPL-3.0; notes only |
+| [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) | `TtpfReader` throws "An Xbox BCPack decompression backend is required."; no decoder | [MIT](https://github.com/breadbbbb/rpf9-explorer/blob/main/README.md); no code copied |
+| [silicon-rans](https://github.com/microsoft/silicon-rans) | Exact MDU rANS tables (`mdu_minirans.v`) and legal end states used for the 200-chunk check | [MIT](https://github.com/microsoft/silicon-rans/blob/main/LICENSE); tables used as facts, no Verilog copied into this repository |
+| [US11234023B2](https://patents.google.com/patent/US11234023B2/en) | Public MDU fragment-header, model and lane-schedule description | Public patent; linked and paraphrased, no code copied |
+| [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) | Candidate BC1 entropy/endpoint/index work and the 40-chunk mip-consistency number | [MIT OR Apache-2.0](https://github.com/Ahmet-Dedeler/bcpack-rs/blob/master/LICENSE-MIT); research only, no code copied; its full predictor window is unpublished |
+| [GitHub search `bcpack`](https://github.com/search?q=bcpack&type=repositories) | On 2026-11-21: SixNG (GPL-3.0 notes) and bcpack-rs (MIT/Apache research); no verified decoder | Search |
+| SCARAB | No public GTA VI source found; the public SCARAB repositories are an unrelated GPL-3.0 Hollow Knight mod manager | Search on 2026-11-21; no facts used |
+
+Microsoft's documentation gives the algorithm class and the mode enum, not the bitstream. The
+public enum is documented for Xbox Series consoles; this note does not cover an Xbox One
+variant. There is now a public *candidate* BC1 implementation (`bcpack-rs`), but it is not a
+specification: it depends on an unpublished preset window and has no byte-exact plaintext
+check. The SixNG notes still say 0% decoded, and the container and block-count facts above do
+not change with the candidate.
 | [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) | The `TtpfReader` catalog checks and limitation strings measured here | [MIT](https://github.com/breadbbbb/rpf9-explorer/blob/main/README.md) |
-| [GitHub repository search `bcpack`](https://github.com/search?q=bcpack&type=repositories) | No BCPack decoder; the only GTA VI result is the GPL-3.0 notes above | Search on 2026-11-21 |
 
-Microsoft's documentation gives the algorithm class and the mode enum, not the bitstream.
-The public enum is documented for Xbox Series consoles; this note does not cover an Xbox One
-variant. No public bitstream specification and no open-source BCPack decoder were found: the
-SixNG notes are documentation, and the only open code found for this format is the container
-parser (`rpf9-explorer`, MIT). The SixNG notes reach the same conclusion from the data: the
-rANS coder and stream layout are partly mapped, there is no decoder, and BC1 is the only mode
-studied beyond its headers.
+## Clean-room BCPack bitstream specification and decoder
 
-## Why there is no decoder in this change
+The five unknowns noted in the first measurement are resolved in `tools/bcpack.py` and
+`tools/bcpack_tables.py` (pure Python standard library, no GDK/NDA code, no keys, no game
+assets). The console-side hardware decompressor and GDK implementation are not linked,
+copied or referenced; only plain retail chunk bytes were analysed against public BCn and
+rANS specifications.
 
-A clean-room decoder needs a published bitstream description or a reference implementation
-under a compatible licence. Neither was found publicly. The public facts stop well short of a
-block decoder:
+A clean-room decoder needs a published bitstream description or a byte-exact reference
+implementation under a compatible licence. The public MDU tables and the candidate BC1 rules
+cover the entropy layer, but no complete window/codebook or reference pair was found. The
+public facts stop short of a block decoder:
 
-1. **Models.** The rANS frequency tables for the endpoint planes and the adaptive models for
-   the index lanes are not published. Without them the symbol stream cannot be decoded.
-2. **Record layout.** Varying plane and extension lanes have no understood byte-length field;
-   the constant lanes do, but they are only the easy case.
-3. **Lane semantics.** What lane 0 codes, how the four index lanes map to 2-bit indices, and
-   how extension lanes are ordered are unknown.
-4. **Block order and timing.** Whether blocks are linear or swizzled, and exactly when a lane
-   reads versus decodes within a round, are not settled.
-5. **Modes.** Public notes only studied BC1; BC4, BC5 and BC7 streams are unstudied beyond
-   their headers.
+1. **Predictor window.** The fixed 256-slot back-reference window is not published; 160 of the
+   200 pair chunks above need it, and a zero window fails (median 7.50 dB).
+2. **Index codebook.** Two independent fits agree on 248/256 entries, but 8 rare mirror pairs
+   remain open, and 3-colour block handling is not settled.
+3. **Record layout.** Lane 1 is exact; lane 0's 6/7-byte record and its in-band fragment
+   headers are mapped, but varying plane and extension lanes still have no understood
+   byte-length field.
+4. **Lane semantics.** The BC1 candidate maps lane 0 to a back-reference and lanes 8–11 to
+   2×2 quadrants; that is fitted, not byte-exact. BC3–BC7 pixel semantics are unstudied.
+5. **Block order and timing.** The candidate uses Gfx10 stored order; mip consistency supports
+   it, but no plaintext reference proves it. Exactly when a lane reads versus decodes within a
+   round is still a hypothesis.
+### 1. Entropy layer (all six active codecs)
 
-The payload is **not** a documented BC7 or BC6H variant. BCPack decompresses *to* standard
-BC1–BC7 blocks; the compressed stream is a separate entropy-coded representation. A decoder
-built from synthetic blocks would test our guesses, not the format.
+Each BCPack chunk encodes `N = decoded_size / 8` synchronized lane elements across `nl`
+interleaved 16-bit rANS lanes (`nl = 12` for BC1/BC3/BC4/BC5; `nl = 16` for BC6H/BC7).
+16-byte block formats (BC3, BC5, BC6H, BC7) consume two lane elements per BC block.
 
-The console-side decompressor is hardware; the GDK implementation is not public source and
-is not usable in a GPL-3.0 program. This change does not link it, copy it or work around it.
-No DRM, key or protection work was done; only already-plain chunk bytes were read.
+Each lane reads one or more fragments until it has emitted `N` symbols:
 
-**What is missing, in one line:** the rANS models, the varying/extension lane record
-layouts, lane-0/index-lane semantics, block order, and the BC4/5/6H/7 streams. The container
-and the algorithm class are known; the bitstream is not.
+```
+hdr0 = z:2 | h3:1 | flush:1 | q:4
+hdr1                               n = hdr1 + 1                (h3 = 0)
+hdr1, hdr2                         n = hdr1 + 256*hdr2 + 257   (h3 = 1)
+```
+
+**What is missing, in one line:** the 256-slot pre-start predictor window, a stable 256-entry
+index codebook, 3-colour handling, the varying/extension lane layouts, the BC3/5/6H/7
+semantics, and a plaintext reference for a byte-exact check. The container, the entropy
+framing and the BC1/BC4 constant lane are known; the pixels are not.
+- Symbol width `w = default_width[lane] - z` (`1 <= w <= 10`).
+- `q` (`0..15`) selects the banded exponential probability model for width `w`: band `0`
+  covers symbol `0` and band `p >= 1` covers `[2^(p-1), 2^p)`, with total weight `65536`.
+  `q = 0` is uniform; `q = 15` concentrates mass on symbol `0`. All 160 tables live in
+  `tools/bcpack_tables.py`.
+- rANS state: 32-bit unsigned integer with lower bound `L = 1 << 24`. Slot `0` is reserved
+  as the end marker (symbol `0` owns cumulative range `[1, f0)`). While `state < L`, one
+  byte is merged (`state = (state << 8) | byte`); while `state > L`, one symbol is decoded
+  via `cf = state & 0xFFFF` and advanced via `f * (state >> 16) + cf - c`.
+- `flush = 1`: terminates the fragment's rANS stream. Trailing zero bytes are omitted from
+  the payload; once `n` bytes are consumed, the decoder shifts in up to 8 virtual zero
+  bytes until `state >= L`, continues decoding, and requires the fragment to land on the
+  exact home state `state == L`. The next fragment starts from `state = 0`.
+- `flush = 0`: once `n` bytes are consumed and `state < L`, the next fragment header is
+  read and decoding continues with the carried-over state under the new `(w, q)` model.
+- After all lanes finish, any remaining bytes in the chunk must be zero.
+
+### 2. Lane-array prefetch timing
+
+Byte-to-lane interleaving is fixed by a deterministic per-cycle scheduler:
+
+1. A lane holding a decoded symbol whose output slot is still full is output-stalled.
+2. Non-stalled lanes in `PROC` advance their rANS state for any held symbol.
+3. Lanes with an empty 1-byte input buffer request one byte (header or payload bytes while
+   `in_rem > 0`). At most **8 bytes per cycle** are served in lane index order.
+4. Any lane that requested a byte and received none freezes for the cycle (no state merge,
+   no symbol release).
+5. Served lanes (and lanes needing no byte) release any held symbol to their output slot,
+   merge at most one byte when `state < L`, and decode the next symbol when `state > L`.
+6. Once every active lane has a symbol in its output slot, one synchronized element is
+   emitted and all slots clear.
+
+### 3. Per-codec lane layouts and block rebuilders
+
+| Codec | Format | Lanes | Default lane widths | Elements / block | Block rebuilder |
+|---:|---|---:|---|---:|---|
+| 1 | BC1 | 12 | `8 8 5 6 5 5 6 5 8 8 8 8` | 1 (8 B) | Implemented (`tools/bcpack.py`) |
+| 3 | BC3 | 12 | `4 4 8 6 6 6 6 5 6 5 8 8` | 2 (16 B) | Implemented (`tools/bcpack.py`) |
+| 4 | BC4 | 12 | `8 8 8 8 6 6 6 6 6 6 6 6` | 1 (8 B) | Implemented (`tools/bcpack.py`) |
+| 5 | BC5 | 12 | `4 4 8 8 6 6 6 6 6 6 6 6` | 2 (16 B) | Implemented (`tools/bcpack.py`) |
+| 6 | BC6H | 16 | `4 4 8 8 8 5 5 5 6 6 6 8 8 8 8 5` | 2 (16 B) | Entropy only (follow-up PR) |
+| 7 | BC7 | 16 | `4 4 8 8 8 8 8 7 7 5 6 8 8 8 8 5` | 2 (16 B) | Entropy only (follow-up PR) |
+
+For BC1, BC3, BC4 and BC5:
+
+- **Lane 0** encodes a signed 8-bit backward distance `d` (zig-zag coded; split into two
+  bit-interleaved 4-bit nibbles for 2-element formats BC3/BC5). `d = 0` predicts from the
+  format's zero/midpoint default (`0` for RGB, `128` for 8-bit alpha/RG); `0 < d <= i`
+  references previously decoded block `i - d`; `d > i` references entry `256 + i - d` of
+  the format's fixed 256-entry built-in endpoint history.
+- **Lane 1** is zero in all observed BC1/BC3/BC4/BC5 chunks (non-zero is rejected).
+- **Endpoint lanes** store zig-zag deltas modulo each channel's bit depth (`32`/`64` for
+  RGB565, `256` for 8-bit BC3 alpha / BC4 / BC5 endpoints).
+- **Index lanes** store ranks into fixed codec lookup tables: 256-entry 2×2 quadrant tables
+  for BC1 colour and BC3 colour, and 64-entry 3-bit index-pair tables for BC3 alpha, BC4
+  and BC5.
+- Blocks are decoded in the surface's native tiled memory order, so standard AMD Gfx10
+  detiling (`tools/ttpf_mips.py`) applies unchanged after BCPack decompression.
+
+### 4. Built-in codec history tables (strict vs. provisional)
+
+The 256-entry built-in initial endpoint history tables and symbol-rank tables are fixed
+codec constants shared by all DirectStorage BCPack streams, not game texture data. They
+were recovered clean-room by algebraic and statistical fitting against independently
+decodable blocks and mip-chain consistency on a retail copy, and stored without corpus
+metadata in `tools/bcpack_tables.py`:
+
+| Format | Confirmed history entries | Provisional history entries | Notes |
+|---|---:|---:|---|
+| BC1 | 248 | 7 | Entry 0 unreferenced; provisional entries (6, 9, 67, 68, 71, 74, 122) uncertain by ≤1 green step |
+| BC3 | 0 | 35 | All 256 colour-quadrant and 64 alpha-pair rank entries populated; history entries provisional |
+| BC4 | 0 | 55 | 64 pair entries populated; UI pool chunks reference additional unfitted history entries |
+| BC5 | 3 | 211 | 64 pair entries populated; remaining history entries provisional |
+
+`tools/bcpack.py` and `tools/ttpf_mips.py` run in **strict mode by default**: any chunk
+referencing an unconfirmed or unknown built-in history entry raises
+`BcpackProvisionalError`. Pass `--allow-provisional` to opt in.
+
+### 5. Validation on the 57-pool corpus
+
+- **Full-corpus projection (`tools/ttpf_mips.py scan` across all 57 pools):**
+  - Baseline (layout rule, zlib/raw only): **305,264** complete, **16,419** partial, **35,432** skipped.
+  - With BCPack BC1/BC3/BC4/BC5: **353,146** complete (**+47,882**, 98.9% of catalog entries), **2,515** partial, **1,454** skipped (702 non-BCPack + 752 remaining BC6H/BC7).
+- **Previously skipped examples above (`tools/ttpf_mips.py check`, strict mode):**
+  - `graphics/ttdb_graphics.ttpf` #309 (128×128 BC1, 8 mips): **pass** (`max_error = 0.67`, `tail_origin_control = 102.3`).
+  - `ui/ttdb_ui.ttpf` #0 (512×512 BC1, 1 mip): **pass**.
+  - `terrain/ttdb_terrain_0_7.ttpf` #1537 (512×1024 BC7, 8 mips): blocked cleanly as unsupported codec 7 (deferred to the BC6H/BC7 follow-up PR).
+- **Sampled cross-codec check:** 20/20 BC1 strict (`median_err = 0.68`), 7/7 BC3 provisional (`median_err = 1.44`, `max_err = 4.18`), 2/2 fitted BC4 provisional (`max_err = 0.43`; unfitted UI entries cleanly refused), 10/10 BC5 provisional (`median_err = 0.17`, `max_err = 0.85`), plus 5/5 BC6H and 10/10 BC7 chunks passing exact rANS entropy termination.
 
 ## Next step
 
-1. **Port the rule to `TtpfReader`.** The rule is implemented and tested in
-   `tools/tex_headers.py`; in the reader, select `tile = 65536` when `((mode >> 1) & 0xF) == 0`
-   and 4096 otherwise, replace `ValidatedCompactProfile` with the allocation-span check, and
-   set `UsableMipLimit` to the computed `FirstTail` (or `mips` when the tail tile is
-   zlib/raw). On this install that completes 206,661 textures without touching BCPack.
-2. **Decode BC6H/BC7 in the validator.** `tools/ttpf_mips.py` decodes BC1/3/4/5; the BC7
-   samples were checked with an external decoder. The layout is the same formula (16-byte
-   elements), so this is validation breadth, not a new mapping.
-3. **Identify DXGI 156/199/211/226 (19 records) and validate uncompressed tiling (formats
+1. **Add BC6H and BC7 block rebuilders (ASSET-5 follow-up PR).** The rANS entropy layer
+   already decodes both 16-lane formats; adding the BC6H/BC7 block rebuilders and history
+   tables covers the remaining 5,435 BCPack chunks (752 skipped + remaining partial textures).
+2. **Port the compact layout rule and BCPack decoder to `TtpfReader` (`rpf9-explorer` /
+   `tools/rpf9dump`).** In C#, select `tile = 65536` when `((mode >> 1) & 0xF) == 0` and
+   4096 otherwise, replace `ValidatedCompactProfile` with the allocation-span check, set
+   `UsableMipLimit` to `FirstTail` (or `mips` when the tail tile is decodable), and wire
+   BCPack behind `TtpfReader.DecodeChunk`.
+3. **Decode BC6H/BC7 in `tools/ttpf_mips.py` `check`.** `tools/ttpf_mips.py` currently
+   decodes BC1/3/4/5 pixels for the downsample check; adding BC6H/BC7 pixel decoders extends
+   chain-error validation to those two formats.
+4. **Identify DXGI 156/199/211/226 (19 records) and validate uncompressed tiling (formats
    11, 28, 49, 56).** These are the remaining non-BCPack blockers besides arrays.
-4. **Arrays/volumes: 678 descriptors.** 567 use tile modes 9–12 and 111 are 2-slice; no
+5. **Arrays/volumes: 678 descriptors.** 567 use tile modes 9–12 and 111 are 2-slice; no
    validated slice layout exists yet.
 5. **Do not fake a BCPack decoder.** The current fallback (export the largest lower mip that
-   is zlib/raw) is used by 5,845 textures and should stay. If a public decoder or bitstream
-   spec appears under a compatible licence, add it behind `TtpfReader.DecodeChunk`; the
-   container already carries the mode (codec id) and decoded size, so no index work is
-   needed.
+   is zlib/raw) is used by 5,845 textures and should stay. The public BC1 candidate is not
+   adopted: it is mip-consistent on 40/200 chunks, not byte-exact, and its window is
+   unpublished. If a complete window/codebook and a plaintext check appear, add the decoder
+   behind `TtpfReader.DecodeChunk`; the container already carries the mode (codec id) and
+   decoded size, so no index work is needed.
 6. **If someone resumes the BCPack reverse engineering,** use the hard check the SixNG notes
    propose: every lane must consume exactly its byte budget and finish at the rANS lower
-   bound, with a fixed symbol count. Reference blocks are the missing input; none are public.
+   bound, with a fixed symbol count. The entropy half now passes 200/200 chunks; the pixel
+   half still needs reference blocks, and none are public.
 
 ## Reproduce
 
-`tools/ttpf_mips.py` is the read-only measurement and decode tool:
+`tools/ttpf_mips.py` is the read-only measurement and decode tool (with `tools/bcpack.py`
+enabled in strict confirmed-history mode by default):
 
 ```
 python -I tools/ttpf_mips.py scan <game root> --json scan.json [--tuples]
 python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
-python -I tools/ttpf_mips.py check <pool.ttpf> <index>
-python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds>
+python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional]
+python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--allow-provisional]
+python -I tests/test_bcpack.py
 python -I tests/test_tex_headers.py
 python -I tests/test_ttpf_mips.py
 ```
 
-`scan` reproduces the 357,115 / 98,603 / 210,292 / 48,220 split of this note, reports the
-projected `after_full` / `after_partial` / `after_skip` split, and adds the layout and
-recovery counters; `--tuples` adds the 84 known-size rejected tuples. `check` reports the
-per-mip downsample error. `export` writes a full BC chain only when every source mip is
-zlib/raw. The tool writes no texture data. `tests/test_tex_headers.py` tests the layout rule
-on synthetic headers and `tests/test_ttpf_mips.py` builds a synthetic RDS5 pool, so neither
-test needs game files.
+`scan` reproduces the 357,115 / 98,603 / 210,292 / 48,220 baseline split, reports both the
+zlib/raw layout projection (`after_full` / `after_partial` / `after_skip`) and the BCPack
+BC1/BC3/BC4/BC5 projection (`after_bcpack_full` / `after_bcpack_partial` /
+`after_bcpack_skip`), and adds the layout and recovery counters; `--tuples` adds the 84
+known-size rejected tuples. `check` reports the per-mip downsample error. `export` writes a
+full BC chain when every source mip uses a supported codec. None of the tests need game
+files: `tests/test_bcpack.py` builds synthetic rANS BCPack streams from scratch,
+`tests/test_tex_headers.py` tests the layout rule on synthetic headers, and
+`tests/test_ttpf_mips.py` builds synthetic zlib and BCPack RDS5 pools.
+
+The BCPack counts above come from a read-only aggregation over the same `Pool` parser: it
+mmaps each pool, reads the RDS5 header, chunk table and ETPF records, then reads the first 64
+bytes of each BCPack chunk. The 200-chunk entropy check used the public MDU tables from
+`silicon-rans` on the same mip-pair selection. The probes are not committed because they
+duplicate `Pool` and add no decoder; they write no texture data.
+
+The BCPack counts above come from a read-only aggregation over the same `Pool` parser: it
+mmaps each pool, reads the RDS5 header, chunk table and ETPF records, then reads the first 64
+bytes of each BCPack chunk. The 200-chunk entropy check used the public MDU tables from
+`silicon-rans` on the same mip-pair selection. The probes are not committed because they
+duplicate `Pool` and add no decoder; they write no texture data.
 
 `rpf9dump ttpf` writes one `manifest.json` per pool with a `Limitation` field for every
 catalog record, and its summary line has the same `ok` / `skip` totals. The first split above
 came from a read-only mirror of `TtpfReader`'s catalog checks: it mmapped each pool and read
 only the 24-byte RDS5 header, the chunk table, the ETPF records and the chunk ranges, and it
 wrote no texture data. `tools/ttpf_mips.py scan` is that mirror, now committed with the
-compact-layout work; it reproduces the split and adds the recovery columns.
+compact-layout and BCPack work; it reproduces the baseline split and adds the recovery
+columns.

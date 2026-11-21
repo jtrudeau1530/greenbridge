@@ -159,6 +159,40 @@ class PageIndexTest(unittest.TestCase):
             self.assertEqual(page_doc["continuations"][0]["offset"], 0x200)
             self.assertEqual(page_doc["q38_records"][0]["target_stream"], 1)
 
+    def test_bad_arguments_fail_before_the_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "a.rpf")
+            make_rpf(rpf, [header(0x100)])
+            cases = ((os.path.join(tmp, "out.txt"), (), "must end in .json or .csv"),
+                     (os.path.join(tmp, "out.json"), ("--limit", "0"), "must be at least 1"),
+                     (os.path.join(tmp, "out.json"), ("--limit", "-5"), "must be at least 1"),
+                     (os.path.join(tmp, "out.json"), ("--start", "-1"), "must be 0 or more"))
+            for out, extra, message in cases:
+                proc = subprocess.run([sys.executable, "-I", TOOL, rpf, out, "--quiet", *extra],
+                                      capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn(message, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_start_outside_the_archive_is_one_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "a.rpf")
+            make_rpf(rpf, [header(0x100)])
+            proc = subprocess.run([sys.executable, "-I", TOOL, rpf, os.path.join(tmp, "o.json"), "--quiet",
+                                   "--start", "99999"], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("start offset is outside the archive", proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+
+    def test_empty_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "empty.rpf")
+            open(rpf, "wb").close()
+            out = os.path.join(tmp, "pages.json")
+            run_tool(rpf, out)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["pages"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

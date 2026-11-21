@@ -344,5 +344,126 @@ class SyntheticPoolTest(unittest.TestCase):
         self.assertEqual(total["after_skip"], 1)
 
 
+def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
+                          meta=0x103, extra=0, packed=4, ref_dists=None):
+    """Build a synthetic RDS5 pool whose chunk is encoded with BCPack codec 1 (BC1)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import test_bcpack as tb
+    layout = ttpf.surface_layout(width, height, 71, mips, ttpf.tile_bytes(mode))
+    linear = solid_chain(layout, 71)
+    payload = bytearray(layout["size"])
+    for mip in layout["mips"]:
+        retile_to(layout, mip, linear[mip["index"]], payload)
+    packed_payload = tb.encode_bc1_blocks(bytes(payload), ref_dists=ref_dists)
+    pad = (-len(packed_payload)) % 256
+    count = 3
+    table_end = 24 + (count - 1) * 8
+    etpf = ttpf.align(table_end, 256)
+    metadata = 16 + 24 + 32
+    padded = ttpf.align(metadata, 4096)
+    source = etpf + padded
+    chunk_end = source + len(packed_payload) + pad
+    virt = padded
+    vsize = virt + layout["size"]
+    entry = (source // 256) | (1 << 26) | ((virt // 4096) << 30) | (pad << 52)
+    sentinel = (chunk_end // 256) | ((vsize // 4096) << 30)
+    header = bytearray(24)
+    header[0:4] = b"RDS5"
+    struct.pack_into("<I", header, 4, count)
+    struct.pack_into("<Q", header, 8, vsize | (22 << 56))
+    struct.pack_into("<I", header, 16, (count + 31) // 32)
+    struct.pack_into("<I", header, 20, 0)
+    a = (width - 1) | ((height - 1) << 14) | ((packed & 0xF) << 28)
+    b = non_tail | (71 << 3) | (1 << 21) | (mode << 23)
+    c = (virt // 4096) | (meta << 21)
+    record = struct.pack("<IIII", a, b, c, extra) + struct.pack("<Q", 0xCAFEBABE12345678)
+    blob = bytearray(chunk_end)
+    blob[0:24] = header
+    struct.pack_into("<QQ", blob, 24, entry, sentinel)
+    blob[etpf:etpf + 4] = b"ETPF"
+    struct.pack_into("<III", blob, etpf + 4, 634, 1, 24)
+    blob[etpf + 16:etpf + 16 + 24] = record
+    blob[source:source + len(packed_payload)] = packed_payload
+    with open(path, "wb") as f:
+        f.write(blob)
+    return layout, linear, bytes(payload)
+
+
+class SyntheticBcpackPoolTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_bc4_and_bc5_decode_pixels(self):
+        bc4_blk = bytes([200, 100]) + (0).to_bytes(6, "little")
+        px4 = ttpf.decode_pixels(80, bc4_blk, 1, 1)
+        self.assertEqual(len(px4), 16)
+        self.assertEqual(px4[0], (200.0, 200.0, 200.0))
+        bc5_blk = bc4_blk + bytes([50, 25]) + (0).to_bytes(6, "little")
+        px5 = ttpf.decode_pixels(83, bc5_blk, 1, 1)
+        self.assertEqual(len(px5), 16)
+        self.assertEqual(px5[0], (200.0, 50.0, 0.0))
+
+    def test_bc1_bcpack_pool_check_export_and_scan(self):
+        import io
+        from contextlib import redirect_stdout
+        path = os.path.join(self.tmp.name, "bc1_bcpack.ttpf")
+        layout, linear, expected_tiled = build_bc1_bcpack_pool(path)
+        pool = ttpf.Pool(path)
+        self.addCleanup(pool.close)
+
+        a = ttpf.analyze(pool, 0)
+        self.assertTrue(a["full_chain"])
+        self.assertEqual(a["mip_codecs"][0], [1])
+        with self.assertRaises(ttpf.BcpackRequired):
+            pool.read_range(a["descriptor"]["base"], layout["size"], bcpack_mode="off")
+        self.assertEqual(pool.read_range(a["descriptor"]["base"], layout["size"]), expected_tiled)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = ttpf.check(pool, 0)
+        res = json.loads(buf.getvalue())
+        self.assertEqual(code, 0, res)
+        self.assertLess(res["max_error"], 4.0)
+
+        out_dds = os.path.join(self.tmp.name, "bc1_bcpack.dds")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ttpf.export(pool, 0, out_dds), 0)
+        with open(out_dds, "rb") as f:
+            dds = f.read()
+        self.assertEqual(dds[148:], b"".join(linear[m["index"]] for m in layout["mips"]))
+
+        scan_out = os.path.join(self.tmp.name, "scan_bcpack.json")
+        with redirect_stdout(io.StringIO()):
+            ttpf.scan_pools([path], scan_out)
+        with open(scan_out, encoding="utf-8") as f:
+            total = json.load(f)["total"]
+        self.assertEqual((total["after_full"], total["after_skip"]), (0, 1))
+        self.assertEqual((total["after_bcpack_full"], total["after_bcpack_skip"],
+                          total["bcpack_unlocked_full"]), (1, 0, 1))
+
+    def test_provisional_history_strict_refusal_and_opt_in(self):
+        import io
+        from contextlib import redirect_stdout
+        path = os.path.join(self.tmp.name, "bc1_prov.ttpf")
+        layout = ttpf.surface_layout(64, 64, 71, 5, ttpf.tile_bytes(4))
+        nblocks = layout["size"] // 8
+        # Block 0 references provisional entry 6 (256 + 0 - 250 = 6).
+        build_bc1_bcpack_pool(path, ref_dists=[250] + [0] * (nblocks - 1))
+        pool = ttpf.Pool(path)
+        self.addCleanup(pool.close)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code_strict = ttpf.check(pool, 0)
+        self.assertEqual(code_strict, 2)
+        self.assertIn("provisional BCPack history required", json.loads(buf.getvalue())["blocked"])
+
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            code_prov = ttpf.check(pool, 0, allow_provisional=True)
+        self.assertEqual(code_prov, 0, buf2.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

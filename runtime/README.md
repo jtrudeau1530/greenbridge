@@ -50,13 +50,15 @@ package is recorded in the runtime-imports documentation.
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
 that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` relocations, binds
-imports by name or ordinal, parses the export table, and sets section protections. Modules are deduped
-by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
+imports by name or ordinal, parses the export table, sets section protections, and registers the
+image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
+through a mapped image are dispatched and stack walks can step over its frames. The table is validated
+first (entries in bounds, sorted and non-overlapping) and removed when the loader is destroyed. Modules
+are deduped by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
 
 Current limits, by design:
 
 - `DllMain`, TLS callbacks and the entry point are left to the caller; `--dry-run` never runs them.
-- The loader does not yet register x64 unwind tables; that is a separate runtime step.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -109,6 +111,8 @@ the files in place and never copy or commit game data.
 
 ## Current limits
 
+`gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its
+own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
@@ -118,3 +122,17 @@ in [docs/design.md](../docs/design.md), and the differential-validation design i
 work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
+
+### Typed UINT clear regression
+
+`clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
+`d3d12_uint_clear_test` compares 21 full/rectangle readbacks with Windows WARP across the three
+currently supported typed UINT render-target formats. Fixtures are synthetic; no shaders or game data are needed.
+The GPU test runs explicitly, while the CPU test is registered in CTest.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^clear_color$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_uint_clear_test.exe
+```
