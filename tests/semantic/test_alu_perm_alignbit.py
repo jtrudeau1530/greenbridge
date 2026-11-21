@@ -6,10 +6,10 @@ SPIR-V), so these tests also check that the translation never emits one, includi
 OpSelect.
 
 v_perm_b32 D, S0, S1, SEL: result byte i is chosen by byte i of SEL from the 64-bit value {S0, S1} (S1 is bytes 0-3,
-S0 bytes 4-7). Selector 0x0c gives 0x00 and anything above 0x0c gives 0xff. Reference: LLVM
-llvm/lib/Target/AMDGPU/AMDGPUISelLowering.cpp, computeKnownBitsForTargetNode, case AMDGPUISD::PERM. Selectors 8-11
-are not tested: LLVM treats them as unknown bits and the translator returns 0x00 for them (see the comment at
-v_perm_b32 in tools/rdna2spirv.py).
+S0 bytes 4-7). Selector 0x0c gives 0x00 and anything above 0x0c gives 0xff. Selectors 8, 9, 10, 11 give 0xff when
+bit 7 of byte 1, 3, 5, 7 is set, else 0x00. Reference: AMD "RDNA 2" ISA reference, VOP3 opcode 836 V_PERM_B32
+(`byte_permute` pseudocode, page 189 of the PDF); LLVM's AMDGPUISD::PERM known bits
+(llvm/lib/Target/AMDGPU/AMDGPUISelLowering.cpp) agrees on 0-7, 0x0c and above and leaves 8-11 unknown.
 
 v_alignbit_b32 D, S0, S1, S2: the low 32 bits of ({S0, S1} >> (S2 & 31)), S1 being the low word.
 """
@@ -34,24 +34,24 @@ import spirv_mini_interp as si  # noqa: E402
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
-# Selector byte values with a defined, documented result (8-11 left out, see the module docstring).
-PERM_SELECTORS = tuple(range(8)) + (0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x7F, 0x80, 0xFF)
+# Every selector class: byte picks 0-7, sign selectors 8-11, 0x0c and values above it.
+PERM_SELECTORS = tuple(range(12)) + (0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x7F, 0x80, 0xFF)
 
 
 def ref_perm(src0: int, src1: int, sel: int) -> int:
-    """v_perm_b32 reference for selector bytes 0-7, 0x0c and above 0x0c."""
+    """v_perm_b32 reference (RDNA 2 ISA byte_permute)."""
     data = ((src0 & MASK32) << 32) | (src1 & MASK32)
     out = 0
     for i in range(4):
         s = (sel >> (8 * i)) & 0xFF
         if s < 8:
             byte = (data >> (8 * s)) & 0xFF
+        elif s < 0x0C:
+            byte = 0xFF if (data >> (8 * (2 * (s - 8) + 1) + 7)) & 1 else 0x00   # sign of byte 1, 3, 5, 7
         elif s == 0x0C:
             byte = 0x00
-        elif s > 0x0C:
-            byte = 0xFF
         else:
-            raise ValueError(f"selector byte {s:#x} is not covered by this reference")
+            byte = 0xFF
         out |= byte << (8 * i)
     return out
 
@@ -114,8 +114,9 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(ref_perm(0x8899AABB, 0x11223344, 0x00010203), 0x44332211)
         self.assertEqual(ref_perm(0x8899AABB, 0x11223344, 0x07050301), 0x88AA1133)
         self.assertEqual(ref_perm(0x8899AABB, 0x11223344, 0x0C0D0C0D), 0x00FF00FF)
-        with self.assertRaises(ValueError):
-            ref_perm(0, 0, 0x08)
+        # Sign selectors: bytes 1, 3, 5, 7 are 0x33, 0x11, 0xAA, 0x88 -> 0x00, 0x00, 0xff, 0xff.
+        self.assertEqual(ref_perm(0x8899AABB, 0x11223344, 0x0B0A0908), 0xFFFF0000)
+        self.assertEqual(ref_perm(0, 0x00008000, 0x08080808), 0xFFFFFFFF)
 
     def test_alignbit_reference(self):
         self.assertEqual(ref_alignbit(0x12345678, 0x9ABCDEF0, 0), 0x9ABCDEF0)
@@ -155,6 +156,17 @@ class PermTests(unittest.TestCase):
                 sel = (0x0C0C0C0C & ~(0xFF << (8 * pos))) | (s << (8 * pos))
                 with self.subTest(pos=pos, s=hex(s)):
                     self.check(sel)
+
+    def test_sign_selectors(self):
+        # Selectors 8-11 replicate bit 7 of bytes 1, 3, 5, 7. With S0 = 0x8899AABB, S1 = 0x11223344 those bytes are
+        # 0x33, 0x11, 0xAA, 0x88: 8 and 9 give 0x00, 10 and 11 give 0xff.
+        self.assertEqual(run_vop3("v_perm_b32", self.S0, self.S1, 0x0B0A0908), 0xFFFF0000)
+        # Bytes 1, 3, 5, 7 of {0x7F00FF00, 0x00800000} are 0x00, 0x00, 0xFF, 0x7F: only selector 10 gives 0xff
+        # (bit 7 of byte 2 = 0x80 must not count), placed in result byte 1.
+        self.assertEqual(run_vop3("v_perm_b32", 0x7F00FF00, 0x00800000, 0x080B0A09), 0x0000FF00)
+        for src0, src1 in ((0, MASK32), (MASK32, 0), (0x80808080, 0x80808080)):
+            with self.subTest(src0=hex(src0), src1=hex(src1)):
+                self.check(0x0B0A0908, src0, src1)
 
     def test_inline_selector(self):
         # Inline-constant selector 0 picks byte 0 of src1 into every byte.

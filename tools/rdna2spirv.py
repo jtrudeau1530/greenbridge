@@ -2914,31 +2914,42 @@ class Gen:
             self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
         elif op == "v_perm_b32":
-            # Byte permute: result byte i = selector byte i picks from the 8 bytes {src0, src1} (src1 is low).
-            # Selector values 0-7 pick a byte; 12 -> 0x00, >=13 -> 0xFF (sign/other cases not used here are 0).
-            # Both candidate shifts are (k & 3) * 8, so every shift stays below 32 (SPIR-V leaves larger ones
-            # undefined, even on the side of the OpSelect that is discarded).
+            # Byte permute (RDNA ISA, V_PERM_B32 / BYTE_PERMUTE): result byte i = selector byte i over the 8 bytes
+            # of {src0, src1} (src1 is bytes 0-3). Selector 0-7 picks that byte; 8, 9, 10, 11 give 0xFF if the sign
+            # bit of byte 1, 3, 5, 7 is set, else 0x00; 12 gives 0x00; 13 and above give 0xFF.
+            # Shift amounts stay below 32: the byte offset is (k & 3) * 8 and src0 or src1 is picked by k < 4.
             s0, s1, sel = (self.src_u(t) for t in a[1:4])
+
+            def pick(k):
+                lo4, k3, sh, word, b = (self.tmp() for _ in range(5))
+                self.emit(f"{lo4} = OpULessThan %bool {k} {self.cu(4)}")
+                self.emit(f"{word} = OpSelect %uint {lo4} {s1} {s0}")
+                self.emit(f"{k3} = OpBitFieldUExtract %uint {k} {self.cu(0)} {self.cu(2)}")
+                self.emit(f"{sh} = OpIMul %uint {k3} {self.cu(8)}")
+                self.emit(f"{b} = OpBitFieldUExtract %uint {word} {sh} {self.cu(8)}")
+                return b
+
             out = self.cu(0)
             for i in range(4):
-                sb, lo_pick, hi_pick, k, b, k3, sh, chosen, inrange, val, shifted, acc = \
-                    (self.tmp() for _ in range(12))
+                sb, k, ks, sign, signv, ff, big, is_sign, inrange, v1, val, shifted, acc = \
+                    (self.tmp() for _ in range(13))
                 self.emit(f"{sb} = OpBitFieldUExtract %uint {sel} {self.cu(8 * i)} {self.cu(8)}")
                 self.emit(f"{k} = OpBitwiseAnd %uint {sb} {self.cu(7)}")
-                self.emit(f"{b} = OpULessThan %bool {k} {self.cu(4)}")
-                self.emit(f"{k3} = OpBitwiseAnd %uint {k} {self.cu(3)}")
-                self.emit(f"{sh} = OpIMul %uint {k3} {self.cu(8)}")
-                self.emit(f"{lo_pick} = OpShiftRightLogical %uint {s1} {sh}")
-                self.emit(f"{hi_pick} = OpShiftRightLogical %uint {s0} {sh}")
-                self.emit(f"{chosen} = OpSelect %uint {b} {lo_pick} {hi_pick}")
-                self.emit(f"{inrange} = OpULessThan %bool {sb} {self.cu(8)}")
-                ff, big = self.tmp(), self.tmp()
+                byte = pick(k)
+                # Sign source byte for selectors 8-11: (sel & 3) * 2 + 1 = byte 1, 3, 5 or 7.
+                k2, k2x2 = self.tmp(), self.tmp()
+                self.emit(f"{k2} = OpBitFieldUExtract %uint {sb} {self.cu(0)} {self.cu(2)}")
+                self.emit(f"{k2x2} = OpIMul %uint {k2} {self.cu(2)}")
+                self.emit(f"{ks} = OpIAdd %uint {k2x2} {self.cu(1)}")
+                self.emit(f"{sign} = OpBitFieldUExtract %uint {pick(ks)} {self.cu(7)} {self.cu(1)}")
+                self.emit(f"{signv} = OpIMul %uint {sign} {self.cu(0xFF)}")
                 self.emit(f"{big} = OpUGreaterThanEqual %bool {sb} {self.cu(13)}")
                 self.emit(f"{ff} = OpSelect %uint {big} {self.cu(0xFF)} {self.cu(0)}")
-                self.emit(f"{val} = OpSelect %uint {inrange} {chosen} {ff}")
-                m8 = self.tmp()
-                self.emit(f"{m8} = OpBitwiseAnd %uint {val} {self.cu(0xFF)}")
-                self.emit(f"{shifted} = OpShiftLeftLogical %uint {m8} {self.cu(8 * i)}")
+                self.emit(f"{is_sign} = OpULessThan %bool {sb} {self.cu(12)}")
+                self.emit(f"{v1} = OpSelect %uint {is_sign} {signv} {ff}")
+                self.emit(f"{inrange} = OpULessThan %bool {sb} {self.cu(8)}")
+                self.emit(f"{val} = OpSelect %uint {inrange} {byte} {v1}")
+                self.emit(f"{shifted} = OpShiftLeftLogical %uint {val} {self.cu(8 * i)}")
                 self.emit(f"{acc} = OpBitwiseOr %uint {out} {shifted}")
                 out = acc
             self.dst(a[0], out)
