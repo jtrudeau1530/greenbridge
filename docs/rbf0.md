@@ -400,7 +400,8 @@ and `Screen` contains `ID`. No attribute is present.
 JSON carries one object per resource: `offset`, `size`, `chunks`, `layout`, `root_name`, `status`, `error`,
 `descriptors`, `counts` and `tree`. Every node has a `kind` and a byte `offset`. Elements carry `descriptor`,
 `attrs_declared`, `attributes`, ordered `content` and `end`; values carry `descriptor`, `type`, `payload_offset`,
-`size` and `value`; text nodes carry `length`, `nul_terminated`, `text` and `utf8_valid`.
+`size` and `value`; text nodes carry `length`, `nul_terminated`, `text` and `utf8_valid`. The full-corpus JSON is
+about 534 MB because every node keeps its offset; `--root`, `--offset` and `--limit` select samples.
 
 XML is a rendering, not a round-trip. Fixed tags avoid descriptor names that cannot be used as XML element names:
 `<node name="...">`, `<attr>`, `<value>` and `<text>`. A string containing XML markup is escaped by the writer. The
