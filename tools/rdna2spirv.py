@@ -2402,11 +2402,13 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_alignbyte_b32":
             # (({src0, src1} as 64 bits) >> (8 * (src2 & 3))) low 32 bits
+            # (32 - b) & 31 keeps the left shift below 32 when b == 0; that result is discarded by the OpSelect.
             hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
-            m, b, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(8))
+            m, b, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(9))
             self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
             self.emit(f"{b} = OpShiftLeftLogical %uint {m} {self.cu(3)}")
-            self.emit(f"{inv} = OpISub %uint {self.cu(32)} {b}")
+            self.emit(f"{inv0} = OpISub %uint {self.cu(32)} {b}")
+            self.emit(f"{inv} = OpBitwiseAnd %uint {inv0} {self.cu(31)}")
             self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {b}")
             self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {inv}")
             self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
