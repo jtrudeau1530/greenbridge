@@ -442,6 +442,70 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
     ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
 
 
+WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
+WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
+
+
+def test_wqm_on_a_lane_mask_gathers_the_quad_and_votes_scc(make_shader, monkeypatch):
+    """s_wqm on a lane mask ORs the lane's bit with its quad's (two OpGroupNonUniformQuadSwap, horizontal then
+    vertical) and SCC is the wave-wide any. Emulated, the four lanes of the quad come through %x_buf instead."""
+    shader = make_shader(WQM_MASK, name="cs_wqm_mask_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpCapability GroupNonUniformQuad" in asm
+    assert asm.count("OpGroupNonUniformQuadSwap %uint %c3") == 2
+    assert re.search(r"OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c0\n(?:.*\n)*?.*OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c1\n", asm)
+    assert "OpGroupNonUniformAny" in asm                   # SCC: any bit of the result in the wave
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    emulated = shader.translate()
+    shader.validate(emulated)
+    assert "OpGroupNonUniform" not in emulated and "GroupNonUniformQuad" not in emulated
+    assert "%x_buf" in emulated
+
+
+def test_wqm_on_data_is_a_bit_operation(make_shader):
+    """A register that is not a lane mask is data: per 32-bit word (x | x>>1 | x>>2 | x>>3) & 0x11111111, times 15."""
+    shader = make_shader(WQM_DATA, name="cs_wqm_data_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpGroupNonUniform" not in asm
+    for k in (1, 2, 3):                                  # three shifts per word, two words (s_wqm_b64)
+        assert len(re.findall(rf"OpShiftRightLogical %uint %t\d+ %c{k}\n", asm)) == 2
+    assert len(re.findall(r"OpBitwiseAnd %uint %t\d+ %c11111111\n", asm)) == 2
+    assert len(re.findall(r"OpIMul %uint %t\d+ %cf\n", asm)) == 2
+    assert re.search(r"OpBitwiseOr %uint %t\d+ %t\d+\n(?:.*\n)*?.*OpStore %scc", asm)   # SCC = low | high != 0
+
+
+def test_wqm_without_quad_operations_outside_fragment_and_compute(make_shader):
+    """Quad operations are only guaranteed in fragment and compute shaders: a vertex shader shuffles from the four
+    lanes of the quad instead."""
+    shader = make_shader("v_cmp_gt_u32_e32 vcc_lo, 1, v0\ns_wqm_b32 s8, vcc_lo\nv_cndmask_b32_e64 v6, 0, 1, s8\n"
+                         "exp pos0 v6, v6, v6, v6 done\ns_endpgm\n", name="vs_wqm_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "QuadSwap" not in asm and "GroupNonUniformQuad" not in asm
+    assert asm.count("OpGroupNonUniformShuffle") == 4
+
+
+def test_wave64_wqm_b32_changes_and_votes_only_its_half(make_shader):
+    """s_wqm_b32 exec_hi in wave64 writes the lanes 32-63 of EXEC only (exec_half_write) and SCC votes over them."""
+    shader = make_shader("s_mov_b32 exec_hi, 0x102\ns_wqm_b32 exec_hi, exec_hi\ns_cselect_b32 s9, 1, 0\ns_endpgm\n",
+                         name="cs_wqm_half_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.wave64
+    assert re.search(r"(%t\d+) = OpUGreaterThanEqual %bool %t\d+ %c20\n(?:.*\n)*?.*OpLogicalAnd %bool \1 %t\d+\n"
+                     r"(?:.*\n)*?.*OpGroupNonUniformAny", asm)
+
+
+def test_wqm_in_a_pixel_shader_uses_the_fragment_quad(make_shader):
+    shader = make_shader("v_cmp_gt_u32_e32 vcc_lo, 1, v0\ns_wqm_b32 s8, vcc_lo\nv_cndmask_b32_e64 v6, 0, 1, s8\n"
+                         "exp mrt0 v6, v6, v6, v6 done vm\ns_endpgm\n", name="ps_wqm_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert asm.count("OpGroupNonUniformQuadSwap") == 2 and "OpCapability GroupNonUniformQuad" in asm
+
+
 EMULATE_SAMPLES = [p for p in SAMPLES if os.path.basename(p).startswith(("cs_", "ms_"))]
 
 
