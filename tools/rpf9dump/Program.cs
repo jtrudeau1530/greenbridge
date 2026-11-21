@@ -110,6 +110,7 @@ else if (mode is "models" or "textures")
     writer.WriteStartArray("Items");
     void Row(object row) => JsonSerializer.Serialize(writer, row, json);
     int embedded = 0;
+    var modelDecodeFailures = new SortedDictionary<string, int>(StringComparer.Ordinal);
     foreach (var e in list)
     {
         string stem = Util.Safe(Path.GetFileNameWithoutExtension(e.Name));
@@ -121,7 +122,16 @@ else if (mode is "models" or "textures")
             if (mode == "models")
             {
                 var m = RageModelDecoder.Decode(sys, gfx);
-                if (m == null) { fail++; continue; }
+                if (m == null)
+                {
+                    var reason = ModelDecodeFailure.Explain(sys, gfx.Length);
+                    int count = modelDecodeFailures.GetValueOrDefault(reason.Code) + 1;
+                    modelDecodeFailures[reason.Code] = count;
+                    if (count <= 3)
+                        Console.Error.WriteLine($"  model decode failed at 0x{e.Offset:X}: {reason.Code} ({reason.Detail})");
+                    fail++;
+                    continue;
+                }
                 string obj = Path.Combine(sub, stem + ".obj");
                 if (!File.Exists(obj)) File.WriteAllText(obj, RageModelDecoder.CreateObj(m));
                 if (m.EmbeddedTextures != null && m.EmbeddedTextureDictionaryOffset is int dOff)
@@ -160,6 +170,13 @@ else if (mode is "models" or "textures")
     }
     if (mode == "models") Console.WriteLine($"  embedded textures {embedded:N0}");
     writer.WriteEndArray();
+    if (mode == "models")
+    {
+        writer.WritePropertyName("ModelDecodeFailures");
+        JsonSerializer.Serialize(writer, modelDecodeFailures, json);
+        foreach (var (code, count) in modelDecodeFailures)
+            Console.Error.WriteLine($"  model decode failures ({code}): {count:N0}");
+    }
     writer.WriteEndObject();
     writer.Dispose();          // flushes; the later using-dispose is a no-op
     mstream.Dispose();
