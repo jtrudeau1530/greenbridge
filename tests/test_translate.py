@@ -126,6 +126,23 @@ def test_mesh_without_psv0_is_rejected(make_shader):
         shader.translate()
 
 
+@pytest.mark.parametrize("threads", [96, 128], ids=["96-threads", "128-threads"])
+def test_mesh_v5_seed_and_threads_constant(make_shader, threads):
+    """Mesh prologue computes v5 = %wlin * NumThreads + %lidx and registers NumThreads before assembly (7b82460)."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_tri.asm"), encoding="utf-8") as f:
+        asm = f.read()
+    dxbc = make_dxbc([mesh_psv0_chunk(threads=(threads, 1, 1), max_vertices=64, max_primitives=64)])
+    shader = make_shader(asm, name=f"ms_v5_seed_{threads}", dxbc=dxbc)
+    spvasm = shader.translate()
+    cid = f"%c{threads:x}"
+    assert f"{cid} = OpConstant %uint {threads}" in spvasm
+    assert f"%wbase = OpIMul %uint %wlin {cid}" in spvasm
+    assert "%v5v = OpIAdd %uint %wbase %lidx" in spvasm
+    assert "%v5p = OpAccessChain %_ptr_Function_uint %vgpr %c5" in spvasm
+    assert "OpStore %v5p %v5v" in spvasm
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+
+
 # ---- pos1..pos3: ClipDistance / CullDistance / misc exports (VS & MS) ----
 
 def _vgpr_to_index_map(spvasm, array_var, ptr_type):
