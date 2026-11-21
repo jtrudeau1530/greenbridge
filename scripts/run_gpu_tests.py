@@ -206,6 +206,15 @@ def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
+UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders)
+
+
+def unsupported_skip(msg: str) -> str:
+    """The SKIP detail for a harness that exited UNSUPPORTED, quoting its "unsupported: ..." line."""
+    m = re.search(r"unsupported: .*", msg)
+    return f"SKIP ({m.group(0) if m else 'unsupported device'})"
+
+
 def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
     p = subprocess.run(cmd, capture_output=True, text=True, env=env)
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
@@ -575,7 +584,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_GS=spv)
             rc, msg = run_cmd([vk_harness, vs_tri, fs_loc1, raw], env=env)
-            if rc != 0:
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_grad(raw, 0.0, 0.0)
@@ -596,7 +607,9 @@ def run_suite(a, work: str) -> int:
             # the wave64 compute dumps are.
             no64 = (name == "ms_w64x_ballot" and os.environ.get("LEONIDA_W64_EMULATE") != "1" and
                     not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
-            if rc != 0:
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
                 results.append((name, False, msg))
             elif no64:
                 results.append((name, None, "SKIP (no 64-wide subgroup on this device)"))
@@ -607,7 +620,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_MESH="1")
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
-            if rc != 0:
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
