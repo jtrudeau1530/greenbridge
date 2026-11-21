@@ -45,11 +45,12 @@ int main(int argc, char** argv) {
     VkInstance inst = VK_NULL_HANDLE;
     LOADI(vkCreateInstance);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.apiVersion = VK_API_VERSION_1_2;
+    app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties);
+    LOADI(vkGetPhysicalDeviceProperties2); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetPhysicalDeviceMemoryProperties);
     LOADI(vkCreateDevice); LOADI(vkGetDeviceProcAddr);
     uint32_t n = 0;
@@ -62,7 +63,11 @@ int main(int argc, char** argv) {
         if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
-    std::fprintf(stderr, "device: %s\n", props.deviceName);
+    VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2.pNext = &sgProps;
+    vkGetPhysicalDeviceProperties2(pd, &props2);
+    std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
@@ -108,6 +113,16 @@ int main(int argc, char** argv) {
     if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
         enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
+    }
+    VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2q.pNext = &f13q;
+    vkGetPhysicalDeviceFeatures2(pd, &f2q);
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    if (f13q.subgroupSizeControl) {
+        f13.subgroupSizeControl = VK_TRUE;
+        f13.pNext = chain;
+        chain = &f13;
     }
     for (auto e : enable) std::fprintf(stderr, "enabled %s\n", e);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -185,6 +200,20 @@ int main(int argc, char** argv) {
         CHECK(module(gs_path, &gsm));
         stages[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT; stages[2].module = gsm; stages[2].pName = "main";
         nstages = 3;
+    }
+    const char* sg_env = std::getenv("VKH_SUBGROUP_SIZE");
+    const uint32_t req_sg = sg_env ? uint32_t(atoi(sg_env)) : 0;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+    reqSg.requiredSubgroupSize = req_sg;
+    if (req_sg > 0 && f13q.subgroupSizeControl &&
+        req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize) {
+        if (mesh && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT))
+            stages[0].pNext = &reqSg;
+        else if (gs_path && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_GEOMETRY_BIT))
+            stages[2].pNext = &reqSg;
+        else if (!mesh && !gs_path && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
+            stages[1].pNext = &reqSg;
     }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
