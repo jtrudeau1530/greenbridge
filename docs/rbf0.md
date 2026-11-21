@@ -313,12 +313,8 @@ and a value can follow a child element. A text record attaches to the open eleme
 | Resources decoded | 1,263 / 1,263 `ok` |
 | Elements | 475,461 |
 | Elements with 0 / 1 / 2 declared attributes | 389,525 / 84,541 / 1,395 |
-| Attribute values | 87,331: 85,924 string, 1,111 integer, 296 float |
 | Two-attribute type pairs | float/float 128, string/int 1,111, string/float 40, string/string 116 |
-| Non-attribute values | 73,159: 38,008 float, 28,289 integer, 6,862 boolean |
-| Non-attribute values after a child element | 22,977 |
 | Text records | 254,935, all NUL-terminated |
-| Text-only elements | 254,935; one text record, first content, no child or value |
 | String values | 85,924; all are attributes and none is NUL-terminated |
 | Text / string length | 2-1,006 / 1-126 bytes (the text length includes its trailing NUL) |
 | Descriptor instances reused with more than one type | 564 |
@@ -335,75 +331,102 @@ Of the 26 text payloads that are not valid UTF-8, all are text records; no strin
 a strict UTF-8 decode. The decoder replaces invalid bytes with U+FFFD and sets `utf8_valid: false`; the original
 encoding is not established.
 
-### 9.3 Sample trees
+### 9.3 Measured tree shape
 
-The three samples below are the smallest resources of their root schema that decode completely. Offsets are
-relative to the start of the joined resource.
+Every resource has one root. The corpus has **1,263 roots**, **474,198 parent-child edges** and **890,886 tree
+nodes** in total: 475,461 elements, 160,490 values and 254,935 texts. The depth distribution is:
 
-| Root schema | Archive offset | Inflated | Layout | Descriptors | Elements | Texts | Strings | Depth |
-|---|---|---:|---|---:|---:|---:|---:|---:|
-| `CMovieSubtitleContainer` | `0x9ed7280` | 490 | wide-64 | 13 | 11 | 3 | 3 | 4 |
-| `rage__fwuiPrefab` | `0x11dd8950` | 195 | wide-64 | 5 | 4 | 2 | 1 | 3 |
-| `UIScreen` | `0x12059180` | 385 | wide-64 | 9 | 9 | 6 | 0 | 3 |
+| Depth | Elements | Depth | Elements |
+|---:|---:|---:|---:|
+| 1 | 1,263 | 19 | 24,523 |
+| 2 | 3,722 | 20 | 31,186 |
+| 3 | 15,537 | 21 | 21,989 |
+| 4 | 19,248 | 22 | 11,765 |
+| 5 | 18,377 | 23 | 10,702 |
+| 6 | 24,965 | 24 | 10,247 |
+| 7 | 22,295 | 25 | 15,399 |
+| 8 | 19,530 | 26 | 8,563 |
+| 9 | 18,599 | 27 | 7,918 |
+| 10 | 17,738 | 28 | 13,470 |
+| 11 | 16,822 | 29 | 5,721 |
+| 12 | 14,247 | 30 | 4,177 |
+| 13 | 14,740 | 31 | 3,433 |
+| 14 | 12,670 | 32 | 1,612 |
+| 15 | 14,584 | 33 | 1,139 |
+| 16 | 28,395 | 34 | 363 |
+| 17 | 18,917 | 35 | 38 |
+| 18 | 21,559 | 36 | 8 |
 
-`CMovieSubtitleContainer` descriptor table:
+The child-count distribution is concentrated at the leaves: 280,469 elements have no child element, while the
+largest element has 156. The mean is 0.9973 child elements per element.
 
-| ID | Name | First type | Uses |
-|---:|---|---|---:|
-| 0 | `CMovieSubtitleContainer` | open | 1 |
-| 1 | `TextBlockName` | open | 1 |
-| 2 | `pCutsceneEventArgsList` | open | 1 |
-| 3 | `Item` | open | 3 |
-| 4 | `type` | string | 3 |
-| 5 | `cName` | open | 2 |
-| 6 | `m_cOptionalActor` | open | 2 |
-| 7 | `fSubtitleDuration` | float | 2 |
-| 8 | `pCutsceneEventList` | open | 1 |
-| 9 | `fTime` | float | 1 |
-| 10 | `iEventId` | int | 1 |
-| 11 | `iEventArgsIndex` | int | 1 |
-| 12 | `iObjectId` | int | 1 |
+| Child elements | Elements |
+|---:|---:|
+| 0 | 280,469 |
+| 1 | 76,379 |
+| 2 | 54,236 |
+| 3 | 20,118 |
+| 4 | 27,568 |
+| 5 | 7,731 |
+| 6 | 2,594 |
+| 7 | 2,277 |
+| 8 | 1,615 |
+| 9 | 968 |
+| 10 | 191 |
+| 11 | 661 |
+| 12-19 | 407 |
+| 20-29 | 69 |
+| 30-39 | 71 |
+| 40-49 | 25 |
+| 50-59 | 17 |
+| 60-69 | 8 |
+| 70-79 | 18 |
+| 80-89 | 10 |
+| 90-99 | 9 |
+| 100-109 | 14 |
+| 124-127 | 5 |
+| 156 | 1 |
 
-The tree shows the attribute/content split directly:
+The tree also separates attribute values from content values. 87,331 values are attributes (85,924 string, 1,111
+integer, 296 float); 73,159 are content (38,008 float, 28,289 integer, 6,862 boolean). 22,977 content values follow
+a child element rather than preceding it. 14,423 elements have an empty content list (attributes do not count),
+and 254,935 have text as their only content.
+
+A synthetic four-element tree shows the stored fields without using game names:
 
 ```
-0x0008  element 0  CMovieSubtitleContainer  attrs=0  end 0x01ea
-0x0029    element 1  TextBlockName
-0x0040      text     length 8
-0x0050    element 2  pCutsceneEventArgsList
-0x0070      element 3  Item  attrs=1
-0x007e        value 4  type (string, attribute)
-0x009e        element 5  cName
-0x00ad          text   length 12
-0x00c1        element 6  m_cOptionalActor
-0x00dd        value 7  fSubtitleDuration (float, content after the child)
-0x0154    element 8  pCutsceneEventList
-0x0170      element 3  Item  attrs=1
-0x018f        value 9  fTime (float)
-0x01a0        value 10 iEventId (int)
-0x01b4        value 11 iEventArgsIndex (int)
-0x01cf        value 12 iObjectId (int)
-0x01e8  close root; end 0x01ea
+Root         depth 1  attrs 0/0  children 2  content 2
+  Item       depth 2  attrs 1/1  children 1  content 2
+    value "id" (string, attribute)
+    Child    depth 3  attrs 0/0  children 0  content 1
+      text "example"
+  Empty      depth 2  attrs 0/0  children 0  content 0
 ```
 
-The 195-byte `rage__fwuiPrefab` uses descriptor IDs 0-4: root, `Id`, `PrefabObject`, `type` (string) and `Style`.
-Its root is at 0x08; `Id` at 0x22 with a 42-byte text at 0x2e; `PrefabObject` at 0x60 with one attribute `type`
-at 0x76; `Style` at 0x8f with a 25-byte text at 0x9e; root close at 0xc1, end 0xc3.
-
-The 385-byte `UIScreen` uses descriptor IDs 0-8: `UIScreen`, `LayoutParams`, `widthContentMode`,
-`heightContentMode`, `horizontalAlignment`, `verticalAlignment`, `Name`, `Screen` and `ID`. It has nine elements
-and six text leaves; `LayoutParams` contains four text-valued children and the root contains `Name`, `Screen` and
-`ID` siblings. No attribute is present.
+`attrs` is `declared/actual`; `children` counts child elements only, while `content` counts every ordered content
+record (child element, value or text). The root's `end` is the byte after its close; a complete resource consumes
+the buffer exactly.
 
 ### 9.4 Output and failure behavior
 
 JSON carries one object per resource: `offset`, `size`, `chunks`, `layout`, `root_name`, `status`, `error`,
 `descriptors`, `counts` and `tree`. Every node has a `kind` and a byte `offset`. Elements carry `descriptor`,
-`attrs_declared`, `attributes`, ordered `content` and `end`; values carry `descriptor`, `type`, `payload_offset`,
-`size` and `value`; text nodes carry `length`, `nul_terminated`, `text` and `utf8_valid`.
+`attrs_declared`, `attrs_actual`, `children`, `content_count`, `attributes`, ordered `content` and `end`; values
+carry `descriptor`, `type`, `payload_offset`, `size` and `value`; text nodes carry `length`, `nul_terminated`,
+`text` and `utf8_valid`. The full-corpus JSON is about 534 MB because every node keeps its offset; `--root`,
+`--offset` and `--limit` select samples. The JSON summary adds the aggregate tree shape: `nodes`,
+`elements_by_depth`, `children_histogram`, `content_length_histogram`, `attribute_count_histogram`,
+`leaf_elements`, `empty_elements`, `text_only_elements`, `parent_child_edges`, `max_children` and `mean_children`.
 
-XML is a rendering, not a round-trip. Fixed tags avoid descriptor names that are not legal XML names:
-`<node name="...">`, `<attr>`, `<value>` and `<text>`. A string containing XML markup is escaped by the writer.
+`--csv PATH` writes one flat row per node. The `parent` column is the parent element's byte offset, `slot` is
+`attribute` or `content`, `sibling` is the index in that list, and `child_index` is the index among child elements;
+`attrs`, `children`, `content_count`, `type`, `length`, `nul`, `utf8` and `value` describe the node. The CSV is a
+convenience view of the same structural tree, not a second parse.
+
+XML is a rendering, not a round-trip. Fixed tags avoid descriptor names that cannot be used as XML element names:
+`<node name="...">`, `<attr>`, `<value>` and `<text>`. A string containing XML markup is escaped by the writer. The
+`<rbf0>` root carries `status` and, on failure, `error`. JSON, CSV and XML all contain names or payloads and are
+game data.
 
 The decoder fails closed. An index beyond the current descriptor table, an unknown record type, a non-zero element
 header word, a close or text with no open element, and a truncated payload stop that resource with `status` `bad`
@@ -419,11 +442,11 @@ the last byte. The corpus has 0 bad, 0 truncated and 0 trailing resources.
 - The attribute rule is measured, not proven universal: every corpus attribute leads its element and every text
   element is a text-only leaf. The decoder marks `attribute_order_violation`, `multiple_text` and
   `text_after_child` if a future resource departs from it; the corpus has none of these.
-- The 26 invalid UTF-8 text payloads have no established encoding. The XML writer replaces bad bytes, so it is
-  lossy for those records.
+- The 26 invalid UTF-8 text payloads have no established encoding. The JSON, CSV and XML writers replace bad bytes,
+  so they are lossy for those records.
 - `xmlns:xi` is a literal field name. Its namespace meaning is not decoded.
 - `0x50` (three floats) is accepted by the grammar but never occurs in this corpus.
-- No external schema or XSD validates the tree; XML output is a structural rendering only.
+- No external schema or XSD validates the tree; JSON, CSV and XML output are structural renderings only.
 - A resource does not store its archive path. The source label is the carve offset or file name, not a game path.
 
 ## 10. Reproduction
@@ -436,8 +459,9 @@ python -I tools/rbf0_index.py <package>\data.rpf <work>\rbf0.csv --quiet
 # Index a directory of already-carved streams (offsets from leading hex file names)
 python -I tools/rbf0_index.py <work>\data-carve <work>\rbf0.json
 
-# Decode trees from the same carve; JSON plus optional per-resource XML
+# Decode trees from the same carve; JSON plus optional CSV node table and per-resource XML
 python -I tools/rbf0_tree.py <work>\data-carve <work>\rbf0-tree.json
+python -I tools/rbf0_tree.py <work>\data-carve <work>\rbf0-tree.json --csv <work>\rbf0-nodes.csv
 python -I tools/rbf0_tree.py <work>\data-carve <work>\rbf0-tree.json --xml <work>\rbf0-xml
 python -I tools/rbf0_tree.py <work>\data-carve <work>\subtitle.json --root CMovieSubtitleContainer --limit 1
 
@@ -449,8 +473,11 @@ python -I tests/test_rbf0_tree.py
 The JSON summary carries the corpus totals used above (`streams`, `compressed_bytes`, `inflated_bytes`,
 `rbf0.resources`, `rbf0.multi_chunk`, `rbf0.by_root`, `rbf0.size_buckets`, record counts, string categories and
 keyword occurrences), so the numbers can be re-measured without committing an index. `--all-strings` writes the
-full readable string list to JSON; that file is game data and must stay out of git. The tree output and XML files
-contain names and payloads and are game data too.
+full readable string list to JSON; that file is game data and must stay out of git. The tree summary adds the
+structural counts `elements_by_depth`, `children_histogram`, `content_length_histogram`,
+`attribute_count_histogram`, `leaf_elements`, `empty_elements`, `text_only_elements`, `parent_child_edges`,
+`max_children` and `mean_children`, so the tree shape can be re-measured without keeping the trees. The tree JSON,
+CSV and XML outputs contain names and payloads and are game data too.
 
 ## 11. No-sharing rule
 
