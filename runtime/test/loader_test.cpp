@@ -22,6 +22,10 @@ int g_failed = 0;
 unsigned g_files = 0;
 std::filesystem::path g_dir;
 
+// Sentinels that the synthesised TLS callback and DllMain stubs write, so a test can see execution happen.
+uint32_t g_tls_ran = 0;
+uint32_t g_main_ran = 0;
+
 void pass(const char* what) {
     ++g_checks;
     std::printf("ok    %s\n", what);
@@ -361,6 +365,108 @@ void test_delay_imports() {
     }
 }
 
+// movabs rax, addr ; mov dword [rax], value ; mov eax, eax_value ; ret
+void emit_store_stub(std::vector<uint8_t>& img, size_t off, uint64_t addr, uint32_t value, uint32_t eax_value) {
+    size_t n = off;
+    img[n++] = 0x48;
+    img[n++] = 0xB8;
+    for (int i = 0; i < 8; ++i) img[n++] = static_cast<uint8_t>(addr >> (8 * i));
+    img[n++] = 0xC7;
+    img[n++] = 0x00;
+    for (int i = 0; i < 4; ++i) img[n++] = static_cast<uint8_t>(value >> (8 * i));
+    img[n++] = 0xB8;
+    for (int i = 0; i < 4; ++i) img[n++] = static_cast<uint8_t>(eax_value >> (8 * i));
+    img[n++] = 0xC3;
+}
+
+constexpr uint64_t kInitBase = 0x140000000;
+
+// make_image() plus a TLS directory and an entry point, both aimed at real machine code: a stub that stores a
+// sentinel in this process, so the test can tell a callback ran rather than only that it was parsed.
+std::vector<uint8_t> make_init_image() {
+    auto img = make_image();
+    auto* nt = nt_of(img);
+    nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+    nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
+    auto va = [](uint32_t rva) { return kInitBase + rva; };
+    constexpr size_t text = 0x200;  // file offset of RVA 0x1000
+    emit_store_stub(img, text + 0x00, reinterpret_cast<uint64_t>(&g_tls_ran), 1, 0);
+    emit_store_stub(img, text + 0x40, reinterpret_cast<uint64_t>(&g_main_ran), 2, 1);
+    std::memcpy(img.data() + text + 0x80, "TLS!", 4);
+    auto* callbacks = reinterpret_cast<uint64_t*>(img.data() + text + 0x90);
+    callbacks[0] = va(0x1000);
+    callbacks[1] = 0;
+    auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(img.data() + text + 0xB0);
+    tls->StartAddressOfRawData = va(0x1080);
+    tls->EndAddressOfRawData = va(0x1084);
+    tls->AddressOfIndex = va(0x10A0);
+    tls->AddressOfCallBacks = va(0x1090);
+    tls->SizeOfZeroFill = 8;
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    dir.VirtualAddress = 0x10B0;
+    dir.Size = sizeof(IMAGE_TLS_DIRECTORY64);
+    return img;
+}
+
+void expect_init_rejects(const char* what, const std::vector<uint8_t>& bytes) {
+    auto p = write_image(bytes);
+    try {
+        rt::Loader loader(g_dir);
+        loader.load(p);
+        loader.initialise();
+        failed(what, "the module initialised");
+    } catch (const std::exception&) {
+        pass(what);
+    }
+}
+
+void test_initialise() {
+    g_tls_ran = 0;
+    g_main_ran = 0;
+    auto p = write_image(make_init_image());
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(p);
+        loader.initialise();
+        if (g_tls_ran != 1)
+            failed("initialise runs the TLS callback", "the callback never wrote its sentinel");
+        else
+            pass("initialise runs the TLS callback");
+        if (g_main_ran != 2)
+            failed("initialise calls DllMain for a DLL", "the entry point never wrote its sentinel");
+        else
+            pass("initialise calls DllMain for a DLL");
+        uint32_t slot = *reinterpret_cast<const uint32_t*>(m.base + 0x10A0);
+        void* block = slot == TLS_OUT_OF_INDEXES ? nullptr : TlsGetValue(slot);
+        if (!block || std::memcmp(block, "TLS!", 4) != 0)
+            failed("the TLS template is copied into the allocated slot", "the slot doesn't hold the template");
+        else
+            pass("the TLS template is copied into the allocated slot");
+    } catch (const std::exception& e) {
+        failed("initialise runs a TLS callback and DllMain", e.what());
+    }
+}
+
+void test_initialise_rejects() {
+    {
+        auto img = make_init_image();
+        nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress = 0x1FF0;
+        expect_init_rejects("a TLS directory past the image is rejected", img);
+    }
+    {
+        auto img = make_init_image();
+        auto* callbacks = reinterpret_cast<uint64_t*>(img.data() + 0x290);  // file offset of RVA 0x1090
+        callbacks[0] = kInitBase + 0x9000;                                  // well past SizeOfImage
+        expect_init_rejects("a TLS callback outside the image is rejected", img);
+    }
+    {
+        g_main_ran = 0;
+        auto img = make_init_image();
+        emit_store_stub(img, 0x240, reinterpret_cast<uint64_t>(&g_main_ran), 3, 0);  // DllMain returns FALSE
+        expect_init_rejects("a DllMain that returns FALSE is rejected", img);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -381,6 +487,8 @@ int main() {
     test_exports();
     test_imports();
     test_delay_imports();
+    test_initialise();
+    test_initialise_rejects();
 
     std::filesystem::remove_all(g_dir, ec);
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
