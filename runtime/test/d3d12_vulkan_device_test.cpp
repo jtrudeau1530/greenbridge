@@ -1104,7 +1104,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 5)) && SUCCEEDED(fence->SetEventOnCompletion(5, nullptr)));
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 9)) && SUCCEEDED(fence->SetEventOnCompletion(9, nullptr)));
             for (UINT row = 0; row < size; ++row)
                 for (UINT col = 0; col < size; ++col) {
                     report("reserved texel", row * size + col,
