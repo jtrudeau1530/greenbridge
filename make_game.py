@@ -303,7 +303,7 @@ def shaders(game: str, work: str, jobs: int) -> None:
         shutil.rmtree(spirv, ignore_errors=True)
     if not os.path.isfile(disassembled):
         need(os.environ.get("LLVM_MC", "llvm-mc"),
-             "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's full path.")
+             "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's path or whole command.")
         log("shaders: disassembling (gfx1013)")
         drop(translated)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
