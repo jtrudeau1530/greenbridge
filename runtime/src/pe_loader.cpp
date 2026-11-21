@@ -252,14 +252,62 @@ void Loader::parse_exports(Module& m) {
     auto* funcs = at<uint32_t>(m.base, ed->AddressOfFunctions);
     auto* names = at<uint32_t>(m.base, ed->AddressOfNames);
     auto* ords = at<uint16_t>(m.base, ed->AddressOfNameOrdinals);
+    // An export whose RVA lands inside the export directory is a forwarder string ("KERNEL32.Sleep",
+    // "api-ms-win-core-file-l1-1-0.CreateFileW"), not code. Storing base + that RVA would hand callers a pointer
+    // into the string, so forwarders are kept apart and followed when an import asks for one.
+    const uint64_t dir_begin = dir.VirtualAddress, dir_end = dir_begin + dir.Size;
+    auto add_export = [&](const std::string& key, uint32_t rva) {
+        if (rva >= dir_begin && rva < dir_end)
+            m.forwarders[key] = read_string(m.name, m.base, m.size, rva, "a forwarded export");
+        else
+            m.exports[key] = m.base + rva;
+    };
     for (uint32_t i = 0; i < ed->NumberOfFunctions; ++i)
-        if (funcs[i]) m.exports["#" + std::to_string(ed->Base + i)] = m.base + funcs[i];
+        if (funcs[i]) add_export("#" + std::to_string(ed->Base + i), funcs[i]);
     for (uint32_t i = 0; i < ed->NumberOfNames; ++i) {
         if (ords[i] >= ed->NumberOfFunctions)
             throw std::runtime_error(m.name + ": an export name points past the address table");
-        m.exports[read_string(m.name, m.base, m.size, names[i], "an export name")] = m.base + funcs[ords[i]];
+        add_export(read_string(m.name, m.base, m.size, names[i], "an export name"), funcs[ords[i]]);
     }
-    // Forwarded exports (RVA inside the export directory) aren't followed yet; none of the bundled DLLs use them.
+}
+
+// Follows a forwarder string to the module and export it names. Bundled modules are searched first, with or without
+// the extension, because a forwarder may point at another mapped module; system DLLs go through LoadLibraryEx, whose
+// own GetProcAddress already follows its forwarders. Errors are "not found": the caller decides what to bind.
+void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int depth) {
+    if (depth >= 8) return nullptr;  // a longer chain is a loop between modules, not a re-export
+    auto dot = spec.rfind('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= spec.size()) return nullptr;
+    const std::string module = spec.substr(0, dot), symbol = spec.substr(dot + 1);
+    const bool by_ordinal = symbol.size() > 1 && symbol[0] == '#';
+    uint32_t ordinal = 0;
+    if (by_ordinal) {
+        for (size_t i = 1; i < symbol.size(); ++i) {
+            if (symbol[i] < '0' || symbol[i] > '9' || ordinal > 0xFFFF) return nullptr;
+            ordinal = ordinal * 10 + static_cast<uint32_t>(symbol[i] - '0');
+        }
+    }
+
+    const std::filesystem::path candidates[] = {game_dir_ / module, game_dir_ / (module + ".dll")};
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (prefer_host_copy(lower(module)) || !std::filesystem::exists(candidate, ec)) continue;
+        Module& dep = load(candidate);
+        if (auto it = dep.exports.find(symbol); it != dep.exports.end()) {
+            binding = Binding::Module;
+            return it->second;
+        }
+        if (auto it = dep.forwarders.find(symbol); it != dep.forwarders.end())
+            return resolve_forwarder(it->second, binding, depth + 1);
+        return nullptr;  // the bundled module exists and does not export it; don't look for a host namesake
+    }
+
+    HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) return nullptr;
+    FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
+    if (!p) return nullptr;
+    binding = Binding::Host;
+    return reinterpret_cast<void*>(p);
 }
 
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
@@ -277,6 +325,13 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         if (auto it = dep.exports.find(sym); it != dep.exports.end()) {
             m.imports.push_back({dll, sym, Binding::Module});
             return it->second;
+        }
+        if (auto it = dep.forwarders.find(sym); it != dep.forwarders.end()) {
+            Binding binding = Binding::Unimplemented;
+            if (void* p = resolve_forwarder(it->second, binding, 0)) {
+                m.imports.push_back({dll, sym, binding});
+                return p;
+            }
         }
     }
     // Host Windows: system DLLs and API sets. LOAD_LIBRARY_SEARCH_SYSTEM32 keeps the game folder out of the search.
@@ -334,8 +389,16 @@ void Loader::bind_imports(Module& m) {
             require_range(m.name, rva, sizeof(IMAGE_DELAYLOAD_DESCRIPTOR), m.size, "the delay-import table");
             auto* d = at<IMAGE_DELAYLOAD_DESCRIPTOR>(m.base, static_cast<uint32_t>(rva));
             if (!d->DllNameRVA) break;
+            // x64 descriptors always carry dlattrRva (0x1). Without it the fields would be 32-bit virtual
+            // addresses, which cannot express a 64-bit image base, so the descriptor is not usable as written.
+            if (!d->Attributes.RvaBased)
+                throw std::runtime_error(m.name + ": a delay-import descriptor without the RVA attribute");
+            if (!d->ImportAddressTableRVA)
+                throw std::runtime_error(m.name + ": a delay-import descriptor has no address table");
             std::string dll = read_string(m.name, m.base, m.size, d->DllNameRVA, "a delay-imported DLL name");
-            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA);
+            // The name table is optional: without it, entries are read back through the address table itself.
+            bind_thunks(dll, d->ImportNameTableRVA ? d->ImportNameTableRVA : d->ImportAddressTableRVA,
+                        d->ImportAddressTableRVA);
         }
     }
 }
