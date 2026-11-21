@@ -1,12 +1,21 @@
-// xmem.dll: the GDK's tracked allocator. Mapped onto the CRT's aligned heap and VirtualQuery.
+// xmem.dll: the GDK's tracked allocator. Mapped onto the CRT's aligned heap and VirtualQueryEx.
 //
-// TODO: decode the XALLOC_ATTRIBUTES alignment and memory-type fields. Until that's checked against real call
-// sites, every block is 64-byte aligned, which covers cache-line and SIMD alignment.
+// The measured ABI (docs from the clean-room spec) shows four imports:
+//   XMemAlloc(size, attributes)
+//   XMemFree(ptr, attributes)
+//   XMemVirtualQuery(process, address, out64)
+//   XMemGetWorkingSetStatistics(out)
+//
+// ASSUMPTION: the attribute word is not decoded by the measured call sites (one passes 0x5e50000). Until a call
+// site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
+// zero is rounded up to one byte so the result is a stable, non-null pointer that XMemFree can release.
 #include <windows.h>
 #include <malloc.h>
 #include <psapi.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "shims.h"
@@ -19,23 +28,56 @@ void* __stdcall XMemAlloc(size_t size, uint64_t /*attributes*/) { return _aligne
 
 void __stdcall XMemFree(void* p, uint64_t /*attributes*/) { _aligned_free(p); }
 
-// Same shape as VirtualQuery on the console (MEMORY_BASIC_INFORMATION out, returns bytes written).
-SIZE_T __stdcall XMemVirtualQuery(const void* address, MEMORY_BASIC_INFORMATION* info, SIZE_T length) {
-    return VirtualQuery(address, info, length);
+// Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
+// known: callers read at least the base and size fields. Fill that prefix from VirtualQueryEx and zero the rest.
+constexpr size_t kVirtualQueryOutSize = 64;
+static_assert(sizeof(MEMORY_BASIC_INFORMATION) <= kVirtualQueryOutSize,
+              "the 64-byte XMemVirtualQuery output must hold MEMORY_BASIC_INFORMATION");
+
+// Returns the number of bytes written (the VirtualQuery convention) or 0 on failure. The exact return type and the
+// meaning of every output field are not fully known; callers in the package only test for success.
+SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out) {
+    if (!out) return 0;
+    std::memset(out, 0, kVirtualQueryOutSize);
+    if (!address) return 0;
+
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] xmem: XMemVirtualQuery: fields after MEMORY_BASIC_INFORMATION are unknown; "
+                     "the 64-byte output is zero-filled there\n");
+    }
+
+    // A null handle means the current process; GetCurrentProcess() is the (HANDLE)-1 pseudo handle.
+    HANDLE target = process ? process : GetCurrentProcess();
+    MEMORY_BASIC_INFORMATION info{};
+    SIZE_T written = VirtualQueryEx(target, address, &info, sizeof(info));
+    if (!written) return 0;
+
+    std::memcpy(out, &info, written < kVirtualQueryOutSize ? written : kVirtualQueryOutSize);
+    return written;
 }
 
-// GDK: HRESULT XMemGetWorkingSetStatistics(XMEM_WORKING_SET_STATISTICS*). The struct's exact layout isn't known
-// yet, so it's zeroed up to a conservative size and filled with the process's working set in the first field.
-// Revisit once the exe's call sites show which fields are read.
-long __stdcall XMemGetWorkingSetStatistics(void* stats) {
-    if (!stats) return static_cast<long>(0x80070057);  // E_INVALIDARG
-    std::memset(stats, 0, 32);
-    PROCESS_MEMORY_COUNTERS pmc{};
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
-        uint64_t ws = pmc.WorkingSetSize;
-        std::memcpy(stats, &ws, sizeof(ws));
+// GDK: BOOL XMemGetWorkingSetStatistics(XMEM_WORKING_SET_STATISTICS*). The layout is not fully known. The FidelityFX
+// upscaler reads a 64-bit size at +8 and treats FALSE as "no data", so only the first 16 bytes are touched: zero at
+// +0 (unknown) and the process working set at +8. Do not claim more of the struct than is measured.
+BOOL __stdcall XMemGetWorkingSetStatistics(void* stats) {
+    if (!stats) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[rt] xmem: XMemGetWorkingSetStatistics(nullptr) -> FALSE\n");
+        }
+        return FALSE;
     }
-    return 0;  // S_OK
+
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return FALSE;
+
+    uint8_t* bytes = static_cast<uint8_t*>(stats);
+    std::memset(bytes, 0, 16);
+    uint64_t working_set = pmc.WorkingSetSize;
+    std::memcpy(bytes + 8, &working_set, sizeof(working_set));
+    return TRUE;
 }
 
 }  // namespace

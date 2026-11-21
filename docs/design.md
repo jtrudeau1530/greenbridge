@@ -120,9 +120,11 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
 - `tools\hashdict.py`: joaat hash→name dictionary (`<work>\hashes.json`, 1.9M entries, checked against
   `adder` = 0xB779A091). On day one, rerun with `--extra <exe>` so PSO field and type names resolve. Without the exe
   only about 1% do.
-- Runtime shims: all of `xmem.dll` is shimmed (`XMemAlloc`, `XMemFree`, `XMemVirtualQuery`,
-  `XMemGetWorkingSetStatistics`). The only imports the bundled DLLs still can't bind are two `d3d12_xs`
-  root-signature calls.
+- Runtime shims: all of `xmem.dll` is shimmed with the measured argument shapes (`XMemAlloc`, `XMemFree`,
+  `XMemVirtualQuery(process, address, out64)`, `XMemGetWorkingSetStatistics(out)`). The `d3d12_xs` root-signature
+  serializer forwards to the PC `d3d12.dll` after clearing the Xbox flag byte; the deserializer forwards unchanged.
+  `D3D12XboxCreateDevice` returns a PC device; the Xbox-ABI proxy for its measured slot overrides is not implemented
+  yet.
 - PSO metadata is a new variant (`PSIN`, `LSCH` schema, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`, little-endian).
   CodeWalker's parser reads the container but not the new schema; dump it once the exe gives the field names.
 
@@ -266,6 +268,6 @@ gfx1030 and 283 clean for gfx1010–1012.
   `python -I tools\manifest.py verify <game>` to check a copy against it.
 - `reports/rpf_probe.json`: all 22 archives are **RPF9**. Five have tables that look packed or encrypted (`levels`,
   `movies`, `core_bvh4`, `navmeshes`, `data`).
-- `reports/pe/`: the 16 bundled DLLs are plain x86-64 PE with no encrypted sections. Through the loader they need
-  only `xmem.dll` (`XMemAlloc` and `XMemFree` are shimmed; `XMemVirtualQuery` and `XMemGetWorkingSetStatistics` aren't
-  yet) and two `d3d12_xs.dll` root-signature calls. Every other import resolves on desktop Windows.
+- `reports/pe/`: the 16 bundled DLLs are plain x86-64 PE with no encrypted sections. Through the loader their
+  `xmem.dll` imports and two `d3d12_xs.dll` root-signature calls bind to shims. Every other import resolves on
+  desktop Windows. The `D3D12XboxCreateDevice` slot layout beyond the measured entries remains unknown.
