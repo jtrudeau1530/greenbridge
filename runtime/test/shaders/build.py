@@ -34,7 +34,9 @@ def translate_tests(work, names):
                             os.path.join(HERE, n + ".asm")], capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
-        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{r.stdout}", encoding="utf-8")
+        # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
+        code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
+        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
         if n.startswith("cs_"):
             header = bytearray(0x148)
             struct.pack_into("<4I", header, 0x138, RSRC2, *GROUP)
