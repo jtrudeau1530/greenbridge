@@ -173,6 +173,22 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %cFF\n"), 0xFFFFFFFF)
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %c80\n"), 7)
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %cF0\n"), 3)
+        # FindILsb / FindUMsb: bit number of the lowest / highest 1 bit, -1 for 0 (GLSL.std.450).
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindILsb %c0\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindILsb %cF0\n"), 4)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindUMsb %c0\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindUMsb %cF0\n"), 31)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindUMsb %c80\n"), 7)
+        # UMax / SMin and the clamps compare as the name says: 0xffffffff is the largest unsigned, -1 signed.
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl UMax %cFF %c1\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SMin %cFF %c1\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl UClamp %cFF %c1 %c8\n"), 8)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SClamp %cFF %c1 %c8\n"), 1)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SClamp %c4 %cF0 %c8\n"), 4)
+        with self.assertRaises(si.UnsupportedConstruct):                                  # minVal > maxVal
+            run_word("%res = OpExtInst %uint %glsl UClamp %c4 %c8 %c1\n")
+        self.assertEqual(run_word("%b = OpUGreaterThanEqual %bool %c8 %c8\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpUGreaterThanEqual %bool %c1 %cFF\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
         self.assertEqual(run_word("%x = OpBitcast %float %c0\n%s = OpExtInst %float %glsl Sin %x\n"
                                   "%res = OpBitcast %uint %s\n"), 0)
 
@@ -203,7 +219,7 @@ class InterpreterTests(unittest.TestCase):
 
     def test_unsupported_constructs_are_rejected(self):
         for body in ("%res = OpUDiv %uint %c2 %c1\n",                                     # opcode not modelled
-                     "%res = OpExtInst %uint %glsl FindUMsb %c2\n",                      # ext inst not modelled
+                     "%res = OpExtInst %uint %glsl Ldexp %c2 %c1\n",                     # ext inst not modelled
                      "%res = OpBitFieldUExtract %uint %cFF %c32 %c1\n",                  # undefined per spec
                      "%res = OpShiftLeftLogical %uint %cFF %c32\n",                     # undefined per spec
                      "%res = OpShiftRightLogical %uint %cFF %c32\n",                    # undefined per spec
