@@ -2,7 +2,9 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test, vk_harness and vk_bindless_test (runtime/build by default).
+The test programs are vk_compute_test, vk_store_test, vk_harness and vk_bindless_test (runtime/build by default). With
+the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by
+itself (the newest complete one if there are several) and its name is printed.
 Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
 0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
@@ -26,6 +28,47 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
+
+# The programs every run needs. Multi-config CMake generators (Visual Studio, Xcode, Ninja Multi-Config) put each of
+# them in build/<Config> instead of build/ (TEST-38).
+TEST_PROGRAMS = ("vk_compute_test", "vk_store_test", "vk_harness")
+CONFIG_DIRS = ("RelWithDebInfo", "Release", "Debug", "MinSizeRel")
+
+
+def complete_build_dirs(build, programs):
+    """`build` and its configuration subfolders, in that order, that hold all of `programs` (file names with extension)."""
+    return [d for d in (build, *(os.path.join(build, c) for c in CONFIG_DIRS))
+            if all(os.path.isfile(os.path.join(d, n)) for n in programs)]
+
+
+def resolve_build_dir(build, programs):
+    """The folder that holds all of `programs`.
+
+    Makefile and Ninja builds leave them in `build`. With the Visual Studio generator they land in build/RelWithDebInfo,
+    build/Release and so on. `build` itself wins when it has them all; otherwise the configuration folder that has them
+    all and was built last. If none has them, `build` is returned, so a "not found" message names the folder given."""
+    found = complete_build_dirs(build, programs)
+    if not found or found[0] == build:
+        return build
+    return max(found, key=lambda d: max(os.path.getmtime(os.path.join(d, n)) for n in programs))
+
+
+def pick_build_dir(build, programs):
+    """resolve_build_dir, and say which folder was picked when it is a configuration subfolder, so a report can name
+    the build it ran and a stale pick is visible."""
+    chosen = resolve_build_dir(build, programs)
+    if chosen != build:
+        names = [os.path.basename(d) for d in complete_build_dirs(build, programs)]
+        print(f"test programs: {chosen}" + (f" (newest of {', '.join(names)})" if len(names) > 1 else ""))
+    return chosen
+
+
+def not_found_message(build, missing):
+    return (f"Test programs not found in {build}: {', '.join(missing)}\n"
+            f"(its {', '.join(CONFIG_DIRS)} subfolders were searched too)\n"
+            "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
+            "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
+            "Vulkan headers (vulkan-headers on Arch) and configure again.")
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
@@ -98,12 +141,8 @@ def run(*cmd, env=None):
         if not isinstance(e, FileNotFoundError):
             return 1, start_failure(cmd[0], e)
         tools = os.path.abspath(os.path.dirname(cmd[0]))
-        missing = [t + EXE for t in ("vk_compute_test", "vk_store_test", "vk_harness")
-                   if not os.path.isfile(os.path.join(tools, t + EXE))]
-        sys.exit(f"Test programs not found in {tools}: {', '.join(missing)}\n"
-                 "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
-                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
-                 "Vulkan headers (vulkan-headers on Arch) and configure again.")
+        missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
+        sys.exit(not_found_message(tools, missing))
     return r.returncode, r.stdout + r.stderr
 
 
@@ -328,6 +367,7 @@ def main():
         sys.exit(__doc__)
     spirv = os.path.join(sys.argv[1], "spirv")
     tools = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, "..", "..", "build")
+    tools = pick_build_dir(os.path.abspath(tools), tuple(t + EXE for t in TEST_PROGRAMS))
     results = []
     for name, groups, expect in COMPUTE:
         results.append((name, compute_test(tools, spirv, name, groups, expect)))
