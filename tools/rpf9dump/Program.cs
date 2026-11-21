@@ -78,7 +78,16 @@ else if (mode is "models" or "textures")
     var list = doc.Entries.Where(e => e.Compression == want).ToList();
     Console.WriteLine($"  {list.Count:N0} {mode} entries ({sw.Elapsed.TotalSeconds:0}s)");
     string sub = Path.Combine(outDir, mode); Directory.CreateDirectory(sub);
-    var rows = new List<object>();
+    // The manifest is streamed row by row: holding 150k rows (each capturing its decoded model through lazy
+    // projections) ran out of memory on levels.rpf. Written to a .partial file and renamed when complete.
+    string manifestPath = Path.Combine(sub, "manifest.json"), partial = manifestPath + ".partial";
+    using var mstream = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+    using var writer = new Utf8JsonWriter(mstream, new JsonWriterOptions { Indented = true });
+    writer.WriteStartObject();
+    writer.WriteString("src", src);
+    writer.WriteNumber("Count", list.Count);
+    writer.WriteStartArray("Items");
+    void Row(object row) => JsonSerializer.Serialize(writer, row, json);
     int embedded = 0;
     foreach (var e in list)
     {
@@ -104,12 +113,12 @@ else if (mode is "models" or "textures")
                         try { File.WriteAllBytes(p, Util.BgraDds(RageTextureDecoder.DecodeEmbeddedTexturePixels(sys, gfx, dOff, t.Index))); embedded++; } catch { }
                     }
                 }
-                rows.Add(new { e.Offset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
+                Row(new { e.Offset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
                     Min = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z }, Max = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
-                    MeshShaders = m.Meshes.Select(x => x.ShaderIndex),
-                    Embedded = m.EmbeddedTextures?.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }),
+                    MeshShaders = m.Meshes.Select(x => x.ShaderIndex).ToArray(),
+                    Embedded = m.EmbeddedTextures?.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray(),
                     Materials = m.Materials?.Select(x => new { x.ShaderIndex, Shader = x.ShaderHash.ToString("X8"), Preset = x.PresetHash.ToString("X8"), x.RenderBucket,
-                        Textures = x.Textures.Select(r => new { Param = r.ParameterHash.ToString("X8"), r.TextureIndex, Name = r.NameHash.ToString("X8"), Id64 = r.OpaqueId64.ToString("X16"), Tag = r.Tag.ToString("X8") }) }) });
+                        Textures = x.Textures.Select(r => new { Param = r.ParameterHash.ToString("X8"), r.TextureIndex, Name = r.NameHash.ToString("X8"), Id64 = r.OpaqueId64.ToString("X16"), Tag = r.Tag.ToString("X8") }).ToArray() }).ToArray() });
                 ok++;
             }
             else
@@ -122,14 +131,18 @@ else if (mode is "models" or "textures")
                     string p = Path.Combine(td, $"{t.Index:D3}_{Util.Safe(t.Name)}.dds");
                     try { if (!File.Exists(p)) File.WriteAllBytes(p, RageTextureDecoder.CreateDds(sys, gfx, t.Index)); ok++; } catch { fail++; }
                 }
-                rows.Add(new { e.Offset, Dir = stem, Textures = dict.Textures.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, t.MipCount, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }) });
+                Row(new { e.Offset, Dir = stem, Textures = dict.Textures.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, t.MipCount, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray() });
             }
         }
         catch (Exception ex) { fail++; if (fail <= 5) Console.WriteLine($"  fail {e.Name}: {ex.GetType().Name} {ex.Message}"); }
         if ((ok + fail) % 1000 == 0) Console.WriteLine($"  exported {ok + fail:N0}/{list.Count:N0}");
     }
     if (mode == "models") Console.WriteLine($"  embedded textures {embedded:N0}");
-    File.WriteAllText(Path.Combine(sub, "manifest.json"), JsonSerializer.Serialize(new { src, Count = list.Count, Items = rows }, json));
+    writer.WriteEndArray();
+    writer.WriteEndObject();
+    writer.Dispose();          // flushes; the later using-dispose is a no-op
+    mstream.Dispose();
+    File.Move(partial, manifestPath, true);
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
 return 0;
