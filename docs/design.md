@@ -267,6 +267,15 @@ How the generated SPIR-V expects the runtime to work:
 | Mesh/compute input registers (historical measurement) | An early read-before-write analysis over all compute and mesh shaders found **compute** v0 (880), v0–v1 (614), v0–v2 (50), consistent with AMD's local thread ID x/y/z in v0/v1/v2, and scalar inputs centred on a pointer at s[4:5] and s6/s7. **Mesh:** every one of 2,969 reads exactly **v5**, plus s3 (always arithmetic), s[16:17] and s19–s23. The early pass also read FSSM 0x13C as the group width and compared the first SGPR multiply against it (82 match, 151 don't, 1,447 no simple multiply) and wrongly concluded that 0x13C was not the group width; the matching register varied by shader (s6/s10/s7/s9…). PSV0 gave the real thread-group sizes (32×1×1 for 1,253, 8×8×1 for 416, …). **Superseded:** 0x13C/0x140/0x144 are the thread-group size, `COMPUTE_PGM_RSRC2` at 0x138 gives the per-shader user-SGPR count and enabled workgroup IDs, and mesh takes NumThreads, limits and topology from PSV0 with `v5 = linearGroupIndex * NumThreads + LocalInvocationIndex`. All 2,689 CS and 9,282 mesh shaders translate now (see the Compute shaders and Mesh shaders rows). |
 | Formerly untranslated | Mesh (9,282), geometry (195) and compute (2,689) now translate; `s_swappc_b64` is replaced by Vulkan vertex inputs (see *Vertex fetch*) and the `tbuffer_load_format_*` forms use the instruction's format. A few rare ops are still reported by name rather than guessed. |
 
+### System values confirmed on the corpus (SHADER-4)
+
+Counted with `scripts/audit_shader4_regs.py` on the disassembled game shaders (counts only):
+
+- **Compute shaders:** Confirmed by corpus counts across all 2,689 CS (`TIDIG_COMP_CNT` 0/1/2/3 = 724/1,786/179/0; `TGID` X/Y/Z 100/110/111 = 724/1,786/179; `TG_SIZE_EN` = 0, `SCRATCH_EN` = 0, `TRAP_PRESENT` = 0; RBW VGPRs: `v0` in 2,602, `v1` in 893, `v2` in 57) + GPU tests `cs_lds.asm` and #186's `cs_workgroup_yz.asm` (Y/Z `WorkgroupId`).
+- **Mesh shaders:** Confirmed by corpus counts (all 9,282 MS are 128×1×1 in PSV0, 100% read `v5` once, through `v_readfirstlane_b32` followed only by `s_lshr_b32 D, sX, 7`, 100% read `s3` exclusively via `s_bfe_u32 D, s3, 0x40018` for bits [27:24]; 0 read `s3` [31:28], [23:16], or [15:0]; audited with `scripts/audit_shader4_regs.py`) + GPU tests `ms_tri.asm`, `ms_wave_info_s3.asm` (`s3[27:24]` across both waves), and #219 (mesh `v5` workgroup index on a 2 × 3 × 4 grid).
+- **Geometry shaders:** Confirmed by corpus counts (all 195 GS read only `v0` and `v1`; 0 read `v2`, `v3`, or `v4`) + GPU test `gs_tri.asm`.
+
+
 **Main blocker at the time (superseded): descriptor loads.** On a 3,000-shader sample, `s_load_dwordx4`/`x8` stop over half of them. Shaders
 load texture, buffer and sampler descriptors through user-data SGPR pointers, and how the game's root signatures
 map onto those SGPRs is set up by game code. Reading that mapping from the exe (root signature creation plus the
