@@ -5648,7 +5648,7 @@ def pos_export_layout(osg1, insns):
       - clip distances precede cull distances, packed contiguously into 4-component pos exports (<= 8 total).
     Contrasted with DXBC OSG1 (D3D_NAME: 2=SV_ClipDistance, 3=SV_CullDistance,
     4=SV_RenderTargetArrayIndex, 5=SV_ViewportArrayIndex, 23=SV_ShadingRate).
-    When OSG1 is absent, infer contiguous ClipDistance slots from non-off pos1..pos2 exports.
+    When OSG1 is absent (or declares no clip/cull/misc outputs), pos1..pos3 exports are ignored.
     """
     misc_svs = {sv for _, _, sv, _, _ in osg1 if sv in (4, 5, 23)}
     has_misc = bool(misc_svs)
@@ -5667,21 +5667,6 @@ def pos_export_layout(osg1, insns):
             if (mask >> c) & 1:
                 slots.append(("cull", cull_n))
                 cull_n += 1
-    if not osg1:
-        used = set()
-        for ins in insns:
-            if base_op(ins["op"]) != "exp":
-                continue
-            a = ins["args"]
-            tgt = a[0]["t"] if a and a[0]["k"] in ("target", "special") else ""
-            if tgt in ("pos1", "pos2"):
-                p = int(tgt[3:])
-                for c, x in enumerate(a[1:5]):
-                    if not (x["k"] == "special" and x["t"] == "off"):
-                        used.add((p - 1) * 4 + c)
-        if used:
-            clip_n = min(max(used) + 1, 8)
-            slots = [("clip", i) for i in range(clip_n)]
     base_pos = 2 if has_misc else 1
     pos_map = {}
     for k, target in enumerate(slots[:8]):
