@@ -7,6 +7,7 @@ The SCARAB cross-check runs only when SCARAB_REF points at a checkout; it is not
 """
 import os
 import sys
+import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import d3d12_xs_surface as S  # noqa: E402
@@ -31,8 +32,7 @@ def test_iid_block_is_alphabetical():
 def test_standard_iids_match_sdk():
     um, _shared = S.find_sdk_include()
     if not um:
-        import pytest
-        pytest.skip("Windows SDK headers not found")
+        raise unittest.SkipTest("Windows SDK headers not found")
     errors, checked, _um = S.check_sdk()
     assert errors == []
     assert checked == 83
@@ -41,8 +41,7 @@ def test_standard_iids_match_sdk():
 def test_scarab_cross_check():
     root = os.environ.get("SCARAB_REF")
     if not root:
-        import pytest
-        pytest.skip("SCARAB_REF is not set")
+        raise unittest.SkipTest("SCARAB_REF is not set")
     errors, _notes = S.check_scarab(root)
     assert errors == []
 

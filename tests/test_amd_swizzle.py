@@ -2,7 +2,7 @@
 
     python -I tests/test_amd_swizzle.py
 """
-import pytest
+import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
 
 import os
 import sys
@@ -15,6 +15,7 @@ try:
 except ModuleNotFoundError as e:
     if e.name != "numpy":
         raise
+    import pytest  # noqa: E811
     pytest.skip("amd_swizzle needs numpy", allow_module_level=True)
 
 

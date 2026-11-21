@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -28,3 +28,26 @@ jobs:
         run: cmake --build runtime/build
       - name: CPU runtime tests
         run: ctest --test-dir runtime/build --output-on-failure
+
+  linux-gpu-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Vulkan SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev cmake ninja-build g++
+      - name: Configure
+        run: cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build runtime/build --parallel
+      - name: Check GPU tools exist
+        run: |
+          for tool in vk_harness vk_pipeline_check vk_command_replay_test vk_compute_test vk_texture_test vk_store_test d3d12_state_map_test command_list_test; do
+            if [ ! -f "runtime/build/$tool" ] && [ ! -f "runtime/build/$tool.exe" ]; then
+              echo "Missing: $tool"
+              exit 1
+            fi
+          done
+          echo "All GPU tools built"
