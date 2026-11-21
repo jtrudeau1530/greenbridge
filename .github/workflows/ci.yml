@@ -19,7 +19,7 @@ jobs:
         run: python -I make_game.py --help
       - name: Tests (standard library only, no game data)
         shell: bash
-        run: for t in tests/test_*.py; do echo "== $t"; python -I "$t" || exit 1; done
+        run: for t in tests/test_*.py; do [ "$t" = tests/test_translate.py ] && continue; echo "== $t"; python -I "$t" || exit 1; done  # test_translate.py: pytest job
       - name: Build the runtime (the GPU tools are skipped without the Vulkan SDK)
         run: |
           cmake -S runtime -B runtime/build
