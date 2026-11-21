@@ -6,6 +6,7 @@ same ``; encoding:`` listing format that tools/shader_disasm.py produces, next t
 """
 import glob
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -119,8 +120,19 @@ class Shader:
             rsrc2, (lx, ly, lz) = cs_header
             (workdir / "fssm").mkdir(exist_ok=True)
             (workdir / "fssm" / f"{name}.fssm").write_bytes(bytes(0x138) + struct.pack("<4I", rsrc2, lx, ly, lz))
-        r = subprocess.run([LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"],
-                           input=asm, capture_output=True, text=True)
+        cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        for ln in asm.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if not s.startswith(";"):
+                break
+            m = re.match(r";\s*mattr:\s*(\S+)", s)
+            if m:
+                cmd.append(f"-mattr={m.group(1)}")
+                break
+        cmd.append("-show-encoding")
+        r = subprocess.run(cmd, input=asm, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         self.path = disasm / f"{name}.s"
         self.path.write_text(r.stdout)
