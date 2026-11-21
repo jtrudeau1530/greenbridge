@@ -22,7 +22,7 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
 # tests, pixel tests, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + 3 + len(check.BOUNDS))   # + ms_v5_workgroup, ms_w64x_ballot, ps_tex (#230)
+         + len(check.PIXEL_TESTS) + 4 + len(check.BOUNDS))   # + ms_v5_workgroup, ms_w64x_ballot, ps_tex (#230), ps_ssharp
 
 
 class Wave64Checks(unittest.TestCase):
@@ -79,7 +79,8 @@ class Wave64Checks(unittest.TestCase):
                 (spirv / "cs_wave64_ballot.spv").touch()
             output = io.StringIO()
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
-                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
+                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "bindless_test", return_value=""), patch.object(check, "sampler_test", return_value=""),
+                  patch.object(check, "W64_EMULATED", emulated),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -183,6 +184,43 @@ class PixelDeviceLimits(unittest.TestCase):
         out = "device: fake (subgroup 32..32)\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
 
+
+class SamplerMipChecks(unittest.TestCase):
+    """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""
+
+    def test_levels_follow_the_s_and_t_fields(self):
+        want = {"point": (0, 1), "point max_lod 0": (0, 0), "point min_lod 1": (1, 1), "point bias +1": (1, 1),
+                "point bias -1": (0, 0), "none": (0, 0), "none min_lod 1": (0, 0), "point base 1": (1, 1)}
+        self.assertEqual({name for name, _, _ in check.SAMPLER_CASES}, set(want))
+        for name, words, view in check.SAMPLER_CASES:
+            with self.subTest(name=name):
+                self.assertEqual((check.sampler_level(words, view, 0), check.sampler_level(words, view, 1)), want[name])
+
+    def test_s_words_put_the_fields_where_mesa_does(self):
+        self.assertEqual(check.ssharp_words(1, min_lod=1, max_lod=15, bias=-1), (0x92, 0xf00100, 0x04003f00, 0))
+
+    @staticmethod
+    def image(level_lz, level_implicit):
+        return b"".join(struct.pack("<4f", *check.sampler_texel(level_lz, x, y), *check.sampler_texel(level_implicit, x, y))
+                        for y in range(64) for x in range(64))
+
+    def test_every_channel_and_the_last_pixel_are_judged(self):
+        words, view = check.ssharp_words(1), (0, 1)
+        good = self.image(0, 1)
+        self.assertEqual(check.sampler_mismatch(good, words, view), "")
+        for channel in range(4):
+            bad = bytearray(good)
+            struct.pack_into("<f", bad, len(good) - 16 + 4 * channel, 0.25)
+            self.assertTrue(check.sampler_mismatch(bytes(bad), words, view).startswith("(63,63):"))
+        self.assertIn("bytes", check.sampler_mismatch(good[:-16], words, view))
+
+    def test_a_wrong_level_or_swapped_uv_fails_where_predicted(self):
+        words, view = check.ssharp_words(1), (0, 1)
+        self.assertTrue(check.sampler_mismatch(self.image(1, 1), words, view).startswith("(0,0):"))
+        self.assertTrue(check.sampler_mismatch(self.image(0, 0), words, view).startswith("(0,0):"))
+        swapped = b"".join(struct.pack("<4f", *check.sampler_texel(0, y, x), *check.sampler_texel(1, y, x))
+                           for y in range(64) for x in range(64))
+        self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
 
 if __name__ == "__main__":
     unittest.main()

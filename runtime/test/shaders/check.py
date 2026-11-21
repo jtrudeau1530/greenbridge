@@ -2,7 +2,7 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test, vk_harness and vk_bindless_test (runtime/build by default).
+The test programs are vk_compute_test, vk_store_test, vk_harness, vk_bindless_test and vk_sampler_test (runtime/build by default).
 Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
 0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
@@ -10,7 +10,8 @@ The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see 
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
 to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
 fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
-ps_tex is skipped when the device lacks a feature the bindless set or the shader needs.
+ps_tex is skipped when the device lacks a feature the bindless set or the shader needs, ps_ssharp when it lacks one
+vk_sampler_test needs.
 """
 import collections
 import json
@@ -225,6 +226,87 @@ def bindless_test(tools, spirv):
     return "" if code == 0 and m and m.group(2) == "0" else failure(code, out, 3)
 
 
+def ssharp_words(mip_filter, min_lod=0.0, max_lod=15.0, bias=0.0):
+    """An S# with point min/mag filters, clamp-to-last-texel addressing and the given mip fields. Positions as
+    Mesa's gfx10-rsrc.json has them: WORD0 CLAMP_X/Y/Z [8:0], WORD1 MIN_LOD [11:0] and MAX_LOD [23:12] (4.8 fixed),
+    WORD2 LOD_BIAS [13:0] (signed 5.8 fixed) and MIP_FILTER [27:26] (0 none, 1 point, 2 linear)."""
+    clamp = 2 | 2 << 3 | 2 << 6
+    return (clamp, round(min_lod * 256) | round(max_lod * 256) << 12,
+            (round(bias * 256) & 0x3fff) | mip_filter << 26, 0)
+
+
+# (name, S#, (BASE_LEVEL, LAST_LEVEL) of the T#). Expected levels, explicit LOD 0 / implicit LOD 1:
+SAMPLER_CASES = [("point", ssharp_words(1), (0, 1)),                       # 0 / 1
+                 ("point max_lod 0", ssharp_words(1, max_lod=0), (0, 1)),  # 0 / 0
+                 ("point min_lod 1", ssharp_words(1, min_lod=1), (0, 1)),  # 1 / 1: MIN_LOD clamps an explicit LOD too
+                 ("point bias +1", ssharp_words(1, bias=1), (0, 1)),       # 1 / 1: the S# bias applies to an explicit LOD
+                 ("point bias -1", ssharp_words(1, bias=-1), (0, 1)),      # 0 / 0
+                 ("none", ssharp_words(0), (0, 1)),                        # 0 / 0: MIP_FILTER_NONE reads the base level
+                 ("none min_lod 1", ssharp_words(0, min_lod=1), (0, 1)),   # 0 / 0: and ignores the LOD clamp
+                 ("point base 1", ssharp_words(1), (1, 1))]                # 1 / 1: the T#'s BASE_LEVEL starts the view
+SAMPLER_SIZE = 64          # the target; the texture is twice as wide, so implicit sampling sees LOD 1
+GREY = 128 / 255
+
+
+def sampler_level(words, view, lod):
+    """The texture level one sample reads, from the S# fields and the T# view alone (not from gfx10_descriptors.h).
+    MIP_FILTER_NONE reads the view's base level whatever the LOD. Otherwise the LOD plus LOD_BIAS is clamped to
+    [MIN_LOD, MAX_LOD], a point mip filter takes the nearest level (ceil(lod + 0.5) - 1, as Vulkan's
+    VK_SAMPLER_MIPMAP_MODE_NEAREST does) and the result stays inside the view."""
+    base, last = view
+    if (words[2] >> 26) & 3 == 0:
+        return base
+    bias = ((words[2] & 0x3fff) ^ 0x2000) - 0x2000
+    lo, hi = (words[1] & 0xfff) / 256, (words[1] >> 12 & 0xfff) / 256
+    level = math.ceil(min(max(lod + bias / 256, lo), hi) + 0.5) - 1
+    return base + min(max(level, 0), last - base)
+
+
+def sampler_texel(level, x, y):
+    """(r, g) of the texel under pixel (x, y): level 0 is red, green, blue and yellow quadrants, level 1 grey."""
+    if level:
+        return (GREY, GREY)
+    half = SAMPLER_SIZE // 2
+    return ((1.0, 0.0), (0.0, 1.0), (0.0, 0.0), (1.0, 1.0))[2 * (y >= half) + (x >= half)]
+
+
+def sampler_mismatch(data, words, view):
+    """The first pixel whose (lz.r, lz.g, implicit.r, implicit.g) is not what the S# and T# select, or ""."""
+    if len(data) != SAMPLER_SIZE ** 2 * 16:
+        return f"expected {SAMPLER_SIZE ** 2} RGBA32F pixels, got {len(data)} bytes"
+    explicit, implicit = sampler_level(words, view, 0), sampler_level(words, view, 1)
+    for i, got in enumerate(struct.iter_unpack("<4f", data)):
+        y, x = divmod(i, SAMPLER_SIZE)
+        want = sampler_texel(explicit, x, y) + sampler_texel(implicit, x, y)
+        if any(abs(g - w) > 1e-6 for g, w in zip(got, want)):
+            return f"({x},{y}): {tuple(round(g, 4) for g in got)} != {tuple(round(w, 4) for w in want)}"
+    return ""
+
+
+def sampler_test(tools, spirv):
+    """ps_ssharp: every SAMPLER_CASES S#/T# pair drawn with vk_sampler_test and judged per pixel by sampler_level.
+    A grey level-1 texel differs from every level-0 texel in both channels, so a wrong level fails at each pixel."""
+    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_ssharp")]
+    for path in shaders:
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    with tempfile.TemporaryDirectory(prefix="leonida-sampler-") as tmp:
+        for name, words, view in SAMPLER_CASES:
+            raw = Path(tmp) / "pixels.raw"
+            raw.unlink(missing_ok=True)
+            code, out = run(os.path.join(tools, "vk_sampler_test" + EXE), *shaders, raw,
+                            *(f"{w:x}" for w in words), *(str(v) for v in view))
+            if code == UNSUPPORTED:
+                m = re.search(r"unsupported: .*", out)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"{name}: {failure(code, out, 3)}"
+            problem = sampler_mismatch(raw.read_bytes(), words, view)
+            if problem:
+                return f"{name}: {problem}"
+    return ""
+
+
 def pixels(tools, spirv, name, fmt):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
@@ -319,6 +401,7 @@ def main():
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
+    results.append(("ps_ssharp", sampler_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"

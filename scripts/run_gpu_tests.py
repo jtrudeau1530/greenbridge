@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from compute_fixture import compute_header
-from check import Skip, mesh_v5_test
+from check import SAMPLER_CASES, Skip, mesh_v5_test, sampler_test
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -389,9 +389,9 @@ def run_suite(a, work: str) -> int:
     asm_files = sorted(f for f in os.listdir(SHADER_DIR) if f.endswith(".asm"))
     if a.filter:
         asm_files = [f for f in asm_files if a.filter in f]
-    # Shaders a selected test draws with are built even when the filter leaves them out (#192): ps_flat uses vs_ids.
+    # Shaders a selected test draws with are built even when the filter leaves them out (#192): ps_flat and ps_ssharp use vs_ids.
     build_files = list(asm_files)
-    if any(f.startswith("ps_flat") for f in asm_files) and "vs_ids.asm" not in build_files:
+    if any(f.startswith(("ps_flat", "ps_ssharp")) for f in asm_files) and "vs_ids.asm" not in build_files:
         build_files.append("vs_ids.asm")
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
@@ -577,6 +577,11 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, f"SKIP ({reason})"))
             else:
                 results.append((name, rc == 0, lines[-1] if lines else ""))
+        elif name == "ps_ssharp":
+            # The S#/T# mip fields through vulkan_sampler() and the view range (check.py's SAMPLER_CASES).
+            problem = sampler_test(a.build, spirv_dir)
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or f"{len(SAMPLER_CASES)} S#/T# cases, 4096 pixels each exact"))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
