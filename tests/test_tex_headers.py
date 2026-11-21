@@ -8,6 +8,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -653,6 +654,35 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         q_active, hits_active = tex_headers._find_gpu_ptr_qwords(blob)
         self.assertEqual([int(v) for v in q_active], [int(v) for v in q_std])
         self.assertEqual([int(k) for k in hits_active], hits_std)
+
+
+class CliInputTest(unittest.TestCase):
+    """A missing carve folder or an unknown --archives name ended in a FileNotFoundError traceback."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "tex_headers.py"), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_bad_carve_folders_are_usage_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            os.makedirs(os.path.join(tmp, "empty"))
+            out = os.path.join(tmp, "t.json")
+            cases = (((os.path.join(tmp, "missing"),), "is not a folder"),
+                     ((os.path.join(tmp, "empty"),), "no carved archive"),
+                     ((os.path.join(tmp, "carve"), "--archives", "a,nope"), "no index.json for nope"))
+            for args, message in cases:
+                with self.subTest(args=args):
+                    p = self.run_tool(*args, "--out", out)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertIn(message, p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("0 textures", p.stdout)
 
 
 if __name__ == "__main__":
