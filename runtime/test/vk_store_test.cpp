@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
         ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         CHECK(vkCreateImage(dev, &ii, nullptr, &img[k]));
         VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img[k], &mr);
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -156,30 +156,35 @@ int main(int argc, char** argv) {
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &view[k]));
     }
-    // Set 0: binding 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays.
-    VkDescriptorSetLayoutBinding b[4]{};
+    // Set 0: binding 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays, 0 = sampled 2D images.
+    // image_load picks its path from the T# format at run time, so the shader also holds the float path's fetch
+    // from binding 0 and the layout has to declare it (leaving it out crashed pipeline creation on AMD).
+    VkDescriptorSetLayoutBinding b[5]{};
+    b[4] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[0] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     for (int k = 0; k < 3; k++) b[1 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 4; dli.pBindings = b;
+    dli.bindingCount = 5; dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
-    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3}};
+    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3},
+                                  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = 1; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
+    dpi.maxSets = 1; dpi.poolSizeCount = 3; dpi.pPoolSizes = ps;
     VkDescriptorPool dp; CHECK(vkCreateDescriptorPool(dev, &dpi, nullptr, &dp));
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &dsl;
     VkDescriptorSet ds; CHECK(vkAllocateDescriptorSets(dev, &dai, &ds));
     VkDescriptorBufferInfo tbi{tb, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo dii[3];
-    VkWriteDescriptorSet wr[4]{};
+    VkWriteDescriptorSet wr[5]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; w.descriptorCount = 1; }
     wr[0].dstBinding = 2; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[0].pBufferInfo = &tbi;
     for (int k = 0; k < 3; k++) {
         dii[k] = {VK_NULL_HANDLE, view[k], VK_IMAGE_LAYOUT_GENERAL};
         wr[1 + k].dstBinding = 8 + k; wr[1 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[1 + k].pImageInfo = &dii[k];
     }
-    vkUpdateDescriptorSets(dev, 4, wr, 0, nullptr);
+    wr[4].dstBinding = 0; wr[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[4].pImageInfo = &dii[0];
+    vkUpdateDescriptorSets(dev, 5, wr, 0, nullptr);
 
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});

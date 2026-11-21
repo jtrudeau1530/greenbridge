@@ -1,6 +1,7 @@
 // Headless Vulkan compute test for translated compute shaders.
 // Usage: vk_compute_test cs.spv groups expect
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
+//            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
 #include <vulkan/vulkan.h>
@@ -166,6 +167,16 @@ int main(int argc, char** argv) {
         for (uint32_t g = 0; g < groups; g++)
             for (uint32_t t = 0; t < 64; t++) {
                 uint32_t want = (t >= 16 && t < 48) ? 7u : 0u, got = out[g * 64 + t];
+                if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
+            }
+    }
+    if (!std::strcmp(argv[3], "wavemask")) {  // runtime/test/shaders/cs_wavemask.asm
+        for (uint32_t g = 0; g < groups; g++)
+            for (uint32_t t = 0; t < 64; t++) {
+                // lanes 16-47: on again after the parked mask (0x80) and after the one through a VGPR (0x40),
+                // plus how many set lanes are below this one
+                uint32_t top = (t >= 16 && t < 48) ? 0xc0u + t - 16 : 0;
+                uint32_t want = 65u | 16u << 8 | 8u << 16 | top << 24, got = out[g * 64 + t];
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
     }

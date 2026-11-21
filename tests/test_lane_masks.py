@@ -1,0 +1,127 @@
+"""lane_masks.analyse: which registers hold a lane mask when an instruction runs.
+
+    python -I tests/test_lane_masks.py
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+import lane_masks as L  # noqa: E402
+
+
+def s(r, n=1):
+    return {"k": "sgpr", "r": r, "n": n}
+
+
+def sp(t):
+    return {"k": "special", "t": t}
+
+
+def imm(v):
+    return {"k": "imm", "v": v}
+
+
+def v(r):
+    return {"k": "vgpr", "r": r, "n": 1}
+
+
+def ins(op, *args):
+    return {"op": op, "args": list(args), "mods": []}
+
+
+def masks_at_last(blocks, succ, block=-1):
+    return L.analyse(blocks, succ)[0][id(blocks[block][-1])]
+
+
+def test_straight_line():
+    use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
+    # A saved EXEC is a mask, in both registers of the pair.
+    assert masks_at_last([[ins("s_mov_b64", s(6, 2), sp("exec")), use]], [[]]) == {6, 7}
+    # A compare result is a mask, whether it lands in VCC or in a register pair.
+    assert masks_at_last([[ins("v_cmp_gt_f32_e32", sp("vcc_lo"), imm(0), v(1)), use]], [[]]) == {"vcc"}
+    assert masks_at_last([[ins("v_cmp_gt_f32_e64", s(6, 2), imm(0), v(1)), use]], [[]]) == {6, 7}
+    # Masks combined with masks stay masks; saveexec leaves the old EXEC in its destination.
+    assert masks_at_last([[ins("v_cmp_eq_u32_e64", s(2, 2), v(0), v(1)), ins("s_and_b64", s(6, 2), s(2, 2), sp("exec")),
+                           ins("s_and_saveexec_b64", s(10, 2), s(6, 2)), use]], [[]]) == {2, 3, 6, 7, 10, 11}
+    # A light mask built from loaded dwords is data, and so is a mask once data is mixed in or it is overwritten.
+    assert masks_at_last([[ins("s_buffer_load_dword", s(6), s(0, 4), imm(8)), ins("s_lshr_b32", s(7), s(6), imm(3)),
+                           use]], [[]]) == set()
+    assert masks_at_last([[ins("s_mov_b64", s(6, 2), sp("exec")), ins("s_and_b64", s(6, 2), s(6, 2), s(20, 2)),
+                           use]], [[]]) == set()
+    assert masks_at_last([[ins("s_mov_b64", s(6, 2), sp("exec")), ins("s_load_dwordx4", s(4, 4), s(0, 2), imm(0)),
+                           use]], [[]]) == set()
+    # Compares that only set SCC, and v_cmpx, read their first operand: the mask in it survives.
+    assert masks_at_last([[ins("s_mov_b64", s(6, 2), sp("exec")), ins("s_cmp_eq_u64", s(6, 2), imm(0)),
+                           ins("v_cmpx_eq_u32_e32", s(6), v(1)), use]], [[]]) == {6, 7}
+    # Carry out of a 64-bit add is a mask.
+    assert masks_at_last([[ins("v_add_co_u32_e64", v(0), s(6, 2), v(1), v(2)), use]], [[]]) == {6, 7}
+
+
+def test_joins():
+    use = ins("s_ff1_i32_b64", s(8), s(6, 2))
+    mask = ins("s_mov_b64", s(6, 2), sp("exec"))
+    zero = ins("s_mov_b64", s(6, 2), imm(0))
+    data = ins("s_load_dwordx2", s(6, 2), s(0, 2), imm(0))
+    diamond = [[1, 2], [3], [3], []]
+    # A mask on one path and a constant 0 on the other: a mask. A mask on one and data on the other: not.
+    assert masks_at_last([[ins("s_nop")], [mask], [zero], [use]], diamond) == {6, 7}
+    assert masks_at_last([[ins("s_nop")], [mask], [data], [use]], diamond) == set()
+    # Constant on every path: plain data (the bits are the same either way).
+    assert masks_at_last([[ins("s_nop")], [zero], [dict(zero)], [use]], diamond) == set()
+    # A mask accumulated around a loop stays a mask; the loop body is seen with the entry state merged in.
+    acc = ins("s_or_b64", s(6, 2), s(6, 2), sp("vcc"))
+    cmp_ = ins("v_cmp_lt_u32_e32", sp("vcc_lo"), v(0), v(1))
+    assert masks_at_last([[zero], [cmp_, acc], [use]], [[1], [1, 2], []]) == {6, 7, "vcc"}
+    # Unreachable blocks get an answer too (nothing is a mask there).
+    assert masks_at_last([[mask], [use]], [[], []]) == set()
+
+
+def test_parked_masks():
+    save = ins("s_mov_b64", s(0, 2), sp("exec"))
+    park = [ins("v_writelane_b32", v(128), s(0), imm(0)), ins("v_writelane_b32", v(128), s(1), imm(1))]
+    clobber = ins("s_load_dwordx2", s(0, 2), s(8, 2), imm(0))
+    fetch = [ins("v_readlane_b32", s(0), v(128), imm(0)), ins("v_readlane_b32", s(1), v(128), imm(1))]
+    use = ins("s_mov_b64", sp("exec"), s(0, 2))
+    slots = {("lane", 128, 0), ("lane", 128, 1)}
+    # A saved EXEC parked in two lanes of v128 and fetched back is a mask again; the slots stay known.
+    assert masks_at_last([[save] + park + [clobber] + fetch + [use]], [[]]) == {0, 1} | slots
+    # Data parked the same way stays data, and so does a mask fetched from a lane it was not parked in.
+    assert masks_at_last([[clobber] + park + fetch + [use]], [[]]) == set()
+    other_lane = ins("v_readlane_b32", s(0), v(128), imm(5))
+    assert masks_at_last([[save, park[0], clobber, other_lane, use]], [[]]) == {("lane", 128, 0)}
+    # Writing the VGPR any other way ends what was parked there.
+    assert masks_at_last([[save] + park + [clobber, ins("v_mov_b32_e32", v(128), imm(0))] + fetch + [use]], [[]]) == set()
+    # Parked on one path only: not a mask.
+    assert masks_at_last([[save], park, [ins("s_nop")], [clobber] + fetch + [use]], [[1, 2], [3], [3], []]) == set()
+    # The slots the translator has to keep per lane: those some v_readlane fetches a mask from.
+    blocks = [[save] + park + [clobber] + fetch + [use]]
+    assert L.parked(blocks, L.analyse(blocks, [[]])[0]) == [(128, 0), (128, 1)]
+    blocks = [[clobber] + park + fetch + [use]]
+    assert L.parked(blocks, L.analyse(blocks, [[]])[0]) == []
+
+
+def test_masks_through_a_vgpr():
+    use = ins("s_mov_b32", sp("exec_lo"), s(3))
+    masks = [ins("s_mov_b32", s(3), sp("exec_lo")), ins("v_cmp_eq_u32_e64", s(47), v(1), v(2))]
+    # An OR of two masks done in the vector unit and read back: still a mask, through v51.
+    via = [ins("v_mov_b32_e32", v(51), s(3)), ins("v_or3_b32", v(51), s(3), s(47), v(51)),
+           ins("v_readfirstlane_b32", s(3), v(51))]
+    blocks = [masks + via + [use]]
+    got, writes = L.analyse(blocks, [[]])
+    assert got[id(use)] == {3, 47, ("v", 51)}
+    assert writes == {id(via[0]), id(via[1])}
+    # Mixed with data, or with the VGPR written by anything else in between, it is data.
+    data = ins("s_buffer_load_dword", s(47), s(0, 4), imm(0))
+    assert masks_at_last([[masks[0], data] + via + [use]], [[]]) == set()
+    assert masks_at_last([masks + [via[0], ins("v_add_nc_u32_e32", v(51), v(51), v(2)), via[2], use]], [[]]) == {47}
+    # A constant alone does not make a VGPR a mask (v_mov_b32 v, 0 is everywhere).
+    blocks = [[ins("v_mov_b32_e32", v(51), imm(0)), ins("v_readfirstlane_b32", s(3), v(51)), use]]
+    assert L.analyse(blocks, [[]]) == ({id(i): frozenset() for i in blocks[0]}, set())
+
+
+if __name__ == "__main__":
+    test_straight_line()
+    test_joins()
+    test_parked_masks()
+    test_masks_through_a_vgpr()
+    print("ok")
