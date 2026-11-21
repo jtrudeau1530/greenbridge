@@ -143,15 +143,25 @@ The command-list surface maps to the IR as follows:
 The IR is the place to add the trace, validation and "unsupported call" reporting. It also lets the layer replay a
 frame deterministically from a capture, which is valuable for comparing against the game.
 
-`runtime/src/clear_commands.h` implements the initial full-view color-clear slice of the IR. It copies the
-resource ID, mip, array-layer range and RGBA values while recording. `runtime/src/vulkan_clear.h` resolves
-those stable resource IDs to Vulkan images and emits ordered transfer clears. This slice supports 2D images
-and arrays with matching float or normalized view formats. The caller owns image lifetime and layout
-transitions. COM command-list and queue wiring, state tracking, and rectangle clears are future work.
+`runtime/src/command_list.h` implements the first slice of the IR: legacy resource barriers (transition, UAV,
+aliasing; split barriers record their end half) and full-view `ClearRenderTargetView` / `ClearDepthStencilView`.
+Clears copy the resource ID, mip and array-layer range by value while recording, so the CPU descriptor slot can be
+rewritten afterwards. `runtime/src/vulkan_replay.h` resolves the stable resource IDs to Vulkan images (or to the
+shared buffer space, whose transitions become global memory barriers), checks every command, then emits it; a
+rejected list writes nothing. Transitions use the section 4.3 table (`vulkan_access`) with the recorded `before`
+state as the old layout, as D3D12 itself trusts it. Clears assume the state D3D12 requires (`RENDER_TARGET`,
+`DEPTH_WRITE`) and wrap a transfer clear in a layout round trip, so cleared images must be created with
+`TRANSFER_DST` usage. Not done yet: rectangle clears (they need `vkCmdClearAttachments` inside a rendering scope),
+per-plane depth/stencil clears while the other plane is in a different state, implicit state promotion/decay,
+enhanced barriers, and the COM command-list and queue wiring.
 
-Build `runtime/` and run `ctest --test-dir <build> --output-on-failure` for the CPU recorder test. With Vulkan
-headers available, build and run `vk_clear_replay_test` for a 4×4 offscreen readback. It overwrites the CPU
-descriptor, then verifies both recorded layer targets and the final color after repeated clears.
+Build `runtime/` and run `ctest --test-dir <build> --output-on-failure` for the CPU tests: `command_list_test`
+(recording rules) and, when the Vulkan headers are found, `d3d12_state_map_test` (the state table, subresource
+decoding, and the IR's D3D12 constants checked against the SDK's `d3d12.h`). `vk_command_replay_test` needs a GPU:
+it clears two layers of a 4×4 colour image through a reused descriptor, clears depth then depth-only on a
+`D32_SFLOAT_S8_UINT` image (stencil must survive), transitions both to `COPY_SOURCE` with recorded barriers, and
+reads them back. It also checks that each rejected list returns the right error. Set `LEONIDA_VK_VALIDATION=1`
+to run it under `VK_LAYER_KHRONOS_validation`; any validation error fails it.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
@@ -513,8 +523,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 | `PRESENT` | `PRESENT_SRC_KHR` for swapchain images, `GENERAL` otherwise | present |
 | `RAYTRACING_ACCELERATION_STRUCTURE` | buffer, no layout | acceleration structure read/write |
 
-- Split barriers (`BEGIN_ONLY`/`END_ONLY`) are an optimisation. A full barrier at the begin point is correct and
-  slower; use `VK_KHR_synchronization2` and a deferred barrier at the end point if profiling needs it.
+- Split barriers (`BEGIN_ONLY`/`END_ONLY`) are an optimisation. The resource is unusable between the halves, so
+  one full barrier at either point is correct; the IR records it at the end point (`command_list.h`). Use
+  `VK_KHR_synchronization2` events if profiling needs the overlap.
 - Aliasing barriers: if image aliasing is implemented (one `VkDeviceMemory` per D3D12 heap range, with
   `VK_IMAGE_CREATE_ALIAS_BIT`), transition the old image to `UNDEFINED`, issue a global memory barrier, then
   transition the new image. Until then, log aliasing and allocate distinct memory; do not silently return the
