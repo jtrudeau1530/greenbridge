@@ -615,7 +615,15 @@ The trace will enumerate them.
   arena's limits, not the console's.
 - `GetResourceAllocationInfo` and `GetCopyableFootprints`: implement D3D12's rules locally; the game uses them to
   suballocate and to lay out uploads. They are deterministic and public. Validate against a host D3D12 device in
-  tests if one is available; do not require one at runtime.
+  tests if one is available; do not require one at runtime. `GetResourceAllocationInfo` (and `1`/`2`): a buffer
+  takes its width rounded up to 64 KiB, aligned to 64 KiB. A texture's size is the memory its `VkImage` needs
+  (`vkGetDeviceImageMemoryRequirements`), rounded up to its D3D12 alignment. That alignment is 64 KiB, or 4 MiB with
+  MSAA. The small alignments (4 KiB, or 64 KiB with MSAA) apply only when the application asks for them. 4 KiB
+  also needs the texture to fit in 64 KiB and not be a render target or depth buffer; if it doesn't qualify, the
+  description is invalid (`UINT64_MAX`), as the PC runtime answers. The MSAA 64 KiB alignment has no size limit
+  on the PC runtime, so none here either. Texture sizes are the driver's on both runtimes, so only buffer sizes,
+  alignments and invalid descriptions are compared with the host. One known difference: a mip count beyond the
+  full chain is invalid here (Vulkan can't create it), while the PC runtime still answers with a size.
 
 ### 4.2 Resources, heaps, placed and reserved
 
