@@ -2,10 +2,11 @@
 
     python -I tests/test_amd_swizzle.py
 """
+import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
+
 import os
 import sys
 import tempfile
-import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
@@ -14,9 +15,8 @@ try:
 except ModuleNotFoundError as e:
     if e.name != "numpy":
         raise
-    _skip_numpy = True
-else:
-    _skip_numpy = False
+    import pytest  # noqa: E811
+    pytest.skip("amd_swizzle needs numpy", allow_module_level=True)
 
 
 def table(name, rows):
@@ -57,9 +57,6 @@ def test_rejects_code():
 
 
 if __name__ == "__main__":
-    if _skip_numpy:
-        print("skipped: amd_swizzle needs numpy")
-        raise SystemExit(0)
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()
