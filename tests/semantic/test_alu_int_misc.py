@@ -60,6 +60,8 @@ CASES = {
         (0xAAAAAAAA, 0x55555555, 0x55555555, 0x55555555),
         (0xDEADBEEF, 0x0000FFFF, 0xFFFF0000, 0xFFFFBEEF),
         (0x0000000C, 0x0000000A, 0x00000003, 0x0000000B),  # (S0|S1)&S2 or S0&(S1|S2) would differ
+        (0x000000FF, 0x0000000F, 0x0000000F, 0x0000000F),  # overlapping bits: OR, not ADD (ADD gives 0x1E)
+        (0xFFFFFFFF, 0xFFFFFFFF, 0x00000001, 0xFFFFFFFF),  # ADD would wrap to 0
     ],
     "v_add_lshl_u32": [
         (1, 2, 3, 0x00000018),
