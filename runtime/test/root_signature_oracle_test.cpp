@@ -100,6 +100,11 @@ int main() {
 
     RootSignature model;
     check(parse_blob(blobs.blob, model), "oracle blob parses");
+    if (g_failures != 0) {
+        // Never index into a model that failed to parse (that segfaulted CI).
+        std::printf("%d FAILURES\n", g_failures);
+        return 1;
+    }
     check(model.params.size() == 2, "oracle model has 2 params");
     check(model.params[0].type == ParamType::Constants &&
               model.params[0].num_values == 4 &&

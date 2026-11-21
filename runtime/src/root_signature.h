@@ -27,15 +27,15 @@ enum class ParamType : uint32_t {
     Table = 2,  // DESCRIPTOR_TABLE: 2 dwords (table GPU VA)
 };
 
-// D3D12_SHADER_VISIBILITY (D3D12 order: ALL 0, VERTEX 1, HULL 2, DOMAIN 3,
-// GEOMETRY 4, PIXEL 5).
+// D3D12_SHADER_VISIBILITY (ALL 0, VERTEX 1, HULL 2, DOMAIN 3,
+// GEOMETRY 4, PIXEL 5, AMPLIFICATION 6, MESH 7).
 enum class Visibility : uint32_t {
     All = 0,
     Vertex = 1,
     Geometry = 4,
     Pixel = 5,
-    Compute = 6,  // no D3D12 value; Xbox extension bucket, opaque for packing
-    Mesh = 7,  // Xbox extension bucket; treated as opaque for packing
+    Amplification = 6,
+    Mesh = 7,
 };
 
 // One descriptor range inside a table (SRV/CBV/UAV/sampler + count).
@@ -133,13 +133,17 @@ struct DecodeResult {
 
 [[nodiscard]] DecodeResult decode_canonical(const uint8_t* data, size_t size);
 
-// RTS0 chunk parser (HYPOTHESIS until the Windows oracle test passes).
+// RTS0 chunk parser (payload layout per the maintainer: offset table).
 //
-// The DXBC "RTS0" chunk is the console serializer's output for one root
-// signature. Its exact byte layout is undocumented, so this decodes it as
-// the straight-line flattening of the public descriptor structs (version,
-// counts, then per-parameter fields in d3d12.h order). Every deviation the
-// oracle test finds is a hard failure to investigate, not a quirk to absorb.
+// The input is a whole DXBC container (what D3D12SerializeVersionedRootSignature
+// returns: "DXBC" magic, hash, size, chunk table). The parser walks the chunk
+// table exactly like tools/rdna2spirv.py:input_signature does, finds the
+// "RTS0" chunk and decodes its payload: version, counts and table offsets,
+// then a parameter table of {d3d_type, visibility, offset} entries with
+// payloads at their offsets (d3d types follow D3D12_ROOT_PARAMETER_TYPE
+// numbering). A bare payload without the DXBC header is also accepted
+// (unit-test path). Every deviation the oracle test finds is a hard failure
+// to investigate, not a quirk to absorb.
 // Returns ok == false with a reason for unknown versions or truncation.
 [[nodiscard]] DecodeResult parse_rts0(const uint8_t* data, size_t size);
 

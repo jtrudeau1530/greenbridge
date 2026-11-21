@@ -228,13 +228,39 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
 // Payload decoder: the RTS0 chunk contents (see header for the hypothesis).
 static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
     DecodeResult out;
-    Reader r(data == nullptr ? reinterpret_cast<const uint8_t*>("") : data, size);
-    uint32_t ver = 0, nparams = 0, nsamplers = 0, flags = 0;
     if (data == nullptr && size != 0) {
         out.error = "null data with nonzero size";
         return out;
     }
-    if (!r.u32(ver) || !r.u32(nparams) || !r.u32(nsamplers) || !r.u32(flags)) {
+    if (data == nullptr) {
+        out.error = "null RTS0 payload";
+        return out;
+    }
+    // Random access into the payload: every (offset, byte-count) pair is
+    // validated before any byte is touched. Offsets count from payload start.
+    auto at = [&](size_t off, size_t bytes) -> const uint8_t* {
+        if (bytes > size || off > size - bytes) return nullptr;
+        return data + off;
+    };
+    auto u32_at = [&](size_t off, uint32_t& v) {
+        const uint8_t* p = at(off, 4);
+        if (p == nullptr) return false;
+        v = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+        return true;
+    };
+    auto f32_at = [&](size_t off, float& v) {
+        uint32_t bits = 0;
+        if (!u32_at(off, bits)) return false;
+        static_assert(sizeof(bits) == sizeof(v));
+        std::memcpy(&v, &bits, sizeof(v));
+        return true;
+    };
+    // Header: version, num_params, params_offset, num_samplers,
+    // samplers_offset, flags.
+    uint32_t ver = 0, nparams = 0, params_off = 0, nsamplers = 0, samplers_off = 0, flags = 0;
+    if (!u32_at(0, ver) || !u32_at(4, nparams) || !u32_at(8, params_off) ||
+        !u32_at(12, nsamplers) || !u32_at(16, samplers_off) || !u32_at(20, flags)) {
         out.error = "truncated RTS0 header";
         return out;
     }
@@ -252,74 +278,115 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
     }
     out.sig.version = ver == 1 ? Version::V1_0 : Version::V1_1;
     out.sig.flags = flags;
+    // Parameter table at params_off: num_params x {u32 d3d_type, u32
+    // visibility, u32 offset}. d3d_type follows D3D12_ROOT_PARAMETER_TYPE
+    // (0 table, 1 constants, 2/3/4 CBV/SRV/UAV root descriptors).
+    constexpr size_t kEntryBytes = 12;
+    if (nparams > 0 &&
+        (params_off > size || nparams > (size - params_off) / kEntryBytes)) {
+        out.error = "RTS0 parameter table overruns its payload";
+        return out;
+    }
     out.sig.params.reserve(nparams);
     for (uint32_t i = 0; i < nparams; ++i) {
+        const size_t eoff = static_cast<size_t>(params_off) + i * kEntryBytes;
+        uint32_t dtype = 0, vis = 0, poff = 0;
+        if (!u32_at(eoff, dtype) || !u32_at(eoff + 4, vis) || !u32_at(eoff + 8, poff)) {
+            out.error = "truncated RTS0 parameter entry";
+            return out;
+        }
         RootParameter p;
-        uint32_t type = 0, vis = 0;
-        if (!r.u32(type) || !r.u32(vis)) {
-            out.error = "truncated RTS0 parameter";
-            return out;
-        }
-        if (type > 2) {
-            out.error = "unknown RTS0 parameter type";
-            return out;
-        }
-        p.type = static_cast<ParamType>(type);
         p.visibility = static_cast<Visibility>(vis);
-        if (p.type == ParamType::Constants) {
-            if (!r.u32(p.shader_register) || !r.u32(p.register_space) || !r.u32(p.num_values)) {
-                out.error = "truncated RTS0 constants";
+        if (dtype == 1) {
+            p.type = ParamType::Constants;
+            if (!u32_at(poff, p.shader_register) || !u32_at(poff + 4, p.register_space) ||
+                !u32_at(poff + 8, p.num_values)) {
+                out.error = "truncated RTS0 constants payload";
                 return out;
             }
-        } else if (p.type == ParamType::Descriptor) {
-            if (!r.u32(p.descriptor_register) || !r.u32(p.descriptor_space)) {
-                out.error = "truncated RTS0 descriptor";
+        } else if (dtype == 2 || dtype == 3 || dtype == 4) {
+            p.type = ParamType::Descriptor;
+            uint32_t dflags = 0;
+            const size_t need = ver == 2 ? 12 : 8;
+            if (poff > size || need > size - static_cast<size_t>(poff)) {
+                out.error = "truncated RTS0 descriptor payload";
                 return out;
             }
-        } else {
+            if (!u32_at(poff, p.descriptor_register) || !u32_at(poff + 4, p.descriptor_space)) {
+                out.error = "truncated RTS0 descriptor payload";
+                return out;
+            }
+            if (ver == 2 && !u32_at(poff + 8, dflags)) {
+                out.error = "truncated RTS0 descriptor flags";
+                return out;
+            }
+            (void)dflags;  // descriptor flags do not affect the user-SGPR map
+        } else if (dtype == 0) {
+            p.type = ParamType::Table;
             uint32_t nranges = 0;
-            if (!r.u32(nranges)) {
-                out.error = "truncated RTS0 table";
+            if (!u32_at(poff, nranges)) {
+                out.error = "truncated RTS0 table payload";
                 return out;
             }
             if (nranges > 1024) {
                 out.error = "absurd RTS0 range count";
                 return out;
             }
+            // Range record: {type, num, base_reg, space, offset} (+ flags on 1.1).
+            const size_t stride = ver == 2 ? 24 : 20;
+            if (nranges > 0 &&
+                (poff + 4 > size || nranges > (size - (poff + 4)) / stride)) {
+                out.error = "RTS0 ranges overrun their payload";
+                return out;
+            }
             p.ranges.reserve(nranges);
             for (uint32_t j = 0; j < nranges; ++j) {
+                const size_t roff = static_cast<size_t>(poff) + 4 + j * stride;
                 DescriptorRange range;
-                uint32_t base_reg = 0, space = 0, offset = 0;
-                if (!r.u32(range.range_type) || !r.u32(range.num_descriptors) || !r.u32(base_reg) ||
-                    !r.u32(space) || !r.u32(offset)) {
+                uint32_t base_reg = 0, space = 0, disp_off = 0, rflags = 0;
+                if (!u32_at(roff, range.range_type) || !u32_at(roff + 4, range.num_descriptors) ||
+                    !u32_at(roff + 8, base_reg) || !u32_at(roff + 12, space) ||
+                    !u32_at(roff + 16, disp_off) ||
+                    (ver == 2 && !u32_at(roff + 20, rflags))) {
                     out.error = "truncated RTS0 range";
                     return out;
                 }
                 (void)base_reg;
                 (void)space;
-                (void)offset;
+                (void)disp_off;
+                (void)rflags;
                 p.ranges.push_back(range);
             }
+        } else {
+            out.error = "unknown RTS0 parameter type";
+            return out;
         }
         out.sig.params.push_back(std::move(p));
     }
+    // Sampler records mirror D3D12_STATIC_SAMPLER_DESC field order.
+    constexpr size_t kSamplerBytes = 13 * 4;
+    if (nsamplers > 0 &&
+        (samplers_off > size || nsamplers > (size - samplers_off) / kSamplerBytes)) {
+        out.error = "RTS0 samplers overrun their payload";
+        return out;
+    }
     out.sig.static_samplers.reserve(nsamplers);
     for (uint32_t i = 0; i < nsamplers; ++i) {
+        const size_t soff = static_cast<size_t>(samplers_off) + i * kSamplerBytes;
         StaticSampler s;
         uint32_t vis = 0;
-        if (!r.u32(s.filter) || !r.u32(s.address_u) || !r.u32(s.address_v) || !r.u32(s.address_w) ||
-            !r.f32(s.mip_lod_bias) || !r.u32(s.max_anisotropy) || !r.u32(s.comparison_func) ||
-            !r.u32(s.border_color) || !r.f32(s.min_lod) || !r.f32(s.max_lod) ||
-            !r.u32(s.shader_register) || !r.u32(s.register_space) || !r.u32(vis)) {
+        if (!u32_at(soff, s.filter) || !u32_at(soff + 4, s.address_u) ||
+            !u32_at(soff + 8, s.address_v) || !u32_at(soff + 12, s.address_w) ||
+            !f32_at(soff + 16, s.mip_lod_bias) || !u32_at(soff + 20, s.max_anisotropy) ||
+            !u32_at(soff + 24, s.comparison_func) || !u32_at(soff + 28, s.border_color) ||
+            !f32_at(soff + 32, s.min_lod) || !f32_at(soff + 36, s.max_lod) ||
+            !u32_at(soff + 40, s.shader_register) || !u32_at(soff + 44, s.register_space) ||
+            !u32_at(soff + 48, vis)) {
             out.error = "truncated RTS0 sampler";
             return out;
         }
         s.visibility = static_cast<Visibility>(vis);
         out.sig.static_samplers.push_back(s);
-    }
-    if (!r.at_end()) {
-        out.error = "trailing bytes after RTS0 root signature";
-        return out;
     }
     out.ok = true;
     return out;

@@ -45,6 +45,32 @@ void put_u32(std::vector<uint8_t>& out, uint32_t v) {
     out.push_back(static_cast<uint8_t>(v >> 24));
 }
 
+// Hand-built RTS0 payload in the offset-table layout the maintainer
+// described: header, parameter table, then payloads at their offsets.
+std::vector<uint8_t> build_payload() {
+    std::vector<uint8_t> p;
+    put_u32(p, 2);  // version 1.1
+    put_u32(p, 2);  // 2 params
+    put_u32(p, 24);  // params table offset
+    put_u32(p, 0);  // 0 samplers
+    put_u32(p, 0);  // samplers offset
+    put_u32(p, 0x03000000u);  // Xbox flags
+    // entry 0: constants at 48; entry 1: CBV descriptor at 60.
+    put_u32(p, 1);
+    put_u32(p, 0);
+    put_u32(p, 48);
+    put_u32(p, 2);
+    put_u32(p, 4);
+    put_u32(p, 60);
+    put_u32(p, 7);  // register (ignored by packer)
+    put_u32(p, 0);  // space
+    put_u32(p, 3);  // 3 values
+    put_u32(p, 0);  // register
+    put_u32(p, 0);  // space
+    put_u32(p, 0);  // 1.1 descriptor flags
+    return p;
+}
+
 }  // namespace
 
 int main() {
@@ -130,22 +156,11 @@ int main() {
     }
 
     // RTS0 hypothesis: a hand-built blob per the documented layout parses.
+    // Hand-built RTS0 payload in the offset-table layout the maintainer
+    // described: header, parameter table, then payloads at their offsets.
     {
-        std::vector<uint8_t> blob;
-        put_u32(blob, 2);  // version 1.1
-        put_u32(blob, 2);  // 2 params
-        put_u32(blob, 0);  // 0 samplers
-        put_u32(blob, 0x03000000u);  // Xbox flags
-        put_u32(blob, 0);  // Constants
-        put_u32(blob, 0);  // visibility All
-        put_u32(blob, 7);  // register (ignored by packer)
-        put_u32(blob, 0);  // space
-        put_u32(blob, 3);  // 3 values
-        put_u32(blob, 1);  // Descriptor
-        put_u32(blob, 4);  // visibility Pixel
-        put_u32(blob, 0);  // register
-        put_u32(blob, 0);  // space
-        const DecodeResult d = parse_rts0(blob.data(), blob.size());
+        const std::vector<uint8_t> payload = build_payload();
+        const DecodeResult d = parse_rts0(payload.data(), payload.size());
         check(d.ok, "hand-built RTS0 parses");
         check(d.sig.params.size() == 2 && d.sig.params[0].num_values == 3 &&
                   d.sig.flags == 0x03000000u,
@@ -154,10 +169,12 @@ int main() {
         check(r.ok && r.dword_count == 3 + 2, "parsed RTS0 packs to 5 dwords");
     }
 
-    // RTS0 controls: unknown version and truncation fail loudly.
+    // RTS0 controls: unknown version, wild offsets and truncation fail loudly.
     {
         std::vector<uint8_t> blob;
-        put_u32(blob, 9);
+        put_u32(blob, 9);  // unknown version
+        put_u32(blob, 0);
+        put_u32(blob, 0);
         put_u32(blob, 0);
         put_u32(blob, 0);
         put_u32(blob, 0);
@@ -165,21 +182,19 @@ int main() {
         check(!d.ok, "unknown RTS0 version rejected");
         std::vector<uint8_t> cut = {1, 0};
         check(!parse_rts0(cut.data(), cut.size()).ok, "truncated RTS0 rejected");
+        std::vector<uint8_t> wild = build_payload();
+        // Corrupt the params offset to point past the end.
+        wild[8] = 0xFF;
+        wild[9] = 0xFF;
+        wild[10] = 0xFF;
+        wild[11] = 0xFF;
+        check(!parse_rts0(wild.data(), wild.size()).ok, "wild offset rejected");
     }
 
     // DXBC container walk: a hand-built container with one RTS0 chunk parses
     // through the chunk table (same path the MS serializer blob takes).
     {
-        std::vector<uint8_t> payload;
-        put_u32(payload, 2);  // version 1.1
-        put_u32(payload, 1);  // 1 param
-        put_u32(payload, 0);  // 0 samplers
-        put_u32(payload, 0);  // flags
-        put_u32(payload, 0);  // Constants
-        put_u32(payload, 0);  // visibility All
-        put_u32(payload, 0);  // register
-        put_u32(payload, 0);  // space
-        put_u32(payload, 2);  // 2 values
+        const std::vector<uint8_t> payload = build_payload();
         std::vector<uint8_t> blob;
         blob.insert(blob.end(), {'D', 'X', 'B', 'C'});
         blob.insert(blob.end(), 16, 0);  // hash
@@ -197,7 +212,7 @@ int main() {
         blob[27] = static_cast<uint8_t>(total >> 24);
         const DecodeResult d = parse_rts0(blob.data(), blob.size());
         check(d.ok, "DXBC container walk finds RTS0");
-        check(d.sig.params.size() == 1 && d.sig.params[0].num_values == 2,
+        check(d.sig.params.size() == 2 && d.sig.params[0].num_values == 3,
               "walked RTS0 model matches payload");
     }
 
