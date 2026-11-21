@@ -1,6 +1,6 @@
 """Repackage the Opus streams of AWC audio banks into standard Ogg Opus files (lossless: no re-encoding).
 
-    python -I awc_opus.py <bank.awc | dir of .awc> <out dir> [--limit N]
+    python -I awc_opus.py <bank.awc | dir of .awc> <out dir> [--limit N] [--jobs N]
 
 AWC layout (little-endian "ADAT"), as read by rpf9-explorer's OpusPreview.cpp: a stream table of u32
 (id[28:0] | tag count[31:29]), then 8-byte tags (type[63:56], size[55:28], offset[27:0]). Tag 0x55 = data,
@@ -20,6 +20,7 @@ import argparse
 import os
 import struct
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ---- Ogg ----
 _CRC = []
@@ -137,8 +138,7 @@ def parse_awc(d: bytes):
             codec, channels = d[fmt[0] + 28], d[fmt[0] + 29]
             streams.append({"id": sid, "samples": samples, "rate": rate, "codec": codec, "channels": channels,
                             "data": data})
-    parse_awc.music = music
-    return streams
+    return streams, music
 
 
 def music_channels(d: bytes, mus, data):
@@ -194,8 +194,8 @@ def export_bank(path: str, out_dir: str):
     od = os.path.join(out_dir, name)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
-    streams = parse_awc(d)
-    for mus, data in parse_awc.music:
+    streams, music = parse_awc(d)
+    for mus, data in music:
         for cid, samples, rate, codec, pk in music_channels(d, mus, data):
             if pk:
                 n48 = samples * 48000 // rate if rate else 0
@@ -228,6 +228,8 @@ def main() -> int:
     ap.add_argument("src")
     ap.add_argument("out")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                    help="banks to export at once (default: half the CPU count)")
     a = ap.parse_args()
     if os.path.isdir(a.src):
         banks = []
@@ -238,16 +240,35 @@ def main() -> int:
         banks = [a.src]
     banks = banks[: a.limit] if a.limit else banks
     tot = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
-    for i, b in enumerate(banks):
-        try:
-            c = export_bank(b, a.out)
-        except (ValueError, struct.error, IndexError) as e:
-            print(f"  skip {os.path.basename(b)}: {e}")
-            continue
+    jobs = max(1, a.jobs)
+
+    def add(c):
         for k in tot:
             tot[k] += c[k]
-        if (i + 1) % 200 == 0:
-            print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
+
+    def skipped(b, e):
+        print(f"  skip {os.path.basename(b)}: {e}")
+
+    if jobs == 1:
+        for i, b in enumerate(banks):
+            try:
+                add(export_bank(b, a.out))
+            except (ValueError, struct.error, IndexError, OSError) as e:
+                skipped(b, e)
+                continue
+            if (i + 1) % 200 == 0:
+                print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=jobs) as ex:
+            futures = {ex.submit(export_bank, b, a.out): b for b in banks}
+            for i, fut in enumerate(as_completed(futures), 1):
+                b = futures[fut]
+                try:
+                    add(fut.result())
+                except (ValueError, struct.error, IndexError, OSError) as e:
+                    skipped(b, e)
+                if i % 200 == 0:
+                    print(f"  {i}/{len(banks)} banks: {tot}", flush=True)
     print(f"{len(banks)} banks: {tot['opus']} Ogg Opus, {tot['music']} music channels (Ogg Opus), {tot['pcm']} WAV, "
           f"{tot['other']} not handled (XMA/other)")
     return 0
