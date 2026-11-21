@@ -4714,9 +4714,9 @@ class Gen:
                     self.emit(f"{off} = OpCompositeConstruct {'%v3int' if n_off == 3 else '%v2int'} {' '.join(parts)}")
                 self.uses_img_offset = True
             minlod = None
-            if kind == "_d_cl":
-                # Same as _d plus a trailing min-LOD clamp coordinate.
-                minlod, f, kind = f[-1], f[:-1], "_d"
+            clamp = kind == "_d_cl"        # _d plus a min-LOD clamp, read after the gradients
+            if clamp:
+                kind = "_d"
                 self.uses_minlod = True
             ref = None
             if kind.startswith("_c"):
@@ -4739,6 +4739,12 @@ class Gen:
                     self.emit(f"{gx} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
                     self.emit(f"{gy} = OpCompositeConstruct %v2float {f[2]} {f[3]}")
                     grads, f = (gx, gy), f[4:]
+            if clamp:
+                # The clamp is the component right after the coordinates. Under a16 an f16 pad may follow it, so
+                # it isn't the last one there (taking the last one read that pad until 2026-11-21).
+                if len(f) <= ncoord:
+                    raise Unsupported(op + " coords")
+                minlod, f = f[ncoord], f[:ncoord]
             if len(f) < ncoord:
                 raise Unsupported(op + " coords")
             if dim == "dim:SQ_RSRC_IMG_CUBE":
