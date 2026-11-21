@@ -1,0 +1,382 @@
+"""Index RPF9 `0DRP` page directories without the encrypted table of contents.
+
+The RPF9 data area is a sequence of zlib streams. A directory stream starts with eight zero bytes, a
+`0x50000000`-based self-pointer, `0DRP` at +0x10, version 122 at +0x14, table pointers, and four u16 counts
+at +0x48. The fixed header is 0x60 bytes; the first resource payload starts at +0x60.
+
+The table at +0x38 is the useful one: `u16@0x4c` records of 16 bytes, each `{u32 hash, u32 size, u64 pointer}`.
+The pointer is a virtual offset into the logical resource after subtracting 0x50000000, not an archive offset
+and not necessarily an offset inside this zlib stream. If the table or a payload crosses the inflated stream
+end, the next zlib stream in archive order continues the same resource. This tool concatenates only as many
+continuation streams as the declared table and entry ranges require, then reports exact virtual boundaries.
+
+The header has no key: what earlier reports called a 64-bit key at +0x60 is the first payload byte on
+29,297 of 29,298 measured pages. This tool reports `payload_at_0x60` instead.
+
+The +0x28 table (32-byte records) is reported raw as `q28_records`: the hash in its first u32 matches a +0x38
+hash on most pages, its +0x10 pointer resolves in the resource, and its +0x1c word behaves as flags. The
++0x08 and +0x18 words are not decoded and are exported as `field_08` and `count_or_size`. The +0x30 and +0x40
+tables are reported by offset only; their internal layout is not decoded here.
+
+Usage:
+    python -I page_index.py <archive.rpf> <out.json|out.csv> [--start N] [--limit BYTES] [--quiet]
+    python -I page_index.py <carved-dir> <out.json|out.csv> [--quiet]
+"""
+import argparse
+import csv
+import json
+import mmap
+import os
+import re
+import struct
+import sys
+import zlib
+
+# zlib stream start. Kept in step with rpf9_carve.py.
+ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
+BASE = 0x50000000
+HEADER_SIZE = 0x60
+MAX_CONTINUATIONS = 16
+COLUMNS = [
+    "page_offset", "stored", "inflated", "version", "page_count",
+    "q28_count", "q30_count", "q38_count", "span", "complete",
+    "record_index", "hash", "size", "target", "target_stream",
+]
+
+
+def _u16(data, at):
+    return struct.unpack_from("<H", data, at)[0] if len(data) >= at + 2 else None
+
+
+def _u32(data, at):
+    return struct.unpack_from("<I", data, at)[0] if len(data) >= at + 4 else None
+
+
+def _u64(data, at):
+    return struct.unpack_from("<Q", data, at)[0] if len(data) >= at + 8 else None
+
+
+def offset_of(value):
+    """Decode a 0x50000000-based pointer. All measured values are zero-extended 32-bit."""
+    if value is None:
+        return None
+    if value >> 32 == 0 and BASE <= value < BASE + 0x10000000:
+        return value - BASE
+    if value >> 32 == BASE:  # tolerate a full-width form of the same base
+        return value & 0xFFFFFFFF
+    return None
+
+
+def is_page(data):
+    return len(data) >= HEADER_SIZE and data[0x10:0x14] == b"0DRP"
+
+
+def scan_rpf(path, start=None, limit=None):
+    """Yield (archive_offset, stored_bytes, inflated_bytes) for each zlib stream."""
+    with open(path, "rb") as fh:
+        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        size = len(m)
+        if size < 8:
+            return
+        first = struct.unpack_from("<I", m, 4)[0]
+        pos = start if start is not None else first
+        if not 0 <= pos <= size:
+            raise ValueError("start offset is outside the archive")
+        end = min(size, pos + limit) if limit else size
+        try:
+            while pos < end:
+                match = ZHDR.search(m, pos, end)
+                if not match:
+                    break
+                s = match.start()
+                d = zlib.decompressobj()
+                chunks, p = [], s
+                try:
+                    while not d.eof and p < size:
+                        block = m[p:p + (1 << 20)]
+                        if not block:
+                            break
+                        chunks.append(d.decompress(block))
+                        p += len(block)
+                        if d.unused_data or d.eof:
+                            break
+                    out = b"".join(chunks) + d.flush()
+                except zlib.error:
+                    pos = s + 1
+                    continue
+                if not d.eof or len(out) < 64:
+                    pos = s + 1
+                    continue
+                used = p - s - len(d.unused_data)
+                yield s, used, out
+                pos = s + used
+        finally:
+            m.close()
+
+
+def scan_dir(path):
+    """Yield (offset, None, bytes) from carved `<offset>.bin` files, sorted by offset."""
+    entries = []
+    for name in os.listdir(path):
+        full = os.path.join(path, name)
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
+            continue
+        match = re.match(r"([0-9a-fA-F]{6,})", name)
+        offset = int(match.group(1), 16) if match else None
+        entries.append((offset, name, full))
+    fallback = 0
+    for offset, name, full in sorted(entries, key=lambda e: (e[0] is None, e[0] or 0, e[1])):
+        if offset is None:
+            offset = fallback
+        fallback = max(fallback, offset + 1)
+        with open(full, "rb") as f:
+            data = f.read()
+        yield offset, None, data
+
+
+def _q38(data, q38, count):
+    """Parse a q38 table from `data`. Returns (records, complete, error)."""
+    if q38 is None:
+        return [], True, "q38 is not a 0x50000000 pointer"
+    if count == 0:
+        return [], True, ""
+    if q38 + 16 * count > len(data):
+        return [], False, ""
+    records = []
+    for i in range(count):
+        h, size, pointer = struct.unpack_from("<IIQ", data, q38 + 16 * i)
+        target = offset_of(pointer)
+        if target is None:
+            return [], True, "q38 entry %d has a non-0x50000000 pointer" % i
+        records.append({"hash": h, "size": size, "target": target})
+    need = max([q38 + 16 * count] + [r["target"] + r["size"] for r in records])
+    if need > len(data):
+        return [], False, ""
+    return records, True, ""
+
+
+def _q28(data, q28, count):
+    """Parse the +0x28 table raw. Unresolved words keep their measured names."""
+    if not count or q28 is None or q28 + 32 * count > len(data):
+        return [], ""
+    out = []
+    for i in range(count):
+        hash_a, hash_b, field_08, pointer, count_or_size, flags = struct.unpack_from(
+            "<IIQQII", data, q28 + 32 * i)
+        target = offset_of(pointer)
+        if target is None:
+            return out, "q28 entry %d has a non-0x50000000 pointer" % i
+        out.append({
+            "hash_a": hash_a, "hash_b": hash_b, "field_08": field_08,
+            "target": target, "count_or_size": count_or_size, "flags": flags,
+        })
+    return out, ""
+
+
+def parse_page(base, continuations):
+    """Parse one 0DRP page plus its continuation stream payloads.
+
+    Returns (page_dict, complete). A page is complete when the q38 table and every q38 entry fit in the
+    concatenated resource. An unparsable pointer is reported and does not keep the page waiting.
+    """
+    if not is_page(base):
+        return None, True
+    data = base + b"".join(s[2] for s in continuations)
+    page = {
+        "offset": None,
+        "stored": None,
+        "inflated": len(base),
+        "version": _u32(base, 0x14),
+        "page_count": _u32(base, 0x20),
+        "counts": [_u16(base, 0x48), _u16(base, 0x4A), _u16(base, 0x4C), _u16(base, 0x4E)],
+        "tables": {
+            "q28": offset_of(_u64(base, 0x28)),
+            "q30": offset_of(_u64(base, 0x30)),
+            "q38": offset_of(_u64(base, 0x38)),
+            "q40": offset_of(_u64(base, 0x40)),
+        },
+        "q38_records": [],
+        "q28_records": [],
+        "continuations": [{"offset": s[0], "stored": s[1], "inflated": len(s[2])} for s in continuations],
+        "span": 0,
+        "payload_at_0x60": False,
+        "complete": True,
+        "error": "",
+    }
+    q38 = page["tables"]["q38"]
+    count = page["counts"][2] or 0
+    records, complete, error = _q38(data, q38, count)
+    page["error"] = error
+    if not complete:
+        page["complete"] = False
+        return page, False
+    page["span"] = max([r["target"] + r["size"] for r in records], default=0)
+    page["payload_at_0x60"] = any(r["target"] == HEADER_SIZE for r in records)
+    # Attach a stream index to each target. Index 0 is the directory stream itself.
+    lengths = [len(base)] + [len(s[2]) for s in continuations]
+    starts = []
+    total = 0
+    for n in lengths:
+        starts.append(total)
+        total += n
+    enriched = []
+    for r in records:
+        stream = 0
+        for i in range(1, len(starts)):
+            if r["target"] >= starts[i]:
+                stream = i
+        item = dict(r)
+        item["target_stream"] = stream
+        item["spans_streams"] = stream + 1 < len(starts) and r["target"] + r["size"] > starts[stream + 1]
+        enriched.append(item)
+    page["q38_records"] = enriched
+    q28 = page["tables"]["q28"]
+    page["q28_records"], page["q28_error"] = _q28(data, q28, page["counts"][0] or 0)
+    return page, True
+
+
+def index_streams(streams, progress=None):
+    """Consume a stream sequence and return page records. At most one page waits for a continuation."""
+    pages = []
+    waiting = None
+    streams_seen = 0
+
+    def start(offset, stored, data):
+        page, complete = parse_page(data, [])
+        page["offset"] = offset
+        page["stored"] = stored
+        if complete:
+            pages.append(page)
+            return None
+        return (page, data, [])
+
+    for offset, stored, data in streams:
+        streams_seen += 1
+        if progress and streams_seen % 2000 == 0:
+            progress(streams_seen, len(pages))
+        if waiting is not None:
+            page, base, cont = waiting
+            cont.append((offset, stored, data))
+            page, complete = parse_page(base, cont)
+            page["offset"] = waiting[0]["offset"]
+            page["stored"] = waiting[0]["stored"]
+            if complete:
+                pages.append(page)
+                waiting = None
+                continue
+            if is_page(data):
+                # The previous resource ended before its declared table/entries did. Report it, then
+                # treat this stream as the new directory page instead of swallowing it as a continuation.
+                waiting[0]["complete"] = False
+                waiting[0]["error"] = waiting[0]["error"] or "resource ended before q38 was complete"
+                pages.append(waiting[0])
+                waiting = start(offset, stored, data)
+                continue
+            if len(cont) >= MAX_CONTINUATIONS:
+                page["complete"] = False
+                page["error"] = page["error"] or "too many continuation streams"
+                pages.append(page)
+                waiting = None
+            else:
+                waiting = (page, base, cont)
+            continue
+        if is_page(data):
+            waiting = start(offset, stored, data)
+    if waiting is not None:
+        page = waiting[0]
+        page["complete"] = False
+        page["error"] = page["error"] or "archive ended before q38 was complete"
+        pages.append(page)
+    return pages, streams_seen
+
+
+def summarise(pages, mode, source):
+    complete = sum(1 for p in pages if p["complete"])
+    return {
+        "mode": mode,
+        "source": source,
+        "pages": len(pages),
+        "complete_pages": complete,
+        "incomplete_pages": len(pages) - complete,
+        "q38_records": sum(len(p["q38_records"]) for p in pages),
+        "q28_records": sum(len(p["q28_records"]) for p in pages),
+        "pages_with_continuations": sum(1 for p in pages if p["continuations"]),
+        "span_bytes": sum(p["span"] for p in pages),
+        "payload_at_0x60": sum(1 for p in pages if p["payload_at_0x60"]),
+        "versions": {str(v): sum(1 for p in pages if p["version"] == v)
+                     for v in sorted({p["version"] for p in pages})},
+        "page_counts": {str(v): sum(1 for p in pages if p["page_count"] == v)
+                        for v in sorted({p["page_count"] for p in pages if p["page_count"] is not None})},
+    }
+
+
+def write_json(path, pages, summary):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"summary": summary, "pages": pages}, f, indent=1)
+
+
+def write_csv(path, pages):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        for page in pages:
+            records = page["q38_records"]
+            base = {
+                "page_offset": "0x%x" % page["offset"],
+                "stored": "" if page["stored"] is None else page["stored"],
+                "inflated": page["inflated"],
+                "version": page["version"],
+                "page_count": page["page_count"],
+                "q28_count": page["counts"][0],
+                "q30_count": page["counts"][1],
+                "q38_count": page["counts"][2],
+                "span": page["span"],
+                "complete": int(page["complete"]),
+            }
+            if not records:
+                w.writerow(dict(base, record_index="", hash="", size="", target="", target_stream=""))
+                continue
+            for i, r in enumerate(records):
+                w.writerow(dict(base, record_index=i, hash="0x%08x" % r["hash"], size=r["size"],
+                                target="0x%x" % r["target"], target_stream=r["target_stream"]))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Index RPF9 0DRP page directories (read-only, no TOC decryption)")
+    ap.add_argument("source", help="archive.rpf or a directory of carved <offset>.bin files")
+    ap.add_argument("out", help="output .json or .csv")
+    ap.add_argument("--start", type=lambda v: int(v, 0), help="first archive offset (default: header u32@4)")
+    ap.add_argument("--limit", type=lambda v: int(v, 0), help="stop after this many bytes")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+
+    def progress(n, pages):
+        print("streams=%d pages=%d" % (n, pages), file=sys.stderr, flush=True)
+
+    if os.path.isdir(a.source):
+        streams = scan_dir(a.source)
+        mode = "directory"
+    elif os.path.isfile(a.source):
+        streams = scan_rpf(a.source, a.start, a.limit)
+        mode = "rpf9"
+    else:
+        print("not a file or directory: %s" % a.source, file=sys.stderr)
+        return 2
+    pages, streams_seen = index_streams(streams, None if a.quiet else progress)
+    summary = summarise(pages, mode, a.source)
+    summary["streams"] = streams_seen
+    ext = os.path.splitext(a.out)[1].lower()
+    if ext == ".json":
+        write_json(a.out, pages, summary)
+    elif ext == ".csv":
+        write_csv(a.out, pages)
+    else:
+        print("output must end in .json or .csv", file=sys.stderr)
+        return 2
+    if not a.quiet:
+        print(json.dumps(summary, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

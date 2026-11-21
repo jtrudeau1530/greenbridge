@@ -76,5 +76,7 @@ both paths. It is used to check exported assets without keeping a second copy.
 ## See also
 
 - [docs/design.md](design.md) — the asset-stage table, coverage numbers and the recovery approach.
+- [docs/page_directory.md](page_directory.md) — the `0DRP` page directory layout, `q38` resource boundaries and
+  `tools/page_index.py`.
 - `docs/audio.md` - AWC layout and the audio exporters, once the audio guide is merged.
 - the related-projects page - the rpf9-explorer/PercyStar/SCARAB licence boundaries.
