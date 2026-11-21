@@ -78,7 +78,10 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - [Python 3.11+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
-- [LLVM 21+](https://github.com/llvm/llvm-project/releases) with `llvm-mc` on PATH, or set `LLVM_MC` to its path.
+- [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
+  Windows build has no AMDGPU target: on Windows install `llvm-21` in WSL and set
+  `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see [docs/design.md](docs/design.md#disassembling-shaders)).
+  On Linux, `llvm-mc` on PATH is enough.
 - Visual Studio 2022 with **Desktop development with C++**, for the runtime stage.
 
 **From a terminal**, with the same behaviour and more control:
