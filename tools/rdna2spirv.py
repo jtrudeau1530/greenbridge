@@ -3313,6 +3313,25 @@ class Gen:
             self.emit(f"{s} = OpUMulExtended %umul {x} {y}")
             self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
             self.dst(a[0], r)
+        elif op == "s_mul_hi_i32":
+            # High 32 bits of the signed 64-bit product; SCC is not written.
+            x, y = self.as_int(self.src_u(a[1])), self.as_int(self.src_u(a[2]))
+            s, hi, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{s} = OpSMulExtended %smul {x} {y}")
+            self.emit(f"{hi} = OpCompositeExtract %int {s} 1")
+            self.emit(f"{r} = OpBitcast %uint {hi}")
+            self.uses_smul = True
+            self.dst(a[0], r)
+        elif op == "s_absdiff_i32":
+            # RDNA2 ISA: D = S0 - S1 as a 32-bit signed value, negated if negative; SCC = (D != 0). The difference
+            # wraps before the absolute value (0x7FFFFFFF - 0x80000000 = -1 -> 1), and SAbs keeps 0x80000000 as is.
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            d, ab, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{d} = OpISub %uint {x} {y}")
+            self.emit(f"{ab} = OpExtInst %int %glsl SAbs {self.as_int(d)}")
+            self.emit(f"{r} = OpBitcast %uint {ab}")
+            self.dst(a[0], r)
+            self.scc_nonzero(r)
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
             sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
             selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
