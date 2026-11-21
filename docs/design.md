@@ -159,7 +159,8 @@ code-embedded data via `s_getpc_b64`, global memory, exact packed-f16 modifiers)
 operands. GPU re-test on the final SPIR-V: `VS_Passthrough` exact, texture test within RTZ f16 rounding, 400/400
 arithmetic-only PS finite and deterministic. (Earlier runs rejected 321 pixel shaders for unexplained system inputs; those were raw barycentric reads,
 now mapped to `BaryCoordKHR`.) GPU re-test against the final SPIR-V: `VS_Passthrough` exact, texture test within RTZ f16
-rounding (1.3e-5), and **400/400** arithmetic-only PS finite and identical across two runs. Mesh (9,282) and geometry (195) shaders aren't translated yet; compute is covered in its own row below.
+rounding (1.3e-5), and **400/400** arithmetic-only PS finite and identical across two runs. Mesh (9,282) and geometry (195) shaders aren't translated yet; compute is covered in its own row below. Output:
+`<work>\shaders\spirv\` (`.spvasm` + `.spv`), and the log is `<work>\shaders\spirv_run.log`.
 
 How the generated SPIR-V expects the runtime to work:
 
