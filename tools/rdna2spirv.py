@@ -81,6 +81,7 @@ class Gen:
         self.uses_tex_3d = False
         self.uses_v4uint = False
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
+        self.uses_store_reads = False  # typed image_load through the uint/sint views
         self.writes_depth = False
         self.uses_smul = False
         self.uses_minlod = False
@@ -3081,6 +3082,9 @@ class Gen:
             else:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
+            if dim in self.STORE_DIMS and not d16:
+                self.image_load_typed(dim, t, iv, img, dmask, vdata)
+                return
             res = self.tmp()
             self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
             ncomp = bin(dmask).count("1")
@@ -3323,6 +3327,76 @@ class Gen:
             cls.INT_FORMATS = (u, si)
         return cls.INT_FORMATS
 
+    def fmt_int_flags(self, word1):
+        """(is UINT format, is SINT format) for a T# word1 (FORMAT [28:20]), from the 512-bit tables."""
+        for w in [16] + sum(self.int_format_masks(), []):
+            self.cu(w)
+        fmt, word, bit = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{fmt} = OpBitFieldUExtract %uint {word1} {self.cu(20)} {self.cu(9)}")
+        self.emit(f"{word} = OpShiftRightLogical %uint {fmt} {self.cu(5)}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {fmt} {self.cu(31)}")
+        flags = []
+        for mask in ("%fmt_uint_mask", "%fmt_sint_mask"):
+            p, w, b, nz = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{p} = OpAccessChain %_ptr_Private_uint {mask} {word}")
+            self.emit(f"{w} = OpLoad %uint {p}")
+            self.emit(f"{b} = OpBitFieldUExtract %uint {w} {bit} {self.cu(1)}")
+            self.emit(f"{nz} = OpINotEqual %bool {b} {self.cu(0)}")
+            flags.append(nz)
+        return flags
+
+    def image_load_typed(self, dim, t, iv, img, dmask, vdata):
+        """image_load with the image's numeric type decided at run time (T# FORMAT): UINT/SINT formats are read
+        through the uint/sint storage views (OpImageRead, read-without-format), everything else through the float
+        sampled view (OpImageFetch, as before). Vulkan requires the view's component type to match the format, so a
+        float view of an integer image would be undefined. Results are the raw bits of the dmask components."""
+        di = self.STORE_DIMS[dim][0]
+        self.uses_store_views.add(di)
+        self.uses_store_reads = True
+        idx = self.desc_lookup(t)
+        is_u, is_s = self.fmt_int_flags(t[1])
+        act = self.active_b()
+        L = {k: self.tmp() + "_" + k for k in ("s", "rest", "e2", "u", "f", "e3")}
+
+        def write(v4u):
+            k = 0
+            for c in range(4):
+                if dmask >> c & 1:
+                    x = self.tmp()
+                    self.emit(f"{x} = OpCompositeExtract %uint {v4u} {c}")
+                    self.dst({"k": "vgpr", "r": vdata["r"] + k, "n": 1}, x)
+                    k += 1
+
+        def read(cls, ty):
+            ip, im, r, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{ip} = OpAccessChain %_ptr_UC_stv{cls}_{di} %stv{cls}_{di} {idx}")
+            self.emit(f"{im} = OpLoad %stimg{cls}_{di} {ip}")
+            self.emit(f"{r} = OpImageRead {ty} {im} {iv}")
+            self.emit(f"{b} = OpBitcast %v4uint_st {r}")
+            write(b)
+
+        _ = act
+        self.emit(f"OpSelectionMerge {L['e2']} None")
+        self.emit(f"OpBranchConditional {is_s} {L['s']} {L['rest']}")
+        self.emit(f"{L['s']} = OpLabel")
+        read(2, "%v4int_st")
+        self.emit(f"OpBranch {L['e2']}")
+        self.emit(f"{L['rest']} = OpLabel")
+        self.emit(f"OpSelectionMerge {L['e3']} None")
+        self.emit(f"OpBranchConditional {is_u} {L['u']} {L['f']}")
+        self.emit(f"{L['u']} = OpLabel")
+        read(1, "%v4uint_st")
+        self.emit(f"OpBranch {L['e3']}")
+        self.emit(f"{L['f']} = OpLabel")
+        res, b = self.tmp(), self.tmp()
+        self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
+        self.emit(f"{b} = OpBitcast %v4uint_st {res}")
+        write(b)
+        self.emit(f"OpBranch {L['e3']}")
+        self.emit(f"{L['e3']} = OpLabel")
+        self.emit(f"OpBranch {L['e2']}")
+        self.emit(f"{L['e2']} = OpLabel")
+
     def image_store(self, a, mods, dim):
         """image_store vData, vAddr, T#: write the dmask components to a storage image. The view is picked at run
         time from T# word1 FORMAT [28:20]: *_UINT -> uint view, *_SINT -> sint view, anything else -> float view
@@ -3358,19 +3432,7 @@ class Gen:
         else:
             iv = self.tmp()
             self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if nc == 2 else '%v3int'} {' '.join(coords)}")
-        fmt, word, bit = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{fmt} = OpBitFieldUExtract %uint {t[1]} {self.cu(20)} {self.cu(9)}")
-        self.emit(f"{word} = OpShiftRightLogical %uint {fmt} {self.cu(5)}")
-        self.emit(f"{bit} = OpBitwiseAnd %uint {fmt} {self.cu(31)}")
-        flags = []
-        for mask in ("%fmt_uint_mask", "%fmt_sint_mask"):
-            p, w, b, nz = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_Private_uint {mask} {word}")
-            self.emit(f"{w} = OpLoad %uint {p}")
-            self.emit(f"{b} = OpBitFieldUExtract %uint {w} {bit} {self.cu(1)}")
-            self.emit(f"{nz} = OpINotEqual %bool {b} {self.cu(0)}")
-            flags.append(nz)
-        is_u, is_s = flags
+        is_u, is_s = self.fmt_int_flags(t[1])
         fv = [self.tof(v) for v in vals]
         sv = [self.as_int(v) for v in vals]
         v4f, v4u, v4s = self.tmp(), self.tmp(), self.tmp()
@@ -4038,6 +4100,8 @@ def assemble(gen):
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
         if 3 in gen.uses_store_views:
             caps.append("Image1D")
+        if gen.uses_store_reads:
+            caps.append("StorageImageReadWithoutFormat")     # shaderStorageImageReadWithoutFormat
     if gsx:
         caps.append("Geometry")
     if ms:

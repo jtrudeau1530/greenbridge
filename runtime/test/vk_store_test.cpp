@@ -83,6 +83,9 @@ int main(int argc, char** argv) {
     f12.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
+    // "load" mode (cs_imgload.asm): the sint image receives the uint texel read back with image_load.
+    const bool load_mode = argc > 2 && !std::strcmp(argv[2], "load");
     f2.features.shaderInt64 = VK_TRUE;
     f2.pNext = &f12;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -239,7 +242,8 @@ int main(int argc, char** argv) {
             int er = int(std::lround(x / 7.0 * 255)), eg = int(std::lround(y / 7.0 * 255));
             if (std::abs(c[0] - er) > 1 || std::abs(c[1] - eg) > 1 || std::abs(c[2] - 128) > 1 || c[3] != 255) bad[0]++;
             if (static_cast<const uint32_t*>(rbp[1])[i] != 100 + 8 * y + x) bad[1]++;
-            if (static_cast<const int32_t*>(rbp[2])[i] != -int32_t(8 * y + x)) bad[2]++;
+            const int32_t want_s = load_mode ? int32_t(100 + 8 * y + x) : -int32_t(8 * y + x);
+            if (static_cast<const int32_t*>(rbp[2])[i] != want_s) bad[2]++;
         }
     const uint8_t* c = static_cast<const uint8_t*>(rbp[0]) + 4 * (3 * W + 5);
     std::printf("rgba8 unorm (float view): %u bad, texel(5,3) = %u %u %u %u\n", bad[0], c[0], c[1], c[2], c[3]);
