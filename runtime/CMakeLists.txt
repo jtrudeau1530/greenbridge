@@ -46,6 +46,19 @@ if(WIN32)
     message(STATUS "d3d12.lib not found: root_sig_test is not built")
   endif()
 
+  # xmem shim ABI test: resolves the registered xmem.dll exports itself, so xmem.cpp and registry.cpp are compiled
+  # into this executable instead of reusing gta6rt's objects (which would duplicate their symbols).
+  add_executable(xmem_test
+    test/xmem_test.cpp
+    shims/xmem.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xmem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xmem_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xmem_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xmem_test PRIVATE psapi)
+
 else()
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
 endif()
@@ -54,6 +67,9 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(clear_commands_test test/clear_commands_test.cpp)
   add_test(NAME clear_commands COMMAND clear_commands_test)
+  if(WIN32 AND TARGET xmem_test)
+    add_test(NAME xmem COMMAND xmem_test)
+  endif()
 endif()
 
 if(WIN32)
