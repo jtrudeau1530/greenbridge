@@ -163,6 +163,10 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
         out.error = "more than 64 root parameters";
         return out;
     }
+    if (nsamplers > 4096) {
+        out.error = "absurd sampler count";
+        return out;
+    }
     out.sig.version = ver == 1 ? Version::V1_0 : Version::V1_1;
     out.sig.params.reserve(nparams);
     for (uint32_t i = 0; i < nparams; ++i) {
@@ -239,6 +243,10 @@ DecodeResult parse_rts0(const uint8_t* data, size_t size) {
     }
     if (nparams > 64) {
         out.error = "RTS0 with more than 64 root parameters";
+        return out;
+    }
+    if (nsamplers > 4096) {
+        out.error = "RTS0 with absurd sampler count";
         return out;
     }
     out.sig.version = ver == 1 ? Version::V1_0 : Version::V1_1;

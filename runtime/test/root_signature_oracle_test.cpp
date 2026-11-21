@@ -48,6 +48,14 @@ D3D12_VERSIONED_ROOT_SIGNATURE_DESC make_desc(
 bool parse_blob(ID3DBlob* blob, rt::rootsig::RootSignature& model) {
     const auto* bytes = static_cast<const uint8_t*>(blob->GetBufferPointer());
     const size_t size = blob->GetBufferSize();
+    // Diagnostics first: if the layout hypothesis is wrong, the CI log shows
+    // the real bytes instead of just a crash or a bare failure.
+    std::printf("oracle blob: %zu bytes: ", size);
+    for (size_t i = 0; i < 32 && i < size; ++i) {
+        std::printf("%02x", bytes[i]);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
     const rt::rootsig::DecodeResult d = rt::rootsig::parse_rts0(bytes, size);
     if (!d.ok) {
         std::printf("oracle parse failed: %s\n", d.error.c_str());
