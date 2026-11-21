@@ -870,9 +870,11 @@ class Gen:
             self.emit(f"{v} = OpPhi %uint {v_do} {lbl_do} {self.cu(0)} {pre_label}")
             words.append(v)
         # Sub-dword formats start at the byte shift inside dword 0 (and may spill into dword 1).
-        w0s, w1s, nz, w1sh, merged, bw0 = (self.tmp() for _ in range(6))
+        # (32 - bsh) & 31 keeps the left shift below 32 for an aligned element; that result is discarded by the OpSelect.
+        w0s, w1s, nz, w1sh0, w1sh, merged, bw0 = (self.tmp() for _ in range(7))
         self.emit(f"{w0s} = OpShiftRightLogical %uint {words[0]} {bsh}")
-        self.emit(f"{w1sh} = OpISub %uint {self.cu(32)} {bsh}")
+        self.emit(f"{w1sh0} = OpISub %uint {self.cu(32)} {bsh}")
+        self.emit(f"{w1sh} = OpBitwiseAnd %uint {w1sh0} {self.cu(31)}")
         self.emit(f"{w1s} = OpShiftLeftLogical %uint {words[1]} {w1sh}")
         self.emit(f"{nz} = OpINotEqual %bool {bsh} {self.cu(0)}")
         self.emit(f"{merged} = OpBitwiseOr %uint {w0s} {w1s}")

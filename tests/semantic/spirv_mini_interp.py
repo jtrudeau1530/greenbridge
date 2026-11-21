@@ -395,6 +395,11 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
         elif op == "OpUConvert":
             values[res] = val(a[1]) & wmask(a[0])
+        elif op in ("OpConvertUToF", "OpConvertSToF"):
+            x = val(a[1])
+            if not isinstance(x, int):
+                raise UnsupportedConstruct(f"{op} on non-integer")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x & MASK))
         elif op == "OpBitCount":
             values[res] = (val(a[1]) & wmask(a[0])).bit_count()
         elif op == "OpISubBorrow":
@@ -475,6 +480,10 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
                 values[res] = f32(abs(args[0]))
+            elif name in ("FMin", "FMax"):
+                if any(math.isnan(x) for x in args):
+                    raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
+                values[res] = f32(min(args) if name == "FMin" else max(args))
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "SMax":
