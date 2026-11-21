@@ -188,6 +188,9 @@ What is implemented (all of it testable without the game):
     question 4). RTV/DSV slots hold a `TargetView`; shader-visible heaps return a GPU handle, but nothing reads it
     yet;
   - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D` and `TEXTURE2DARRAY`;
+  - `CopyDescriptors` / `CopyDescriptorsSimple`. A descriptor is the bytes of its slot, so a copy is a byte copy:
+    the destination and source range lists are walked together, one descriptor at a time, and null size arrays
+    mean one descriptor per range;
   - committed buffers (upload and readback heaps mapped persistently and zeroed) and 2D textures in the common
     render-target, depth and texture formats (typeless families become mutable-format images), plus non-attachment
     3D textures with mipmapped upload, image copy and readback;
@@ -270,6 +273,8 @@ and any validation error fails them.
   pattern and copies it on: whole into a texture created in `COMMON`, a boxed part into a smaller texture, a BC1
   round trip and a buffer region. `GetCopyableFootprints` is compared with the PC runtime's, and a short run
   repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
+- `d3d12_descriptor_test`: descriptor copies through the proxy, checked on the slots' bytes: one run, range lists
+  of different shapes on each side, null size arrays, and a destination longer than its source.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
