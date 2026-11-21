@@ -54,6 +54,54 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(clear_commands_test test/clear_commands_test.cpp)
   add_test(NAME clear_commands COMMAND clear_commands_test)
+
+  if(WIN32)
+    # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
+    # imports it so Loader::load exercises recursive module loading. They contain no game data.
+    set(TINY_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/fixtures/$<CONFIG>")
+
+    add_library(tiny_dll SHARED test/fixtures/tiny_dll.cpp)
+    target_compile_definitions(tiny_dll PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_dll PRIVATE /W4 /permissive- /utf-8 /GS-)
+    set_target_properties(tiny_dll PROPERTIES
+      OUTPUT_NAME tiny_dll
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+
+    add_executable(tiny_exe test/fixtures/tiny_exe.cpp)
+    target_link_libraries(tiny_exe PRIVATE tiny_dll)
+    target_compile_definitions(tiny_exe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_exe PRIVATE /W4 /permissive- /utf-8 /GS-)
+    set_target_properties(tiny_exe PROPERTIES
+      OUTPUT_NAME tiny_exe
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+
+    # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The xmem and d3d12_xs tables
+    # are linked too so the optional LEONIDA_GAME_DIR run classifies the shipped modules' imports exactly like
+    # gta6rt does (no d3d12.lib is needed: d3d12_xs resolves its host entry points at run time).
+    add_executable(pe_loader_test
+      test/pe_loader_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+      shims/d3d12_xs.cpp
+    )
+    target_include_directories(pe_loader_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(pe_loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pe_loader_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(pe_loader_test PRIVATE /OPT:NOREF)
+    target_link_libraries(pe_loader_test PRIVATE gta6rt_d3d12_xs_rootsig psapi)
+    add_dependencies(pe_loader_test tiny_dll tiny_exe)
+    add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
+  endif()
 endif()
 
 if(WIN32)
