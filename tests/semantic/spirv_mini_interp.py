@@ -1,17 +1,23 @@
-"""A deliberately tiny interpreter for the straight-line SPIR-V assembly that tools/rdna2spirv.py emits for
-branch-free pixel shaders. It exists so tests can check *computed values*, not just that the module validates.
+"""A deliberately tiny interpreter for the SPIR-V assembly that tools/rdna2spirv.py emits for branch-free pixel
+shaders and simple structured compute shaders. It exists so tests can check *computed values*, not just that the
+module validates.
 
 Design rules (see tests/semantic/README.md):
   * Written from the SPIR-V and GLSL.std.450 specifications. It shares no code with the translator.
   * Strict: any opcode, extended instruction, type or storage class not listed below raises
     UnsupportedConstruct. Nothing is skipped or approximated silently, so a translator change that starts
     emitting something new makes the test error out instead of passing.
-  * Single invocation (one lane), no control flow, no memory beyond Function/Output variables.
-    PushConstant data reads as zero (the shaders under test never read it, but the translator copies the
-    32 user-data dwords at entry); writing to it is rejected.
+  * One invocation (one lane). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
+    branches the translator emits: OpBranch / OpBranchConditional to a later label plus OpPhi at the merge block.
+    Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
+    boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores use a flat
+    address -> word dictionary. Workgroup storage and images are rejected.
+  * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
+    keep the old behaviour.
 
-Values: uint/int are Python ints in [0, 2**32) (signedness is applied by the operation, as in SPIR-V);
-float is a Python float rounded to binary32; vectors are tuples; arrays are lists; bool is bool.
+Values: uint/int are Python ints in [0, 2**32) or [0, 2**64) for 64-bit types (signedness is applied by the
+operation, as in SPIR-V); float is a Python float rounded to binary32; vectors are tuples; arrays are lists;
+bool is bool.
 """
 import math
 import re
@@ -26,9 +32,9 @@ class UnsupportedConstruct(NotImplementedError):
 
 # Instructions that carry no runtime semantics for a single-entry-point, straight-line module.
 _IGNORED = frozenset({
-    "OpCapability", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode", "OpDecorate",
-    "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpSelectionMerge", "OpReturn",
-    "OpFunctionEnd", "OpName", "OpSource",
+    "OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
+    "OpDecorate", "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpSelectionMerge",
+    "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
 })
 
 _LINE = re.compile(r"^(?:(%\S+)\s*=\s*)?(Op\w+)\s*(.*)$")
@@ -87,19 +93,49 @@ class _Types:
             return [self.zero(k[1]) for _ in range(k[2])]
         raise UnsupportedConstruct(f"zero value of type {name} ({k[0]})")
 
+    def size(self, name):
+        """Byte size of a concrete type. Runtime arrays have no size of their own; the element size is used."""
+        k = self.t[name]
+        if k[0] in ("int", "float"):
+            return 4
+        if k[0] == "vec":
+            return 4 * k[2]
+        if k[0] == "arr":
+            return self.size(k[1]) * k[2]
+        if k[0] == "rarr":
+            return self.size(k[1])
+        if k[0] == "struct":
+            return sum(self.size(t) for t in k[1])
+        raise UnsupportedConstruct(f"size of type {name} ({k[0]})")
 
-def run_fragment(text):
+    def bits(self, name):
+        k = self.t[name]
+        if k[0] != "int":
+            raise UnsupportedConstruct(f"integer width of type {name} ({k[0]})")
+        return k[1]
+
+
+def run_fragment(text, inputs=None, push_constants=None, memory=None):
     """Execute the entry point of `text` once and return the words written to every Output variable.
+
+    `inputs` maps an Input variable name (for example "%in_attr1") to its value (a tuple for vectors).
+    `push_constants` is a list of 32-bit words at byte offsets 0, 4, 8, ... of the PushConstant block
+    (missing words read as zero). `memory` is a mutable {byte_address: word} mapping used for
+    PhysicalStorageBuffer loads and stores.
 
     Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns.
     """
+    inputs = inputs or {}
+    push_constants = list(push_constants or [])
+    memory = {} if memory is None else memory
     types = _Types()
     values = {}                 # id -> value (constants and results)
     constants = {}              # id -> value, kept apart so zero-initialised arrays can be built
     ptr_types = {}              # pointer type id -> (storage class, pointee type id)
     var_class = {}              # variable id -> storage class
     var_box = {}                # variable id -> [value]
-    pointers = {}               # id -> (container list, index) for results of OpAccessChain / variables
+    pointers = {}               # id -> (container list, index) / ("pc", offset) / ("psb", address)
+    pc_type = {}                # id -> pointee type id of a PushConstant pointer
     in_body = False
     body = []
     outputs = []
@@ -108,6 +144,22 @@ def run_fragment(text):
         if x in values:
             return values[x]
         raise UnsupportedConstruct(f"use of undefined id {x}")
+
+    def walk(type_id, indices):
+        """Byte offset and element type after selecting `indices` in an aggregate type."""
+        off, cur = 0, type_id
+        for idx in indices:
+            k = types.t[cur]
+            if k[0] == "struct":
+                for m in range(idx):
+                    off += types.size(k[1][m])
+                cur = k[1][idx]
+            elif k[0] in ("arr", "rarr", "vec"):
+                off += types.size(k[1]) * idx
+                cur = k[1]
+            else:
+                raise UnsupportedConstruct(f"OpAccessChain into {k[0]}")
+        return off, cur
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -127,9 +179,10 @@ def run_fragment(text):
         if op in _IGNORED:
             continue
         if op == "OpTypeInt":
-            types.t[res] = ("int", int(a[0]), int(a[1]))
-            if int(a[0]) != 32:
-                raise UnsupportedConstruct("non-32-bit integer type")
+            bits = int(a[0])
+            if bits not in (32, 64):
+                raise UnsupportedConstruct("integer type that is not 32 or 64 bits")
+            types.t[res] = ("int", bits, int(a[1]))
         elif op == "OpTypeFloat":
             if int(a[0]) != 32:
                 raise UnsupportedConstruct("non-32-bit float type")
@@ -140,6 +193,8 @@ def run_fragment(text):
             types.t[res] = ("vec", a[0], int(a[1]))
         elif op == "OpTypeArray":
             types.t[res] = ("arr", a[0], int(constants[a[1]]))
+        elif op == "OpTypeRuntimeArray":
+            types.t[res] = ("rarr", a[0])
         elif op == "OpTypeStruct":
             types.t[res] = ("struct", a)
         elif op == "OpTypePointer":
@@ -149,7 +204,7 @@ def run_fragment(text):
             if k[0] == "float":
                 constants[res] = values[res] = f32(float(a[1]))
             elif k[0] == "int":
-                constants[res] = values[res] = int(a[1]) & MASK
+                constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
             else:
                 raise UnsupportedConstruct(f"OpConstant of type {k[0]}")
         elif op == "OpConstantTrue":
@@ -164,7 +219,11 @@ def run_fragment(text):
                 raise UnsupportedConstruct("OpVariable storage class mismatch")
             var_class[res] = cls
             if cls == "PushConstant":
-                var_box[res] = [None]                  # reads give zero, see _load
+                var_box[res] = [None]                  # reads come from push_constants, see OpLoad
+                pc_type[res] = pointee
+            elif cls == "Input":
+                init = inputs.get(res, types.zero(pointee))
+                var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
             elif cls in ("Function", "Output"):
                 if len(a) > 2:
                     init = values[a[2]]
@@ -175,7 +234,7 @@ def run_fragment(text):
                     outputs.append(res)
             else:
                 raise UnsupportedConstruct(f"storage class {cls}")
-            pointers[res] = (var_box[res], 0)
+            pointers[res] = ("pc", 0) if cls == "PushConstant" else (var_box[res], 0)
         else:
             raise UnsupportedConstruct(f"{op} in module header")
     if not in_body:
@@ -185,17 +244,33 @@ def run_fragment(text):
         box, i = p
         return box[i]
 
+    def wmask(type_id):
+        return (1 << types.bits(type_id)) - 1
+
+    def signed(v, bits):
+        v &= (1 << bits) - 1
+        return v - (1 << bits) if v >> (bits - 1) else v
+
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
     pc = 0
     killed = False
+    cur_label = prev_label = None
     while pc < len(body):
         res, op, a, line = body[pc]
         pc += 1
+        if op == "OpLabel":
+            prev_label, cur_label = cur_label, res
+            continue
         if op in _IGNORED:
             continue
         if op == "OpKill":
             killed = True
             break
+        if op == "OpBranch":
+            if a[0] not in labels or labels[a[0]] < pc:
+                raise UnsupportedConstruct("non-forward branch")
+            pc = labels[a[0]]
+            continue
         if op == "OpBranchConditional":
             cond = val(a[0])
             if not isinstance(cond, bool):
@@ -204,6 +279,12 @@ def run_fragment(text):
             if target not in labels or labels[target] < pc:
                 raise UnsupportedConstruct("non-forward branch")
             pc = labels[target]
+            continue
+        if op == "OpPhi":
+            incoming = [a[i] for i in range(1, len(a) - 1, 2) if a[i + 1] == prev_label]
+            if len(incoming) != 1:
+                raise UnsupportedConstruct("OpPhi with an unknown predecessor")
+            values[res] = val(incoming[0])
             continue
         if op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
@@ -216,22 +297,39 @@ def run_fragment(text):
             base = a[1]
             if base not in pointers:
                 raise UnsupportedConstruct("OpAccessChain on non-pointer")
-            if var_class.get(base) == "PushConstant":
-                pointers[res] = ("pc", None)
+            p = pointers[base]
+            if p[0] == "pc":
+                off, cur = walk(pc_type[base], [values[i] for i in a[2:]])
+                pointers[res] = ("pc", p[1] + off)
+                pc_type[res] = cur
                 var_class[res] = "PushConstant"
                 continue
-            p = pointers[base]
+            if p[0] == "psb":
+                if len(a) != 3:
+                    raise UnsupportedConstruct("multi-index physical-storage-buffer access chain")
+                elem = ptr_types[a[0]][1]
+                if types.t[elem][0] == "rarr":
+                    stride = types.size(types.t[elem][1])
+                elif types.t[elem][0] in ("int", "float", "vec"):
+                    stride = types.size(elem)
+                else:
+                    raise UnsupportedConstruct(f"physical-storage-buffer access chain into {types.t[elem][0]}")
+                pointers[res] = ("psb", p[1] + stride * values[a[2]])
+                continue
             for idx_id in a[2:]:
                 idx = values[idx_id]
                 container = deref(p)
-                if not isinstance(container, list) or not 0 <= idx < len(container):
+                if not isinstance(container, (list, tuple)) or not 0 <= idx < len(container):
                     raise UnsupportedConstruct("OpAccessChain into non-array or out of range")
                 p = (container, idx)
             pointers[res] = p
         elif op == "OpLoad":
             p = pointers[a[1]]
             if p[0] == "pc":
-                values[res] = 0                       # push constants read as zero
+                w = p[1] // 4
+                values[res] = push_constants[w] if 0 <= w < len(push_constants) else 0
+            elif p[0] == "psb":
+                values[res] = memory.get(p[1], 0)
             else:
                 v = deref(p)
                 values[res] = list(v) if isinstance(v, list) else v
@@ -239,7 +337,10 @@ def run_fragment(text):
             p = pointers[a[0]]
             if p[0] == "pc":
                 raise UnsupportedConstruct("store to PushConstant")
-            p[0][p[1]] = val(a[1])
+            if p[0] == "psb":
+                memory[p[1]] = val(a[1])
+            else:
+                p[0][p[1]] = val(a[1])
         elif op == "OpSelect":
             if not isinstance(val(a[1]), bool):
                 raise UnsupportedConstruct("OpSelect with a non-scalar-bool condition")
@@ -253,7 +354,7 @@ def run_fragment(text):
             elif k[0] == "int" and isinstance(v, float):
                 values[res] = f32_bits(v)
             elif k[0] == "int" and isinstance(v, int):
-                values[res] = v & MASK
+                values[res] = v & wmask(a[0])
             else:
                 raise UnsupportedConstruct("OpBitcast between these types")
         elif op == "OpCompositeExtract":
@@ -264,36 +365,49 @@ def run_fragment(text):
         elif op == "OpCompositeConstruct":
             values[res] = tuple(val(x) for x in a[1:])
         elif op == "OpBitwiseAnd":
-            values[res] = val(a[1]) & val(a[2])
+            values[res] = (val(a[1]) & val(a[2])) & wmask(a[0])
         elif op == "OpBitwiseOr":
-            values[res] = val(a[1]) | val(a[2])
+            values[res] = (val(a[1]) | val(a[2])) & wmask(a[0])
         elif op == "OpBitwiseXor":
-            values[res] = val(a[1]) ^ val(a[2])
+            values[res] = (val(a[1]) ^ val(a[2])) & wmask(a[0])
         elif op == "OpNot":
-            values[res] = (~val(a[1])) & MASK
+            values[res] = (~val(a[1])) & wmask(a[0])
         elif op == "OpShiftLeftLogical":
-            if val(a[2]) >= 32:
-                raise UnsupportedConstruct("shift amount >= 32 (undefined in SPIR-V)")
-            values[res] = (val(a[1]) << val(a[2])) & MASK
+            bits = types.bits(a[0])
+            if val(a[2]) >= bits:
+                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+            values[res] = (val(a[1]) << val(a[2])) & wmask(a[0])
         elif op == "OpShiftRightLogical":
-            if val(a[2]) >= 32:
-                raise UnsupportedConstruct("shift amount >= 32 (undefined in SPIR-V)")
-            values[res] = (val(a[1]) & MASK) >> val(a[2])
+            bits = types.bits(a[0])
+            if val(a[2]) >= bits:
+                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+            values[res] = (val(a[1]) & wmask(a[0])) >> val(a[2])
+        elif op == "OpShiftRightArithmetic":
+            bits = types.bits(a[0])
+            if val(a[2]) >= bits:
+                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+            values[res] = (signed(val(a[1]), bits) >> val(a[2])) & wmask(a[0])
         elif op == "OpIAdd":
-            values[res] = (val(a[1]) + val(a[2])) & MASK
+            values[res] = (val(a[1]) + val(a[2])) & wmask(a[0])
         elif op == "OpISub":
-            values[res] = (val(a[1]) - val(a[2])) & MASK
+            values[res] = (val(a[1]) - val(a[2])) & wmask(a[0])
         elif op == "OpIMul":
-            values[res] = (val(a[1]) * val(a[2])) & MASK
+            values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
+        elif op == "OpUConvert":
+            values[res] = val(a[1]) & wmask(a[0])
+        elif op == "OpBitCount":
+            values[res] = (val(a[1]) & wmask(a[0])).bit_count()
         elif op == "OpISubBorrow":
             x, y = val(a[1]) & MASK, val(a[2]) & MASK
             values[res] = ((x - y) & MASK, 1 if x < y else 0)
         elif op == "OpIEqual":
-            values[res] = (val(a[1]) & MASK) == (val(a[2]) & MASK)
+            values[res] = val(a[1]) == val(a[2])
         elif op == "OpINotEqual":
-            values[res] = (val(a[1]) & MASK) != (val(a[2]) & MASK)
+            values[res] = val(a[1]) != val(a[2])
         elif op == "OpSLessThan":
             values[res] = _s32(val(a[1])) < _s32(val(a[2]))
+        elif op == "OpULessThan":
+            values[res] = val(a[1]) < val(a[2])
         elif op == "OpLogicalAnd":
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, bool) and isinstance(y, bool)):
@@ -304,16 +418,26 @@ def run_fragment(text):
             if not (isinstance(x, bool) and isinstance(y, bool)):
                 raise UnsupportedConstruct("OpLogicalOr on non-bool")
             values[res] = x or y
-        elif op == "OpFMul":
+        elif op == "OpLogicalNot":
+            values[res] = not val(a[1])
+        elif op in ("OpFAdd", "OpFSub", "OpFMul"):
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, float) and isinstance(y, float)):
-                raise UnsupportedConstruct("OpFMul on non-float")
-            values[res] = f32(x * y)
-        elif op == "OpFOrdEqual":
+                raise UnsupportedConstruct(f"{op} on non-float")
+            values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
+        elif op == "OpFNegate":
+            values[res] = f32(-val(a[1]))
+        elif op in ("OpFOrdEqual", "OpFOrdLessThan", "OpFOrdGreaterThan", "OpFOrdGreaterThanEqual",
+                    "OpFOrdLessThanEqual", "OpFUnordNotEqual"):
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, float) and isinstance(y, float)):
-                raise UnsupportedConstruct("OpFOrdEqual on non-float")
-            values[res] = (not math.isnan(x)) and (not math.isnan(y)) and x == y
+                raise UnsupportedConstruct(f"{op} on non-float")
+            if op == "OpFUnordNotEqual":
+                values[res] = not (x == y)          # true when unordered, unlike OpFOrdNotEqual
+            else:
+                values[res] = {"OpFOrdEqual": x == y, "OpFOrdLessThan": x < y,
+                               "OpFOrdGreaterThan": x > y, "OpFOrdGreaterThanEqual": x >= y,
+                               "OpFOrdLessThanEqual": x <= y}[op]
         elif op in ("OpBitFieldUExtract", "OpBitFieldSExtract"):
             base, off, cnt = val(a[1]), val(a[2]), val(a[3])
             if off + cnt > 32:
@@ -328,6 +452,9 @@ def run_fragment(text):
                 raise UnsupportedConstruct("bit-field insert beyond 32 bits (undefined in SPIR-V)")
             mk = ((1 << cnt) - 1) << off
             values[res] = ((base & ~mk) | ((ins << off) & mk)) & MASK
+        elif op == "OpConvertUToPtr":
+            values[res] = ("psb", val(a[1]))
+            pointers[res] = values[res]
         elif op == "OpExtInst":
             if len(a) < 3 or a[1] != "%glsl":
                 raise UnsupportedConstruct("extended instruction set")
@@ -344,6 +471,10 @@ def run_fragment(text):
                     values[res] = tuple(f32(p * q + s) for p, q, s in zip(x, y, z))
                 else:
                     values[res] = f32(x * y + z)
+            elif name in ("Sin", "Cos"):
+                values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
+            elif name == "FAbs":
+                values[res] = f32(abs(args[0]))
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "SMax":
@@ -356,8 +487,6 @@ def run_fragment(text):
                     values[res] = x.bit_length() - 1
                 else:
                     values[res] = (~x).bit_length() - 1
-            elif name == "Sin":
-                values[res] = f32(math.sin(args[0]))
             else:
                 raise UnsupportedConstruct(f"GLSL.std.450 {name}")
         else:

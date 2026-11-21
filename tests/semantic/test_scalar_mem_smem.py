@@ -373,20 +373,22 @@ class SmemTranslatorGenTests(unittest.TestCase):
 
 
 class SmemMiniInterpStrictnessTests(unittest.TestCase):
-    """Verifies that spirv_mini_interp strictly rejects PhysicalStorageBuffer and 64-bit integers.
+    """Verifies that spirv_mini_interp rejects storage classes and constructs it does not model.
 
     As documented in tests/semantic/README.md, the mini-interpreter shares no code with the translator
-    and raises UnsupportedConstruct for anything not explicitly modelled (such as pointer dereferences
-    to memory or non-32-bit types), guaranteeing that translator regressions fail tests immediately.
+    and raises UnsupportedConstruct for anything not explicitly modelled (such as physical-storage-buffer
+    OpVariables, odd integer widths, or pointer-to-int casts), guaranteeing that translator regressions fail
+    tests immediately. 64-bit integers, OpConvertUToPtr and physical-storage-buffer loads are modelled; their
+    positive paths are covered in test_interp.py and test_value_semantics.py.
     """
 
-    def test_rejects_non_32bit_integers(self):
+    def test_rejects_unsupported_integer_widths(self):
         module = """\
 OpCapability Shader
 OpMemoryModel Logical GLSL450
 OpEntryPoint Fragment %main "main"
 %void = OpTypeVoid
-%ulong = OpTypeInt 64 0
+%ushort = OpTypeInt 16 0
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
 %entry = OpLabel
@@ -395,7 +397,7 @@ OpFunctionEnd
 """
         with self.assertRaises(si.UnsupportedConstruct) as ctx:
             si.run_fragment(module)
-        self.assertIn("non-32-bit integer type", str(ctx.exception))
+        self.assertIn("integer type that is not 32 or 64 bits", str(ctx.exception))
 
     def test_rejects_physical_storage_buffer_storage_class(self):
         module = """\
@@ -417,7 +419,7 @@ OpFunctionEnd
             si.run_fragment(module)
         self.assertIn("storage class PhysicalStorageBuffer", str(ctx.exception))
 
-    def test_rejects_convert_u_to_ptr_in_body(self):
+    def test_rejects_convert_ptr_to_u_in_body(self):
         module = """\
 OpCapability Shader
 OpMemoryModel Logical GLSL450
@@ -430,12 +432,13 @@ OpEntryPoint Fragment %main "main"
 %main = OpFunction %void None %fn
 %entry = OpLabel
 %p = OpConvertUToPtr %_ptr_Func %c1
+%u = OpConvertPtrToU %uint %p
 OpReturn
 OpFunctionEnd
 """
         with self.assertRaises(si.UnsupportedConstruct) as ctx:
             si.run_fragment(module)
-        self.assertIn("OpConvertUToPtr", str(ctx.exception))
+        self.assertIn("OpConvertPtrToU", str(ctx.exception))
 
 
 if __name__ == "__main__":
