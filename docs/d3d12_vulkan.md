@@ -243,8 +243,7 @@ Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signa
 views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves and
 `ResolveSubresourceRegion`, 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
-increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
-sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error; the GCL8
+increase; such a signal is reported and dropped); the GCL8
 front/back stencil references are recorded but not applied, because there is no pipeline or draw path for them to
 affect.
 
@@ -266,6 +265,9 @@ and any validation error fails them.
   and read back; a 4x multisampled target cleared and resolved; and the copies and resolves that must be refused
   (a z range past the volume or its footprint, a footprint past the buffer, a resolve from a single-sampled
   texture or into another size, a multisampled texture copied to a footprint or to another sample count).
+- `vk_command_replay_test`, part D: every D3D12 sync bit against every access bit (360 pairs), each as a global,
+  a buffer and a texture barrier. Under the validation layer none may be rejected; before
+  `vulkan_barrier_scope` there were 462 validation errors on Intel(R) Graphics.
 - `vk_bindless_test` (run by `runtime/test/shaders/check.py` and `scripts/run_gpu_tests.py`): the translator's
   own lookup against the table and the set. `ps_tex.asm`, a hand-written RDNA2 pixel shader built by `build.py`,
   loads a T# and an S# from a descriptor table and samples. The test draws the gradient with the T# at the fourth
@@ -681,6 +683,21 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   `VkPipelineStageFlags2`, `VkAccessFlags2` and `VkImageLayout` (`vulkan_sync`, `vulkan_barrier_access`,
   `vulkan_layout`). Queue-specific layouts map like their generic forms; ray tracing, video and split scopes use
   `ALL_COMMANDS`; `LayoutBefore = UNDEFINED` or the discard flag becomes `oldLayout = UNDEFINED`.
+- Access bits and sync scopes are not one-to-one. D3D12 lets an access be named with a sync scope whose Vulkan
+  stages cannot perform it: `SYNC_ALL_SHADING` with `ACCESS_VERTEX_BUFFER` is valid D3D12, but
+  `VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT` needs `VERTEX_ATTRIBUTE_INPUT`, which shading stages are not. Vulkan
+  rejects such a barrier. `vulkan_barrier_scope` therefore widens each side's stages by the narrowest stage that
+  can perform each access without one. The table is the synchronization2 chapter's "supported access types". The
+  stages it adds:
+  - `DRAW_INDIRECT` for indirect arguments;
+  - `INDEX_INPUT` and `VERTEX_ATTRIBUTE_INPUT` for index and vertex buffers;
+  - all shading for constant buffers, SRVs and UAVs;
+  - `COLOR_ATTACHMENT_OUTPUT` for render targets;
+  - the fragment tests for depth/stencil;
+  - `ALL_TRANSFER` for copies and resolves. `CLEAR` alone cannot read, and `ALL_GRAPHICS` contains no transfer stage.
+
+  The access itself is never dropped, so the dependency still covers everything the application named, over a
+  slightly larger scope.
 - Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
   rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
   targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with
