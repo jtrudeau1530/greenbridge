@@ -23,7 +23,7 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
 # tests, pixel tests, the two-mip draw, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + 4 + len(check.BOUNDS))   # + ms_v5_workgroup, ms_w64x_ballot, ps_tex (#230), ps_texture_mip0
+         + len(check.PIXEL_TESTS) + len(check.BOUNDS) + 5)  # two mesh fixtures, ps_tex, cs_cmpx_class_f32, ps_texture_mip0
 
 
 class Wave64Checks(unittest.TestCase):
@@ -60,6 +60,8 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_bounds":
                 # 0x12345678, the in-bounds reload, the OOB load's 0, then the untouched 0xEEEEEEEE fill.
                 return 0, "out[0..7] = 305419896 305419896 0 4008636142 4008636142 4008636142 4008636142 4008636142\n"
+            if name == "cs_cmpx_class_f32":
+                return 0, "out[0..7] = " + " ".join(map(str, check.CMPX_CLASS_WORDS)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":
@@ -230,6 +232,40 @@ class SeededPixelTests(unittest.TestCase):
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("needs bufferDeviceAddress", problem)
 
+
+
+class SeededPixelTests(unittest.TestCase):
+    """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""
+
+    def run_pixel_test(self, words, code=0, out=""):
+        seen = {}
+
+        def harness(_tool, _vs, _fs, raw, env=None):
+            seen["env"] = env
+            if not code:
+                Path(raw).write_bytes(struct.pack("<4I", *words) * (64 * 64))
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_vcc_x2.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                problem = check.pixel_test(tmp, tmp, "ps_vcc_x2")
+        return problem, seen["env"] or {}
+
+    def test_v_sharp_and_heap_reach_the_harness(self):
+        problem, env = self.run_pixel_test((0x11223344, 0x55667788, 0, 0))
+        self.assertEqual(problem, "")
+        self.assertEqual(env.get("VKH_SGPRS"), "0x1000,0,16,0")
+        self.assertEqual(env.get("VKH_HEAP"), "0x1000=0x11223344,0x1004=0x55667788")
+
+    def test_unseeded_result_fails(self):
+        problem, _ = self.run_pixel_test((0, 0, 0, 0))
+        self.assertIn("4096 of 4096 pixels differ", problem)
+
+    def test_device_without_buffer_addresses_skips(self):
+        problem, _ = self.run_pixel_test((), code=77, out="unsupported: VKH_HEAP needs bufferDeviceAddress\n")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("needs bufferDeviceAddress", problem)
 
 
 class TextureMipChecks(unittest.TestCase):
