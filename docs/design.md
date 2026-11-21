@@ -262,6 +262,20 @@ Code starts at the u32 at FSSM offset 0xC0, plus 0x28, and ends at the last `s_e
 300 random shaders it decoded 284 cleanly (134 invalid words in total), against 201 clean and 6,560 invalid for
 gfx1030 and 283 clean for gfx1010–1012.
 
+## Pixel-shader inputs
+
+`tools/fssm_header.py` decodes the FSSM input table: 8-byte records from 0x138 while the first byte is 6.
+Byte 1 is the semantic id, byte 2 the component mask, byte 3 the running index, byte 6 the parameter slot,
+and byte 7 holds flags (bit 4 = 16-bit interpolant). The record's position is the `v_interp attr` number.
+`interpolants()` returns the count and a fp16 bitmask by position; a translator can use both, but
+`rdna2spirv.py` does not yet. Measured on the 26,503-blob corpus: 25,643 satisfy
+`u32[0x120] + u32[0x12C] == u32[0x130]` (the 860 that do not store 0xDEADBEEF at 0x130); 12,101 are PS,
+10,307 with a non-empty table (55,791 records, 11,199 of them 16-bit). The count equals the number of
+distinct `v_interp attr` numbers in 11,316/12,101 PS (93.5%); 300 more declare one unread input, 475
+declare two or more, and the 10 undercounts are one family whose first record at 0x138 has kind 7. A
+200-PS spot check agreed on 187/200. Flag bit 4 matches the `*_f16` interpolation opcodes in
+12,067/12,101 (99.7%).
+
 ## Baseline already recorded
 
 - `reports/manifest.json`: SHA-256 of all 108 files in `Documents\GTA6` (208.5 GiB). Run
