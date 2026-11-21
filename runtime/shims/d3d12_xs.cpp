@@ -1,8 +1,8 @@
 // Xbox Series D3D12 imports forwarded to the Windows D3D12 exports.
 // The SDK types describe the Windows side. The measured guest ABI differs in the root-signature flag word: Xbox
 // sets bits in the high byte (observed 0x03000000) and the PC serializer rejects them, so descriptors are copied
-// with that byte cleared before forwarding. The rest of the Xbox device ABI, including the vtable layout, is not
-// implemented here.
+// with that byte cleared before forwarding. D3D12XboxCreateDevice returns an Xbox-ABI proxy (d3d12_xs_device.h)
+// over the PC device; only the measured slots are overridden, the rest follow the PC vtable.
 #include <windows.h>
 #include <d3d12.h>
 
@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <type_traits>
 
+#include "d3d12_xs_device.h"
 #include "d3d12_xs_rootsig.h"
 #include "shims.h"
 
@@ -91,33 +92,37 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }
 
-    static std::atomic<bool> proxy_warned{false};
-    if (!proxy_warned.exchange(true, std::memory_order_relaxed)) {
+    static std::atomic<bool> proxy_logged{false};
+    if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: D3D12XboxCreateDevice: returning the PC ID3D12Device directly; "
-                     "the Xbox-ABI proxy (measured slots 9/10, 14, 62, 76) is not implemented.\n");
+                     "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
+                     "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
     }
 
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
     if (!create) return E_NOTIMPL;
 
-    HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_12_0, *riid, out);
-    if (SUCCEEDED(hr)) {
-        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> device %p\n", *out);
+    ID3D12Device* real = nullptr;
+    HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
+                        reinterpret_cast<void**>(&real));
+    if (FAILED(hr) || !real) {
+        if (real) real->Release();
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: PC D3D12CreateDevice failed (hr=0x%08lx)\n",
+                     static_cast<unsigned long>(hr));
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    if (FAILED(hr)) {
+        // create_device_proxy keeps the caller's reference on failure.
+        real->Release();
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy creation failed (hr=0x%08lx)\n",
+                     static_cast<unsigned long>(hr));
         return hr;
     }
-    std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: PC D3D12CreateDevice failed (hr=0x%08lx)\n",
-                 static_cast<unsigned long>(hr));
-    return hr;
-
-    // TODO(xbox-abi): wrap the returned PC device in an Xbox-ABI proxy. The measured overrides are:
-    //   vtable 9/10  GetCPU/GetGPUDescriptorHandleForHeapStart (8-byte handle returned in RAX)
-    //   vtable 14    CreateDescriptorHeap (forward)
-    //   vtable 62    CreateComputePipelineState (desc, iid, out)
-    //   vtable 76    resource creation -> PC CreateCommittedResource (vtable 27)
-    // The spec does not give the full Xbox vtable order, so forwarding "every other slot" by index would call the
-    // wrong PC method for many slots. Returning the PC device unmodified is the honest behaviour until the full
-    // mapping is measured; callers that use Xbox-only slots fail visibly rather than silently dispatching wrong.
+    std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (PC device %p)\n", *out,
+                 static_cast<void*>(real));
+    return S_OK;
 }
 
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);

@@ -23,6 +23,7 @@ if(WIN32)
     shims/registry.cpp
     shims/xmem.cpp
     shims/d3d12_xs.cpp
+    shims/d3d12_xs_device.cpp
   )
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
@@ -32,18 +33,36 @@ if(WIN32)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
   find_library(D3D12_LIBRARY NAMES d3d12)
+  find_library(DXGI_LIBRARY NAMES dxgi)
   if(D3D12_LIBRARY)
     add_executable(root_sig_test
       test/root_sig_test.cpp
       shims/registry.cpp
       shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
     )
     target_link_libraries(root_sig_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY})
     target_compile_definitions(root_sig_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(root_sig_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(root_sig_test PRIVATE /OPT:NOREF)
+
+    # Xbox-ABI device proxy test: WARP PC device, no game executable. Needs DXGI for the WARP adapter.
+    if(DXGI_LIBRARY)
+      add_executable(device_proxy_test
+        test/device_proxy_test.cpp
+        shims/registry.cpp
+        shims/d3d12_xs.cpp
+        shims/d3d12_xs_device.cpp
+      )
+      target_link_libraries(device_proxy_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY})
+      target_compile_definitions(device_proxy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(device_proxy_test PRIVATE /W4 /permissive- /utf-8)
+      target_link_options(device_proxy_test PRIVATE /OPT:NOREF)
+    else()
+      message(STATUS "dxgi.lib not found: device_proxy_test is not built")
+    endif()
   else()
-    message(STATUS "d3d12.lib not found: root_sig_test is not built")
+    message(STATUS "d3d12.lib not found: root_sig_test and device_proxy_test are not built")
   endif()
 
 else()
@@ -54,6 +73,9 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(clear_commands_test test/clear_commands_test.cpp)
   add_test(NAME clear_commands COMMAND clear_commands_test)
+  if(TARGET device_proxy_test)
+    add_test(NAME device_proxy COMMAND device_proxy_test)
+  endif()
 endif()
 
 if(WIN32)

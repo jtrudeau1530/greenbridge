@@ -123,8 +123,13 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
 - Runtime shims: all of `xmem.dll` is shimmed with the measured argument shapes (`XMemAlloc`, `XMemFree`,
   `XMemVirtualQuery(process, address, out64)`, `XMemGetWorkingSetStatistics(out)`). The `d3d12_xs` root-signature
   serializer forwards to the PC `d3d12.dll` after clearing the Xbox flag byte; the deserializer forwards unchanged.
-  `D3D12XboxCreateDevice` returns a PC device; the Xbox-ABI proxy for its measured slot overrides is not implemented
-  yet.
+  `D3D12XboxCreateDevice` returns an Xbox-ABI proxy over the PC device: every PC vtable slot is forwarded with
+  `this` adjusted, Xbox slot 62 is `CreateComputePipelineState`, and Xbox slot 76 maps resource creation to
+  `CreateCommittedResource` with the Xbox `0x101`/`0x1` layout word replaced by the PC layout. Slots 9/10 are
+  `ID3D12DescriptorHeap` methods, not device methods. The PC heap getters take a hidden return pointer (RDX),
+  while Xbox expects the 8-byte handle in RAX, so slot 14 wraps the heap and slots 9/10 convert it. The heap holds
+  a reference to the device proxy and its `GetDevice` returns that same proxy. Queues, fences, command lists and
+  `PresentX` extensions remain unimplemented.
 - PSO metadata is a new variant (`PSIN`, `LSCH` schema, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`, little-endian).
   CodeWalker's parser reads the container but not the new schema; dump it once the exe gives the field names.
 
@@ -270,4 +275,5 @@ gfx1030 and 283 clean for gfx1010–1012.
   `movies`, `core_bvh4`, `navmeshes`, `data`).
 - `reports/pe/`: the 16 bundled DLLs are plain x86-64 PE with no encrypted sections. Through the loader their
   `xmem.dll` imports and two `d3d12_xs.dll` root-signature calls bind to shims. Every other import resolves on
-  desktop Windows. The `D3D12XboxCreateDevice` slot layout beyond the measured entries remains unknown.
+  desktop Windows. The proxy covers the measured device slots and forwards the rest in PC vtable order; the Xbox
+  queue/fence/command-list extensions and `PresentX` remain unknown.
