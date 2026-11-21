@@ -157,21 +157,23 @@ def find_dumps() -> list:
         roots += ["/mnt", "/media"]
     skip = {"windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
             "system volume information", "node_modules", ".git"}
-    seen, found = set(), []
+    visited_depths, found = {}, {}
 
     def visit(d: str, depth: int) -> None:
         try:
-            real = os.path.realpath(d)
+            real = os.path.normcase(os.path.realpath(d))
         except OSError:
             return
-        if real.lower() in seen:
+        previous_depth = visited_depths.get(real, -1)
+        if real in found or previous_depth >= depth:
             return
-        seen.add(real.lower())
-        if os.path.isfile(os.path.join(d, "MicrosoftGame.Config")):
+        # A later root can reach the same folder with more levels left to search.
+        visited_depths[real] = depth
+        if previous_depth < 0 and os.path.isfile(os.path.join(d, "MicrosoftGame.Config")):
             v = match_version(d)
             if v:
-                found.append((d, v))
-            return
+                found[real] = (d, v)
+                return
         if depth == 0:
             return
         try:
@@ -186,7 +188,7 @@ def find_dumps() -> list:
     for r in roots:
         if os.path.isdir(r):
             visit(r, 2)
-    return found
+    return list(found.values())
 
 
 def choose_game() -> str:

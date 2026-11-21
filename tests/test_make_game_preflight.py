@@ -462,6 +462,57 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                                   match="third_party/rpf9-explorer is missing. Download the project with:")
 
 
+class GameDiscoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.home = self.enterContext(tempfile.TemporaryDirectory())
+        self.desktop = os.path.join(self.home, "Desktop")
+        self.downloads = os.path.join(self.home, "Downloads")
+        self.version = {"title": "Synthetic", "version": "1.0", "files": {
+            "MicrosoftGame.Config": {"size": 3},
+            "Catalog000.bin": {"size": 4},
+            "appdata0.rpf": {"size": 5},
+        }}
+
+    def write_probes(self, folder):
+        os.makedirs(folder)
+        for name, info in self.version["files"].items():
+            with open(os.path.join(folder, name), "wb") as file:
+                file.truncate(info["size"])
+
+    def discover(self):
+        roots = (self.home, self.desktop, self.downloads)
+        isdir = os.path.isdir
+        with mock.patch("os.path.expanduser", return_value=self.home), \
+             mock.patch("os.path.isdir", side_effect=lambda path: path in roots and isdir(path)), \
+             mock.patch.object(make_game, "versions", return_value=[self.version]):
+            return make_game.find_dumps()
+
+    def test_find_searches_below_rejected_folder_with_config(self):
+        outer = os.path.join(self.desktop, "Backup")
+        package = os.path.join(outer, "Package")
+        self.write_probes(package)
+        with open(os.path.join(outer, "MicrosoftGame.Config"), "wb") as config:
+            config.write(b"abc")
+        self.write_probes(os.path.join(outer, "Other", "TooDeep"))
+
+        self.assertEqual(self.discover(), [(package, self.version)])
+
+    def test_find_revisits_aliased_root_with_more_depth(self):
+        target = os.path.join(self.downloads, "Outer", "Inner")
+        package = os.path.join(self.desktop, "Package")
+        self.write_probes(os.path.join(target, "Package"))
+        self.write_probes(package)
+        realpath = os.path.realpath
+
+        def resolve(path):
+            if path == self.desktop or path.startswith(self.desktop + os.sep):
+                path = os.path.join(target, os.path.relpath(path, self.desktop))
+            return realpath(path)
+
+        with mock.patch("os.path.realpath", side_effect=resolve):
+            self.assertEqual(self.discover(), [(package, self.version)])
+
+
 class PathAndGameSelectionTest(PreflightTestBase):
     def test_choose_game_single_found(self):
         dummy_entry = ("D:\\TestGames\\Leonida", {"title": "Xbox Package", "version": "1.0.2.1"})
