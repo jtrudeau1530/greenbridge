@@ -80,6 +80,7 @@ def make_resource(map_file=True):
     if map_file:
         mm = [
             member(WI.FIELD["name"], 0x08, 0x4A),
+            member(WI.FIELD["name64"], 0x10, 0x4F),
             member(WI.FIELD["parent"], 0x68, 0x4A),
             member(WI.FIELD["streamingExtentsMin"], 0x70, 0x32),
             member(WI.FIELD["streamingExtentsMax"], 0x7C, 0x32),
@@ -93,6 +94,7 @@ def make_resource(map_file=True):
         struct.pack_into("<IIQ", b, 0x210, WI.MAPDATA, 0x120, ptr(0x500))
         root = 0x500
         struct.pack_into("<I", b, root + 0x08, 0x11223344)
+        struct.pack_into("<Q", b, root + 0x10, 0x1122334455667788)
         struct.pack_into("<I", b, root + 0x68, 0xAABBCCDD)
         struct.pack_into("<3f", b, root + 0x70, -10.0, -20.0, -30.0)
         struct.pack_into("<3f", b, root + 0x7C, 10.0, 20.0, 30.0)
@@ -130,6 +132,7 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(row["entity_size"], 0x90)
         self.assertEqual(row["archetypes"], 1)
         self.assertEqual(row["map_name"], 0x11223344)
+        self.assertEqual(row["map_name64"], 0x1122334455667788)
         self.assertEqual(row["parent"], 0xAABBCCDD)
         self.assertEqual(row["extent_min"], [-10.0, -20.0, -30.0])
         self.assertEqual(row["extent_max"], [10.0, 20.0, 30.0])

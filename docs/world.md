@@ -198,8 +198,8 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | `scaleXY` | `9ca32637` | +0x54 | f32 | XY scale |
 | `scaleZ` | `10fb7c42` | +0x58 | f32 | Z scale |
 | `flags` | `67d26872` | +0x48 | u32 | entity flags |
-| `guid` | `9a7b6e6d` | +0x20 | u64 | placement GUID |
-| 64-bit hash | — | +0x08 | u64 | per-archetype hash, function unknown |
+| entity id | `1b60404d` | +0x08 | u64 | per-entity id (unique; not a name key) |
+| archetype key | `c8a7b90a` | +0x20 | u64 | per-archetype key: MurmurHash3 x64 128 low 64 of the name |
 | `lodLevel` | `6c8f1715` | +0x7e | u8 | 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4 |
 | `parentIndex` | `d89231bd` | +0x5c | i16 | parent entity index (signed; -1 = none) |
 | `parentInstance` | `e74c3c23` | +0x5e | i16 | parent batch instance |
@@ -208,10 +208,24 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | `childLodDist` | `ca974bcd` | +0x64 | f32 | child LOD distance |
 | `priorityLevel` | `2691f019` | +0x7c | u8 | priority |
 
+The 2,716 entity schemas sampled for [world_names.md](world_names.md) all use the two 64-bit members above.
+The earlier `guid` reading (`9a7b6e6d`, +0x20) was not a member of those schemas: +0x08 changes per placement,
+while +0x20 is one value per archetype. [world_names.md](world_names.md) gives the measured formulas and the
+name-resolution coverage.
+
 The map root carries `name` (`e6e17f14`, +0x08, u32 hash), `parent` (`a99c4651`, +0x68, u32 hash),
 `streamingExtentsMin` (`dd22821f`) / `streamingExtentsMax` (`a22ea335`), `entitiesExtentsMin` (`1c75bcf1`) /
 `entitiesExtentsMax` (`6d074437`), `flags` and `contentFlags`. The extents are reached through the root's member
 table, not fixed offsets.
+
+### Name resolution
+
+`archetypeName` and map `name`/`parent` are the lower-cased joaat of the model or map name. The per-archetype
++0x20 key and the map +0x10 key are MurmurHash3 x64 128 (seed 0, low 64); they confirm a 32-bit match instead of
+assuming it. A local 79,738-name dictionary resolved 5,107/24,105 distinct archetype hashes (8,263/203,799
+entities) in two 1 GiB windows, every one confirmed by the 64-bit key, and rejected one 32-bit-only candidate.
+The same dictionary resolved 5/23,535 map names and 1/2,089 parent rows, all confirmed by the map key. This is a
+name-source lower bound, not a formula limit. See [world_names.md](world_names.md) and `tools/world_names.py`.
 
 ### Measured placement summary
 
@@ -261,17 +275,21 @@ claim about a different enumeration method.
 Readable:
 - the 0x7a header, schema, struct/member tables and instance blocks;
 - map file count, per-file streaming/entity extents;
-- every entity's position, rotation, scale, flags, GUID, 64-bit hash, archetype hash and LOD fields;
+- every entity's position, rotation, scale, flags, per-entity id, per-archetype 64-bit key, archetype hash and LOD
+  fields;
 - in `common.rpf`, the full XML content-definition path list and cell names.
 
 Hash-only or opaque:
 - the RPF directory table and therefore original file names; resource names must be recovered from payloads;
-- map file `name`/`parent` (32-bit hashes; `parent` is 0 in every sampled file);
-- most `archetypeName` values. The repo's model manifest reports 155,598 models with names/bounds; this light
-  check used 61,861 name hashes recovered from sampled drawables, fragments and `packs.rpf`, not the full
-  manifest join. 5,538 of the 75,551 entities matched (7.3%). The remaining 92.7% are hash-only without a full
-  name index and the bbox/archive-order linking step used by SixNG. This is a lower bound, not a claim that the
-  names do not exist;
+- map file `name`/`parent` (32-bit hashes; `parent` is non-zero in 2,089 of the 23,535 census maps). A local
+  dictionary resolves 5 names and 1 parent; all five names are confirmed by the map root's 64-bit key. The
+  remaining map-cell names are not in the local model/XML exports;
+- most `archetypeName` values. The repo's model export reports 155,598 models with names/bounds, but the local
+  dictionary used here contains 79,738 exact names. It resolves 5,107 of 24,105 distinct archetype hashes
+  (8,263 of 203,799 entities, 4.05%) in the two 1 GiB windows in [world_names.md](world_names.md); every match
+  is confirmed by the 64-bit key. The unresolved 95.95% are hash-only because their names are not in the local
+  exports, not because a different formula was observed. This is a lower bound, not a claim that the names do
+  not exist;
 - texture keys do not appear in placement records. They are 64-bit asset keys in model materials, so a runtime
   resolves placement → archetype → model → material asset key;
 - the 0–2 GiB 7-struct family's field semantics and most of its payload;
@@ -290,9 +308,10 @@ Hash-only or opaque:
    placement files.
 3. **Transforms.** Apply `position`, conjugate the stored quaternion for world rotation, and use `scaleXY` /
    `scaleZ`. The source is RAGE Z-up; glTF-style Y-up is `(x, z, -y)` with the vector part rotated accordingly.
-4. **Archetype keys.** Resolve the 32-bit `archetypeName` hash to an exported model. Keep the 64-bit +0x08 hash
-   and GUID as secondary keys. Hash-only records are normal; the runtime needs a hash→model table, with the
-   bbox/archive-order fallback for names that were not recovered.
+4. **Archetype keys.** Resolve the 32-bit `archetypeName` hash to an exported model. Confirm the match with the
+   per-archetype 64-bit key at +0x20 (MurmurHash3 x64 low 64); do not use the +0x08 per-entity id as a name key.
+   Hash-only records are normal; the runtime needs a hash→model table, with the bbox/archive-order fallback for
+   names that were not recovered.
 5. **Streaming cells.** Load map files by their streaming AABB (cube) and use `lodLevel`, `lodDist`,
    `childLodDist`, `parentIndex`, `parentInstance` and `numChildren` to switch HD/LOD/SLOD. Load the HD model
    first, then its parent/children; do not use one global LOD distance.
@@ -302,19 +321,26 @@ Hash-only or opaque:
 ## Tool
 
 `tools/world_index.py` scans an RPF9 archive or a directory of carved streams and writes JSON/CSV with
-`offset, size, signature, version, kind, structs, blocks, entities, extents, position bounds, LOD counts`.
-It implements the header/schema validation above and the continuation join. It does not decrypt anything,
-does not extract models/textures, and keeps the output aggregate (one row per resource, no entity dump).
+`offset, size, signature, version, kind, structs, blocks, entities, extents, position bounds, LOD counts`,
+map name/parent hashes and the map root's 64-bit name key. It implements the header/schema validation above
+and the continuation join. It does not decrypt anything, does not extract models/textures, and keeps the
+output aggregate (one row per resource, no entity dump).
 
 `tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
 `0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
 with 98.32% stream coverage; the exactness condition and byte accounting are in
 [world_census.md](world_census.md).
 
+`tools/world_names.py` builds the hash→name dictionary from local model manifests, level-scan paths, name
+lists and XML, then resolves `world_index`/`world_census` map rows and aggregate archetype counts. It
+reports 32-bit-only candidates separately from matches confirmed by the 64-bit key. The measured dictionary
+and coverage are in [world_names.md](world_names.md).
+
 ```powershell
 python -I tools\world_index.py <levels.rpf> --start 21474836480 --limit 1073741824 `
     --out work\world\levels-20-21.json --csv work\world\levels-20-21.csv
 python -I tests\test_world_index.py
+python -I tests\test_world_names.py
 ```
 
 For a 76 GB archive always bound the run with `--start/--limit`; the tool records the window in its summary.
