@@ -1,0 +1,105 @@
+"""scripts/run_gpu_tests.py: how it judges the output of a compute "dump" test (no device needed)."""
+from pathlib import Path
+import sys
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import run_gpu_tests as rgt
+
+WANT = [55, 48]
+DEVICE_32 = "device: X (subgroup 32..32)\n"
+DEVICE_64 = "device: X (subgroup 32..64)\n"
+CONFIRMED = "compute subgroup size: 64\n"
+
+
+def dump(words, pad=8):
+    return "out[0..7] = " + " ".join(str(w) for w in (list(words) + [0] * pad)[:8]) + "\n"
+
+
+def judge(rc, msg, **kw):
+    kw = {"wave64": False, "partial": False, "emulated": False, **kw}
+    return rgt.judge_cs_dump(rc, msg, WANT, **kw)
+
+
+class DumpWords(unittest.TestCase):
+    def test_eight_decimal_words(self):
+        self.assertEqual(rgt.dump_words("noise\n" + dump(WANT) + "tail\n"), WANT + [0] * 6)
+
+    def test_anything_else_is_not_a_dump(self):
+        for line in ("out[0..7] = 55 48\n", "out[0..7] = 55 48 BAD 0 0 0 0 0\n", "out[0..7] = 1 BAD 3\n",
+                     "out[0..7] = 55 48 0 0 0 0 0\n", "out[0..7] = 55 48 0 0 0 0 0 0 0\n",
+                     "out[0..7] = 55 48 0 0 0 0 0 0 x\n", "out[0..7] = \n", "no dump here\n"):
+            with self.subTest(line=line):
+                self.assertIsNone(rgt.dump_words(line))
+
+
+class WholeWaveDump(unittest.TestCase):
+    """wave64: run with --require-wave64 (the whole-wave mask tests)."""
+    def judge(self, rc, msg):
+        return judge(rc, msg, wave64=True)
+
+    def test_passes_with_the_words_and_the_confirmation(self):
+        self.assertEqual(self.judge(0, DEVICE_64 + CONFIRMED + dump(WANT)), (True, "55 48"))
+
+    def test_a_device_without_64_wide_subgroups_skips(self):
+        ok, detail = self.judge(77, DEVICE_32 + "full 64-wide compute subgroups unavailable\n")
+        self.assertIs(ok, None)
+        self.assertTrue(detail.startswith("SKIP"))
+
+    def test_right_words_without_the_confirmation_fail(self):    # a vk_compute_test that ignores the flag
+        ok, detail = self.judge(0, DEVICE_64 + dump(WANT))
+        self.assertIs(ok, False)
+        self.assertIn("not confirmed", detail)
+
+    def test_wrong_word_and_harness_errors_fail(self):
+        for i in range(len(WANT)):
+            wrong = list(WANT)
+            wrong[i] ^= 1
+            with self.subTest(word=i):
+                self.assertIs(self.judge(0, CONFIRMED + dump(wrong))[0], False)
+        self.assertIs(self.judge(1, "Vulkan pipeline failed\n")[0], False)       # an error is not a skip
+        self.assertIs(self.judge(1, CONFIRMED + dump(WANT))[0], False)
+
+    def test_malformed_dump_lines_fail_without_raising(self):
+        for line in ("out[0..7] = 55 48\n", "out[0..7] = 55 48 BAD 0 0 0 0 0\n", "out[0..7] = 1 BAD 3\n",
+                     "out[0..7] = 55 48 0 0 0 0 0 0 0\n"):
+            with self.subTest(line=line):
+                ok, detail = self.judge(0, CONFIRMED + line)
+                self.assertIs(ok, False)
+                self.assertIn(line.strip(), detail)
+
+
+class NotWholeWave(unittest.TestCase):
+    """Dumps run without --require-wave64: cs_store, emulated wave64 (#152) and partial-group tests."""
+    def test_plain_dump_needs_no_confirmation_and_a_77_is_a_failure(self):
+        self.assertEqual(judge(0, dump(WANT)), (True, "55 48"))
+        self.assertIs(judge(77, "unavailable\n")[0], False)
+
+    def test_hex_words(self):
+        ok, detail = rgt.judge_cs_dump(0, dump([0x400080FF, 7]), [0x400080FF, 7], wave64=False, partial=False,
+                                       emulated=False, hexwords=True)
+        self.assertEqual((ok, detail), (True, "0x400080ff 0x7"))
+
+    def test_emulated_wave64_runs_on_any_subgroup_size_without_the_confirmation(self):
+        self.assertEqual(judge(0, DEVICE_32 + dump(WANT), emulated=True), (True, "55 48"))
+        self.assertIs(judge(77, DEVICE_32, emulated=True)[0], False)             # no skip: it must run here
+        self.assertIs(judge(0, DEVICE_32 + dump([1, 2]), emulated=True)[0], False)
+
+    def test_partial_group_skips_unless_the_device_reports_a_64_subgroup(self):
+        ok, detail = judge(0, DEVICE_32 + dump(WANT), partial=True)
+        self.assertIs(ok, None)
+        self.assertTrue(detail.startswith("SKIP"))
+        self.assertEqual(judge(0, DEVICE_64 + dump(WANT), partial=True), (True, "55 48"))   # no confirmation line
+        self.assertIs(judge(0, DEVICE_64 + dump([1, 2]), partial=True)[0], False)
+
+    def test_partial_group_emulated_runs_everywhere(self):
+        self.assertEqual(judge(0, DEVICE_32 + dump(WANT), partial=True, emulated=True), (True, "55 48"))
+
+    def test_malformed_dump_lines_fail_in_every_mode(self):
+        for kw in ({}, {"emulated": True}, {"partial": True, "emulated": True}):
+            with self.subTest(**kw):
+                self.assertIs(judge(0, DEVICE_64 + "out[0..7] = 55 48 BAD 0 0 0 0 0\n", **kw)[0], False)
+
+
+if __name__ == "__main__":
+    unittest.main()
