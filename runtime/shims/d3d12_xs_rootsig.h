@@ -12,7 +12,7 @@ namespace rt::d3d12_xs {
 
 constexpr uint32_t kXboxRootSignatureFlagHighByte = 0xFF000000u;
 
-// Always copies `in` to `out`. Returns true for the known 1.0/1.1 descriptor versions and clears the high flag
+// Always copies `in` to `out`. Returns true for the known 1.0/1.1/1.2 descriptor versions and clears the high flag
 // byte in the copy. Returns false for an unknown version, leaving the copy byte-for-byte identical to `in` so the
 // caller can forward it unchanged and log the unsupported version.
 bool copy_versioned_root_signature_desc_clear_xbox_flags(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& in,

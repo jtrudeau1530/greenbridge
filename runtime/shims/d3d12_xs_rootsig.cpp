@@ -19,8 +19,11 @@ bool copy_versioned_root_signature_desc_clear_xbox_flags(const D3D12_VERSIONED_R
         case D3D_ROOT_SIGNATURE_VERSION_1_1:
             out.Desc_1_1.Flags = clear_high_byte(in.Desc_1_1.Flags);
             return true;
+        case D3D_ROOT_SIGNATURE_VERSION_1_2:
+            out.Desc_1_2.Flags = clear_high_byte(in.Desc_1_2.Flags);
+            return true;
         default:
-            // Unknown (including 1.2, which this shim has no measured call site for): forward unchanged.
+            // Unknown version: forward unchanged.
             return false;
     }
 }
