@@ -228,11 +228,8 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
                            "https://dotnet.microsoft.com/download/dotnet/8.0")
         ensure_submodule()
-    if "runtime" in stages and os.name == "nt":
-        vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                               "Microsoft Visual Studio", "Installer", "vswhere.exe")
-        if not os.path.isfile(vswhere):
-            missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+    if "runtime" in stages and not visual_cpp_tools_ok():
+        missing.append("Visual Studio 2022 with 'Desktop development with C++'")
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
@@ -241,6 +238,21 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
     if free_gb < need_gb:
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work.")
+
+
+def visual_cpp_tools_ok() -> bool:
+    """Look for the x64 C++ tools required by scripts/build_runtime.ps1."""
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.isfile(vswhere):
+        return False
+    try:
+        result = subprocess.run([vswhere, "-latest", "-products", "*", "-requires",
+                                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                                 "-property", "installationPath"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def dotnet_sdk_ok() -> bool:

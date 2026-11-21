@@ -322,7 +322,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
-                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
                 # runtime is refused before any check off Windows (tests/test_make_game_platform.py)
                 stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
@@ -344,6 +344,21 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn("spirv-val:", err)
                 self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
+
+    def test_preflight_rejects_visual_studio_installer_without_cpp_tools(self):
+        with tempfile.TemporaryDirectory() as tmp_work, \
+             mock.patch("os.name", "nt"), \
+             mock.patch("os.path.isfile", return_value=True), \
+             mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=b"\r\n")):
+            self.assert_fails(make_game.preflight, ["runtime"], tmp_work, match="Visual Studio 2022")
+
+    def test_visual_cpp_tools_accepts_matching_installation(self):
+        with mock.patch("os.path.isfile", return_value=True), \
+             mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=b"C:\\VS\r\n")) as run:
+            self.assertTrue(make_game.visual_cpp_tools_ok())
+        self.assertEqual(run.call_args.args[0][1:], ["-latest", "-products", "*", "-requires",
+                                                   "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                                                   "-property", "installationPath"])
 
     def test_preflight_python_version_check(self):
         with tempfile.TemporaryDirectory() as tmp_work:
