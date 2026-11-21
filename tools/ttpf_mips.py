@@ -556,6 +556,10 @@ def scan_pools(paths, as_json=None):
                  gated_full_chain=0, gated_full_mips=0, gated_full_bytes=0,
                  compact_partial_rows=0, compact_missing_mips=0,
                  compact_decodable_mips=0, compact_decodable_bytes=0,
+                 compact_missing_standalone=0, compact_missing_tail=0,
+                 compact_rows_measured=0, compact_non_tail_before_tail=0,
+                 compact_standalone_beyond_limit=0,
+                 compact_standalone_decodable_beyond_limit=0,
                  compact_full_rows=0, tile_modes={})
     for path in paths:
         pool = Pool(path)
@@ -627,7 +631,14 @@ def scan_pools(paths, as_json=None):
                         total["compact_partial_rows"] += 1
                         missing = d["mips"] - exported
                         total["compact_missing_mips"] += missing
-                        dec = sum(1 for k in range(exported, d["mips"]) if avail[k])
+                        dec = 0
+                        for k in range(exported, d["mips"]):
+                            if avail[k]:
+                                dec += 1
+                                if k < layout["first_tail"]:
+                                    total["compact_missing_standalone"] += 1
+                                else:
+                                    total["compact_missing_tail"] += 1
                         total["compact_decodable_mips"] += dec
                         total["compact_decodable_bytes"] += sum(
                             layout["mips"][k]["blocks_w"] * layout["mips"][k]["blocks_h"] *
@@ -637,6 +648,14 @@ def scan_pools(paths, as_json=None):
                             total["compact_full_rows"] += 1
                 else:
                     total["reader_full"] += 1
+                if d["mode"] in (4, 6, 36):
+                    total["compact_rows_measured"] += 1
+                    if d["non_tail"] < layout["first_tail"]:
+                        total["compact_non_tail_before_tail"] += 1
+                        total["compact_standalone_beyond_limit"] += (
+                            layout["first_tail"] - d["non_tail"])
+                        total["compact_standalone_decodable_beyond_limit"] += sum(
+                            1 for k in range(d["non_tail"], layout["first_tail"]) if avail[k])
         finally:
             pool.close()
     report = dict(total=total)

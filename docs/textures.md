@@ -148,8 +148,8 @@ mapping.
 The descriptor's 3-bit `non_tail` field (`b & 7`) is where the reader stops, and its note calls
 the remaining mips "packed tail". The bytes do not follow that split:
 
-- 177,111 of the 232,789 compact exports have `non_tail < first_tail`; 204,108 standalone mips
-  lie beyond the limit.
+- 177,111 of the 232,789 compact exports have `non_tail < first_tail`; 214,298 standalone
+  mips lie beyond the limit, 204,108 of them in zlib/raw chunks.
 - 196,257 partial exports stop exactly at `non_tail`; 158,272 of them stop **before** the
   computed tail boundary, and only 37,985 stop at it.
 - Of the 1,072,068 missing mips, 1,065,138 are in zlib/raw chunks. That decodable part splits
