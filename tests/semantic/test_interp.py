@@ -25,6 +25,7 @@ OpEntryPoint Fragment %main "main" %out
 %c32 = OpConstant %uint 32
 %cF0 = OpConstant %uint 4294967280
 %cFF = OpConstant %uint 4294967295
+%cInf = OpConstant %uint 2139095040
 %c80 = OpConstant %uint 128
 %ch = OpConstant %uint 1073757184
 %f1 = OpConstant %float 1
@@ -199,6 +200,23 @@ class InterpreterTests(unittest.TestCase):
                 "OpBranchConditional %f %live %dead\n%dead = OpLabel\nOpKill\n%live = OpLabel\n" + FOOTER)
         self.assertEqual(si.run_fragment(live)["%out"][0], 1)
         self.assertEqual(si.run_fragment(dead), {})
+
+    def test_float_ordered_unordered_and_classify(self):
+        nan = "%nan = OpBitcast %float %cFF\n"                       # 0xFFFFFFFF is a NaN
+        for op, nan_result, ordered_result in (("OpFOrdNotEqual", 0, 1), ("OpFUnordNotEqual", 1, 1),
+                                               ("OpFUnordLessThan", 1, 1), ("OpFUnordLessThanEqual", 1, 1),
+                                               ("OpFUnordGreaterThan", 1, 0), ("OpFUnordGreaterThanEqual", 1, 0),
+                                               ("OpFUnordEqual", 1, 0)):
+            with self.subTest(op=op):   # 2 vs NaN, then 2 vs 3
+                self.assertEqual(run_word(nan + f"%b = {op} %bool %f2 %nan\n%res = OpSelect %uint %b %c1 %c0\n"),
+                                 nan_result)
+                self.assertEqual(run_word(f"%b = {op} %bool %f2 %f3\n%res = OpSelect %uint %b %c1 %c0\n"),
+                                 ordered_result)
+        self.assertEqual(run_word(nan + "%b = OpIsNan %bool %nan\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpIsNan %bool %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
+        self.assertEqual(run_word("%i = OpBitcast %float %cInf\n%b = OpIsInf %bool %i\n"
+                                  "%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word(nan + "%b = OpIsInf %bool %nan\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
 
     def test_phi_selects_the_value_from_the_taken_predecessor(self):
         for cond, want in (("%t", 1), ("%f", 2)):

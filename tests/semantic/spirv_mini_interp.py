@@ -436,17 +436,23 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
-        elif op in ("OpFOrdEqual", "OpFOrdLessThan", "OpFOrdGreaterThan", "OpFOrdGreaterThanEqual",
-                    "OpFOrdLessThanEqual", "OpFUnordNotEqual"):
+        elif op in ("OpFOrdEqual", "OpFOrdNotEqual", "OpFOrdLessThan", "OpFOrdGreaterThan",
+                    "OpFOrdGreaterThanEqual", "OpFOrdLessThanEqual", "OpFUnordEqual", "OpFUnordNotEqual",
+                    "OpFUnordLessThan", "OpFUnordGreaterThan", "OpFUnordGreaterThanEqual", "OpFUnordLessThanEqual"):
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, float) and isinstance(y, float)):
                 raise UnsupportedConstruct(f"{op} on non-float")
-            if op == "OpFUnordNotEqual":
-                values[res] = not (x == y)          # true when unordered, unlike OpFOrdNotEqual
-            else:
-                values[res] = {"OpFOrdEqual": x == y, "OpFOrdLessThan": x < y,
-                               "OpFOrdGreaterThan": x > y, "OpFOrdGreaterThanEqual": x >= y,
-                               "OpFOrdLessThanEqual": x <= y}[op]
+            # Ordered: false if either operand is NaN. Unordered: true if either is NaN. Python's own comparisons
+            # are already ordered (NaN compares false), and -0.0 == 0.0 as in SPIR-V.
+            unordered = math.isnan(x) or math.isnan(y)
+            rel = {"Equal": x == y, "NotEqual": x != y and not unordered, "LessThan": x < y,
+                   "GreaterThan": x > y, "GreaterThanEqual": x >= y, "LessThanEqual": x <= y}[op.removeprefix("OpFUnord").removeprefix("OpFOrd")]
+            values[res] = (rel or unordered) if op.startswith("OpFUnord") else rel
+        elif op in ("OpIsNan", "OpIsInf"):
+            x = val(a[1])
+            if not isinstance(x, float):
+                raise UnsupportedConstruct(f"{op} on non-float")
+            values[res] = math.isnan(x) if op == "OpIsNan" else math.isinf(x)
         elif op in ("OpBitFieldUExtract", "OpBitFieldSExtract"):
             base, off, cnt = val(a[1]), val(a[2]), val(a[3])
             if off + cnt > 32:
