@@ -193,7 +193,8 @@ def opus_packets(d: bytes, at: int, size: int):
 
 
 def export_bank(path: str, out_dir: str):
-    d = open(path, "rb").read()
+    with open(path, "rb") as f:
+        d = f.read()
     name = os.path.splitext(os.path.basename(path))[0]
     od = os.path.join(out_dir, name)
     os.makedirs(od, exist_ok=True)

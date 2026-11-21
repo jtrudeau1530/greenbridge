@@ -2,11 +2,10 @@
 
     python -I tests/test_amd_swizzle.py
 """
-import pytest
-
 import os
 import sys
 import tempfile
+import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
@@ -15,7 +14,7 @@ try:
 except ModuleNotFoundError as e:
     if e.name != "numpy":
         raise
-    pytest.skip("amd_swizzle needs numpy", allow_module_level=True)
+    raise unittest.SkipTest("amd_swizzle needs numpy")
 
 
 def table(name, rows):
