@@ -4540,14 +4540,26 @@ class Gen:
         self.emit(f"{img} = OpLoad %{itype} {ip}")
         coords = [self.load_reg("vgpr", r) for r in addr]
         if a16:
-            # Non-G16 image_sample_d keeps its gradients in full VGPRs. Only the coordinates
-            # that follow them are packed as f16 pairs (low half first).
-            gradient_words = 2 * min(ncoord, 2) if op == "image_sample_d" else 0
-            unpacked = coords[:gradient_words]
-            for c in coords[gradient_words:]:
+            # GFX10 A16 packs only the coordinates, and the LOD or clamp after them, as f16 pairs (low half first).
+            # The extra arguments before them keep a whole VGPR each, and so do non-G16 gradients (LLVM AMDGPU
+            # getAddrSizeMIMGOp: the extra arguments' words, the gradients, then the packed halves; llvm-mc wants
+            # v[0:2] for a 2D image_sample_c_b ... a16). A bias is an f16 in the low half of its VGPR, a z-compare
+            # an f32. Until 2026-11-21 those were unpacked as pairs too, and the coordinates after them were read a
+            # half early. A texel offset comes first; samples with one stop under a16 further down.
+            extras = op[len("image_sample"):] if op.startswith("image_sample") else ""
+            w_off = 1 if extras.endswith("_o") else 0
+            extras = extras[:-2] if w_off else extras
+            w_bias = 1 if extras in ("_b", "_c_b") else 0
+            w_grad = 2 * min(ncoord, 2) if extras in ("_d", "_d_cl") else 0
+            whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
+            unpacked = []
+            for i, c in enumerate(coords):
+                if i < whole and not w_off <= i < w_off + w_bias:
+                    unpacked.append(c)            # offset, z-compare or gradient: the whole word
+                    continue
                 v2 = self.tmp()
                 self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {c}")
-                for k in (0, 1):
+                for k in ((0,) if i < whole else (0, 1)):   # a bias is the low half only
                     f = self.tmp()
                     self.emit(f"{f} = OpCompositeExtract %float {v2} {k}")
                     unpacked.append(self.tou(f))
