@@ -17,7 +17,7 @@ translated, most of the game's code can run as-is. The work is everything around
 
 | Layer | Approach | Folder |
 |---|---|---|
-| CPU code | Map the PE image and run it natively. Patch only what can't run on desktop (privileged instructions, console-only intrinsics). | `runtime/src` |
+| CPU code | Map the PE image and run it natively. Patch only what can't run on desktop (privileged instructions, console-only intrinsics). Each mapped image's `.pdata` is checked (in bounds, sorted, non-overlapping; zero-length entries allowed, as in System32's `symcryptk.dll`) and registered with `RtlAddFunctionTable`, so SEH/C++ exceptions and stack walks unwind through its frames. | `runtime/src` |
 | Imports (GameOS / GDK / Xbox DLLs) | Every imported `dll!function` goes to a shim. Unimplemented ones log once and return a failure, so the missing surface shows up at runtime. | `runtime/shims` |
 | Graphics | Xbox D3D12 (`d3d12_xs`) to Vulkan. Shaders ship as compiled RDNA2 machine code; `tools\rdna2spirv.py` translates all 26,503 to SPIR-V. The D3D12 layer is still to do. | `tools\` (translator), later (D3D12) |
 | Assets | `.rpf` archives (RPF9) read through the runtime's file layer. | later |
