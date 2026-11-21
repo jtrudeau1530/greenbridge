@@ -49,7 +49,11 @@ def sha256(path: str) -> str:
 
 
 def walk(game_dir: str):
-    for root, _, files in os.walk(game_dir):
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    # os.walk otherwise treats missing or unreadable directories as empty.
+    for root, _, files in os.walk(game_dir, onerror=scan_failed):
         for name in sorted(files):
             p = os.path.join(root, name)
             yield os.path.relpath(p, game_dir).replace("\\", "/"), p
@@ -150,8 +154,13 @@ def main() -> int:
     add_jobs(v)
     a = ap.parse_args()
     below_normal()
-    return (create(a.game_dir, a.out, a.jobs) if a.cmd == "create"
-            else verify(a.game_dir, a.manifest, a.jobs))
+    try:
+        if a.cmd == "create":
+            return create(a.game_dir, a.out, a.jobs)
+        return verify(a.game_dir, a.manifest, a.jobs)
+    except OSError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
