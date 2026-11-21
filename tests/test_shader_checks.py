@@ -20,9 +20,9 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 
 
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
+# tests, pixel tests, the two-mip draw, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + 2 + len(check.BOUNDS))
+         + len(check.PIXEL_TESTS) + 1 + 2 + len(check.BOUNDS))
 
 
 class Wave64Checks(unittest.TestCase):
@@ -79,7 +79,8 @@ class Wave64Checks(unittest.TestCase):
                 (spirv / "cs_wave64_ballot.spv").touch()
             output = io.StringIO()
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
-                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
+                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "texture_mip_test", return_value=""),
+                  patch.object(check, "W64_EMULATED", emulated),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -182,6 +183,18 @@ class PixelDeviceLimits(unittest.TestCase):
     def test_bitmask_perm_is_judged_at_32_lanes(self):
         out = "device: fake (subgroup 32..32)\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
+
+
+class TextureMipChecks(unittest.TestCase):
+    def test_implicit_mip_checks_every_channel_through_last_pixel(self):
+        pixel = struct.pack("<4f", 0, 1, 1, 1)
+        image = pixel * (64 * 64)
+        self.assertEqual(check.texture_mip_mismatch(image, 1), "")
+        for channel in range(4):
+            damaged = bytearray(image)
+            struct.pack_into("<f", damaged, len(image) - 16 + 4 * channel, 0.5)
+            self.assertTrue(check.texture_mip_mismatch(damaged, 1).startswith("(63,63):"))
+        self.assertTrue(check.texture_mip_mismatch(image[:-1], 1))
 
 
 if __name__ == "__main__":

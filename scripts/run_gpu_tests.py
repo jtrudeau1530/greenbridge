@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from compute_fixture import compute_header
-from check import Skip, mesh_v5_test
+from check import TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST, Skip, mesh_v5_test, texture_mip_test
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -393,6 +393,10 @@ def run_suite(a, work: str) -> int:
     build_files = list(asm_files)
     if any(f.startswith("ps_flat") for f in asm_files) and "vs_ids.asm" not in build_files:
         build_files.append("vs_ids.asm")
+    if TEXTURE_MIP_TEST + ".asm" in asm_files:
+        for shader in TEXTURE_MIP_DEPENDENCIES:
+            if shader + ".asm" not in build_files:
+                build_files.append(shader + ".asm")
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
     for fname in build_files:
@@ -551,6 +555,10 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgload":
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == TEXTURE_MIP_TEST:
+            problem = texture_mip_test(a.build, spirv_dir)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
         elif name == "ps_texture_sample":
             # #167's bindless texture test: vk_texture_test finds vs_ids.spv and this shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)

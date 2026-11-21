@@ -5,7 +5,8 @@
 // registers that T# -> image index 1 and the shader's literal S# -> sampler index 1, binds an 8x8 gradient at
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
-//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3>   (S# words as hex)
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip]   (S# words as hex)
+//   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw.
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
@@ -38,12 +39,16 @@ static std::vector<uint32_t> read_spv(const char* p) {
 #include "../src/descriptor_table.h"
 
 int main(int argc, char** argv) {
-    const uint32_t W = 64, H = 64, TW = 8;
+    const uint32_t W = 64, H = 64;
+    const bool two_mip = argc == 10 && std::strcmp(argv[9], "--two-mip") == 0;
+    // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
+    const uint32_t TW = two_mip ? 2 * W : 8;
+    const uint32_t levels = two_mip ? 2 : 1;
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-    if (argc >= 9) {
+    if (argc == 9 || two_mip) {
         vs_path = argv[1];
         fs_path = argv[2];
         out_path = argv[3];
@@ -71,7 +76,7 @@ int main(int argc, char** argv) {
         out_path = (argc == 2) ? argv[1] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [vs fs out ptr_sgpr s0 s1 s2 s3]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]]\n");
         return 2;
     }
     uint32_t tsharp[8] = {0x11111111, 0x22222222, 0x33333333, 0x44444444,
@@ -155,36 +160,46 @@ int main(int argc, char** argv) {
     VkBuffer tb; VkDeviceMemory tbm; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbm, &tbp));
     std::memcpy(tbp, table.data(), table.size() * 4);
-    // Textures: index 0 = 1x1 magenta fallback, index 1 = 8x8 gradient (r = x/8, g = y/8, b = 0.5, a = 1).
-    auto make_tex = [&](uint32_t w, uint32_t h, const std::vector<uint32_t>& rgba, VkImage* img, VkImageView* view) {
+    // Index 0 holds the 1x1 magenta fallback. Index 1 holds the sampled texture.
+    auto make_tex = [&](uint32_t w, uint32_t h, uint32_t mip_levels, VkImage* img, VkImageView* view) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM; ii.extent = {w, h, 1};
-        ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.mipLevels = mip_levels; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
         ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         VkResult r = vkCreateImage(dev, &ii, nullptr, img); if (r) return r;
         VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, *img, &mr);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size;
         ai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         VkDeviceMemory m; r = vkAllocateMemory(dev, &ai, nullptr, &m); if (r) return r;
-        vkBindImageMemory(dev, *img, m, 0);
+        r = vkBindImageMemory(dev, *img, m, 0); if (r) return r;
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = *img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ii.format;
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
         return vkCreateImageView(dev, &vi, nullptr, view);
     };
-    std::vector<uint32_t> magenta{0xFFFF00FFu}, grad(TW * TW);
-    for (uint32_t y = 0; y < TW; y++)
-        for (uint32_t x = 0; x < TW; x++)
-            grad[y * TW + x] = (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
+    const uint32_t magenta = 0xFFFF00FFu;
+    // R8G8B8A8 in memory: red, green, blue, transparent yellow, then solid cyan in mip 1.
+    const uint32_t quadrants[2][2] = {{0xFF0000FFu, 0xFF00FF00u}, {0xFFFF0000u, 0x0000FFFFu}};
+    std::vector<uint32_t> texels(TW * TW + (two_mip ? (TW / 2) * (TW / 2) : 0), 0xFFFFFF00u);
+    for (uint32_t y = 0; y < TW; y++) {
+        for (uint32_t x = 0; x < TW; x++) {
+            texels[y * TW + x] = two_mip ? quadrants[y >= TW / 2][x >= TW / 2]
+                                         : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
+        }
+    }
     VkImage timg[2]; VkImageView tview[2];
-    CHECK(make_tex(1, 1, magenta, &timg[0], &tview[0]));
-    CHECK(make_tex(TW, TW, grad, &timg[1], &tview[1]));
+    CHECK(make_tex(1, 1, 1, &timg[0], &tview[0]));
+    CHECK(make_tex(TW, TW, levels, &timg[1], &tview[1]));
     VkBuffer up; VkDeviceMemory upm; void* upp;
-    CHECK(make_buffer(4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up, &upm, &upp));
-    std::memcpy(upp, magenta.data(), 4);
-    std::memcpy(static_cast<char*>(upp) + 256, grad.data(), grad.size() * 4);
+    const VkDeviceSize texture_offset = 256;
+    const VkDeviceSize texture_bytes = texels.size() * sizeof(uint32_t);
+    CHECK(make_buffer(texture_offset + texture_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up, &upm, &upp));
+    std::memcpy(upp, &magenta, sizeof(magenta));
+    std::memcpy(static_cast<char*>(upp) + texture_offset, texels.data(), texture_bytes);
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.maxLod = float(levels - 1);
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VkSampler smp[2]; CHECK(vkCreateSampler(dev, &sci, nullptr, &smp[0])); CHECK(vkCreateSampler(dev, &sci, nullptr, &smp[1]));
     // Render target.
@@ -280,12 +295,18 @@ int main(int argc, char** argv) {
     for (int t = 0; t < 2; t++) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.image = timg[t];
-        ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        const uint32_t mip_levels = t ? levels : 1;
+        ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1}; ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
-        VkBufferImageCopy c{}; c.bufferOffset = t ? 256 : 0; c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        c.imageExtent = {t ? TW : 1u, t ? TW : 1u, 1};
-        vkCmdCopyBufferToImage(cmd, up, timg[t], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        VkDeviceSize offset = t ? texture_offset : 0;
+        for (uint32_t level = 0; level < mip_levels; ++level) {
+            const uint32_t side = t ? TW >> level : 1;
+            VkBufferImageCopy c{}; c.bufferOffset = offset; c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+            c.imageExtent = {side, side, 1};
+            vkCmdCopyBufferToImage(cmd, up, timg[t], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            offset += VkDeviceSize(side) * side * sizeof(uint32_t);
+        }
         ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);

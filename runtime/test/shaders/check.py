@@ -2,7 +2,7 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test and vk_harness (runtime/build by default). Each line is one
+The test programs are vk_compute_test, vk_store_test, vk_harness and vk_texture_test (runtime/build by default). Each line is one
 shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes 0-31, since a GPU
 with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
@@ -60,6 +60,8 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000)}
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
+TEXTURE_MIP_TEST = "ps_texture_mip0"
+TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
 
 
 def run(*cmd, env=None):
@@ -227,6 +229,52 @@ def pixels(tools, spirv, name, fmt):
     return list(struct.iter_unpack(fmt, data)), out
 
 
+def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -> str:
+    width = 64
+    if len(data) != width**2 * 16:
+        return f"expected {width**2} RGBA32F pixels, got {len(data)} bytes"
+    one = 0x3f800000
+    quadrants = ((one, 0, 0, one), (0, one, 0, one),
+                 (0, 0, one, one), (one, one, 0, 0))
+    for i, actual in enumerate(struct.iter_unpack("<4I", data)):
+        y, x = divmod(i, width)
+        # The normalized UV at each pixel center lies within the same quadrant of mip 0.
+        u, v = (y, x) if transpose_uv else (x, y)
+        expected = (0, one, one, one) if mip == 1 else quadrants[2 * (v >= width // 2) + (u >= width // 2)]
+        if actual != expected:
+            return f"({x},{y}): RGBA32F bits {actual} != {expected}"
+    return ""
+
+
+def texture_mip_test(tools: str, spirv: str) -> str:
+    tool = Path(tools) / ("vk_texture_test" + EXE)
+    if not tool.is_file():
+        return f"missing {tool}"
+    shaders = Path(spirv)
+    vertex = shaders / "vs_ids.spv"
+    with tempfile.TemporaryDirectory(prefix="leonida-mip-") as tmp:
+        for mip, name in enumerate((TEXTURE_MIP_TEST, "ps_texture_sample")):
+            fragment = shaders / (name + ".spv")
+            for shader in (vertex, fragment):
+                if not shader.is_file():
+                    return f"missing {shader}"
+            raw = Path(tmp) / f"mip{mip}.raw"
+            code, output = run(tool, vertex, fragment, raw, "0", "92", "c00000", "14500000", "0", "--two-mip")
+            if code == UNSUPPORTED:
+                return Skip(f"SKIP (texture mip test: {output.strip() or 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"{name}: {failure(code, output, 4)}"
+            data = raw.read_bytes()
+            mismatch = texture_mip_mismatch(data, mip)
+            if mismatch:
+                return f"{name}: {mismatch}"
+            if not texture_mip_mismatch(data, 1 - mip).startswith("(0,0):"):
+                return f"{name}: wrong mip control missed the expected first pixel"
+            if mip == 0 and not texture_mip_mismatch(data, mip, transpose_uv=True).startswith("(32,0):"):
+                return f"{name}: transposed UV control missed the expected first pixel"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
@@ -301,6 +349,7 @@ def main():
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
+    results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"
