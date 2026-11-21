@@ -13,8 +13,8 @@
 ; Expect: out[0..7] = 12 1 4 0 8 15728880 4 32
 s_mov_b32 exec_lo, 0x80000240
 s_wqm_b32 exec_lo, exec_lo
-s_bcnt1_i32_b32 s8, exec_lo
 s_cselect_b32 s9, 1, 0
+s_bcnt1_i32_b32 s8, exec_lo
 s_ff1_i32_b32 s14, exec_lo
 s_mov_b32 exec_lo, -1
 v_cmp_eq_u32_e32 vcc_lo, 5, v0

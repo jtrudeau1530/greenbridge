@@ -232,7 +232,43 @@ int main() {
         D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))));
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
-        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)) == E_INVALIDARG);
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+        EXPECT(options.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_3);
+        EXPECT(options.MaxGPUVirtualAddressBitsPerResource == 40);
+
+        D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va_support{};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va_support, sizeof(va_support))));
+        EXPECT(va_support.MaxGPUVirtualAddressBitsPerResource == 40);
+        EXPECT(va_support.MaxGPUVirtualAddressBitsPerProcess == 48);
+
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support{DXGI_FORMAT_R8G8B8A8_UNORM};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support))));
+        EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+        EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
+        EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
+
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
+        EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
+
+        // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
+        EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);
+        EXPECT(rt::d3d12::device_max_push_constants_size(inner) == rt::d3d12::device_max_push_constants_size(device.p));
+        EXPECT(!rt::d3d12::device_push_constants_need_fallback(device.p));
+
+        // Simulated fallback path when maxPushConstantsSize < 144 bytes:
+        {
+            rt::d3d12::VulkanDeviceInfo fallback_info = info;
+            fallback_info.max_push_constants_size = 128;
+            fallback_info.push_constants_need_fallback = true;
+            ID3D12Device* fallback_inner = nullptr;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(fallback_info, IID_PPV_ARGS(&fallback_inner))));
+            Ref<ID3D12Device> fallback_device;
+            EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(fallback_inner, __uuidof(ID3D12Device),
+                                                               reinterpret_cast<void**>(&fallback_device.p))));
+            rt::d3d12::set_device_outer(fallback_inner, fallback_device.p);
+            EXPECT(rt::d3d12::device_max_push_constants_size(fallback_device.p) == 128);
+            EXPECT(rt::d3d12::device_push_constants_need_fallback(fallback_device.p));
+        }
 
         const int footprint_mismatches = compare_footprints(device.p);
         if (footprint_mismatches < 0)
@@ -551,6 +587,75 @@ int main() {
         }
         volume.reset();
 
+        // A resolve: a 4x multisampled target is cleared and resolved into a single-sampled texture, which is read
+        // back. First the shapes D3D12 refuses: a multisampled texture that is not a single-mip render target or
+        // depth-stencil, a sample count that is not a power of two, and a multisampled volume.
+        {
+            Ref<ID3D12Resource> msaa, resolved, refused;
+            D3D12_RESOURCE_DESC shape =
+                texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 2);
+            shape.SampleDesc.Count = 4;
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.MipLevels = 1;
+            shape.Flags = D3D12_RESOURCE_FLAG_NONE;
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            shape.SampleDesc.Count = 3;
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape = volume_desc(1);
+            shape.SampleDesc.Count = 4;
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+
+            D3D12_RESOURCE_DESC samples4 =
+                texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            samples4.SampleDesc.Count = 4;
+            EXPECT(SUCCEEDED(create(default_heap, samples4, D3D12_RESOURCE_STATE_RENDER_TARGET, msaa)));
+            EXPECT(SUCCEEDED(create(default_heap, rgba, D3D12_RESOURCE_STATE_RESOLVE_DEST, resolved)));
+            EXPECT(msaa->GetDesc().SampleDesc.Count == 4);
+            D3D12_RENDER_TARGET_VIEW_DESC msaa_view{};
+            msaa_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            msaa_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+            device->CreateRenderTargetView(msaa.p, &msaa_view, rtv1);  // the lists that used this slot have run
+            cursor = 0;
+            const auto resolved_place = place(device.p, resolved.p, 0, cursor);
+            std::memset(down, 0xcd, 65536);
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const FLOAT green[4] = {0, 1, 0, 1};
+            list->ClearRenderTargetView(rtv1, green, 0, nullptr);
+            barrier = transition(msaa.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            list->ResolveSubresource(resolved.p, 0, msaa.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            barrier = transition(resolved.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            {
+                const auto dst = footprint(readback.p, resolved_place);
+                const auto src = subresource(resolved.p, 0);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+            const std::uint8_t resolved_green[4] = {0, 255, 0, 255};
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col)
+                    report("resolved texel", row * size + col,
+                           down + resolved_place.Offset + row * resolved_place.Footprint.RowPitch + col * 4,
+                           resolved_green, 4);
+
+            // A resolve of a resource into itself is refused when it is recorded, one from a single-sampled
+            // texture when it is executed; nothing is submitted.
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->ResolveSubresource(resolved.p, 0, resolved.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->ResolveSubresource(resolved.p, 0, source.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
@@ -584,6 +689,6 @@ int main() {
         return 1;
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
-                "BC copies, and GetCopyableFootprints all matched\n");
+                "BC copies, a resolve, and GetCopyableFootprints all matched\n");
     return 0;
 }

@@ -50,13 +50,15 @@ package is recorded in the runtime-imports documentation.
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
 that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` relocations, binds
-imports by name or ordinal, parses the export table, and sets section protections. Modules are deduped
-by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
+imports by name or ordinal, parses the export table, sets section protections, and registers the
+image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
+through a mapped image are dispatched and stack walks can step over its frames. The table is validated
+first (entries in bounds, sorted and non-overlapping) and removed when the loader is destroyed. Modules
+are deduped by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
 
 Current limits, by design:
 
 - `DllMain`, TLS callbacks and the entry point are left to the caller; `--dry-run` never runs them.
-- The loader does not yet register x64 unwind tables; that is a separate runtime step.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -110,7 +112,8 @@ the files in place and never copy or commit game data.
 ## Current limits
 
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
-entry point, command-list/queue/fence extensions, `PresentX`, and the `xgameruntime` surface. The
+entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
+shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
 D3D12-to-Vulkan design and the measured console ABI are in
 [docs/d3d12_vulkan.md](../docs/d3d12_vulkan.md); the shader translator and its GPU checks are described
 in [docs/design.md](../docs/design.md), and the differential-validation design is in the shader-validation

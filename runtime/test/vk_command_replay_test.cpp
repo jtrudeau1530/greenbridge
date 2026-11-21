@@ -1,7 +1,8 @@
 // Replays recorded command lists on offscreen images and reads them back. No shaders or game data.
 // Part A uses only Vulkan 1.0 functions and no layout tracker. Part B uses the tracker with separate depth/stencil
 // layouts: rectangle clears, a depth clear while the stencil plane is in another state, a texture used after
-// implicit promotion from common, and enhanced barriers.
+// implicit promotion from common, and enhanced barriers. Part C copies a volume (footprint, box and whole) and
+// resolves a multisampled target.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -304,12 +305,167 @@ int part_b(vktest::Device& d) {
     return 0;
 }
 
+// Part C: volumes and resolves. A 4x4x4 volume is uploaded from a footprint whose slices lie `height` rows apart,
+// copied in part (a 2x2x2 block) and whole, and read back; a 4x multisampled target is cleared and resolved.
+// Nothing is transitioned before its first use: the images start in UNDEFINED and are zero-filled then.
+int part_c(vktest::Device& d) {
+    constexpr std::uint32_t size = 4, wide = 8, pitch = 256, slice = size * pitch;
+    constexpr VkDeviceSize bytes = 16384, up_at = 512, back_at = 0, part_at = 4096, resolved_at = 8192;
+    constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    void *up_mapped = nullptr, *down_mapped = nullptr;
+    const VkBuffer up = d.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up_mapped);
+    const VkBuffer down = d.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &down_mapped);
+    const VkImage volume = d.image(format, size, size, 1, VK_IMAGE_USAGE_SAMPLED_BIT, size);
+    const VkImage part = d.image(format, size, size, 1, VK_IMAGE_USAGE_SAMPLED_BIT, size);
+    const VkImage whole = d.image(format, size, size, 1, VK_IMAGE_USAGE_SAMPLED_BIT, size);
+    const VkImage msaa = d.image(format, wide, wide, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 1, 4);
+    const VkImage resolved = d.image(format, wide, wide, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    EXPECT(up && down && volume && part && whole && msaa && resolved);
+    auto* u = static_cast<std::uint8_t*>(up_mapped);
+    const auto* r = static_cast<const std::uint8_t*>(down_mapped);
+    const auto texel = [&](std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+        return u + up_at + z * slice + y * pitch + x * 4;
+    };
+    for (std::uint32_t z = 0; z < size; ++z)
+        for (std::uint32_t y = 0; y < size; ++y)
+            for (std::uint32_t x = 0; x < size; ++x) {
+                const Rgba value{std::uint8_t(x * 16 + y), std::uint8_t(z * 40 + 1), std::uint8_t(x ^ y ^ (z << 4)), 255};
+                std::copy(value.begin(), value.end(), texel(x, y, z));
+            }
+
+    const auto image_binding = [&](VkImage image, std::uint32_t extent, std::uint32_t depth, std::uint32_t samples) {
+        ResourceBinding b{};
+        b.image = image;
+        b.format = format;
+        b.width = b.height = extent;
+        b.depth = depth;
+        b.volume = depth > 1;
+        b.samples = samples;
+        return b;
+    };
+    const auto buffer_binding = [&](VkBuffer buffer) {
+        ResourceBinding b{};
+        b.buffer = buffer;
+        b.size = bytes;
+        return b;
+    };
+    constexpr ResourceId up_id = 20, down_id = 21, volume_id = 22, part_id = 23, whole_id = 24, msaa_id = 25,
+                         resolved_id = 26;
+    const std::map<ResourceId, ResourceBinding> bindings{
+        {up_id, buffer_binding(up)},
+        {down_id, buffer_binding(down)},
+        {volume_id, image_binding(volume, size, size, 1)},
+        {part_id, image_binding(part, size, size, 1)},
+        {whole_id, image_binding(whole, size, size, 1)},
+        {msaa_id, image_binding(msaa, wide, 1, 4)},
+        {resolved_id, image_binding(resolved, wide, 1, 1)},
+    };
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        const auto it = bindings.find(id);
+        return it == bindings.end() ? nullptr : &it->second;
+    };
+    LayoutTracker tracker(true);
+    for (const ResourceId id : {volume_id, part_id, whole_id, msaa_id, resolved_id})
+        tracker.track(id, bindings.at(id), VK_IMAGE_LAYOUT_UNDEFINED);
+
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    vk.clear_depth_stencil_image = d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
+    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    vk.separate_depth_stencil_layouts = true;
+    const ReplayFunctions without_resolve = vk;
+    vk.resolve_image = d.fn<PFN_vkCmdResolveImage>("vkCmdResolveImage");
+
+    const auto sub = [](ResourceId id) { return CopyLocation{id, false, 0, 0, 0, 0, 0, 0}; };
+    const auto slices = [&](ResourceId id, VkDeviceSize offset, std::uint32_t depth) {
+        return CopyLocation{id, true, 0, offset, size, size, depth, pitch};
+    };
+    CommandList list;
+    EXPECT(list.copy_texture({sub(volume_id), 0, 0, 0, slices(up_id, up_at, size), false, {}}));  // four slices up
+    EXPECT(list.transition({volume_id, 0, s::copy_dest, s::copy_source}));
+    EXPECT(list.copy_texture({sub(part_id), 2, 0, 1, sub(volume_id), true, {1, 1, 1, 3, 3, 3}}));  // 2x2x2 to (2, 0, 1)
+    EXPECT(list.copy_resource({whole_id, volume_id}));
+    EXPECT(list.transition({part_id, 0, s::copy_dest, s::copy_source}));
+    EXPECT(list.transition({whole_id, 0, s::copy_dest, s::copy_source}));
+    // Slices 1 and 2 of the whole copy, to slice 1 of a footprint; then all of the partly written volume.
+    EXPECT(list.copy_texture({slices(down_id, back_at, size), 0, 0, 1, sub(whole_id), true, {0, 0, 1, size, size, 3}}));
+    EXPECT(list.copy_texture({slices(down_id, part_at, size), 0, 0, 0, sub(part_id), false, {}}));
+    EXPECT(list.clear_render_target({msaa_id, 0, 0, 1}, {0, 1, 0, 1}));
+    EXPECT(list.transition({msaa_id, 0, s::render_target, s::resolve_source}));
+    EXPECT(list.resolve_subresource({resolved_id, 0, msaa_id, 0}));
+    EXPECT(list.transition({resolved_id, 0, s::resolve_dest, s::copy_source}));
+    EXPECT(list.copy_texture({{down_id, true, 0, resolved_at, wide, wide, 1, pitch}, 0, 0, 0, sub(resolved_id), false, {}}));
+    EXPECT(list.close());
+
+    bool ok = d.run([&](VkCommandBuffer cb) {
+        // Rejected lists write nothing and leave the tracker alone.
+        CommandList bad;
+        const auto rejected = [&](auto&& record, ReplayResult expected, const ReplayFunctions& functions) {
+            if (!bad.closed()) bad.close();
+            bad.reset();
+            if (!record()) return false;
+            bad.close();
+            const ReplayResult got = replay(bad, cb, resolve, functions, &tracker);
+            if (got != expected) std::fprintf(stderr, "rejected list: got %d, want %d\n", int(got), int(expected));
+            return got == expected;
+        };
+        const auto copy = [&](const CopyTexture& c) { return [&bad, c] { return bad.copy_texture(c); }; };
+        const auto resolving = [&](const ResolveSubresource& c) { return [&bad, c] { return bad.resolve_subresource(c); }; };
+        constexpr auto invalid = ReplayResult::invalid_copy;
+        if (!rejected(resolving({msaa_id, 0, resolved_id, 0}), invalid, vk) ||          // single-sampled source
+            !rejected(resolving({volume_id, 0, msaa_id, 0}), invalid, vk) ||            // another size
+            !rejected(resolving({resolved_id, 1, msaa_id, 0}), ReplayResult::invalid_subresource, vk) ||
+            !rejected(resolving({resolved_id, 0, msaa_id, 0}), ReplayResult::unsupported, without_resolve) ||
+            // Slices 3 and 4 of 4; a box deeper than its footprint; a footprint past the end of the buffer.
+            !rejected(copy({sub(part_id), 0, 0, 3, sub(volume_id), true, {0, 0, 0, size, size, 2}}), invalid, vk) ||
+            !rejected(copy({sub(volume_id), 0, 0, 0, slices(up_id, up_at, 2), true, {0, 0, 0, size, size, 3}}), invalid, vk) ||
+            !rejected(copy({sub(volume_id), 0, 0, 0, slices(up_id, 13312, size), false, {}}), invalid, vk) ||
+            // A multisampled texture has no footprint and copies only to its own sample count.
+            !rejected(copy({{down_id, true, 0, 0, wide, wide, 1, pitch}, 0, 0, 0, sub(msaa_id), false, {}}), invalid, vk) ||
+            !rejected(copy({sub(resolved_id), 0, 0, 0, sub(msaa_id), false, {}}), invalid, vk))
+            return false;
+        if (tracker.layout(volume_id, 0) != VK_IMAGE_LAYOUT_UNDEFINED) return false;
+        return replay(list, cb, resolve, vk, &tracker) == ReplayResult::success;
+    });
+    EXPECT(ok);
+    for (const ResourceId id : {volume_id, part_id, whole_id, msaa_id, resolved_id})
+        EXPECT(tracker.layout(id, 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    const auto expect_texel = [&](const char* what, const std::uint8_t* got, const std::uint8_t* want, std::uint32_t index) {
+        Rgba expected{};
+        std::copy(want, want + 4, expected.begin());
+        expect_rgba(what, got, index, expected);
+    };
+    const std::uint8_t zero[4] = {};
+    for (std::uint32_t z = 0; z < size; ++z) {
+        for (std::uint32_t y = 0; y < size; ++y) {
+            for (std::uint32_t x = 0; x < size; ++x) {
+                const std::uint32_t row = z * slice + y * pitch;
+                if (z == 1 || z == 2) expect_texel("C slices", r + back_at + row, texel(x, y, z), x);
+                // The block came from (1..2, 1..2, 1..2); the rest of the volume was zero-filled on first use.
+                const bool inside = x >= 2 && y < 2 && z >= 1 && z < 3;
+                expect_texel("C block", r + part_at + row, inside ? texel(x - 1, y + 1, z) : zero, x);
+            }
+        }
+    }
+    EXPECT(r[back_at] == 0xcd && r[back_at + 3 * slice] == 0xcd && r[back_at + slice + 16] == 0xcd);  // not written
+    for (std::uint32_t row = 0; row < wide; ++row)
+        for (std::uint32_t col = 0; col < wide; ++col) expect_rgba("C resolve", r + resolved_at + row * pitch, col, green);
+    std::printf("C: a %ux%ux%u volume uploaded, copied in part and whole and read back; a 4x resolve of %u texels\n",
+                size, size, size, wide * wide);
+    return 0;
+}
+
 } // namespace
 
 int main() {
     vktest::Device device;
     EXPECT(device.create());
-    if (part_a(device) || part_b(device)) return 1;
+    if (part_a(device) || part_b(device) || part_c(device)) return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", device.validation_errors());

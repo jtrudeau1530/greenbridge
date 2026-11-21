@@ -39,6 +39,12 @@ class TestHash(unittest.TestCase):
         self.assertEqual(A.normalized_name("A.B-C"), "a_b_c")
         self.assertEqual(A.normalized_name("Already_ok"), "already_ok")
 
+    def test_title_stream_id(self):
+        title = "Hello,  World!"
+        self.assertEqual(A.title_stream_id(title), A.joaat("hello_world") & A.STREAM_MASK)
+        self.assertEqual(A.title_stream_id("Test Song"),
+                         A.joaat(A.normalized_name("Test Song")) & A.STREAM_MASK)
+
 
 class TestScan(unittest.TestCase):
     def test_single_record(self):

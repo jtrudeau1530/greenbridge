@@ -64,6 +64,16 @@ def joaat(text):
     return h & 0xFFFFFFFF
 
 
+def title_stream_id(title: str) -> int:
+    """AWC stream id for a config title.
+
+    The config's ``hash B`` is ``joaat(normalized_name(title))`` and the
+    stream id is its low 29 bits. This is the lookup used to resolve untitled
+    config records when the title is known from credits or a playlist.
+    """
+    return joaat(normalized_name(title)) & STREAM_MASK
+
+
 def normalized_name(text):
     """Lowercase, and map every non-alphanumeric run to a single underscore."""
     out = []
@@ -200,6 +210,8 @@ def main():
 
     names = load_names(a.names) if a.names else None
     records = collect(a.src, a.min_ms, a.max_ms, names, a.join)
+    if not records:
+        sys.exit(f"{a.src}: no audio-config records found")
     summary = summarize(records)
 
     if a.json:

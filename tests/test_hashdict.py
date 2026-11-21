@@ -105,33 +105,6 @@ class StringHarvestTest(unittest.TestCase):
         self.assertIn("ghij", found4)
 
 
-class CollisionHandlingTest(unittest.TestCase):
-    def test_case_collision_preserves_first_seen(self):
-        # Case variants collide to identical hash; setdefault retains first entry
-        d = {}
-        for s in ["Adder", "adder", "ADDER"]:
-            d.setdefault(f"{hashdict.joaat(s):08x}", s)
-        self.assertEqual(len(d), 1)
-        self.assertEqual(d["b779a091"], "Adder")
-
-    def test_distinct_strings_collision_handling(self):
-        # Two distinct synthetic strings producing the same 32-bit joaat hash (0x18c8836d)
-        s1 = "str_85_83667"
-        s2 = "str_63346_847129"
-        self.assertNotEqual(s1, s2)
-        h1 = hashdict.joaat(s1)
-        h2 = hashdict.joaat(s2)
-        self.assertEqual(h1, 0x18C8836D)
-        self.assertEqual(h2, 0x18C8836D)
-
-        d = {}
-        d.setdefault(f"{h1:08x}", s1)
-        d.setdefault(f"{h2:08x}", s2)
-        # Collision does not overwrite the existing mapping
-        self.assertEqual(len(d), 1)
-        self.assertEqual(d["18c8836d"], s1)
-
-
 class LookupCLITest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -265,6 +238,27 @@ class CarveAndExtraCLITest(unittest.TestCase):
         p_lookup = self.run_tool("--lookup", self.out_json, lookup_hash)
         self.assertEqual(p_lookup.returncode, 0, p_lookup.stderr)
         self.assertIn(f"{lookup_hash} model_prop", p_lookup.stdout)
+
+    def test_build_is_reproducible_with_collisions(self):
+        with open(self.extra_file, "wb") as f:
+            f.write(b"widget Widget str_85_83667 str_63346_847129")
+
+        results = []
+        for seed in ("1", "2"):
+            # Unlike -I, -P keeps PYTHONHASHSEED while leaving the script directory off sys.path.
+            result = subprocess.run(
+                [sys.executable, "-P", TOOL, self.carve_dir, "--out", self.out_json, "--extra", self.extra_file],
+                env=dict(os.environ, PYTHONHASHSEED=seed), capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(self.out_json, "rb") as f:
+                results.append(f.read())
+
+        self.assertEqual(results[0], results[1])
+        mapping = json.loads(results[0])
+        self.assertEqual(mapping[f"{hashdict.joaat('widget'):08x}"], "Widget")
+        # The two synthetic identifiers share a 32-bit hash.
+        self.assertEqual(mapping["18c8836d"], "str_63346_847129")
 
 
 if __name__ == "__main__":
