@@ -137,6 +137,7 @@ The command-list surface maps to the IR as follows:
 | `Dispatch` / `DispatchMesh` | command with a state snapshot |
 | `Copy*` / `Resolve*` / `Clear*` | copy/clear command |
 | `ResourceBarrier` / `Barrier` | barrier command; state tracking |
+| `DiscardResource` / `WriteBufferImmediate` / `AtomicCopyBufferUINT(64)` | discard, immediate-write and atomic-copy commands (section 4.2) |
 | `BeginQuery` / `EndQuery` / `ResolveQueryData` | query commands |
 | `ExecuteIndirect` | command; signature + argument buffer |
 | `BeginRenderPass` / `EndRenderPass` | rendering scope |
@@ -150,7 +151,8 @@ What is implemented (all of it testable without the game):
 - **IR** (`runtime/src/command_list.h`): legacy barriers (transition, UAV, aliasing; split barriers record their end
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
   replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles,
-  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, and `ResolveSubresource`.
+  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, `ResolveSubresource`, and (D3D-26) `DiscardResource`,
+  `WriteBufferImmediate` and `AtomicCopyBufferUINT` / `AtomicCopyBufferUINT64`.
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
@@ -165,7 +167,8 @@ What is implemented (all of it testable without the game):
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. Depth-stencil resolves, and resolves between
   two formats of one typeless family, are refused as unsupported. A multisampled texture copies only to one with
-  the same sample count and has no footprint.
+  the same sample count and has no footprint. Discards, immediate writes and atomic copies replay as section 4.2
+  describes.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -266,6 +269,14 @@ and any validation error fails them.
   and read back; a 4x multisampled target cleared and resolved; and the copies and resolves that must be refused
   (a z range past the volume or its footprint, a footprint past the buffer, a resolve from a single-sampled
   texture or into another size, a multisampled texture copied to a footprint or to another sample count).
+- `vk_command_replay_test`, part D (D3D-26): `WriteBufferImmediate` in all three modes at console VAs, one of them
+  in a binding that is a range inside another buffer (as arena resources are); UINT and UINT64 atomic copies
+  ordered between the writes so that a missing barrier would copy a stale or a later value; a buffer discard
+  (kept), a texture cleared, discarded and cleared again, and a rectangle discard (kept); and the lists that must
+  be refused (an address past a binding or in none, no `vkCmdUpdateBuffer`, a copy or dependent range past its
+  buffer, an unknown dependent resource, a subresource the resource does not have).
+- `d3d12_vulkan_device_test` also runs both atomic copies and the discards through COM, and checks that
+  `WriteBufferImmediate` is refused at execution while no buffer has a GPU virtual address on `main`.
 - `vk_bindless_test` (run by `runtime/test/shaders/check.py` and `scripts/run_gpu_tests.py`): the translator's
   own lookup against the table and the set. `ps_tex.asm`, a hand-written RDNA2 pixel shader built by `build.py`,
   loads a T# and an S# from a descriptor table and samples. The test draws the gradient with the T# at the fourth
@@ -640,6 +651,25 @@ The trace will enumerate them.
   `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer`/`vkCmdCopyImage`, using the `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
   row pitch and height; `CopyResource` → a whole-subresource copy; `ResolveSubresource` → `vkCmdResolveImage`.
   Partial resolve regions need a shader or a region copy.
+- `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
+  executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
+  `buffer_offset + (address - va)`. These are the same fields and lookup as #291's arena, and the device fills
+  `va` once `GetGPUVirtualAddress` lands (#157/#291); until then, a list with an immediate write is refused as
+  `unresolved_resource`. `DEFAULT` adds no barrier: it is ordered like any copy, by the application's barriers.
+  `MARKER_OUT` waits for every earlier command to finish and sees its writes (`ALL_COMMANDS`/`MEMORY_WRITE` →
+  `TRANSFER`/`TRANSFER_WRITE`). `MARKER_IN` only needs earlier commands to have started. Vulkan cannot express
+  that, because `TOP_OF_PIPE` in a first synchronisation scope is no stage at all, so it gets an execution-only
+  `ALL_COMMANDS` → `TRANSFER` dependency: stricter than D3D12 requires, never weaker. Recording refuses a null
+  or unaligned address and an unknown mode (the debug layer's `WRITEBUFFERIMMEDIATE_*` messages, IDs 1090-1092 in
+  `d3d12sdklayers.h`).
+- `AtomicCopyBufferUINT` / `AtomicCopyBufferUINT64` (D3D-26) → one `vkCmdCopyBuffer` region of 4 or 8 bytes, after
+  a `ALL_COMMANDS`/`MEMORY_WRITE` → `TRANSFER`/`TRANSFER_READ|WRITE` barrier. That barrier covers every earlier
+  write, those to the dependent resources among them, so the copy sees them all, as D3D12 requires. The dependent
+  ranges are checked against their buffers but add nothing a global barrier does not already cover. Recording
+  follows the debug layer's `ATOMICCOPYBUFFER_*` rules (IDs 1027-1040): offsets aligned to the copy size and at
+  least one dependency. **Assumption:** Vulkan promises no atomicity for a transfer, and the layer relies on a
+  naturally aligned 4- or 8-byte copy being a single write on the GPU. This matters only to a reader racing the
+  copy on another queue or on the host.
 - Clears: a full-subresource clear maps to `vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` (UAV buffers to
   `vkCmdFillBuffer`); a rect clear uses `vkCmdClearAttachments` inside the rendering scope. UAV image clears use
   `vkCmdClearColorImage` in `GENERAL`; non-32-bit buffer patterns need a compute clear.
@@ -681,6 +711,12 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   `VkPipelineStageFlags2`, `VkAccessFlags2` and `VkImageLayout` (`vulkan_sync`, `vulkan_barrier_access`,
   `vulkan_layout`). Queue-specific layouts map like their generic forms; ray tracing, video and split scopes use
   `ALL_COMMANDS`; `LayoutBefore = UNDEFINED` or the discard flag becomes `oldLayout = UNDEFINED`.
+- `DiscardResource` (D3D-26): each discarded image subresource gets a barrier from `oldLayout = UNDEFINED` to the
+  layout the tracker already has for it, so the driver may drop the contents while later commands see no layout
+  change. The other cases are no-ops, which "contents undefined" allows: buffers, discards with rectangles (only
+  part of each subresource), a part never used yet (it is still to be zero-filled on first use), a list replayed
+  without a tracker, and one plane of a combined depth-stencil image without `separateDepthStencilLayouts`
+  (discarding one plane would also discard the other).
 - Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
   rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
   targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with

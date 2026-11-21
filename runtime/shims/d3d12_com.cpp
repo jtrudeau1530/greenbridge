@@ -181,6 +181,34 @@ public:
                                         stencil, to_rects(count, rects)));
     }
 
+    // A null region discards the whole resource.
+    void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* resource, const D3D12_DISCARD_REGION* region) override {
+        if (!region) return check(list_.discard({resource_id(resource), 0, leonida::all_subresources, false}));
+        if (region->NumRects && !region->pRects) return check(false);
+        check(list_.discard({resource_id(resource), region->FirstSubresource, region->NumSubresources,
+                             region->NumRects != 0}));
+    }
+
+    // GCL2. A null pModes means DEFAULT for every write. The address is resolved when the list is executed.
+    void STDMETHODCALLTYPE WriteBufferImmediate(UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* params,
+                                                const D3D12_WRITEBUFFERIMMEDIATE_MODE* modes) override {
+        if (count && !params) return check(false);
+        for (UINT i = 0; i < count; ++i)
+            check(list_.write_immediate({params[i].Dest, params[i].Value, modes ? u(modes[i]) : 0}));
+    }
+
+    // GCL1.
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                                                UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                                                const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) override {
+        atomic_copy(4, dst, dst_offset, src, src_offset, count, resources, ranges);
+    }
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT64(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                                                  UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                                                  const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) override {
+        atomic_copy(8, dst, dst_offset, src, src_offset, count, resources, ranges);
+    }
+
     // GCL8. Vulkan can set the two faces independently with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT /
     // BACK_BIT), but that state only matters when a pipeline uses it, and this layer has no pipeline or draw path
     // yet. Retain the values for that path and report that nothing consumed them, rather than emit a call whose
@@ -217,6 +245,17 @@ private:
 
     void check(bool ok) {
         if (!ok) invalid_ = true;
+    }
+
+    void atomic_copy(std::uint32_t bytes, ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                     UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
+                     const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
+        if (count && (!resources || !ranges)) return check(false);
+        leonida::AtomicCopyBuffer copy{resource_id(dst), dst_offset, resource_id(src), src_offset, bytes, {}};
+        for (UINT i = 0; i < count; ++i)
+            copy.dependencies.push_back(
+                {resource_id(resources[i]), ranges[i].Subresource, ranges[i].Range.Begin, ranges[i].Range.End});
+        check(list_.atomic_copy(copy));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;

@@ -656,6 +656,60 @@ int main() {
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
         }
 
+        // D3D-26 through COM: AtomicCopyBufferUINT/UINT64 from the upload buffer to the readback buffer, discards of a
+        // texture and a buffer, and a WriteBufferImmediate whose address no resource holds, which fails at execution.
+        {
+            Ref<ID3D12GraphicsCommandList1> list1;
+            Ref<ID3D12GraphicsCommandList2> list2;
+            EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+            EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list2.p))));
+            const std::uint32_t value32 = 0x600df00d;
+            const std::uint64_t value64 = 0x0123456789abcdefull;
+            std::memcpy(up + 4096, &value32, 4);
+            std::memcpy(up + 4104, &value64, 8);
+            std::memset(down, 0xcd, 65536);
+            ID3D12Resource* const dependents[] = {upload.p};
+            const D3D12_SUBRESOURCE_RANGE_UINT64 ranges[] = {{0, {4096, 4112}}};
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list1->AtomicCopyBufferUINT(readback.p, 256, upload.p, 4096, 1, dependents, ranges);
+            list1->AtomicCopyBufferUINT64(readback.p, 264, upload.p, 4104, 1, dependents, ranges);
+            list->DiscardResource(rt_resource.p, nullptr);
+            const D3D12_DISCARD_REGION first_mip{0, nullptr, 0, 1};
+            list->DiscardResource(rt_resource.p, &first_mip);
+            list->DiscardResource(upload.p, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 5)) && SUCCEEDED(fence->SetEventOnCompletion(5, nullptr)));
+            report("atomic copy UINT", 0, down + 256, reinterpret_cast<const std::uint8_t*>(&value32), 4);
+            report("atomic copy UINT64", 0, down + 264, reinterpret_cast<const std::uint8_t*>(&value64), 8);
+            const std::uint8_t cd[4] = {0xcd, 0xcd, 0xcd, 0xcd};
+            report("next to the atomic copies", 0, down + 252, cd, 4);
+            report("next to the atomic copies", 1, down + 272, cd, 4);
+
+            // Misaligned or empty calls are refused when they are recorded.
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list1->AtomicCopyBufferUINT64(readback.p, 260, upload.p, 4104, 1, dependents, ranges);
+            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list1->AtomicCopyBufferUINT(readback.p, 256, upload.p, 4096, 0, nullptr, nullptr);
+            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER misaligned{0x10002, 1};
+            list2->WriteBufferImmediate(1, &misaligned, nullptr);
+            EXPECT(list->Close() == E_INVALIDARG);
+
+            // Nothing on main gives a buffer a GPU virtual address yet (GetGPUVirtualAddress, #157/#291), so an
+            // immediate write has no target: the list is refused and nothing is submitted.
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write{0x10000, 1};
+            const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+            list2->WriteBufferImmediate(1, &write, &mode);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::unresolved_resource);
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);

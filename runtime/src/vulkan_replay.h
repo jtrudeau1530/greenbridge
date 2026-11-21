@@ -49,7 +49,9 @@ struct ResourceBinding {
     bool simultaneous_access = false;  // D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS: always GENERAL
     bool not_zeroed = false;           // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: first use skips the zero fill
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
+    VkDeviceSize buffer_offset = 0;    // where it starts in `buffer` (the GPU address arena holds many)
     VkDeviceSize size = 0;             // its size in bytes
+    std::uint64_t va = 0;              // a buffer's console VA (GetGPUVirtualAddress), for vertex/index views
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
@@ -468,6 +470,9 @@ struct ReplayFunctions {
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
+    PFN_vkCmdUpdateBuffer update_buffer = nullptr;              // WriteBufferImmediate
+    // The buffer and offset holding [va, va + size), from ResourceBinding::va; WriteBufferImmediate.
+    std::function<bool(std::uint64_t va, std::uint64_t size, VkBuffer&, VkDeviceSize&)> buffer_at;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -497,6 +502,9 @@ struct Prepared {
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
+    std::vector<VkImageSubresourceRange> discards;  // DiscardResource: the subresources to discard
+    VkBuffer write_buffer = VK_NULL_HANDLE;          // WriteBufferImmediate: where the address lands
+    VkDeviceSize write_offset = 0;
 };
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
@@ -905,6 +913,43 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
+        } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
+            // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
+            if (!bind(discard->resource)) return ReplayResult::unresolved_resource;
+            if (!p.binding.image) {
+                if (discard->count != all_subresources && discard->first_subresource + discard->count > 1)
+                    return ReplayResult::invalid_subresource;
+            } else if (discard->count == all_subresources) {
+                VkImageSubresourceRange range{};
+                if (!image_range(p.binding, all_subresources, range)) return ReplayResult::invalid_subresource;
+                if (!discard->partial) p.discards.push_back(range);
+            } else {
+                for (std::uint32_t s = discard->first_subresource; s < discard->first_subresource + discard->count; ++s) {
+                    VkImageSubresourceRange range{};
+                    if (!image_range(p.binding, s, range)) return ReplayResult::invalid_subresource;
+                    if (!discard->partial) p.discards.push_back(range);
+                }
+            }
+        } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
+            if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
+            if (!vk.buffer_at(write->address, 4, p.write_buffer, p.write_offset)) return ReplayResult::unresolved_resource;
+            if (p.write_offset % 4) return ReplayResult::invalid_copy;
+        } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
+            if (!vk.copy_buffer) return ReplayResult::unsupported;
+            const ResourceBinding* source = resolve(atomic->src);
+            if (!bind(atomic->dst) || !source) return ReplayResult::unresolved_resource;
+            p.source = *source;
+            if (!p.binding.buffer || !p.source.buffer || !detail::within(atomic->dst_offset, atomic->bytes, p.binding.size) ||
+                !detail::within(atomic->src_offset, atomic->bytes, p.source.size))
+                return ReplayResult::invalid_copy;
+            for (const auto& d : atomic->dependencies) {
+                const ResourceBinding* dependent = resolve(d.resource);
+                if (!dependent) return ReplayResult::unresolved_resource;
+                if (!dependent->image && (d.subresource != 0 || d.begin > d.end || d.end > dependent->size))
+                    return ReplayResult::invalid_copy;
+            }
+            p.buffer_copies.push_back({p.source.buffer_offset + atomic->src_offset,
+                                       p.binding.buffer_offset + atomic->dst_offset, atomic->bytes});
         }
     }
     return ReplayResult::success;
@@ -1114,6 +1159,43 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
+        } else if (std::holds_alternative<DiscardResource>(command)) {
+            // oldLayout = UNDEFINED tells the driver the contents may go; the image stays in the layout the tracker
+            // has for it, so later commands see no change. Without a tracker the layout is unknown, and a part
+            // never used yet is still to be zero-filled: both are left alone. Without separate depth/stencil
+            // layouts, discarding one plane would also discard the other, so that is left alone too.
+            constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            for (const auto& range : p.discards) {
+                if (!tracker || detail::planes_for_layout(p.binding, range, separate).aspectMask != range.aspectMask)
+                    continue;
+                std::vector<LayoutPiece> pieces;
+                if (!tracker->pieces(id, range, pieces)) continue;
+                for (const auto& piece : pieces)
+                    if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED)
+                        detail::image_barrier(vk, command_buffer, p.binding.image, piece.range, VK_IMAGE_LAYOUT_UNDEFINED,
+                                              piece.layout, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                              any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            }
+        } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
+            // vkCmdUpdateBuffer runs in the transfer stage. MARKER_OUT waits for every earlier command to finish
+            // and sees its writes. MARKER_IN only needs them started, which Vulkan cannot express (TOP_OF_PIPE in a
+            // first scope is no stage at all), so it waits for them to finish too, without their writes. DEFAULT is
+            // ordered like any copy, by the application's barriers.
+            if (write->mode == write_immediate_mode::marker_out)
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            else if (write->mode == write_immediate_mode::marker_in)
+                detail::memory_barrier(vk, command_buffer, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vk.update_buffer(command_buffer, p.write_buffer, p.write_offset, 4, &write->value);
+        } else if (std::holds_alternative<AtomicCopyBuffer>(command)) {
+            // Every earlier write, to the dependent resources among others, finishes and is visible before the copy.
+            // Vulkan promises no atomicity for a transfer; that a naturally aligned 4- or 8-byte copy is one write
+            // is an assumption about the hardware (docs/d3d12_vulkan.md, section 4.2).
+            detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
         }
     }
 }

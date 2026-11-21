@@ -2,8 +2,8 @@
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
-// render-target and depth-stencil clears (whole views or rectangles), copies and resolves. It has no Windows or
-// Vulkan dependency.
+// render-target and depth-stencil clears (whole views or rectangles), copies and resolves, discards, immediate
+// buffer writes and atomic copies. It has no Windows or Vulkan dependency.
 
 #include <array>
 #include <cstdint>
@@ -296,9 +296,51 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
+// DiscardResource. count == all_subresources: the whole resource (a null region). partial: the region had
+// rectangles, so only part of each subresource is discarded.
+struct DiscardResource {
+    ResourceId resource;
+    std::uint32_t first_subresource;
+    std::uint32_t count;
+    bool partial;
+};
+
+// D3D12_WRITEBUFFERIMMEDIATE_MODE.
+namespace write_immediate_mode {
+inline constexpr std::uint32_t normal = 0;      // DEFAULT: ordered like any copy write
+inline constexpr std::uint32_t marker_in = 1;   // after every earlier command has started
+inline constexpr std::uint32_t marker_out = 2;  // after every earlier command has finished
+} // namespace write_immediate_mode
+
+// One D3D12_WRITEBUFFERIMMEDIATE_PARAMETER: a 32-bit value written at a GPU virtual address.
+struct WriteImmediate {
+    std::uint64_t address;
+    std::uint32_t value;
+    std::uint32_t mode;
+};
+
+// D3D12_SUBRESOURCE_RANGE_UINT64 of a dependent resource: [begin, end) in bytes of one subresource.
+struct DependentRange {
+    ResourceId resource;
+    std::uint32_t subresource;
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+
+// AtomicCopyBufferUINT (bytes 4) and AtomicCopyBufferUINT64 (bytes 8). The copy runs once every earlier write to
+// the dependent resources has finished.
+struct AtomicCopyBuffer {
+    ResourceId dst;
+    std::uint64_t dst_offset;
+    ResourceId src;
+    std::uint64_t src_offset;
+    std::uint32_t bytes;
+    std::vector<DependentRange> dependencies;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource>;
+                             CopyResource, ResolveSubresource, DiscardResource, WriteImmediate, AtomicCopyBuffer>;
 
 class CommandList {
 public:
@@ -380,6 +422,34 @@ public:
         if (!flags || (flags & ~(clear_depth | clear_stencil))) return false;
         if ((flags & clear_depth) && !(depth >= 0.0f && depth <= 1.0f)) return false;
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
+    }
+
+    // DiscardResource: a count of 0 discards nothing, as in D3D12.
+    bool discard(const DiscardResource& discard) {
+        if (!discard.resource) return false;
+        if (discard.count == 0) return !closed_;
+        if (discard.count != all_subresources && discard.first_subresource > all_subresources - discard.count)
+            return false;
+        return append(discard);
+    }
+
+    // WriteBufferImmediate: D3D12 requires a 4-byte aligned, non-null address and one of the three modes.
+    bool write_immediate(const WriteImmediate& write) {
+        if (!write.address || write.address % 4 || write.mode > write_immediate_mode::marker_out) return false;
+        return append(write);
+    }
+
+    // AtomicCopyBufferUINT/UINT64, with the rules of the D3D12 debug layer's ATOMICCOPYBUFFER_* messages (IDs
+    // 1027-1040 in d3d12sdklayers.h): both offsets aligned to the copy's size and at least one dependency, each on a
+    // named resource. A copy of a value onto itself (vkCmdCopyBuffer forbids the overlap) is refused too.
+    bool atomic_copy(const AtomicCopyBuffer& copy) {
+        if ((copy.bytes != 4 && copy.bytes != 8) || !copy.dst || !copy.src) return false;
+        if (copy.dst == copy.src && copy.dst_offset == copy.src_offset) return false;
+        if (copy.dst_offset % copy.bytes || copy.src_offset % copy.bytes) return false;
+        if (copy.dependencies.empty()) return false;
+        for (const auto& d : copy.dependencies)
+            if (!d.resource) return false;
+        return append(copy);
     }
 
     bool close() {

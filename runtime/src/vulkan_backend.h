@@ -32,7 +32,7 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage)
+    X(vkCmdResolveImage) X(vkCmdUpdateBuffer)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -50,7 +50,7 @@ struct VulkanDeviceFunctions {
                vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
                vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
-               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage;
+               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage && vkCmdUpdateBuffer;
     }
 };
 
@@ -72,6 +72,18 @@ public:
         replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
         replay_.copy_image = vk.vkCmdCopyImage;
         replay_.resolve_image = vk.vkCmdResolveImage;
+        replay_.update_buffer = vk.vkCmdUpdateBuffer;
+        // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
+        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
+            for (const auto& [id, b] : resources_) {
+                if (b.image || !b.buffer || !b.va || va < b.va || va - b.va >= b.size || size > b.size - (va - b.va))
+                    continue;
+                buffer = b.buffer;
+                offset = b.buffer_offset + (va - b.va);
+                return true;
+            }
+            return false;
+        };
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
