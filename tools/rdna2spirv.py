@@ -1985,10 +1985,10 @@ class Gen:
             self.emit(f"{r} = OpExtInst %float %glsl RoundEven {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_madak_f32", "v_madmk_f32"):
-            if op == "v_madak_f32":
-                x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[3])
-            else:
-                x, y, z = self.src_f(a[1]), self.src_f(a[3]), self.src_f(a[2])
+            # madak D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`; madmk D = S0 * K + S1, printed
+            # `vdst, src0, K, vsrc1`. In print order both are a[1] * a[2] + a[3]. Until 2026-11-21 madmk read
+            # a[3] as the factor, so it computed S0 * S1 + K.
+            x, y, z = (self.src_f(t) for t in a[1:4])
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{r} = OpFAdd %float {m} {z}")
@@ -3395,14 +3395,13 @@ class Gen:
             self.emit(f"{r} = OpFSub %float {y} {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_fma_f32", "v_fmac_f32", "v_mac_f32", "v_fmaak_f32", "v_fmamk_f32", "v_med3_f32"):
-            if op == "v_fma_f32":
+            if op in ("v_fma_f32", "v_fmaak_f32", "v_fmamk_f32"):
+                # fmaak D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`; fmamk D = S0 * K + S1, printed
+                # `vdst, src0, K, vsrc1`. In print order both are fma(a[1], a[2], a[3]), like v_fma_f32. Until
+                # 2026-11-21 fmamk read a[3] as the factor, so it computed S0 * S1 + K.
                 x, y, z = (self.src_f(t) for t in a[1:4])
             elif op in ("v_fmac_f32", "v_mac_f32"):
                 x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
-            elif op == "v_fmaak_f32":
-                x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[3])
-            elif op == "v_fmamk_f32":
-                x, y, z = self.src_f(a[1]), self.src_f(a[3]), self.src_f(a[2])
             else:
                 x, y, z = (self.src_f(t) for t in a[1:4])
                 lo, hi, r = self.tmp(), self.tmp(), self.tmp()
