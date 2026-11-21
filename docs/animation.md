@@ -235,8 +235,8 @@ Mapping to the name tables:
 
 ### Bone tables and motion matchers
 
-Four small resources carry bone names. One is a standalone name list; three are motion-matcher resources that
-embed a bone table and a `pack:/...motionmatcher` path:
+Four small resources in this index carry full bone names. One is a standalone name list; three are motion-matcher
+resources that embed a bone table and a `pack:/...motionmatcher` path:
 
 | Offset | Inflated | Distinct names | Occurrences | Confirmed joaat32 hashes | Kind |
 |---|---:|---:|---:|---:|---|
