@@ -232,7 +232,23 @@ int main() {
         D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))));
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
-        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)) == E_INVALIDARG);
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
+        EXPECT(options.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_3);
+        EXPECT(options.MaxGPUVirtualAddressBitsPerResource == 40);
+
+        D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va_support{};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va_support, sizeof(va_support))));
+        EXPECT(va_support.MaxGPUVirtualAddressBitsPerResource == 40);
+        EXPECT(va_support.MaxGPUVirtualAddressBitsPerProcess == 48);
+
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support{DXGI_FORMAT_R8G8B8A8_UNORM};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support))));
+        EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+        EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
+        EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
+
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
+        EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
 
         const int footprint_mismatches = compare_footprints(device.p);
         if (footprint_mismatches < 0)

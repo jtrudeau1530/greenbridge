@@ -589,6 +589,92 @@ public:
             if (v1) arch->IsolatedMMU = TRUE;
             return S_OK;
         }
+        case D3D12_FEATURE_D3D12_OPTIONS: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
+            *opts = {};
+            opts->DoublePrecisionFloatShaderOps = TRUE;
+            opts->OutputMergerLogicOp = TRUE;
+            opts->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
+            opts->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+            opts->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;  // Bindless descriptor indexing supported
+            opts->PSSpecifiedStencilRefSupported = TRUE;
+            opts->TypedUAVLoadAdditionalFormats = TRUE;
+            opts->ROVsSupported = TRUE;
+            opts->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+            opts->MaxGPUVirtualAddressBitsPerResource = 40;
+            opts->StandardSwizzle64KBSupported = FALSE;
+            opts->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
+            opts->CrossAdapterRowMajorTextureSupported = FALSE;
+            opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
+            opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+            return S_OK;
+        }
+        case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
+            if (size != sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT)) return E_INVALIDARG;
+            auto* va = static_cast<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT*>(data);
+            // The console and PC BDA support 48-bit GPU virtual addresses (section 4.1).
+            va->MaxGPUVirtualAddressBitsPerResource = 40;
+            va->MaxGPUVirtualAddressBitsPerProcess = 48;
+            return S_OK;
+        }
+        case D3D12_FEATURE_FORMAT_SUPPORT: {
+            if (size != sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT)) return E_INVALIDARG;
+            auto* fs = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
+            fs->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
+            fs->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
+            const Format fmt = vulkan_format(fs->Format, false);
+            const Format depth_fmt = vulkan_format(fs->Format, true);
+            const VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
+            if (vk_fmt == VK_FORMAT_UNDEFINED || !state_.format_properties) {
+                return DXGI_ERROR_UNSUPPORTED;
+            }
+            VkFormatProperties props{};
+            state_.format_properties(state_.info.physical, vk_fmt, &props);
+            const VkFormatFeatureFlags optimal = props.optimalTilingFeatures;
+            const VkFormatFeatureFlags buffer = props.bufferFeatures;
+
+            D3D12_FORMAT_SUPPORT1 s1 = D3D12_FORMAT_SUPPORT1_NONE;
+            D3D12_FORMAT_SUPPORT2 s2 = D3D12_FORMAT_SUPPORT2_NONE;
+
+            if (buffer != 0) s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
+            if (buffer & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) s1 |= D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
+            if (fs->Format == DXGI_FORMAT_R16_UINT || fs->Format == DXGI_FORMAT_R32_UINT)
+                s1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
+
+            if (optimal & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+                s1 |= D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+                      D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+                      D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
+            }
+            if (buffer & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT) {
+                s1 |= D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
+            }
+            if (optimal & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) {
+                s1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
+            }
+            if (optimal & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+                s1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+            }
+            if (optimal & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) {
+                s1 |= D3D12_FORMAT_SUPPORT1_BLENDABLE;
+            }
+            if (optimal & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+                s1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
+            }
+            if ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
+                (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) {
+                s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+                s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+                if ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) ||
+                    (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT)) {
+                    s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+                }
+            }
+            fs->Support1 = s1;
+            fs->Support2 = s2;
+            return S_OK;
+        }
         default:
             // Not answered yet. The log above lists every query; answers are added as the trace asks for them.
             return E_INVALIDARG;
