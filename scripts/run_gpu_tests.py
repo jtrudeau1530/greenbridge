@@ -318,6 +318,15 @@ def main() -> int:
     ap.add_argument("--filter", default="")
     a = ap.parse_args()
 
+    ext = ".exe" if os.name == "nt" else ""
+    missing = [t + ext for t in ("vk_compute_test", "vk_store_test", "vk_harness")
+               if not os.path.isfile(os.path.join(a.build, t + ext))]
+    if missing:
+        sys.exit(f"Test programs not found in {os.path.abspath(a.build)}: {', '.join(missing)}\n"
+                 "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
+                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
+                 "Vulkan headers (vulkan-headers on Arch) and configure again.")
+
     work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
     try:
         return run_suite(a, work)
