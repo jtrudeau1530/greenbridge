@@ -244,9 +244,13 @@ def main():
                 print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
         rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
     write_output(a.out, rows, summary)
+    top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
     print(json.dumps({k: summary[k] for k in
                       ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",
-                       "span", "readable_fraction", "bink2_files", "signatures")}, indent=1))
+                       "span", "readable_fraction", "bink2_files")}, indent=1))
+    print(f"{len(summary['signatures'])} signature classes; top 15:")
+    for name, counts in top.items():
+        print(f"  {name:24} {counts['files']:6} files {counts['stored']:12} stored {counts['inflated']:12} inflated")
     return 0
 
 

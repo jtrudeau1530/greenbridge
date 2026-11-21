@@ -171,7 +171,7 @@ The last 21 streams are one logical `RBF0` blob split into 64 KiB blocks (20 × 
 They hold 58,391 stored / 1,348,436 inflated bytes and 20,224 printable runs (4,819 distinct). The readable
 content is a rig-set manager, not clip keyframes:
 
-| Token | Occurrences | Distinct |
+| Lowercase token | Occurrences | Distinct |
 |---|---:|---:|
 | `anim/rigset/` paths | 1,126 | 1,126 |
 | `anim/rig/` paths | 6,677 | 3,669 |
@@ -186,6 +186,9 @@ content is a rig-set manager, not clip keyframes:
 | `facial` | 164 | 5 |
 | `motion` | 150 | 1 |
 | `bone`, `SKEL_`, `clip` | 0 | 0 |
+
+Counts are case-sensitive lowercase matches. Case-insensitively, `bone` is 4/2 and `skel` is 2/1, all inside two
+rig path names; `clip` stays 0. `facial` and `motion` also appear capitalised in a few path names.
 
 Schema field names include `rage__crRigSetManager`, `RigSet`, `Item`, `Entries`, `Dictionary`, `Priority`, `key`,
 `canonical@legacy`, `canonical@source`, `generated@source`, `pipelined@source`, `deformation`, `facial`,
