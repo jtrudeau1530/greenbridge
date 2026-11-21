@@ -320,6 +320,13 @@ constexpr const char* kDtor = "??1XboxBvhBuilder@@QEAA@XZ";
 constexpr size_t kObjectBuffer = 1u << 20;
 constexpr uint8_t kSentinel = 0xCD;
 
+// The module's TLS index, whichever loader this builds against: #95 records a slot (has_tls_slot/tls_slot), #93
+// a module TLS index (tls_index, kNoTlsIndex when there is none). ~0u means no TLS.
+template <class M>
+auto module_tls_index(const M& m, int) -> decltype(m.tls_index, uint32_t()) { return m.tls_index; }
+template <class M>
+auto module_tls_index(const M& m, long) -> decltype(m.tls_slot, uint32_t()) { return m.has_tls_slot ? m.tls_slot : ~0u; }
+
 }  // namespace
 
 int main() {
@@ -371,7 +378,8 @@ int main() {
         const DWORD init = guarded_initialise(&loader);
         check(init == 0, "Loader::initialise (TLS, DllMain) succeeds" + (init ? " (exception " + hex(init) + ")" : ""));
         if (init) return 1;
-        std::printf("TLS: %s slot %u\n", bvh.has_tls_slot ? "loader" : "no", bvh.tls_slot);
+        const uint32_t tls = module_tls_index(bvh, 0);
+        std::printf("TLS: %s index %u\n", tls != ~0u ? "loader" : "no", tls);
 
         ID3D12Device* pc = nullptr;
         const bool on_vulkan = env("LEONIDA_BVH_DEVICE") == "vulkan";

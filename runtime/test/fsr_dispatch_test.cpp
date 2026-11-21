@@ -227,6 +227,13 @@ void print_slot_hits(const void* proxy) {
     note("descriptor-heap slots hit:" + (heap.empty() ? std::string(" none") : heap));
 }
 
+// The module's TLS index, whichever loader this builds against: #95 records a slot (has_tls_slot/tls_slot), #93
+// a module TLS index (tls_index, kNoTlsIndex when there is none). ~0u means no TLS.
+template <class M>
+auto module_tls_index(const M& m, int) -> decltype(m.tls_index, uint32_t()) { return m.tls_index; }
+template <class M>
+auto module_tls_index(const M& m, long) -> decltype(m.tls_slot, uint32_t()) { return m.has_tls_slot ? m.tls_slot : ~0u; }
+
 }  // namespace
 
 int main() {
@@ -282,12 +289,13 @@ int main() {
         const DWORD init = guarded_initialise(&loader);
         check(init == 0, "Loader::initialise (TLS, DllMain) succeeds" + (init ? " (exception " + hex(init) + ")" : ""));
         if (init) return 1;
-        std::printf("TLS: %s slot %u\n", fsr.has_tls_slot ? "loader" : "no", fsr.tls_slot);
-        if (fsr.has_tls_slot) {
+        const uint32_t tls = module_tls_index(fsr, 0);
+        std::printf("TLS: %s index %u\n", tls != ~0u ? "loader" : "no", tls);
+        if (tls != ~0u) {
             // __declspec(thread) code reads TEB->ThreadLocalStoragePointer[_tls_index] (gs:[58h]), not TlsGetValue.
             auto** tls_array = reinterpret_cast<void**>(__readgsqword(0x58));
-            void* seen = tls_array ? tls_array[fsr.tls_slot] : nullptr;
-            note("TLS check: ThreadLocalStoragePointer[" + std::to_string(fsr.tls_slot) + "] = " +
+            void* seen = tls_array ? tls_array[tls] : nullptr;
+            note("TLS check: ThreadLocalStoragePointer[" + std::to_string(tls) + "] = " +
                  hex(reinterpret_cast<uint64_t>(seen)) + ", loader block = " + hex(reinterpret_cast<uint64_t>(fsr.tls_block)));
             // A TlsAlloc index names TEB->TlsSlots, a different array: the image would read another module's TLS
             // block, and its thread-safe statics then fault or not depending on what is there (#93 fixes this).
