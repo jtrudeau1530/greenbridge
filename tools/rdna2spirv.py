@@ -88,6 +88,8 @@ class Gen:
         self.uses_pops = False
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
+        self.uses_bvh = False
+        self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
         self.uses_lds = False
         self.lds_dwords = 16384        # CS: set from RSRC2 LDS_SIZE (power of two, covers every offset used)
@@ -1207,6 +1209,14 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
+    def cl(self, v):
+        """64-bit unsigned constant id (declared with the PhysicalStorageBuffer types)."""
+        v &= 0xFFFFFFFFFFFFFFFF
+        if v not in self.lconsts:
+            self.lconsts[v] = f"%cl{v:x}"
+        self.uses_psb = True
+        return self.lconsts[v]
+
     def wave_lane(self):
         """This invocation's hardware lane within its wave. Compute and mesh shaders: LocalInvocationIndex mod the
         wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane, which is
@@ -1721,6 +1731,8 @@ class Gen:
                 r = self.tmp()
                 self.emit(f"{r} = OpFConvert %float {x}")
                 self.dst(a[0], self.tou(r))
+        elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
+            self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64":
             # D = ((1 << size) - 1) << offset as a lane mask: in the per-lane model this lane's bit is
             # offset <= lane < offset + size (size/offset taken mod 64).
@@ -3607,6 +3619,253 @@ class Gen:
         self.emit(f"OpBranch {end}")
         self.emit(f"{end} = OpLabel")
 
+    # ---- ray tracing: image_bvh(64)_intersect_ray ----
+    def image_bvh(self, op, a, mods):
+        """One BVH traversal step against AMD's hardware node format, emulated over buffer reads. Semantics follow
+        Mesa RADV's software path (radv_nir_rt_common.c: intersect_ray_amd_software_box / _tri), which RADV uses
+        in place of this instruction. Node id = byte address >> 3 with the node type in bits [2:0]: 0..3 triangle,
+        4 box16, 5 box32. Address = descriptor base + ((node & ~7) << 3); the base is BVH descriptor bits [39:0]
+        taken in 256-byte units (ASSUMPTION: RADV only ever uses base 0). Box nodes return the four child ids
+        (misses and inactive boxes = 0xFFFFFFFF), sorted by entry distance when the descriptor's box_sort_enable
+        (bit 63) is set. Triangle nodes return (t/|det|, sign(det), v/|det|, w/|det|), or (inf, 1, 0, 0) on a miss:
+        consumers divide by .y, which gives the same values as the hardware's numerator/denominator form."""
+        if "a16" in mods:
+            raise Unsupported(op + " a16")
+        is64 = op.startswith("image_bvh64")
+        self.uses_bvh = True
+        vd = a[0]
+        regs = self.addr_regs(a[1])
+        need = 12 if is64 else 11
+        if len(regs) < need or vd["k"] != "vgpr":
+            raise Unsupported(op + " operands")
+        desc = self.sgpr_words(a[2], 4)
+        ld = lambda r: self.load_reg("vgpr", r)
+        self.uses_psb = True
+        self.uses_long = True
+        e = self.emit
+        T = self.tmp
+
+        def u64(lo, hi):
+            l, h, sh, r = T(), T(), T(), T()
+            e(f"{l} = OpUConvert %ulong {lo}")
+            e(f"{h} = OpUConvert %ulong {hi}")
+            e(f"{sh} = OpShiftLeftLogical %ulong {h} %c64_32")
+            e(f"{r} = OpBitwiseOr %ulong {sh} {l}")
+            return r
+
+        # descriptor base (bits [39:0], 256-byte units) and sort flag
+        bhi, base40, base = T(), T(), T()
+        e(f"{bhi} = OpBitwiseAnd %uint {desc[1]} {self.cu(0xFF)}")
+        base40 = u64(desc[0], bhi)
+        e(f"{base} = OpShiftLeftLogical %ulong {base40} {self.cl(8)}")
+        sortb, sort = T(), T()
+        e(f"{sortb} = OpShiftRightLogical %uint {desc[1]} {self.cu(31)}")
+        e(f"{sort} = OpINotEqual %bool {sortb} {self.cu(0)}")
+        # node id
+        if is64:
+            node = u64(ld(regs[0]), ld(regs[1]))
+            rest = regs[2:]
+        else:
+            n32 = T()
+            e(f"{n32} = OpUConvert %ulong {ld(regs[0])}")
+            node = n32
+            rest = regs[1:]
+        nlo, ntype = T(), T()
+        e(f"{nlo} = OpUConvert %uint {node}")
+        e(f"{ntype} = OpBitwiseAnd %uint {nlo} {self.cu(7)}")
+        nm, off, addr = T(), T(), T()
+        e(f"{nm} = OpBitwiseAnd %ulong {node} {self.cl(0xFFFFFFFFFFFFFFF8)}")
+        e(f"{off} = OpShiftLeftLogical %ulong {nm} {self.cl(3)}")
+        e(f"{addr} = OpIAdd %ulong {base} {off}")
+        ptr = T()
+        e(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+
+        def ldw(i):
+            pp, v = T(), T()
+            e(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+            e(f"{v} = OpLoad %uint {pp} Aligned 4")
+            return v
+
+        f = lambda r: self.tof(ld(r))
+        tmax = f(rest[0])
+        org = [f(r) for r in rest[1:4]]
+        dirv = [f(r) for r in rest[4:7]]
+        inv = [f(r) for r in rest[7:10]]
+        INF, ONE, NEGMAX, POSMAX = (self.tof(self.cu(x)) for x in (0x7F800000, 0x3F800000, 0xFF7FFFFF, 0x7F7FFFFF))
+        out = lambda k, v: self.dst({"k": "vgpr", "r": vd["r"] + k, "n": 1}, v)
+
+        def fop(o, x, y):
+            r = T()
+            e(f"{r} = {o} %float {x} {y}")
+            return r
+
+        def fext(name, *xs):
+            r = T()
+            e(f"{r} = OpExtInst %float %glsl {name} {' '.join(xs)}")
+            return r
+
+        def bop(o, x, y):
+            r = T()
+            e(f"{r} = {o} %bool {x} {y}")
+            return r
+
+        def sel(c, x, y, ty="%float"):
+            r = T()
+            e(f"{r} = OpSelect {ty} {c} {x} {y}")
+            return r
+
+        is_tri, is_b16, is_box = T(), T(), T()
+        e(f"{is_tri} = OpULessThan %bool {ntype} {self.cu(4)}")
+        e(f"{is_b16} = OpIEqual %bool {ntype} {self.cu(4)}")
+        bx16 = T()
+        e(f"{bx16} = OpIEqual %bool {ntype} {self.cu(5)}")
+        e(f"{is_box} = OpLogicalOr %bool {is_b16} {bx16}")
+        L = {k: T() + "_" + k for k in ("tri", "nt", "box", "oth", "end1", "end2")}
+        e(f"OpSelectionMerge {L['end1']} None")
+        e(f"OpBranchConditional {is_tri} {L['tri']} {L['nt']}")
+
+        # ---------------- triangle ----------------
+        e(f"{L['tri']} = OpLabel")
+        V = [[self.tof(ldw(3 * j + c)) for c in range(3)] for j in range(3)]
+        ad = [fext("FAbs", d) for d in dirv]
+        c01, c02, c12 = bop("OpFOrdGreaterThanEqual", ad[0], ad[1]), bop("OpFOrdGreaterThanEqual", ad[0], ad[2]), \
+            bop("OpFOrdGreaterThanEqual", ad[1], ad[2])
+        k_a = sel(c02, self.cu((0 << 4) | (2 << 2) | 1), self.cu((2 << 4) | (1 << 2) | 0), "%uint")
+        k_b = sel(c12, self.cu((1 << 4) | (0 << 2) | 2), self.cu((2 << 4) | (1 << 2) | 0), "%uint")
+        pk = sel(c01, k_a, k_b, "%uint")
+        kx0, ky0, kz = T(), T(), T()
+        e(f"{kx0} = OpBitwiseAnd %uint {pk} {self.cu(3)}")
+        e(f"{ky0} = OpBitFieldUExtract %uint {pk} {self.cu(2)} {self.cu(2)}")
+        e(f"{kz} = OpShiftRightLogical %uint {pk} {self.cu(4)}")
+        dvec, ivec = T(), T()
+        e(f"{dvec} = OpCompositeConstruct %v3float {' '.join(dirv)}")
+        e(f"{ivec} = OpCompositeConstruct %v3float {' '.join(inv)}")
+
+        def vx(vec, i):
+            r = T()
+            e(f"{r} = OpVectorExtractDynamic %float {vec} {i}")
+            return r
+        dkz = vx(dvec, kz)
+        neg = bop("OpFOrdLessThan", dkz, "%f0")
+        kx = sel(neg, ky0, kx0, "%uint")
+        ky = sel(neg, kx0, ky0, "%uint")
+        sz = vx(ivec, kz)
+        sx = fop("OpFMul", vx(dvec, kx), sz)
+        sy = fop("OpFMul", vx(dvec, ky), sz)
+        rel = []
+        for j in range(3):
+            vv = T()
+            comps = [fop("OpFSub", V[j][c], org[c]) for c in range(3)]
+            e(f"{vv} = OpCompositeConstruct %v3float {' '.join(comps)}")
+            rel.append(vv)
+        def shear(vv):
+            zk = vx(vv, kz)
+            return (fop("OpFSub", vx(vv, kx), fop("OpFMul", sx, zk)),
+                    fop("OpFSub", vx(vv, ky), fop("OpFMul", sy, zk)), zk)
+        (ax, ay, az0), (bx, by, bz0), (cx, cy, cz0) = (shear(r) for r in rel)
+        uu = fop("OpFSub", fop("OpFMul", cx, by), fop("OpFMul", cy, bx))
+        vv_ = fop("OpFSub", fop("OpFMul", ax, cy), fop("OpFMul", ay, cx))
+        ww = fop("OpFSub", fop("OpFMul", bx, ay), fop("OpFMul", by, ax))
+        lt0 = lambda x: bop("OpFOrdLessThan", x, "%f0")
+        gt0 = lambda x: bop("OpFOrdGreaterThan", x, "%f0")
+        eq0 = lambda x: bop("OpFOrdEqual", x, "%f0")
+        le0 = lambda x: bop("OpFOrdLessThanEqual", x, "%f0")
+        orr = lambda x, y: bop("OpLogicalOr", x, y)
+        andd = lambda x, y: bop("OpLogicalAnd", x, y)
+        cback = orr(orr(lt0(uu), lt0(vv_)), lt0(ww))
+        cfront = orr(orr(gt0(uu), gt0(vv_)), gt0(ww))
+        cond = T()
+        e(f"{cond} = OpLogicalNot %bool {andd(cback, cfront)}")
+        ea, eb, ec = eq0(uu), eq0(vv_), eq0(ww)
+
+        def edge(v0x, v0y, v1x, v1y):
+            tx = fop("OpFSub", v1x, v0x)
+            ty = fop("OpFSub", v1y, v0y)
+            return sel(eq0(tx), lt0(ty), lt0(tx), "%bool")
+
+        def vert(v0x, v1x, v2x):
+            return andd(le0(fop("OpFSub", v1x, v0x)), gt0(fop("OpFSub", v2x, v0x)))
+        iea = andd(ea, edge(bx, by, cx, cy))
+        ieb = andd(eb, edge(cx, cy, ax, ay))
+        iec = andd(ec, edge(ax, ay, bx, by))
+        ie = andd(cond, orr(orr(iea, ieb), iec))
+        isva, isvb, isvc = andd(eb, ec), andd(ea, ec), andd(ea, eb)
+        iva = andd(isva, vert(ax, bx, cx))
+        ivb = andd(isvb, vert(bx, cx, ax))
+        ivc = andd(isvc, vert(cx, ax, bx))
+        isv = orr(orr(isva, isvb), isvc)
+        nisv = T()
+        e(f"{nisv} = OpLogicalNot %bool {isv}")
+        iv = orr(nisv, orr(orr(iva, ivb), ivc))
+        ie2 = andd(ie, iv)
+        cedge = orr(orr(ea, eb), ec)
+        hitc = sel(cedge, ie2, cond, "%bool")
+        det = fop("OpFAdd", uu, fop("OpFAdd", vv_, ww))
+        azz, bzz, czz = (fop("OpFMul", sz, z) for z in (az0, bz0, cz0))
+        tt = fop("OpFAdd", fop("OpFAdd", fop("OpFMul", uu, azz), fop("OpFMul", vv_, bzz)), fop("OpFMul", ww, czz))
+        sg = fext("FSign", det)
+        ts = fop("OpFMul", sg, tt)
+        front = T()
+        e(f"{front} = OpLogicalNot %bool {lt0(ts)}")
+        hit = andd(hitc, front)
+        dab = fext("FAbs", det)
+        rt = sel(hit, fop("OpFDiv", tt, dab), INF)
+        rs = sel(hit, sg, ONE)
+        rv = sel(hit, fop("OpFDiv", vv_, dab), "%f0")
+        rw = sel(hit, fop("OpFDiv", ww, dab), "%f0")
+        for k, v in enumerate((rt, rs, rv, rw)):
+            out(k, self.tou(v))
+        e(f"OpBranch {L['end1']}")
+
+        # ---------------- not a triangle ----------------
+        e(f"{L['nt']} = OpLabel")
+        e(f"OpSelectionMerge {L['end2']} None")
+        e(f"OpBranchConditional {is_box} {L['box']} {L['oth']}")
+        e(f"{L['box']} = OpLabel")
+        invc = [fext("FClamp", d, NEGMAX, POSMAX) for d in inv]
+        dist, idx = [], []
+        for i in range(4):
+            child = ldw(i)
+            # box32: min/max f32 at 16 + 24 i; box16: 6 halves at 16 + 12 i (min x,y,z, max x,y,z)
+            m32 = [self.tof(ldw(4 + 6 * i + c)) for c in range(6)]
+            h = [ldw(4 + 3 * i + c) for c in range(3)]
+            m16 = []
+            for w in h:
+                v2 = T()
+                e(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {w}")
+                for c in range(2):
+                    x = T()
+                    e(f"{x} = OpCompositeExtract %float {v2} {c}")
+                    m16.append(x)
+            mm = [sel(is_b16, m16[c], m32[c]) for c in range(6)]
+            b0 = [fop("OpFMul", fop("OpFSub", mm[c], org[c]), invc[c]) for c in range(3)]
+            b1 = [fop("OpFMul", fop("OpFSub", mm[3 + c], org[c]), invc[c]) for c in range(3)]
+            tmin = fext("FMax", fext("FMax", fext("FMin", b0[0], b1[0]), fext("FMin", b0[1], b1[1])),
+                        fext("FMin", b0[2], b1[2]))
+            tmx = fext("FMin", fext("FMin", fext("FMax", b0[0], b1[0]), fext("FMax", b0[1], b1[1])),
+                       fext("FMax", b0[2], b1[2]))
+            notnan = T()
+            e(f"{notnan} = OpFOrdEqual %bool {mm[0]} {mm[0]}")
+            h1 = bop("OpFOrdGreaterThanEqual", tmx, fext("FMax", "%f0", tmin))
+            h2 = bop("OpFOrdLessThan", tmin, tmax)
+            hb = andd(notnan, andd(h1, h2))
+            dist.append(sel(hb, tmin, INF))
+            idx.append(sel(hb, child, self.cu(0xFFFFFFFF), "%uint"))
+        for p_, q_ in ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2)):
+            sw = andd(sort, bop("OpFOrdLessThan", dist[q_], dist[p_]))
+            dist[p_], dist[q_] = sel(sw, dist[q_], dist[p_]), sel(sw, dist[p_], dist[q_])
+            idx[p_], idx[q_] = sel(sw, idx[q_], idx[p_], "%uint"), sel(sw, idx[p_], idx[q_], "%uint")
+        for k in range(4):
+            out(k, idx[k])
+        e(f"OpBranch {L['end2']}")
+        e(f"{L['oth']} = OpLabel")
+        for k in range(4):            # instance / aabb nodes are handled by the shader, not the instruction
+            out(k, self.cu(0xFFFFFFFF))
+        e(f"OpBranch {L['end2']}")
+        e(f"{L['end2']} = OpLabel")
+        e(f"OpBranch {L['end1']}")
+        e(f"{L['end1']} = OpLabel")
+
     def ms_export(self, tgt, ins):
         """NGG export in a mesh shader: thread t exports vertex t (pos/param) and primitive t (prim). The values are
         staged in per-invocation variables and written to the mesh outputs at shader end, after
@@ -3855,6 +4114,7 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
+        types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
         types += ["%img2d = OpTypeImage %float 2D 0 0 0 1 Unknown", "%smp = OpTypeSampler",
@@ -3911,6 +4171,8 @@ def assemble(gen):
     gen.consts.setdefault(0, "%c0")
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
+    if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
+        types.append("%v3float = OpTypeVector %float 3")
     gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" for n in gen.outputs]
     # Push constants: s0..s31 user data, then the 64-bit host address of the Xbox GPU VA window (heap base).
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
@@ -4227,7 +4489,9 @@ def fold_far_branches(insns):
     out, i = [], 0
     while i < len(insns):
         w = insns[i:i + 4]
-        if len(w) == 4 and [base_op(x["op"]) for x in w] == ["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"]:
+        ops4 = [base_op(x["op"]) for x in w]
+        if len(w) == 4 and ops4 in (["s_getpc_b64", "s_add_u32", "s_addc_u32", "s_setpc_b64"],
+                                    ["s_getpc_b64", "s_sub_u32", "s_subb_u32", "s_setpc_b64"]):
             g, ad, ac, sp = w
             r = g["args"][0].get("r") if g["args"] and g["args"][0]["k"] == "sgpr" else None
             ok = r is not None and                 [x.get("r") for x in ad["args"][:2]] == [r, r] and ad["args"][2]["k"] == "imm" and                 [x.get("r") for x in ac["args"][:2]] == [r + 1, r + 1] and ac["args"][2]["k"] == "imm" and                 sp["args"] and sp["args"][0].get("r") == r
@@ -4238,6 +4502,8 @@ def fold_far_branches(insns):
                     k -= 1 << 32
                 elif hi != 0:
                     ok = False
+                if ops4[1] == "s_sub_u32":          # backward far branch (loop back-edge)
+                    k = -k
             if ok:
                 out.append({"op": "s_branch", "args": [], "mods": [], "pc": g["pc"],
                             "enc": "".join(x["enc"] for x in w), "target": g["pc"] + 4 + k})

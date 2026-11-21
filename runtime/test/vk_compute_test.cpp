@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include <windows.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -101,6 +102,18 @@ int main(int argc, char** argv) {
     CHECK(vkBindBufferMemory(dev, buf, mem, 0));
     void* map; CHECK(vkMapMemory(dev, mem, 0, bytes, 0, &map));
     std::memset(map, !std::strcmp(argv[3], "exec64") ? 0 : 0xEE, size_t(bytes));
+    if (!std::strcmp(argv[3], "bvh")) {
+        // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
+        // triangle at z=10 (node 0x40, addr 0x200), a triangle at z=5 (node 0x48, addr 0x240), a box the ray
+        // misses, and an inactive (NaN) box. Node id = address >> 3 | type.
+        auto f32 = [&](uint32_t at, float v) { std::memcpy(static_cast<char*>(map) + at, &v, 4); };
+        auto u32 = [&](uint32_t at, uint32_t v) { std::memcpy(static_cast<char*>(map) + at, &v, 4); };
+        u32(0x100, 0x40); u32(0x104, 0x48); u32(0x108, 0x60); u32(0x10C, 0x68);
+        const float boxes[4][6] = {{0, 0, 10, 1, 1, 10}, {0, 0, 5, 1, 1, 5}, {5, 0, 0, 6, 1, 1}, {NAN, 0, 0, 1, 1, 1}};
+        for (int i = 0; i < 4; i++) for (int c = 0; c < 6; c++) f32(0x110 + 24 * i + 4 * c, boxes[i][c]);
+        const float tri[2][9] = {{0, 0, 10, 1, 0, 10, 0, 1, 10}, {0, 0, 5, 1, 0, 5, 0, 1, 5}};
+        for (int t = 0; t < 2; t++) for (int c = 0; c < 9; c++) f32(0x200 + 0x40 * t + 4 * c, tri[t][c]);
+    }
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = buf;
     const uint64_t heap = vkGetBufferDeviceAddress(dev, &bai);
@@ -155,6 +168,11 @@ int main(int argc, char** argv) {
                 uint32_t want = (t >= 16 && t < 48) ? 7u : 0u, got = out[g * 64 + t];
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
+    }
+    if (!std::strcmp(argv[3], "bvh")) {
+        const uint32_t want[8] = {0x48, 0x40, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xC1200000u, 0xBF800000u, 0xBE800000u, 0xBE800000u};
+        for (int i = 0; i < 8; i++) if (out[i] != want[i]) { if (!bad) first_bad = i; bad++; }
+        std::printf("bvh out = %08x %08x %08x %08x | %08x %08x %08x %08x\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
     }
     std::printf("%u groups x 64: %u mismatches", groups, bad);
     if (bad) std::printf(" (first at %u: got 0x%08x)", first_bad, out[first_bad]);
