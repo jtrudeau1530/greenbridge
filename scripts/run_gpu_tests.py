@@ -461,6 +461,15 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == "cs_bounds":
+            # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
+            # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            want = [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
+            dump = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
+            vals = [int(x) for x in dump.partition("=")[2].split()[:len(want)]] if dump else []
+            results.append((name, rc == 0 and vals == want,
+                            " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", "--require-wave64"], env=cs_env)

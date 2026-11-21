@@ -21,7 +21,7 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
 # tests, pixel tests, and ms_w64x_ballot (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + 1)
+         + len(check.PIXEL_TESTS) + 1 + len(check.BOUNDS))
 
 
 class Wave64Checks(unittest.TestCase):
@@ -55,6 +55,9 @@ class Wave64Checks(unittest.TestCase):
                 self.assertFalse(missing_ballot, "missing shader was sent to the harness")
                 return ballot
             self.assertNotIn("--require-wave64", args)
+            if name == "cs_bounds":
+                # 0x12345678, the in-bounds reload, the OOB load's 0, then the untouched 0xEEEEEEEE fill.
+                return 0, "out[0..7] = 305419896 305419896 0 4008636142 4008636142 4008636142 4008636142 4008636142\n"
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":
