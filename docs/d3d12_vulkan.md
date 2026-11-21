@@ -370,6 +370,12 @@ dump; nothing from those files is in this repository):
 The runtime can then reconcile the root signature with the shader's reads and fail loudly on a mismatch instead of
 rendering silently wrong.
 
+`tools/shader_meta.py` (invoked by `tools/rdna2spirv.py` and verified by `tests/test_shader_meta.py`) now emits these
+fields into `spirv/index.json`: `user_sgpr_reads` (`const32`, `ptr64_lo`/`ptr64_hi`, `ptr32_lo`, `vsharp`, `tsharp`,
+`ssharp`), `descriptor_strides`, `uses_code_base`, `literal_samplers`, `input_signature` (ISG1 semantic name/index,
+register, masks, system value, component type), `fssm_sha256`, and `descriptor_access` (DXBC `SFI0` direct-indexing
+bits 25/26 plus table-load and high-dword-truncation flags).
+
 ### 3.6 Shader identity, PSOs and feature selection
 
 A D3D12 PSO carries DXBC containers, not SPIR-V. The layer identifies a shader by hashing the **FSSM payload** (the
