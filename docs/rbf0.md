@@ -58,7 +58,8 @@ archive stores another zlib stream whose first bytes continue the previous recor
 continuation header. The split can fall inside any field: the 20 multi-chunk resources use 2, 3, 4, 8, 10, 17 and
 37 chunks, with 96 continuation streams in total. The record stream carries no length field and no self-size, so a decoder
 must append by archive order and stop when the root close leaves the buffer exactly consumed (or at the next
-known signature). All 20 multi-chunk resources are in the 299.6-302.7 MB archive range.
+known signature). All 20 multi-chunk resources are in the 299.6-302.7 MB archive range. All 20 are wide; the three
+narrow resources are single-stream.
 
 ## 3. Header and record grammar
 

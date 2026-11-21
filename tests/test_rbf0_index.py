@@ -146,7 +146,6 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(r["elements"], 2)
         self.assertEqual(r["attributes"], 0)
         # A close before both declared attributes is a mismatch, not a parse failure.
-        b[-4:] = b"\xff\xff\xff\xff"
         broken = WIDE + _open(0, b"Root", attrs=1) + b"\xff\xff"
         self.assertEqual(rbf0_index.parse_rbf0(broken)["attributes"], 1)
 
