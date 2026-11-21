@@ -7,6 +7,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../tools/rpf9dump/ModelDecodeFailure.cs" Link="ModelDecodeFailure.cs" />
+    <Compile Include="../../tools/rpf9dump/Util.cs" Link="Util.cs" />
     <ProjectReference Include="../../third_party/rpf9-explorer/Core/RpfPreview.Core.csproj" />
   </ItemGroup>
 </Project>
