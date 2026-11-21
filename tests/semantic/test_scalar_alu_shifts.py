@@ -18,10 +18,9 @@ RDNA2 ISA rules (Scalar ALU Operations / SOP2):
     non-zero; cleared to 0 if the 64-bit result is all zeroes).
 
 Translator integration (rdna2spirv):
-  - s_lshl_b64 and s_lshr_b64 pack SGPR pairs into %ulong, mask the shift count with 63,
-    perform OpShiftLeftLogical / OpShiftRightLogical, unpack to low and high dwords,
+  - s_lshl_b64, s_lshr_b64 and s_ashr_i64 pack SGPR pairs into %ulong, mask the shift count with 63,
+    perform OpShiftLeftLogical / OpShiftRightLogical / OpShiftRightArithmetic, unpack to low and high dwords,
     and update %scc via OpSelect.
-  - s_ashr_i64 is currently unhandled in rdna2spirv and must cleanly raise Unsupported.
 """
 import os
 import sys
@@ -464,8 +463,7 @@ class TestSpirvTranslatorIntegration(unittest.TestCase):
         self.assertIn("OpStore %scc", emitted)
         self.assertTrue(g.uses_psb)
 
-    def test_rdna2spirv_ashr_i64_raises_unsupported(self):
-        # As s_ashr_i64 is not implemented in rdna2spirv, the translator must fail loud.
+    def test_rdna2spirv_ashr_i64_emission(self):
         g = rdna2spirv.Gen("ps")
         ins = {
             "op": "s_ashr_i64",
@@ -476,8 +474,15 @@ class TestSpirvTranslatorIntegration(unittest.TestCase):
             ],
             "mods": [],
         }
-        with self.assertRaises(rdna2spirv.Unsupported):
-            g.insn(ins)
+        g.insn(ins)
+        emitted = "\n".join(g.body)
+
+        self.assertIn("OpBitcast %long", emitted)
+        self.assertIn("OpShiftRightArithmetic %long", emitted)
+        self.assertIn("OpBitcast %ulong", emitted)
+        self.assertIn("OpBitwiseAnd %uint", emitted)
+        self.assertIn("OpStore %scc", emitted)
+        self.assertTrue(g.uses_psb)
 
     def test_spirv_expansion_logic_matches_interpreter(self):
         # Simulate the exact SPIR-V sequence emitted by rdna2spirv and verify equivalence with ref_s_lshl_b64.
