@@ -122,6 +122,8 @@ class Gen:
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
+        self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
+        self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
 
     def tmp(self):
@@ -148,6 +150,8 @@ class Gen:
     def store_reg(self, kind, r, val):
         if kind == "sgpr":
             self.mask_sgprs.discard(r)
+            if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
+                self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
         p = self.tmp()
         self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
@@ -675,8 +679,8 @@ class Gen:
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x3")
         dmask = int(dm.split(":")[1], 0)
         vdata, addr = a[0], self.addr_regs(a[1])
-        img_idx = self.desc_lookup(self.sgpr_words(a[2], 8))
-        smp_idx = self.desc_lookup(self.sgpr_words(a[3], 4) + [self.cu(0xFFFFFFFF)] * 4)
+        img_idx = self.desc_lookup_sgpr(a[2], 8)
+        smp_idx = self.desc_lookup_sgpr(a[3], 4)
         ip, img, sp, smp, si = (self.tmp() for _ in range(5))
         self.emit(f"{ip} = OpAccessChain %{'_ptr_UC_imga' if arr else '_ptr_UC_img'} "
                   f"{'%images_arr' if arr else '%images'} {img_idx}")
@@ -3223,6 +3227,49 @@ class Gen:
         self.emit(f"{r} = OpLoad %uint {iv}")
         return r
 
+    def desc_cache_ok(self):
+        """True when the next instruction is emitted at the top level of the basic block, outside any selection or
+        loop construct an earlier instruction opened and has not yet reached the merge label of. An id defined
+        there dominates everything after it in the block. One defined inside a construct would not dominate the
+        code after the merge, so lookups made there are not cached. The body is append-only within a block, so
+        this only reads the lines added since the last call."""
+        body, seen, open_ = self._scan
+        if body is not self.body:
+            body, seen, open_ = self.body, 0, []
+        for line in body[seen:]:
+            s = line.strip()
+            if s.startswith(("OpSelectionMerge ", "OpLoopMerge ")):
+                open_.append(s.split()[1])
+            elif s.endswith("= OpLabel"):
+                name = s.split()[0]
+                if name in open_:
+                    del open_[open_.index(name):]
+        self._scan = (body, len(body), open_)
+        return not open_
+
+    def desc_lookup_sgpr(self, a, n):
+        """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
+
+        The cache holds the id of the call's result per (first SGPR, n). It is dropped by store_reg when any
+        SGPR of the range is written (all writes to the %sgpr array go through store_reg, including the 64-bit
+        ones, which are two calls, s_load results, v_readlane/v_readfirstlane results and the spare slots lane
+        masks are parked in) and cleared when a basic block starts. Only lookups made at the block's top level
+        are remembered, see desc_cache_ok. Returns the bindless index (a uint id)."""
+        if a["k"] != "sgpr" or a.get("n", 1) < n:
+            raise Unsupported("descriptor operand")
+        key = (a["r"], n)
+        hit = self.desc_cache.get(key)
+        if hit is not None:
+            return hit
+        top = self.desc_cache_ok()
+        words = self.sgpr_words(a, n)
+        if n < 8:
+            words = words + [self.cu(0xFFFFFFFF)] * (8 - n)
+        idx = self.desc_lookup(words)
+        if top:
+            self.desc_cache[key] = idx
+        return idx
+
     def sgpr_words(self, a, n):
         if a["k"] != "sgpr" or a.get("n", 1) < n:
             raise Unsupported("descriptor operand")
@@ -3263,8 +3310,7 @@ class Gen:
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
         vdata, addr = a[0], self.addr_regs(a[1])
-        t = self.sgpr_words(a[2], 8)
-        img_idx = self.desc_lookup(t)
+        img_idx = self.desc_lookup_sgpr(a[2], 8)
         ip, img = self.tmp(), self.tmp()
         self.emit(f"{ip} = OpAccessChain %{iptr} {iarr} {img_idx}")
         self.emit(f"{img} = OpLoad %{itype} {ip}")
@@ -3299,14 +3345,13 @@ class Gen:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
             if dim in self.STORE_DIMS and not d16:
-                self.image_load_typed(dim, t, iv, img, dmask, vdata)
+                self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, img_idx, dmask, vdata)
                 return
             res = self.tmp()
             self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
             ncomp = bin(dmask).count("1")
         else:
-            s = self.sgpr_words(a[3], 4)
-            smp_idx = self.desc_lookup(s + [self.cu(0xFFFFFFFF)] * 4)
+            smp_idx = self.desc_lookup_sgpr(a[3], 4)
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
             self.emit(f"{smp} = OpLoad %smp {sp}")
@@ -3561,16 +3606,16 @@ class Gen:
             flags.append(nz)
         return flags
 
-    def image_load_typed(self, dim, t, iv, img, dmask, vdata):
+    def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata):
         """image_load with the image's numeric type decided at run time (T# FORMAT): UINT/SINT formats are read
         through the uint/sint storage views (OpImageRead, read-without-format), everything else through the float
         sampled view (OpImageFetch, as before). Vulkan requires the view's component type to match the format, so a
-        float view of an integer image would be undefined. Results are the raw bits of the dmask components."""
+        float view of an integer image would be undefined. Results are the raw bits of the dmask components.
+        t1 is the T#'s second dword (FORMAT), idx the bindless index image_load already looked up."""
         di = self.STORE_DIMS[dim][0]
         self.uses_store_views.add(di)
         self.uses_store_reads = True
-        idx = self.desc_lookup(t)
-        is_u, is_s = self.fmt_int_flags(t[1])
+        is_u, is_s = self.fmt_int_flags(t1)
         act = self.active_b()
         L = {k: self.tmp() + "_" + k for k in ("s", "rest", "e2", "u", "f", "e3")}
 
@@ -3638,8 +3683,8 @@ class Gen:
             raise Unsupported("image_store coords")
         vals = [self.load_reg("vgpr", vdata["r"] + i) for i in range(ncomp)] + [self.cu(0)] * (4 - ncomp)
         coords = [self.as_int(c) for c in raw[:nc]]
-        t = self.sgpr_words(a[2], 8)
-        idx = self.desc_lookup(t)
+        idx = self.desc_lookup_sgpr(a[2], 8)
+        t1 = self.load_reg("sgpr", a[2]["r"] + 1)
         self.uses_store_views.add(di)
         for w in [16] + sum(self.int_format_masks(), []):      # constants used by assemble's format masks
             self.cu(w)
@@ -3648,7 +3693,7 @@ class Gen:
         else:
             iv = self.tmp()
             self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if nc == 2 else '%v3int'} {' '.join(coords)}")
-        is_u, is_s = self.fmt_int_flags(t[1])
+        is_u, is_s = self.fmt_int_flags(t1)
         fv = [self.tof(v) for v in vals]
         sv = [self.as_int(v) for v in vals]
         v4f, v4u, v4s = self.tmp(), self.tmp(), self.tmp()
@@ -3699,7 +3744,7 @@ class Gen:
             vdata, addr = a[0], self.addr_regs(a[1])
             if len(addr) < 4:
                 raise Unsupported("image_load_mip coords")
-            idx = self.desc_lookup(self.sgpr_words(a[2], 8))
+            idx = self.desc_lookup_sgpr(a[2], 8)
             self.uses_tex_3d = True
             ip, img, iv, res = self.tmp(), self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_img3 %images_3d {idx}")
@@ -3719,8 +3764,7 @@ class Gen:
         if (dim != "dim:SQ_RSRC_IMG_2D" and not is3d_atomic) or "d16" in mods or "a16" in mods:
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
-        t = self.sgpr_words(a[2], 8)
-        idx = self.desc_lookup(t)
+        idx = self.desc_lookup_sgpr(a[2], 8)
         if is3d_atomic:
             # 3D r32ui storage image atomics (binding 7).
             self.uses_storage3d = True
@@ -5314,6 +5358,7 @@ def translate(path):
         g.body = []
         g.block_label = f"%blk{n}"
         g.mask_sgprs.clear()
+        g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
         term = None
         for ins in blk:
             op = base_op(ins["op"])
