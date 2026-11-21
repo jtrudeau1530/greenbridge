@@ -39,43 +39,50 @@ call it accepts must behave like D3D12.
 
 | Fact | Evidence | Confidence |
 |---|---|---|
-| The public D3D12 interface chain and method order are in the Windows SDK `d3d12.h` (10.0.26100.0 here). The Xbox public reference lists the same base interfaces and method names under `d3d12_xs.h` / `d3d12_xs.lib`; the vtable order is assumed identical (section 3.1). | Local SDK header; [Xbox public graphics reference](https://devdocs.xbox.com/reference/graphics/d3d12); e.g. [CreateCommittedResource](https://devdocs.xbox.com/reference/graphics/d3d12/interfaces/id3d12device/methods/id3d12device_createcommittedresource_public) | Public |
+| The public D3D12 interface chain and method order are in the Windows SDK `d3d12.h` (10.0.26100.0 here). The Xbox public reference lists the same base interfaces and method names under `d3d12_xs.h` / `d3d12_xs.lib`; the measured Xbox device ABI is mostly that order, with deviations at slots 62/76 and heap slots 9/10 (section 7). | Local SDK header; [Xbox public graphics reference](https://devdocs.xbox.com/reference/graphics/d3d12); e.g. [CreateCommittedResource](https://devdocs.xbox.com/reference/graphics/d3d12/interfaces/id3d12device/methods/id3d12device_createcommittedresource_public) | Public; measured deviations in section 7 |
 | The game's raytracing helper is a shipped DLL, `XboxBvhBuilder.dll`, whose export signatures name `ID3D12Device11`, `ID3D12GraphicsCommandList4`, `ID3D12GraphicsCommandList6` and `ID3D12GraphicsCommandList8`, plus Xbox XDXR batched/streaming acceleration-structure types. | PE export table of `XboxBvhBuilder.dll` (884,224 bytes); see Appendix A | Verified |
 | That DLL imports only `d3d12_xs.dll!D3D12SerializeVersionedRootSignature` and `xmem.dll!XMemVirtualQuery` from console libraries. It receives the device and command lists from the game. | PE import table; Appendix A | Verified |
 | `amd_fidelityfx_upscaler_xbox.dll` imports only `d3d12_xs.dll!D3D12CreateRootSignatureDeserializer` and contains the base `ID3D12Device`, `ID3D12Resource`, `ID3D12PipelineState`, `ID3D12RootSignature`, `ID3D12Heap`, `ID3D12DescriptorHeap` and `ID3D12CommandSignature` IIDs. | PE import table and GUID byte scan; Appendix A | Verified |
 | None of the other scanned non-CRT DLLs (`amd_fidelityfx_loader_xbox`, `Bink2Scarlett`, `libHttpClient.GDK`, `XCurl`) imports `d3d12_xs`. | PE import scan; Appendix A | Verified |
 | The package layout lists `game_scarlett_master.exe`, but the file is not in the package folder. | `layout_..._xs.xml`, chunk 1001; directory listing | Verified |
 | `gameos.xvd` is an XVD (`msft-xvd` at file offset 0x200, format version 3) with a high-entropy payload and no plaintext PE headers or D3D12 strings. Extracting `d3d12_xs.dll` from it would require keys, which this project does not do. | Entropy and string scan; Appendix A | Verified |
+| Prior art runs the package DLLs against a PC D3D12 device and measured the Xbox ABI: 6 Xbox-specific static imports across the 16 DLLs, `D3D12XboxCreateDevice`, device slots 62/76, descriptor-heap start handles in RAX, root-signature flags `0x03000000`, and the BVH builder's Xbox DXIL shaders. | [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md), [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md) | Verified by the prior art (running the package DLLs / static imports; section 7) |
 | The translator and its GPU tests already define the shader contract: set 0 bindings 0–19, 144-byte push constants, heap/code base, FNV-1a descriptor hash table, buffer device addresses. | [design.md](design.md#translator-status-and-runtime-contract); `runtime/test/vk_texture_test.cpp` | Verified |
 
-What this does **not** tell us: the `d3d12_xs.dll` export list and device-creation entry point, whether Xbox
-interfaces append vtable methods, the root-signature-to-`s0..s31` mapping, the console descriptor layout, the
-present path, the raytracing path, and the GPU VA window. Section 7.2 lists each with a way to resolve it.
+What this does **not** tell us: the full `d3d12_xs.dll` export list, the `D3D12XboxCreateDevice` params/flag
+layout, the remaining Xbox slot deviations (presentation, command lists, queues, fences), the
+root-signature-to-`s0..s31` mapping, the console descriptor layout, the present path, the raytracing path, and the
+GPU VA window. Section 8.2 lists each with a way to resolve it.
 
 The first run with the executable should be a **trace build**: every free function and COM method is a logging
 stub that returns a failure, and the methods are filled in in the order the game calls them. Section 3.1 describes
-the interception; section 7.2 turns the trace into a work list.
+the interception; section 8.2 turns the trace into a work list.
 
 ## 3. Architecture
 
 ### 3.1 Interception and COM
 
 The current shim (`runtime/shims/d3d12_xs.cpp`) forwards only two free functions to the host `d3d12.dll`. That is
-enough for the bundled middleware, not for the game. The layer adds:
+enough for the bundled middleware's `d3d12_xs` calls, not for the game. The layer adds:
 
-- **Free functions.** Every `d3d12_xs.dll` export the executable imports. The import table is the source of truth;
-  the device-creation entry point is not in the public Series function index, so its name and flags are **Open**.
-  The shim should accept any flag bits, log them, and create the same device object.
+- **Free functions.** Every `d3d12_xs.dll` export the executable imports. The import table is the source of truth.
+  Prior art names the device entry point `D3D12XboxCreateDevice(adapter, params, riid, out)`; its 24-word params
+  struct is only logged there, and the signature is taken from public documentation rather than a header. Treat the
+  params/flag layout as **Open**, accept the call, log the words, and create the device. Do not assume
+  `D3D12CreateDevice` is the console entry point.
 - **COM objects.** `Device`, `CommandQueue`, `CommandAllocator`, `GraphicsCommandList`, `RootSignature`,
   `PipelineState`, `DescriptorHeap`, `Resource`, `Heap`, `Fence`, `QueryHeap`, `CommandSignature`,
   `PipelineLibrary`, and the raytracing/lifetime objects if used.
-- **Vtable layout.** Use the Windows SDK's `d3d12.h` declarations as the ABI contract: implement the public
-  interface chain in order, up to at least `ID3D12Device11` and `ID3D12GraphicsCommandList8`, which the shipped
-  BVH builder names. The interfaces are append-only COM interfaces; exposing one object for all supported IIDs is
-  valid. Device 11 adds `CreateSampler2`; command list 8 adds `OMSetFrontAndBackStencilRef` (public SDK).
-- **Unknown IIDs.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the public chain.
-  If the game then fails, the IID and the call site identify the Xbox-specific interface to reverse. Do not invent
-  a vtable for an unknown IID: a wrong slot is worse than a clean failure.
+- **Vtable layout.** Use the Windows SDK's `d3d12.h` declarations for the public chain, but treat the vtable as
+  **mostly public, not universally public**. Prior art measured device slots 1, 15, 18, 19, 27 and 38 in the
+  desktop order, but also an extra texture-creation method at slot 76, a `CreateComputePipelineState` call at
+  slot 62 where the PC interface it forwarded to presents `CreateStateObject` (different arity), and descriptor-heap
+  start handles returned in RAX at heap slots 9/10. Implement the public chain plus those measured overrides
+  explicitly; do not assume every slot. Device 11 adds `CreateSampler2`; command list 8 adds
+  `OMSetFrontAndBackStencilRef` (public SDK).
+- **Unknown IIDs and slots.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the
+  public chain. If the game then fails, the IID and the call site identify the Xbox-specific interface to reverse.
+  Do not invent a vtable for an unknown IID: a wrong slot is worse than a clean failure.
 - **No host D3D12 or DXGI.** The PE loader currently lets unknown system DLLs bind to the host. `dxgi.dll` and
   `d3d12.dll` must be shimmed, not resolved from System32. Host DXGI would hand the game a desktop adapter and
   swapchain that cannot see our Vulkan device, and host D3D12 would create a second, unrelated device. This is an
@@ -83,9 +90,10 @@ enough for the bundled middleware, not for the game. The layer adds:
 - **Trace first.** Each method wrapper records its name and arguments at a low rate (first call, then every N),
   with a `--trace-d3d12` switch. The trace must not quote game data; API names and counts only.
 
-**Assumption:** the Xbox build's public interfaces have the same vtable order as the Windows SDK. The public Xbox
-reference lists the same methods for the base interfaces, and COM append-only versioning makes insertion
-implausible, but this is not proof. If the game calls a method at an unexpected slot, the trace will show it.
+**Measured, not assumed:** the Xbox device ABI is not uniformly the desktop order. Slots 1/15/18/19/27/38 matched
+in the prior art, while slots 62 and 76 and the heap start-handle return convention did not. Treat every slot as
+unverified until traced; the public interface names and IIDs may still be usable, but the slot mapping is not
+guaranteed.
 
 ### 3.2 Record and replay
 
@@ -225,6 +233,11 @@ The layer's descriptor model:
   GPU handles are arena VAs. `Create*View`, `CopyDescriptors` and `CopyDescriptorsSimple` write the shadow and mark
   the range dirty. The execute-time scan below is the correctness path, so a game that writes raw descriptor bytes
   through a CPU handle still works; dirty tracking is only an optimisation.
+- **Heap start-handle ABI.** Prior art measured `GetCPUDescriptorHandleForHeapStart` and
+  `GetGPUDescriptorHandleForHeapStart` (heap slots 9/10) returning the 8-byte handle in RAX on the Xbox build,
+  while the PC call returns it through a hidden pointer in RDX. A generic sret/IDL thunk must special-case these
+  two slots or the handle is garbage. This is a method-level ABI quirk; the heap object is still the public
+  `ID3D12DescriptorHeap` interface.
 - The bytes written for an image/sampler descriptor are **GFX10 T#/S# structures**, the same structures the
   translator reads. The layer writes them itself in `Create*View`; this does not depend on what the console driver
   wrote. If the game builds descriptors in memory itself, it must use the same format (the shader reads raw T#/S#),
@@ -237,10 +250,11 @@ The layer's descriptor model:
 - Unbounded descriptor ranges (`NumDescriptors = UINT_MAX`) have no end. Scan from the table handle to the end of
   the bound heap, and cache parsed descriptors by key so unchanged slots cost nothing. **Open:** whether the game
   uses unbounded tables; the trace will show the root-signature ranges.
-- The heap stride is the value the layer returns from `GetDescriptorHandleIncrementSize`. Choose 32 bytes for
-  CBV/SRV/UAV (the T# size) and 32 bytes for samplers (16 bytes of S# plus padding). **Open:** the game may
-  hardcode the console increments or infer them from shader address arithmetic. The shader's shift amount gives
-  the stride it expects; the layer must match it.
+- The heap stride is the value the layer returns from `GetDescriptorHandleIncrementSize`. Prior art forwards device
+  slot 15 (`GetDescriptorHandleIncrementSize`) unchanged, but the actual increment values are still **Open**. Choose
+  32 bytes for CBV/SRV/UAV (the T# size) and 32 bytes for samplers (16 bytes of S# plus padding) pending the console
+  value. The game may hardcode the console increments or infer them from shader address arithmetic; the shader's
+  shift amount gives the stride it expects, and the layer must match it.
 - `CopyDescriptors` copies raw bytes. If the descriptor was produced by our `Create*View`, the copy is a valid
   T#/S#; if it came from game memory, it is still valid raw data. No re-encoding is needed.
 - Handle validation: a GPU descriptor handle is an arena VA; the heap registry maps the containing range to a
@@ -279,6 +293,12 @@ The default mapping (**Assumption**) follows root parameter order:
 
 Before the draw/dispatch, the layer copies the current root arguments into a 32-dword block in that order and
 uploads it as push constants. Missing parameters are zero.
+
+**Root-signature flag quirk.** Prior art measured Xbox root-signature descriptors carrying flags `0x03000000`; the
+PC serializer rejects them with `E_INVALIDARG` because its flags live in the low 16 bits. Clear the high byte on a
+private copy before calling the host serializer/deserializer; never modify the game's descriptor. The meaning of the
+bits is unknown. The v1.0 `D3D12SerializeRootSignature` path keeps flags at offset +32, and a descriptor with
+`0x3000001` also fails on the PC runtime.
 
 Things that can invalidate this simple model, all **Open**:
 
@@ -357,14 +377,14 @@ The trace will enumerate them.
 
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
 |---|---|---|
-| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public vtable chain | The shipped BVH builder names Device11; Device5 supplies the public ray-tracing methods. Unknown Xbox IIDs are logged and refused. |
+| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
 | `ID3D12CommandQueue` | `Queue` over one or more `VkQueue`s | Start with one graphics+compute+transfer queue; add dedicated queues when the game uses async compute. `PresentX` is Xbox-specific and not in the public vtable (**Open**). |
 | `ID3D12CommandAllocator` | IR arena + `VkCommandPool` | Reset only when the previous submission's fence is complete. |
 | `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers, front/back stencil ref. |
-| `ID3D12RootSignature` | `RootSignature` + `VkPipelineLayout` | Deserialize the blob with the host `D3D12CreateVersionedRootSignatureDeserializer` when possible; fall back to a local parser. Build the user-SGPR map and static samplers. |
-| `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash → SPIR-V + index entry; PSO state → Vulkan state; dynamic state where possible. |
-| `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Increments are layer-chosen (32/32) pending the console value. |
-| `ID3D12Resource` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed and placed; reserved is stubbed as linear for now. `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
+| `ID3D12RootSignature` | `RootSignature` + `VkPipelineLayout` | Deserialize the blob with the host `D3D12CreateVersionedRootSignatureDeserializer` when possible; clear the measured `0x03000000` flag byte on a copy first; fall back to a local parser. Build the user-SGPR map and static samplers. |
+| `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash → SPIR-V + index entry; PSO state → Vulkan state; dynamic state where possible. The BVH builder's compute PSOs arrive at device slot 62 with a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`. |
+| `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. Increments are layer-chosen (32/32) pending the console value. |
+| `ID3D12Resource` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed and placed; reserved is stubbed as linear for now. Xbox textures may arrive through device slot 76 rather than `CreateCommittedResource` (section 4.2). `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
 | `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get their own `VkDeviceMemory`. Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
 | `ID3D12Fence` / `ID3D12Fence1` | `Fence` over a timeline `VkSemaphore` | `GetCompletedValue` = counter value; `SetEventOnCompletion` = wait thread + Win32 event; CPU `Signal` = host signal. |
 | Resource barriers (legacy) | `vkCmdPipelineBarrier` | Per-subresource state tracking; `BEGIN_ONLY`/`END_ONLY` become conservative full barriers at the begin point. |
@@ -399,19 +419,26 @@ The trace will enumerate them.
 
 ### 4.2 Resources, heaps, placed and reserved
 
+- **Xbox texture creation is a separate device method at slot 76**, not `CreateCommittedResource`. Prior art
+  reports its shape as heap properties / heap flags / description / initial state / clear value / iid / output,
+  forwarded on the PC side to `CreateCommittedResource` slot 27. The description is 56 bytes plus extension words,
+  and its layout field is `0x101` (tiled) or `0x1` (row-major buffer). The PC proxy replaces the layout with a
+  driver-chosen one; our layer must recognise slot 76 and `0x101` explicitly and must not pass `0x101` to the public
+  layout enum. The FidelityFX upscaler creates 10 default-heap resources through this slot, so it is not optional
+  for middleware. The actual console tiled data layout and the detile path remain **Open**.
 - `CreateCommittedResource`: allocate an aligned range in the arena for a buffer, or a separate `VkDeviceMemory`
   for an image; record the initial state. Map `D3D12_HEAP_TYPE_DEFAULT` to device-local memory, `UPLOAD`/`READBACK`
-  to separate host-visible buffers.
+  to separate host-visible buffers. This remains the path for buffers and for any PC-style committed resource.
 - `CreateHeap`: reserve a VA range with the requested size/alignment. `CreatePlacedResource`: assign the resource
   the range at `heap_va + offset`; a buffer uses that range in the arena, an image uses the offset as a key and
   binds its own memory. Vulkan image alignment can exceed D3D12's 64 KiB; because images do not share the arena,
   this mostly affects true aliasing, which is **Open** until tested on the target GPU.
 - `CreateReservedResource`: reserve the full size linearly; tile mapping calls are logged, not emulated, for the
   first boot.
-- `D3D12_RESOURCE_DESC::Layout`: row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a
-  staging copy; `64KB_STANDARD_SWIZZLE` has no Vulkan equivalent. If the game uploads console-tiled data, the
-  layer needs a detile step or a matching tiled image. **Open**; the game's texture upload path is not visible
-  without the executable.
+- `D3D12_RESOURCE_DESC::Layout`: the public `ROW_MAJOR` and `64KB_STANDARD_SWIZZLE` values plus the Xbox `0x101`
+  tiled value from slot 76. Row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a staging
+  copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. If the game uploads console-tiled data,
+  the layer needs a detile step or a matching tiled image. **Open**; the ABI value is known, the data layout is not.
 - Formats: a `DXGI_FORMAT` → `VkFormat` table, including sRGB and typeless variants. Typeless resources get a
   concrete image format plus `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and a `VK_KHR_image_format_list` when views cast
   within the family; unsupported casts are logged and fall back to the resource format. Depth/stencil, BCn and
@@ -536,6 +563,10 @@ own names use the `XDXR` prefix for Xbox's raytracing path:
 
 - Its constructor takes `ID3D12Device11*`; its build/copy/rehydrate methods take
   `ID3D12GraphicsCommandList4/6/8*`.
+- Prior art measured its constructor creating 53 compute pipelines through device slot 62, called with the
+  compute-PSO shape (a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`, two zero words, iid, out); on the PC interface used
+  there slot 62 is `CreateStateObject` (a different arity), so the proxy overrides it. The layer must implement
+  slot 62 as compute-PSO creation, not as a state object.
 - It exposes standard `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC` builds, batched Xbox builds
   (`D3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2`), XDXR stream descriptions
   (`D3D12XBOX_XDXR_STREAM_DESC`), post-build offline statistics, and a `DEHYDRATE` build flag. The exact layouts
@@ -544,14 +575,24 @@ own names use the `XDXR` prefix for Xbox's raytracing path:
   node format: node id = address >> 3 | type, box16/box32/triangle nodes, 256-byte base units. That is the format
   the runtime must produce for the game's compute traversal.
 
+**The builder's own shaders are a separate problem.** They are Xbox DXIL using `@xbox.*` intrinsics, not FSSM
+RDNA2: prior art found 44 of the 53 call non-standard `@xbox.*` functions and fail the PC D3D12 shader compiler,
+and 22 have been lowered to standard DXIL and accepted as pipelines on an RX 7800 XT. Thirty-one of the 53 use raw
+64-bit addresses (global load/store/atomic and `s_load`), so lowering also needs an address-to-resource mapping.
+The existing FSSM translator does not cover these shaders, and their results are not yet checked against a
+reference. If the game uses the builder, the layer needs a DXIL path (or a substitute builder); this is on the
+critical path for the RT effects, not a footnote.
+
 The design choice follows from that: **build AMD-format BVH data, not a `VkAccelerationStructureKHR`, unless the
 shaders are changed to `OpTraceRayKHR`.** The game's 64 RT compute shaders traverse the nodes themselves; a
 Vulkan AS would be invisible to them. Two paths:
 
 1. If `XboxBvhBuilder` does the build with its own compute dispatches (the likely case, given it ships as a DLL
-   with a device and command lists), the layer only has to run those dispatches correctly: buffers, UAVs,
-   descriptors, barriers, indirect dispatch. The standard `BuildRaytracingAccelerationStructure` calls may never
-   reach our command list.
+   with a device and command lists), the layer must translate and run its Xbox DXIL compute shaders — it cannot
+   feed DXIL to Vulkan directly. Buffers, UAVs, descriptors, barriers and indirect dispatch are necessary but not
+   sufficient; the 53 builder shaders need the DXIL path described above, and the 31 raw-address shaders need a
+   VA-to-resource mapping. The standard `BuildRaytracingAccelerationStructure` calls may never reach our command
+   list.
 2. If the game calls `ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure`, the layer must implement
    it. Produce the AMD node layout in the arena, with the same geometry/instance rules the translator assumes,
    and make `GetRaytracingAccelerationStructurePrebuildInfo` return sizes for that layout.
@@ -674,13 +715,13 @@ M0–M2 do not need the executable.
 
 | # | Scope | What it proves | Done when |
 |---|---|---|---|
-| **M0** | Device, one direct queue, allocator/list, fence, fake DXGI factory/adapter/swapchain, clear + present | COM interception, vtable layout, swapchain, frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced |
-| **M1** | Root signature with root constants, one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0 |
-| **M2** | Descriptor heap, `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries |
+| **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/swapchain, clear + present | COM interception, the known Xbox device entry point and ABI overrides, swapchain, frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced |
+| **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0 |
+| **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries |
 | **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report |
 | **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check |
 | **M5** | Mesh shaders, `ExecuteIndirect`, bindless-table pressure, multi-threaded command lists, pipeline cache | World rendering | A stable open-world frame at any frame rate; then profile and optimise |
-| **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format | RT shadows and any RT effects | RT output matches a reference; no unknown XDXR call remains |
+| **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; Xbox DXIL path for the builder's 53 shaders (22 lowered so far) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the DXIL path or a substitute; no unknown XDXR call remains |
 | **M7** | HDR, VRS, PresentX planes, resize, alt-tab, frame pacing | Presentation polish | HDR and resize work on the target display; no validation errors over a long run |
 
 ### 6.1 Minimum API set for the first frame
@@ -688,9 +729,12 @@ M0–M2 do not need the executable.
 M0–M3's synthetic tests need only this subset. The game itself may need more as soon as its first frame does;
 everything else can be absent or a clean failure:
 
-- device creation and `CheckFeatureSupport`; one direct queue, one allocator, one command list, one fence;
+- `D3D12XboxCreateDevice` and `CheckFeatureSupport`; the measured device overrides (heap start handles in RAX;
+  slot 76 texture creation if the game uses it; slot 62, compute-PSO creation in the builder's ABI, is not needed
+  for the first frame); one direct queue, one allocator, one command list, one fence;
 - DXGI factory/adapter/swapchain, `GetBuffer`, `Present`;
-- a root signature with root constants and one descriptor table; one VS+PS PSO and an input layout;
+- a root signature with root constants and one descriptor table, masking `0x03000000` on a copy; one VS+PS PSO and
+  an input layout;
 - a shader-visible CBV/SRV/UAV heap and a sampler heap; `CreateShaderResourceView`, `CreateSampler`,
   `SetDescriptorHeaps`, `SetGraphicsRootDescriptorTable`;
 - one committed vertex/index buffer, one texture, upload through `Map`/`Unmap` or `WriteToSubresource`,
@@ -713,30 +757,117 @@ DXR path.
 If the first frame is a loading screen with a simple UI draw, M3 may be enough; if it is the world, M5 is the real
 minimum. The trace decides, not the milestone labels.
 
-## 7. Known vs unknown
+## 7. Prior art and measured Xbox ABI
 
-### 7.1 Known
+A GPL-2.0-only fork of AnyPS5 (`americas-recomp`, branch `xbox-series`) recompiles the same GTA VI Xbox Series
+shaders and has run the package's DLLs against a PC D3D12 device behind an Xbox-ABI proxy. Its measurements are
+prior art for this design. The findings below are paraphrased; no code or long passages are copied. They were
+verified there by running the package DLLs (`XS_TRACE=1`, per-slot hit counters) or by static import analysis, not
+independently re-measured here. **Basis:** *static imports* means PE import-table analysis; *run* means the package
+DLLs were executed against a PC D3D12 device through the Xbox-ABI proxy.
+
+| Finding | Basis and link | Consequence for this design |
+|---|---|---|
+| Across the 16 package DLLs there are only 6 Xbox-specific static imports: `xmem.dll` → `XMemAlloc`, `XMemFree`, `XMemGetWorkingSetStatistics`, `XMemVirtualQuery`; `d3d12_xs.dll` → `D3D12SerializeVersionedRootSignature`, `D3D12CreateRootSignatureDeserializer`. Both `d3d12_xs` names exist with the same names in the PC `d3d12.dll`. The other 492 functions are standard Windows and 113 are shipped in the package. Argument shapes for the less common `xmem` calls come from caller disassembly; some attribute bits are inferred. | *Static imports* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Confirms the middleware surface is tiny. The repo's `xmem` shim already covers all four; `d3d12_xs` still forwards only the two root-signature functions. The device/queue/command-list surface belongs to the executable. |
+| `D3D12XboxCreateDevice(adapter, params, riid, out)` returns a PC `ID3D12Device` behind the Xbox-ABI proxy. The params struct is 24 words and is only logged; the signature comes from public documentation, not a header. | *Run* — [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md), [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Corrects "device entry point unknown": the entry point is named. The params/flag layout remains **Open**. Do not assume `D3D12CreateDevice`. |
+| Xbox texture creation is device slot 76 (heap properties / heap flags / description / initial state / clear value / iid / out), not `CreateCommittedResource`. The description is 56 bytes plus extension words; its layout field is `0x101` (tiled) or `0x1` (row-major buffer), and the PC proxy forwards it to `CreateCommittedResource` slot 27 with a driver-chosen layout. The FidelityFX upscaler creates 10 default-heap resources this way. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Adds a required Xbox-specific device method and a non-public layout value. `0x101` must not be passed to the public layout enum; the tiled data layout/detile path remains **Open**. See section 4.2. |
+| Device slot 14 is the public `CreateDescriptorHeap`; the returned heap is wrapped because `GetCPUDescriptorHandleForHeapStart` / `GetGPUDescriptorHandleForHeapStart` (heap slots 9/10) return the 8-byte handle in RAX on the Xbox build. The PC call returns it through a hidden pointer in RDX, so the proxy special-cases the return. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Adds a return-convention quirk to the descriptor-heap ABI. A generic IDL/sret thunk will corrupt the handle. See section 3.4. |
+| Xbox root-signature descriptors carry flags `0x03000000`. The PC serializer rejects them with `E_INVALIDARG`; the proxy clears the high byte on a copy. The v1.0 `D3D12SerializeRootSignature` path keeps flags at +32, and `0x3000001` also fails on the PC runtime. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Narrows the root-signature reflection risk. Mask the high byte on a private copy; the meaning of the bits remains **Open**. See section 3.5. |
+| The BVH builder's constructor creates 53 compute pipelines through device slot 62, called with a compute-PSO shape (a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`, two zero words, iid, out). On the PC interface the prior art forwards to, slot 62 is `CreateStateObject` (wrong arity), so the proxy overrides it. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Corrects the assumption that the whole device vtable is public order. Slot 62 must be compute-PSO creation for the builder, not a state object. Slots 1/15/18/19/27/38 did match the desktop order. |
+| A reusable `xbox_device_proxy.h` forwards every slot to a PC object, counts hits per slot and logs first calls with `XS_TRACE=1`; the observed device slots include 1, 14, 15, 16, 18, 19, 27, 38, 62 and 76. Their `xgr` stand-in covers 48 of 398 methods; Xodus (LGPL-2.1) covers 152 of 396 via IDL-generated stubs. | *Run* — [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md), [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Confirms the trace-first approach and shows the long tail. We adopt the *method* (per-slot counters, first-call logging), not the code. |
+| The BVH builder's 53 compute shaders are Xbox DXIL with `@xbox.*` intrinsics; 44 of 53 fail the PC D3D12 shader compiler, 22 have been lowered to standard DXIL and accepted as pipelines, and 31 use raw 64-bit GPU addresses. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | A separate translation path from the FSSM RDNA2 corpus. See section 4.8 and the paragraph below. |
+
+### 7.1 What this confirms, corrects and narrows
+
+**Confirms.**
+
+- The 16 middleware DLLs need only four `xmem` functions and the two `d3d12_xs` root-signature functions. Our
+  earlier statement that the bundled DLLs only import the two root-signature calls was right but incomplete; the
+  four `xmem` imports complete the static surface. The repo's `xmem` shim already implements all four.
+- Device slots 1 (AddRef), 15 (`GetDescriptorHandleIncrementSize`), 18 (`CreateShaderResourceView`),
+  19 (`CreateUnorderedAccessView`), 27 (`CreateCommittedResource`) and 38 (`GetCopyableFootprints`) match the
+  desktop order. Device slot 14 is the public `CreateDescriptorHeap`; only the returned heap's start-handle return
+  is wrapped. The public chain is a usable base for those methods, not a guess.
+- The BVH builder receives the device and command lists from the caller; prior art runs it exactly that way.
+
+**Corrects.**
+
+- **Device creation.** `D3D12XboxCreateDevice` is the entry point. The 24-word params struct is only logged, so
+  the flag/layout meaning is still unknown; the name and call shape are no longer unknown. Prior art returns a PC
+  D3D12 device behind the proxy; this design returns the Vulkan-backed `Device` behind the same call shape.
+- **Vtable.** The Xbox device is not uniformly the public order. Slot 76 is an extra texture-creation method,
+  slot 62 is called with a compute-PSO signature where the PC interface has a state-object method, and the
+  descriptor-heap start handles use a different return convention. Implement the public chain plus explicit
+  measured overrides; do not trust a single generic thunk for every slot.
+- **Texture layout.** Xbox `0x101` tiled is not a public `D3D12_TEXTURE_LAYOUT` value, and slot 76 is the texture
+  path. Our earlier `D3D12_RESOURCE_DESC::Layout` discussion covered only the public enum; it now includes the
+  Xbox value and slot 76.
+- **Root signatures.** The `0x03000000` flags must be masked on a copy before the host serializer/deserializer.
+  Our earlier "forward the blob to the host" was too simple; the PC serializer rejects the Xbox bits.
+- **BVH builder.** Its shaders are Xbox DXIL, not FSSM. "Run the builder's dispatches" therefore needs a DXIL
+  translation/lowering path plus an address-to-resource mapping for the raw-address shaders; the FSSM translator
+  does not cover them.
+
+**Narrows.**
+
+- Presentation (`PresentX` and plane parameters), command-list extensions, and queue/fence creation slots remain
+  unknown; the prior art explicitly stops before them.
+- Descriptor start-handle ABI is known; descriptor bytes and heap increments are still **Open**. Slot 15 is
+  forwarded unchanged, but the actual increment values were not measured.
+- Texture creation ABI and the `0x101` value are known; the tiled data layout, detile path and DCC remain
+  **Open**.
+- The device params (command-queue ring size, scratch memory, debug flags) are unused and their meanings are
+  still unknown.
+- The `xgr` 48/398 and Xodus 152/396 coverage numbers show how large the long tail is. They do not change the
+  plan: implement what the game calls, in the order it calls it.
+
+### 7.2 The BVH builder's Xbox DXIL path
+
+The builder's 53 compute shaders are a second shader front end. They are Xbox DXIL with `@xbox.*` intrinsics that
+map one-to-one to RDNA instructions (global load/store/atomic with 64-bit addresses, `s_load`, min/med/max,
+bitfield insert, alignbyte, cndmask, packed f16 min/max and lane/wave operations). The standard PC DXIL compiler
+rejects 44 of the 53; 22 have been lowered to standard DXIL and compile; the 31 that use raw 64-bit addresses also
+need a table mapping those addresses to resources. This is separate from the FSSM RDNA2 translator, which covers
+the game's 26,503 shaders. A port that uses `XboxBvhBuilder` needs both: FSSM → SPIR-V for the game, and an Xbox
+DXIL → standard DXIL → SPIR-V path (or a substitute builder) for the BVH helper. The prior art has compiled
+lowered shaders but has no reference output yet, so correctness is unverified.
+
+### 7.3 Licence
+
+`americas-recomp` / AnyPS5 is **GPL-2.0-only**. GPL-2.0-only is not compatible with this repository's
+GPL-3.0-or-later, so no code, headers, generated stubs or other implementation text from that tree may be copied
+into Leonida. This section records ABI/format facts and links only; the designs in this document are independent.
+Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code source.
+
+## 8. Known vs unknown
+
+### 8.1 Known
 
 - The public D3D12 ABI and method order (Windows SDK `d3d12.h` 10.0.26100.0); the Xbox public reference lists the
-  same base interfaces and method names under `d3d12_xs.h`, with the vtable order assumed identical.
+  same base interfaces and method names under `d3d12_xs.h`, but the measured Xbox device ABI is only mostly the
+  public order: slots 1/15/18/19/27/38 matched, while slots 62 and 76 and the descriptor-heap start-handle return
+  did not (section 7).
 - The translator/runtime shader contract, and that it works on a real GPU for the tested paths.
 - The package evidence in section 2 and Appendix A: the BVH builder's Device11/CommandList4/6/8 signatures and
   XDXR types, the FSR IIDs, the other DLLs' lack of `d3d12_xs` imports, `gameos.xvd`'s encrypted payload, and the
   absent executable.
+- The prior art's measured Xbox ABI (section 7): 6 Xbox-specific static imports across the 16 DLLs,
+  `D3D12XboxCreateDevice`, device slots 62/76, descriptor-heap start handles in RAX, root-signature flags
+  `0x03000000`, and the BVH builder's Xbox DXIL shaders.
 
-### 7.2 Unknown / open questions
+### 8.2 Unknown / open questions
 
 | # | Question | How to resolve |
 |---|---|---|
-| 1 | What is the device-creation export of `d3d12_xs.dll`, and what do its flags mean? | The executable's import table (`gta6rt --dry-run`, REA `inspect_pe_imports`). Implement a permissive shim for the name that appears. |
-| 2 | Do Xbox interfaces append methods to the public vtables? Which IIDs? | Trace every `QueryInterface` and every method slot. A wrong slot shows as an immediate crash or wrong argument; compare against the SDK vtable. |
-| 3 | How does the console map a root signature to `s0..s31` (order, per-stage visibility, spills above 32 dwords, static samplers, direct-heap base)? | Dump the game's root-signature blobs with the host deserializer; match against the per-shader user-SGPR read sets. If a signature exceeds 32 dwords, reverse the spill pointer from the shader. |
-| 4 | Are Xbox descriptor bytes GFX10 T#/S#, and what are the heap increments? Does the game use `Create*View` or build descriptors itself? | Dump a shader-visible heap after the first `CreateShaderResourceView` and after the first draw; compare the bytes the shader loads with the T# parser. Log `GetDescriptorHandleIncrementSize` and the shader's address shifts. |
+| 1 | The device entry point is now named `D3D12XboxCreateDevice(adapter, params, riid, out)`. What do its 24-word params and flag bits mean? | Public documentation and the executable's call sites. Log the words and accept any flag bits; do not treat a wrong params layout as fatal until the fields are understood. |
+| 2 | Which Xbox device/heap/queue/command-list slots differ? Prior art measured device slots 62 and 76 and descriptor-heap slots 9/10; slot 14 is the public `CreateDescriptorHeap`, with only the returned heap's start-handle return wrapped. Presentation, command-list, queue and fence slots remain unknown. | Trace every `QueryInterface` and every method slot with per-slot hit counters. A wrong slot shows as an immediate crash or wrong argument; compare against the SDK vtable. |
+| 3 | How does the console map a root signature to `s0..s31` (order, per-stage visibility, spills above 32 dwords, static samplers, direct-heap base)? | Dump the game's root-signature blobs with the host deserializer; mask the `0x03000000` flag byte on a copy first; match against the per-shader user-SGPR read sets. If a signature exceeds 32 dwords, reverse the spill pointer from the shader. |
+| 4 | Are Xbox descriptor bytes GFX10 T#/S#, and what are the heap increments? Does the game use `Create*View` or build descriptors itself? | Dump a shader-visible heap after the first `CreateShaderResourceView` and after the first draw; compare the bytes the shader loads with the T# parser. The start-handle return ABI is known (RAX); the increment values still need measuring. |
 | 5 | What is the buffer/descriptor/code VA range, and what arena capacity is needed? | Log every `GetGPUVirtualAddress` and every descriptor base; track the high-water mark. Choose a capacity; grow at a frame boundary if needed. |
 | 6 | Which swapchain/present path is used: DXGI, `PresentX`, or both? | The executable's imports and the first present call. Implement DXGI first; add the PresentX plane compose if the trace shows it. |
-| 7 | Does the game build acceleration structures through the standard D3D12 calls or through `XboxBvhBuilder`'s own compute path? | Log `BuildRaytracingAccelerationStructure`, `CopyRaytracingAccelerationStructure`, `Emit...PostbuildInfo`, and the builder's command-list method calls on the first RT frame. |
+| 7 | Does the game build acceleration structures through the standard D3D12 calls or through `XboxBvhBuilder`'s own compute path? | Log `BuildRaytracingAccelerationStructure`, `CopyRaytracingAccelerationStructure`, `Emit...PostbuildInfo`, and the builder's command-list method calls on the first RT frame. The builder's 53 shaders are Xbox DXIL; 44/53 fail the PC compiler and 22 have been lowered. If the builder path is used, the layer needs a DXIL plan. |
 | 8 | What are the layouts of `D3D12XBOX_XDXR_STREAM_DESC`, the batched build desc, and the offline statistics desc? | Recover from the builder's call sites, or use the NDA GDK headers if available. Do not guess; a wrong layout corrupts memory. |
-| 9 | How are textures uploaded and tiled? Does the game use row-major, 64 KiB swizzle, or console-tiled data? | Trace `CreateCommittedResource`/`CreatePlacedResource` for textures, `Map`/`WriteToSubresource`/`CopyTextureRegion`, and the resource descs. If the game uploads console-tiled data, add a detile step or a matching layout. |
+| 9 | Xbox texture creation is device slot 76 with layout `0x101` (tiled) or `0x1` (row-major). What is the tiled data layout, and does the game upload console-tiled or DCC data? | Trace slot 76, `CopyTextureRegion` and the resource descs. If the game uploads console-tiled data, add a detile step or a matching layout. |
 | 10 | Does the game use binning, DCC, VRS, wave MMA, stream output, tessellation, or amplification shaders? | Scan the PSO/stream subobjects and the shader corpus. Ignore binning for correctness; implement VRS/mesh if present; map WMMA only if `v_mfma` appears. |
 | 11 | What should `CheckFeatureSupport` answer for UMA, resource binding tier, mesh tier, RT tier? | Log every feature query and the game's subsequent behaviour; answer truthfully from Vulkan first. |
 | 12 | Does the game rely on async compute or copy queues for correctness? | Trace queue creation and cross-queue fences. If only performance, serialize on one queue for boot. |
@@ -746,16 +877,20 @@ minimum. The trace decides, not the milestone labels.
 | 16 | Does the game use append/consume UAV counters or typed buffer formats the translator does not model? | Trace UAV descs and shader `buffer_*` ops; extend the translator/runtime together. |
 | 17 | Do upload/readback resources ever reach shaders (as vertex/index buffers or descriptors), and does the `-heap_base` bias work for them? | Trace `CreateCommittedResource` heap types and every VB/IB/descriptor that points at an upload resource; test the bias with a synthetic draw. |
 | 18 | Does the game alias buffers/images in a heap, or use reserved/tiled resources? | Trace `CreatePlacedResource` ranges, aliasing barriers, `CreateReservedResource` and tile mappings. If yes, implement shared memory per heap range or fall back to linear allocations with a clear log. |
+| 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. Compare against the public flag enum and observe the game's behaviour with and without the mask. |
+| 20 | Which of the BVH builder's 53 Xbox DXIL shaders does the game actually use, and can the 31 raw-address shaders be lowered without a reference? | Dump the slot-62 compute PSOs on the first RT frame; lower and compile each; compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
 
-## 8. Risks and non-goals
+## 9. Risks and non-goals
 
 **Risks.**
 
-- **The Xbox-specific vtable.** If the game calls `PresentX` or another appended method at a slot the public header
-  does not define, the layer cannot implement it from public sources. The trace and the import table are the only
-  way to size the problem; NDA headers may be needed for the layout.
+- **Xbox ABI deviations.** The device vtable is mostly public but not uniformly: slot 76 adds texture creation,
+  slot 62 is compute-PSO creation for the BVH builder, descriptor-heap slots 9/10 return in RAX, and root signatures
+  carry `0x03000000`. Use a per-slot proxy with counters; presentation, command-list, queue and fence slots remain
+  unknown. A wrong return convention or slot mapping corrupts state rather than failing cleanly.
 - **Root-signature mapping.** A wrong `s0..s31` packing produces silently wrong rendering, not a crash. The
-  per-shader read-set metadata and a strict mismatch check are the mitigation.
+  per-shader read-set metadata and a strict mismatch check are the mitigation. The `0x03000000` flag mask is a
+  workaround, not an explanation.
 - **The arena.** A single BDA arena is required by the shader contract for buffers, descriptor tables and code; the
   game's buffer working set may exceed `maxBufferSize` or PC VRAM. Host-visible arenas are slow; device-local
   arenas need staging and careful upload/readback handling. This is the main performance risk.
@@ -763,8 +898,11 @@ minimum. The trace decides, not the milestone labels.
   correctness, not speed. Measure early; optimise the table or cache indices without changing the shader contract.
 - **Wave64.** On NVIDIA, wave64 shaders use the translator's 32-wide approximation; cross-half ops are approximate.
   AMD GPUs with 64-wide subgroups are exact. This is a known fidelity gap, not specific to the layer.
-- **Xbox tiling/DCC.** If the game's texture path assumes console tiling or compression metadata, the layer needs a
-  detile/repack step that is not visible from the package alone.
+- **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain
+  unknown. If the game assumes console tiling or compression metadata, the layer needs a detile/repack step.
+- **BVH builder DXIL.** 44 of the builder's 53 Xbox DXIL shaders fail the PC compiler; 22 have been lowered to
+  standard DXIL and compile, and 31 use raw 64-bit addresses. The lowered shaders have no reference output yet, and
+  this is a separate front end from the FSSM translator.
 - **Ray tracing.** The game's RT work includes 64 compute shaders that traverse AMD-format BVH nodes, and it ships
   a BVH builder; a standard D3D12 AS path may also exist. If it is used, the layer must build AMD-format nodes, not
   a Vulkan AS.
@@ -775,10 +913,19 @@ minimum. The trace decides, not the milestone labels.
 - D3D11, D3D12 video, protected content, cross-process sharing, meta commands, DRED tooling.
 - A general D3D12 compatibility layer for arbitrary applications.
 - Any use of game data, keys or decryption.
+- Copying code, headers or generated stubs from the GPL-2.0-only prior art; its ABI/format facts are cited with
+  links only.
 - Replacing the translator's shader contract. The layer adapts to it; changes to it (per-stage code base, extra
   metadata) are coordinated with `tools/rdna2spirv.py`.
 
-## 9. References
+## 10. References
+
+Prior art (facts and links only; no code copied; GPL-2.0-only, see section 7.3):
+
+- [americas-recomp, branch `xbox-series`](https://github.com/realdody/americas-recomp/tree/xbox-series)
+- [PLATFORM_SURFACE.md: package import surface and measured device ABI](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md)
+- [platform tools README: proxy, `XS_TRACE`, xgr, first-run workflow](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md)
+- [GPL-2.0 license text](https://github.com/realdody/americas-recomp/blob/xbox-series/LICENSE)
 
 Public D3D12:
 
