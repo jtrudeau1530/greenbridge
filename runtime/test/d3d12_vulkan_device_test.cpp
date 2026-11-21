@@ -2,7 +2,8 @@
 // the proxy the way the game will call it: device methods (forwarded slots), descriptor heaps from slot 14 with
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue and a fence. Results are read back through D3D12 itself
-// (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints is compared with the host PC runtime's.
+// (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints and GetResourceAllocationInfo are
+// compared with the host PC runtime's.
 // No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation
 // error fails the test.
 #include "vk_test_device.h"
@@ -115,15 +116,20 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     return barrier;
 }
 
-// GetCopyableFootprints must match the PC runtime's exactly, since applications size and fill upload buffers from
-// it. Returns the number of mismatches, or -1 when the host has no D3D12 device to compare with.
-int compare_footprints(ID3D12Device* ours) {
+// The host PC runtime's D3D12 device on the default adapter, to compare answers with; false if there is none.
+bool create_host_device(Ref<ID3D12Device>& host) {
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
                                     reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
                               : nullptr;
+    return create && SUCCEEDED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)));
+}
+
+// GetCopyableFootprints must match the PC runtime's exactly, since applications size and fill upload buffers from
+// it. Returns the number of mismatches, or -1 when the host has no D3D12 device to compare with.
+int compare_footprints(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
-    if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return -1;
+    if (!create_host_device(host)) return -1;
     struct Case {
         D3D12_RESOURCE_DESC desc;
         UINT subresources;
@@ -176,6 +182,123 @@ int compare_footprints(ID3D12Device* ours) {
                 std::fprintf(stderr, "footprint format %d base %llu: total ours %llu host %llu\n", int(c.desc.Format),
                              (unsigned long long)base, (unsigned long long)total_a, (unsigned long long)total_b);
         }
+    }
+    return mismatches;
+}
+
+// GetResourceAllocationInfo against the PC runtime. Buffer sizes, every alignment and which descriptions are invalid
+// must match it exactly. A texture's size is the driver's choice on both sides, so ours is only checked to be a
+// whole number of alignments and at least the texels of its top mip; both sizes are printed. Also checks the
+// Device4/Device8 variants' per-resource layout. Returns the number of mismatches, or -1 without a host device.
+int compare_allocation_info(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    const auto with = [](D3D12_RESOURCE_DESC desc, UINT64 alignment, UINT samples = 1) {
+        desc.Alignment = alignment;
+        desc.SampleDesc.Count = samples;
+        return desc;
+    };
+    constexpr UINT64 k4 = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT, k64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    constexpr D3D12_RESOURCE_FLAGS none = D3D12_RESOURCE_FLAG_NONE, rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    constexpr DXGI_FORMAT rgba8 = DXGI_FORMAT_R8G8B8A8_UNORM;
+    struct Case {
+        const char* name;
+        D3D12_RESOURCE_DESC desc;
+        UINT64 top_mip_bytes;  // 0: the size must match the host's exactly (buffers, invalid descriptions)
+    };
+    D3D12_RESOURCE_DESC bad_buffer = buffer_desc(256);
+    bad_buffer.Height = 2;
+    D3D12_RESOURCE_DESC typed_buffer = buffer_desc(256);
+    typed_buffer.Format = DXGI_FORMAT_R8_UNORM;
+    D3D12_RESOURCE_DESC big_volume = volume_desc(1);
+    big_volume.Width = big_volume.Height = 32;
+    big_volume.DepthOrArraySize = 8;
+    const Case cases[] = {
+        {"buffer 300", buffer_desc(300), 0},
+        {"buffer 64 KiB", buffer_desc(65536), 0},
+        {"buffer 64 KiB + 1", buffer_desc(65537), 0},
+        {"buffer aligned 64 KiB", with(buffer_desc(1000), k64), 0},
+        {"buffer width 0", buffer_desc(0), 0},
+        {"buffer height 2", bad_buffer, 0},
+        {"buffer with a format", typed_buffer, 0},
+        {"256x256 full chain", texture_desc(256, 256, rgba8, none, 0), 256 * 256 * 4},
+        {"16x16 small", with(texture_desc(16, 16, rgba8, none), k4), 16 * 16 * 4},
+        {"16x16 small render target", with(texture_desc(16, 16, rgba8, rt), k4), 16 * 16 * 4},
+        {"1024x1024 small (too big)", with(texture_desc(1024, 1024, rgba8, none), k4), 1024 * 1024 * 4},
+        {"64x64 BC1 small", with(texture_desc(64, 64, DXGI_FORMAT_BC1_UNORM, none, 3), k4), 16 * 16 * 8},
+        {"64x64 depth", texture_desc(64, 64, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+         64 * 64 * 4},
+        {"8x8 array of 6", texture_desc(8, 8, rgba8, none, 4, 6), 8 * 8 * 4 * 6},
+        {"32x32x8 volume", big_volume, 32 * 32 * 8 * 4},
+        {"64x64 4x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 4), 64 * 64 * 4 * 4},
+        {"64x64 4x MSAA small", with(texture_desc(64, 64, rgba8, rt), k64, 4), 64 * 64 * 4 * 4},
+        {"1024x1024 4x MSAA small", with(texture_desc(1024, 1024, rgba8, rt), k64, 4), 1024 * 1024 * 4 * 4},
+        {"zero width", texture_desc(0, 16, rgba8, none), 0},
+        {"alignment 12345", with(texture_desc(16, 16, rgba8, none), 12345), 0},
+        {"4x MSAA with 2 mips", with(texture_desc(64, 64, rgba8, rt, 2), 0, 4), 0},
+    };
+    int mismatches = 0;
+    const auto mismatch = [&](const char* name, const D3D12_RESOURCE_ALLOCATION_INFO& a,
+                              const D3D12_RESOURCE_ALLOCATION_INFO& b) {
+        if (mismatches++ < 24)
+            std::fprintf(stderr, "allocation info %s: ours size %llu alignment %llu, host size %llu alignment %llu\n",
+                         name, (unsigned long long)a.SizeInBytes, (unsigned long long)a.Alignment,
+                         (unsigned long long)b.SizeInBytes, (unsigned long long)b.Alignment);
+    };
+    for (const Case& c : cases) {
+        const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 1, &c.desc);
+        const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 1, &c.desc);
+        if (b.SizeInBytes == UINT64_MAX || !c.top_mip_bytes) {
+            if (a.SizeInBytes != b.SizeInBytes || (b.SizeInBytes != UINT64_MAX && a.Alignment != b.Alignment))
+                mismatch(c.name, a, b);
+            continue;
+        }
+        if (a.Alignment != b.Alignment || a.SizeInBytes == UINT64_MAX || a.SizeInBytes % a.Alignment ||
+            a.SizeInBytes < c.top_mip_bytes)
+            mismatch(c.name, a, b);
+        std::printf("allocation info %s: alignment %llu, size ours %llu host %llu\n", c.name,
+                    (unsigned long long)a.Alignment, (unsigned long long)a.SizeInBytes,
+                    (unsigned long long)b.SizeInBytes);
+    }
+
+    // Several resources at once: each at its own alignment after the one before, the largest alignment overall.
+    // Buffers only for the host comparison (their sizes are fixed); the texture checks our own layout.
+    const D3D12_RESOURCE_DESC buffers[] = {buffer_desc(300), buffer_desc(70000), buffer_desc(1)};
+    const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 3, buffers);
+    const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 3, buffers);
+    if (a.SizeInBytes != b.SizeInBytes || a.Alignment != b.Alignment) mismatch("three buffers", a, b);
+
+    Ref<ID3D12Device8> ours8;
+    if (FAILED(ours->QueryInterface(IID_PPV_ARGS(&ours8.p)))) return mismatches + 1;
+    const D3D12_RESOURCE_DESC mixed[] = {with(texture_desc(16, 16, rgba8, none), k4), buffer_desc(300),
+                                         with(texture_desc(64, 64, rgba8, rt), 0, 4)};
+    D3D12_RESOURCE_DESC1 mixed1[3]{};
+    for (int i = 0; i < 3; ++i) std::memcpy(&mixed1[i], &mixed[i], sizeof(mixed[i]));
+    D3D12_RESOURCE_ALLOCATION_INFO1 each[3]{}, each2[3]{};
+    const D3D12_RESOURCE_ALLOCATION_INFO total = ours8->GetResourceAllocationInfo1(0, 3, mixed, each);
+    const D3D12_RESOURCE_ALLOCATION_INFO total2 = ours8->GetResourceAllocationInfo2(0, 3, mixed1, each2);
+    const auto aligned = [](UINT64 v, UINT64 to) { return (v + to - 1) / to * to; };
+    bool layout_ok = total.SizeInBytes == total2.SizeInBytes && total.Alignment == total2.Alignment &&
+                     each[0].Offset == 0 && each[0].Alignment == k4 && each[1].Alignment == k64 &&
+                     each[2].Alignment == D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT &&
+                     total.Alignment == D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT &&
+                     total.SizeInBytes == each[2].Offset + each[2].SizeInBytes;
+    for (int i = 0; i < 3; ++i) {
+        const D3D12_RESOURCE_ALLOCATION_INFO single = ours->GetResourceAllocationInfo(0, 1, &mixed[i]);
+        layout_ok = layout_ok && each[i].SizeInBytes == single.SizeInBytes &&
+                    each[i].Alignment == single.Alignment && each[i].Offset == each2[i].Offset &&
+                    each[i].SizeInBytes == each2[i].SizeInBytes && each[i].Alignment == each2[i].Alignment &&
+                    (i == 0 || each[i].Offset == aligned(each[i - 1].Offset + each[i - 1].SizeInBytes,
+                                                         each[i].Alignment));
+    }
+    // An invalid description in the list makes the whole answer invalid.
+    const D3D12_RESOURCE_DESC with_bad[] = {buffer_desc(300), buffer_desc(0)};
+    layout_ok = layout_ok && ours8->GetResourceAllocationInfo1(0, 2, with_bad, each).SizeInBytes == UINT64_MAX &&
+                host->GetResourceAllocationInfo(0, 2, with_bad).SizeInBytes == UINT64_MAX;
+    if (!layout_ok) {
+        ++mismatches;
+        std::fprintf(stderr, "allocation info: Device4/Device8 per-resource layout wrong (total %llu/%llu)\n",
+                     (unsigned long long)total.SizeInBytes, (unsigned long long)total.Alignment);
     }
     return mismatches;
 }
@@ -274,6 +397,10 @@ int main() {
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
         EXPECT(footprint_mismatches <= 0);
+        const int allocation_mismatches = compare_allocation_info(device.p);
+        if (allocation_mismatches < 0)
+            std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
+        EXPECT(allocation_mismatches <= 0);
 
         // Command objects; their GetDevice is the proxy, never the inner device.
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
