@@ -9,6 +9,7 @@
 //   --jobs N      compile on N threads (default: half the hardware threads)
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print compute pipelines slower than SEC (default 30); compiles past 60 s are named while running
+//   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
 #include "vulkan_loader.h"
 
 #include <algorithm>
@@ -75,13 +76,13 @@ static std::map<std::string, ShaderMeta> read_index(const std::string& path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC]\n");
+        std::fprintf(stderr, "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] [--max-bytes N]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
     std::string dir = argv[1], cache_path;
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
-    size_t start = 0, count = 0;
+    size_t start = 0, count = 0, max_bytes = 0;
     double slow = 30.0;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
         else if (a == "--start") start = std::stoull(val());
         else if (a == "--count") count = std::stoull(val());
         else if (a == "--slow") slow = std::stod(val());
+        else if (a == "--max-bytes") max_bytes = std::stoull(val());
         else cache_path = a;
     }
     auto index = read_index(dir + "/index.json");
@@ -218,7 +220,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "checking %zu shaders [%zu, %zu) on %u threads\n", work.size(), lo, hi, jobs);
 
     std::mutex mu;  // guards the counters, stdout and the in-flight table
-    std::map<std::string, uint32_t> modules_ok, modules_bad, pipes_ok, pipes_bad;
+    std::map<std::string, uint32_t> modules_ok, modules_bad, pipes_ok, pipes_bad, big_skipped;
     uint32_t cs_w32_ok = 0, cs_w32_bad = 0, cs_w64_ok = 0, cs_w64_bad = 0, cs_done = 0;
     double cs_seconds = 0, cs_max = 0;
     std::string cs_max_name;
@@ -232,7 +234,23 @@ int main(int argc, char** argv) {
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
-            std::ifstream f(dir + "/" + name + ".spv", std::ios::binary);
+            const std::string path = dir + "/" + name + ".spv";
+            std::ifstream f(path, std::ios::binary | std::ios::ate);
+            const std::streamoff file_size = f.tellg();
+            if (max_bytes && file_size > std::streamoff(max_bytes)) {
+                {
+                    std::lock_guard<std::mutex> g(mu);
+                    big_skipped[stage]++;
+                    std::printf("BIG SKIP %s (%lld bytes, limit %zu)\n",
+                                name.c_str(), static_cast<long long>(file_size), max_bytes);
+                }
+                if (++done % 1000 == 0) {
+                    std::lock_guard<std::mutex> g(mu);
+                    std::fprintf(stderr, "  %zu/%zu (%.0fs)\n", size_t(done), work.size(), elapsed());
+                }
+                continue;
+            }
+            f.seekg(0);
             std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
             VkShaderModule sm = VK_NULL_HANDLE;
             bool mod_ok = false;
@@ -309,6 +327,13 @@ int main(int argc, char** argv) {
     for (auto& t : pool) t.join();
     watch.join();
 
+    uint32_t big_total = 0;
+    for (auto& [st, c] : big_skipped) big_total += c;
+    if (big_total) {
+        std::printf("big modules skipped: %u (limit %zu bytes)", big_total, max_bytes);
+        for (auto& [st, c] : big_skipped) std::printf(" %s=%u", st.c_str(), c);
+        std::printf("; checked %zu of %zu\n", work.size() - big_total, work.size());
+    }
     for (auto& [st, c] : modules_ok) std::printf("%s: %u modules ok, %u failed\n", st.c_str(), c, modules_bad[st]);
     for (auto& [st, c] : modules_bad) if (!modules_ok.count(st)) std::printf("%s: 0 modules ok, %u failed\n", st.c_str(), c);
     if (cs_done > 0) {
