@@ -23,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 EXTS = (".ogg", ".opus")
@@ -139,28 +140,23 @@ def output_names(items):
 
 
 def decode(ffmpeg: str, src: str, dst: str):
-    """Decode one file to a temporary WAV next to dst, then rename it, so an interrupted run leaves no short WAV."""
-    tmp = dst + ".part.wav"
+    """Decode under the destination directory and rename the finished WAV into place."""
     try:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        cmd = [ffmpeg, "-v", "error", "-y", "-i", src]
-        samples = ogg_output_samples(src)
-        if samples:
-            cmd += ["-af", f"atrim=end_sample={samples}"]
-        cmd += ["-c:a", "pcm_s16le", tmp]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-        if r.returncode != 0:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-            return False, (r.stderr.strip() or f"ffmpeg exited with {r.returncode}")
-        os.replace(tmp, dst)
+        out_dir = os.path.dirname(dst)
+        os.makedirs(out_dir, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=out_dir, ignore_cleanup_errors=True) as tmp_dir:
+            tmp = os.path.join(tmp_dir, "decoded.wav")
+            cmd = [ffmpeg, "-v", "error", "-y", "-i", src]
+            samples = ogg_output_samples(src)
+            if samples:
+                cmd += ["-af", f"atrim=end_sample={samples}"]
+            cmd += ["-c:a", "pcm_s16le", tmp]
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            if r.returncode != 0:
+                return False, (r.stderr.strip() or f"ffmpeg exited with {r.returncode}")
+            os.replace(tmp, dst)
         return True, ""
     except OSError as e:
-        if os.path.isfile(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
         return False, str(e)
 
 
