@@ -1548,14 +1548,17 @@ class WorldBuildTest(unittest.TestCase):
             before_files = sorted(os.listdir(chunks_dir))
             self.assertEqual(len(before_files), 2)
 
-            # Plant an orphan .glb.tmp and rebuild with limit=1 into the SAME out_dir.
-            orphan_tmp = os.path.join(chunks_dir, "c_99_99.glb.tmp")
-            with open(orphan_tmp, "wb") as f:
-                f.write(b"stale")
+            # Include a partial generated chunk and unrelated files in the same directory.
+            obsolete = ["c_-3_12.glb", "c_0_-7.glb.tmp"]
+            unrelated = ["my-model.glb", "my-model.glb.tmp", "c_01_0.glb", "c_-0_0.glb"]
+            for name in obsolete + unrelated:
+                with open(os.path.join(chunks_dir, name), "wb") as f:
+                    f.write(b"fixture")
             res_limited = world_build.build_world(assets_dir, out_dir, limit=1, jobs=4)
             self.assertEqual(len(res_limited["chunks"]), 1)
             after_files = sorted(os.listdir(chunks_dir))
-            self.assertEqual(after_files, [f"{res_limited['chunks'][0]['id']}.glb"])
+            expected = [f"{res_limited['chunks'][0]['id']}.glb"] + unrelated
+            self.assertEqual(after_files, sorted(expected))
 
             # Non-existent assets_dir raises FileNotFoundError in API and returns exit 1 in CLI.
             missing = os.path.join(tmp, "does_not_exist")

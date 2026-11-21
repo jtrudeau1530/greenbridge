@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import threading
@@ -461,8 +462,12 @@ def _write_json_atomic(path: str, data: dict) -> None:
         raise
 
 
+# Cell coordinates are written as decimal integers, without leading zeros.
+_CHUNK_FILE_RE = re.compile(r"c_(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?")
+
+
 def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
-    """Remove obsolete *.glb and *.glb.tmp files left over from earlier builds."""
+    """Remove stale chunk files and partial writes left by earlier builds."""
     try:
         entries = os.listdir(chunks_dir)
     except OSError:
@@ -470,7 +475,7 @@ def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
     for name in entries:
         if name in keep_filenames:
             continue
-        if not (name.endswith(".glb") or name.endswith(".glb.tmp")):
+        if not _CHUNK_FILE_RE.fullmatch(name):
             continue
         full = os.path.join(chunks_dir, name)
         if os.path.isfile(full):
