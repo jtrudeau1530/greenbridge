@@ -183,6 +183,17 @@ class PixelDeviceLimits(unittest.TestCase):
         out = "device: fake (subgroup 32..32)\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
 
+    def test_bitmask_perm_skips_when_the_frame_is_short_below_32_lanes(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=b"short")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("narrower than 32 lanes", problem)
+
+    def test_bitmask_perm_skips_without_a_subgroup_width(self):
+        problem = self.run_pixel("ps_bitmask_perm", 0, "ok 64x64\n", data=self.bitmask_pixels(32))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("no subgroup width", problem)
+
 
 if __name__ == "__main__":
     unittest.main()
