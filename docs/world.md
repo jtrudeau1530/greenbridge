@@ -246,7 +246,11 @@ that was a lower bound, and the full pass settles the extrapolation. See
 coverage.
 
 The full count is lower than SixNG's published 30,785 map files / 2,249,490 entities
-(https://github.com/holdmysocks/SixNG). The difference is not yet explained. The census counts only
+(https://github.com/holdmysocks/SixNG). A census of the other ten non-radio archives found no maps
+outside `levels.rpf`, so the 7,250-map / 579,048-entity difference is not explained by other archives;
+duplicate map payloads and map-name hashes are zero, and the 138,839 `CMapData`-only metadata
+resources cannot account for the 579,048 entities (see
+[world_census.md](world_census.md#other-archives)). The census counts only
 validated `0x7a` resources whose schema includes `CMapData` and whose entity table is self-consistent;
 SixNG may count archive entries, nested maps, or map resources that this scanner rejects. Treat the
 23,535 / 1,670,442 figure as the measured count for this package and this validation rule, not as a
