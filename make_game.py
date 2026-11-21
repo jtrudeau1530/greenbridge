@@ -34,6 +34,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
+WINDOWS_ONLY = ("runtime",)
 # Archives scanned for models and texture dictionaries, small to large.
 MODEL_ARCHIVES = [
     "common.rpf", "textures.rpf", "data.rpf",
@@ -201,6 +202,11 @@ MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
 def preflight(stages: list, work: str, wav: bool = False) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
+    if os.name != "nt":
+        asked = [s for s in stages if s in WINDOWS_ONLY]
+        if asked:
+            fail(f"The {', '.join(asked)} stage builds on Windows only for now. Leave it out of --stages; "
+                 "without --stages it is left out on this system.")
     missing = []
     if wav and "assets" in stages and not shutil.which("ffmpeg"):
         missing.append("ffmpeg (needed for --wav): https://ffmpeg.org/download.html, then reopen the terminal")
@@ -538,11 +544,26 @@ def positive_int(text: str) -> int:
     return value
 
 
+def pipeline_check_exe():
+    """vk_pipeline_check where the build puts it: runtime/build on Windows (scripts/build_runtime.ps1), the CMake
+    build folders of the README and CONTRIBUTING.md elsewhere."""
+    build = os.path.join(ROOT, "runtime", "build")
+    if os.name == "nt":
+        found = [os.path.join(build, "vk_pipeline_check.exe")]
+    else:
+        found = [os.path.join(build, "linux", "vk_pipeline_check"), os.path.join(build, "vk_pipeline_check")]
+    return next((p for p in found if os.path.isfile(p)), None)
+
+
 def pipelines(work: str, out: str) -> None:
-    exe = os.path.join(ROOT, "runtime", "build", "vk_pipeline_check.exe")
+    exe = pipeline_check_exe()
     spirv = os.path.join(work, "shaders", "spirv")
-    if not os.path.isfile(exe):
+    if not exe and os.name == "nt":
         fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
+    if not exe:
+        fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
+             "loader installed, run: cmake -S runtime -B runtime/build/linux && "
+             "cmake --build runtime/build/linux --parallel")
     if not os.path.isfile(os.path.join(spirv, "index.json")):
         fail("No translated shaders yet: run the shaders stage first.")
     log("pipelines: creating every shader module and compute pipeline on this GPU")
@@ -596,6 +617,9 @@ def main() -> int:
     for s in stages:
         if s not in STAGES:
             fail(f"unknown stage '{s}'")
+    if os.name != "nt" and a.stages == ap.get_default("stages"):
+        stages = [s for s in stages if s not in WINDOWS_ONLY]
+        log(f"{', '.join(WINDOWS_ONLY)}: left out, it builds on Windows only for now")
     preflight(stages, work, a.wav)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()

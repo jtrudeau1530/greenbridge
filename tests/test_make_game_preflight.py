@@ -316,7 +316,9 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("os.path.isfile", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
-                make_game.preflight(["shaders", "assets", "runtime"], tmp_work, wav=True)
+                # runtime is refused before any check off Windows (tests/test_make_game_platform.py)
+                stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
+                make_game.preflight(stages, tmp_work, wav=True)
 
     def test_preflight_aggregates_multiple_missing_tools_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as tmp_work:
