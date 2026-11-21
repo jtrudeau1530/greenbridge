@@ -306,15 +306,19 @@ def assets(game: str, work: str) -> None:
                 continue
             log(f"assets: {mode} from {rel}")
             run([exe, mode, src, out])
+    # Texture pools: data/ttdb/** and each pack's own pack/<name>/data/ttdb/** (pool names repeat across packs,
+    # so pack pools go under ttpf_pack/<pack>/).
     pools = []
-    for root, _, files in os.walk(os.path.join(game, "data", "ttdb")):
+    for root, _, files in os.walk(game):
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
     for p in sorted(pools, key=os.path.getsize):
         name = os.path.splitext(os.path.basename(p))[0]
-        if os.path.isfile(os.path.join(out, "ttpf", name, "manifest.json")):
+        parts = os.path.relpath(p, game).replace("\\", "/").split("/")
+        dest = os.path.join(out, "ttpf_pack", parts[1]) if parts[0] == "pack" else os.path.join(out, "ttpf")
+        if os.path.isfile(os.path.join(dest, name, "manifest.json")):
             continue
         log(f"assets: texture pool {os.path.relpath(p, game)}")
-        run([exe, "ttpf", p, os.path.join(out, "ttpf")])
+        run([exe, "ttpf", p, dest])
     if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):
         log("assets: audio banks")
         run([exe, "audio", os.path.join(game, "audio.rpf"), out])
