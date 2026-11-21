@@ -60,6 +60,9 @@ Verified:
 `shared_minigame000_bvh4.rpf` has the same families: 1,237 `bvh4`, 1,233 `instance208`, 85 other descriptors and
 5 XML chunks. `story000_bvh4.rpf` contains only 4 XML chunks (section 5).
 
+Counting the 10 chunked first chunks and their 10 continuation chunks with the complete buffers, 99.95% of all
+inflated bytes belong to the BVH family. The archive is not a mixed asset pack.
+
 ### 3.1 BVH4 stream header
 
 **Verified** on 271,627 complete streams and 10 chunked streams (271,637/271,637):
@@ -164,9 +167,9 @@ Both small packs are ordinary RPF9 files with the same header, zlib streams and 
 * `story000_bvh4.rpf` is **metadata-only**: 4 XML chunks (a `SSetupData`-shaped setup file, a content file and two
   changesets). It has no descriptors and no BVH streams. It registers per-tile `*_bvh.rpf` archives but contains
   none of their data.
-* `shared_minigame000_bvh4.rpf` is **not empty**: 1,237 BVH streams and 1,233 instance records, plus 5 XML chunks.
-  Its data is the same two-family layout as core. It is sparse in the same way: 90.4% of the declared node area is
-  zero.
+* `shared_minigame000_bvh4.rpf` is **not empty**: 1,237 BVH streams, 1,233 instance records, 85 other descriptors
+  and 5 XML chunks. Its data is the same two-family layout as core. It is sparse in the same way: 90.4% of the
+  declared node area is zero.
 * Both use the same `0x81020006` tag, the same `0x140` node start and the same `0x5000xxxx` descriptor template.
 
 `core_bvh4.rpf` ends with 11 XML chunks: one setup file, one content file and three copies of a changeset split
