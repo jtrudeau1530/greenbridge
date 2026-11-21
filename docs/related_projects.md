@@ -70,6 +70,20 @@ lands), the IID/extension tables, and the call-sequence observations that Leonid
 [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) still lists as unknown. SCARAB forwards to
 D3D12; Leonida translates to Vulkan. The ABI facts carry over, the forwarding architecture does not.
 
+## microsoft/libHttpClient
+
+<https://github.com/microsoft/libHttpClient>
+
+Microsoft's HTTP/WebSocket library for GDK titles. Its `Source/Task` folder is the implementation of the GDK's
+`XTaskQueue` and `XAsync`.
+
+**Licence:** MIT, which is compatible with GPL-3.0-or-later.
+
+**What we use:** the task queue's headers and Win32 sources, copied unmodified into `third_party/xtaskqueue` (commit
+and file list in its README) with the licence file. `runtime/shims/xgameruntime.cpp` registers those functions as
+`xgameruntime.dll` imports. The HTTP and WebSocket stack is not included. Unlike the projects above, this is code
+use under a compatible licence, so the MIT notice must stay with the files.
+
 ## The line
 
 | Fine | Not fine |

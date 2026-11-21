@@ -35,6 +35,22 @@ if(WIN32)
   target_compile_options(root_signature_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(root_signature_test PRIVATE /OPT:NOREF)
 
+  # XTaskQueue/XAsync from microsoft/libHttpClient (MIT), vendored in third_party/xtaskqueue; shims/xtaskqueue/pch.h
+  # stands in for libHttpClient's pch.h so only the task queue builds. Used by the xgameruntime shim.
+  set(XTASKQUEUE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/xtaskqueue)
+  add_library(gta6rt_xtaskqueue STATIC
+    ${XTASKQUEUE_DIR}/Source/Task/TaskQueue.cpp
+    ${XTASKQUEUE_DIR}/Source/Task/AsyncLib.cpp
+    ${XTASKQUEUE_DIR}/Source/Task/ThreadPool_win32.cpp
+    ${XTASKQUEUE_DIR}/Source/Task/WaitTimer_win32.cpp
+  )
+  target_include_directories(gta6rt_xtaskqueue
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims/xtaskqueue ${XTASKQUEUE_DIR}/Source/Task ${XTASKQUEUE_DIR}/Source/Common
+    PUBLIC ${XTASKQUEUE_DIR}/Include)
+  target_compile_definitions(gta6rt_xtaskqueue PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gta6rt_xtaskqueue PRIVATE /utf-8)  # third-party code: its own warning level
+  target_link_libraries(gta6rt_xtaskqueue PUBLIC ole32)
+
   add_executable(gta6rt
     src/main.cpp
     src/pe_loader.cpp
@@ -42,12 +58,13 @@ if(WIN32)
     shims/xmem.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
+    shims/xgameruntime.cpp
   )
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
   target_link_options(gta6rt PRIVATE /OPT:NOREF)
-  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig psapi)
+  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
   # find_library searches %LIB% (a Developer Prompt), not the Windows SDK the Visual Studio generator links
@@ -117,6 +134,19 @@ if(WIN32)
   target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
+
+  # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
+  # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
+  add_executable(xgameruntime_test
+    test/xgameruntime_test.cpp
+    shims/xgameruntime.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xgameruntime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xgameruntime_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xgameruntime_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xgameruntime_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue)
 
 else()
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
@@ -221,6 +251,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+  endif()
+  if(WIN32 AND TARGET xgameruntime_test)
+    add_test(NAME xgameruntime COMMAND xgameruntime_test)
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
