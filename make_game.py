@@ -278,9 +278,25 @@ def shaders(game: str, work: str, jobs: int) -> None:
     if not os.path.isdir(spirv) or len(os.listdir(spirv)) < 1000:
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
-        log("shaders: translating RDNA2 to SPIR-V (the longest step)")
-        py("rdna2spirv.py", disasm, "--out", spirv)
+        log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
+        translate(disasm, spirv, jobs)
     log("shaders: done")
+
+
+def translate(disasm: str, spirv: str, jobs: int) -> None:
+    """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts."""
+    os.makedirs(spirv, exist_ok=True)
+    for f in os.listdir(spirv):  # parts from an earlier run with another --jobs would be merged in too
+        if f.startswith("index.part") and f.endswith(".json"):
+            os.remove(os.path.join(spirv, f))
+    tool = os.path.join(TOOLS, "rdna2spirv.py")
+    log(f"  rdna2spirv.py {disasm} --out {spirv} --shard 0..{jobs - 1}/{jobs}")
+    procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}"])
+             for i in range(jobs)]
+    bad = [f"shard {i} exited with {r}" for i, r in enumerate(p.wait() for p in procs) if r != 0]
+    if bad:
+        fail("rdna2spirv.py: " + ", ".join(bad))
+    py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
 
 
 # ---------------------------------------------------------------- assets
