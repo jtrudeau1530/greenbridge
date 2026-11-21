@@ -324,6 +324,10 @@ def assets(game: str, work: str) -> None:
     if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):
         log("assets: audio banks")
         run([exe, "audio", os.path.join(game, "audio.rpf"), out])
+    if not os.path.isdir(os.path.join(out, "audio", "ogg")):
+        # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
+        log("assets: audio streams -> Ogg Opus")
+        py("awc_opus.py", os.path.join(out, "audio", "awc"), os.path.join(out, "audio", "ogg"))
     log("assets: done")
 
 
