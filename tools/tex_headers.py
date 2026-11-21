@@ -18,8 +18,6 @@ import struct
 import sys
 from collections import Counter
 
-import numpy as np
-
 DXGI = {
     2: "R32G32B32A32_FLOAT", 3: "R32G32B32A32_UINT", 4: "R32G32B32A32_SINT",
     6: "R32G32B32_FLOAT", 7: "R32G32B32_UINT", 8: "R32G32B32_SINT",
@@ -266,6 +264,12 @@ def parse_dds_header(data):
 
 
 def scan_archive(carve, arch):
+    # numpy is only needed for the descriptor scan; keeping it out of the module import lets the
+    # standard-library tests run on a Python without numpy.
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("scan_archive needs numpy (pip install numpy)") from exc
     with open(os.path.join(carve, arch, "index.json"), encoding="utf-8") as f:
         files = sorted(json.load(f)["files"], key=lambda r: r["off"])
     out = []
