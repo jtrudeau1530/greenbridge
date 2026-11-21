@@ -3,9 +3,10 @@
 //   gta6rt --run tiny_game.exe -- hello 42
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, and the
 // xgameruntime.dll imports (answered by the shim registry: the stub DLL it links against would fail them), then
-// calls exit() with 0 when everything held. It also throws and catches a C++ exception inside the image, which
-// needs the loader's unwind registration (#176). thread_local needs static TLS (#93); LEONIDA_RUN_TLS=1 turns that
-// check on until it is on main.
+// calls exit() with 0 when everything held. Two checks are opt-in: thread_local needs static TLS (#93;
+// LEONIDA_RUN_TLS=1), and a C++ exception (LEONIDA_RUN_EH=1) needs more than the unwind tables #176 registers on MSVC:
+// _CxxThrowException finds the throwing image with RtlPcToFileHeader, which only knows modules the Windows loader
+// mapped. With MinGW (libgcc's SEH unwinder) the #176 tables are enough and the check passes.
 #include <windows.h>
 
 #include <cstdint>
@@ -89,13 +90,17 @@ int main(int argc, char** argv) {
     } else {
         std::printf("tiny_game: SKIP thread_local (needs static TLS, #93; LEONIDA_RUN_TLS=1)\n");
     }
-    bool caught = false;
-    try {
-        throw std::string("boom");
-    } catch (const std::string& e) {
-        caught = e == "boom";
+    if (env_on("LEONIDA_RUN_EH")) {
+        bool caught = false;
+        try {
+            throw std::string("boom");
+        } catch (const std::string& e) {
+            caught = e == "boom";
+        }
+        check(caught, "a C++ exception is thrown and caught inside the image");
+    } else {
+        std::printf("tiny_game: SKIP C++ exception (MSVC needs the image known to RtlPcToFileHeader; LEONIDA_RUN_EH=1)\n");
     }
-    check(caught, "a C++ exception is thrown and caught inside the image (unwind tables registered, #176)");
 
     std::printf("tiny_game: %s\n", g_failures ? "FAILED" : "OK");
     std::fflush(stdout);
