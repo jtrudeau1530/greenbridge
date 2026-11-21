@@ -235,6 +235,14 @@ def pixel_test(tools, spirv, name):
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    if name == "ps_bitmask_perm":
+        # Decide from the reported width before the pixel count: a narrow device's frame can be short, and with no
+        # width line the lanes 0-31 this shader writes are not known to exist.
+        m = re.search(r"subgroup \d+\.\.(\d+)", out)
+        if not m:
+            return Skip("SKIP (vk_harness reported no subgroup width)")
+        if int(m.group(1)) < 32:
+            return Skip(f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)")
     if not px:
         return "vk_harness failed or returned no pixels"
     n = len(px)
@@ -254,9 +262,6 @@ def pixel_test(tools, spirv, name):
         err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
         return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}"
     if name == "ps_bitmask_perm":
-        m = re.search(r"subgroup \d+\.\.(\d+)", out)
-        if m and int(m.group(1)) < 32:   # the shader writes lanes 0-31; a narrower subgroup has no such lanes
-            return Skip(f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)")
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"

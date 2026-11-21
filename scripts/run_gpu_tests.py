@@ -566,7 +566,8 @@ def run_suite(a, work: str) -> int:
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=gfx_env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
-                results.append((name, None, "SKIP (unsupported device)"))
+                m = re.search(r"unsupported: .*", msg)
+                results.append((name, None, f"SKIP ({m.group(0) if m else 'unsupported device'})"))
                 continue
             if rc != 0:
                 results.append((name, False, msg))
