@@ -54,7 +54,11 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
               "ps_ops5": (0x12340010, 0xbeef0800, 0xaaaaffff, 0xdeadbc00),
               "ps_ops6": (0xf800ffff, 0x01000010, 0x00800800, 0x8000fff0),
-              "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000)}
+              "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
+              "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0)}
+# Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
+# tests/semantic/test_value_semantics.py does for the interpreter.
+PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
 
 
@@ -173,6 +177,8 @@ def pixels(tools, spirv, name, fmt):
     # (RADV's default on RDNA1) reads lanes it was never written for.
     sg = subgroup_size(spirv, name)
     env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
+    if name in PIXEL_ENV:
+        env = dict(env or os.environ, **PIXEL_ENV[name])
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, _ = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),

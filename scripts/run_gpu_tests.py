@@ -249,9 +249,9 @@ def check_bitmask_perm(raw_path: str) -> tuple[bool, str]:
     return (bad == 0 and judged > 0), (first if bad else f"{judged}/{judged} pixels in lanes 0-31 exact")
 
 
-# Test shaders that need memory or push constants only the semantic-test interpreter sets up (tests/semantic).
-# On the GPU harness they would read an unset descriptor; ps_vcc_x2 loses the device that way.
-INTERPRETER_ONLY = {"ps_vcc_x2": "needs the seeded V# memory of tests/semantic; checked there"}
+# Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
+# tests/semantic/test_value_semantics.py does for the interpreter (same table as check.py).
+PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
 
 
 def check_flat(raw_path: str) -> tuple[bool, str]:
@@ -438,10 +438,7 @@ def run_suite(a, work: str) -> int:
     results: list[tuple[str, bool, str]] = []
     for fname in asm_files:
         name = os.path.splitext(fname)[0]
-        if name in INTERPRETER_ONLY:
-            results.append((name, None, "SKIP (" + INTERPRETER_ONLY[name] + ")"))
-            continue
-        spv = os.path.join(spirv_dir, f"{name}.spv")
+        spv =os.path.join(spirv_dir, f"{name}.spv")
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))
             continue
@@ -529,7 +526,8 @@ def run_suite(a, work: str) -> int:
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
-            rc, msg = run_cmd([vk_harness, vs, spv, raw], env=gfx_env)
+            env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
+            rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
             if rc != 0:
                 results.append((name, False, msg))
                 continue
@@ -543,6 +541,7 @@ def run_suite(a, work: str) -> int:
                 "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
                 "ps_ops5": (0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00),   # from the .asm headers
                 "ps_ops6": (0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0),
+                "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
