@@ -26,7 +26,7 @@ The requested command (`python -I tools/rpf9_carve.py <package>/anim.rpf <work>/
 | inflated bytes | 11,592,111,696 (10.80 GiB) |
 | zero padding | 180,165,556 (4.09% of span) |
 | unread bytes | 23,664,707 (0.54% of span) |
-| readable | 95.37% of span |
+| readable | 95.40% of span |
 | Bink 2 | 0 streams |
 | elapsed | 141 s |
 
@@ -41,7 +41,7 @@ streams at the tail. `tools/anim_index.py` advances by the actual slice length. 
 | inflated bytes | 11,593,460,132 (10.80 GiB) |
 | zero padding | 180,167,209 (4.09%) |
 | unread bytes | 23,678,497 (0.54%) |
-| readable | 95.37% |
+| readable | 95.38% |
 | elapsed | ~140 s |
 
 The 21 extra streams are the 1.35 MB `RBF0` rig metadata at the end of the data area (below). The class table
