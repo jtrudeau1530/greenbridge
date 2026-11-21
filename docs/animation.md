@@ -149,14 +149,14 @@ describes `PSIN` as PSO metadata, and these bytes do not show that it is animati
 
 ### Packed clip streams
 
-1,790 streams start with:
+1,781 streams start with:
 
 ```
 02 00 00 00 01 01 00 00 ...     or     03 00 00 00 01 01 00 00 ...
 ```
 
-The leading u32 is 2 or 3; the next four bytes are constant. Stored 18,268,253 bytes, inflated 33,175,328 bytes.
-1,186 distinct payloads (duplicates up to 10 copies). Entropy 4.3–6.5 bits/byte, so these are packed/quantized
+The leading u32 is 2 or 3; the next four bytes are constant. Stored 18,168,950 bytes, inflated 32,691,776 bytes.
+1,767 distinct payloads (duplicates up to 10 copies). Entropy 4.03–7.79 bits/byte, so these are packed/quantized
 bitstreams rather than zlib streams. The 24-byte header has five small fields after the type, but their meaning
 is not established; no name is stored in the stream.
 
@@ -205,7 +205,7 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
 ## Readable, compressed and still opaque
 
 - **Readable:** all 273 name tables (2,298 paths), 31 distinct `SKEL_*` tokens, the `0DRP` version/page count, 1,355
-  type-hash headers, 1,790 clip-stream headers, and the 4,819 distinct strings in the `RBF0` rig metadata. Some
+  type-hash headers, 1,781 clip-stream headers, and the 4,819 distinct strings in the `RBF0` rig metadata. Some
   `MoVE` and zero-prefixed pages expose counts and float arrays directly.
 - **Outer compression:** the only compression this work inverts is the RPF9 zlib framing. Inflating the 130,470
   streams accounts for the 11.59 GB above.
@@ -216,7 +216,7 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
   sampled positions.
   No Oodle signature is known from these bytes; none is guessed.
 - **Still opaque:** high-entropy blocks inside `other` and zero-prefixed pages (4 KiB blocks up to 7.96
-  bits/byte), the 1,790 packed clip streams, and the fields of `MoVE` beyond the version and size hint.
+  bits/byte), the 1,781 packed clip streams, and the fields of `MoVE` beyond the version and size hint.
 
 ## Cross-check with the model and XML work
 
@@ -225,8 +225,8 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
   `Id64` keys, but no bone names or skeleton hashes.
 - None of the 1,350 model names occurs in the 8,020 animation paths collected here, and none occurs in the
   `RBF0` rig metadata either. The sampled clip hash `0x25ed0554e58ba1fc` and the recurring `0x98e1750c` are
-  absent from all manifest integers. A real cross-check needs the full model export (155,598 models per
-  `docs/design.md`) and the rig table.
+  absent from all manifest names and integer/string values. A real cross-check needs the full model export
+  (155,598 models per `docs/design.md`) and the rig table.
 - `common.rpf` is the readable metadata layer. It carved to 781 streams, 710 of them XML-ish. Strict keyword
   occurrences: `clip` 734, `anim` 1,131, `motion` 237, `gesture` 2, `bone` 428 (214 `<Bones>` open/close
   pairs), `ped_` 1,308, `blend` 40; `facial`, `ycd` and `skeleton` 0. The tags include `<AnimData>`,
