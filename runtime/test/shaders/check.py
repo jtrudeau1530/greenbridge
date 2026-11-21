@@ -71,6 +71,7 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
+CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
 
 
@@ -323,6 +324,34 @@ def pixel_test(tools, spirv, name):
     return "no check written for this shader"
 
 
+def clip_test(tools, spirv, name):
+    with tempfile.TemporaryDirectory(prefix="leonida-clip-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        for clip_x, clip_y in ((False, False), (True, False), (False, True), (True, True)):
+            code, output = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, name + ".spv"),
+                               os.path.join(spirv, "ps_ops.spv"), raw, "64", "64",
+                               "0" if clip_x else "4", "0" if clip_y else "4")
+            if code == UNSUPPORTED:
+                return Skip("SKIP (shaderClipDistance unavailable)")
+            if code:
+                return failure(code, output, 2)
+            if not raw.is_file():
+                return "missing framebuffer"
+            data = raw.read_bytes()
+            raw.unlink()
+            if len(data) != 64 * 64 * 16:
+                return "incomplete framebuffer"
+            clear = (0xbf800000,) * 4
+            wrong = 0
+            for i, pixel in enumerate(struct.iter_unpack("<4I", data)):
+                inside = (not clip_x or i % 64 < 32) and (not clip_y or i // 64 < 16)
+                drawn = inside or name == "vs_clip_undeclared"
+                wrong += pixel != (PIXEL_BITS["ps_ops"] if drawn else clear)
+            if wrong:
+                return f"x={clip_x} y={clip_y}: {wrong} of 4096 pixels differ"
+    return ""
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -357,6 +386,8 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    for name in CLIP_TESTS:
+        results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
