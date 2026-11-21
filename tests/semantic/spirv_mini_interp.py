@@ -534,9 +534,12 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
                 v = max(args[0], args[1])
                 values[res] = f32(v if name == "FMax" else min(v, args[2]))
-            elif name == "RoundEven":
+            elif name in ("RoundEven", "Floor", "Ceil", "Trunc"):
+                # round() breaks ties to even. An integral result keeps the operand's sign (IEEE 754
+                # roundToIntegral), so RoundEven(-0.4), Ceil(-0.5) and Trunc(-0.5) are -0.0, not +0.0.
                 x = args[0]
-                values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
+                fn = {"RoundEven": round, "Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc}[name]
+                values[res] = f32(math.copysign(float(fn(x)), x)) if math.isfinite(x) else x
             elif name in ("FMin", "FMax"):
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")

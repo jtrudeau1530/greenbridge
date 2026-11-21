@@ -34,6 +34,7 @@ OpEntryPoint Fragment %main "main" %out
 %f70000 = OpConstant %float 70000
 %f2p5 = OpConstant %float 2.5
 %f3p5 = OpConstant %float 3.5
+%f0p5 = OpConstant %float 0.5
 %int = OpTypeInt 32 1
 %t = OpConstantTrue %bool
 %f = OpConstantFalse %bool
@@ -117,6 +118,24 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%x = OpFNegate %float %f2p5\n%res = OpConvertFToS %int %x\n"), 0xFFFFFFFE)
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f2p5\n"), 2)
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f70000\n"), 70000)
+
+    def test_floor_ceil_trunc_and_signed_zero(self):
+        def word(name, const, neg=False):
+            pre = f"%n = OpFNegate %float {const}\n" if neg else ""
+            x = "%n" if neg else const
+            return run_word(f"{pre}%x = OpExtInst %float %glsl {name} {x}\n%res = OpBitcast %uint %x\n")
+        self.assertEqual(word("Floor", "%f2p5"), 0x40000000)                 # 2.5 -> 2
+        self.assertEqual(word("Floor", "%f2p5", neg=True), 0xC0400000)       # -2.5 -> -3
+        self.assertEqual(word("Ceil", "%f2p5"), 0x40400000)                  # 2.5 -> 3
+        self.assertEqual(word("Ceil", "%f2p5", neg=True), 0xC0000000)        # -2.5 -> -2
+        self.assertEqual(word("Trunc", "%f3p5"), 0x40400000)                 # 3.5 -> 3
+        self.assertEqual(word("Trunc", "%f3p5", neg=True), 0xC0400000)       # -3.5 -> -3
+        # A zero result keeps the operand's sign: -0.5 rounds to -0.0 (0x80000000), 0.5 to +0.0.
+        self.assertEqual(word("Ceil", "%f0p5", neg=True), 0x80000000)
+        self.assertEqual(word("Trunc", "%f0p5", neg=True), 0x80000000)
+        self.assertEqual(word("RoundEven", "%f0p5", neg=True), 0x80000000)
+        self.assertEqual(word("Floor", "%f0p5"), 0)
+        self.assertEqual(word("Floor", "%f70000"), 0x4788B800)              # already integral: unchanged
 
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
