@@ -180,6 +180,9 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 - A 4-channel streamed-music bank gives four 42.0 s mono channels with real levels and no decoder errors.
 - A 1-channel streamed-music descriptor can carry stereo Opus packets; it exports as one stereo Ogg with the
   interleaved sample count halved, and a 3-channel descriptor with stereo packets exports three stereo Oggs.
+- In the 3,008-bank / 3,116-channel streamed-music census, 2,501 of 2,958 one-channel descriptors carry stereo
+  packets; the 50 multi-channel descriptors split into 20 all-stereo and 30 all-mono banks, with no channel
+  mixing TOC stereo bits. 61 representative exports decode cleanly.
 - All exported WAVs decode. Codec 2 values are stored as-is, so a float WAV can exceed ±1.
 
 The tools export the streams and channels as stored. They do not reconstruct runtime mixing, looping, ducking or
