@@ -46,10 +46,10 @@ and 5 DXGI 11).
 | no mapped allocation ("unmapped shard") | 0 | 0 |
 | **total** | **48,220** | **35,432** |
 
-The "before" compact row becomes two measured rows after the layout rule: records the rule
-sizes but cannot decode because every mip is BCPack, and records whose element size is still
-unknown. The 1,218 mixed compact records that become partial exports are not skips; they are
-counted in the partial table below.
+The "before" compact row becomes the measured rows below it after the layout rule: records
+the rule sizes but cannot decode because every mip is BCPack, and records whose element size
+is still unknown. The 1,218 mixed compact records that become partial exports are not skips;
+they are counted in the partial table below.
 
 The compact row is not one thing:
 
