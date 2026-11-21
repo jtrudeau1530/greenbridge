@@ -16,7 +16,7 @@ downloads is the third_party/rpf9-explorer submodule, when it is missing. Never 
 Stages, in order (each skips work that is already done, so a stopped build continues where it left off):
     check     file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V
-    assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC)
+    assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
     runtime   build the loader (needs the game's executable to run, not to build)
     pipelines create every translated shader on your GPU's driver (and every compute pipeline), report anything
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
@@ -190,9 +190,11 @@ def default_out() -> str:
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
 
-def preflight(stages: list, work: str) -> None:
+def preflight(stages: list, work: str, wav: bool = False) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     missing = []
+    if wav and not shutil.which("ffmpeg"):
+        missing.append("ffmpeg (needed for --wav): https://ffmpeg.org/download.html, then reopen the terminal")
     if sys.version_info < (3, 11):
         missing.append("Python 3.11 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
@@ -297,7 +299,7 @@ def rpf9dump(work: str) -> str:
     return exe
 
 
-def assets(game: str, work: str) -> None:
+def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     exe = rpf9dump(work)
     out = os.path.join(work, "assets")
     for rel in MODEL_ARCHIVES:
@@ -328,6 +330,13 @@ def assets(game: str, work: str) -> None:
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
         py("awc_opus.py", os.path.join(out, "audio", "awc"), os.path.join(out, "audio", "ogg"))
+    if wav:
+        ogg = os.path.join(out, "audio", "ogg")
+        if not os.path.isdir(ogg):
+            fail("assets: no Ogg Opus output to decode. The audio bank step must finish first (run the assets stage).")
+        # Opt-in: lossless Ogg Opus -> 16-bit PCM WAV, several times larger. Existing WAVs are skipped.
+        log("assets: audio Ogg Opus -> PCM WAV")
+        py("audio_wav.py", ogg, "--out", os.path.join(out, "audio", "wav"), "--jobs", str(jobs))
     xma_dir = os.path.join(out, "audio", "xma")
     if not os.path.isdir(xma_dir):
         log("assets: XMA2 streams")
@@ -384,6 +393,8 @@ def main() -> int:
     ap.add_argument("--stages", default=",".join(STAGES), help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
+    ap.add_argument("--wav", action="store_true",
+                    help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     a = ap.parse_args()
@@ -411,13 +422,13 @@ def main() -> int:
     for s in stages:
         if s not in STAGES:
             fail(f"unknown stage '{s}'")
-    preflight(stages, work)
+    preflight(stages, work, a.wav)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
         shaders(game, work, a.jobs)
     if "assets" in stages:
-        assets(game, work)
+        assets(game, work, a.wav, a.jobs)
     if "runtime" in stages:
         runtime(game, out, v)
     if "pipelines" in stages:

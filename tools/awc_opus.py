@@ -15,6 +15,8 @@ its run of 2048-byte subblocks after the 2048-aligned header, and the first `ski
 previous chunk's tail and are dropped (whole packets).
 
 Output: <out>/<bank>/<stream id>.ogg (or .wav), plus a summary line per bank.
+
+For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
 """
 import argparse
 import os
