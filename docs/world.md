@@ -59,9 +59,9 @@ the same tool.
 | 70.8–70.92 | 2,353 | 97.7% | 0 | 0 | 0 |
 | **new windows** | **620,481** | **98.2%** | **86,308** | **9,124** | **597,765** |
 
-The second pass scanned 37,026,725,270 bytes (34.48 GiB) in 35.125 GiB of windows. Together with the first
-pass, 39,984,950,733 bytes (37.24 GiB) were scanned, 52.5% of the 70.92 GiB archive. This is still a sample,
-not a census.
+The second pass scanned 37,026,725,270 bytes (34.48 GiB) in 35.125 GiB of windows. Adding the three first-pass
+`world_index` windows gives 39,984,950,733 bytes (37.24 GiB, 52.5% of the archive); adding the carver-indexed
+0–2 GiB window gives 42,126,097,955 bytes (39.23 GiB, 55.3%). This is still a sample, not a census.
 
 The first four `levels.rpf` windows cover 5,153,960,755 bytes, 6.77% of the archive. The sampled stream split
 is ~2.36 GiB in 20–21 GiB, 1.77 GiB in 40–41 GiB and 1.92 GiB in 70–70.8 GiB; the first two GiB are anomalous
@@ -239,7 +239,8 @@ pattern in the 0–2 GiB family is a hash-table slot, not a matrix row.
 ### How many are there?
 
 The measured 9,918 files and 680,228 entities are a **lower bound**, not a whole-archive total. The sample is
-29 GiB of the 57 GiB map band (50.9%) and 37.24 GiB of the archive (52.5%).
+29 GiB of the 57 GiB map band (50.9%) and 39.23 GiB of the archive (55.3%, including the carver-indexed 0–2 GiB
+window).
 
 A single multiplier is weak because density is not uniform: sampled 1-GiB blocks range from 96 to 2,174 map
 files and from 4,754 to 145,118 entities. Treating the 29 sampled 1-GiB units as exchangeable gives a
