@@ -18,8 +18,8 @@ def fmt(samples, rate, codec, channels):
     return bytes(block)
 
 
-def music_blob(ids, samples, rate):
-    """(descriptor, data) for one block of mono Opus channels."""
+def music_blob(ids, samples, rate, toc=0xF8):
+    """(descriptor, data) for one block of Opus channels. toc is the packet TOC byte."""
     desc = bytearray(12 + 16 * len(ids))
     struct.pack_into("<III", desc, 0, 1, 2048, len(ids))
     for i, cid in enumerate(ids):
@@ -31,7 +31,7 @@ def music_blob(ids, samples, rate):
     for i in range(len(ids)):
         struct.pack_into("<I", data, 24 * i + 4, 1)   # subblock count; skip stays 0
         struct.pack_into("<H", data, 2048 + 2048 * i, 1)
-        data[2050 + 2048 * i] = 0xF8                  # CELT 20 ms, one frame
+        data[2050 + 2048 * i] = toc                   # CELT 20 ms, one frame (stereo when bit 2 is set)
     return bytes(desc), bytes(data)
 
 
@@ -131,6 +131,19 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual([r["stream"] for r in doc["streams"]], ["00000010", "00000020", "00000030"])
         self.assertIs(doc["streams"][0]["streamed_music"], False)
         self.assertAlmostEqual(doc["streams"][0]["duration_s"], 0.1, places=6)
+
+    def test_stereo_streamed_music_uses_packet_channels_and_per_channel_samples(self):
+        desc, data = music_blob([0x40], 1920, 48000, toc=0xFC)   # 2 x 960 interleaved samples
+        path = os.path.join(self.tmp.name, "stereo.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(0x50, [(0x48, desc), (0x55, data)])]))
+        p = self.run_tool(path)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = {r["stream"]: r for r in csv.DictReader(io.StringIO(p.stdout))}
+        row = rows["00000040"]
+        self.assertEqual((row["channels"], row["declared_samples"]), ("2", "960"))
+        self.assertAlmostEqual(float(row["duration_s"]), 0.02, places=6)
+        self.assertEqual(row["streamed_music"], "yes")
 
 
 if __name__ == "__main__":

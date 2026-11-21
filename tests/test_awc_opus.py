@@ -329,6 +329,16 @@ class StreamedMusicTest(unittest.TestCase):
         info = awc.music_channels(d, music[0][0], music[0][1])
         self.assertEqual((info[0][1], info[0][5]), (960, 2))
 
+    def test_music_channels_metadata_only_still_reports_packet_channels(self):
+        path = os.path.join(self.tmp.name, "streamed.awc")
+        with open(path, "wb") as f:
+            f.write(build_music_bank([0xFC], 1920))
+        with open(path, "rb") as f:
+            d = f.read()
+        _, music = awc.parse_awc(d)
+        info = awc.music_channels(d, music[0][0], music[0][1], collect_packets=False)
+        self.assertEqual((info[0][1], info[0][4], info[0][5]), (960, [], 2))
+
 
 class MalformedBankTest(unittest.TestCase):
     def test_bad_magic_raises_value_error(self):
