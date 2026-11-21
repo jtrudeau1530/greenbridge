@@ -157,12 +157,9 @@ target and dumps the floats. Test shaders are in `<work>\gputest`.
 Full corpus (verified pixel-shader inputs incl. front face, ACO-confirmed 16-bit semantics, `vcc_hi` as an SGPR,
 code-embedded data via `s_getpc_b64`, global memory, exact packed-f16 modifiers): **16,728 of 26,503 shaders translated, all passing `spirv-val`** (Vulkan 1.2): **all 14,337 vertex and pixel shaders** (2,236 VS, 12,101 PS) and **2,391 of 2,689 compute shaders** (88.9%). Not translated: 9,282 mesh and 195 geometry shaders, plus 298 CS (largest groups: `buffer_load_format_d16` 64, `exec_hi` writes in wave64 code 33, ray-tracing `image_bvh*_intersect_ray` 56, uncommon `ds_swizzle` patterns 32, `image_gather4_l` 16, `image_store` a16/1D 23, `s_setpc_b64` 13).
 operands. GPU re-test on the final SPIR-V: `VS_Passthrough` exact, texture test within RTZ f16 rounding, 400/400
-arithmetic-only PS finite and deterministic. 319 pixel shaders are deliberately rejected because they read unexplained system-input registers (raw
-barycentrics and so on). GPU re-test against the final SPIR-V: `VS_Passthrough` exact, texture test within RTZ f16
-rounding (1.3e-5), and **400/400** arithmetic-only PS finite and identical across two runs. Mesh (9,282), compute (2,689) and geometry (195) shaders aren't
-attempted yet. Of the remaining ~580 VS/PS: 288 use 16-bit shifts (`v_lshrrev_b16`, and whether the destination's
-high half is kept or cleared needs confirming), 155 contain words LLVM can't decode, and 62 write `vcc_hi`. Output:
-`<work>\shaders\spirv\` (`.spvasm` + `.spv`), and the log is `<work>\shaders\spirv_run.log`.
+arithmetic-only PS finite and deterministic. (Earlier runs rejected 321 pixel shaders for unexplained system inputs; those were raw barycentric reads,
+now mapped to `BaryCoordKHR`.) GPU re-test against the final SPIR-V: `VS_Passthrough` exact, texture test within RTZ f16
+rounding (1.3e-5), and **400/400** arithmetic-only PS finite and identical across two runs. Mesh (9,282) and geometry (195) shaders aren't translated yet; compute is covered in its own row below.
 
 How the generated SPIR-V expects the runtime to work:
 
