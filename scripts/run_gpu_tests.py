@@ -447,10 +447,16 @@ def main() -> int:
     resolved_build = find_test_programs(requested_build, ext)
     if resolved_build is None:
         searched = [requested_build, *(os.path.join(requested_build, config) for config in BUILD_CONFIGS)]
-        missing = [name + ext for name in REQUIRED_TEST_PROGRAMS]
-        sys.exit(f"Test programs not found in {', '.join(searched)}: {', '.join(missing)}\n"
+        details = []
+        for directory in searched:
+            missing = [name + ext for name in REQUIRED_TEST_PROGRAMS
+                       if not os.path.isfile(os.path.join(directory, name + ext))]
+            details.append(f"  {directory}: {', '.join(missing)}")
+        sys.exit("Required GPU test programs were not found together in one build directory.\n"
+                 "Missing files by searched directory:\n" + "\n".join(details) + "\n"
                  "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
-                 "For Visual Studio, use: cmake --build <build-dir> --config RelWithDebInfo.\n"
+                 "For Visual Studio, use: cmake --build <build-dir> --config RelWithDebInfo "
+                 "--target vk_compute_test vk_store_test vk_harness.\n"
                  "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
                  "Vulkan headers (vulkan-headers on Arch) and configure again.")
     a.build = resolved_build
