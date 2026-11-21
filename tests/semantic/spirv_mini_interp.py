@@ -135,6 +135,7 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     var_class = {}              # variable id -> storage class
     var_box = {}                # variable id -> [value]
     pointers = {}               # id -> (container list, index) / ("pc", offset) / ("psb", address)
+    id_type = {}                # constant / result id -> its type id (the width of a signed comparison)
     pc_type = {}                # id -> pointee type id of a PushConstant pointer
     in_body = False
     body = []
@@ -205,6 +206,7 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 constants[res] = values[res] = f32(float(a[1]))
             elif k[0] == "int":
                 constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
+                id_type[res] = a[0]
             else:
                 raise UnsupportedConstruct(f"OpConstant of type {k[0]}")
         elif op == "OpConstantTrue":
@@ -251,6 +253,13 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
         v &= (1 << bits) - 1
         return v - (1 << bits) if v >> (bits - 1) else v
 
+    def sval(x):
+        """An integer operand as signed, at the width of its type (a scalar int; 32 if the type is unknown)."""
+        t = types.t.get(id_type.get(x))
+        if t is not None and t[0] != "int":
+            raise UnsupportedConstruct(f"signed comparison of a {t[0]}")
+        return signed(val(x), t[1] if t else 32)
+
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
     pc = 0
     killed = False
@@ -258,6 +267,8 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     while pc < len(body):
         res, op, a, line = body[pc]
         pc += 1
+        if res and a:
+            id_type[res] = a[0]
         if op == "OpLabel":
             prev_label, cur_label = cur_label, res
             continue
@@ -404,10 +415,16 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = val(a[1]) == val(a[2])
         elif op == "OpINotEqual":
             values[res] = val(a[1]) != val(a[2])
-        elif op == "OpSLessThan":
-            values[res] = _s32(val(a[1])) < _s32(val(a[2]))
+        elif op in ("OpSLessThan", "OpSLessThanEqual", "OpSGreaterThan", "OpSGreaterThanEqual"):
+            x, y = sval(a[1]), sval(a[2])
+            values[res] = {"OpSLessThan": x < y, "OpSLessThanEqual": x <= y,
+                           "OpSGreaterThan": x > y, "OpSGreaterThanEqual": x >= y}[op]
         elif op == "OpULessThan":
             values[res] = val(a[1]) < val(a[2])
+        elif op == "OpULessThanEqual":
+            values[res] = val(a[1]) <= val(a[2])
+        elif op == "OpUGreaterThan":
+            values[res] = val(a[1]) > val(a[2])
         elif op == "OpUGreaterThanEqual":
             values[res] = val(a[1]) >= val(a[2])
         elif op == "OpLogicalAnd":

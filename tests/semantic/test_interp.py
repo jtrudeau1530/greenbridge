@@ -164,6 +164,31 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%b = OpLogicalAnd %bool %t %f\n%res = OpSelect %uint %b %c1 %c2\n"), 2)
         self.assertEqual(run_word("%b = OpLogicalOr %bool %f %t\n%res = OpSelect %uint %b %c1 %c2\n"), 1)
 
+    def test_ordered_integer_comparisons(self):
+        # 2 vs 0xFFFFFFFF: unsigned 2 < 4294967295, signed 2 > -1
+        for op, want in (("OpULessThan", 1), ("OpULessThanEqual", 1), ("OpUGreaterThan", 0),
+                         ("OpUGreaterThanEqual", 0), ("OpSLessThan", 0), ("OpSLessThanEqual", 0),
+                         ("OpSGreaterThan", 1), ("OpSGreaterThanEqual", 1)):
+            with self.subTest(op=op):
+                self.assertEqual(run_word(f"%b = {op} %bool %c2 %cFF\n%res = OpSelect %uint %b %c1 %c0\n"), want)
+        for op, want in (("OpULessThanEqual", 1), ("OpUGreaterThan", 0), ("OpSLessThanEqual", 1),
+                         ("OpSGreaterThan", 0), ("OpSGreaterThanEqual", 1)):
+            with self.subTest(op=op, equal=True):
+                self.assertEqual(run_word(f"%b = {op} %bool %c2 %c2\n%res = OpSelect %uint %b %c1 %c0\n"), want)
+
+    def test_signed_comparisons_use_the_operand_width(self):
+        # 0x80000000 as a 64-bit operand is positive; as a 32-bit one it is negative.
+        types = ("%ulong = OpTypeInt 64 0\n%L80 = OpConstant %ulong 2147483648\n%L1 = OpConstant %ulong 1\n"
+                 "%Lneg = OpConstant %ulong 18446744073709551615\n%c8000 = OpConstant %uint 2147483648\n")
+        header = HEADER.replace("%main = OpFunction", types + "%main = OpFunction")
+        for a, b, want in (("%L80", "%L1", 1), ("%Lneg", "%L1", 0), ("%c8000", "%c1", 0)):
+            with self.subTest(a=a, b=b):
+                body = f"%b = OpSGreaterThan %bool {a} {b}\n%res = OpSelect %uint %b %c1 %c0\n"
+                self.assertEqual(si.run_fragment(header + body + "OpStore %out %res\n" + FOOTER)["%out"][0], want)
+        body = ("%x = OpIAdd %ulong %L80 %L80\n%b = OpSGreaterThan %bool %x %L1\n"   # a result id keeps its width
+                "%res = OpSelect %uint %b %c1 %c0\n")
+        self.assertEqual(si.run_fragment(header + body + "OpStore %out %res\n" + FOOTER)["%out"][0], 1)
+
     def test_float_mul_ord_equal_findsmsb_sin(self):
         self.assertEqual(run_word("%x = OpFMul %float %f2 %f3\n%res = OpBitcast %uint %x\n"), 0x40C00000)
         self.assertEqual(run_word("%b = OpFOrdEqual %bool %f2 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
