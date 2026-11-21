@@ -277,6 +277,10 @@ set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
 python -I make_game.py --game "D:\path\to\your\package" --stages shaders
 ```
 
+The same form works in every tool that reads `LLVM_MC`. `tools/mc_command.py` splits it for `shader_disasm.py`,
+the tests, `runtime/test/shaders/build.py` and `scripts/run_gpu_tests.py`; the assembler callers pass the assembly
+on stdin, so a WSL command never receives a Windows file path.
+
 `shader_disasm.py` disassembles one `s_endpgm` before starting, so a missing tool or AMDGPU target stops the run
 with that reason instead of writing empty `.s` files. To disassemble by hand inside WSL:
 

@@ -13,32 +13,18 @@ Set LLVM_MC to llvm-mc's path, or to a whole command such as
 """
 import argparse
 import os
-import shlex
 import struct
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mc_command import mc_command  # noqa: E402
+
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
-
-
-def split_command(raw: str) -> list:
-    """Split LLVM_MC without eating the backslashes of a Windows path (POSIX shlex would)."""
-    if os.name != "nt":
-        return shlex.split(raw)
-    parts = shlex.split(raw, posix=False)
-    return [p[1:-1] if len(p) > 1 and p[0] == p[-1] == '"' else p for p in parts]
-
-
-def mc_command() -> list:
-    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'."""
-    raw = os.environ.get("LLVM_MC", "llvm-mc").strip()
-    if os.path.isfile(raw):
-        return [raw]                    # a plain path, spaces and all
-    return split_command(raw) or ["llvm-mc"]
 
 
 MC = mc_command()

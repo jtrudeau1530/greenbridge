@@ -3,8 +3,9 @@
     python3 -I runtime/test/shaders/build.py <out dir> [name ...]
 
 Each .asm is RDNA2 assembly. It is assembled with llvm-mc (LLVM 21+ with the AMDGPU target; set LLVM_MC to its
-path, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are staged in a temporary
-directory. After validation, the build writes <out>/spirv/<name>.spv and the translator metadata.
+path or to a whole command, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are
+staged in a temporary directory. After validation, the build writes <out>/spirv/<name>.spv and the translator
+metadata.
 
 Compute shaders get the header the tests were written for: RSRC2 0x8088 (4 user SGPRs holding the V#, the
 workgroup id in s4, 512 bytes of LDS) and a 64x1x1 group (a "; group: X,Y,Z" comment at the top of the .asm
@@ -22,8 +23,12 @@ import tempfile
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TRANSLATOR = os.path.join(HERE, "..", "..", "..", "tools", "rdna2spirv.py")
-LLVM_MC = os.environ.get("LLVM_MC", "llvm-mc")
+TOOLS = os.path.join(HERE, "..", "..", "..", "tools")
+TRANSLATOR = os.path.join(TOOLS, "rdna2spirv.py")
+sys.path.insert(0, TOOLS)
+import mc_command  # noqa: E402
+
+MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
 
 
@@ -60,12 +65,14 @@ def translate_tests(work, names):
     fssm.mkdir()
     for n in names:
         asm_path = os.path.join(HERE, n + ".asm")
+        raw = Path(asm_path).read_text(encoding="utf-8")
         mattr = asm_mattr(asm_path)
-        cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         if mattr:
             cmd.append(f"-mattr={mattr}")
-        cmd += ["-show-encoding", asm_path]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        cmd.append("-show-encoding")
+        # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
+        r = subprocess.run(cmd, input=raw, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.

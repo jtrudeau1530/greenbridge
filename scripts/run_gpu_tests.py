@@ -1,7 +1,9 @@
 """Assemble, translate, and run the synthetic RDNA2->SPIR-V GPU test suite on Vulkan.
 
 Usage:
-    python -I scripts/run_gpu_tests.py [--llvm-mc PATH] [--build DIR] [--work DIR] [--filter SUBSTR]
+    python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR]
+
+--llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc".
 """
 import argparse
 import json
@@ -16,6 +18,8 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import mc_command  # noqa: E402
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -80,7 +84,7 @@ def asm_group(asm_path: str) -> tuple[int, int, int]:
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     raw = open(asm_path, encoding="utf-8").read()
-    cmd = [llvm_mc, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+    cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
     for ln in raw.splitlines():
         s = ln.strip()
         if not s:
@@ -357,7 +361,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
+    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
+                    help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")

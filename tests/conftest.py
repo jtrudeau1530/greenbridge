@@ -17,13 +17,14 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import mc_command  # noqa: E402
 import rdna2spirv  # noqa: E402
 
 
 def _has_amdgpu(mc):
     """True if this llvm-mc was built with the AMDGPU target (the official Windows release archives are not)."""
     try:
-        r = subprocess.run([mc, "--version"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(mc + ["--version"], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return "amdgcn" in r.stdout
@@ -33,12 +34,14 @@ def _find_llvm_mc():
     candidates = []
     env = os.environ.get("LLVM_MC")
     if env:
-        candidates.append(shutil.which(env))      # None when the path doesn't exist
-    candidates.append(shutil.which("llvm-mc"))
+        candidates.append(mc_command.split_command(env))
+    found = shutil.which("llvm-mc")
+    if found:
+        candidates.append([found])
     # Debian/Ubuntu install it versioned, out of PATH.
-    candidates += sorted(glob.glob("/usr/lib/llvm-*/bin/llvm-mc"), reverse=True)
+    candidates += [[p] for p in sorted(glob.glob("/usr/lib/llvm-*/bin/llvm-mc"), reverse=True)]
     # Default location of the official Windows installer, which doesn't add LLVM to PATH unless asked to.
-    candidates += glob.glob(r"C:\Program Files\LLVM\bin\llvm-mc.exe")
+    candidates += [[p] for p in glob.glob(r"C:\Program Files\LLVM\bin\llvm-mc.exe")]
     for c in candidates:
         if c and _has_amdgpu(c):
             return c
@@ -126,7 +129,7 @@ class Shader:
             rsrc2, (lx, ly, lz) = cs_header
             (workdir / "fssm").mkdir(exist_ok=True)
             (workdir / "fssm" / f"{name}.fssm").write_bytes(bytes(0x138) + struct.pack("<4I", rsrc2, lx, ly, lz))
-        cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        cmd = LLVM_MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         for ln in asm.splitlines():
             s = ln.strip()
             if not s:
