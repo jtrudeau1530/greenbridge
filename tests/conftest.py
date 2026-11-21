@@ -72,13 +72,14 @@ def make_dxbc(chunks):
 
 
 def signature_chunk(fourcc, elements):
-    """ISG1/OSG1 chunk. elements = [(register, system value, mask)]: system value 1 is SV_Position, 0 is a plain
-    varying. Semantic names are left out (offset 0): the translator only reads register, system value, component
-    type and the two masks."""
+    """ISG1/OSG1 chunk. elements = [(register, system value, mask)] or [(register, system value, mask, sem_idx)].
+    System value 1 is SV_Position, 2 is SV_ClipDistance, 3 is SV_CullDistance, 0 is a plain varying."""
     out = struct.pack("<II", len(elements), 8)
-    for reg, sysv, mask in elements:
+    for item in elements:
+        reg, sysv, mask = item[:3]
+        sem = item[3] if len(item) > 3 else 0
         # stream, name offset, semantic index, system value, component type (3 = float), register, masks, padding
-        out += struct.pack("<6I", 0, 0, 0, sysv, 3, reg) + bytes([mask, mask, 0, 0]) + struct.pack("<I", 0)
+        out += struct.pack("<6I", 0, 0, sem, sysv, 3, reg) + bytes([mask, mask, 0, 0]) + struct.pack("<I", 0)
     return fourcc, out
 
 
@@ -98,11 +99,16 @@ def mesh_psv0_chunk(threads=(128, 1, 1), max_vertices=64, max_primitives=64, top
 GS_TRI_DXBC = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF)]),      # SV_Position reg 0, TEXCOORD0 reg 1
                          signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)])])
 MS_TRI_DXBC = make_dxbc([mesh_psv0_chunk()])                                          # 128 threads, 64/64, triangles
-SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC}
+MS_CLIP_DXBC = make_dxbc([mesh_psv0_chunk(),
+                          signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0x1)])])      # SV_Position + SV_ClipDistance.x
+SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC}
 
 # spirv-val errors on valid-looking output, by sample. ms_tri: SPIRV-Tools 2025.1 (Ubuntu 24.04) rejects the
 # CullPrimitiveEXT output although it is declared as the spec asks (PerPrimitiveEXT array of bool, MeshEXT model).
-KNOWN_VAL_ISSUES = {"ms_tri": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036"}
+KNOWN_VAL_ISSUES = {
+    "ms_tri": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036",
+    "ms_clip": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036",
+}
 
 # Compute shaders take their system registers from the FSSM header (rdna2spirv.translate reads it from
 # <disasm dir>/../fssm/<name>.fssm): word 0x138 is COMPUTE_PGM_RSRC2, words 0x13C/0x140/0x144 the thread-group size.
