@@ -143,8 +143,10 @@ def parse_awc(d: bytes):
     return streams, music
 
 
-def music_channels(d: bytes, mus, data):
-    """[(channel id, samples, rate, codec, [packets])] for one streamed-music descriptor."""
+def music_channels(d: bytes, mus, data, collect_packets: bool = True):
+    """[(channel id, samples, rate, codec, [packets])] for one streamed-music descriptor.
+
+    collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py)."""
     (m_at, m_size), (d_at, d_size) = mus, data
     blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
     if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
@@ -165,7 +167,7 @@ def music_channels(d: bytes, mus, data):
         for c, (count, skip) in enumerate(recs):
             start = at + header + before * 2048
             before += count
-            if info[c][3] != 0x0B or count == 0:
+            if info[c][3] != 0x0B or count == 0 or not collect_packets:
                 continue
             for pk in opus_packets(d, start, count * 2048):
                 n = opus_samples(pk)
