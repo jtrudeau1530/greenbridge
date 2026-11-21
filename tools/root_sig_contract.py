@@ -77,7 +77,7 @@ def reconcile(shader_reads, dwords):
         by_sgpr.setdefault(read["sgpr"], []).append(read["kind"])
     for sgpr in sorted(by_sgpr):
         kinds = by_sgpr[sgpr]
-        if sgpr >= len(dwords):
+        if sgpr < 0 or sgpr >= len(dwords):
             issues.append(f"s{sgpr} read but layout has {len(dwords)} dwords")
             continue
         slot = dwords[sgpr]
