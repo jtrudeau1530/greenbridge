@@ -29,6 +29,29 @@ counted against the declared `entity_size` and no entity block was left in a gra
 `entities_exact` is the same check summed over all rows. Six entities of the 23,535 maps were split
 across a continuation; the joiner adopted 174 streams in total.
 
+### Placement maps vs metadata
+
+The 23,535 rows above are **placement maps**: a `CMapData` root and at least one countable
+`CEntityDef` block. The same pass also validates **138,839 `CMapData`-only metadata resources** with
+no `CEntityDef` block, plus **26,075 other `0x7a` metadata resources**. Counting every `CMapData`
+root regardless of entity schema gives **162,374** resources, but only the 23,535 with entities are
+placement maps in this census. Keeping the two classes separate avoids inflating the map count with
+map-definition metadata.
+
+| Detail | Count |
+|---|---:|
+| Placement maps (`CMapData` + `CEntityDef`) | 23,535 |
+| `CMapData`-only metadata (no `CEntityDef`) | 138,839 |
+| Other `0x7a` metadata | 26,075 |
+| Placement maps joining a continuation | 2,868 |
+| Placement maps using a raw continuation page | 3 |
+| Metadata resources using a raw continuation page | 1 |
+| Byte-identical duplicate map payloads | 0 |
+| Duplicate 32-bit map-name hashes | 0 |
+| Entity blocks in graphics pages | 0 |
+| Unresolved or truncated map resources | 0 |
+
+
 ## Coverage
 
 | Byte class | Bytes | Share of data area |
@@ -54,6 +77,7 @@ payload, not counted maps.
 - `complete` is true and every expected shard was written;
 - `maps_exact == maps` and `entities_exact == entities`;
 - `entity_gfx == 0` and `entity_unresolved == 0`;
+- `incomplete == 0` and `invalid == 0`;
 - `raw_maps == 0` and `missed_zlib_meta == 0`.
 
 The run above satisfies every condition. `accounted_ratio` is 1.0 because every byte is assigned to
@@ -82,7 +106,8 @@ python -I tests\test_world_census.py
 ```
 
 The default shard size is 2 GiB, the default job count is half the logical CPUs, and the scan is
-bounded by `--start` / `--limit` when a partial pass is wanted.
+bounded by `--start` / `--limit` when a partial pass is wanted. `--jobs 1` runs the shards in-process
+instead of a process pool, which is useful for small synthetic archives and tests.
 
 ## Limits
 
