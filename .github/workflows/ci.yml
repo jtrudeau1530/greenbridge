@@ -18,7 +18,7 @@ jobs:
         with:
           dotnet-version: "8.0.x"
       - name: Python tools compile
-        run: python -m compileall -q make_game.py tools
+        run: python -m compileall -q make_game.py tools tests
       - name: make_game.py help
         run: python -I make_game.py --help
       - name: Tests (standard library only, no game data)
@@ -61,3 +61,13 @@ jobs:
           python-version: "3.12"
       - name: Translator semantic tests
         run: python -m unittest discover -s tests/semantic -v
+
+  viewer-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - name: Viewer chunk streaming (synthetic, no browser or game data)
+        run: node --test tests/test_viewer_streaming.cjs
