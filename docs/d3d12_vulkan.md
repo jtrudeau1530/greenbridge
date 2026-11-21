@@ -2,9 +2,10 @@
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
 render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears, and query heaps)
-runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
-set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
-implemented.** This is the plan for replacing the console's
+runs behind the Xbox-ABI device proxy, and a presenter puts back buffers in a window (section 3.2). The M0
+milestone passes in a synthetic test (section 6). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
+set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the game's own present
+entry point (DXGI or PresentX) are not implemented.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
 exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
@@ -318,6 +319,19 @@ What is implemented (all of it testable without the game):
 
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it, as it does
   `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
+- **Presentation** (`runtime/src/vulkan_present.h`, `rt::d3d12::create_window_presenter`). This is the part every
+  present front end needs; DXGI or `PresentX` is still open (question 6). It takes a back buffer, an ordinary
+  texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image, scaling when the window
+  size differs. The blit goes on the same `VkQueue` after the application's work, so the frame contains everything
+  submitted before the present. Details:
+  - two frames in flight, and a present semaphore per swapchain image;
+  - FIFO when vsync is asked for, otherwise MAILBOX or IMMEDIATE;
+  - the swapchain is recreated on resize or when the surface reports it out of date or suboptimal, and a minimised
+    window skips presents;
+  - a back buffer that was never written is zero-filled like any other texture.
+
+  The device needs `VK_KHR_swapchain` (and the instance the surface extensions). The standalone device enables
+  them when present.
 
   New textures are not touched at creation. They are tracked as `UNDEFINED`, and the first command that uses a
   part of one zero-fills it (D3D12 committed resources start zeroed; `CREATE_NOT_ZEROED` skips this) and moves it
@@ -400,10 +414,10 @@ A typed 3D color target supports default and explicit RTVs. The default covers m
 `WSize` select the depth slices in an explicit view's mip. `d3d12_clear_test --volume` checks full and
 rectangular clears of overlapping slice ranges against both Windows WARP and expected RGBA bytes.
 
-Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
-creation), root signatures, PSOs, draws, typeless volume RTVs,
-placed resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
-1D textures and the swapchain;
+Known gaps: the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what
+either calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they
+do not wait on view creation), root signatures, PSOs, draws, typeless volume RTVs, placed resources,
+`GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves and 1D textures;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); the GCL8
 front/back stencil references are recorded but not applied, because there is no pipeline or draw path for them to
@@ -536,6 +550,10 @@ and any validation error fails them.
     this one in Vulkan and binds the device's set. It reads the texture through the view's own slot and through
     a copy of it, and gets the fallback from a slot of bytes no view was made for and, after the texture is
     destroyed, from the view's own bytes.
+- `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
+  the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
+  resizes the window, which recreates the swapchain and scales the blit, and switches to unsynchronised presents.
+  Last, it reads the colour on screen with GDI when the window is in front.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
@@ -1199,6 +1217,11 @@ That import must be shimmed. The shim provides:
   toggles borderless/fullscreen; `GetFrameStatistics` is a stub.
 - `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
 
+**What exists.** The back end of this path is `leonida::VulkanPresenter` (section 3.2): surface, swapchain,
+blit, present, resize. A DXGI shim's `Present` and a `PresentX` implementation would both end in its `present()`.
+`GetBuffer(i)` therefore does not need to wrap swapchain images: the buffers can be ordinary committed textures,
+blitted at present time, which also frees the game's buffer count and format from the surface's.
+
 **PresentX and frame events (GDKX).** Public Microsoft samples present on Xbox without a DXGI swapchain. Facts
 below come from MIT/zlib-licensed code and docs, read directly; none is from the game or the SDK. Sources:
 [SimpleDeviceAndSwapChain](https://github.com/microsoft/Xbox-GDK-Samples/tree/main/Samples/IntroGraphics/SimpleDeviceAndSwapChain)
@@ -1537,7 +1560,7 @@ M0–M2 do not need the executable.
 
 | # | Scope | What it proves | Done when |
 |---|---|---|---|
-| **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/output, `ALLOW_DISPLAY` back buffers, frame events + `PresentX` (DXGI swapchain only if the game creates one), clear + present | COM interception, the known Xbox device entry point and ABI overrides, presentation (`PresentX` + frame events, or swapchain), frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced |
+| **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/output, `ALLOW_DISPLAY` back buffers, frame events + `PresentX` (DXGI swapchain only if the game creates one), clear + present | COM interception, the known Xbox device entry point and ABI overrides, presentation (`PresentX` + frame events, or swapchain), frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced. **Synthetic part met** by `d3d12_present_test`: 60 frames through the proxy on Vulkan, validation clean, colour checked on screen. Still open: the game's present front end (frame events + `PresentX`, or a DXGI swapchain) and the per-call trace |
 | **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0 |
 | **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries |
 | **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report |
