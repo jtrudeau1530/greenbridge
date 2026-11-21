@@ -458,7 +458,11 @@ The compute path, end to end:
     topology, vertex strides, stencil references and the blend factor are dynamic.
   - **Formats:** dynamic rendering takes the RTV and DSV formats.
   - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
-    that both read their code base (question 14).
+    that both read their code base (question 14, section 5.2).
+  - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
+    stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
+    `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) has every PSO refused, with the
+    limit in the log, until the uniform-buffer tail exists.
 
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
@@ -1617,15 +1621,13 @@ VS, 93 PS, 266 MS and 263 CS (0 GS); the 147 VS/PS match the translator's own no
 MS+PS pipeline can therefore need a code base.
 
 **Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). Intel Arc is not uniform: the earlier fleet entries report the 128-byte specification minimum (`maxPushConstantsSize == 128`) for Arc, but an Arc B580 (Battlemage) on Windows 11, driver 32.0.101.9175, reports 256 bytes (#166, @rtrexmass), so there D3D-14's fallback never engages. The 128 figure may be specific to another OS or driver (Mesa ANV on Linux is the guess; no Arc run on Linux that records the OS is cited here, and an ANV result would settle it). So does an integrated AMD RDNA2 GPU, a Radeon 680M on the Windows driver 22.40.84.06, so the minimum is not Intel-only. 128 bytes cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
-Measured per stage (all 26,503, `tools/feature_scan.py`): `s_getpc_b64` is kept to read code-embedded data in 54
-VS, 93 PS, 266 MS and 263 CS (0 GS); the 147 VS/PS match the translator's own note. Both stages of a VS+PS or
-MS+PS pipeline can therefore need a code base.
-
 **Open:** the exact count of such PSOs (the pairing is in the executable), and the minimum `maxPushConstantsSize` across target GPUs. If a GPU only
 supports 128 bytes, the current 144-byte contract already fails; the layer needs a fallback (uniform buffer for the
 tail) regardless.
 
-**Open:** the exact count of such PSOs; the pairing is in the executable, not in `shaders.rpf`.
+At run time, `CreateGraphicsPipelineState` refuses a pair where both stages read their code base, with a log, so
+the first boot measures the pair count. A device whose `maxPushConstantsSize` is below 144 has every PSO refused,
+with the limit in the log, until the uniform-buffer tail exists.
 
 ### 5.3 Descriptor T#/S# parsing
 

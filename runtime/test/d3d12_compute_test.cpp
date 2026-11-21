@@ -209,6 +209,25 @@ int main() {
         const auto other_container = shader_container(other);
         pso_desc.CS = {other_container.data(), other_container.size()};
         EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
+        pso_desc.CS = {container.data(), container.size()};
+
+        // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
+        // its PSOs are refused instead of creating a pipeline layout the spec forbids (#224's fallback flag).
+        {
+            rt::d3d12::VulkanDeviceInfo limited_info = info;
+            limited_info.max_push_constants_size = 128;
+            limited_info.push_constants_need_fallback = true;
+            Ref<ID3D12Device> limited;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(limited_info, IID_PPV_ARGS(&limited.p))));
+            EXPECT(rt::d3d12::device_push_constants_need_fallback(limited.p));
+            Ref<ID3D12RootSignature> limited_root;
+            EXPECT(SUCCEEDED(limited->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+                                                        IID_PPV_ARGS(&limited_root.p))));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC limited_desc = pso_desc;
+            limited_desc.pRootSignature = limited_root.p;
+            Ref<ID3D12PipelineState> refused;
+            EXPECT(limited->CreateComputePipelineState(&limited_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+        }
 
         // Buffers in the arena, an upload buffer outside it, a readback buffer for the results.
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};

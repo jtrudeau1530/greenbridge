@@ -1230,6 +1230,19 @@ public:
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_);
     }
 
+    // Pipeline layouts declare the whole 144-byte block as one push-constant range. A device whose
+    // maxPushConstantsSize is smaller (128 bytes is the Vulkan minimum, which some Intel and mobile drivers
+    // report) needs the uniform-buffer tail #224 flags with push_constants_need_fallback, which is not built yet,
+    // so pipelines are refused there with the limit named instead of breaking VUID-VkPushConstantRange-size-00298.
+    bool push_constants_fit() const {
+        const std::uint32_t limit = device_.info.max_push_constants_size;
+        if (limit == 0 || limit >= sizeof(leonida::ShaderUserData)) return true;  // 0: not queried
+        log_once("pipelines need 144 bytes of push constants (uniform-buffer fallback not built yet); "
+                 "maxPushConstantsSize",
+                 int(limit));
+        return false;
+    }
+
     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
     bool compute() const { return registered_ && !is_graphics_; }
     bool graphics() const { return registered_ && is_graphics_; }
@@ -1247,6 +1260,7 @@ public:
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
             return E_NOTIMPL;
         }
+        if (!push_constants_fit()) return E_NOTIMPL;
         if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.GS.BytecodeLength || desc.StreamOutput.NumEntries) {
             log_once("graphics pipeline stage not supported yet (hull/domain/geometry/stream output):", 0);
             return E_NOTIMPL;
@@ -1452,8 +1466,10 @@ public:
         dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states));
         dynamic.pDynamicStates = dynamic_states;
 
-        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                                       sizeof(leonida::ShaderUserData)};
+        // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
+        // stages present. A stage added to the table (geometry, mesh) is covered without touching this.
+        for (const Stage& stage : stages) graphics_.push_stages |= stage.bit;
+        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -1496,6 +1512,7 @@ public:
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 0);
             return E_NOTIMPL;
         }
+        if (!push_constants_fit()) return E_NOTIMPL;
         const std::vector<std::uint8_t> fssm = leonida::fssm_program(
             {static_cast<const std::uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength});
         if (fssm.empty()) {
