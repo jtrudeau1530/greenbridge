@@ -310,6 +310,9 @@ void test_recursive_exe(const fs::path& exe, const fs::path& dll) {
     }
     check(dependency != nullptr, "load(exe) recursively maps the imported tiny_dll.dll");
     check(loader.modules().size() == 2, "load(exe) maps exactly the EXE and its tiny DLL");
+    const auto& init = loader.initialisation_order();
+    check(init.size() == 2 && init[0] == dependency && init[1] == &module,
+          "initialisation_order() puts tiny_dll.dll before the EXE that imports it");
     std::printf("     modules=%zu\n", loader.modules().size());
 
     if (dependency) {

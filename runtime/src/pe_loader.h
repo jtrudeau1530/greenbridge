@@ -48,6 +48,10 @@ public:
 
     const std::vector<Module*>& modules() const { return order_; }
 
+    // The order initialise() runs modules in: each module after every module it imports (a cycle is broken at the
+    // module that closed it). modules() is mapping order, which puts an importer before its imports.
+    const std::vector<Module*>& initialisation_order() const { return init_order_; }
+
     // Runs each loaded module's TLS callbacks and then its DllMain(DLL_PROCESS_ATTACH), dependencies first.
     // Only DLLs get DllMain called: an EXE's entry point is the caller's to run. Throws on a corrupt TLS
     // directory, a TLS callback outside its image, or a DllMain that returns FALSE.
@@ -63,7 +67,8 @@ private:
 
     std::filesystem::path game_dir_;
     std::map<std::string, Module*> by_name_;  // lower-case file name
-    std::vector<Module*> order_;
+    std::vector<Module*> order_;       // mapping order; owns the modules
+    std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
 };
 
 std::string lower(std::string s);

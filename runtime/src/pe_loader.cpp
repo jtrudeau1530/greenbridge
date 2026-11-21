@@ -67,14 +67,16 @@ Module& Loader::load(const std::filesystem::path& image) {
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
     Module& m = map_image(image);
-    bind_imports(m);
+    bind_imports(m);  // loads every bundled module m imports first, so they land in init_order_ before m
     protect_sections(m);
+    init_order_.push_back(&m);
     return m;
 }
 
 void Loader::initialise() {
-    // order_ is dependency order: a module is pushed after the modules it imports.
-    for (auto* m : order_) initialise(*m);
+    // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
+    // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
+    for (auto* m : init_order_) initialise(*m);
 }
 
 void Loader::initialise(Module& m) {
