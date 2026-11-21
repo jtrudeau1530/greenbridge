@@ -202,6 +202,175 @@ class TestMipmapCalculations(unittest.TestCase):
             tex_headers.calc_mip_level_bytes(64, 64, 1, fmt=9999)
 
 
+class TestCompactMipLayout(unittest.TestCase):
+    def test_descriptor_mode_is_flag_plus_tile_mode(self):
+        cases = {
+            0: (0, 65536), 1: (0, 65536),
+            2: (1, 4096), 3: (1, 4096),
+            4: (2, 4096), 5: (2, 4096),
+            6: (3, 4096), 7: (3, 4096),
+            32: (0, 65536), 34: (1, 4096), 36: (2, 4096), 38: (3, 4096),
+            18: (9, 4096), 20: (10, 4096), 22: (11, 4096), 24: (12, 4096),
+        }
+        for mode, (tile_mode, tile_bytes) in cases.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(tex_headers.gfx10_tile_mode(mode), tile_mode)
+                self.assertEqual(tex_headers.gfx10_tile_bytes(mode), tile_bytes)
+
+    def test_invalid_mode_rejected(self):
+        for mode in (-1, -32, "4", None):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError):
+                    tex_headers.gfx10_tile_mode(mode)
+
+    def test_known_4k_chain_sizes(self):
+        lay = tex_headers.compact_layout_for_dxgi(256, 256, 71, 7)
+        self.assertEqual(lay["size"], 45056)
+        self.assertEqual(lay["first_tail"], 2)
+        self.assertEqual(lay["block_w"], 32)
+        self.assertEqual(lay["block_h"], 16)
+        self.assertEqual([m["region"] for m in lay["mips"]],
+                         [32768, 8192, 4096, 4096, 4096, 4096, 4096])
+        self.assertEqual([m["offset"] for m in lay["mips"][:2]], [12288, 4096])
+        self.assertEqual((lay["mips"][2]["tile_x"], lay["mips"][2]["tile_y"]), (16, 0))
+        self.assertEqual((lay["mips"][6]["tile_x"], lay["mips"][6]["tile_y"]), (8, 4))
+
+    def test_known_1024_chain_matches_allocation(self):
+        lay = tex_headers.compact_layout_for_dxgi(1024, 1024, 71, 9)
+        self.assertEqual(lay["size"], 700416)
+        self.assertEqual(lay["first_tail"], 4)
+        self.assertEqual([m["region"] for m in lay["mips"][:4]],
+                         [524288, 131072, 32768, 8192])
+        self.assertEqual([m["offset"] for m in lay["mips"][:4]],
+                         [176128, 45056, 12288, 4096])
+        self.assertTrue(tex_headers.compact_span_matches(lay, 700416))
+
+    def test_known_64k_tile_chain(self):
+        lay = tex_headers.compact_layout_for_dxgi(1024, 1024, 98, 9,
+                                                  tile=tex_headers.COMPACT_TILE_64K)
+        self.assertEqual(lay["tile"], 65536)
+        self.assertEqual(lay["first_tail"], 3)
+        self.assertEqual(lay["size"], 1441792)
+        self.assertEqual([m["region"] for m in lay["mips"][:3]],
+                         [1048576, 262144, 65536])
+
+    def test_non_square_chain(self):
+        lay = tex_headers.compact_layout_for_dxgi(512, 256, 71, 7)
+        self.assertEqual(lay["size"], 90112)
+        self.assertEqual(lay["first_tail"], 3)
+        self.assertEqual([m["region"] for m in lay["mips"][:3]],
+                         [65536, 16384, 4096])
+        self.assertEqual(lay["mips"][3]["pixels_w"], 64)
+        self.assertEqual(lay["mips"][3]["pixels_h"], 32)
+
+    def test_single_mip_is_padded_to_one_tile(self):
+        lay = tex_headers.compact_layout_for_dxgi(64, 64, 71, 1)
+        self.assertEqual(lay["size"], 4096)
+        self.assertEqual(lay["first_tail"], 1)
+        self.assertEqual(lay["mips"][0]["offset"], 0)
+        self.assertEqual(lay["mips"][0]["region"], 4096)
+        self.assertFalse(lay["mips"][0]["in_tail"])
+
+    def test_sub_tile_mips_share_the_tail(self):
+        lay = tex_headers.compact_layout_for_dxgi(8, 4, 71, 2)
+        self.assertEqual(lay["size"], 4096)
+        self.assertEqual(lay["first_tail"], 0)
+        self.assertTrue(all(m["in_tail"] for m in lay["mips"]))
+        self.assertEqual([(m["tile_x"], m["tile_y"]) for m in lay["mips"]],
+                         [(16, 0), (8, 8)])
+
+    def test_uncompressed_chain_is_sized_by_pixels(self):
+        lay = tex_headers.compact_layout_for_dxgi(128, 128, 28, 8)
+        self.assertEqual(lay["element_bytes"], 4)
+        self.assertEqual(lay["size"], 90112)
+        self.assertEqual(lay["first_tail"], 3)
+        self.assertEqual([m["region"] for m in lay["mips"][:3]],
+                         [65536, 16384, 4096])
+        self.assertEqual(lay["mips"][0]["blocks_w"], 128)
+        self.assertEqual(lay["mips"][0]["blocks_h"], 128)
+
+    def test_size_is_standalone_regions_plus_one_tail_tile(self):
+        for args in [(256, 256, 71, 7), (1024, 1024, 98, 9),
+                     (128, 256, 98, 6), (512, 256, 28, 9)]:
+            with self.subTest(args=args):
+                lay = tex_headers.compact_layout_for_dxgi(*args)
+                standalone = sum(m["region"] for m in lay["mips"] if not m["in_tail"])
+                tail = lay["tile"] if lay["first_tail"] < len(lay["mips"]) else 0
+                self.assertEqual(lay["size"], standalone + tail)
+                self.assertTrue(tex_headers.compact_span_matches(lay, lay["size"]))
+
+    def test_inconsistent_span_rejected(self):
+        lay = tex_headers.compact_layout_for_dxgi(256, 256, 71, 7)
+        self.assertTrue(tex_headers.compact_span_matches(lay, 45056))
+        self.assertFalse(tex_headers.compact_span_matches(lay, 45057))
+        self.assertFalse(tex_headers.compact_span_matches(lay, 40960))
+        self.assertFalse(tex_headers.compact_span_matches(lay, None))
+
+    def test_invalid_mip_counts_rejected(self):
+        for width, height, mips in [(256, 256, 0), (256, 256, -1),
+                                    (64, 64, 20), (1, 1, 2)]:
+            with self.subTest(width=width, height=height, mips=mips):
+                with self.assertRaises(ValueError):
+                    tex_headers.compact_surface_layout(width, height, mips, 8, 4)
+
+    def test_invalid_sizes_rejected(self):
+        bad = [
+            dict(width=0, height=256, mips=1, element_bytes=8, block=4),
+            dict(width=256, height=-1, mips=1, element_bytes=8, block=4),
+            dict(width=256, height=256, mips=7, element_bytes=3, block=4),
+            dict(width=256, height=256, mips=7, element_bytes=12, block=4),
+            dict(width=256, height=256, mips=7, element_bytes=8, block=2),
+            dict(width=256, height=256, mips=7, element_bytes=8, block=4, tile=8192),
+        ]
+        for case in bad:
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    tex_headers.compact_surface_layout(**case)
+
+    def test_unknown_dxgi_format_rejected(self):
+        with self.assertRaises(ValueError):
+            tex_headers.compact_layout_for_dxgi(256, 256, 9999, 7)
+
+    def test_parse_etpf_record(self):
+        a = (512 - 1) | ((256 - 1) << 14) | (7 << 28)
+        b = 1 | (71 << 3) | (0 << 11) | (1 << 21) | (4 << 23)
+        c = 0x1234 | (0x103 << 21)
+        d = 0x04030201
+        desc = tex_headers.parse_etpf_texture_record(struct.pack("<IIII", a, b, c, d))
+        self.assertEqual(desc["width"], 512)
+        self.assertEqual(desc["height"], 256)
+        self.assertEqual(desc["packed_mips"], 7)
+        self.assertEqual(desc["non_tail"], 1)
+        self.assertEqual(desc["mips"], 8)
+        self.assertEqual(desc["format"], 71)
+        self.assertEqual(desc["depth"], 1)
+        self.assertEqual(desc["dimension"], 1)
+        self.assertEqual(desc["mode"], 4)
+        self.assertEqual(desc["meta"], 0x103)
+        self.assertEqual(desc["extra"], 0x04030201)
+        self.assertEqual(desc["base"], 0x1234 * 4096)
+        self.assertEqual(tex_headers.compact_profile_key(desc, 8),
+                         (4, 512, 256, 8, 1, 8))
+        with self.assertRaises(ValueError):
+            tex_headers.parse_etpf_texture_record(b"\x00" * 15)
+
+    def test_parse_etpf_maximum_fields(self):
+        # All packed fields at their maximum: 16 Ki mips worth of split bits,
+        # maximum depth/dimension/mode/meta/base. The parser reports the bit
+        # fields; layout validation is what rejects an impossible mip count.
+        record = struct.pack("<IIII", 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+        desc = tex_headers.parse_etpf_texture_record(record)
+        self.assertEqual((desc["width"], desc["height"]), (16384, 16384))
+        self.assertEqual((desc["packed_mips"], desc["non_tail"], desc["mips"]), (15, 7, 22))
+        self.assertEqual((desc["format"], desc["depth"], desc["dimension"]), (255, 1024, 3))
+        self.assertEqual(desc["mode"], 511)
+        self.assertEqual(desc["meta"], 0x7FF)
+        self.assertEqual(desc["base"], 0x1FFFFF * 4096)
+        with self.assertRaises(ValueError):
+            tex_headers.compact_surface_layout(desc["width"], desc["height"],
+                                               desc["mips"], 16, 4)
+
+
 class TestDDSHeaderSynthesis(unittest.TestCase):
     def test_dds_header_2d_basic(self):
         hdr = tex_headers.dds_header(512, 256, depth=1, mips=1, fmt=28, is_cube=False, linear_size=512 * 256 * 4)
