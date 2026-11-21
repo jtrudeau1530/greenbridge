@@ -135,7 +135,7 @@ class Shader:
         r = subprocess.run(cmd, input=asm, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         self.path = disasm / f"{name}.s"
-        self.path.write_text(r.stdout)
+        self.path.write_text(f"; {name}  synthetic\n{r.stdout}")
         self.workdir = workdir
 
     def translate(self):
