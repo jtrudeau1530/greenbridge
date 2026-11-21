@@ -102,6 +102,14 @@ GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_cvt_f32_sat.asm (#300): s4 is a binary32 input, out[0] = v_cvt_u32_f32, out[1] = v_cvt_i32_f32 (truncate,
+# saturate, NaN -> 0). One dispatch per input through VKC_SGPRS; the inputs of tests/semantic/test_float_to_int.py.
+CVT_F32_SAT_CASES = (
+    (0x00000000, 0, 0), (0x80000000, 0, 0), (0x00000001, 0, 0), (0x3FC00000, 1, 1), (0xBFC00000, 0, 0xFFFFFFFF),
+    (0x4EFFFFFF, 0x7FFFFF80, 0x7FFFFF80), (0x4F000000, 0x80000000, 0x7FFFFFFF), (0x4F7FFFFF, 0xFFFFFF00, 0x7FFFFFFF),
+    (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
+    (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
+    (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
@@ -294,6 +302,17 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         if m and m.group(1) == "0":
             return ""
     return failure(code, out, 2)
+
+
+def cvt_f32_sat_test(tools, spirv):
+    """cs_cvt_f32_sat once per input of CVT_F32_SAT_CASES: an empty string when every pair of words is exact."""
+    wrong = []
+    for bits, unsigned, signed in CVT_F32_SAT_CASES:
+        problem = compute_test(tools, spirv, "cs_cvt_f32_sat", "1", "dump", expected_words=[unsigned, signed],
+                               env={"VKC_SGPRS": f"{bits:#010x}"})
+        if problem:
+            wrong.append(f"{bits:#010x}: {problem}")
+    return f"{len(wrong)} of {len(CVT_F32_SAT_CASES)} inputs wrong, first {wrong[0]}" if wrong else ""
 
 
 def mesh_w64x_test(tools, spirv, name):
@@ -589,6 +608,7 @@ def main():
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
+    results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
