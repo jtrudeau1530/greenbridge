@@ -297,6 +297,17 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(p_verify.returncode, 0, p_verify.stderr)
         self.assertIn("OK", p_verify.stdout)
 
+    def test_in_tree_manifest_is_ignored_on_create_and_verify(self):
+        manifest_path = os.path.join(self.pkg, "reports", "manifest.json")
+        for _ in range(2):
+            result = self.run_cli("create", self.pkg, "--out", manifest_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with open(manifest_path, encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)["files"]), {"sample.dat"})
+        result = self.run_cli("verify", self.pkg, "--manifest", manifest_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "OK")
+
     def test_cli_verify_failure_exit_code(self):
         self.assertEqual(self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "1").returncode, 0)
 
