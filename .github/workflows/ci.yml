@@ -26,11 +26,6 @@ jobs:
           if [ -n "$bad" ]; then echo "Game or binary files tracked:"; echo "$bad"; exit 1; fi
   translator-tests:
     runs-on: ubuntu-24.04
-  semantic-tests:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,6 +37,16 @@ jobs:
           sudo apt-get install -y llvm-18 spirv-tools
           pip install pytest
       - name: Translator tests
-        run: python -m pytest tests -q
+        run: python -m pytest tests -q --ignore=tests/semantic
+  semantic-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Translator semantic tests
         run: python -m unittest discover -s tests/semantic -v
