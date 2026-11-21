@@ -674,6 +674,14 @@ The trace will enumerate them.
   on the PC runtime, so none here either. Texture sizes are the driver's on both runtimes, so only buffer sizes,
   alignments and invalid descriptions are compared with the host. One known difference: a mip count beyond the
   full chain is invalid here (Vulkan can't create it), while the PC runtime still answers with a size.
+- `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
+  adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
+  621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.
+- `GetCustomHeapProperties` (implemented): the D3D12 documentation's table for a NUMA adapter, matching the
+  `UMA = FALSE` that `D3D12_FEATURE_ARCHITECTURE` reports: `DEFAULT` is `NOT_AVAILABLE`/`L1`, `UPLOAD`
+  `WRITE_COMBINE`/`L0`, `READBACK` `WRITE_BACK`/`L0`, `GPU_UPLOAD` `WRITE_COMBINE`/`L1`, all with type `CUSTOM` and
+  node masks 1. `CUSTOM`, unknown types and node masks above 1 get an all-zero answer, logged. The test compares
+  `DEFAULT`, `UPLOAD` and `READBACK` byte for byte with the host runtime's answer (RTX 4090: identical).
 
 ### 4.2 Resources, heaps, placed and reserved
 
@@ -787,12 +795,30 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 - `SetEventOnCompletion(value, hEvent)`: a small wait thread calls `vkWaitSemaphores` and `SetEvent`. Reuse one
   thread with a condition variable; do not create a thread per fence.
 - `GetCompletedValue` is `vkGetSemaphoreCounterValue`; CPU `Signal` is `vkSignalSemaphore`.
+- `SetEventOnMultipleFenceCompletion` (implemented). With a null event it is one blocking `vkWaitSemaphores` over
+  every fence's semaphore, with `VK_SEMAPHORE_WAIT_ANY_BIT` for `D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY` and no flag for
+  `ALL`. With an event, each fence's existing wait thread counts down one shared waiter (1 for `ANY`, the fence
+  count for `ALL`) and the hit that reaches zero sets the event, so no thread is added. Values already reached are
+  counted before the call returns; zero fences set the event at once. Other flags, a null array with a non-zero
+  count, or a fence from elsewhere are `E_INVALIDARG`. A fence released while an event waits on it drops the wait
+  and the event is never set.
 - The swapchain owns acquire/present semaphores and N frames in flight. A present waits for the frame's
   render-finished semaphore; the next acquire waits for the image's present-complete semaphore.
 - Queue types: a direct queue maps to a graphics+compute queue, a compute queue to a compute-only family if one
   exists, a copy queue to a transfer-only family. If the host exposes only one family, serialize and log; async
   compute is a performance feature, not a correctness one.
 - `GetTimestampFrequency`/`GetClockCalibration` use `VK_EXT_calibrated_timestamps` where available.
+  `GetClockCalibration` (implemented) returns the GPU stamp in device ticks (`1e9 / timestampPeriod` per second,
+  the units of `GetTimestampFrequency`) and the CPU stamp in `QueryPerformanceCounter` units. When the device has
+  `VK_KHR_calibrated_timestamps` or `VK_EXT_calibrated_timestamps` enabled (`VulkanDeviceInfo::calibrated_timestamps`;
+  the standalone device enables whichever the GPU has) and offers the `DEVICE` and `QUERY_PERFORMANCE_COUNTER`
+  domains, it is one `vkGetCalibratedTimestampsKHR` call. Otherwise the queue waits until idle, submits a
+  `vkCmdWriteTimestamp` and waits for it, and answers with the midpoint of the `QueryPerformanceCounter` reads
+  around that submission. This stalls the queue, which is acceptable for a call made once per profiling capture. A
+  queue family with `timestampValidBits = 0` fails with `E_FAIL`. `d3d12_fence_timing_test` takes two calibrations
+  50 ms apart and compares the GPU and CPU intervals. On an RTX 4090 (driver 621.14) the gap is 2 us with calibrated
+  timestamps, 20 us with the fallback, and 0.4 ms with the fallback under the validation layer. The test fails
+  above 2 ms.
 
 ### 4.5 Swapchain and present
 

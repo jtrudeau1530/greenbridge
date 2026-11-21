@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -268,6 +269,19 @@ private:
     bool stencil_ref_set_ = false;
 };
 
+// An event waiting for `remaining` fence values: 1 for SetEventOnCompletion and for the ANY flag of
+// SetEventOnMultipleFenceCompletion, the fence count for ALL. Each fence that reaches its value counts down once; the
+// hit that takes it from 1 to 0 sets the event, and later hits (ANY) do nothing.
+struct FenceWaiter {
+    FenceWaiter(HANDLE e, int n) : event(e), remaining(n) {}
+    void hit() {
+        if (remaining.fetch_sub(1) == 1) SetEvent(event);
+    }
+    bool done() const { return remaining.load() <= 0; }
+    HANDLE event;
+    std::atomic<int> remaining;
+};
+
 class Fence final
     : public Child<Fence, ID3D12Fence1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Fence,
                     ID3D12Fence1> {
@@ -310,18 +324,23 @@ public:
 
     // A null event blocks until the value is reached, as D3D12 does.
     HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
+        if (!event) return fence_.completed() >= value || fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
+        notify(value, std::make_shared<FenceWaiter>(event, 1));
+        return S_OK;
+    }
+
+    // Counts `waiter` down once this fence reaches `value`: now if it has, else from the waiter thread.
+    void notify(UINT64 value, std::shared_ptr<FenceWaiter> waiter) {
         if (fence_.completed() >= value) {
-            if (event) SetEvent(event);
-            return S_OK;
+            waiter->hit();
+            return;
         }
-        if (!event) return fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
         {
             std::lock_guard lock(mutex_);
-            pending_.emplace_back(value, event);
+            pending_.emplace_back(value, std::move(waiter));
             if (!waiter_.joinable()) waiter_ = std::thread([this] { wait_loop(); });
         }
         changed_.notify_all();
-        return S_OK;
     }
 
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
@@ -338,9 +357,11 @@ private:
             fence_.wait(lowest, 10'000'000);  // 10 ms, so destruction is never held up for long
             const UINT64 done = fence_.completed();
             lock.lock();
+            // An ANY wait that another fence already satisfied is dropped without waiting for this one.
             std::erase_if(pending_, [done](const auto& entry) {
+                if (entry.second->done()) return true;
                 if (entry.first > done) return false;
-                SetEvent(entry.second);
+                entry.second->hit();
                 return true;
             });
         }
@@ -351,7 +372,7 @@ private:
     std::atomic<UINT64> highest_;
     std::mutex mutex_;
     std::condition_variable changed_;
-    std::vector<std::pair<UINT64, HANDLE>> pending_;
+    std::vector<std::pair<UINT64, std::shared_ptr<FenceWaiter>>> pending_;
     std::thread waiter_;
     bool stop_ = false;
 };
@@ -364,8 +385,16 @@ public:
     static constexpr GUID kTag{0xe1a85d76, 0x0b3f, 0x4c29, {0xa7, 0xd4, 0x58, 0xf2, 0xc6, 0xe0, 0xb9, 0x13}};
 
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
-                 const D3D12_COMMAND_QUEUE_DESC& desc)
-        : desc_(desc), queue_(context, queue, family) {}
+                 const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock)
+        : desc_(desc), queue_(context, queue, family), context_(context), vk_queue_(queue), family_(family),
+          clock_(clock) {}
+
+    ~CommandQueue() override {
+        if (!stamp_.pool) return;
+        const VkDevice device = context_.device();
+        stamp_.destroy_query_pool(device, stamp_.queries, nullptr);
+        context_.vk.vkDestroyCommandPool(device, stamp_.pool, nullptr);
+    }
 
     bool ok() const { return queue_.ok(); }
     leonida::ReplayResult last_result() const { return last_result_; }
@@ -406,22 +435,131 @@ public:
         return S_OK;
     }
 
+    // The GPU timestamp is in device ticks (what GetTimestampFrequency counts: 1e9 / timestampPeriod per second)
+    // and the CPU one is QueryPerformanceCounter's, both read at about the same moment.
+    HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* gpu, UINT64* cpu) override {
+        if (!gpu || !cpu) return E_INVALIDARG;
+        if (clock_.calibrated) {
+            VkCalibratedTimestampInfoKHR domains[2]{{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR},
+                                                    {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR}};
+            domains[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+            domains[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+            std::uint64_t stamps[2]{}, deviation = 0;
+            if (clock_.calibrated(context_.device(), 2, domains, stamps, &deviation) == VK_SUCCESS) {
+                *gpu = stamps[0];
+                *cpu = stamps[1];
+                return S_OK;
+            }
+        }
+        return submitted_calibration(*gpu, *cpu);
+    }
+
+    bool uses_calibrated_timestamps() const { return clock_.calibrated != nullptr; }
+
     static CommandQueue* from(IUnknown* object) { return Child::from<CommandQueue>(object); }
 
 private:
+    // The fallback without calibrated timestamps: wait for the queue to go idle, then submit a timestamp write and
+    // wait for it, with QueryPerformanceCounter read just before the submission and just after it completes. The
+    // GPU timestamp falls between the two; the midpoint is the answer, off by at most half the round trip (tens of
+    // microseconds). It stalls the queue, which is acceptable for a call profilers make once per capture.
+    HRESULT submitted_calibration(UINT64& gpu, UINT64& cpu) {
+        std::lock_guard lock(mutex_);
+        if (!clock_.timestamp_valid_bits || !clock_.get_device_proc || !create_stamp()) return E_FAIL;
+        auto& vk = context_.vk;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vk.vkBeginCommandBuffer(stamp_.commands, &begin) != VK_SUCCESS) return E_FAIL;
+        stamp_.reset_query_pool(stamp_.commands, stamp_.queries, 0, 1);
+        stamp_.write_timestamp(stamp_.commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stamp_.queries, 0);
+        if (vk.vkEndCommandBuffer(stamp_.commands) != VK_SUCCESS) return E_FAIL;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &stamp_.commands;
+        LARGE_INTEGER before{}, after{};
+        {
+            std::lock_guard submit_lock(context_.submit_mutex());
+            if (vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS) return E_FAIL;
+            QueryPerformanceCounter(&before);
+            if (vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS ||
+                vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS)
+                return E_FAIL;
+            QueryPerformanceCounter(&after);
+        }
+        std::uint64_t stamp = 0;
+        if (stamp_.get_query_pool_results(context_.device(), stamp_.queries, 0, 1, sizeof(stamp), &stamp,
+                                          sizeof(stamp), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+            return E_FAIL;
+        if (clock_.timestamp_valid_bits < 64) stamp &= (std::uint64_t(1) << clock_.timestamp_valid_bits) - 1;
+        gpu = stamp;
+        cpu = UINT64(before.QuadPart) + UINT64(after.QuadPart - before.QuadPart) / 2;
+        return S_OK;
+    }
+
+    // The fallback's command buffer and one-query timestamp pool, made on first use. Called with mutex_ held.
+    bool create_stamp() {
+        if (stamp_.pool) return true;
+        const VkDevice device = context_.device();
+        const auto get = clock_.get_device_proc;
+        stamp_.create_query_pool = reinterpret_cast<PFN_vkCreateQueryPool>(get(device, "vkCreateQueryPool"));
+        stamp_.destroy_query_pool = reinterpret_cast<PFN_vkDestroyQueryPool>(get(device, "vkDestroyQueryPool"));
+        stamp_.reset_query_pool = reinterpret_cast<PFN_vkCmdResetQueryPool>(get(device, "vkCmdResetQueryPool"));
+        stamp_.write_timestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(get(device, "vkCmdWriteTimestamp"));
+        stamp_.get_query_pool_results =
+            reinterpret_cast<PFN_vkGetQueryPoolResults>(get(device, "vkGetQueryPoolResults"));
+        if (!stamp_.create_query_pool || !stamp_.destroy_query_pool || !stamp_.reset_query_pool ||
+            !stamp_.write_timestamp || !stamp_.get_query_pool_results)
+            return false;
+        auto& vk = context_.vk;
+        VkQueryPoolCreateInfo queries{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        queries.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queries.queryCount = 1;
+        if (stamp_.create_query_pool(device, &queries, nullptr, &stamp_.queries) != VK_SUCCESS) return false;
+        VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pool.queueFamilyIndex = family_;
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate.commandBufferCount = 1;
+        if (vk.vkCreateCommandPool(device, &pool, nullptr, &stamp_.pool) == VK_SUCCESS) {
+            allocate.commandPool = stamp_.pool;
+            if (vk.vkAllocateCommandBuffers(device, &allocate, &stamp_.commands) == VK_SUCCESS) return true;
+            vk.vkDestroyCommandPool(device, stamp_.pool, nullptr);
+            stamp_.pool = VK_NULL_HANDLE;
+        }
+        stamp_.destroy_query_pool(device, stamp_.queries, nullptr);
+        stamp_.queries = VK_NULL_HANDLE;
+        return false;
+    }
+
     D3D12_COMMAND_QUEUE_DESC desc_;
     std::mutex mutex_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
+    leonida::VulkanContext& context_;
+    VkQueue vk_queue_;
+    std::uint32_t family_;
+    QueueClock clock_;
+    struct {
+        PFN_vkCreateQueryPool create_query_pool = nullptr;
+        PFN_vkDestroyQueryPool destroy_query_pool = nullptr;
+        PFN_vkCmdResetQueryPool reset_query_pool = nullptr;
+        PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
+        PFN_vkGetQueryPoolResults get_query_pool_results = nullptr;
+        VkQueryPool queries = VK_NULL_HANDLE;
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+    } stamp_;
 };
 
 }  // namespace
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
-                             const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device) {
+                             const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,
+                             const QueueClock& clock) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* object = new CommandQueue(context, queue, queue_family, desc);
+    auto* object = new CommandQueue(context, queue, queue_family, desc, clock);
     if (!object->ok()) {
         object->Release();
         return E_FAIL;
@@ -462,6 +600,42 @@ HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D1
     }
     object->attach_device(device);
     return hand_out(object, riid, out);
+}
+
+HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, ID3D12Fence* const* fences,
+                                               const UINT64* values, UINT count,
+                                               D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
+    if (flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY)
+        return E_INVALIDARG;
+    if (count && (!fences || !values)) return E_INVALIDARG;
+    std::vector<Fence*> objects(count);
+    for (UINT i = 0; i < count; ++i)
+        if (!(objects[i] = Fence::from(fences[i]))) return E_INVALIDARG;
+    const bool any = flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
+    if (!count) {  // nothing to wait for
+        if (event) SetEvent(event);
+        return S_OK;
+    }
+    if (!event) {
+        // One vkWaitSemaphores call: VK_SEMAPHORE_WAIT_ANY_BIT is the ANY flag, no flag is ALL.
+        std::vector<VkSemaphore> semaphores(count);
+        for (UINT i = 0; i < count; ++i) semaphores[i] = objects[i]->semaphore();
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.flags = any ? VK_SEMAPHORE_WAIT_ANY_BIT : 0;
+        wait.semaphoreCount = count;
+        wait.pSemaphores = semaphores.data();
+        wait.pValues = values;
+        return context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX) == VK_SUCCESS ? S_OK : E_FAIL;
+    }
+    // Each fence's own waiter thread counts the shared waiter down; no thread of its own.
+    const auto waiter = std::make_shared<FenceWaiter>(event, any ? 1 : int(count));
+    for (UINT i = 0; i < count && !waiter->done(); ++i) objects[i]->notify(values[i], waiter);
+    return S_OK;
+}
+
+bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
+    const CommandQueue* q = CommandQueue::from(queue);
+    return q && q->uses_calibrated_timestamps();
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {

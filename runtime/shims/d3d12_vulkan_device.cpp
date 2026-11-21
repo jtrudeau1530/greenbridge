@@ -144,6 +144,8 @@ struct DeviceState {
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
+    LUID luid{};       // VkPhysicalDeviceIDProperties::deviceLUID; zero when the driver reports none
+    QueueClock clock;  // what every queue's GetClockCalibration uses
 
     bool depth_usable(VkFormat format) const {
         VkFormatProperties properties{};
@@ -722,6 +724,7 @@ public:
                                                                   info.separate_depth_stencil_layouts);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
+        query_luid_and_clock(get_device);
     }
 
     // Set 0 of every translated shader that declares bindings: images, samplers and the descriptor hash table
@@ -768,6 +771,53 @@ public:
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
+
+    // The Vulkan physical device's LUID, which is the DXGI adapter's on Windows. Zero (logged) when the driver has
+    // none to report (deviceLUIDValid false).
+    LUID STDMETHODCALLTYPE GetAdapterLuid() override { return state_.luid; }
+
+    // The CUSTOM equivalent of a standard heap type, from the D3D12 documentation's table for a NUMA adapter
+    // (D3D12_FEATURE_ARCHITECTURE answers UMA = FALSE): DEFAULT is GPU-only memory in L1, UPLOAD write-combined
+    // and READBACK write-back system memory in L0, GPU_UPLOAD write-combined L1. CUSTOM and unknown types have
+    // no equivalent and get an all-zero answer (D3D12 reports them through the debug layer).
+    D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE GetCustomHeapProperties(UINT node_mask, D3D12_HEAP_TYPE type) override {
+        D3D12_HEAP_PROPERTIES properties{};
+        if (node_mask > 1) {
+            log_once("GetCustomHeapProperties node mask", int(node_mask));
+            return properties;
+        }
+        switch (type) {
+        case D3D12_HEAP_TYPE_DEFAULT:
+            properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+            properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L1;
+            break;
+        case D3D12_HEAP_TYPE_UPLOAD:
+            properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+            properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+            break;
+        case D3D12_HEAP_TYPE_READBACK:
+            properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+            properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+            break;
+        case D3D12_HEAP_TYPE_GPU_UPLOAD:
+            properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+            properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L1;
+            break;
+        default:
+            log_once("GetCustomHeapProperties heap type without a custom equivalent:", int(type));
+            return properties;
+        }
+        properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+        properties.CreationNodeMask = 1;
+        properties.VisibleNodeMask = 1;
+        return properties;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetEventOnMultipleFenceCompletion(ID3D12Fence* const* fences, const UINT64* values,
+                                                                UINT count, D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags,
+                                                                HANDLE event) override {
+        return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
+    }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return S_OK; }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
@@ -776,7 +826,7 @@ public:
         // Copy and compute queues share the one graphics VkQueue for now (section 8.2, question 12).
         if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT) log_once("command queue type on the direct VkQueue:", desc->Type);
         return create_command_queue(*state_.context, state_.info.queue, state_.info.queue_family, *desc, riid, out,
-                                    identity());
+                                    identity(), state_.clock);
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
@@ -1388,6 +1438,59 @@ private:
         state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(), storage);
     }
 
+    // GetAdapterLuid's answer, and how queues read the clocks: calibrated timestamps when the caller enabled the
+    // extension and the GPU calibrates its DEVICE domain against QueryPerformanceCounter, else the queue family's
+    // timestamp queries.
+    void query_luid_and_clock(PFN_vkGetDeviceProcAddr get_device) {
+        const VulkanDeviceInfo& info = state_.info;
+        const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"));
+        if (properties2) {
+            VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+            properties2(info.physical, &properties);
+            static_assert(sizeof(LUID) == VK_LUID_SIZE);
+            if (id.deviceLUIDValid) std::memcpy(&state_.luid, id.deviceLUID, sizeof(LUID));
+        }
+        if (!state_.luid.LowPart && !state_.luid.HighPart) log_once("the Vulkan driver reports no device LUID;", 0);
+
+        state_.clock.get_device_proc = get_device;
+        const auto families_of = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+        if (families_of) {
+            std::uint32_t count = 0;
+            families_of(info.physical, &count, nullptr);
+            std::vector<VkQueueFamilyProperties> families(count);
+            families_of(info.physical, &count, families.data());
+            if (info.queue_family < count)
+                state_.clock.timestamp_valid_bits = families[info.queue_family].timestampValidBits;
+        }
+        if (!info.calibrated_timestamps) return;
+        // The KHR names first; the EXT ones are aliases with the same signatures.
+        auto domains_of = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR"));
+        auto calibrated = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+            get_device(info.device, "vkGetCalibratedTimestampsKHR"));
+        if (!domains_of || !calibrated) {
+            domains_of = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
+            calibrated = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+                get_device(info.device, "vkGetCalibratedTimestampsEXT"));
+        }
+        if (!domains_of || !calibrated) return;
+        std::uint32_t count = 0;
+        domains_of(info.physical, &count, nullptr);
+        std::vector<VkTimeDomainKHR> domains(count);
+        domains_of(info.physical, &count, domains.data());
+        const auto has = [&](VkTimeDomainKHR domain) {
+            return std::find(domains.begin(), domains.end(), domain) != domains.end();
+        };
+        if (has(VK_TIME_DOMAIN_DEVICE_KHR) && has(VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR))
+            state_.clock.calibrated = calibrated;
+        else
+            log_once("calibrated timestamps lack the DEVICE or QueryPerformanceCounter domain; domains:", int(count));
+    }
+
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -1509,6 +1612,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
     LEONIDA_INSTANCE(vkCreateDevice);
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
+    LEONIDA_INSTANCE(vkEnumerateDeviceExtensionProperties);
 #undef LEONIDA_INSTANCE
     std::uint32_t count = 0;
     vkEnumeratePhysicalDevices(owned.instance, &count, nullptr);
@@ -1590,10 +1694,27 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
     enable.samplerAnisotropy = info.sampler_anisotropy;
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
+    // GetClockCalibration reads both clocks at once with calibrated timestamps (KHR, or the older EXT).
+    const char* calibrated = nullptr;
+    {
+        std::uint32_t extension_count = 0;
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> extensions(extension_count);
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
+        for (const char* name :
+             {VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME}) {
+            for (const auto& extension : extensions)
+                if (std::strcmp(extension.extensionName, name) == 0) calibrated = name;
+            if (calibrated) break;
+        }
+    }
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
+    device_info.enabledExtensionCount = calibrated ? 1 : 0;
+    device_info.ppEnabledExtensionNames = &calibrated;
+    info.calibrated_timestamps = calibrated != nullptr;
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;
