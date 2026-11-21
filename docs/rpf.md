@@ -76,5 +76,6 @@ both paths. It is used to check exported assets without keeping a second copy.
 ## See also
 
 - [docs/design.md](design.md) — the asset-stage table, coverage numbers and the recovery approach.
+- [docs/story.md](story.md) — measured `story000`/`shared_minigame000` composition, nested RPF9 sub-archives and the `PSIN`/`RSC8` headers.
 - `docs/audio.md` - AWC layout and the audio exporters, once the audio guide is merged.
 - the related-projects page - the rpf9-explorer/PercyStar/SCARAB licence boundaries.
