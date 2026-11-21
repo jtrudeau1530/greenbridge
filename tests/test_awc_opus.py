@@ -116,6 +116,33 @@ def build_bank(streams):
     return bytes(out)
 
 
+def build_music_bank(tocs, samples, rate=48000):
+    """A one-stream AWC with a 0x48 streamed-music descriptor and one 2048-byte block.
+
+    tocs: one Opus TOC byte per descriptor channel, each in its own 2048-byte subblock.
+    samples: the descriptor's interleaved sample count (per-channel frames * packet channels).
+    """
+    channels = len(tocs)
+    desc = bytearray(12 + 16 * channels)
+    struct.pack_into("<III", desc, 0, 1, 2048, channels)
+    for i, toc in enumerate(tocs):
+        base = 12 + 16 * i
+        struct.pack_into("<II", desc, base, 0x100 + i, samples)
+        struct.pack_into("<H", desc, base + 10, rate)
+        desc[base + 12] = 0x0B
+    data = bytearray(2048 + 2048 * channels)
+    for i in range(channels):
+        struct.pack_into("<I", data, 24 * i + 4, 1)   # one subblock
+        struct.pack_into("<H", data, 2048 + 2048 * i, 1)
+        data[2050 + 2048 * i] = tocs[i]
+    header = 16 + 4 + 2 * 8
+    out = bytearray(b"ADAT" + struct.pack("<III", 0, 1, header))
+    out += struct.pack("<I", 0x20 | (2 << 29))
+    out += struct.pack("<Q", tag(0x48, header, len(desc)))
+    out += struct.pack("<Q", tag(0x55, header + len(desc), len(data)))
+    return bytes(out + desc + data)
+
+
 class WriteWavTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -257,6 +284,60 @@ class ExportBankTest(unittest.TestCase):
             self.assertEqual(last["granule"], 960 + 1920)      # both packet TOCs, exact end trimming
             self.assertGreater(last["granule"], 0)
             self.assertEqual(last["serial"], 3)
+
+
+class StreamedMusicTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "out")
+
+    def export(self, tocs, samples):
+        path = os.path.join(self.tmp.name, "streamed.awc")
+        with open(path, "wb") as f:
+            f.write(build_music_bank(tocs, samples))
+        counts = awc.export_bank(path, self.out)
+        return counts, os.path.join(self.out, "streamed")
+
+    def test_stereo_packets_export_one_stereo_ogg(self):
+        counts, od = self.export([0xFC], 1920)              # 2 x 960 interleaved samples
+        self.assertEqual(counts, {"opus": 0, "pcm": 0, "other": 0, "music": 1})
+        with open(os.path.join(od, "00000100.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        version, channels, preskip, in_rate, gain, mapping = struct.unpack_from("<BBHIhB", pages[0]["body"], 8)
+        self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 2, 0, 48000, 0, 0))
+        self.assertEqual(pages[-1]["granule"], 960)
+
+    def test_two_mono_groups_export_two_mono_oggs(self):
+        counts, od = self.export([0x78, 0x78], 960)
+        self.assertEqual(counts, {"opus": 0, "pcm": 0, "other": 0, "music": 2})
+        for sid in ("00000100", "00000101"):
+            with self.subTest(sid=sid):
+                with open(os.path.join(od, sid + ".ogg"), "rb") as f:
+                    pages = parse_ogg_pages(f.read())
+                channels = pages[0]["body"][9]
+                self.assertEqual(channels, 1)
+                self.assertEqual(pages[-1]["granule"], 960)
+
+    def test_music_channels_halves_interleaved_samples(self):
+        path = os.path.join(self.tmp.name, "streamed.awc")
+        with open(path, "wb") as f:
+            f.write(build_music_bank([0xFC], 1920))
+        with open(path, "rb") as f:
+            d = f.read()
+        _, music = awc.parse_awc(d)
+        info = awc.music_channels(d, music[0][0], music[0][1])
+        self.assertEqual((info[0][1], info[0][5]), (960, 2))
+
+    def test_music_channels_metadata_only_still_reports_packet_channels(self):
+        path = os.path.join(self.tmp.name, "streamed.awc")
+        with open(path, "wb") as f:
+            f.write(build_music_bank([0xFC], 1920))
+        with open(path, "rb") as f:
+            d = f.read()
+        _, music = awc.parse_awc(d)
+        info = awc.music_channels(d, music[0][0], music[0][1], collect_packets=False)
+        self.assertEqual((info[0][1], info[0][4], info[0][5]), (960, [], 2))
 
 
 class MalformedBankTest(unittest.TestCase):

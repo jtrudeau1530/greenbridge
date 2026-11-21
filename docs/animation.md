@@ -224,6 +224,13 @@ The first rig-set block starts at 0x0045. The tag/length layout is visible direc
   `deformation[2]` (1,702), `identity` (1,109), `pose` (938), `pose.ragdoll.post` (160), `facial` (152), and
   ten smaller values.
 
+The grammar-driven tree decoder (`tools/rbf0_tree.py`; `docs/rbf0.md` section 9) parses the same 1,348,436-byte
+blob to its last byte and confirms the counts above: 9 descriptors, 28,962 elements, 20,031 text records, 1,126
+string values, 6,677 integer values and maximum element depth 6. The 1,126 string values are the `key` attributes
+on the rig-set `Item` elements. Each of the 6,677 entry `Item` elements contains `Dictionary`, `Rig` and `Group`
+text children followed by a `Priority` integer. The record framing is consumed exactly; the numeric field
+semantics and the rig-to-skeleton link remain unresolved.
+
 Mapping to the name tables:
 
 - The 2,298 distinct `pack:/...` paths resolve to a stored joaat32 stem hash for **1,901** names (82.7%);

@@ -286,6 +286,29 @@ def test_vs_misc_pos1_shifts_clip_to_pos2(make_shader):
     assert [int(x) for x in clip_chains] == [0, 1]
 
 
+def test_pos1_without_osg1_is_ignored(make_shader):
+    """Without OSG1 declaring SV_ClipDistance/SV_CullDistance, pos1 exports are discarded in both VS and MS."""
+    vs = make_shader(_vs_header_asm("exp pos1 v10, off, off, off done"), name="vs_no_osg1_pos1")
+    vs_spv = vs.translate()
+    vs.validate(vs_spv)
+    assert "OpCapability ClipDistance" not in vs_spv
+    assert "BuiltIn ClipDistance" not in vs_spv
+    vs_meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, vs_spv)
+    assert "shaderClipDistance" not in vs_meta["features"]
+    assert 1 not in vs_meta.get("outputs", [])
+
+    ms = make_shader(_ms_header_asm("exp pos1 v10, off, off, off done"), name="ms_no_osg1_pos1",
+                     dxbc=make_dxbc([mesh_psv0_chunk()]))
+    ms_spv = ms.translate()
+    ms.validate(ms_spv, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "OpCapability ClipDistance" not in ms_spv
+    assert "BuiltIn ClipDistance" not in ms_spv
+    assert "%ms_out_pos" in ms_spv and "%ms_vtx_blk" not in ms_spv
+    ms_meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, ms_spv)
+    assert "shaderClipDistance" not in ms_meta["features"]
+    assert 1 not in ms_meta.get("params", [])
+
+
 def test_ms_dummy_all_off_pos1_does_not_emit_clip(make_shader):
     """An all-off dummy pos1 export in a mesh shader must not emit ClipDistance or change the output block."""
     dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0x1)])])

@@ -34,23 +34,7 @@ static std::vector<uint32_t> read_spv(const char* p) {
     return w;
 }
 
-// Same hash as the translator's desc_lookup: FNV-1a over the 8 key dwords (whole dwords, not bytes).
-static uint32_t key_hash(const uint32_t k[8]) {
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < 8; i++) h = (h ^ k[i]) * 16777619u;
-    return h;
-}
-static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32_t index) {
-    uint32_t mask = t[0], h = key_hash(key);
-    for (uint32_t k = 0; k < 8; k++) {
-        uint32_t slot = (h + k) & mask, base = slot * 10;
-        if (t[base + 10] == 0xA11CA7ED) continue;           // pad dword marks a used slot (host-side only)
-        for (int j = 0; j < 8; j++) t[base + 1 + j] = key[j];
-        t[base + 9] = index;
-        t[base + 10] = 0xA11CA7ED;
-        return;
-    }
-}
+#include "../src/descriptor_table.h"
 
 int main(int argc, char** argv) {
     if (argc < 9) { std::fprintf(stderr, "usage: vk_texture_test vs fs out ptr_sgpr s0 s1 s2 s3\n"); return 2; }
@@ -133,11 +117,10 @@ int main(int argc, char** argv) {
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
     // Descriptor hash table: 16 slots.
-    std::vector<uint32_t> table(1 + 16 * 10 + 10, 0);
-    table[0] = 15;
-    table_insert(table, tsharp, 1);
-    table_insert(table, ssharp, 1);
-    for (uint32_t s = 0; s <= 16; s++) if (s * 10 + 10 < table.size() && table[s * 10 + 10] == 0xA11CA7ED) table[s * 10 + 10] = 0;
+    leonida::DescriptorTable desc_table(16);
+    desc_table.insert(tsharp, 1);
+    desc_table.insert(ssharp, 1);
+    const auto table = desc_table.build_gpu_buffer(true);
     VkBuffer tb; VkDeviceMemory tbm; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbm, &tbp));
     std::memcpy(tbp, table.data(), table.size() * 4);

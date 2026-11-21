@@ -13,32 +13,18 @@ Set LLVM_MC to llvm-mc's path, or to a whole command such as
 """
 import argparse
 import os
-import shlex
 import struct
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mc_command import mc_command  # noqa: E402
+
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
-
-
-def split_command(raw: str) -> list:
-    """Split LLVM_MC without eating the backslashes of a Windows path (POSIX shlex would)."""
-    if os.name != "nt":
-        return shlex.split(raw)
-    parts = shlex.split(raw, posix=False)
-    return [p[1:-1] if len(p) > 1 and p[0] == p[-1] == '"' else p for p in parts]
-
-
-def mc_command() -> list:
-    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'."""
-    raw = os.environ.get("LLVM_MC", "llvm-mc").strip()
-    if os.path.isfile(raw):
-        return [raw]                    # a plain path, spaces and all
-    return split_command(raw) or ["llvm-mc"]
 
 
 MC = mc_command()
@@ -56,13 +42,15 @@ def probe(mcpu: str) -> None:
                            input=PROBE, capture_output=True, text=True,
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
-        fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it, e.g.\n"
+        fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it (on Windows,\n"
+             f"scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
     if p.returncode != 0 or "s_endpgm" not in p.stdout:
         why = (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[0]
         fail(f"'{' '.join(MC)}' did not disassemble an s_endpgm: {why}\n"
              f"The disassembler needs LLVM 21+ with the AMDGPU target. The official Windows LLVM build has no\n"
-             f"AMDGPU target; run it from WSL instead (docs/design.md, 'Disassembling shaders'), e.g.\n"
+             f"AMDGPU target: build a native one with scripts\\build_llvm_mc.ps1, or run it from WSL\n"
+             f"(docs/design.md, 'Disassembling shaders'), e.g.\n"
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 

@@ -3,28 +3,33 @@
     python3 -I runtime/test/shaders/build.py <out dir> [name ...]
 
 Each .asm is RDNA2 assembly. It is assembled with llvm-mc (LLVM 21+ with the AMDGPU target; set LLVM_MC to its
-path, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are staged in a temporary
-directory. After validation, the build writes <out>/spirv/<name>.spv and the translator metadata.
+path or to a whole command, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are
+staged in a temporary directory. After validation, the build writes <out>/spirv/<name>.spv and the translator
+metadata.
 
-Compute shaders get the header the tests were written for: RSRC2 0x8088 (4 user SGPRs holding the V#, the
-workgroup id in s4, 512 bytes of LDS) and a 64x1x1 group (a "; group: X,Y,Z" comment at the top of the .asm
-overrides the size). The stage comes from the name's prefix. Mesh and
-geometry shaders (ms_, gs_) also need a DXBC container with their signatures, which this doesn't make.
+Compute shaders can override the default header with leading "; group: X,Y,Z" and "; rsrc2: 0x..." comments.
+The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
+their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
 """
 import json
 import os
 import re
-import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TRANSLATOR = os.path.join(HERE, "..", "..", "..", "tools", "rdna2spirv.py")
-LLVM_MC = os.environ.get("LLVM_MC", "llvm-mc")
+TOOLS = os.path.join(HERE, "..", "..", "..", "tools")
+TRANSLATOR = os.path.join(TOOLS, "rdna2spirv.py")
+sys.path.insert(0, TOOLS)
+import mc_command  # noqa: E402
+
+MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
+sys.path.insert(0, HERE)  # this script is also run with python -I
+from compute_fixture import compute_header  # noqa: E402
 
 
 def asm_mattr(path):
@@ -40,41 +45,27 @@ def asm_mattr(path):
     return None
 
 
-def asm_group(path):
-    """Thread-group size from a leading "; group: X,Y,Z" comment (default GROUP)."""
-    for ln in Path(path).read_text(encoding="utf-8").splitlines():
-        s = ln.strip()
-        if not s:
-            continue
-        if not s.startswith(";"):
-            break
-        m = re.match(r";\s*group:\s*(\d+),(\d+),(\d+)", s)
-        if m:
-            return tuple(int(x) for x in m.groups())
-    return GROUP
-
-
 def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
     fssm.mkdir()
     for n in names:
         asm_path = os.path.join(HERE, n + ".asm")
+        raw = Path(asm_path).read_text(encoding="utf-8")
         mattr = asm_mattr(asm_path)
-        cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         if mattr:
             cmd.append(f"-mattr={mattr}")
-        cmd += ["-show-encoding", asm_path]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        cmd.append("-show-encoding")
+        # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
+        r = subprocess.run(cmd, input=raw, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
         (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
         if n.startswith("cs_"):
-            header = bytearray(0x148)
-            struct.pack_into("<4I", header, 0x138, RSRC2, *asm_group(asm_path))
-            (fssm / (n + ".fssm")).write_bytes(header)
+            (fssm / (n + ".fssm")).write_bytes(compute_header(asm_path))
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]

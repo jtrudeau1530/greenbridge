@@ -423,17 +423,14 @@ command object.
 | Builder's internal field layout (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x350`, `+0x544`) | No header or symbol; the helper's writes prove the contract is wider than the public vtable, but not what the fields mean. |
 | DMA list use/value | The IID is prior art; type 6 is derived; no shipped module uses it. |
 
-### 5.4 A concrete current gap: GCL8
+### 5.4 GCL8 (resolved in PR #164)
 
 The shipped builder's rehydrate exports name `ID3D12GraphicsCommandList8`, and
-`OMSetFrontAndBackStencilRef` is public GCL8 at slot 81. The repository's command-list class is
-`ID3D12GraphicsCommandList7` (`runtime/shims/d3d12_com.cpp:57-61`), so it cannot answer
-`IID_ID3D12GraphicsCommandList8` and has no slot 81. `d3d12_vulkan.md` §4's table says the
-command list "supports … front/back stencil ref", but no such implementation exists in
-`runtime/` (a source grep finds no `OMSetFrontAndBackStencilRef` or front/back stencil command).
-Adding the public GCL8 interface is a small, justified runtime change: one method, one standard
-IID, no Xbox extension. It would not close the builder's `+0x490` gap, but it would let a GCL8
-pointer be served instead of refused.
+`OMSetFrontAndBackStencilRef` is public GCL8 at slot 81. **PR #164 adds the public GCL8 interface**
+to `runtime/shims/d3d12_com.cpp`: it records the front/back values, resets them in `Reset`, answers
+`IID_ID3D12GraphicsCommandList8`, and registers the `d3d12_gcl8` CTest (9/9). The values are recorded
+but not applied because this layer still has no pipeline/draw path. It does **not** close the
+builder's `+0x490` gap, but a GCL8 pointer is now served instead of refused.
 
 ## 6. Return conventions
 
@@ -463,8 +460,8 @@ than invent slots.
    builder validates its inputs before reaching the dispatch, use a descriptor shaped like the
    one its own `GetRaytracingAccelerationStructurePrebuildInfo` accepts (prior art measured a
    3,000-vertex triangle geometry; the prebuild answer is 204,800 bytes / 128,704 scratch).
-2. **Add GCL8 to the runtime** (public, one method, slot 81) so the rehydrate entry points can
-   be handed a real object. This is a code change for a separate PR, not this document.
+2. **GCL8 is now implemented** in PR #164 (public slot 81, recorded/reset, CTest 9/9); the
+   remaining builder gap is the `+0x490` method.
 3. **When the executable appears, trace the four creation calls first.** Per-slot counters on
    device slots 8/9/12/36, then queue slots 10/14/15, fence slots 8/9/10, and every slot beyond
    the public chain. The first `PresentX` call and the queue vtable tail are the only way to

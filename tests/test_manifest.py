@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "manifest.py")
@@ -68,6 +69,19 @@ class ManifestWalkTest(unittest.TestCase):
         for rel, abs_path in entries:
             self.assertTrue(os.path.isabs(abs_path))
             self.assertTrue(os.path.exists(abs_path))
+
+    def test_walk_reports_an_unreadable_subdirectory(self):
+        blocked = os.path.join(self.pkg, "sub", "deep")
+        scandir = os.scandir
+
+        def scan(path):
+            if path == blocked:
+                raise PermissionError(f"cannot read {path}")
+            return scandir(path)
+
+        with patch.object(os, "scandir", side_effect=scan):
+            with self.assertRaises(PermissionError):
+                list(manifest.walk(self.pkg))
 
 
 class ManifestCreateVerifyTest(unittest.TestCase):
@@ -292,6 +306,26 @@ class ManifestCliTest(unittest.TestCase):
         p_verify = self.run_cli("verify", self.pkg, "--manifest", self.out_manifest, "--jobs", "1")
         self.assertEqual(p_verify.returncode, 1)
         self.assertIn("problem(s)", p_verify.stdout)
+
+    def test_cli_rejects_invalid_game_directories(self):
+        # Start with a valid empty manifest, which would otherwise verify even if the scan never ran.
+        empty = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty)
+        self.assertEqual(self.run_cli("create", empty, "--out", self.out_manifest).returncode, 0)
+        self.assertEqual(self.run_cli("verify", empty, "--manifest", self.out_manifest).returncode, 0)
+        with open(self.out_manifest, "rb") as f:
+            original = f.read()
+
+        for game_dir in (os.path.join(self.tmp.name, "missing"), os.path.join(self.pkg, "sample.dat")):
+            for command, option in (("create", "--out"), ("verify", "--manifest")):
+                with self.subTest(game_dir=game_dir, command=command):
+                    result = self.run_cli(command, game_dir, option, self.out_manifest)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(os.path.basename(game_dir), result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    with open(self.out_manifest, "rb") as f:
+                        self.assertEqual(f.read(), original)
 
 
 class ManifestBelowNormalTest(unittest.TestCase):

@@ -1,6 +1,7 @@
 // Headless Vulkan compute test for translated compute shaders.
 // Usage: vk_compute_test cs.spv groups expect [--require-wave64]
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
+//            "workgroup_yz": pass 2x3x4 for groups; check the Y/Z histogram (cs_workgroup_yz.asm)
 //            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
 //   --require-wave64: require full 64-wide subgroups (local size X must be a multiple of 64), or exit 77.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
@@ -31,7 +32,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
         return 2;
     }
-    const uint32_t groups = uint32_t(atoi(argv[2]));
+    const bool workgroup_yz = !std::strcmp(argv[3], "workgroup_yz");
+    if (workgroup_yz && std::strcmp(argv[2], "2x3x4")) {
+        std::fprintf(stderr, "workgroup_yz expects a 2x3x4 dispatch\n");
+        return 2;
+    }
+    const uint32_t groups = workgroup_yz ? 2u : uint32_t(atoi(argv[2]));
+    const uint32_t groups_y = workgroup_yz ? 3u : 1u, groups_z = workgroup_yz ? 4u : 1u;
+    const uint32_t yz_bins = (groups_y + 1) * (groups_z + 1);
+    const uint32_t origins = workgroup_yz ? groups * groups_y * groups_z : 0;
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -110,11 +119,12 @@ int main(int argc, char** argv) {
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateCommandPool);
     LOADD(vkAllocateCommandBuffers); LOADD(vkBeginCommandBuffer); LOADD(vkCmdBindPipeline);
     LOADD(vkCmdPushConstants); LOADD(vkCmdDispatch); LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit);
-    LOADD(vkQueueWaitIdle);
+    LOADD(vkQueueWaitIdle); LOADD(vkCmdPipelineBarrier); LOADD(vkCmdDispatchBase);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
 
     // Output buffer = heap. Host-visible so the result can be read back directly.
-    const VkDeviceSize bytes = VkDeviceSize(groups) * 64 * 4;
+    const VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
+    const VkDeviceSize bytes = words * sizeof(uint32_t);
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -133,7 +143,7 @@ int main(int argc, char** argv) {
     VkDeviceMemory mem; CHECK(vkAllocateMemory(dev, &mai, nullptr, &mem));
     CHECK(vkBindBufferMemory(dev, buf, mem, 0));
     void* map; CHECK(vkMapMemory(dev, mem, 0, bytes, 0, &map));
-    std::memset(map, !std::strcmp(argv[3], "exec64") ? 0 : 0xEE, size_t(bytes));
+    std::memset(map, workgroup_yz || !std::strcmp(argv[3], "exec64") ? 0 : 0xEE, size_t(bytes));
     if (!std::strcmp(argv[3], "bvh")) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
         // triangle at z=10 (node 0x40, addr 0x200), a triangle at z=5 (node 0x48, addr 0x240), a box the ray
@@ -160,6 +170,7 @@ int main(int argc, char** argv) {
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    if (workgroup_yz) cpi.flags |= VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
@@ -186,7 +197,20 @@ int main(int argc, char** argv) {
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 144, pc);
-    vkCmdDispatch(cmd, groups, 1, 1);
+    vkCmdDispatch(cmd, groups, groups_y, groups_z);
+    // A permutation within one axis can leave the full-grid histogram unchanged. Dispatch one group at
+    // each known origin into its own histogram, selected by the host independently of the shader's SGPRs.
+    for (uint32_t g = 0; g < origins; ++g) {
+        const uint64_t base = heap + (g + 1) * yz_bins * sizeof(uint32_t);
+        const uint32_t address[] = {uint32_t(base), uint32_t(base >> 32)};
+        vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 32 * sizeof(uint32_t), sizeof(address), address);
+        vkCmdDispatchBase(cmd, g % groups, (g / groups) % groups_y, g / (groups * groups_y), 1, 1, 1);
+    }
+    VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readback.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         1, &readback, 0, nullptr, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
@@ -195,6 +219,37 @@ int main(int argc, char** argv) {
 
     const uint32_t* out = static_cast<const uint32_t*>(map);
     uint32_t bad = 0, first_bad = ~0u;
+    if (workgroup_yz) {
+        // X is disabled in RSRC2. Both X groups must contribute to each valid (Y,Z) bin.
+        // The last column and row catch out-of-range register values without indexing past the buffer.
+        for (uint32_t z = 0; z <= groups_z; ++z) {
+            for (uint32_t y = 0; y <= groups_y; ++y) {
+                const uint32_t want = y < groups_y && z < groups_z ? groups : 0;
+                const uint32_t got = out[z * (groups_y + 1) + y];
+                if (got != want) {
+                    std::fprintf(stderr, "(Y=%u, Z=%u): got %u, expected %u\n", y, z, got, want);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("2x3x4 workgroup Y/Z: %u mismatches\n", bad);
+        uint32_t wrong_origins = 0;
+        for (uint32_t g = 0; g < origins; ++g) {
+            const uint32_t y = (g / groups) % groups_y, z = g / (groups * groups_y);
+            const uint32_t* histogram = out + (g + 1) * yz_bins;
+            for (uint32_t bin = 0; bin < yz_bins; ++bin) {
+                const uint32_t want = bin == z * (groups_y + 1) + y ? 1u : 0u;
+                if (histogram[bin] != want) {
+                    std::fprintf(stderr, "origin (%u,%u,%u), bin %u: got %u, expected %u\n",
+                                 g % groups, y, z, bin, histogram[bin], want);
+                    ++wrong_origins;
+                    break;
+                }
+            }
+        }
+        std::printf("single-group origins: %u/%u matched\n", origins - wrong_origins, origins);
+        return bad || wrong_origins ? 1 : 0;
+    }
     if (!std::strcmp(argv[3], "mirror64")) {
         for (uint32_t g = 0; g < groups; g++)
             for (uint32_t t = 0; t < 64; t++) {
