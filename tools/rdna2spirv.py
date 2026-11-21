@@ -228,6 +228,44 @@ class Gen:
         self.emit(f"{r} = OpBitwiseOr %uint {keep} {lo16}")
         self.dst(d, r)
 
+    @staticmethod
+    def opsel_bits(mods, nsrc):
+        """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
+        A select bit of 1 reads the high half of that source; the last bit sends the result to the high half.
+        No modifier means all zeros."""
+        sel = next((m for m in mods if m.startswith("op_sel:")), None)
+        if sel is None:
+            return [0] * nsrc, 0
+        bits = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0] * (nsrc + 1)
+        return bits[:nsrc], bits[nsrc]
+
+    def f16_in(self, s, hi=0):
+        """Read operand ``s`` as an f16 (low half, or high half when ``hi``) widened to f32, then apply its neg/abs."""
+        u = self.src_u({**s, "neg": False, "abs": False})
+        v2, f = self.tmp(), self.tmp()
+        self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+        self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")
+        return self.modify_f(f, s)
+
+    def f16_out(self, d, r, hi=0):
+        """Narrow f32 ``r`` to f16 (round to nearest) and write it to the low half of ``d``, or to the high half when
+        ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16)."""
+        w2, p, lo = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{w2} = OpCompositeConstruct %v2float {r} %f0")
+        self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {w2}")
+        self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
+        if not hi:
+            self.write_lo16(d, lo)
+            return
+        if d["k"] != "vgpr":
+            raise Unsupported("op_sel destination")
+        old, keep, sh16, v = (self.tmp() for _ in range(4))
+        self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', d['r'])}")
+        self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+        self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
+        self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+        self.dst(d, v)
+
     def f16_rtz(self, f):
         """f32 -> f16 bits (low 16) with round-toward-zero, as v_cvt_pkrtz does: pack to nearest, and if that
         rounded away from zero (|half| > |x|), step one f16 ulp back toward zero. Inf/NaN inputs keep the nearest
@@ -2185,22 +2223,12 @@ class Gen:
             self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, rlo)
             self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
         elif op == "v_fmac_f16":
-            if any(m.startswith("op_sel") for m in mods):
-                raise Unsupported(op + " op_sel")
-            vals = []
-            for s in (a[1], a[2], a[0]):
-                u = self.src_u({**s, "neg": False, "abs": False})
-                v2, f = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-                vals.append(self.modify_f(f, s))
-            r, v2, p, old, keep, newv = (self.tmp() for _ in range(6))
+            # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
+            sel, dhi = self.opsel_bits(mods, 3)
+            vals = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1]), self.f16_in(a[0], sel[2])]
+            r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
-            self.emit(f"{v2} = OpCompositeConstruct %v2float {r} %f0")
-            self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
-            lo = self.tmp()
-            self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
-            self.write_lo16(a[0], lo)  # GFX10: f16 ops keep the high half
+            self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_add_nc_u16", "v_sub_nc_u16"):
             # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept.
             self._insn({**ins, "op": ("v_add_u16_e64" if op == "v_add_nc_u16" else "v_sub_u16_e64")})
@@ -2292,31 +2320,12 @@ class Gen:
             self.emit(f"{z} = OpSelect %uint {c} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
         elif op == "v_fma_f16":
-            # VOP3 op_sel:[s0,s1,s2,dst]: a set source bit reads that source's high half; a set dst bit writes the
-            # result to the high half and keeps the low half (opsel-capable VOP3, see "16-bit results").
-            m = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0,0]")
-            osel = [int(x) for x in m.split("[")[1].rstrip("]").split(",")] + [0, 0, 0, 0]
-            vals = []
-            for i, s in enumerate(a[1:4]):
-                u = self.src_u({**s, "neg": False, "abs": False})
-                v2, f = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                self.emit(f"{f} = OpCompositeExtract %float {v2} {osel[i]}")
-                vals.append(self.modify_f(f, s))
-            r, w2, p, lo = (self.tmp() for _ in range(4))
+            sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
+            vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
+            r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
             r = self.clamp_mods(r, mods)
-            self.emit(f"{w2} = OpCompositeConstruct %v2float {r} %f0")
-            self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {w2}")
-            self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
-            if osel[3]:
-                if a[0]["k"] != "vgpr":
-                    raise Unsupported(op + " op_sel destination")
-                hi16 = self.tmp()
-                self.emit(f"{hi16} = OpBitFieldInsert %uint {self.load_reg('vgpr', a[0]['r'])} {lo} {self.cu(16)} {self.cu(16)}")
-                self.dst(a[0], hi16)
-            else:
-                self.write_lo16(a[0], lo)  # GFX10: f16 ops keep the high half
+            self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16", "v_pk_fma_f16"):
             # Packed f16x2 (VOP3P). Result lo: source i takes its half from op_sel[i] (0 = lo, 1 = hi), negated by
             # neg_lo[i]. Result hi: half from op_sel_hi[i], negated by neg_hi[i]. Defaults: op_sel [0,0],
@@ -2386,25 +2395,14 @@ class Gen:
             else:
                 self.dst(d, v)
         elif op == "v_med3_f16":
-            if any(m.startswith("op_sel") for m in mods):
-                raise Unsupported(op + " op_sel")
-            vals = []
-            for s in a[1:4]:
-                u = self.src_u({**s, "neg": False, "abs": False})
-                v2, f = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-                vals.append(self.modify_f(f, s))
+            sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
+            vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
             lo_, hi_, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{lo_} = OpExtInst %float %glsl FMin {vals[0]} {vals[1]}")
             self.emit(f"{hi_} = OpExtInst %float %glsl FMax {vals[0]} {vals[1]}")
             self.emit(f"{r} = OpExtInst %float %glsl FClamp {vals[2]} {lo_} {hi_}")
             r = self.clamp_mods(r, mods)
-            w2, p, lo = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{w2} = OpCompositeConstruct %v2float {r} %f0")
-            self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {w2}")
-            self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
-            self.write_lo16(a[0], lo)     # opsel-capable VOP3: keeps the high half (Mesa ACO can_use_opsel)
+            self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
         elif op == "v_xad_u32":
             x, y, z = (self.src_u(t) for t in a[1:4])
             t, r = self.tmp(), self.tmp()
@@ -2419,14 +2417,10 @@ class Gen:
             self.scc_from_mask(r)
         elif op in ("v_rsq_f16", "v_rcp_f16", "v_sqrt_f16", "v_exp_f16", "v_log_f16", "v_floor_f16", "v_fract_f16",
                     "v_ceil_f16", "v_trunc_f16", "v_rndne_f16"):
-            # f16 unary on the low half; result in the low half, high half cleared (non-op_sel form).
-            if any(m.startswith("op_sel") for m in mods):
-                raise Unsupported(op + " op_sel")
-            u = self.src_u({**a[1], "neg": False, "abs": False})
-            v2, f = self.tmp(), self.tmp()
-            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-            f = self.modify_f(f, a[1])
+            # f16 unary on the low half (op_sel:[src,dst] picks the high half of the source / of the destination);
+            # the other half of the destination is kept.
+            sel, dhi = self.opsel_bits(mods, 1)
+            f = self.f16_in(a[1], sel[0])
             r = self.tmp()
             fn = {"v_rsq_f16": "InverseSqrt", "v_sqrt_f16": "Sqrt", "v_exp_f16": "Exp2", "v_log_f16": "Log2",
                   "v_floor_f16": "Floor", "v_fract_f16": "Fract", "v_ceil_f16": "Ceil", "v_trunc_f16": "Trunc",
@@ -2436,11 +2430,7 @@ class Gen:
             else:
                 self.emit(f"{r} = OpFDiv %float %f1 {f}")
             r = self.clamp_mods(r, mods)
-            w2, p, lo = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{w2} = OpCompositeConstruct %v2float {r} %f0")
-            self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {w2}")
-            self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
-            self.write_lo16(a[0], lo)  # GFX10: f16 ops keep the high half
+            self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op == "v_not_b32":
             x = self.src_u(a[1])
             r = self.tmp()
@@ -2455,16 +2445,10 @@ class Gen:
             self.uses_smul = True
             self.dst(a[0], r)
         elif op in ("v_add_f16", "v_sub_f16", "v_mul_f16", "v_max_f16", "v_min_f16"):
-            # f16 math on the low halves; the result's high half is cleared (non-op_sel form).
-            if any(m.startswith("op_sel") for m in mods):
-                raise Unsupported(op + " op_sel")
-            vals = []
-            for s in a[1:3]:
-                u = self.src_u({**s, "neg": False, "abs": False})
-                v2, f = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-                vals.append(self.modify_f(f, s))
+            # f16 math on the low halves (op_sel:[src0,src1,dst] in the VOP3 form); the other half of the destination
+            # is kept.
+            sel, dhi = self.opsel_bits(mods, 2)
+            vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:3])]
             r = self.tmp()
             k = {"v_add_f16": "OpFAdd", "v_sub_f16": "OpFSub", "v_mul_f16": "OpFMul"}.get(op)
             if k:
@@ -2472,11 +2456,7 @@ class Gen:
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {'FMax' if 'max' in op else 'FMin'} {vals[0]} {vals[1]}")
             r = self.clamp_mods(r, mods)
-            v2, p, lo = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{v2} = OpCompositeConstruct %v2float {r} %f0")
-            self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
-            self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
-            self.write_lo16(a[0], lo)  # GFX10: f16 ops keep the high half
+            self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op.startswith(("v_cmp_", "v_cmpx_")) and op.endswith(("_u64", "_i64")) and op.split("_")[2] in ("eq", "ne", "lg"):
             # 64-bit equality compare: both halves of the register pairs. GFX10 v_cmpx has no destination operand:
             # it writes EXEC only (inactive lanes stay inactive).
