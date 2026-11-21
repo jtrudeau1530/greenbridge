@@ -210,8 +210,8 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
     missing = []
     if wav and "assets" in stages and not shutil.which("ffmpeg"):
         missing.append("ffmpeg (needed for --wav): https://ffmpeg.org/download.html, then reopen the terminal")
-    if sys.version_info < (3, 11):
-        missing.append("Python 3.11 or newer: https://www.python.org/downloads/")
+    if sys.version_info < (3, 12):
+        missing.append("Python 3.12 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
         llvm = os.environ.get("LLVM_MC", "llvm-mc")
         if not tool_available(llvm):
