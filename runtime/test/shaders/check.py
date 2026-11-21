@@ -113,7 +113,17 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
               "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
-              "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000)}
+              "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
+              # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
+              "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),
+              "ps_f16_med3_mods": (0x41005555, 0x3c005555, 0x41003800, 0xaaaaba00),
+              "ps_f16_vop2": (0xaaaa4000, 0xaaaac000, 0xaaaa3a00, 0x42003f00),
+              "ps_f16_vop2b": (0xaaaa3e00, 0xaaaab800, 0xaaaa3c00, 0x42003400),
+              "ps_f16_vop1": (0xaaaa4000, 0xaaaabc00, 0xaaaac000, 0xaaaa8000),
+              "ps_f16_vop1b": (0xaaaa3400, 0xaaaa4000, 0xaaaab400, 0xaaaa3800),
+              "ps_f16_const": (0xaaaa3d00, 0x38005555, 0xaaaa3800, 0x3f000000),
+              "ps_f16_const2": (0x42003d00, 0x3d004200, 0xaaaabc00, 3),
+              "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
