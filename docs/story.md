@@ -23,8 +23,8 @@ first 1 GiB of the data area, and the full-file non-inflating signature scan is 
 Readable is the carver's `stored / span`; Bink 2 streams count as readable. The first `story000`
 row scans file offsets `0xA120`-`0x4000A11F`.
 
-A full 20 GB walk was attempted. At 72% (about 14.4 billion bytes, 106,000 streams) one zlib
-candidate expanded to 8.5 GB in memory, so the run was stopped and is not reported as a full index.
+A full 20 GB walk was attempted. At 72% (about 14.4 billion bytes, 106,000 streams) the run was
+stopped; one zlib candidate had expanded to 8.5 GB in memory. It is not reported as a full index.
 The bounded windows below and the non-inflating signature scan cover the rest without that risk.
 
 ## `story000.rpf` layout
