@@ -179,6 +179,42 @@ The existing `runtime/test` tools already expose the hard parts (device selectio
 descriptor setup, readback). The differential runner should call them rather than grow a second
 Vulkan stack.
 
+### LDS and `ds_*` on the GPU (`tools/lds_fuzz.py`, FUZZ-6)
+
+LDS ops are workgroup-wide, so `tools/lds_fuzz.py` runs on the GPU rather than one lane in the
+interpreter. Each seeded program is one 64-thread group (wave64, or two wave32s) with 4 KiB of LDS
+that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, each followed by
+`s_waitcnt` and `s_barrier`, then stores all 16 result VGPRs of every thread and the whole LDS.
+`vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP`.
+
+- **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`), the
+  byte and short writes (also `d16_hi`), `read2`/`write2` with and without `st64`, the add, sub,
+  min, max, and, or and xor atomics with and without return, `wrxchg`, `cmpst`, `ds_swizzle_b32`
+  and `ds_bpermute_b32`.
+- **Reference.** A model in the same file, written from the ISA and not from the translator.
+- **Determinism.** Programs stay deterministic. Writes, returning atomics, `wrxchg` and `cmpst` use
+  addresses no other lane touches in the same op. Only order-independent atomics without return
+  share addresses. Every access is in bounds, because the translator wraps out-of-range indices
+  where hardware returns 0.
+- **Swizzle.** Offsets are the two forms the LLVM `swizzle()` macros encode, checked with
+  `llvm-mc 23 -mcpu=gfx1013`: bit 15 = quad permute; otherwise and = bits 4:0, or = 9:5,
+  xor = 14:10, within each 32-lane group.
+- **EXEC.** Random EXEC masks are used on every op except `ds_swizzle`.
+- **Reports.** A mismatch names the thread, the register or LDS word, and the op that last wrote it.
+  `--no-exec KIND` drops one op kind's masks without changing the rest of the program, to separate
+  a known finding from new ones.
+
+First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and with
+`--wave64-emulate` at subgroup 32:
+
+- **One finding, already fixed by #253.** With wave32 `ds_bpermute` under EXEC, a source lane that
+  is off returned its value instead of 0: 12 of 240 programs (seeds 1 to 3) failed, each time
+  under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
+  native and emulated) match.
+- **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
+- **Not covered.** The translator rejects `ds_permute_b32` and the 8-bit d16 reads
+  (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
