@@ -1,7 +1,9 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
-**Status: design. The device/queue/command-list layer is not implemented; only the two root-signature free
-functions are shimmed (`runtime/shims/d3d12_xs.cpp`).** This is the plan for replacing the console's
+**Status: design, with the command path in place. The command list, queue, allocator and fence exist as COM objects
+over Vulkan (`runtime/shims/d3d12_com.cpp`, section 3.2), but no device hands them out yet:
+`D3D12XboxCreateDevice` still returns the host PC device, and resources, descriptor heaps, PSOs and the swapchain
+are not implemented.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
 exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
@@ -143,25 +145,52 @@ The command-list surface maps to the IR as follows:
 The IR is the place to add the trace, validation and "unsupported call" reporting. It also lets the layer replay a
 frame deterministically from a capture, which is valuable for comparing against the game.
 
-`runtime/src/command_list.h` implements the first slice of the IR: legacy resource barriers (transition, UAV,
-aliasing; split barriers record their end half) and full-view `ClearRenderTargetView` / `ClearDepthStencilView`.
-Clears copy the resource ID, mip and array-layer range by value while recording, so the CPU descriptor slot can be
-rewritten afterwards. `runtime/src/vulkan_replay.h` resolves the stable resource IDs to Vulkan images (or to the
-shared buffer space, whose transitions become global memory barriers), checks every command, then emits it; a
-rejected list writes nothing. Transitions use the section 4.3 table (`vulkan_access`) with the recorded `before`
-state as the old layout, as D3D12 itself trusts it. Clears assume the state D3D12 requires (`RENDER_TARGET`,
-`DEPTH_WRITE`) and wrap a transfer clear in a layout round trip, so cleared images must be created with
-`TRANSFER_DST` usage. Not done yet: rectangle clears (they need `vkCmdClearAttachments` inside a rendering scope),
-per-plane depth/stencil clears while the other plane is in a different state, implicit state promotion/decay,
-enhanced barriers, and the COM command-list and queue wiring.
+What is implemented (all of it testable without the game):
 
-Build `runtime/` and run `ctest --test-dir <build> --output-on-failure` for the CPU tests: `command_list_test`
-(recording rules) and, when the Vulkan headers are found, `d3d12_state_map_test` (the state table, subresource
-decoding, and the IR's D3D12 constants checked against the SDK's `d3d12.h`). `vk_command_replay_test` needs a GPU:
-it clears two layers of a 4×4 colour image through a reused descriptor, clears depth then depth-only on a
-`D32_SFLOAT_S8_UINT` image (stencil must survive), transitions both to `COPY_SOURCE` with recorded barriers, and
-reads them back. It also checks that each rejected list returns the right error. Set `LEONIDA_VK_VALIDATION=1`
-to run it under `VK_LAYER_KHRONOS_validation`; any validation error fails it.
+- **IR** (`runtime/src/command_list.h`): legacy barriers (transition, UAV, aliasing; split barriers record their end
+  half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
+  replayed as a full barrier), and `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles.
+  Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
+- **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
+  writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
+  `vulkan_sync` / `vulkan_barrier_access` / `vulkan_layout` to `vkCmdPipelineBarrier2`. Whole-view clears are
+  transfer clears inside a layout round trip; rectangle clears are `vkCmdClearAttachments` in a dynamic-rendering
+  scope, with rectangles clipped to the mip.
+- **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
+  from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
+  texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
+  promoted state still starts from `GENERAL`, and decay changes no layout. Buffers have no layout, and
+  simultaneous-access textures stay in `GENERAL` for life. With `separateDepthStencilLayouts` the depth and stencil
+  planes are tracked apart, so a depth-only clear or a one-plane transition leaves the other plane where it is.
+- **Execution** (`runtime/src/vulkan_backend.h`): `VulkanContext` (registered resources, the tracker, a view cache),
+  `VulkanQueue` (`ExecuteCommandLists` prepares every list before writing any, so a bad list submits nothing and
+  leaves the tracker as it was; `Signal`; `Wait`, which is attached to the next submission because a Vulkan wait
+  only holds back its own batch) and `VulkanFence` (a timeline semaphore).
+- **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList7`, `ID3D12CommandQueue`,
+  `ID3D12CommandAllocator` and `ID3D12Fence1` (with `SetEventOnCompletion` events). Every method they do not
+  implement is a stub generated at build time from the SDK's `d3d12.h` by `tools/gen_d3d12_stubs.py`. The stub
+  reports its name once, so the vtables follow the SDK order exactly and nothing derived from the SDK is checked
+  in. Unknown IIDs are logged and refused. Resources are identified by their `ID3D12Resource` pointer, and
+  RTV/DSV CPU handles point at a `TargetView`: that is the contract the device and descriptor heaps must meet.
+
+Known gaps: the device proxy that creates these objects (blocked on the measured device ABI, section 7);
+resources, descriptor heaps, PSOs, draws and copies; a fence cannot be signalled to a lower value (Vulkan timelines
+only increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
+sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error.
+
+Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <build> --output-on-failure` for the
+CPU tests:
+- `command_list_test` covers the recording rules.
+- `d3d12_state_map_test` covers both state tables, subresource and barrier-range decoding, and layout tracking. On
+  Windows it also checks every D3D12 constant the IR copies against the SDK's `d3d12.h`.
+
+The GPU tests read their results back. With `LEONIDA_VK_VALIDATION=1` they run under `VK_LAYER_KHRONOS_validation`,
+and any validation error fails them.
+- `vk_command_replay_test`, part A: only Vulkan 1.0 functions and no tracker.
+- `vk_command_replay_test`, part B: rectangle clears, a depth clear while the stencil plane is read-only, a promoted
+  texture, and enhanced barriers including a discard.
+- `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
+  the CPU has not signalled holds the GPU back.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
@@ -523,16 +552,19 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 | `PRESENT` | `PRESENT_SRC_KHR` for swapchain images, `GENERAL` otherwise | present |
 | `RAYTRACING_ACCELERATION_STRUCTURE` | buffer, no layout | acceleration structure read/write |
 
-- Split barriers (`BEGIN_ONLY`/`END_ONLY`) are an optimisation. The resource is unusable between the halves, so
-  one full barrier at either point is correct; the IR records it at the end point (`command_list.h`). Use
-  `VK_KHR_synchronization2` events if profiling needs the overlap.
+- Split barriers (`BEGIN_ONLY`/`END_ONLY`, and enhanced `SYNC_SPLIT`) are an optimisation. The resource is unusable
+  between the halves, so one full barrier at either point is correct; the IR records it at the end point
+  (`command_list.h`). Use `VK_KHR_synchronization2` events if profiling needs the overlap.
+- Implicit promotion and decay need no extra barriers: `COMMON` is `GENERAL`, and the layout tracker makes later
+  barriers start from it (section 3.2).
 - Aliasing barriers: if image aliasing is implemented (one `VkDeviceMemory` per D3D12 heap range, with
   `VK_IMAGE_CREATE_ALIAS_BIT`), transition the old image to `UNDEFINED`, issue a global memory barrier, then
   transition the new image. Until then, log aliasing and allocate distinct memory; do not silently return the
   wrong contents.
 - Enhanced barriers (`D3D12_BARRIER_SYNC_*`, `D3D12_BARRIER_ACCESS_*`, `D3D12_BARRIER_LAYOUT_*`) map directly to
-  `VkPipelineStageFlags2`, `VkAccessFlags2` and `VkImageLayout`. Implement them first if the trace shows them;
-  they are more precise and avoid the legacy table's conservatism.
+  `VkPipelineStageFlags2`, `VkAccessFlags2` and `VkImageLayout` (`vulkan_sync`, `vulkan_barrier_access`,
+  `vulkan_layout`). Queue-specific layouts map like their generic forms; ray tracing, video and split scopes use
+  `ALL_COMMANDS`; `LayoutBefore = UNDEFINED` or the discard flag becomes `oldLayout = UNDEFINED`.
 - Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
   rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
   targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with

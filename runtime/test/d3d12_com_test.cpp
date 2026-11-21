@@ -1,0 +1,199 @@
+// End to end through the D3D12 COM surface: an ID3D12GraphicsCommandList7 records clears (whole and rectangles),
+// legacy and enhanced barriers; an ID3D12CommandQueue executes it on Vulkan behind a queue Wait on a fence the CPU
+// signals later; an ID3D12Fence1 event reports completion; the images are read back. No shaders or game data.
+// Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
+#include "vk_test_device.h"
+#include "../shims/d3d12_com.h"
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+
+#define EXPECT(condition) do { \
+    if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
+} while (0)
+
+namespace {
+
+template<class T>
+struct Ref {
+    T* p = nullptr;
+    ~Ref() {
+        if (p) p->Release();
+    }
+    T* operator->() const { return p; }
+    void** out() { return reinterpret_cast<void**>(&p); }
+};
+
+}  // namespace
+
+int main() {
+    using namespace leonida;
+    vktest::Device d;
+    EXPECT(d.create());
+    VulkanContext context(d.device_proc, d.device, true);
+    EXPECT(context.loaded());
+
+    constexpr std::uint32_t size = 4, texels = size * size;
+    const VkImage rt = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    const VkImage ds = d.image(VK_FORMAT_D32_SFLOAT_S8_UINT, size, size, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    void* mapped = nullptr;
+    constexpr VkDeviceSize depth_offset = texels * 4, stencil_offset = depth_offset + texels * 4;
+    const VkBuffer buffer = d.buffer(stencil_offset + texels, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
+    EXPECT(rt && ds && buffer && d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT));
+    EXPECT(d.run([&](VkCommandBuffer cb) {
+        d.initial_layout(cb, rt, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        d.initial_layout(cb, ds, depth_stencil_aspects, 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        return true;
+    }));
+
+    // Stand-ins for the device: resources are identified by their ID3D12Resource pointer, which the layer never
+    // dereferences, and RTV/DSV handles point at TargetViews.
+    auto* rt_resource = reinterpret_cast<ID3D12Resource*>(std::uintptr_t{0x1000});
+    auto* ds_resource = reinterpret_cast<ID3D12Resource*>(std::uintptr_t{0x2000});
+    ResourceBinding rt_binding{};
+    rt_binding.image = rt;
+    rt_binding.format = VK_FORMAT_R8G8B8A8_UNORM;
+    rt_binding.width = rt_binding.height = size;
+    ResourceBinding ds_binding = rt_binding;
+    ds_binding.image = ds;
+    ds_binding.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    ds_binding.aspects = depth_stencil_aspects;
+    context.add_resource(rt::d3d12::resource_id(rt_resource), rt_binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    context.add_resource(rt::d3d12::resource_id(ds_resource), ds_binding,
+                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    const TargetView rtv{rt::d3d12::resource_id(rt_resource), 0, 0, 1};
+    const TargetView dsv{rt::d3d12::resource_id(ds_resource), 0, 0, 1};
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle{reinterpret_cast<SIZE_T>(&rtv)};
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle{reinterpret_cast<SIZE_T>(&dsv)};
+
+    {
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        Ref<ID3D12CommandQueue> queue;
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList7> list;
+        Ref<ID3D12Fence1> done, gate;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_queue(context, d.queue, d.family, queue_desc,
+                                                          IID_PPV_ARGS(&queue.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p,
+                                                         IID_PPV_ARGS(&list.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_fence(context, 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_fence(context, 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))));
+
+        // COM identity: the public chain answers, an unknown IID is refused (and logged).
+        {
+            Ref<ID3D12GraphicsCommandList> base;
+            Ref<ID3D12Device> device;
+            EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&base.p))) && base.p == list.p);
+            EXPECT(list->QueryInterface(IID_PPV_ARGS(&device.p)) == E_NOINTERFACE && !device.p);
+        }
+        EXPECT(queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
+        EXPECT(list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT);
+        constexpr GUID kTestData{0x0badf00d, 0x1, 0x2, {3, 4, 5, 6, 7, 8, 9, 10}};
+        const std::uint32_t tag = 0x1234abcd;
+        std::uint32_t read = 0;
+        UINT read_size = sizeof(read);
+        EXPECT(SUCCEEDED(queue->SetPrivateData(kTestData, sizeof(tag), &tag)));
+        EXPECT(SUCCEEDED(queue->GetPrivateData(kTestData, &read_size, &read)) && read == tag);
+
+        // An open list is rejected by ExecuteCommandLists and nothing is submitted.
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == ReplayResult::list_open);
+
+        const FLOAT red[4] = {1, 0, 0, 1}, blue[4] = {0, 0, 1, 1};
+        const D3D12_RECT square{1, 1, 3, 3};
+        list->ClearRenderTargetView(rtv_handle, red, 0, nullptr);
+        list->ClearRenderTargetView(rtv_handle, blue, 1, &square);
+        list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5f, 0x33, 0,
+                                    nullptr);
+        D3D12_RESOURCE_BARRIER transition{};
+        transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        transition.Transition.pResource = rt_resource;
+        transition.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        transition.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        transition.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &transition);
+        D3D12_TEXTURE_BARRIER texture{};
+        texture.SyncBefore = D3D12_BARRIER_SYNC_DEPTH_STENCIL;
+        texture.SyncAfter = D3D12_BARRIER_SYNC_COPY;
+        texture.AccessBefore = D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE;
+        texture.AccessAfter = D3D12_BARRIER_ACCESS_COPY_SOURCE;
+        texture.LayoutBefore = D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE;
+        texture.LayoutAfter = D3D12_BARRIER_LAYOUT_COPY_SOURCE;
+        texture.pResource = ds_resource;
+        texture.Subresources = {0xffffffff, 0, 0, 0, 0, 0};
+        D3D12_BARRIER_GROUP group{};
+        group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+        group.NumBarriers = 1;
+        group.pTextureBarriers = &texture;
+        list->Barrier(1, &group);
+        list->DrawInstanced(3, 1, 0, 0);  // not implemented: reported once by its generated stub, recording continues
+        EXPECT(list->Close() == S_OK);
+        EXPECT(list->Close() == E_FAIL);  // already closed
+
+        // The queue waits for `gate`, which only the CPU signals, so the work cannot have run before that.
+        EXPECT(SUCCEEDED(queue->Wait(gate.p, 1)));
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(done.p, 1)));
+        Sleep(50);
+        EXPECT(done->GetCompletedValue() == 0);
+        const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(event);
+        EXPECT(SUCCEEDED(done->SetEventOnCompletion(1, event)));
+        EXPECT(WaitForSingleObject(event, 0) == WAIT_TIMEOUT);
+        EXPECT(SUCCEEDED(gate->Signal(1)));
+        EXPECT(WaitForSingleObject(event, 5000) == WAIT_OBJECT_0);
+        CloseHandle(event);
+        EXPECT(done->GetCompletedValue() == 1);
+        EXPECT(SUCCEEDED(done->Signal(1)));  // not above the current value: reported and dropped
+        EXPECT(done->GetCompletedValue() == 1);
+
+        EXPECT(context.layout(rt::d3d12::resource_id(rt_resource), 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 1) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        // A depth outside [0, 1] makes Close report the invalid call, as D3D12 does.
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 2.0f, 0, 0, nullptr);
+        EXPECT(list->Close() == E_INVALIDARG);
+    }
+
+    EXPECT(d.run([&](VkCommandBuffer cb) {
+        d.read_back(cb, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, 1, buffer, 0);
+        d.read_back(cb, ds, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, size, size, 1, buffer,
+                    depth_offset);
+        d.read_back(cb, ds, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_STENCIL_BIT, size, size, 1, buffer,
+                    stencil_offset);
+        return true;
+    }));
+    const auto* data = static_cast<const std::uint8_t*>(mapped);
+    unsigned mismatches = 0;
+    for (std::uint32_t row = 0; row < size; ++row) {
+        for (std::uint32_t col = 0; col < size; ++col) {
+            const std::uint32_t i = row * size + col;
+            const bool inside = col >= 1 && col < 3 && row >= 1 && row < 3;
+            const std::array<std::uint8_t, 4> want = inside ? std::array<std::uint8_t, 4>{0, 0, 255, 255}
+                                                            : std::array<std::uint8_t, 4>{255, 0, 0, 255};
+            float depth;
+            std::memcpy(&depth, data + depth_offset + i * 4, 4);
+            if (!std::equal(want.begin(), want.end(), data + i * 4) || depth != 0.5f || data[stencil_offset + i] != 0x33) {
+                if (mismatches++ < 4)
+                    std::fprintf(stderr, "texel %u: colour %u,%u,%u,%u depth %f stencil 0x%02x\n", i,
+                                 unsigned(data[i * 4]), unsigned(data[i * 4 + 1]), unsigned(data[i * 4 + 2]),
+                                 unsigned(data[i * 4 + 3]), depth, unsigned(data[stencil_offset + i]));
+            }
+        }
+    }
+    EXPECT(!mismatches);
+    if (d.validation_errors()) {
+        std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+        return 1;
+    }
+    std::printf("COM list/queue/fence: %u colour, depth and stencil texels matched; queue wait held the GPU\n", texels);
+    return 0;
+}

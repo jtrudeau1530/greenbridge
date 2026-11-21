@@ -84,6 +84,32 @@ if(Vulkan_FOUND)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
+  # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(WIN32 AND Python3_FOUND)
+    set(LEONIDA_STUBS ${CMAKE_CURRENT_BINARY_DIR}/generated/d3d12_stubs.h)
+    add_custom_command(
+      OUTPUT ${LEONIDA_STUBS}
+      COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
+              ID3D12GraphicsCommandList7 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
+      COMMENT "Generating D3D12 COM stubs"
+      VERBATIM)
+    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp ${LEONIDA_STUBS})
+    target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers)
+    target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8)
+
+    add_executable(d3d12_com_test test/d3d12_com_test.cpp)
+    target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_com_test PRIVATE /W4 /permissive- /utf-8)
+  else()
+    message(STATUS "Python 3 or Windows missing: the D3D12 COM objects and d3d12_com_test are not built")
+  endif()
+
   # Needs only the Vulkan headers, not a GPU.
   if(BUILD_TESTING)
     add_executable(d3d12_state_map_test test/d3d12_state_map_test.cpp)

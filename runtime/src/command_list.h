@@ -1,8 +1,8 @@
 #pragma once
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
-// ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers resource barriers and full-view
-// render-target and depth-stencil clears. It has no Windows or Vulkan dependency.
+// ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
+// render-target and depth-stencil clears (whole views or rectangles). It has no Windows or Vulkan dependency.
 
 #include <array>
 #include <cstdint>
@@ -15,8 +15,8 @@ namespace leonida {
 using ResourceId = std::uintptr_t;
 using ClearColor = std::array<float, 4>;
 
-// D3D12_RESOURCE_STATES values from the public d3d12.h, so the IR builds without the Windows SDK.
-// d3d12_state_map_test checks them against d3d12.h on Windows.
+// D3D12 enum values from the public d3d12.h, so the IR builds without the Windows SDK.
+// d3d12_state_map_test checks every one against d3d12.h on Windows.
 namespace d3d12_state {
 inline constexpr std::uint32_t common = 0;
 inline constexpr std::uint32_t vertex_and_constant_buffer = 0x1;
@@ -39,12 +39,109 @@ inline constexpr std::uint32_t generic_read = 0xac3;
 inline constexpr std::uint32_t present = 0;
 } // namespace d3d12_state
 
-// D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAGS and D3D12_CLEAR_FLAGS.
+// D3D12_BARRIER_SYNC (enhanced barriers).
+namespace d3d12_sync {
+inline constexpr std::uint32_t none = 0;
+inline constexpr std::uint32_t all = 0x1;
+inline constexpr std::uint32_t draw = 0x2;
+inline constexpr std::uint32_t index_input = 0x4;
+inline constexpr std::uint32_t vertex_shading = 0x8;
+inline constexpr std::uint32_t pixel_shading = 0x10;
+inline constexpr std::uint32_t depth_stencil = 0x20;
+inline constexpr std::uint32_t render_target = 0x40;
+inline constexpr std::uint32_t compute_shading = 0x80;
+inline constexpr std::uint32_t raytracing = 0x100;
+inline constexpr std::uint32_t copy = 0x200;
+inline constexpr std::uint32_t resolve = 0x400;
+inline constexpr std::uint32_t execute_indirect = 0x800;
+inline constexpr std::uint32_t predication = 0x800;
+inline constexpr std::uint32_t all_shading = 0x1000;
+inline constexpr std::uint32_t non_pixel_shading = 0x2000;
+inline constexpr std::uint32_t emit_raytracing_acceleration_structure_postbuild_info = 0x4000;
+inline constexpr std::uint32_t clear_unordered_access_view = 0x8000;
+inline constexpr std::uint32_t video_decode = 0x100000;
+inline constexpr std::uint32_t video_process = 0x200000;
+inline constexpr std::uint32_t video_encode = 0x400000;
+inline constexpr std::uint32_t build_raytracing_acceleration_structure = 0x800000;
+inline constexpr std::uint32_t copy_raytracing_acceleration_structure = 0x1000000;
+inline constexpr std::uint32_t split = 0x80000000;
+} // namespace d3d12_sync
+
+// D3D12_BARRIER_ACCESS.
+namespace d3d12_access {
+inline constexpr std::uint32_t common = 0;
+inline constexpr std::uint32_t vertex_buffer = 0x1;
+inline constexpr std::uint32_t constant_buffer = 0x2;
+inline constexpr std::uint32_t index_buffer = 0x4;
+inline constexpr std::uint32_t render_target = 0x8;
+inline constexpr std::uint32_t unordered_access = 0x10;
+inline constexpr std::uint32_t depth_stencil_write = 0x20;
+inline constexpr std::uint32_t depth_stencil_read = 0x40;
+inline constexpr std::uint32_t shader_resource = 0x80;
+inline constexpr std::uint32_t stream_output = 0x100;
+inline constexpr std::uint32_t indirect_argument = 0x200;
+inline constexpr std::uint32_t predication = 0x200;
+inline constexpr std::uint32_t copy_dest = 0x400;
+inline constexpr std::uint32_t copy_source = 0x800;
+inline constexpr std::uint32_t resolve_dest = 0x1000;
+inline constexpr std::uint32_t resolve_source = 0x2000;
+inline constexpr std::uint32_t raytracing_acceleration_structure_read = 0x4000;
+inline constexpr std::uint32_t raytracing_acceleration_structure_write = 0x8000;
+inline constexpr std::uint32_t shading_rate_source = 0x10000;
+inline constexpr std::uint32_t video_decode_read = 0x20000;
+inline constexpr std::uint32_t video_decode_write = 0x40000;
+inline constexpr std::uint32_t video_process_read = 0x80000;
+inline constexpr std::uint32_t video_process_write = 0x100000;
+inline constexpr std::uint32_t video_encode_read = 0x200000;
+inline constexpr std::uint32_t video_encode_write = 0x400000;
+inline constexpr std::uint32_t no_access = 0x80000000;
+} // namespace d3d12_access
+
+// D3D12_BARRIER_LAYOUT.
+namespace d3d12_layout {
+inline constexpr std::uint32_t undefined = 0xffffffff;
+inline constexpr std::uint32_t common = 0;
+inline constexpr std::uint32_t present = 0;
+inline constexpr std::uint32_t generic_read = 1;
+inline constexpr std::uint32_t render_target = 2;
+inline constexpr std::uint32_t unordered_access = 3;
+inline constexpr std::uint32_t depth_stencil_write = 4;
+inline constexpr std::uint32_t depth_stencil_read = 5;
+inline constexpr std::uint32_t shader_resource = 6;
+inline constexpr std::uint32_t copy_source = 7;
+inline constexpr std::uint32_t copy_dest = 8;
+inline constexpr std::uint32_t resolve_source = 9;
+inline constexpr std::uint32_t resolve_dest = 10;
+inline constexpr std::uint32_t shading_rate_source = 11;
+inline constexpr std::uint32_t video_decode_read = 12;
+inline constexpr std::uint32_t video_decode_write = 13;
+inline constexpr std::uint32_t video_process_read = 14;
+inline constexpr std::uint32_t video_process_write = 15;
+inline constexpr std::uint32_t video_encode_read = 16;
+inline constexpr std::uint32_t video_encode_write = 17;
+inline constexpr std::uint32_t direct_queue_common = 18;
+inline constexpr std::uint32_t direct_queue_generic_read = 19;
+inline constexpr std::uint32_t direct_queue_unordered_access = 20;
+inline constexpr std::uint32_t direct_queue_shader_resource = 21;
+inline constexpr std::uint32_t direct_queue_copy_source = 22;
+inline constexpr std::uint32_t direct_queue_copy_dest = 23;
+inline constexpr std::uint32_t compute_queue_common = 24;
+inline constexpr std::uint32_t compute_queue_generic_read = 25;
+inline constexpr std::uint32_t compute_queue_unordered_access = 26;
+inline constexpr std::uint32_t compute_queue_shader_resource = 27;
+inline constexpr std::uint32_t compute_queue_copy_source = 28;
+inline constexpr std::uint32_t compute_queue_copy_dest = 29;
+inline constexpr std::uint32_t video_queue_common = 30;
+} // namespace d3d12_layout
+
+// D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAGS, D3D12_CLEAR_FLAGS and
+// D3D12_TEXTURE_BARRIER_FLAGS.
 inline constexpr std::uint32_t all_subresources = 0xffffffff;
 inline constexpr std::uint32_t barrier_begin_only = 0x1;
 inline constexpr std::uint32_t barrier_end_only = 0x2;
 inline constexpr std::uint32_t clear_depth = 0x1;
 inline constexpr std::uint32_t clear_stencil = 0x2;
+inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.
 struct TargetView {
@@ -52,6 +149,14 @@ struct TargetView {
     std::uint32_t mip;
     std::uint32_t first_layer;
     std::uint32_t layer_count;
+};
+
+// D3D12_RECT: right and bottom are exclusive.
+struct Rect {
+    std::int32_t left;
+    std::int32_t top;
+    std::int32_t right;
+    std::int32_t bottom;
 };
 
 // D3D12 subresource index: mip + layer * mips + plane * mips * layers, or all_subresources.
@@ -73,9 +178,51 @@ struct AliasingBarrier {
     ResourceId after;
 };
 
+// Enhanced barriers (ID3D12GraphicsCommandList7::Barrier).
+struct GlobalBarrier {
+    std::uint32_t sync_before;
+    std::uint32_t sync_after;
+    std::uint32_t access_before;
+    std::uint32_t access_after;
+};
+
+// Offset and size are not kept: D3D12 requires 0 and UINT64_MAX (the whole buffer).
+struct BufferBarrier {
+    std::uint32_t sync_before;
+    std::uint32_t sync_after;
+    std::uint32_t access_before;
+    std::uint32_t access_after;
+    ResourceId resource;
+};
+
+// D3D12_BARRIER_SUBRESOURCE_RANGE: mip_count == 0 means index_or_first_mip is a subresource index
+// (all_subresources for every one).
+struct BarrierSubresourceRange {
+    std::uint32_t index_or_first_mip;
+    std::uint32_t mip_count;
+    std::uint32_t first_layer;
+    std::uint32_t layer_count;
+    std::uint32_t first_plane;
+    std::uint32_t plane_count;
+};
+
+struct TextureBarrier {
+    std::uint32_t sync_before;
+    std::uint32_t sync_after;
+    std::uint32_t access_before;
+    std::uint32_t access_after;
+    std::uint32_t layout_before;
+    std::uint32_t layout_after;
+    ResourceId resource;
+    BarrierSubresourceRange range;
+    std::uint32_t flags;  // texture_barrier_discard
+};
+
+// rects empty: the whole view.
 struct ClearRenderTarget {
     TargetView target;
     ClearColor color;
+    std::vector<Rect> rects;
 };
 
 struct ClearDepthStencil {
@@ -83,9 +230,11 @@ struct ClearDepthStencil {
     std::uint32_t flags;  // clear_depth | clear_stencil
     float depth;
     std::uint8_t stencil;
+    std::vector<Rect> rects;
 };
 
-using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, ClearRenderTarget, ClearDepthStencil>;
+using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
+                             TextureBarrier, ClearRenderTarget, ClearDepthStencil>;
 
 class CommandList {
 public:
@@ -103,19 +252,44 @@ public:
     bool uav_barrier(const UavBarrier& barrier) { return append(barrier); }
     bool aliasing_barrier(const AliasingBarrier& barrier) { return append(barrier); }
 
-    // ClearRenderTargetView with NumRects == 0; the resource must be in render_target state at execution.
-    bool clear_render_target(const TargetView& target, const ClearColor& color) {
-        if (!valid(target)) return false;
-        return append(ClearRenderTarget{target, color});
+    // Enhanced split barriers follow the same rule: the half with sync_after == split is dropped, and the half with
+    // sync_before == split is replayed as a full barrier.
+    bool barrier(const GlobalBarrier& barrier) {
+        if (!valid_sync(barrier.sync_before, barrier.sync_after)) return false;
+        if (barrier.sync_after == d3d12_sync::split) return !closed_;
+        return append(barrier);
     }
 
-    // ClearDepthStencilView with NumRects == 0; the resource must be in depth_write state at execution.
+    bool barrier(const BufferBarrier& barrier) {
+        if (!barrier.resource || !valid_sync(barrier.sync_before, barrier.sync_after)) return false;
+        if (barrier.sync_after == d3d12_sync::split) return !closed_;
+        return append(barrier);
+    }
+
+    bool barrier(const TextureBarrier& barrier) {
+        if (!barrier.resource || !valid_sync(barrier.sync_before, barrier.sync_after)) return false;
+        if (barrier.layout_after == d3d12_layout::undefined && barrier.layout_before != d3d12_layout::undefined)
+            return false;
+        if (barrier.flags & ~texture_barrier_discard) return false;
+        if (barrier.range.mip_count && (!barrier.range.layer_count || !barrier.range.plane_count)) return false;
+        if (barrier.sync_after == d3d12_sync::split) return !closed_;
+        return append(barrier);
+    }
+
+    // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
+    bool clear_render_target(const TargetView& target, const ClearColor& color, std::span<const Rect> rects = {}) {
+        if (!valid(target)) return false;
+        return append(ClearRenderTarget{target, color, {rects.begin(), rects.end()}});
+    }
+
+    // ClearDepthStencilView; the cleared planes must be in depth_write state at execution.
     // D3D12 requires depth in [0, 1] and at least one clear flag.
-    bool clear_depth_stencil(const TargetView& target, std::uint32_t flags, float depth, std::uint8_t stencil) {
+    bool clear_depth_stencil(const TargetView& target, std::uint32_t flags, float depth, std::uint8_t stencil,
+                             std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
         if (!flags || (flags & ~(clear_depth | clear_stencil))) return false;
         if ((flags & clear_depth) && !(depth >= 0.0f && depth <= 1.0f)) return false;
-        return append(ClearDepthStencil{target, flags, depth, stencil});
+        return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
     bool close() {
@@ -136,6 +310,11 @@ public:
 
 private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
+
+    // A split begin and end cannot be the same barrier.
+    static bool valid_sync(std::uint32_t before, std::uint32_t after) {
+        return !(before == d3d12_sync::split && after == d3d12_sync::split);
+    }
 
     bool append(const Command& command) {
         if (closed_) return false;

@@ -69,6 +69,41 @@ int main() {
     const auto* both = std::get_if<ClearDepthStencil>(&commands[6]);
     CHECK(both && both->flags == (clear_depth | clear_stencil) && both->depth == 0.25f && both->stencil == 3);
 
+    // Rectangles are copied while recording.
+    CHECK(list.reset());
+    Rect rects[] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+    CHECK(list.clear_render_target({36, 0, 0, 1}, color, rects));
+    CHECK(list.clear_depth_stencil({48, 0, 0, 1}, clear_depth, 0.5f, 0, {rects, 1}));
+    rects[0] = {};
+    CHECK(list.close());
+    const auto& rect_clear = std::get<ClearRenderTarget>(list.commands()[0]);
+    CHECK(rect_clear.rects.size() == 2 && rect_clear.rects[0].left == 1 && rect_clear.rects[1].bottom == 8);
+    CHECK(std::get<ClearDepthStencil>(list.commands()[1]).rects.size() == 1);
+
+    // Enhanced barriers: split begin halves are dropped, end halves kept; invalid shapes are refused.
+    namespace y = d3d12_sync;
+    namespace a = d3d12_access;
+    namespace l = d3d12_layout;
+    CHECK(list.reset());
+    const BarrierSubresourceRange all{all_subresources, 0, 0, 0, 0, 0};
+    CHECK(list.barrier(GlobalBarrier{y::all, y::all, a::common, a::common}));
+    CHECK(list.barrier(GlobalBarrier{y::compute_shading, y::split, a::unordered_access, a::shader_resource}));
+    CHECK(list.barrier(GlobalBarrier{y::split, y::pixel_shading, a::unordered_access, a::shader_resource}));
+    CHECK(!list.barrier(GlobalBarrier{y::split, y::split, 0, 0}));
+    CHECK(list.barrier(BufferBarrier{y::copy, y::vertex_shading, a::copy_dest, a::vertex_buffer, 7}));
+    CHECK(!list.barrier(BufferBarrier{y::copy, y::vertex_shading, a::copy_dest, a::vertex_buffer, 0}));
+    CHECK(list.barrier(TextureBarrier{y::none, y::render_target, a::no_access, a::render_target, l::undefined,
+                                      l::render_target, 9, all, texture_barrier_discard}));
+    CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::undefined, 9, all, 0}));
+    CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::common, 9, all, 0x2}));
+    CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::common, 9,
+                                       {0, 1, 0, 0, 0, 1}, 0}));  // zero layers
+    CHECK(list.close());
+    CHECK(list.commands().size() == 4);
+    CHECK(std::get<GlobalBarrier>(list.commands()[1]).sync_before == y::split);
+    CHECK(std::get<BufferBarrier>(list.commands()[2]).resource == 7);
+    CHECK(std::get<TextureBarrier>(list.commands()[3]).flags == texture_barrier_discard);
+
     CHECK(list.reset());
     CHECK(!list.closed() && list.commands().empty());
     CHECK(!list.reset());
