@@ -144,7 +144,10 @@ def decode(ffmpeg: str, src: str, dst: str):
     try:
         out_dir = os.path.dirname(dst)
         os.makedirs(out_dir, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=out_dir, ignore_cleanup_errors=True) as tmp_dir:
+        td_kwargs = {"dir": out_dir}
+        if sys.version_info >= (3, 10):
+            td_kwargs["ignore_cleanup_errors"] = True
+        with tempfile.TemporaryDirectory(**td_kwargs) as tmp_dir:
             tmp = os.path.join(tmp_dir, "decoded.wav")
             cmd = [ffmpeg, "-v", "error", "-y", "-i", src]
             samples = ogg_output_samples(src)
