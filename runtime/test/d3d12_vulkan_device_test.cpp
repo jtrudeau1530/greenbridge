@@ -234,6 +234,26 @@ int main() {
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
         EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)) == E_INVALIDARG);
 
+        // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
+        EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);
+        EXPECT(rt::d3d12::device_max_push_constants_size(inner) == rt::d3d12::device_max_push_constants_size(device.p));
+        EXPECT(!rt::d3d12::device_push_constants_need_fallback(device.p));
+
+        // Simulated fallback path when maxPushConstantsSize < 144 bytes:
+        {
+            rt::d3d12::VulkanDeviceInfo fallback_info = info;
+            fallback_info.max_push_constants_size = 128;
+            fallback_info.push_constants_need_fallback = true;
+            ID3D12Device* fallback_inner = nullptr;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(fallback_info, IID_PPV_ARGS(&fallback_inner))));
+            Ref<ID3D12Device> fallback_device;
+            EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(fallback_inner, __uuidof(ID3D12Device),
+                                                               reinterpret_cast<void**>(&fallback_device.p))));
+            rt::d3d12::set_device_outer(fallback_inner, fallback_device.p);
+            EXPECT(rt::d3d12::device_max_push_constants_size(fallback_device.p) == 128);
+            EXPECT(rt::d3d12::device_push_constants_need_fallback(fallback_device.p));
+        }
+
         const int footprint_mismatches = compare_footprints(device.p);
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
