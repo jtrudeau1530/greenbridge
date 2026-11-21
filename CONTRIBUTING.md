@@ -17,6 +17,13 @@ Thanks for helping. A few rules keep the project safe to host:
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
 - `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all).
+- Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build`, then
+  `ctest --test-dir runtime/build --output-on-failure`. The CPU tests that need no game data are configured
+  on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
+  decode test) in place and print `SKIP` when the variable is unset; never copy or commit those files.
+- Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
+  `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
+  pipeline) for every translated shader and reports failures plus the saved cache path.
 - GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` there turns them into
   SPIR-V (it needs `llvm-mc`, so WSL or a Linux container), and `check.py` runs them on your GPU and compares
   the results. A new test gets its expected values in the comment at its top and a check in `check.py`.
