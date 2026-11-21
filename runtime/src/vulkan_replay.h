@@ -560,6 +560,10 @@ struct ReplayFunctions {
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
+    // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
+    PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
+    PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT end_label = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -1039,9 +1043,20 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     return ReplayResult::success;
 }
 
+// Ends the debug labels a submission left open, so every command buffer is balanced as Vulkan requires.
+inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& vk, std::uint32_t& open_labels) {
+    for (; open_labels && vk.end_label; --open_labels) vk.end_label(command_buffer);
+    open_labels = 0;
+}
+
 // Writes a prepared list. With a tracker, barriers start from the tracked layouts and update them.
+// `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
+// is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
+// (close_labels). Without it, the list's own events are balanced at its end.
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
-                 LayoutTracker* tracker = nullptr) {
+                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
+    std::uint32_t own_labels = 0;
+    std::uint32_t& labels = open_labels ? *open_labels : own_labels;
     const auto commands = prepared.list->commands();
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
@@ -1246,8 +1261,22 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
+        } else if (const auto* marker = std::get_if<DebugMarker>(&command)) {
+            if (!vk.insert_label || !vk.begin_label || !vk.end_label) continue;
+            VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+            label.pLabelName = marker->label.c_str();
+            if (marker->kind == DebugMarker::Kind::set) {
+                vk.insert_label(command_buffer, &label);
+            } else if (marker->kind == DebugMarker::Kind::begin) {
+                vk.begin_label(command_buffer, &label);
+                ++labels;
+            } else if (labels) {
+                vk.end_label(command_buffer);
+                --labels;
+            }
         }
     }
+    if (!open_labels) close_labels(command_buffer, vk, own_labels);
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.

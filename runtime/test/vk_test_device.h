@@ -40,6 +40,8 @@ public:
     bool bc = false;  // textureCompressionBC enabled
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
+    bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
+    bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
 
     Device() = default;
     Device(const Device&) = delete;
@@ -99,7 +101,7 @@ public:
 #endif
         validation = env && std::strcmp(env, "0") != 0;
         const char* layer = "VK_LAYER_KHRONOS_validation";
-        const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        const char* debug_utils_name = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
         VkDebugUtilsMessengerCreateInfoEXT messenger_info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
         messenger_info.messageSeverity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
@@ -126,8 +128,20 @@ public:
             instance_info.pNext = &messenger_info;
             instance_info.enabledLayerCount = 1;
             instance_info.ppEnabledLayerNames = &layer;
+            debug_utils = true;  // the validation layer provides it
+        } else if (request_debug_utils) {
+            const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                instance_proc(nullptr, "vkEnumerateInstanceExtensionProperties"));
+            std::uint32_t count = 0;
+            enumerate(nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> extensions(count);
+            enumerate(nullptr, &count, extensions.data());
+            for (const auto& e : extensions)
+                debug_utils = debug_utils || std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+        }
+        if (debug_utils) {
             instance_info.enabledExtensionCount = 1;
-            instance_info.ppEnabledExtensionNames = &debug_utils;
+            instance_info.ppEnabledExtensionNames = &debug_utils_name;
         }
         if (create_instance(&instance_info, nullptr, &instance) != VK_SUCCESS) return false;
         if (validation &&

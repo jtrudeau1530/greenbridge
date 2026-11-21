@@ -20,6 +20,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace rt::d3d12 {
@@ -722,6 +723,21 @@ public:
                                                                   info.separate_depth_stencil_layouts);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
+        if (info.debug_utils) {
+            leonida::DebugLabelFunctions labels;
+            const auto load = [&](auto& f, const char* name) {
+                f = reinterpret_cast<std::remove_reference_t<decltype(f)>>(info.get_instance_proc(info.instance, name));
+            };
+            load(labels.cmd_insert, "vkCmdInsertDebugUtilsLabelEXT");
+            load(labels.cmd_begin, "vkCmdBeginDebugUtilsLabelEXT");
+            load(labels.cmd_end, "vkCmdEndDebugUtilsLabelEXT");
+            load(labels.queue_insert, "vkQueueInsertDebugUtilsLabelEXT");
+            load(labels.queue_begin, "vkQueueBeginDebugUtilsLabelEXT");
+            load(labels.queue_end, "vkQueueEndDebugUtilsLabelEXT");
+            state_.context->enable_debug_labels(labels);
+            if (!state_.context->debug_labels())
+                std::fprintf(stderr, "[rt] d3d12: VK_EXT_debug_utils entry points missing; debug markers are off\n");
+        }
     }
 
     // Set 0 of every translated shader that declares bindings: images, samplers and the descriptor hash table
@@ -1490,6 +1506,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         instance_info.enabledLayerCount = 1;
         instance_info.ppEnabledLayerNames = &layer;
     }
+    // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
+    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    bool has_debug_utils = false;
+    if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+            get(nullptr, "vkEnumerateInstanceExtensionProperties"))) {
+        std::uint32_t extension_count = 0;
+        enumerate(nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> extensions(extension_count);
+        enumerate(nullptr, &extension_count, extensions.data());
+        for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
+    }
+    if (has_debug_utils) {
+        instance_info.enabledExtensionCount = 1;
+        instance_info.ppEnabledExtensionNames = &debug_utils;
+    }
     OwnedRuntime owned{};
     if (create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
         std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
@@ -1518,6 +1549,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.get_instance_proc = get;
     info.instance = owned.instance;
     info.separate_depth_stencil_layouts = true;
+    info.debug_utils = has_debug_utils;
     VkPhysicalDeviceProperties chosen{};
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};

@@ -2,13 +2,15 @@
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
-// render-target and depth-stencil clears (whole views or rectangles), copies and resolves. It has no Windows or
-// Vulkan dependency.
+// render-target and depth-stencil clears (whole views or rectangles), copies, resolves and debug markers. It has no
+// Windows or Vulkan dependency.
 
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -304,9 +306,17 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
+// SetMarker, BeginEvent and EndEvent, replayed as VK_EXT_debug_utils labels when the device has them (and skipped
+// when it does not). The label is UTF-8; an end has none.
+struct DebugMarker {
+    enum class Kind : std::uint8_t { set, begin, end };
+    Kind kind;
+    std::string label;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource>;
+                             CopyResource, ResolveSubresource, DebugMarker>;
 
 class CommandList {
 public:
@@ -402,6 +412,13 @@ public:
         if (this == &bundle || closed_ || !bundle.closed_) return false;
         commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
         return true;
+    }
+
+    // Debug markers. D3D12 does not ask a list to balance its events (one list may end what another began), so
+    // they are recorded as given; the replay balances them per submission (vulkan_replay.h, emit).
+    bool marker(DebugMarker::Kind kind, std::string label = {}) {
+        if (kind == DebugMarker::Kind::end) label.clear();
+        return append(DebugMarker{kind, std::move(label)});
     }
 
     bool close() {

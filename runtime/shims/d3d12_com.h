@@ -47,6 +47,9 @@ struct VulkanDeviceInfo {
     // samplerAnisotropy and samplerMirrorClampToEdge enabled; without them such samplers are approximated.
     bool sampler_anisotropy = false;
     bool sampler_mirror_clamp_to_edge = false;
+    // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
+    // do nothing.
+    bool debug_utils = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
