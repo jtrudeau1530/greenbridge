@@ -782,6 +782,21 @@ VkImage vulkan_image(ID3D12Resource* resource) {
     return r ? r->image() : VK_NULL_HANDLE;
 }
 
+bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (!dst || !src) return false;
+    const Format requested = vulkan_format(format, false);
+    if (requested.typeless || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return false;
+    if (format == DXGI_FORMAT_R32G32B32A32_UINT || format == DXGI_FORMAT_R8G8B8A8_UINT ||
+        format == DXGI_FORMAT_R32_UINT)
+        return false;
+    const auto matches = [&](ID3D12Resource* resource) {
+        const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        return vulkan_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL).format ==
+               requested.format;
+    };
+    return matches(dst) && matches(src);
+}
+
 std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
     if (!device) return 0;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
