@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from compute_fixture import compute_header
-from check import Skip, mesh_v5_test, start_failure
+from check import CMPX_CLASS_WORDS, Skip, mesh_v5_test, start_failure
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -559,11 +559,10 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == "cs_bounds":
-            # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
-            # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
+        elif name in ("cs_bounds", "cs_cmpx_class_f32"):
+            # These per-lane results do not require a particular subgroup width.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
-            want = [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
+            want = CMPX_CLASS_WORDS if name == "cs_cmpx_class_f32" else [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
             results.append((name, rc == 0 and vals == want,

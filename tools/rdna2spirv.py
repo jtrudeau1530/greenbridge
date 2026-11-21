@@ -1200,8 +1200,8 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
-    def cmp_class(self, a):
-        """v_cmp_class_f32 dst, x, mask: true if x's class bit is set in mask.
+    def cmp_class(self, a, exec_only=False):
+        """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
         Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
         x, mask = self.src_f(a[-2]), self.src_u(a[-1])
         u = self.tou(x)
@@ -1241,6 +1241,10 @@ class Gen:
             hit = b(f"OpLogicalAnd %bool {on} {c}")
             acc = b(f"OpLogicalOr %bool {acc} {hit}")
         acc = b(f"OpLogicalAnd %bool {acc} {self.active_b()}")   # inactive lanes write 0
+        if exec_only:
+            self.emit(f"OpStore %active {acc}")
+            self.uses_active = True
+            return
         r = b(f"OpSelect %uint {acc} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         d = a[0]
         if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
@@ -2035,8 +2039,8 @@ class Gen:
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
-        elif op == "v_cmp_class_f32":
-            self.cmp_class(a)
+        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32"):
+            self.cmp_class(a, exec_only=op == "v_cmpx_class_f32")
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
             x = self.src_u(a[1])
