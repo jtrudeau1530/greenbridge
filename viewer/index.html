@@ -146,6 +146,9 @@ addEventListener("blur", () => keys.clear());
 
 // ---------- chunk streaming ----------
 const LOAD_R = 1400, UNLOAD_R = 2000, MAX_INFLIGHT = 4;
+// Three total attempts per chunk, with 1s/2s backoff. Failed chunks keep their budget
+// when leaving and returning; successfully loaded chunks start fresh after unloading.
+const MAX_LOAD_ATTEMPTS = 3, RETRY_DELAY_MS = 1000;
 const loader = new GLTFLoader();
 const live = new Map(); let inflight = 0, wire = false, clay = false, showBounds = false, failed = 0;
 const clayMat = new THREE.MeshStandardMaterial({ color: 0xb8c0ca, roughness: 0.85, wireframe: wire, side: THREE.DoubleSide });
@@ -192,26 +195,57 @@ function dist(c, p) {
 }
 function drop(id) {
   const c = live.get(id); if (!c) return;
+  live.delete(id);
+  c.controller?.abort();
   if (c.obj) {
     scene.remove(c.obj);
     disposeObject(c.obj);
   }
-  live.delete(id);
 }
-function stream() {
+async function loadChunk(entry) {
+  const { def, controller } = entry;
+  inflight++;
+  try {
+    const response = await fetch(def.url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`Chunk request failed: ${response.status}`);
+    const bytes = await response.arrayBuffer();
+    if (controller.signal.aborted) return;
+    const g = await loader.parseAsync(bytes, THREE.LoaderUtils.extractUrlBase(def.url));
+    // GLTFLoader cannot cancel a parse already underway. Dispose its late result.
+    if (live.get(def.id) !== entry) { disposeObject(g.scene); return; }
+    entry.obj = g.scene; scene.add(g.scene); applyClay(g.scene); applyWire(g.scene);
+  } catch {
+    if (live.get(def.id) !== entry) return;
+    failed++;
+    entry.retryAt = performance.now() + RETRY_DELAY_MS * 2 ** (entry.attempts - 1);
+  } finally {
+    entry.loading = false;
+    entry.controller = null;
+    entry.previous = null;
+    inflight--;
+  }
+}
+function stream(now = performance.now()) {
   const p = camera.position;
-  for (const [id, c] of live) if (c.obj && dist(c.def, p) > UNLOAD_R) drop(id);
-  const want = world.chunks.filter(c => !live.has(c.id) && dist(c, p) < LOAD_R).sort((a, b) => dist(a, p) - dist(b, p));
+  for (const [id, c] of live) {
+    if ((!c.obj && !c.loading) || dist(c.def, p) <= UNLOAD_R) continue;
+    drop(id);
+    // A canceled retry does not erase the previous failures or spend another attempt.
+    if (c.previous) live.set(id, c.previous);
+  }
+  const want = world.chunks.filter(c => {
+    if (dist(c, p) >= LOAD_R) return false;
+    const entry = live.get(c.id);
+    return !entry || (!entry.obj && !entry.loading && entry.attempts < MAX_LOAD_ATTEMPTS && now >= entry.retryAt);
+  }).sort((a, b) => dist(a, p) - dist(b, p));
   for (const def of want) {
     if (inflight >= MAX_INFLIGHT) break;
-    const entry = { def, obj: null }; live.set(def.id, entry);
-    if (def.test) { entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyClay(entry.obj); applyWire(entry.obj); continue; }
-    inflight++;
-    loader.load(def.url, g => {
-      inflight--;
-      if (live.get(def.id) !== entry) { disposeObject(g.scene); return; }
-      entry.obj = g.scene; scene.add(g.scene); applyClay(g.scene); applyWire(g.scene);
-    }, undefined, () => { inflight--; failed++; });
+    const previous = live.get(def.id);
+    const entry = { def, obj: null, loading: true, attempts: (previous?.attempts || 0) + 1, retryAt: 0, previous };
+    live.set(def.id, entry);
+    if (def.test) { entry.loading = false; entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyClay(entry.obj); applyWire(entry.obj); continue; }
+    entry.controller = new AbortController();
+    void loadChunk(entry);
   }
 }
 
@@ -245,7 +279,7 @@ renderer.setAnimationLoop(() => {
   const p = camera.position, loaded = [...live.values()].filter(c => c.obj).length;
   hud.innerHTML = `<b>${world.test ? "test terrain" : "world"}</b><br>pos ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}<br>` +
     `speed ${speed.toFixed(0)} m/s · ${fps.toFixed(0)} fps<br>chunks ${loaded}/${world.chunks.length} loaded, ${inflight} loading` +
-    (failed ? `, <span style="color:var(--warn)">${failed} failed</span>` : "") +
+    (failed ? `, <span style="color:var(--warn)">${failed} load errors</span>` : "") +
     `<br>draw calls ${renderer.info.render.calls}, tris ${(renderer.info.render.triangles / 1000).toFixed(0)}k`;
 });
 </script>

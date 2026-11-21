@@ -10,6 +10,13 @@ Thanks for helping. A few rules keep the project safe to host:
 - Short excerpts needed to explain a format (a few header bytes, one instruction sequence) are fine in docs and
   comments.
 
+## Before you start
+
+Claim the work in [#156](https://github.com/ItsNotRexed/Leonida/issues/156) first: check its tables and the open
+pull requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID
+in your pull request. When two pull requests overlap anyway, the one that lands first is merged and the other is
+asked to rebase or close. GPU test results go in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
+
 ## Working on the code
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise.
@@ -21,6 +28,8 @@ Thanks for helping. A few rules keep the project safe to host:
   `ctest --test-dir runtime/build --output-on-failure`. The CPU tests that need no game data are configured
   on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
   decode test) in place and print `SKIP` when the variable is unset; never copy or commit those files.
+- Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, no packages,
+  browser, network or game data). These execute the viewer streaming code with a synthetic loader and clock.
 - Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
   `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
   pipeline) for every translated shader and reports failures plus the saved cache path.

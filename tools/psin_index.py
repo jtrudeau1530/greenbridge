@@ -72,6 +72,9 @@ def parse(blob):
     if first < HEADER or first > len(blob):
         record["error"] = f"first section offset {first} is outside the file"
         return record
+    if len(blob) - first < SECTION_HEADER:
+        record["error"] = f"missing or truncated first section header at {first}"
+        return record
     offset = first
     while offset + SECTION_HEADER <= len(blob):
         tag = blob[offset:offset + 4]
@@ -154,11 +157,22 @@ def summarize(records):
     }
 
 
+def count(text):
+    """--limit: 0 or a negative value used to mean no limit (0 is falsy, a negative count is never reached)."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description="Index PSIN metadata containers.")
     ap.add_argument("src", help="PSIN file or directory of carved .bin streams")
     ap.add_argument("--json", action="store_true", help="write records and summary as JSON")
-    ap.add_argument("--limit", type=int, help="stop after this many PSIN files")
+    ap.add_argument("--limit", type=count, help="stop after this many PSIN files")
     a = ap.parse_args()
 
     records = collect(a.src, a.limit)

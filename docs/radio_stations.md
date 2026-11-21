@@ -231,6 +231,21 @@ block at base `0x9481`. This is consistent with a station graph mixing its own l
 shared ranges, each range keeping its own base; that reading is inferred from the ranges, not decoded
 from a per-range base field.
 
+## Title-keyed stream ids
+
+The low 29 bits of `hash B` are the AWC stream id, and `hash B` is `joaat(normalized title)`. That
+turns the record table into a title-keyed lookup even when the config's display-name field is blank.
+On the current 800 resolved rows, the unmodified normalized title matches the stream id exactly for
+**702 (87.75%)**; trying case, punctuation, bracket, dash and feature-credit variants raises this to
+**746 (93.25%)**. The 54 misses are not evidence of absence: the stored title can differ from the
+in-game name, the hash can cover a different mix or edition, and a few records are duplicate-title or
+placeholder collisions.
+
+This rule resolved four previously untitled CircoLoco records whose config names were empty; one of
+the four is assigned to CircoLoco by record-id and AWC-bank adjacency rather than by a station field.
+The title hash identifies a bank, not a station, not a play order and not a start offset. Keep the
+station assignment and cue times as separate, evidence-labelled steps.
+
 ## What a runtime needs
 
 | Need | Source | Status |
@@ -271,6 +286,8 @@ Measured:
 - No VCRR prefix sum appears as a u32 in the two streams; the known cue times do not occur in the
   54 MiB config.
 - The six cluster ranges and their present/span counts.
+- The title-keyed stream-id check: 702/800 exact `joaat(normalized title)` matches and 746/800
+  with the tested case/punctuation/feature variants; 54 remain unmatched.
 
 Inferred:
 
@@ -279,6 +296,8 @@ Inferred:
 - That the 80-record block at `0xBD73` is VCRR's track set, and that about 70 of the 80 are used.
 - The station ownership of every non-VCRR group and every shared cluster base.
 - That the `0x202C` ident table is a station-ident map rather than another content table.
+- That the four title-resolved CircoLoco records belong to that station; one assignment is by
+  record-id/AWC-bank adjacency, not by a station field.
 
 ## Reproduce
 

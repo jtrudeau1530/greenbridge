@@ -119,7 +119,9 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
 `audio_manifest.json` is the bank index: each bank's `Path`, `Offset`, `Size`, and its `Streams` with `Index`,
-`Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`.
+`Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`. For streamed music,
+`Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
+interleaved sample count is divided by that channel count.
 
 `audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count, and trims to the Ogg
 Opus end granule. Existing `.wav` files are skipped, so a stopped run continues. With no `--out`, a directory writes
@@ -178,6 +180,9 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 - A 4-channel streamed-music bank gives four 42.0 s mono channels with real levels and no decoder errors.
 - A 1-channel streamed-music descriptor can carry stereo Opus packets; it exports as one stereo Ogg with the
   interleaved sample count halved, and a 3-channel descriptor with stereo packets exports three stereo Oggs.
+- In the 3,008-bank / 3,116-channel streamed-music census, 2,501 of 2,958 one-channel descriptors carry stereo
+  packets; the 50 multi-channel descriptors split into 20 all-stereo and 30 all-mono banks, with no channel
+  mixing TOC stereo bits. 61 representative exports decode cleanly.
 - All exported WAVs decode. Codec 2 values are stored as-is, so a float WAV can exceed ±1.
 
 The tools export the streams and channels as stored. They do not reconstruct runtime mixing, looping, ducking or

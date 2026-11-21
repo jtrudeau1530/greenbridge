@@ -229,6 +229,26 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["signature"] for r in rows], ["psin", "page-directory", "rsc8"])
         self.assertEqual(summary["mode"], "directory")
 
+    def test_empty_archive(self):
+        empty = os.path.join(self.root, "empty.rpf")
+        open(empty, "wb").close()
+        rows, summary = story_index.scan_rpf(empty)
+        self.assertEqual(rows, [])
+        self.assertEqual((summary["files"], summary["span"]), (0, 0))
+
+    def test_cli_rejects_bad_ranges(self):
+        out = os.path.join(self.root, "bad.json")
+        for extra, code, message in ((("--limit", "0"), 2, "must be at least 1"),
+                                     (("--limit", "-1"), 2, "must be at least 1"),
+                                     (("--start", "-1"), 2, "must be 0 or more"),
+                                     (("--start", "0x7fffffff"), 2, "start offset is outside the archive")):
+            p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet", *extra],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, code, p.stderr)
+            self.assertIn(message, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
 
 if __name__ == "__main__":
     unittest.main()

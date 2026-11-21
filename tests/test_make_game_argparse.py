@@ -218,7 +218,8 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                                             self.assertEqual(ret, 0)
 
         expected_calls = [
-            call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY),
+            call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
+                         emulate=unittest.mock.ANY, keep_emulated=True),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
             call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
             call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir)),
@@ -291,10 +292,12 @@ class JobsHandlingTest(unittest.TestCase):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
                             with patch("make_game.log"):
-                                with patch("make_game.shaders") as mock_shaders:
+                                with patch("make_game.shaders") as mock_shaders, \
+                                        patch("make_game.wave64_emulate", return_value=True):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
-                                    mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6)
+                                    mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
+                                                                         emulate=True, keep_emulated=True)
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,6 +338,14 @@ class JobsHandlingTest(unittest.TestCase):
 
 class WavValidationTest(unittest.TestCase):
     """Test --wav validation in preflight and assets stage behavior."""
+
+    def setUp(self):
+        # preflight runs `dotnet --list-sdks` (#223). Follow the test's faked shutil.which instead: the SDK counts as
+        # installed exactly when the test says dotnet is on PATH, so no real dotnet is needed and none is consulted.
+        patcher = patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
 
     @patch.object(sys, "version_info", (3, 11, 0))
     @patch("make_game.ensure_submodule")
@@ -482,6 +493,13 @@ class WavValidationTest(unittest.TestCase):
 
 class PathContainmentAndDiskSpaceTest(unittest.TestCase):
     """Test rejection of output paths inside game folder and preflight disk space checks."""
+
+    def setUp(self):
+        # preflight runs `dotnet --list-sdks` (#223). Follow the test's faked shutil.which instead: the SDK counts as
+        # installed exactly when the test says dotnet is on PATH, so no real dotnet is needed and none is consulted.
+        patcher = patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_out_inside_game_folder_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

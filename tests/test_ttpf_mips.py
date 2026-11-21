@@ -270,6 +270,10 @@ class SyntheticPoolTest(unittest.TestCase):
         self.assertEqual(result["compact_missing_mips"], 6)
         self.assertEqual(result["compact_decodable_mips"], 6)
         self.assertEqual(result["compact_full_rows"], 1)
+        self.assertEqual(result["gated_accounted"], 0)
+        self.assertEqual(result["gated_tuple_distinct"], 0)
+        self.assertEqual((result["after_full"], result["after_partial"],
+                          result["after_skip"]), (1, 0, 0))
 
     def test_scan_counts_an_unlisted_tuple_as_gated(self):
         path = os.path.join(self.tmp.name, "unlisted.ttpf")
@@ -285,6 +289,59 @@ class SyntheticPoolTest(unittest.TestCase):
         self.assertEqual(total["gated_layout_ok"], 1)
         self.assertEqual(total["gated_full_chain"], 1)
         self.assertEqual(total["gated_full_mips"], 7)
+        self.assertEqual(total["gated_partial"], 0)
+        self.assertEqual(total["gated_no_contiguous"], 0)
+        self.assertEqual(total["gated_no_layout"], 0)
+        self.assertEqual(total["gated_unknown_format"], 0)
+        self.assertEqual(total["gated_other_layout_error"], 0)
+        self.assertEqual(total["gated_span_mismatch"], 0)
+        self.assertEqual(total["gated_unreadable_range"], 0)
+        self.assertEqual(total["gated_accounted"], total["whitelist_gated"])
+        self.assertEqual(total["gated_tuple_distinct"], 1)
+        self.assertEqual((total["after_full"], total["after_partial"],
+                          total["after_skip"]), (1, 0, 0))
+
+    def test_scan_reports_the_rejected_tuple(self):
+        path = os.path.join(self.tmp.name, "tuple.ttpf")
+        build_pool(path, meta=0x599)
+        out = os.path.join(self.tmp.name, "scan3.json")
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            ttpf.scan_pools([path], out, include_tuples=True)
+        with open(out, encoding="utf-8") as f:
+            total = json.load(f)["total"]
+        self.assertEqual(total["gated_tuples"],
+                         [{"tuple": [4, 256, 256, 7, 1, 8], "count": 1}])
+
+    def test_scan_buckets_an_unknown_element_size(self):
+        path = os.path.join(self.tmp.name, "unknown-format.ttpf")
+        build_pool(path, meta=0x599)
+        # Rewrite the format field in the one ETPF record. The scan rejects the
+        # record before reading texture data, so the payload stays untouched.
+        etpf = ttpf.align(24 + 2 * 8, 256)
+        at = etpf + 16 + 4
+        with open(path, "r+b") as f:
+            f.seek(at)
+            b = struct.unpack("<I", f.read(4))[0]
+            f.seek(at)
+            f.write(struct.pack("<I", (b & ~(255 << 3)) | (156 << 3)))
+        out = os.path.join(self.tmp.name, "scan4.json")
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            ttpf.scan_pools([path], out)
+        with open(out, encoding="utf-8") as f:
+            total = json.load(f)["total"]
+        self.assertEqual(total["whitelist_gated"], 1)
+        self.assertEqual(total["gated_layout_ok"], 0)
+        self.assertEqual(total["gated_no_layout"], 1)
+        self.assertEqual(total["gated_unknown_format"], 1)
+        self.assertEqual(total["gated_other_layout_error"], 0)
+        self.assertEqual(total["gated_accounted"], 1)
+        self.assertEqual(total["gated_full_chain"], 0)
+        self.assertEqual(total["after_full"], 0)
+        self.assertEqual(total["after_skip"], 1)
 
 
 if __name__ == "__main__":

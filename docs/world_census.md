@@ -29,6 +29,29 @@ counted against the declared `entity_size` and no entity block was left in a gra
 `entities_exact` is the same check summed over all rows. Six entities of the 23,535 maps were split
 across a continuation; the joiner adopted 174 streams in total.
 
+### Placement maps vs metadata
+
+The 23,535 rows above are **placement maps**: a `CMapData` root and at least one countable
+`CEntityDef` block. The same pass also validates **138,839 `CMapData`-only metadata resources** with
+no `CEntityDef` block, plus **26,075 other `0x7a` metadata resources**. Counting every `CMapData`
+root regardless of entity schema gives **162,374** resources, but only the 23,535 with entities are
+placement maps in this census. Keeping the two classes separate avoids inflating the map count with
+map-definition metadata.
+
+| Detail | Count |
+|---|---:|
+| Placement maps (`CMapData` + `CEntityDef`) | 23,535 |
+| `CMapData`-only metadata (no `CEntityDef`) | 138,839 |
+| Other `0x7a` metadata | 26,075 |
+| Placement maps joining a continuation | 2,868 |
+| Placement maps using a raw continuation page | 3 |
+| Metadata resources using a raw continuation page | 1 |
+| Byte-identical duplicate map payloads | 0 |
+| Duplicate 32-bit map-name hashes | 0 |
+| Entity blocks in graphics pages | 0 |
+| Unresolved or truncated map resources | 0 |
+
+
 ## Coverage
 
 | Byte class | Bytes | Share of data area |
@@ -47,6 +70,56 @@ that inflates to a `0DRP` header was found in a gap (`missed_zlib_meta = 0`). Th
 candidates are zlib streams that do not form a complete `0x7a` resource; they are ordinary archive
 payload, not counted maps.
 
+## Other archives
+
+The same walk was run over the ten other non-radio RPF9 archives in the package, in 1 GiB shards
+(32 shards total) with 12 jobs; `--merge-only` then rebuilt each summary from its shard files. All
+shards completed and every byte of the scanned data areas is accounted for. A `CMapData`-only
+metadata row has a `CMapData` root but no `CEntityDef` table; the `Other 0x7a meta` column is every
+other non-map `0x7a` resource.
+
+| Archive | Size (bytes) | Data span (bytes) | Maps | Entities | `CMapData`-only meta | Other `0x7a` meta rows | Shards | Stream coverage | Accounted |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `data.rpf` | 481,544,304 | 481,474,576 | 0 | 0 | 0 | 15,768 | 1/1 | 87.9% | 100% |
+| `packs.rpf` | 4,798,213,264 | 4,798,195,520 | 0 | 0 | 0 | 4,678 | 5/5 | 95.5% | 100% |
+| `common.rpf` | 6,642,192 | 6,603,920 | 0 | 0 | 0 | 0 | 1/1 | 85.5% | 100% |
+| `textures.rpf` | 192,585,024 | 192,583,088 | 0 | 0 | 0 | 0 | 1/1 | 97.8% | 100% |
+| `anim.rpf` | 4,407,626,384 | 4,407,608,368 | 0 | 0 | 0 | 22,823 | 5/5 | 95.4% | 100% |
+| `navmeshes.rpf` | 6,707,512,496 | 6,707,510,576 | 0 | 0 | 0 | 9,603 | 7/7 | 97.5% | 100% |
+| `shaders.rpf` | 411,695,600 | 411,661,232 | 0 | 0 | 0 | 0 | 1/1 | 33.4% | 100% |
+| `movies.rpf` | 8,832,481,776 | 8,832,454,448 | 0 | 0 | 0 | 0 | 9/9 | 0.0% | 100% |
+| `script.rpf` | 4,358,960 | 4,358,352 | 0 | 0 | 0 | 0 | 1/1 | 59.2% | 100% |
+| `appdata0.rpf` | 8,880 | 8,016 | 0 | 0 | 0 | 0 | 1/1 | 0.0% | 100% |
+| **Total** | **25,842,668,880** | **25,842,458,096** | **0** | **0** | **0** | **52,872** | **32/32** | **62.2%** | **100%** |
+
+Outside `levels.rpf`, **no `0x7a` resource has a `CMapData` root: 0 placement maps / 0
+entities**. The 52,872 metadata rows describe other `0x7a` resources. `tools/world_index.py`
+independently parsed the ten archives and also returned 0 maps / 0 entities. `audio.rpf` (radio) was
+not scanned.
+
+`movies.rpf` and `appdata0.rpf` have 0% stream coverage because their data areas contain no complete
+zlib streams; `movies.rpf` holds Bink video (`KB2` at file offset `0x7000`) and `appdata0.rpf` is an
+8,016-byte data area. Their negative result rests on the whole-gap audit, which looked for a raw
+`0DRP` + `0x7a` header and for an unaligned zlib stream hiding one. `shaders.rpf` (33.4%) and the
+unread remainders of `data`, `packs`, `anim` and `navmeshes` are non-zlib payload. Across the ten
+archives the gap audit found **63** `0DRP` + `0x7a` signatures in unread ranges, but none resolved to
+a map or metadata resource (`gap_0drp_other = 63`), and no unaligned zlib stream inflated to a
+`0DRP` header (`missed_zlib_meta = 0`). All ten are valid `9FPR` archives with complete shards.
+`movies.rpf` and `appdata0.rpf` are not supported by the zlib stream walk, so their negative result
+is a signature audit of the data area rather than a full stream census; neither archive is malformed.
+The other eight have stream censuses with 33–98% accepted payload and audited gaps.
+
+Adding these archives does not change the measured total: **23,535 maps / 1,670,442 entities**, all
+in `levels.rpf`. SixNG publishes 30,785 map files / 2,249,490 entities, leaving 7,250 maps / 579,048
+entities. The difference is not explained by maps outside `levels.rpf` (zero found here) or by
+duplicates (the levels census reports zero byte-identical map payloads and zero duplicate map-name
+hashes). The census counts top-level `0x7a` resources and does not enumerate nested payloads, so it
+cannot rule out a nested-resource counting rule. `levels.rpf` also contains 138,839 `CMapData`-only
+metadata resources and 26,075 other `0x7a` metadata resources. The `CMapData`-only class has no
+`CEntityDef` table and cannot account for the 579,048 entities; the other class has no `CMapData` root
+and is not a placement map. Nothing shows SixNG counts either class, so the remaining difference is
+unexplained.
+
 ## Exactness condition
 
 `summary.json` sets `census_exact` only when all of these hold:
@@ -54,6 +127,7 @@ payload, not counted maps.
 - `complete` is true and every expected shard was written;
 - `maps_exact == maps` and `entities_exact == entities`;
 - `entity_gfx == 0` and `entity_unresolved == 0`;
+- `incomplete == 0` and `invalid == 0`;
 - `raw_maps == 0` and `missed_zlib_meta == 0`.
 
 The run above satisfies every condition. `accounted_ratio` is 1.0 because every byte is assigned to
@@ -82,7 +156,8 @@ python -I tests\test_world_census.py
 ```
 
 The default shard size is 2 GiB, the default job count is half the logical CPUs, and the scan is
-bounded by `--start` / `--limit` when a partial pass is wanted.
+bounded by `--start` / `--limit` when a partial pass is wanted. `--jobs 1` runs the shards in-process
+instead of a process pool, which is useful for small synthetic archives and tests.
 
 ## Limits
 

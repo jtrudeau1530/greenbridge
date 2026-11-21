@@ -95,9 +95,6 @@ public:
             if (entry.pad == kSlotOccupiedMarker && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
                 return entry.index;
             }
-            if (entry.pad != kSlotOccupiedMarker) {
-                return 0; // Empty slot encountered: key is definitely absent
-            }
         }
         return 0; // Exceeded 8 probes without a match
     }
@@ -115,13 +112,23 @@ public:
             if (entry.pad == kSlotOccupiedMarker && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
                 return true;
             }
-            if (entry.pad != kSlotOccupiedMarker) return false;
         }
         return false;
     }
 
     bool contains(const DescriptorKey& key) const {
         return contains(key.data());
+    }
+
+    // Erases a key from the table. Returns true if the key was found and erased, false otherwise.
+    // Backward-shifts downstream entries in the probe cluster so probe chains remain intact and compact.
+    bool erase(const std::uint32_t key[8]) {
+        std::lock_guard lock(mutex_);
+        return erase_locked(key);
+    }
+
+    bool erase(const DescriptorKey& key) {
+        return erase(key.data());
     }
 
     void clear() {
@@ -207,6 +214,40 @@ private:
             // Table is full (>50% load) or no slot found in 8 probes: grow and retry
             grow_locked();
         }
+    }
+
+    bool erase_locked(const std::uint32_t key[8]) {
+        const std::uint32_t h = hash_descriptor_key(key);
+        std::uint32_t found_slot = 0;
+        bool found = false;
+        for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
+            const std::uint32_t slot = (h + k) & mask_;
+            const auto& entry = entries_[slot];
+            if (entry.pad == kSlotOccupiedMarker && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
+                found_slot = slot;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+
+        // Backward-shift entries in the probe cluster to maintain probe chains
+        std::uint32_t i = found_slot;
+        std::uint32_t j = i;
+        while (true) {
+            j = (j + 1) & mask_;
+            if (entries_[j].pad != kSlotOccupiedMarker) break;
+            const std::uint32_t r = hash_descriptor_key(entries_[j].key);
+            const std::uint32_t dist_r_to_i = (i - r) & mask_;
+            const std::uint32_t dist_r_to_j = (j - r) & mask_;
+            if (dist_r_to_i < dist_r_to_j && dist_r_to_i < kDescriptorProbes) {
+                entries_[i] = entries_[j];
+                i = j;
+            }
+        }
+        entries_[i] = DescriptorEntry{};
+        --occupied_count_;
+        return true;
     }
 
     void grow_locked() {

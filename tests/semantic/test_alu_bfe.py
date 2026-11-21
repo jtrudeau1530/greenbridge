@@ -7,6 +7,9 @@ as well as direct SPIR-V OpBitFieldUExtract and OpBitFieldSExtract interpreter e
   * Single-bit extractions across all 32 lane bit positions
   * Width and offset masking modulo 32 per RDNA ISA (offset & 31, width & 31)
   * Exact boundary conditions (offset + width == 32)
+  * Fields that run past bit 31 (offset + width > 32): the field stops at bit 31, as LLVM's constantFoldBFE
+    computes (Src0 >> Offset, arithmetic for v_bfe_i32), and the translation keeps the SPIR-V count in range
+  * s_bfe_u32 / s_bfe_i32, whose width (bits 22:16 of src1) goes up to 127
   * Rejection of out-of-bounds bitfields (offset + width > 32, undefined in SPIR-V)
   * Comparison against an independent plain-Python reference oracle
 """
@@ -62,7 +65,9 @@ def ref_bfe_i32(base: int, offset: int, width: int) -> int:
     width &= 31
     if width == 0:
         return 0
-    field = (base >> offset) & ((1 << width) - 1)
+    signed = base - (1 << 32) if base >> 31 else base
+    # Arithmetic shift: a field that runs past bit 31 is filled with the sign bit.
+    field = (signed >> offset) & ((1 << width) - 1)
     if field & (1 << (width - 1)):
         field -= 1 << width
     return field & MASK32
@@ -284,20 +289,76 @@ class AluBfeSemanticTests(unittest.TestCase):
             0xAAAAAAAA,
             0x80000000,
         ]
-        test_offsets = [0, 1, 4, 16, 31]
-        test_widths = [0, 1, 4, 8, 16]
+        test_offsets = [0, 1, 4, 16, 20, 31]
+        test_widths = [0, 1, 4, 8, 16, 17, 31]
 
         for base in test_bases:
             for off in test_offsets:
                 for wid in test_widths:
-                    if (off & 31) + (wid & 31) > 32:
-                        continue
                     exp_u = ref_bfe_u32(base, off, wid)
                     exp_i = ref_bfe_i32(base, off, wid)
                     got_u = run_rdna_bfe("v_bfe_u32", base, off, wid)
                     got_i = run_rdna_bfe("v_bfe_i32", base, off, wid)
                     self.assertEqual(got_u, exp_u, f"v_bfe_u32 mismatch: base={base:#x}, off={off}, wid={wid}")
                     self.assertEqual(got_i, exp_i, f"v_bfe_i32 mismatch: base={base:#x}, off={off}, wid={wid}")
+
+    def test_field_past_bit_31_stops_there(self):
+        # offset + width > 32: the bits past 31 are zero (u32) or the sign bit (i32), not undefined.
+        for base, off, wid, want_u, want_i in (
+            (0xF0000000, 28, 8, 0xF, 0xFFFFFFFF),
+            (0x80000000, 31, 2, 1, 0xFFFFFFFF),
+            (0x7FFFFFFF, 31, 2, 0, 0),
+            (0x12345678, 16, 17, 0x1234, 0x1234),
+            (0xABCD0000, 20, 20, 0xABC, 0xFFFFFABC),
+        ):
+            with self.subTest(base=hex(base), off=off, wid=wid):
+                self.assertEqual(ref_bfe_u32(base, off, wid), want_u)
+                self.assertEqual(ref_bfe_i32(base, off, wid), want_i)
+                self.assertEqual(run_rdna_bfe("v_bfe_u32", base, off, wid), want_u)
+                self.assertEqual(run_rdna_bfe("v_bfe_i32", base, off, wid), want_i)
+                self.assertEqual(run_rdna_bfe("v_bfe_u32", base, off, wid, use_vgpr=False), want_u)
+                self.assertEqual(run_rdna_bfe("v_bfe_i32", base, off, wid, use_vgpr=False), want_i)
+
+
+def run_rdna_s_bfe(op: str, base: int, offset: int, width: int) -> int:
+    """Translate and execute s_bfe_u32 / s_bfe_i32 with src1 = offset | width << 16, return the result."""
+    if _TMP_DIR is None:
+        setUpModule()
+    asm_content = (
+        "; test_s_bfe\n"
+        f"\ts_mov_b32 s1, {base & MASK32:#x}\n"
+        f"\ts_mov_b32 s2, {(offset & 31) | (width & 0x7F) << 16:#x}\n"
+        f"\t{op} s0, s1, s2\n"
+        "\tv_mov_b32 v0, s0\n"
+        "\texp mrt0 v0, v0, v0, v0 done vm\n"
+        "\ts_endpgm\n"
+    )
+    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+        f.write(asm_content)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_SRC_PATH)
+    return si.run_fragment(spv)["%out_mrt0"][0]
+
+
+def ref_s_bfe(signed: bool, base: int, offset: int, width: int) -> int:
+    """s_bfe reference: the v_bfe field, with a 7-bit width; 32 or more takes every bit from offset up."""
+    width = min(width & 0x7F, 32)
+    if width == 32:
+        if offset == 0:
+            return base & MASK32
+        width = 32 - offset   # same field: it is cut at bit 31 anyway
+    return (ref_bfe_i32 if signed else ref_bfe_u32)(base, offset, width)
+
+
+class ScalarBfeTests(unittest.TestCase):
+    def test_s_bfe_in_range_and_past_bit_31(self):
+        for base in (0x12345678, 0x80000000, 0xFEDCBA98):
+            for off in (0, 4, 16, 28, 31):
+                for wid in (0, 1, 8, 16, 17, 31, 32, 64, 127):
+                    for op, signed in (("s_bfe_u32", False), ("s_bfe_i32", True)):
+                        with self.subTest(op=op, base=hex(base), off=off, wid=wid):
+                            self.assertEqual(run_rdna_s_bfe(op, base, off, wid), ref_s_bfe(signed, base, off, wid))
 
 
 if __name__ == "__main__":

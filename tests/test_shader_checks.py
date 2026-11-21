@@ -1,7 +1,9 @@
 """Exercise the synthetic Vulkan test runner without a Vulkan device."""
 import contextlib
 import io
+import struct
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -20,9 +22,9 @@ W32 = dict(check.W32_DUMPS)
 
 
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
-# tests, the wave32 dumps, pixel tests, and ms_w64x_ballot (skipped here: build.py does not build mesh shaders)
+# tests, the wave32 dumps, pixel tests, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + len(W32) + 2
-         + len(check.PIXEL_TESTS) + 1)
+         + len(check.PIXEL_TESTS) + 3 + len(check.BOUNDS))   # + ms_v5_workgroup, ms_w64x_ballot, ps_tex (#230)
 
 
 class Wave64Checks(unittest.TestCase):
@@ -59,6 +61,9 @@ class Wave64Checks(unittest.TestCase):
                 self.assertFalse(missing_ballot, "missing shader was sent to the harness")
                 return ballot
             self.assertNotIn("--require-wave64", args)
+            if name == "cs_bounds":
+                # 0x12345678, the in-bounds reload, the OOB load's 0, then the untouched 0xEEEEEEEE fill.
+                return 0, "out[0..7] = 305419896 305419896 0 4008636142 4008636142 4008636142 4008636142 4008636142\n"
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":
@@ -79,7 +84,7 @@ class Wave64Checks(unittest.TestCase):
                 (spirv / "cs_wave64_ballot.spv").touch()
             output = io.StringIO()
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
-                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
+                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -91,7 +96,7 @@ class Wave64Checks(unittest.TestCase):
         self.assertRegex(out, r"cs_wavemask +SKIP")
         self.assertRegex(out, r"cs_wave64_ballot +SKIP")
         self.assertRegex(out, r"cs_exec64 +ok")
-        self.assertIn(f"{TOTAL - 3 - len(WAVE64_DUMPS)} of {TOTAL} pass, {3 + len(WAVE64_DUMPS)} skipped", out)
+        self.assertIn(f"{TOTAL - 4 - len(WAVE64_DUMPS)} of {TOTAL} pass, {4 + len(WAVE64_DUMPS)} skipped", out)
 
     def test_full_wave_checks_pass_with_expected_results(self):
         status, out = self.run_checks(
@@ -100,7 +105,7 @@ class Wave64Checks(unittest.TestCase):
         )
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_wave64_ballot +ok")
-        self.assertIn(f"{TOTAL - 1} of {TOTAL} pass, 1 skipped", out)
+        self.assertIn(f"{TOTAL - 2} of {TOTAL} pass, 2 skipped", out)
 
     def test_emulated_wave64_runs_without_a_64_wide_subgroup(self):
         # LEONIDA_W64_EMULATE=1: the shaders were translated with --wave64-emulate, so no wave64 test asks the
@@ -109,7 +114,7 @@ class Wave64Checks(unittest.TestCase):
         status, out = self.run_checks(unsupported, unsupported, emulated=True)
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_w64x_wg128_branches +ok")
-        self.assertIn(f"{TOTAL - 1} of {TOTAL} pass, 1 skipped", out)
+        self.assertIn(f"{TOTAL - 2} of {TOTAL} pass, 2 skipped", out)
 
     def test_ballot_mismatches_and_harness_errors_fail(self):
         wavemask = 0, "compute subgroup size: 64\n0 mismatches\n"
@@ -123,13 +128,111 @@ class Wave64Checks(unittest.TestCase):
                 status, out = self.run_checks(wavemask, ballot)
                 self.assertEqual(status, 1, out)
                 self.assertRegex(out, rf"cs_wave64_ballot +{detail}")
-                self.assertIn(f"{TOTAL - 2} of {TOTAL} pass, 1 skipped", out)
+                self.assertIn(f"{TOTAL - 3} of {TOTAL} pass, 2 skipped", out)
 
     def test_missing_wave64_fixture_fails_even_on_wave32(self):
         unsupported = 77, "full 64-wide compute subgroups unavailable\n"
         status, out = self.run_checks(unsupported, unsupported, missing_ballot=True)
         self.assertEqual(status, 1, out)
         self.assertIn("missing cs_wave64_ballot.spv", out)
+
+
+class MeshWorkgroupChecks(unittest.TestCase):
+    def test_every_group_has_its_own_pixel(self):
+        pixels = [struct.pack("<4f", 32 * g, 32 * g + 1, 32 * g + 31, 1) for g in range(24)]   # #209's v5
+        self.assertEqual(check.check_mesh_v5(b"".join(pixels)), "")
+        pixels[6], pixels[2] = pixels[2], pixels[6]
+        self.assertIn("2/24 mismatches; first (0,1,0)", check.check_mesh_v5(b"".join(pixels)))
+        self.assertIn("384 bytes", check.check_mesh_v5(b"".join(pixels[:-1])))
+class PixelDeviceLimits(unittest.TestCase):
+    """pixel_test with a fake harness: the device's limits decide SKIP instead of a failure."""
+
+    def run_pixel(self, name, code, out, data=b""):
+        def harness(_tool, _vs, _fs, raw, env=None):
+            if data:
+                Path(raw).write_bytes(data)
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp) / "spirv"
+            spirv.mkdir()
+            (spirv / f"{name}.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                return check.pixel_test(tmp, str(spirv), name)
+
+    @staticmethod
+    def bitmask_pixels(subgroup):
+        lanes = min(subgroup, 32)
+        return b"".join(struct.pack("<4I", i % lanes, (i % lanes) ^ 9, (((i % lanes) & 5) | 16) ^ 1, 0)
+                        for i in range(64 * 64))
+
+    def test_shader_needing_missing_barycentrics_skips(self):
+        problem = self.run_pixel("ps_bary", 77,
+                                 "unsupported: ps_bary.spv reads BaryCoordKHR and the device has no "
+                                 "VK_KHR_fragment_shader_barycentric\n")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("BaryCoordKHR", problem)
+
+    def test_other_harness_errors_still_fail(self):
+        problem = self.run_pixel("ps_ops", 1, "FAILED vkCreateDevice -> -9\n")
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("vk_harness failed", problem)
+
+    def test_bitmask_perm_skips_below_32_lanes(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(8))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("narrower than 32 lanes", problem)
+
+    def test_bitmask_perm_is_judged_at_32_lanes(self):
+        out = "device: fake (subgroup 32..32)\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
+
+    def test_bitmask_perm_skips_when_the_frame_is_short_below_32_lanes(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=b"short")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("narrower than 32 lanes", problem)
+
+    def test_bitmask_perm_skips_without_a_subgroup_width(self):
+        problem = self.run_pixel("ps_bitmask_perm", 0, "ok 64x64\n", data=self.bitmask_pixels(32))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("no subgroup width", problem)
+
+
+class SeededPixelTests(unittest.TestCase):
+    """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""
+
+    def run_pixel_test(self, words, code=0, out=""):
+        seen = {}
+
+        def harness(_tool, _vs, _fs, raw, env=None):
+            seen["env"] = env
+            if not code:
+                Path(raw).write_bytes(struct.pack("<4I", *words) * (64 * 64))
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_vcc_x2.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                problem = check.pixel_test(tmp, tmp, "ps_vcc_x2")
+        return problem, seen["env"] or {}
+
+    def test_v_sharp_and_heap_reach_the_harness(self):
+        problem, env = self.run_pixel_test((0x11223344, 0x55667788, 0, 0))
+        self.assertEqual(problem, "")
+        self.assertEqual(env.get("VKH_SGPRS"), "0x1000,0,16,0")
+        self.assertEqual(env.get("VKH_HEAP"), "0x1000=0x11223344,0x1004=0x55667788")
+
+    def test_unseeded_result_fails(self):
+        problem, _ = self.run_pixel_test((0, 0, 0, 0))
+        self.assertIn("4096 of 4096 pixels differ", problem)
+
+    def test_device_without_buffer_addresses_skips(self):
+        problem, _ = self.run_pixel_test((), code=77, out="unsupported: VKH_HEAP needs bufferDeviceAddress\n")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("needs bufferDeviceAddress", problem)
+
 
 
 if __name__ == "__main__":

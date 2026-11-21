@@ -16,7 +16,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   asserted values; `cs_bounds` runs as compute and asserts the four dwords in its buffer after in-bounds
   load/store and out-of-bounds load/store attempts (the V# has num_records 16). `ps_ops4` and `ps_legacy_mul`
   are also asserted there, duplicating the matching `test_ps_semantics.py` cases. As above, constants are
-  written by hand and recomputed by plain-Python references checked against each other.
+  written by hand and recomputed by plain-Python references checked against each other. `cs_fmt_1010102` runs
+  as compute too and asserts 16 dwords: 10:10:10:2 words read through formats 50 and 44 (from the V# and from
+  tbuffer's own format) and stored in both.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.

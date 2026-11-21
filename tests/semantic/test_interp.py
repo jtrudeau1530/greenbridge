@@ -22,6 +22,7 @@ OpEntryPoint Fragment %main "main" %out
 %c2 = OpConstant %uint 2
 %c4 = OpConstant %uint 4
 %c8 = OpConstant %uint 8
+%c31 = OpConstant %uint 31
 %c32 = OpConstant %uint 32
 %cF0 = OpConstant %uint 4294967280
 %cFF = OpConstant %uint 4294967295
@@ -31,6 +32,9 @@ OpEntryPoint Fragment %main "main" %out
 %f2 = OpConstant %float 2
 %f3 = OpConstant %float 3
 %f70000 = OpConstant %float 70000
+%f2p5 = OpConstant %float 2.5
+%f3p5 = OpConstant %float 3.5
+%int = OpTypeInt 32 1
 %t = OpConstantTrue %bool
 %f = OpConstantFalse %bool
 %_ptr_Function_uint = OpTypePointer Function %uint
@@ -104,6 +108,31 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%b = OpFUnordNotEqual %bool %f1 %f1\n"
                                   "%res = OpSelect %uint %b %c1 %c0\n"), 0)
 
+    def test_conversions(self):
+        # SToF reads its operand as signed; FToU and FToS round toward zero.
+        self.assertEqual(run_word("%x = OpConvertUToF %float %c8\n%res = OpBitcast %uint %x\n"), 0x41000000)
+        self.assertEqual(run_word("%x = OpConvertUToF %float %cFF\n%res = OpBitcast %uint %x\n"), 0x4F800000)
+        self.assertEqual(run_word("%x = OpConvertSToF %float %cFF\n%res = OpBitcast %uint %x\n"), 0xBF800000)
+        self.assertEqual(run_word("%x = OpConvertSToF %float %cF0\n%res = OpBitcast %uint %x\n"), 0xC1800000)
+        self.assertEqual(run_word("%x = OpFNegate %float %f2p5\n%res = OpConvertFToS %int %x\n"), 0xFFFFFFFE)
+        self.assertEqual(run_word("%res = OpConvertFToU %uint %f2p5\n"), 2)
+        self.assertEqual(run_word("%res = OpConvertFToU %uint %f70000\n"), 70000)
+
+    def test_round_even_clamp_max(self):
+        # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl RoundEven %f2p5\n%res = OpBitcast %uint %x\n"),
+                         0x40000000)
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl RoundEven %f3p5\n%res = OpBitcast %uint %x\n"),
+                         0x40800000)
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl FClamp %f3 %f1 %f2\n%res = OpBitcast %uint %x\n"),
+                         0x40000000)
+        self.assertEqual(run_word("%n = OpFNegate %float %f3\n%x = OpExtInst %float %glsl FClamp %n %f1 %f2\n"
+                                  "%res = OpBitcast %uint %x\n"), 0x3F800000)
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl FClamp %f2p5 %f1 %f3\n%res = OpBitcast %uint %x\n"),
+                         0x40200000)
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl FMax %f1 %f3\n%res = OpBitcast %uint %x\n"),
+                         0x40400000)
+
     def test_64bit_arithmetic(self):
         text = HEADER.replace("%c0 = OpConstant %uint 0",
                               "%ulong = OpTypeInt 64 0\n"
@@ -164,6 +193,39 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%b = OpLogicalAnd %bool %t %f\n%res = OpSelect %uint %b %c1 %c2\n"), 2)
         self.assertEqual(run_word("%b = OpLogicalOr %bool %f %t\n%res = OpSelect %uint %b %c1 %c2\n"), 1)
 
+    def test_ordered_integer_comparisons(self):
+        # 2 vs 0xFFFFFFFF: unsigned 2 < 4294967295, signed 2 > -1
+        for op, want in (("OpULessThan", 1), ("OpULessThanEqual", 1), ("OpUGreaterThan", 0),
+                         ("OpUGreaterThanEqual", 0), ("OpSLessThan", 0), ("OpSLessThanEqual", 0),
+                         ("OpSGreaterThan", 1), ("OpSGreaterThanEqual", 1)):
+            with self.subTest(op=op):
+                self.assertEqual(run_word(f"%b = {op} %bool %c2 %cFF\n%res = OpSelect %uint %b %c1 %c0\n"), want)
+        for op, want in (("OpULessThanEqual", 1), ("OpUGreaterThan", 0), ("OpSLessThanEqual", 1),
+                         ("OpSGreaterThan", 0), ("OpSGreaterThanEqual", 1)):
+            with self.subTest(op=op, equal=True):
+                self.assertEqual(run_word(f"%b = {op} %bool %c2 %c2\n%res = OpSelect %uint %b %c1 %c0\n"), want)
+
+    def test_signed_comparisons_use_the_operand_width(self):
+        # 0x80000000 as a 64-bit operand is positive; as a 32-bit one it is negative.
+        types = ("%ulong = OpTypeInt 64 0\n%L80 = OpConstant %ulong 2147483648\n%L1 = OpConstant %ulong 1\n"
+                 "%Lneg = OpConstant %ulong 18446744073709551615\n%c8000 = OpConstant %uint 2147483648\n")
+        header = HEADER.replace("%main = OpFunction", types + "%main = OpFunction")
+        for a, b, want in (("%L80", "%L1", 1), ("%Lneg", "%L1", 0), ("%c8000", "%c1", 0)):
+            with self.subTest(a=a, b=b):
+                body = f"%b = OpSGreaterThan %bool {a} {b}\n%res = OpSelect %uint %b %c1 %c0\n"
+                self.assertEqual(si.run_fragment(header + body + "OpStore %out %res\n" + FOOTER)["%out"][0], want)
+        body = ("%x = OpIAdd %ulong %L80 %L80\n%b = OpSGreaterThan %bool %x %L1\n"   # a result id keeps its width
+                "%res = OpSelect %uint %b %c1 %c0\n")
+        self.assertEqual(si.run_fragment(header + body + "OpStore %out %res\n" + FOOTER)["%out"][0], 1)
+    def test_add_carry(self):
+        # 0xFFFFFFFF + 2 = 1, carry 1; 1 + 2 = 3, carry 0
+        self.assertEqual(run_word("%s = OpIAddCarry %umul %cFF %c2\n"
+                                  "%d = OpCompositeExtract %uint %s 0\n"
+                                  "%k = OpCompositeExtract %uint %s 1\n"
+                                  "%res = OpBitwiseAnd %uint %d %k\n"), 1)
+        self.assertEqual(run_word("%s = OpIAddCarry %umul %c1 %c2\n%res = OpCompositeExtract %uint %s 0\n"), 3)
+        self.assertEqual(run_word("%s = OpIAddCarry %umul %c1 %c2\n%res = OpCompositeExtract %uint %s 1\n"), 0)
+
     def test_float_mul_ord_equal_findsmsb_sin(self):
         self.assertEqual(run_word("%x = OpFMul %float %f2 %f3\n%res = OpBitcast %uint %x\n"), 0x40C00000)
         self.assertEqual(run_word("%b = OpFOrdEqual %bool %f2 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
@@ -173,8 +235,32 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %cFF\n"), 0xFFFFFFFF)
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %c80\n"), 7)
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %cF0\n"), 3)
+        # FindILsb / FindUMsb: bit number of the lowest / highest 1 bit, -1 for 0 (GLSL.std.450).
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindILsb %c0\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindILsb %cF0\n"), 4)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindUMsb %c0\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindUMsb %cF0\n"), 31)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindUMsb %c80\n"), 7)
+        # UMax / SMin and the clamps compare as the name says: 0xffffffff is the largest unsigned, -1 signed.
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl UMax %cFF %c1\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SMin %cFF %c1\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl UClamp %cFF %c1 %c8\n"), 8)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SClamp %cFF %c1 %c8\n"), 1)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SClamp %c4 %cF0 %c8\n"), 4)
+        with self.assertRaises(si.UnsupportedConstruct):                                  # minVal > maxVal
+            run_word("%res = OpExtInst %uint %glsl UClamp %c4 %c8 %c1\n")
+        self.assertEqual(run_word("%b = OpUGreaterThanEqual %bool %c8 %c8\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpUGreaterThanEqual %bool %c1 %cFF\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
         self.assertEqual(run_word("%x = OpBitcast %float %c0\n%s = OpExtInst %float %glsl Sin %x\n"
                                   "%res = OpBitcast %uint %s\n"), 0)
+
+    def test_bit_reverse_and_sabs(self):
+        self.assertEqual(run_word("%res = OpBitReverse %uint %c1\n"), 0x80000000)
+        self.assertEqual(run_word("%res = OpBitReverse %uint %cF0\n"), 0x0FFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SAbs %cFF\n"), 1)             # |-1|
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SAbs %c2\n"), 2)
+        self.assertEqual(run_word("%m = OpShiftLeftLogical %uint %c1 %c31\n"                   # |INT_MIN| wraps
+                                  "%res = OpExtInst %uint %glsl SAbs %m\n"), 0x80000000)
 
     def test_forward_branch_and_kill(self):
         live = (HEADER + "OpStore %out %c1\nOpSelectionMerge %live None\n"
@@ -203,10 +289,13 @@ class InterpreterTests(unittest.TestCase):
 
     def test_unsupported_constructs_are_rejected(self):
         for body in ("%res = OpUDiv %uint %c2 %c1\n",                                     # opcode not modelled
-                     "%res = OpExtInst %uint %glsl FindUMsb %c2\n",                      # ext inst not modelled
+                     "%res = OpExtInst %uint %glsl Ldexp %c2 %c1\n",                     # ext inst not modelled
                      "%res = OpBitFieldUExtract %uint %cFF %c32 %c1\n",                  # undefined per spec
                      "%res = OpShiftLeftLogical %uint %cFF %c32\n",                     # undefined per spec
                      "%res = OpShiftRightLogical %uint %cFF %c32\n",                    # undefined per spec
+                     "%x = OpBitcast %float %cFF\n%res = OpConvertFToU %uint %x\n",     # NaN: undefined per spec
+                     "%x = OpFNegate %float %f1\n%res = OpConvertFToU %uint %x\n",      # negative: out of range
+                     "%x = OpExtInst %float %glsl FClamp %f1 %f2 %f1\n%res = OpBitcast %uint %x\n",  # lo > hi
                      "%res = OpSelect %uint %c1 %c1 %c2\n",                              # condition not a bool
                      "OpBranch %entry\n%res = OpCopyObject %uint %c1\n",                 # unconditional branch
                      "OpBranchConditional %t %entry %entry\n%res = OpCopyObject %uint %c1\n"):  # backward branch

@@ -33,6 +33,25 @@ def _is_reserved_segment(seg: str) -> bool:
     return False
 
 
+# Binding to 127.0.0.1 keeps other machines out, but not other web pages: a page on any site can point its own
+# domain at 127.0.0.1 (DNS rebinding) and read /world/ through this server as same-origin. Its requests still carry
+# that domain in the Host header, so only requests that name this machine are answered.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+
+
+def host_allowed(host: str | None) -> bool:
+    """True when a request's Host header names the loopback address. Browsers always send Host; a request without
+    one comes from a local tool, not a web page, and is allowed."""
+    if host is None:
+        return True
+    host = host.strip().lower()
+    if host.startswith("["):                        # [::1] or [::1]:8765
+        name = host[:host.find("]") + 1] if "]" in host else host
+    else:
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    return name.rstrip(".") in _LOOPBACK_HOSTS
+
+
 def safe_world_path(world_dir: str, req_path: str) -> str | None:
     """Resolve a /world/... request path safely inside world_dir, or return None."""
     if not world_dir or not isinstance(req_path, str):
@@ -74,7 +93,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         ".glb": "model/gltf-binary",
     }
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The viewer can cancel a chunk download while its response is being sent.
+            pass
+
     def send_head(self):
+        if not host_allowed(self.headers.get("Host")):
+            self.send_error(403, "Forbidden: open the viewer at http://127.0.0.1 or http://localhost")
+            return None
         clean = self.path.split("#", 1)[0].split("?", 1)[0]
         if self.world and clean.startswith("/world/"):
             if safe_world_path(self.world, self.path) is None:

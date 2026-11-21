@@ -126,6 +126,36 @@ def test_mesh_without_psv0_is_rejected(make_shader):
         shader.translate()
 
 
+@pytest.mark.parametrize("threads", [96, 128], ids=["96-threads", "128-threads"])
+def test_mesh_v5_seed_and_threads_constant(make_shader, threads):
+    """Mesh prologue computes v5 = %wlin * NumThreads + %lidx and registers NumThreads before assembly (7b82460)."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_tri.asm"), encoding="utf-8") as f:
+        asm = f.read()
+    dxbc = make_dxbc([mesh_psv0_chunk(threads=(threads, 1, 1), max_vertices=64, max_primitives=64)])
+    shader = make_shader(asm, name=f"ms_v5_seed_{threads}", dxbc=dxbc)
+    spvasm = shader.translate()
+    cid = f"%c{threads:x}"
+    assert f"{cid} = OpConstant %uint {threads}" in spvasm
+    assert f"%wbase = OpIMul %uint %wlin {cid}" in spvasm
+    assert "%v5v = OpIAdd %uint %wbase %lidx" in spvasm
+    assert "%v5p = OpAccessChain %_ptr_Function_uint %vgpr %c5" in spvasm
+    assert "OpStore %v5p %v5v" in spvasm
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+def test_mesh_cull_primitive_is_block_bool(make_shader):
+    """CullPrimitiveEXT must be a Block bool member (VUID-07036); array-of-bool trips SPIRV-Tools ≤2025.1."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_v5_workgroup.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_v5_workgroup", dxbc=SAMPLE_DXBC["ms_v5_workgroup"])
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpDecorate %ms_cull_blk Block" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT" in spvasm
+    assert "%ms_cull_blk = OpTypeStruct %bool" in spvasm
+    assert re.search(r"%ms_arr_cull = OpTypeArray %ms_cull_blk %c\w+", spvasm)
+    assert "OpDecorate %ms_cull BuiltIn CullPrimitiveEXT" not in spvasm
+    assert re.search(r"OpAccessChain %_ptr_Out_bool_ms %ms_cull %\w+ %c0", spvasm)
+
+
 # ---- pos1..pos3: ClipDistance / CullDistance / misc exports (VS & MS) ----
 
 def _vgpr_to_index_map(spvasm, array_var, ptr_type):
@@ -343,6 +373,19 @@ def test_ms_clip_and_cull_distances_across_pos1_pos2(make_shader):
     assert not ({1, 2} & set(meta.get("params", [])))
 
 
+def test_wave64_detected_from_mask_ops_without_exec_markers(make_shader):
+    """#210 part 2 / SHADER-28: s_bcnt1_i32_b64 on ordinary SGPRs marks the shader wave64 (no exec_hi / saveexec)."""
+    shader = make_shader(
+        "; mattr: +wavefrontsize64,-wavefrontsize32\n"
+        "v_and_b32_e32 v5, 5, v0\nv_cmp_ne_u32_e64 s[20:21], 0, v5\n"
+        "s_bcnt1_i32_b64 s30, s[20:21]\nv_mov_b32 v1, s30\ns_endpgm\n",
+        name="cs_mask_detect_ci",
+    )
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.wave64
+
+
 def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
     """Wave64 s_bfm_b64 must use wave_lane() and reconstruct the 64-bit mask; 32-bit half ops must guard their half."""
     bfm = make_shader("s_mov_b64 exec, -1\ns_bfm_b64 s[6:7], 16, 8\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n",
@@ -383,6 +426,22 @@ def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
     assert asm_vcc.count("OpBitCount %uint %c0") == 2
 
 
+def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader):
+    """Native wave64 ds_bpermute: a source lane missing from a partial wave must read 0, not an undefined shuffle."""
+    shader = make_shader("s_mov_b64 exec, -1\nv_lshlrev_b32_e32 v1, 2, v0\nds_bpermute_b32 v2, v1, v0\n"
+                         "s_waitcnt lgkmcnt(0)\ns_endpgm\n", name="cs_bperm64_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.wave64
+    assert re.search(
+        r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
+        r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \1 (%t\d+)\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \3\n\s*"
+        r"%t\d+ = OpSelect %uint \2 \4 %c0\n",
+        asm,
+    ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
+
+
 EMULATE_SAMPLES = [p for p in SAMPLES if os.path.basename(p).startswith(("cs_", "ms_"))]
 
 
@@ -404,3 +463,123 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
     assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
+# ---- Irreducible CFG node splitting (compute shaders) ----
+
+IRREDUCIBLE_PATTERNS = {
+    # 2-entry SCC with s_branch + s_cbranch_scc0 (all 1-dword insns; offsets are relative dwords from next_pc)
+    "scc0_branch": """\
+s_mov_b32 s1, 0
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc0 3
+s_add_u32 s1, s1, 1
+s_cmp_lt_u32 s1, 4
+s_cbranch_scc0 4
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 8
+s_cbranch_scc0 1
+s_branch -7
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # 2-entry SCC with s_cbranch_scc1
+    "scc1": """\
+s_mov_b32 s1, 0
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 1
+s_cmp_ge_u32 s1, 4
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 8
+s_cbranch_scc1 -6
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # 2-entry SCC with s_cbranch_vccnz
+    "vccnz": """\
+s_mov_b32 s1, 0
+v_cmp_gt_u32_e32 vcc_lo, 4, v0
+s_cbranch_vccnz 3
+s_add_u32 s1, s1, 1
+v_cmp_gt_u32_e32 vcc_lo, 8, v0
+s_cbranch_vccnz 3
+s_add_u32 s1, s1, 2
+v_cmp_lt_u32_e32 vcc_lo, 2, v0
+s_cbranch_vccnz -6
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # Nested irreducible cycle {A, B} inside an outer reducible loop headed by H (pc=2)
+    "nested_in_reducible": """\
+s_mov_b32 s1, 0
+s_mov_b32 s2, 0
+s_add_u32 s2, s2, 1
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc0 3
+s_add_u32 s1, s1, 1
+s_cmp_eq_u32 s1, 3
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 6
+s_cbranch_scc1 -6
+s_cmp_lt_u32 s2, 4
+s_cbranch_scc1 -11
+v_mov_b32 v1, s1
+s_endpgm
+""",
+}
+
+
+@pytest.mark.parametrize("pattern", sorted(IRREDUCIBLE_PATTERNS))
+def test_irreducible_cfg_node_splitting(pattern, make_shader, monkeypatch):
+    """Irreducible CFGs (2-entry SCCs and nested irreducible cycles) structure via node splitting and pass spirv-val."""
+    asm = IRREDUCIBLE_PATTERNS[pattern]
+    shader = make_shader(asm, name=f"cs_irred_{pattern}")
+
+    # Without node splitting, the shader genuinely falls back to the dispatch loop.
+    monkeypatch.setattr(rdna2spirv.cfg_structure, "split_irreducible", lambda succ, **kw: None)
+    spv_fallback = shader.translate()
+    meta_fallback = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv_fallback)
+    assert meta_fallback["control_flow"] == "dispatch loop"
+    assert "OpSwitch" in spv_fallback
+
+    # With node splitting enabled, the shader becomes structured and passes spirv-val.
+    monkeypatch.undo()
+    spv_struct = shader.translate()
+    shader.validate(spv_struct)
+    meta_struct = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv_struct)
+    assert meta_struct["control_flow"] == "structured"
+    assert "OpLoopMerge" in spv_struct
+    assert "OpSwitch" not in spv_struct
+
+
+MASK_REUSE_HEAD = "; mattr: +wavefrontsize64,-wavefrontsize32\nv_mbcnt_lo_u32_b32 v1, -1, 0\nv_mbcnt_hi_u32_b32 v1, -1, v1\n"
+
+
+def emulated_exchanges(make_shader, monkeypatch, body, name="cs_reuse"):
+    """Translate `body` (wave64 compute) with --wave64-emulate; return (SPIR-V, number of mask-word ORs). Every
+    whole-mask exchange ORs two words (lanes 0-31 and 32-63), so the count is two per exchange."""
+    shader = make_shader(MASK_REUSE_HEAD + body + "s_endpgm\n", name)
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    asm = shader.translate()
+    shader.validate(asm)
+    return asm, asm.count("OpAtomicOr")
+
+
+def test_wave64_emulate_reuses_a_mask_exchange(make_shader, monkeypatch):
+    """The same register value (or EXEC) read as a whole mask twice in a block is exchanged once; a rewrite of the
+    register or of EXEC gets a new exchange."""
+    cmp = "v_cmp_eq_u32_e64 s[4:5], 5, v1\n"
+    _, same = emulated_exchanges(make_shader, monkeypatch, cmp + "s_bcnt1_i32_b64 s6, s[4:5]\ns_bcnt1_i32_b64 s7, s[4:5]\n")
+    _, rewritten = emulated_exchanges(
+        make_shader, monkeypatch, cmp + "s_bcnt1_i32_b64 s6, s[4:5]\nv_cmp_gt_u32_e64 s[4:5], 40, v1\ns_bcnt1_i32_b64 s7, s[4:5]\n")
+    _, same_exec = emulated_exchanges(make_shader, monkeypatch, "s_bcnt1_i32_b64 s6, exec\ns_bcnt1_i32_b64 s7, exec\n")
+    _, new_exec = emulated_exchanges(
+        make_shader, monkeypatch, "s_bcnt1_i32_b64 s6, exec\nv_cmpx_gt_u32_e32 10, v1\ns_bcnt1_i32_b64 s7, exec\n")
+    _, pair = emulated_exchanges(  # s4 and s5 hold the same value: one exchange serves v_mbcnt_lo(s4) and _hi(s5)
+        make_shader, monkeypatch, cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_mbcnt_hi_u32_b32 v3, s5, v3\n")
+    _, half = emulated_exchanges(  # s5 rewritten, s4 kept: two exchanges
+        make_shader, monkeypatch,
+        cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_cmp_gt_u32_e64 s[6:7], 40, v1\ns_and_b32 s5, s5, s7\n"
+        "v_mbcnt_hi_u32_b32 v3, s5, v3\n")
+    assert (same, rewritten, same_exec, new_exec, pair, half) == (2, 4, 2, 4, 2, 4)

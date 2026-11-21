@@ -91,17 +91,18 @@ class ShaderStageResumeTest(unittest.TestCase):
         elif tool == "shader_disasm.py":
             os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
 
-    def fake_translate(self, disasm, spirv, jobs):
-        self.ran.append("translate")
+    def fake_translate(self, disasm, spirv, jobs, emulate=False):
+        self.ran.append("translate (emulated)" if emulate else "translate")
         self.touch(spirv, "index.json")
 
-    def run_stage(self):
+    def run_stage(self, emulate=None):
         self.ran = []
+        kw = {} if emulate is None else {"emulate": emulate}
         with mock.patch.object(make_game, "py", self.fake_py), \
                 mock.patch.object(make_game, "need", lambda *a: None), \
                 mock.patch.object(make_game, "translate", self.fake_translate), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.shaders(os.path.join(self.work, "game"), self.work, 2)
+            make_game.shaders(os.path.join(self.work, "game"), self.work, 2, **kw)
         return self.ran
 
     def test_fresh_folder_runs_every_step_then_nothing(self):
@@ -144,6 +145,105 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.run_stage()
         os.remove(os.path.join(self.dxbc, "fssm_index.json"))
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
+
+    def test_folder_finished_before_the_markers_keeps_its_work(self):
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        self.touch(self.dxbc, "disasm", "s0.s")
+        self.touch(self.spirv, "index.json")                # translated by a build from before disasm.done
+        self.assertEqual(self.run_stage(), [])
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+
+    def test_disasm_moved_from_the_old_place_is_kept_and_translated_again(self):
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        self.touch(self.work, "shaders", "disasm", "s0.s")  # disasm next to the carve folder, the old layout
+        self.touch(self.spirv, "index.json")
+        self.assertEqual(self.run_stage(), ["translate"])
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "s0.s")))
+
+    # SHADER-11: the translation depends on --wave64-emulate, so a change of mode translates again.
+    def mode(self):
+        with open(os.path.join(self.spirv, "wave64_emulate.txt"), encoding="utf-8") as f:
+            return f.read().strip()
+
+    def test_the_mode_is_recorded_beside_the_translation(self):
+        self.run_stage(emulate=True)
+        self.assertEqual(self.mode(), "on")
+        self.run_stage(emulate=False)
+        self.assertEqual(self.mode(), "off")
+
+    def test_turning_emulation_on_translates_again_once(self):
+        self.run_stage(emulate=False)
+        self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
+        self.assertEqual(self.run_stage(emulate=True), [])
+
+    def test_turning_emulation_off_translates_again_once(self):
+        self.run_stage(emulate=True)
+        self.assertEqual(self.run_stage(emulate=False), ["translate"])
+        self.assertEqual(self.run_stage(emulate=False), [])
+
+    def test_a_folder_from_before_the_mode_file_counts_as_not_emulated(self):
+        self.run_stage(emulate=False)
+        os.remove(os.path.join(self.spirv, "wave64_emulate.txt"))
+        self.assertEqual(self.run_stage(emulate=False), [])  # nothing translated, so still no mode file
+        self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
+
+    # A kill between the merge (index.json appears) and the end of shaders() must not leave a finished folder
+    # whose mode is unknown or wrong.
+    def kill_after_merge(self, emulate):
+        def translate_then_die(disasm, spirv, jobs, emulate=False):
+            self.touch(spirv, "index.json")                 # rdna2spirv.py --merge finished ...
+            raise KeyboardInterrupt                         # ... and the PC died right after
+        with mock.patch.object(make_game, "py", self.fake_py), \
+                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "translate", translate_then_die), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            with self.assertRaises(KeyboardInterrupt):
+                make_game.shaders(os.path.join(self.work, "game"), self.work, 2, emulate=emulate)
+
+    def test_a_kill_right_after_the_merge_keeps_the_finished_emulated_translation(self):
+        self.kill_after_merge(emulate=True)
+        self.assertEqual(self.run_stage(emulate=True), [])      # hours of translation are not redone
+        self.assertEqual(self.mode(), "on")
+
+    def test_a_kill_right_after_an_emulated_merge_is_not_mistaken_for_a_native_translation(self):
+        self.kill_after_merge(emulate=True)
+        self.assertEqual(self.run_stage(emulate=False), ["translate"])   # off was asked for: native, not "off"
+
+    def test_a_kill_right_after_a_native_merge_counts_as_native(self):
+        self.kill_after_merge(emulate=False)
+        self.assertEqual(self.run_stage(emulate=False), [])
+        self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
+
+    # `auto` can answer differently from one run to the next (a GPU asleep or hidden, vulkaninfo missing): an
+    # emulated translation is exact on every GPU, so auto keeps it instead of translating the corpus again.
+    def run_auto(self, emulate):
+        self.ran = []
+        with mock.patch.object(make_game, "py", self.fake_py), \
+                mock.patch.object(make_game, "need", lambda *a: None), \
+                mock.patch.object(make_game, "translate", self.fake_translate), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            make_game.shaders(os.path.join(self.work, "game"), self.work, 2, emulate=emulate, keep_emulated=True)
+        return self.ran
+
+    def test_auto_keeps_an_emulated_translation_when_this_run_would_not_emulate(self):
+        self.run_stage(emulate=True)
+        self.assertEqual(self.run_auto(emulate=False), [])
+        self.assertEqual(self.mode(), "on")
+
+    def test_auto_still_translates_again_when_a_native_translation_needs_emulation(self):
+        self.run_stage(emulate=False)
+        self.assertEqual(self.run_auto(emulate=True), ["translate (emulated)"])
+
+    def test_an_explicit_off_still_translates_an_emulated_folder_again(self):
+        self.run_stage(emulate=True)
+        self.assertEqual(self.run_stage(emulate=False), ["translate"])
+
+    def test_a_mode_change_does_not_redo_the_steps_before_translation(self):
+        self.run_stage(emulate=False)
+        self.assertEqual(self.run_stage(emulate=True), ["translate (emulated)"])
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
 
 
 if __name__ == "__main__":

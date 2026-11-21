@@ -291,16 +291,20 @@ def scan_shard(job):
                 continue
             for a, used in res["spans"]:
                 intervals.append([a, a + used])
-            raw_system.extend([a, a + used] for a, used in res["raw_spans"])
             stats["streams"] += res["streams"]
             stats["stored"] += res["used"]
-            stats["raw_system"] += res["raw_system"]
             stats["inflated"] += res["inflated"]
             pos = res["end"]
             if pos <= s:
                 pos = s + 1
             if not res["is_meta"]:
                 continue
+            res["offset"] = s
+            if s < start:
+                stats["adopted"] += 1
+                continue
+            raw_system.extend([a, a + used] for a, used in res["raw_spans"])
+            stats["raw_system"] += res["raw_system"]
             if not res["complete"]:
                 stats["incomplete"] += 1
                 continue
@@ -308,7 +312,6 @@ def scan_shard(job):
             if row is None:
                 stats["invalid"] += 1
                 continue
-            res["offset"] = s
             if row["kind"] != "map":
                 stats["meta"] += 1
                 if has_map_root(res["data"]):
@@ -325,9 +328,6 @@ def scan_shard(job):
             stats["join_max"] = max(stats["join_max"], res["pages"])
             stats["entity_gfx"] += maprow["entity_blocks_graphics"]
             stats["entity_unresolved"] += maprow["entity_blocks_unresolved"]
-            if s < start:
-                stats["adopted"] += 1
-                continue
             rows.append(maprow)
             if maprow["gfx_need"]:
                 raw_pages.append([(res["end"] + 15) & ~15, maprow["gfx_need"]])
@@ -621,6 +621,7 @@ def summarize(archive, outdir, start, end, shard_size, data_start):
     }
     summary["census_exact"] = (summary["complete"] and summary["maps_exact"] == summary["maps"]
                                and totals["entity_gfx"] == 0 and totals["entity_unresolved"] == 0
+                               and totals["incomplete"] == 0 and totals["invalid"] == 0
                                and gaps["raw_maps"] == 0 and gaps["missed_zlib_meta"] == 0)
     return summary
 
@@ -661,19 +662,31 @@ def main(argv=None):
         print("census: %d shards, %d to scan, %d jobs, %.2f GiB" %
               (len(expected), len(jobs), a.jobs, (end - start) / (1 << 30)), flush=True)
         failures = 0
-        with ProcessPoolExecutor(max_workers=a.jobs) as ex:
-            futures = {ex.submit(scan_shard, job): job for job in jobs}
-            for done, fut in enumerate(as_completed(futures), 1):
-                job = futures[fut]
+        if a.jobs == 1:
+            for done, job in enumerate(jobs, 1):
                 try:
-                    r = fut.result()
-                except Exception as e:  # keep completed shards; the rerun resumes them
+                    r = scan_shard(job)
+                except Exception as e:
                     failures += 1
                     print("[%d/%d] shard %d FAILED: %r" % (done, len(jobs), job[1], e), flush=True)
                     continue
                 print("[%d/%d] shard %03d %d..%d maps=%d entities=%d %.1fs" %
                       (done, len(jobs), r["index"], r["start"], r["end"], r["maps"],
                        r["entities"], r["elapsed"]), flush=True)
+        else:
+            with ProcessPoolExecutor(max_workers=a.jobs) as ex:
+                futures = {ex.submit(scan_shard, job): job for job in jobs}
+                for done, fut in enumerate(as_completed(futures), 1):
+                    job = futures[fut]
+                    try:
+                        r = fut.result()
+                    except Exception as e:  # keep completed shards; the rerun resumes them
+                        failures += 1
+                        print("[%d/%d] shard %d FAILED: %r" % (done, len(jobs), job[1], e), flush=True)
+                        continue
+                    print("[%d/%d] shard %03d %d..%d maps=%d entities=%d %.1fs" %
+                          (done, len(jobs), r["index"], r["start"], r["end"], r["maps"],
+                           r["entities"], r["elapsed"]), flush=True)
         if failures:
             print("%d shard(s) failed; writing the completed coverage" % failures, flush=True)
     summary = summarize(a.archive, a.out, start, end, a.shard_size, data_start)

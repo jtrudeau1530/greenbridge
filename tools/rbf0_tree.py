@@ -1,4 +1,4 @@
-"""Decode RBF0 resources into strict JSON trees, with an optional simple XML rendering.
+"""Decode RBF0 resources into strict JSON trees, with an optional CSV node table and simple XML rendering.
 
 RBF0 is RAGE's binary form of an XML data file: one record stream with an inline descriptor table. This tool reads
 inflated RBF0 resources from a carve directory or a single resource file, joins the 64 KiB continuation streams of
@@ -9,13 +9,14 @@ The output contains names and payloads taken from the archive, so treat it as ga
 not attach it to an issue or a pull request. Format facts and aggregate counts are in docs/rbf0.md.
 
 Usage:
-    python -I tools/rbf0_tree.py <carve-dir> <out.json> [--xml DIR] [--root NAME]... [--offset 0x...] [--limit N]
+    python -I tools/rbf0_tree.py <carve-dir> <out.json> [--csv PATH] [--xml DIR] [--root NAME]... [--offset 0x...] [--limit N]
 
 The input directory holds inflated zlib streams or complete RBF0 resources. A file name that starts with a
 hexadecimal archive offset is used to order and label the resource, as in the rbf0_index.py carve layout.
 """
 import argparse
 import collections
+import csv
 import json
 import math
 import os
@@ -38,6 +39,9 @@ TYPE_NAMES = {0x00: "open", 0x10: "int", 0x20: "true", 0x30: "false", 0x40: "flo
               0x50: "vec3", 0x60: "string"}
 VALUE_TYPES = {0x10: "int", 0x20: "bool", 0x30: "bool", 0x40: "float", 0x50: "vec3", 0x60: "string"}
 XML_BAD = re.compile(r"[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+CSV_COLUMNS = ["resource", "root", "status", "parent", "slot", "sibling", "child_index", "depth", "kind",
+               "name", "descriptor", "offset", "end", "attrs", "children", "content_count", "type",
+               "length", "nul", "utf8", "value"]
 
 
 def _utf8(raw):
@@ -136,6 +140,7 @@ class Parser:
                 frame["node"]["attribute_order_violation"] = True
                 self.attribute_order_violations += 1
             frame["node"]["attributes"].append(node)
+            frame["node"]["attrs_actual"] += 1
             frame["attrs_seen"] += 1
             return
         if node["kind"] in ("element", "text") and frame["attrs_seen"] < frame["attrs_declared"]:
@@ -143,7 +148,9 @@ class Parser:
             self.attribute_order_violations += 1
         frame["content_started"] = True
         frame["node"]["content"].append(node)
+        frame["node"]["content_count"] += 1
         if node["kind"] == "element":
+            frame["node"]["children"] += 1
             if frame["text_seen"]:
                 frame["node"]["text_before_child"] = True
                 self.text_before_child += 1
@@ -223,7 +230,10 @@ class Parser:
                         "offset": at,
                         "header_offset": payload_at,
                         "attrs_declared": attrs,
+                        "attrs_actual": 0,
                         "depth": len(self.stack) + 1,
+                        "children": 0,
+                        "content_count": 0,
                         "attributes": [],
                         "content": [],
                         "end": None,
@@ -322,8 +332,9 @@ class Parser:
             n = struct.unpack("<H", self.take(2, "string length"))[0]
             raw = self.take(n, "string")
             payload_at = self.p - n
-            body = raw[:-1] if raw.endswith(b"\x00") else raw
-            value, valid = _utf8(body)
+            # The measured string form is length-prefixed, not NUL-terminated. Keep every byte even if the last
+            # one is zero; only the text record (whose u32 length includes a terminator in this corpus) is trimmed.
+            value, valid = _utf8(raw)
             if not valid:
                 self.invalid_utf8 += 1
             extra = {"byte_length": n, "nul_terminated": raw.endswith(b"\x00"), "utf8_valid": valid}
@@ -390,6 +401,8 @@ def decode_source(source, roots=None, offset=None, limit=None, progress=None):
     """Decode every RBF0 start in `source`, joining 64 KiB continuations. Returns (docs, summary)."""
     rows, read = _rows(source)
     starts = [i for i, row in enumerate(rows) if row["head"][:4] == MAGIC]
+    if not starts:
+        raise SystemExit(f"no RBF0 resource in {source}")
     if offset is not None:
         starts = [i for i in starts if rows[i]["offset"] == offset]
         if not starts:
@@ -429,6 +442,44 @@ def _summary(docs):
     counts = collections.Counter()
     for d in docs:
         counts.update(d["counts"])
+    by_depth = collections.Counter()
+    children_hist = collections.Counter()
+    content_hist = collections.Counter()
+    attr_hist = collections.Counter()
+    nodes = 0
+    tree_roots = 0
+    leaf_elements = empty_elements = text_only_elements = 0
+    max_children = 0
+    for d in docs:
+        root = d["tree"]
+        if root is None:
+            continue
+        tree_roots += 1
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            nodes += 1
+            if node["kind"] != "element":
+                continue
+            by_depth[node["depth"]] += 1
+            attr_hist[node["attrs_declared"]] += 1
+            child_count = node.get("children", sum(1 for c in node["content"] if c["kind"] == "element"))
+            children_hist[child_count] += 1
+            content_hist[node.get("content_count", len(node["content"]))] += 1
+            max_children = max(max_children, child_count)
+            if child_count == 0:
+                leaf_elements += 1
+            content = node["content"]
+            if not content:
+                empty_elements += 1
+            elif all(c["kind"] == "text" for c in content):
+                text_only_elements += 1
+            for child in content:
+                stack.append(child)
+            for attribute in node["attributes"]:
+                stack.append(attribute)
+    tree_elements = sum(children_hist.values())
+    edges = tree_elements - tree_roots
     return {
         "resources": len(docs),
         "ok": status.get("ok", 0),
@@ -447,7 +498,18 @@ def _summary(docs):
         "floats": counts.get("floats", 0),
         "bools": counts.get("bools", 0),
         "vec3": counts.get("vec3", 0),
+        "nodes": nodes,
         "max_depth": max((d["max_depth"] for d in docs), default=0),
+        "elements_by_depth": {str(k): v for k, v in sorted(by_depth.items())},
+        "children_histogram": {str(k): v for k, v in sorted(children_hist.items())},
+        "content_length_histogram": {str(k): v for k, v in sorted(content_hist.items())},
+        "attribute_count_histogram": {str(k): v for k, v in sorted(attr_hist.items())},
+        "leaf_elements": leaf_elements,
+        "empty_elements": empty_elements,
+        "text_only_elements": text_only_elements,
+        "parent_child_edges": edges,
+        "max_children": max_children,
+        "mean_children": round(edges / tree_elements, 4) if tree_elements else 0.0,
         "attribute_mismatches": sum(d["attribute_mismatches"] for d in docs),
         "attribute_order_violations": sum(d["attribute_order_violations"] for d in docs),
         "text_after_child": sum(d["text_after_child"] for d in docs),
@@ -496,23 +558,85 @@ def write_xml(directory, docs):
     """Write one generic XML file per resource. Element names are fixed, so any descriptor name is safe."""
     os.makedirs(directory, exist_ok=True)
     paths = []
+    used = set()
     for i, doc in enumerate(docs):
         root = ET.Element("rbf0", {
             "root": _xml_safe(doc["root_name"]), "layout": doc["layout"],
             "offset": f"0x{doc['offset']:x}",
-            "size": str(doc["size"]), "descriptors": str(doc["descriptor_count"]),
-            "status": doc["status"]})
+            "size": str(doc["size"]), "chunks": str(doc["chunks"]),
+            "descriptors": str(doc["descriptor_count"]), "status": doc["status"]})
+        if doc["error"]:
+            root.set("error", _xml_safe(doc["error"]))
         if doc["tree"] is not None:
             _xml_node(root, doc["tree"])
         tree = ET.ElementTree(root)
         ET.indent(tree, space=" ")
         name = f"{doc['offset']:08x}.xml"
+        if name in used:
+            name = f"{doc['offset']:08x}-{i:04d}.xml"
+        used.add(name)
         path = os.path.join(directory, name)
-        if os.path.exists(path):
-            path = os.path.join(directory, f"{doc['offset']:08x}-{i:04d}.xml")
         tree.write(path, encoding="utf-8", xml_declaration=True)
         paths.append(path)
     return paths
+
+
+def write_csv(path, docs):
+    """Write one row per tree node. Parent offsets and sibling slots make the flat table reconstructable.
+
+    The rows carry names and payloads, so the file is game data and must stay local.
+    """
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_COLUMNS)
+        for doc in docs:
+            root = doc["tree"]
+            if root is None:
+                continue
+            resource = f"0x{doc['offset']:x}"
+            stack = [(root, "", "", "", "")]
+            while stack:
+                node, parent, slot, sibling, child_index = stack.pop()
+                if node["kind"] == "element":
+                    end = f"0x{node['end']:x}" if node.get("end") is not None else ""
+                    writer.writerow([
+                        resource, doc["root_name"], doc["status"], parent, slot, sibling, child_index,
+                        node["depth"], node["kind"], node["name"], node["descriptor"],
+                        f"0x{node['offset']:x}", end, node["attrs_declared"], node["children"],
+                        node["content_count"], "", "", "", "", ""])
+                    content = node["content"]
+                    child_indices = []
+                    next_child = 0
+                    for c in content:
+                        if c["kind"] == "element":
+                            child_indices.append(str(next_child))
+                            next_child += 1
+                        else:
+                            child_indices.append("")
+                    for i in range(len(content) - 1, -1, -1):
+                        stack.append((content[i], f"0x{node['offset']:x}", "content", str(i),
+                                      child_indices[i]))
+                    for i in range(len(node["attributes"]) - 1, -1, -1):
+                        stack.append((node["attributes"][i], f"0x{node['offset']:x}", "attribute",
+                                      str(i), ""))
+                elif node["kind"] == "value":
+                    if node.get("float_special") is not None:
+                        value = _render(node["float_special"])
+                    else:
+                        value = _render(node["value"])
+                    writer.writerow([
+                        resource, doc["root_name"], doc["status"], parent, slot, sibling, child_index,
+                        node["depth"], node["kind"], node["name"], node["descriptor"],
+                        f"0x{node['offset']:x}", "", "", "", "", node["type"],
+                        node.get("byte_length", ""),
+                        "" if "nul_terminated" not in node else int(node["nul_terminated"]),
+                        "" if "utf8_valid" not in node else int(node["utf8_valid"]), value])
+                else:
+                    writer.writerow([
+                        resource, doc["root_name"], doc["status"], parent, slot, sibling, child_index,
+                        node["depth"], node["kind"], "", "", f"0x{node['offset']:x}", "",
+                        "", "", "", "text", node["length"],
+                        int(node["nul_terminated"]), int(node["utf8_valid"]), node["text"]])
 
 
 def write_json(path, docs, summary):
@@ -525,6 +649,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="a carve directory, a complete resource, or a single RBF0 stream")
     ap.add_argument("out", help="JSON output path")
+    ap.add_argument("--csv", metavar="PATH", help="also write one flat CSV row per tree node (game data)")
     ap.add_argument("--xml", metavar="DIR", help="also write one generic XML file per resource into DIR")
     ap.add_argument("--root", action="append", metavar="NAME", help="keep only this root schema (repeatable)")
     ap.add_argument("--offset", type=lambda s: int(s, 0), help="decode only the resource at this archive offset")
@@ -539,12 +664,19 @@ def main(argv=None):
     docs, summary = decode_source(args.source, roots=args.root, offset=args.offset,
                                   limit=args.limit, progress=progress)
     write_json(args.out, docs, summary)
+    if args.csv:
+        write_csv(args.csv, docs)
     paths = write_xml(args.xml, docs) if args.xml else []
     if not args.quiet:
         print(f"{summary['resources']} resources: {summary['ok']} ok, {summary['bad']} bad, "
               f"{summary['truncated']} truncated, {summary['trailing']} trailing")
         print(f"{summary['elements']} elements, {summary['texts']} texts, {summary['strings']} strings, "
               f"{summary['descriptors']} descriptors -> {args.out}")
+        print(f"tree: {summary['parent_child_edges']} parent-child edges, {summary['leaf_elements']} leaves, "
+              f"{summary['empty_elements']} empty, max depth {summary['max_depth']}, "
+              f"max children {summary['max_children']}")
+        if args.csv:
+            print(f"node CSV -> {args.csv}")
         if paths:
             print(f"{len(paths)} XML files -> {args.xml}")
     return 0 if summary["ok"] == summary["resources"] else 1
