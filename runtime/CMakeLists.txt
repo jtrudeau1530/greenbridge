@@ -162,6 +162,20 @@ if(BUILD_TESTING)
     target_link_options(bink_decode_test PRIVATE /OPT:NOREF)
     target_link_libraries(bink_decode_test PRIVATE psapi)
     add_test(NAME bink_decode COMMAND bink_decode_test)
+
+    # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE_AUDIO are set.
+    add_executable(bink_audio_test
+      test/bink_audio_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+    )
+    target_compile_definitions(bink_audio_test PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(bink_audio_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_link_options(bink_audio_test PRIVATE /OPT:NOREF)
+    target_link_libraries(bink_audio_test PRIVATE psapi)
+    add_test(NAME bink_audio COMMAND bink_audio_test)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
