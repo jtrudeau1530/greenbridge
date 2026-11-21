@@ -25,18 +25,30 @@ RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"
 
 
 def parts(dxbc: bytes) -> dict:
-    n = struct.unpack_from("<I", dxbc, 28)[0]
+    if len(dxbc) < 32:
+        raise ValueError("truncated DXBC header")
+    count = struct.unpack_from("<I", dxbc, 28)[0]
+    table_end = 32 + 4 * count
+    if table_end > len(dxbc):
+        raise ValueError("truncated DXBC part table")
     out = {}
-    for k in range(n):
-        off = struct.unpack_from("<I", dxbc, 32 + 4 * k)[0]
-        out[dxbc[off:off + 4].decode("latin-1")] = (off + 8, struct.unpack_from("<I", dxbc, off + 4)[0])
+    for entry in range(32, table_end, 4):
+        off = struct.unpack_from("<I", dxbc, entry)[0]
+        if not table_end <= off <= len(dxbc) - 8:
+            raise ValueError("DXBC part header outside the part data")
+        fourcc, size = struct.unpack_from("<4sI", dxbc, off)
+        if off + 8 + size > len(dxbc):
+            raise ValueError("truncated DXBC part payload")
+        out[fourcc.decode("latin-1")] = (off + 8, size)
     return out
 
 
 def shader_model(dxbc: bytes, p: dict):
     if "DXIL" not in p:
         return None, None
-    off, _ = p["DXIL"]
+    off, size = p["DXIL"]
+    if size < 4:
+        raise ValueError("truncated DXIL version and stage")
     ver, kind = struct.unpack_from("<HH", dxbc, off)
     return STAGES.get(kind, str(kind)), f"{ver >> 4}.{ver & 0xF}"
 
@@ -81,8 +93,12 @@ def main() -> int:
             if data[:4] != b"DXBC" or len(data) != size:
                 bad += 1
                 continue
-            p = parts(data)
-            stage, sm = shader_model(data, p)
+            try:
+                p = parts(data)
+                stage, sm = shader_model(data, p)
+            except ValueError:
+                bad += 1
+                continue
             fname = file_name(name, seen, used)
             with open(os.path.join(out, fname), "wb") as f:
                 f.write(data)
