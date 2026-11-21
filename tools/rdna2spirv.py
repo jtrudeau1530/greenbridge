@@ -29,6 +29,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(__file__))
 from shader_ir import parse_file  # noqa: E402
 import cfg_structure  # noqa: E402
+import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
 
@@ -140,6 +141,7 @@ class Gen:
         self.dynamic_format = False  # True when a buffer_load used a runtime V# FORMAT (unknown codes -> 0 at runtime)
         self.fixed_format_codes = set()  # static tbuffer/fixed format codes seen (validated against FORMATS)
         self.frag_inputs = {}      # PS: VGPR -> gl_FragCoord component, from the verified system-VGPR layout
+        self.pixel_interpolants = None  # PS: (count, fp16_mask) from the FSSM pixel-input table; None = no table
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
@@ -282,6 +284,16 @@ class Gen:
         self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
         self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
         self.dst(d, v)
+
+    def f16_roundtrip(self, f):
+        """f32 -> f16 -> f32 (round to nearest), modelling a 32-bit v_interp read of a 16-bit interpolant
+        (FSSM pixel-input table flag bit 4 marks the position; see the PS input path in translate)."""
+        v2, p, back, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{v2} = OpCompositeConstruct %v2float {f} %f0")
+        self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
+        self.emit(f"{back} = OpExtInst %v2float %glsl UnpackHalf2x16 {p}")
+        self.emit(f"{r} = OpCompositeExtract %float {back} 0")
+        return r
 
     def f16_rtz(self, f):
         """f32 -> f16 bits (low 16) with round-toward-zero, as v_cvt_pkrtz does: pack to nearest, and if that
@@ -3095,7 +3107,13 @@ class Gen:
             attr = next((x for x in a if x["k"] == "attr"), None)
             if attr is None or self.stage != "ps":
                 raise Unsupported(op + " form")
-            self.dst(a[0], self.tou(self.attribute(attr["a"], attr["c"], flat=op == "v_interp_mov_f32")))
+            f = self.attribute(attr["a"], attr["c"], flat=op == "v_interp_mov_f32")
+            if self.pixel_interpolants is not None and (self.pixel_interpolants[1] >> attr["a"]) & 1:
+                # 16-bit interpolant (FSSM table flag bit 4) read through a 32-bit op: the stored value only
+                # has f16 precision, so round to nearest f16 and back. Reads through the *_f16 opcodes already
+                # narrow to f16 and are unchanged.
+                f = self.f16_roundtrip(f)
+            self.dst(a[0], self.tou(f))
         elif op == "s_movk_i32":
             v = a[1]["v"] & 0xFFFF
             self.dst(a[0], self.cu(v - 0x10000 if v & 0x8000 else v))
@@ -5916,6 +5934,21 @@ def translate(path):
         g.frag_inputs = layout
         for r in layout:
             g.cu(r)
+        # FSSM pixel-input table (tools/fssm_header.py): the authoritative interpolant list. Position i of the
+        # table is v_interp attr i; interpolants() gives the count and the 16-bit flag mask by position. Every
+        # table position is declared as a fragment input (the table lists inputs the code never reads: 775 of
+        # 12,101 PS overcount by one or more), and the mask marks 16-bit interpolants for the v_interp path
+        # above. No sidecar, or a sidecar with no table, leaves the code-driven declarations untouched.
+        try:
+            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm",
+                                   info["name"] + ".fssm"), "rb") as f:
+                count, fp16 = fssm_header.interpolants(f.read())
+        except OSError:
+            count, fp16 = 0, 0
+        if count:
+            g.pixel_interpolants = (count, fp16)
+            for n in range(count):
+                g.inputs.setdefault(f"%in_attr{n}", n)
     if stage in ("vs", "ms"):
         g.pos_map, g.pos_misc, g.clip_count, g.cull_count = pos_export_layout(
             output_signature_full(path, info["name"]), insns)
@@ -6309,6 +6342,11 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["fssm_sha256"] = fssm_hash
     if g.frag_inputs:
         m["ps_system_inputs"] = sorted({str(c) for c in g.frag_inputs.values()})
+    if getattr(g, "pixel_interpolants", None):
+        # FSSM pixel-input table the PS input path used: interpolant count and 16-bit positions by table order.
+        count, fp16 = g.pixel_interpolants
+        m["ps_interpolants"] = count
+        m["ps_fp16_interpolants"] = [n for n in range(count) if (fp16 >> n) & 1]
     outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if not t.startswith("pos"))
     if outs:
         m["outputs"] = outs
