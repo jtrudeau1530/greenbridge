@@ -4,15 +4,24 @@
 // 6; samplers 1; descriptor hash table 2; storage images 4, 7 and 8..19; push constants 144 bytes). Device features
 // the corpus needs are enabled when the GPU has them. Reports every failure; optionally saves the pipeline cache
 // so a first boot doesn't compile these again.
+//   [cache.bin]   loaded first if it exists (a stopped run resumes: cached pipelines are instant), saved every
+//                 10 minutes and at the end
+//   --jobs N      compile on N threads (default: half the hardware threads)
+//   --start I --count N   check only index entries [I, I+N) (sorted by name)
+//   --slow SEC    print compute pipelines slower than SEC (default 30); compiles past 60 s are named while running
 #include "vulkan_loader.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -65,8 +74,24 @@ static std::map<std::string, ShaderMeta> read_index(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_pipeline_check <spirv dir> [cache.bin]\n"); return 2; }
-    std::string dir = argv[1];
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC]\n");
+        return 2;
+    }
+    std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
+    std::string dir = argv[1], cache_path;
+    uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
+    size_t start = 0, count = 0;
+    double slow = 30.0;
+    for (int i = 2; i < argc; i++) {
+        std::string a = argv[i];
+        auto val = [&] { return i + 1 < argc ? std::string(argv[++i]) : std::string("0"); };
+        if (a == "--jobs") jobs = std::max(1u, uint32_t(std::stoul(val())));
+        else if (a == "--start") start = std::stoull(val());
+        else if (a == "--count") count = std::stoull(val());
+        else if (a == "--slow") slow = std::stod(val());
+        else cache_path = a;
+    }
     auto index = read_index(dir + "/index.json");
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
     gipa = load_vulkan();
@@ -159,71 +184,141 @@ int main(int argc, char** argv) {
     pli.setLayoutCount = 1; pli.pSetLayouts = &dsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
     VkPipelineLayout pl; vkCreatePipelineLayout(dev, &pli, nullptr, &pl);
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    VkPipelineCache cache; vkCreatePipelineCache(dev, &pci, nullptr, &cache);
-
-    std::map<std::string, uint32_t> modules_ok, modules_bad, pipes_ok, pipes_bad;
-    uint32_t cs_w32_ok = 0, cs_w32_bad = 0, cs_w64_ok = 0, cs_w64_bad = 0;
-    uint32_t done = 0, cs_done = 0;
-    const auto t_start = std::chrono::steady_clock::now();
-    for (auto& [name, meta] : index) {
-        const std::string& stage = meta.stage;
-        std::ifstream f(dir + "/" + name + ".spv", std::ios::binary);
-        std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
-        if (code.empty()) { modules_bad[stage]++; continue; }
-        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
-        VkShaderModule sm;
-        if (vkCreateShaderModule(dev, &smi, nullptr, &sm)) { modules_bad[stage]++; std::printf("MODULE FAIL %s\n", name.c_str()); continue; }
-        modules_ok[stage]++;
-        if (stage == "cs") {
-            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
-                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
-            reqSg.requiredSubgroupSize = meta.subgroup_size;
-            VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-            cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-            cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
-            if (f13.subgroupSizeControl &&
-                meta.subgroup_size >= sgProps.minSubgroupSize &&
-                meta.subgroup_size <= sgProps.maxSubgroupSize &&
-                (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
-                cpi.stage.pNext = &reqSg;
-            }
-            cpi.layout = pl;
-            VkPipeline p;
-            const auto t0 = std::chrono::steady_clock::now();
-            VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
-            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            if (sec > 2.0) std::fprintf(stderr, "  SLOW CS %s (%.2fs)\n", name.c_str(), sec);
-            if (r) {
-                pipes_bad[stage]++;
-                if (meta.subgroup_size == 64) cs_w64_bad++; else cs_w32_bad++;
-                std::printf("PIPELINE FAIL %s (w%u, %d)\n", name.c_str(), meta.subgroup_size, r);
-            } else {
-                pipes_ok[stage]++;
-                if (meta.subgroup_size == 64) cs_w64_ok++; else cs_w32_ok++;
-                vkDestroyPipeline(dev, p, nullptr);
-            }
-            if (++cs_done % 50 == 0) {
-                double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-                std::fprintf(stderr, "  cs %u (%.1fs elapsed)\n", cs_done, el);
-            }
-        }
-        vkDestroyShaderModule(dev, sm, nullptr);
-        if (++done % 2000 == 0) std::fprintf(stderr, "  %u/%zu\n", done, index.size());
+    std::vector<char> seed;
+    if (!cache_path.empty()) {  // resume: pipelines already in the cache compile instantly
+        std::ifstream cf(cache_path, std::ios::binary);
+        seed.assign(std::istreambuf_iterator<char>(cf), {});
+        if (!seed.empty()) std::fprintf(stderr, "seeded the pipeline cache with %zu bytes from %s\n", seed.size(), cache_path.c_str());
     }
-    for (auto& [st, c] : modules_ok) std::printf("%s: %u modules ok, %u failed\n", st.c_str(), c, modules_bad[st]);
-    if (cs_done > 0) {
-        std::printf("cs pipelines: %u ok, %u failed\n", pipes_ok["cs"], pipes_bad["cs"]);
-        std::printf("  cs wave32: %u ok, %u failed; wave64: %u ok, %u failed\n",
-                    cs_w32_ok, cs_w32_bad, cs_w64_ok, cs_w64_bad);
+    pci.initialDataSize = seed.size(); pci.pInitialData = seed.empty() ? nullptr : seed.data();
+    VkPipelineCache cache;
+    if (vkCreatePipelineCache(dev, &pci, nullptr, &cache)) {  // data from another driver: start empty
+        pci.initialDataSize = 0; pci.pInitialData = nullptr;
+        vkCreatePipelineCache(dev, &pci, nullptr, &cache);
     }
-    if (argc > 2) {
+    auto save_cache = [&](bool final_save) {
+        if (cache_path.empty()) return;
         size_t sz = 0;
         vkGetPipelineCacheData(dev, cache, &sz, nullptr);
         std::vector<char> data(sz);
         vkGetPipelineCacheData(dev, cache, &sz, data.data());
-        std::ofstream(argv[2], std::ios::binary).write(data.data(), std::streamsize(sz));
-        std::printf("pipeline cache: %zu bytes -> %s\n", sz, argv[2]);
+        const std::string tmp = cache_path + ".partial";
+        std::ofstream(tmp, std::ios::binary).write(data.data(), std::streamsize(sz));
+        std::remove(cache_path.c_str());
+        std::rename(tmp.c_str(), cache_path.c_str());
+        if (final_save) std::printf("pipeline cache: %zu bytes -> %s\n", sz, cache_path.c_str());
+    };
+
+    // Work list: index order (sorted by name), entries [start, start + count).
+    using Item = std::pair<const std::string*, const ShaderMeta*>;
+    std::vector<Item> all;
+    for (auto& [name, meta] : index) all.push_back({&name, &meta});
+    const size_t lo = std::min(start, all.size()), hi = std::min(all.size(), count ? lo + count : all.size());
+    const std::vector<Item> work(all.begin() + lo, all.begin() + hi);
+    std::fprintf(stderr, "checking %zu shaders [%zu, %zu) on %u threads\n", work.size(), lo, hi, jobs);
+
+    std::mutex mu;  // guards the counters, stdout and the in-flight table
+    std::map<std::string, uint32_t> modules_ok, modules_bad, pipes_ok, pipes_bad;
+    uint32_t cs_w32_ok = 0, cs_w32_bad = 0, cs_w64_ok = 0, cs_w64_bad = 0, cs_done = 0;
+    double cs_seconds = 0, cs_max = 0;
+    std::string cs_max_name;
+    std::atomic<size_t> next{0}, done{0};
+    std::map<std::thread::id, std::pair<std::string, std::chrono::steady_clock::time_point>> inflight;
+    const auto t_start = std::chrono::steady_clock::now();
+    auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(); };
+
+    auto worker = [&] {
+        for (size_t k; (k = next++) < work.size();) {
+            const std::string& name = *work[k].first;
+            const ShaderMeta& meta = *work[k].second;
+            const std::string& stage = meta.stage;
+            std::ifstream f(dir + "/" + name + ".spv", std::ios::binary);
+            std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+            VkShaderModule sm = VK_NULL_HANDLE;
+            bool mod_ok = false;
+            if (!code.empty()) {
+                VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
+                mod_ok = vkCreateShaderModule(dev, &smi, nullptr, &sm) == VK_SUCCESS;
+            }
+            {
+                std::lock_guard<std::mutex> g(mu);
+                if (mod_ok) modules_ok[stage]++;
+                else { modules_bad[stage]++; std::printf("MODULE FAIL %s\n", name.c_str()); }
+            }
+            if (mod_ok && stage == "cs") {
+                VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+                reqSg.requiredSubgroupSize = meta.subgroup_size;
+                VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+                cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
+                if (f13.subgroupSizeControl &&
+                    meta.subgroup_size >= sgProps.minSubgroupSize &&
+                    meta.subgroup_size <= sgProps.maxSubgroupSize &&
+                    (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+                    cpi.stage.pNext = &reqSg;
+                }
+                cpi.layout = pl;
+                const auto t0 = std::chrono::steady_clock::now();
+                { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
+                VkPipeline p;
+                VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
+                const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
+                std::lock_guard<std::mutex> g(mu);
+                inflight.erase(std::this_thread::get_id());
+                cs_seconds += sec;
+                if (sec > cs_max) { cs_max = sec; cs_max_name = name; }
+                if (sec > slow) std::printf("SLOW CS %s (w%u, %.1fs)\n", name.c_str(), meta.subgroup_size, sec);
+                if (r) {
+                    pipes_bad[stage]++;
+                    if (meta.subgroup_size == 64) cs_w64_bad++; else cs_w32_bad++;
+                    std::printf("PIPELINE FAIL %s (w%u, %d)\n", name.c_str(), meta.subgroup_size, r);
+                } else {
+                    pipes_ok[stage]++;
+                    if (meta.subgroup_size == 64) cs_w64_ok++; else cs_w32_ok++;
+                }
+                if (++cs_done % 250 == 0) std::fprintf(stderr, "  cs %u (%.0fs elapsed)\n", cs_done, elapsed());
+            }
+            if (sm) vkDestroyShaderModule(dev, sm, nullptr);
+            if (++done % 1000 == 0) {
+                std::lock_guard<std::mutex> g(mu);
+                std::fprintf(stderr, "  %zu/%zu (%.0fs)\n", size_t(done), work.size(), elapsed());
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (uint32_t t = 0; t < jobs; t++) pool.emplace_back(worker);
+    // Watchdog: names every compile running past 60 s (about once a minute) and saves the cache every 10 minutes.
+    std::thread watch([&] {
+        auto last_save = std::chrono::steady_clock::now();
+        while (done < work.size()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            const auto now = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> g(mu);
+                for (auto& [tid, job] : inflight) {
+                    const double s = std::chrono::duration<double>(now - job.second).count();
+                    if (s > 60 && int(s) % 60 < 5) std::fprintf(stderr, "  still compiling %s after %.0fs\n", job.first.c_str(), s);
+                }
+            }
+            if (now - last_save > std::chrono::minutes(10)) { save_cache(false); last_save = now; }
+        }
+    });
+    for (auto& t : pool) t.join();
+    watch.join();
+
+    for (auto& [st, c] : modules_ok) std::printf("%s: %u modules ok, %u failed\n", st.c_str(), c, modules_bad[st]);
+    for (auto& [st, c] : modules_bad) if (!modules_ok.count(st)) std::printf("%s: 0 modules ok, %u failed\n", st.c_str(), c);
+    if (cs_done > 0) {
+        std::printf("cs pipelines: %u ok, %u failed\n", pipes_ok["cs"], pipes_bad["cs"]);
+        std::printf("  cs wave32: %u ok, %u failed; wave64: %u ok, %u failed\n",
+                    cs_w32_ok, cs_w32_bad, cs_w64_ok, cs_w64_bad);
+        std::printf("  cs compile time: %.0fs total, %.2fs mean, slowest %s (%.1fs)\n",
+                    cs_seconds, cs_seconds / cs_done, cs_max_name.c_str(), cs_max);
     }
+    std::printf("wall time: %.0fs on %u threads\n", elapsed(), jobs);
+    save_cache(true);
     return 0;
 }

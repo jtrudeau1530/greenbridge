@@ -20,6 +20,7 @@ carve/
 
 # ---- build output and caches ----
 build/
+build-*/
 bin/
 obj/
 __pycache__/
