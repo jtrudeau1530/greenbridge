@@ -65,7 +65,8 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
-              "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0)}
+              "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
+              "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
