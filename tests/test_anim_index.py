@@ -175,7 +175,7 @@ class RigParseTest(unittest.TestCase):
         name = b"SKEL_Synthetic"
         data = name + b"\x00" + struct.pack("<I", anim_index.joaat32(name.decode())) + b"\x00SKEL_Second\x00"
         r = anim_index.parse_skel_names(data, 0x123)
-        self.assertEqual((r["offset"], r["occurrences"], r["distinct"], r["hashes_confirmed"]),
+        self.assertEqual((r["offset"], r["occurrences"], r["distinct"], r["hashes_present"]),
                          (0x123, 2, 2, 1))
 
 
@@ -305,7 +305,7 @@ class RigArchiveTest(unittest.TestCase):
         self.assertEqual(doc["rbf0"]["summary"]["rigsets"], 3)
         self.assertEqual(doc["skeletons"][0]["distinct"], 2)
         self.assertEqual(doc["skeletons"][0]["kind"], "plain-bone-table")
-        self.assertEqual(doc["skeletons"][1]["hashes_confirmed"], 1)
+        self.assertEqual(doc["skeletons"][1]["hashes_present"], 1)
 
 
 if __name__ == "__main__":

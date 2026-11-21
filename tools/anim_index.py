@@ -156,7 +156,7 @@ def parse_skel_names(data, offset=0):
     distinct = sorted(set(names))
     hashes = sum(1 for n in distinct if struct.pack("<I", joaat32(n)) in data)
     return {"offset": offset, "occurrences": len(names), "distinct": len(distinct),
-            "hashes_confirmed": hashes, "names": distinct}
+            "hashes_present": hashes, "names": distinct}
 
 
 def parse_rbf0(data, offset=0):
@@ -268,7 +268,7 @@ def collect_skeletons(archive, rows):
                 record = parse_skel_names(data, row["offset"])
                 record["kind"] = ("plain-bone-table" if row["signature"] == "skeleton-names"
                                   else ("motion-matcher" if b"motionmatcher" in data else "bone-table"))
-                if record["distinct"] or record["hashes_confirmed"]:
+                if record["distinct"] or record["hashes_present"]:
                     out.append(record)
     return out
 
@@ -285,7 +285,7 @@ def collect_skeletons_dir(path):
             m = re.match(r"([0-9a-fA-F]{6,})", name)
             record = parse_skel_names(data, int(m.group(1), 16) if m else 0)
             record["kind"] = "motion-matcher" if b"motionmatcher" in data else "bone-table"
-            if record["distinct"] or record["hashes_confirmed"]:
+            if record["distinct"] or record["hashes_present"]:
                 out.append(record)
     return out
 

@@ -238,7 +238,7 @@ Mapping to the name tables:
 Four small resources in this index carry full bone names. One is a standalone name list; three are motion-matcher
 resources found in the prefix scan that embed a bone table and a `pack:/...motionmatcher` path:
 
-| Offset | Inflated | Distinct names | Occurrences | Confirmed joaat32 hashes | Kind |
+| Offset | Inflated | Distinct names | Occurrences | joaat32 present | Kind |
 |---|---:|---:|---:|---:|---|
 | `0x101a32160` | 896 | 28 | 68 | 0 | standalone name list |
 | `0x101c379a0` | 4,272 | 28 | 55 | 14 | motion matcher |
@@ -246,8 +246,8 @@ resources found in the prefix scan that embed a bone table and a `pack:/...motio
 | `0x101ea66c0` | 2,848 | 30 | 50 | 19 | motion matcher |
 
 The three motion matcher streams contain four distinct `pack:/...motionmatcher` paths. The union of all four
-streams is 30 names (28 `SKEL_*` and 2 `PH_*`); 19 of the 30 have a confirmed stored joaat32; 11 do not. The
-standalone 896-byte stream has no hash table.
+streams is 30 names (28 `SKEL_*` and 2 `PH_*`); 19 of the 30 have a joaat32 present in at least one stream; 11
+do not. The standalone 896-byte stream has no hash table.
 
 The 2,064-byte stream shows the embedded record layout most clearly: header `0f 00 e0 00 0c 00 16 00`, eight
 0x30-byte records from 0x0528 to 0x0678, a u32 hash at +0x10, a parent-index array at 0x06d0, bind-pose floats
@@ -267,8 +267,7 @@ are in the same stream. It is not a rig → skeleton link for RBF0:
 
 - RBF0 contains no `SKEL_` token and no lowercase `bone`/`skeleton` string; the only `Bones`/`Skel` text is
   inside two rig path names.
-- 0 of the 3,669 rigs and 0 of the 1,126 rig sets match any of the 30 bone names or any of the 19 confirmed
-  hashes.
+- 0 of the 3,669 rigs and 0 of the 1,126 rig sets match any of the 30 bone names or any of the 19 hashes present.
 - The four motionmatcher paths are not in the 2,298 `.clip`/`.anim`/`.motion` name-table paths.
 
 So RBF0 gives rig-set → source → rig, and the motion matcher resources show how a clip can carry its own bone
@@ -285,8 +284,8 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
 
 - **Readable:** all 273 name tables (2,298 paths), the `0DRP` version/page count, 1,371 type-hash headers,
   1,781 clip-stream headers, the RBF0 mapping (1,126 rig sets / 6,677 entries / 3,669 rigs), one standalone
-  bone-name list, and three motion matcher streams with embedded bone tables (30-name union; 19 confirmed bone
-  hashes). Some `MoVE` and zero-prefixed pages expose counts and float arrays directly.
+  bone-name list, and three motion matcher streams with embedded bone tables (30-name union; 19 bone hashes
+  present). Some `MoVE` and zero-prefixed pages expose counts and float arrays directly.
 - **Outer compression:** the only compression this work inverts is the RPF9 zlib framing. Inflating the 130,470
   streams accounts for the 11.59 GB above.
 - **No nested zlib:** in eight sampled zero-prefixed pages, none of the `78 01/5E/9C/DA` byte pairs started a
@@ -343,7 +342,7 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
 - The `RBF0` rig-set/rig/group entries are parsed. The numeric fields, the schema type table and the
   rig→skeleton reference are not; the measured skeleton match is 0.
 - The three motion matcher streams embed bone tables, but whether those define a full skeleton or only the
-  motion-matching bones is not established. 19 of 30 names have a confirmed hash.
+  motion-matching bones is not established. 19 of 30 names have a matching joaat32 in at least one stream.
 
 ## What a future decoder needs
 
@@ -351,7 +350,7 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
    56 rig sets are empty. The key/tag layout is above. The field after `ff ff 08 10` and the rest of the schema
    still need mapping.
 2. **Resolve rig → skeleton.** None of the 3,669 rigs or 1,126 rig sets matches a stored skeleton name or one of
-   the 19 confirmed bone hashes. Three motion matcher streams bind four paths to embedded bone tables (30-name
+   the 19 bone hashes present. Three motion matcher streams bind four paths to embedded bone tables (30-name
    union; parent indices and bind data in the 2,064-byte example). Parse those records to learn the clip→bone
    binding, then find how an RBF0 rig points at the same table. The missing key is likely a separate rig asset
    or an unparsed numeric field, not these pages. Do not infer it from the category names.
