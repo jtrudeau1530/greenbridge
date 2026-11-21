@@ -18,6 +18,7 @@ method, scope and caveats. No game data is included.
 |---|---|
 | [models.md](models.md) | 155,598 models exported to OBJ with bounds, shader index and material keys. |
 | [textures.md](textures.md) | 308,895 TTPF textures exported; 48,220 skips, mostly BCPack. |
+| [textures_arrays.md](textures_arrays.md) | 678 TTPF array/volume descriptors: 90 tile-mode-9 cubes have a validated 6-slice allocation layout; 588 remain unresolved. |
 | [animation.md](animation.md) | 130,470 `anim.rpf` streams, 95.4% readable; 1,126 rig sets / 6,677 source-to-rig entries / 3,669 rigs. |
 | [navmesh.md](navmesh.md) | 90,295 `navmeshes.rpf` streams, 97.5% readable; `0DRP` pages, no navmesh-specific magic. |
 | [bvh.md](bvh.md) | 565,596 `core_bvh4.rpf` streams; 271,627 BVH4 streams and 269,106 instances, prebuilt acceleration data. |
