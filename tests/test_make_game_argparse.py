@@ -439,8 +439,10 @@ class WavValidationTest(unittest.TestCase):
             os.makedirs(game, exist_ok=True)
 
             manifest_dir = os.path.join(out, "audio")
-            with open(os.path.join(manifest_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
-                f.write("{}")
+            # A step counts as done by its marker, not by its folder (a stopped run leaves the folder too).
+            for name in ("audio_manifest.json", "ogg.done", "xma.done"):
+                with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
+                    f.write("{}")
 
             with patch("make_game.rpf9dump", return_value="fake_dump"):
                 with patch("make_game.log"):
@@ -463,8 +465,9 @@ class WavValidationTest(unittest.TestCase):
 
             manifest_dir = os.path.join(out, "audio")
             os.makedirs(manifest_dir, exist_ok=True)
-            with open(os.path.join(manifest_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
-                f.write("{}")
+            for name in ("audio_manifest.json", "ogg.done", "xma.done"):
+                with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
+                    f.write("{}")
             os.makedirs(os.path.join(manifest_dir, "ogg"), exist_ok=True)
             os.makedirs(os.path.join(manifest_dir, "xma"), exist_ok=True)
             os.makedirs(game, exist_ok=True)
