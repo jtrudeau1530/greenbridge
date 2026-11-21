@@ -186,6 +186,19 @@ class PixelDeviceLimits(unittest.TestCase):
 
 
 class TextureMipChecks(unittest.TestCase):
+    def test_mip_draw_reports_unsupported_device_and_preserves_other_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / ("vk_texture_test" + check.EXE)).touch()
+            for shader in (check.TEXTURE_MIP_TEST, *check.TEXTURE_MIP_DEPENDENCIES):
+                (directory / (shader + ".spv")).touch()
+            with patch.object(check, "run", return_value=(77, "unsupported device")):
+                self.assertIsInstance(check.texture_mip_test(tmp, tmp), check.Skip)
+            with patch.object(check, "run", return_value=(1, "device lost")):
+                failure = check.texture_mip_test(tmp, tmp)
+                self.assertNotIsInstance(failure, check.Skip)
+                self.assertIn("device lost", failure)
+
     def test_implicit_mip_checks_every_channel_through_last_pixel(self):
         pixel = struct.pack("<4f", 0, 1, 1, 1)
         image = pixel * (64 * 64)

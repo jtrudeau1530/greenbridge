@@ -93,14 +93,39 @@ int main(int argc, char** argv) {
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
     LI(vkEnumeratePhysicalDevices); LI(vkGetPhysicalDeviceProperties); LI(vkGetPhysicalDeviceQueueFamilyProperties);
     LI(vkGetPhysicalDeviceMemoryProperties); LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
-    uint32_t n = 0; vkEnumeratePhysicalDevices(inst, &n, nullptr);
-    std::vector<VkPhysicalDevice> pds(n); vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = pds[0];
-    for (auto d : pds) { VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
-                         if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) pd = d; }
+    uint32_t n = 0;
+    CHECK(vkEnumeratePhysicalDevices(inst, &n, nullptr));
+    std::vector<VkPhysicalDevice> pds(n);
+    if (n) CHECK(vkEnumeratePhysicalDevices(inst, &n, pds.data()));
+    if (!n) {
+        std::fprintf(stderr, "unsupported: no Vulkan physical device\n");
+        return two_mip ? 77 : 1;
+    }
+    VkPhysicalDevice pd = VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties properties{};
+    for (uint32_t i = 0; i < n; ++i) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(pds[i], &p);
+        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            pd = pds[i];
+            properties = p;
+        }
+    }
+    constexpr uint32_t push_words = 36;
+    constexpr uint32_t push_bytes = push_words * sizeof(uint32_t);
+    if (properties.limits.maxPushConstantsSize < push_bytes) {
+        std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n",
+                     push_bytes, properties.limits.maxPushConstantsSize);
+        return two_mip ? 77 : 1;
+    }
     uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn); vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf.data());
-    uint32_t qi = 0; while (!(qf[qi].queueFlags & VK_QUEUE_GRAPHICS_BIT)) qi++;
+    uint32_t qi = 0;
+    while (qi < qn && !(qf[qi].queueFlags & VK_QUEUE_GRAPHICS_BIT)) ++qi;
+    if (qi == qn) {
+        std::fprintf(stderr, "unsupported: no graphics queue family\n");
+        return two_mip ? 77 : 1;
+    }
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
@@ -110,7 +135,13 @@ int main(int argc, char** argv) {
     f2.features.shaderInt64 = VK_TRUE;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
-    VkDevice dev; CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
+    VkDevice dev;
+    VkResult created = vkCreateDevice(pd, &dci, nullptr, &dev);
+    if (two_mip && created == VK_ERROR_FEATURE_NOT_PRESENT) {
+        std::fprintf(stderr, "unsupported: device lacks a requested texture test feature\n");
+        return 77;
+    }
+    CHECK(created);
 #define LD(n) auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(dev, #n))
     LD(vkGetDeviceQueue); LD(vkCreateImage); LD(vkGetImageMemoryRequirements); LD(vkAllocateMemory);
     LD(vkBindImageMemory); LD(vkCreateImageView); LD(vkCreateRenderPass); LD(vkCreateFramebuffer);
@@ -267,7 +298,7 @@ int main(int argc, char** argv) {
     VkPipelineShaderStageCreateInfo st[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
-    VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, 144};
+    VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, push_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1; pli.pSetLayouts = &dsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
@@ -317,7 +348,7 @@ int main(int argc, char** argv) {
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
-    uint32_t pc[36] = {};
+    uint32_t pc[push_words] = {};
     pc[ptr_sgpr] = tsharp_va;               // pointer to the T# (low dword; the shader forces the high dword to 0)
     pc[32] = uint32_t(heap_base); pc[33] = uint32_t(heap_base >> 32);
     vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), pc);
