@@ -120,3 +120,17 @@ in [docs/design.md](../docs/design.md), and the differential-validation design i
 work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
+
+### Typed UINT clear regression
+
+`clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
+`d3d12_uint_clear_test` compares 21 full/rectangle readbacks with Windows WARP across the three
+currently supported typed UINT render-target formats. Fixtures are synthetic; no shaders or game data are needed.
+The GPU test runs explicitly, while the CPU test is registered in CTest.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^clear_color$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_uint_clear_test.exe
+```
