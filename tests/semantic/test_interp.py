@@ -22,6 +22,7 @@ OpEntryPoint Fragment %main "main" %out
 %c2 = OpConstant %uint 2
 %c4 = OpConstant %uint 4
 %c8 = OpConstant %uint 8
+%c31 = OpConstant %uint 31
 %c32 = OpConstant %uint 32
 %cF0 = OpConstant %uint 4294967280
 %cFF = OpConstant %uint 4294967295
@@ -191,6 +192,14 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%b = OpUGreaterThanEqual %bool %c1 %cFF\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
         self.assertEqual(run_word("%x = OpBitcast %float %c0\n%s = OpExtInst %float %glsl Sin %x\n"
                                   "%res = OpBitcast %uint %s\n"), 0)
+
+    def test_bit_reverse_and_sabs(self):
+        self.assertEqual(run_word("%res = OpBitReverse %uint %c1\n"), 0x80000000)
+        self.assertEqual(run_word("%res = OpBitReverse %uint %cF0\n"), 0x0FFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SAbs %cFF\n"), 1)             # |-1|
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl SAbs %c2\n"), 2)
+        self.assertEqual(run_word("%m = OpShiftLeftLogical %uint %c1 %c31\n"                   # |INT_MIN| wraps
+                                  "%res = OpExtInst %uint %glsl SAbs %m\n"), 0x80000000)
 
     def test_forward_branch_and_kill(self):
         live = (HEADER + "OpStore %out %c1\nOpSelectionMerge %live None\n"

@@ -395,6 +395,9 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
         elif op == "OpUConvert":
             values[res] = val(a[1]) & wmask(a[0])
+        elif op == "OpBitReverse":
+            bits = types.bits(a[0])
+            values[res] = int(f"{val(a[1]) & wmask(a[0]):0{bits}b}"[::-1], 2)
         elif op == "OpBitCount":
             values[res] = (val(a[1]) & wmask(a[0])).bit_count()
         elif op == "OpISubBorrow":
@@ -484,6 +487,9 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
                 values[res] = f32(abs(args[0]))
+            elif name == "SAbs":
+                # Two's complement: the most negative value is its own absolute value (as on the hardware).
+                values[res] = abs(_s32(args[0])) & MASK
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":
