@@ -100,8 +100,14 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
             "unreadable": missing}
 
 
+def getpc_for_data(ops: list) -> bool:
+    """s_getpc_b64 not followed within three instructions by s_setpc_b64: the address is used to read data
+    embedded in the code (a code base), not for a far branch (getpc; add/sub; addc/subb; setpc)."""
+    return any(op == "s_getpc_b64" and "s_setpc_b64" not in ops[i + 1:i + 4] for i, op in enumerate(ops))
+
+
 def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
-    mma, ordered, gds = Counter(), Counter(), Counter()
+    mma, ordered, gds, code_data = Counter(), Counter(), Counter(), Counter()
     mma_ops, ordered_ops = Counter(), Counter()
     files = 0
     for fn in os.listdir(disasm_dir):
@@ -110,8 +116,12 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
         files += 1
         stage = stage_of.get(fn[:-2], "?")
         seen_mma = seen_ord = seen_gds = False
+        ops = []
         with open(os.path.join(disasm_dir, fn), encoding="utf-8", errors="replace") as f:
             for line in f:
+                head = line.split(None, 1)
+                if head and not head[0].startswith((";", ".")):
+                    ops.append(head[0])
                 m = MMA.match(line)
                 if m:
                     mma_ops[m.group(1)] += 1
@@ -125,9 +135,11 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
         mma[stage] += seen_mma
         ordered[stage] += seen_ord
         gds[stage] += seen_gds
+        code_data[stage] += getpc_for_data(ops)
     nz = lambda c: {k: v for k, v in c.items() if v}
     return {"files": files, "wave_mma_shaders": nz(mma), "wave_mma_ops": dict(mma_ops),
-            "ordered_or_gws_shaders": nz(ordered), "ordered_or_gws_ops": dict(ordered_ops), "gds_shaders": nz(gds)}
+            "ordered_or_gws_shaders": nz(ordered), "ordered_or_gws_ops": dict(ordered_ops), "gds_shaders": nz(gds),
+            "getpc_for_data_shaders": nz(code_data)}
 
 
 def scan_spirv(spirv_index: str) -> dict:
@@ -175,6 +187,7 @@ def main() -> int:
         s = result["disasm"]
         print(f"disasm: {s['files']} files | wave MMA shaders {s['wave_mma_shaders'] or 0} | ordered-count/GWS shaders "
               f"{s['ordered_or_gws_shaders'] or 0} {s['ordered_or_gws_ops'] or ''} | GDS shaders {s['gds_shaders'] or 0}")
+        print("s_getpc_b64 used for code-embedded data (not a far branch), by stage:", s["getpc_for_data_shaders"] or 0)
     else:
         print("disasm: not there yet (run the shaders stage)")
     if "spirv" in result:

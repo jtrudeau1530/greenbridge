@@ -56,6 +56,9 @@ def build(root):
         ("b_gs", "gs", 0, [0, 1], "\tds_ordered_count v0, v1 offset:772 gds\n\ts_endpgm\n"),
         ("c_cs", "cs", 0x8000000, [], "\tv_mfma_f32_32x32x8f16 a[0:15], v[0:1], v[2:3], a[0:15]\n\ts_endpgm\n"),
         ("d_vs", "vs", 0, [0], None),
+        # s_getpc for data (the address is kept and offset), and s_getpc for a far branch (setpc follows)
+        ("e_vs", "vs", 0, [0], "\ts_getpc_b64 s[4:5]\n\ts_add_u32 s4, s4, 0x40\n\ts_load_dword s6, s[4:5], 0x0\n\ts_endpgm\n"),
+        ("f_ps", "ps", 0, [0], "\ts_getpc_b64 s[4:5]\n\ts_add_u32 s4, s4, 0x40\n\ts_addc_u32 s5, s5, 0\n\ts_setpc_b64 s[4:5]\n"),
     ]
     index = []
     for name, stage, mask, streams, listing in shaders:
@@ -76,7 +79,7 @@ def build(root):
 with tempfile.TemporaryDirectory() as tmp:
     sh, index = build(tmp)
     d = F.scan_dxbc(os.path.join(sh, "dxbc"), index)
-    check(d["stages"]["ps"] == 1 and d["stages"]["gs"] == 1 and d["stages"]["hs"] == 0 and d["stages"]["as"] == 0,
+    check(d["stages"]["ps"] == 2 and d["stages"]["gs"] == 1 and d["stages"]["hs"] == 0 and d["stages"]["as"] == 0,
           "stage census counts each stage and lists the absent ones as 0")
     check(d["sfi0"].get("ROVS") == {"ps": 1} and d["sfi0"].get("SHADING_RATE") == {"ps": 1},
           "SFI0 bits 0x1000 and 0x80000 decode to ROVS and SHADING_RATE")
@@ -86,7 +89,9 @@ with tempfile.TemporaryDirectory() as tmp:
 
     stage_of = {e["name"]: e["stage"] for e in index}
     s = F.scan_disasm(os.path.join(sh, "dxbc", "disasm"), stage_of)
-    check(s["files"] == 3, "three listings scanned")
+    check(s["files"] == 5, "five listings scanned")
+    check(s["getpc_for_data_shaders"] == {"vs": 1},
+          "s_getpc kept for data counts as a code base, s_getpc into s_setpc (far branch) does not")
     check(s["wave_mma_shaders"] == {"cs": 1} and "v_mfma_f32_32x32x8f16" in s["wave_mma_ops"], "v_mfma is found")
     check(s["ordered_or_gws_shaders"] == {"gs": 1} and s["gds_shaders"] == {"gs": 1},
           "ds_ordered_count with gds is found")
