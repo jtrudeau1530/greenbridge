@@ -45,10 +45,18 @@ def main() -> int:
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "rpf_probe.json"))
     a = ap.parse_args()
     rows = []
-    for root, _, files in os.walk(a.game_dir):
-        for name in files:
-            if name.lower().endswith(".rpf"):
-                rows.append(probe(os.path.join(root, name)))
+
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    try:
+        for root, _, files in os.walk(a.game_dir, onerror=scan_failed):
+            for name in files:
+                if name.lower().endswith(".rpf"):
+                    rows.append(probe(os.path.join(root, name)))
+    except OSError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
     rows.sort(key=lambda r: -r["size"])
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as f:
