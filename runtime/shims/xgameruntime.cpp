@@ -53,7 +53,9 @@ enum class XSystemDeviceType : uint32_t {
 // XSystemDeviceType XSystemGetDeviceType(). The package is the Xbox Series build, so report Series X (Anaconda).
 // LEONIDA_DEVICE_TYPE=<0..8> overrides it, for trying other code paths on day one.
 uint32_t __stdcall XSystemGetDeviceType() {
-    if (const char* s = std::getenv("LEONIDA_DEVICE_TYPE")) {
+    char s[16];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", s, sizeof(s));
+    if (n > 0 && n < sizeof(s)) {
         int v = std::atoi(s);
         if (v >= 0 && v <= 8) return static_cast<uint32_t>(v);
     }

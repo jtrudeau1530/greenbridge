@@ -306,7 +306,8 @@ if(Vulkan_FOUND)
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
-    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp ${LEONIDA_STUBS})
+    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp
+                ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -325,7 +326,7 @@ if(Vulkan_FOUND)
     add_test(NAME d3d12_gcl8 COMMAND d3d12_gcl8_test)
 
     # The Vulkan device behind the Xbox-ABI proxy, end to end.
-    add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp shims/d3d12_xs_device.cpp)
+    add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp)
     target_link_libraries(d3d12_vulkan_device_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
