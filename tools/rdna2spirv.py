@@ -11,7 +11,7 @@ Supported in v0 (anything else is reported, never guessed):
   scalar      s_mov_b32 s_add_u32 s_and_b32 s_or_b32 s_lshl_b32 s_lshr_b32 s_mul_i32
   no-ops      s_waitcnt* s_nop s_inst_prefetch s_endpgm s_setprio s_clause s_delay_alu
   export      exp pos0..3 / param0..31 (vertex) and mrt0..7 (pixel)
-Vertex inputs: v0 = VertexIndex (the full-screen-triangle shaders read only that).
+Vertex inputs: v0 = VertexIndex - BaseVertex and v3 = InstanceIndex - BaseInstance (the hardware's ids are zero-based).
 
 Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
     python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N]
@@ -7595,7 +7595,7 @@ def assemble(gen):
             gen.cu(v)
     model = "Vertex" if vs else "GLCompute" if cs or msc else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
     ms_blk = ms and not msc and (gen.uses_clip or gen.uses_cull)
-    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
+    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index", "%base_vertex", "%base_instance"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)])) if ms else []) + (
@@ -7656,6 +7656,8 @@ def assemble(gen):
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
         if 3 in gen.uses_store_views:
             caps.append("Image1D")
+    if vs:
+        caps.append("DrawParameters")   # BaseVertex / BaseInstance (shaderDrawParameters), see the seeding of v0 / v3
     if gsx:
         caps.append("Geometry")
     if ms and not msc:
@@ -7703,6 +7705,8 @@ def assemble(gen):
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
         dec.append("OpDecorate %instance_index BuiltIn InstanceIndex")
+        dec.append("OpDecorate %base_vertex BuiltIn BaseVertex")
+        dec.append("OpDecorate %base_instance BuiltIn BaseInstance")
     if cs:
         dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %local_id BuiltIn LocalInvocationId"]
     if gsx:
@@ -8049,6 +8053,8 @@ def assemble(gen):
     if vs:
         gvars.append("%vertex_index = OpVariable %_ptr_Input_int Input")
         gvars.append("%instance_index = OpVariable %_ptr_Input_int Input")
+        gvars.append("%base_vertex = OpVariable %_ptr_Input_int Input")
+        gvars.append("%base_instance = OpVariable %_ptr_Input_int Input")
     for reg, ctype in gen.vertex_inputs:
         ptr = {1: "%_ptr_Input_v4u", 2: "%_ptr_Input_v4i"}.get(ctype, "%_ptr_Input_v4")
         gvars.append(f"%vin{reg} = OpVariable {ptr} Input")
@@ -8087,11 +8093,18 @@ def assemble(gen):
                f"%ud{i}s = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(i)}",
                f"OpStore %ud{i}s %ud{i}"]
     if vs:
-        fn += ["%vi = OpLoad %int %vertex_index", "%viu = OpBitcast %uint %vi",
+        # The hardware's VS input VGPRs are zero-based: v0 is the vertex id without the draw's base vertex and v3
+        # the instance id without its first instance (Mesa: ac.vertex_id = load_vertex_id_zero_base, the base in
+        # the base_vertex SGPR; ac.instance_id = load_instance_id, the base in start_instance). Vulkan's
+        # VertexIndex / InstanceIndex include firstVertex|vertexOffset / firstInstance, so subtract BaseVertex /
+        # BaseInstance. GPU-checked with runtime/test/shaders/vs_base_ids.asm (VKH_DRAW=16,7).
+        fn += ["%vi = OpLoad %int %vertex_index", "%bv = OpLoad %int %base_vertex", "%vz = OpISub %int %vi %bv",
+               "%viu = OpBitcast %uint %vz",
                "%v0p = OpAccessChain %_ptr_Function_uint %vgpr %c0", "OpStore %v0p %viu"]
         # v3 = instance id. Over the corpus, the 494 VS that read v3 before writing it are exactly ones whose input
         # signature declares SV_InstanceID, and no VS reads v1 or v2 on entry.
-        fn += ["%ii = OpLoad %int %instance_index", "%iiu = OpBitcast %uint %ii",
+        fn += ["%ii = OpLoad %int %instance_index", "%bi = OpLoad %int %base_instance", "%iz = OpISub %int %ii %bi",
+               "%iiu = OpBitcast %uint %iz",
                f"%v3p = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(3)}", "OpStore %v3p %iiu"]
     if gsx:
         fn[2:2] = ["%gs_stage = OpVariable %_ptr_Function_gs_stage Function %null_gs_stage",
@@ -9401,7 +9414,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "RuntimeDescriptorArray": "runtimeDescriptorArray", "ImageGatherExtended": "shaderImageGatherExtended",
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
-             "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex"}
+             "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
+             "DrawParameters": "shaderDrawParameters"}
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),

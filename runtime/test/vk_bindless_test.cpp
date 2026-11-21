@@ -199,7 +199,8 @@ int main(int argc, char** argv) {
 
     // The features ps_tex's metadata names (bufferDeviceAddress, runtimeDescriptorArray, shaderInt64), dynamic
     // indexing of the image array, and whichever descriptor-indexing flags the set can use.
-    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &have11};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
     if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || !have.features.shaderInt64 ||
@@ -213,7 +214,10 @@ int main(int argc, char** argv) {
                                      have12.descriptorBindingStorageImageUpdateAfterBind &&
                                      have12.descriptorBindingStorageBufferUpdateAfterBind;
     device_flags.partially_bound = have12.descriptorBindingPartiallyBound == VK_TRUE;
-    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) for the zero-based v0 / v3.
+    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    enable11.shaderDrawParameters = have11.shaderDrawParameters;
+    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.bufferDeviceAddress = VK_TRUE;
     enable12.runtimeDescriptorArray = VK_TRUE;
     enable12.descriptorIndexing = have12.descriptorIndexing;
