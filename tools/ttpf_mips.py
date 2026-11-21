@@ -717,7 +717,7 @@ def check(pool, index):
     if all(px is None for px in decoded):
         print(json.dumps(dict(index=index, blocked=(
             f"format {d['format']} is not one of the BC formats this tool decodes "
-            "(71/72/77/78/80/81/83/84)")), indent=1))
+            "(71/72/77/78/80/83)")), indent=1))
         return 2
     errs = []
     for k in range(1, d["mips"]):

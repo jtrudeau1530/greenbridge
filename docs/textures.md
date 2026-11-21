@@ -170,7 +170,7 @@ tile. The allocation spans and the decoded content both put the tail at the comp
 | format without an element-size mapping | 19 |
 | **total** | **14,030** |
 
-- 11,570 have no BCPack chunk: all 35,727 mips decode (2.91 GiB decompressed).
+- 11,570 have every mip in a zlib/raw chunk: all 35,727 mips decode (2.91 GiB decompressed).
 - 469 more have a zlib/raw tail tile but a BCPack larger mip, so only their lower mips can be
   exported.
 - The 19 blocked records are mode 1 (64 KiB) with DXGI formats 156, 199, 211 and 226; the
