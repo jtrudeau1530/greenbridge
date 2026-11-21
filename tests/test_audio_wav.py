@@ -57,6 +57,20 @@ class AudioWavTest(unittest.TestCase):
         self.assertIn("0 WAV written", p.stdout)
         self.assertIn("1 already present", p.stdout)
 
+    def test_decode_preserves_an_existing_wav_at_the_old_temporary_name(self):
+        old_tmp = self.dst + ".part.wav"
+        os.makedirs(self.out)
+        with open(old_tmp, "wb") as f:
+            f.write(b"previous output")
+        # This input would resume from old_tmp while the other input is decoded.
+        shutil.copyfile(self.src, os.path.join(os.path.dirname(self.src), "one.wav.part.opus"))
+        p = self.run_tool(os.path.dirname(self.src), "--out", self.out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("1 WAV written, 1 already present", p.stdout)
+        with open(old_tmp, "rb") as f:
+            self.assertEqual(f.read(), b"previous output")
+        self.assertEqual(sorted(os.listdir(self.out)), ["one.wav", "one.wav.part.wav"])
+
     def test_missing_ffmpeg_is_an_explanation_not_a_traceback(self):
         p = self.run_tool(self.src, "--out", self.out, "--ffmpeg", os.path.join(self.dir, "no-ffmpeg"))
         self.assertNotEqual(p.returncode, 0)
