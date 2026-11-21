@@ -32,8 +32,19 @@ if(WIN32)
   target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
-  find_library(D3D12_LIBRARY NAMES d3d12)
-  find_library(DXGI_LIBRARY NAMES dxgi)
+  # find_library searches %LIB% (a Developer Prompt), not the Windows SDK the Visual Studio generator links
+  # against, so also look in that SDK's um/x64 folder.
+  set(_sdk_lib_hints)
+  if(DEFINED ENV{WindowsSdkDir} AND DEFINED ENV{WindowsSDKLibVersion})
+    list(APPEND _sdk_lib_hints "$ENV{WindowsSdkDir}Lib/$ENV{WindowsSDKLibVersion}um/x64")
+  endif()
+  get_filename_component(_kits_root
+    "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots;KitsRoot10]" ABSOLUTE)
+  if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION AND EXISTS "${_kits_root}")
+    list(APPEND _sdk_lib_hints "${_kits_root}/Lib/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/um/x64")
+  endif()
+  find_library(D3D12_LIBRARY NAMES d3d12 HINTS ${_sdk_lib_hints})
+  find_library(DXGI_LIBRARY NAMES dxgi HINTS ${_sdk_lib_hints})
   if(D3D12_LIBRARY)
     add_executable(root_sig_test
       test/root_sig_test.cpp
