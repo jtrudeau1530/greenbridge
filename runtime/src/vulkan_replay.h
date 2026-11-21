@@ -584,6 +584,22 @@ struct QueryPool {
     std::vector<bool> ended;
 };
 
+// A compute pipeline as replay needs it. code_base is the console VA of the shader's FSSM blob (push-constant
+// dwords 34-35), 0 when the shader does not read it.
+struct ComputePipeline {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::uint64_t code_base = 0;
+};
+
+// The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
+struct ShaderUserData {
+    std::uint32_t s[32];
+    std::uint64_t heap_base;
+    std::uint64_t code_base;
+};
+static_assert(sizeof(ShaderUserData) == 144);
+
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -611,6 +627,11 @@ struct ReplayFunctions {
     PFN_vkCmdEndQuery end_query = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
+    PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
+    PFN_vkCmdPushConstants push_constants = nullptr;
+    PFN_vkCmdDispatch dispatch = nullptr;
+    std::function<const ComputePipeline*(std::uintptr_t)> compute_pipeline;
+    std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
@@ -652,6 +673,7 @@ struct Prepared {
     VkClearColorValue clear_color{};                 // ... the value that writes it into the image
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
     QueryPool* queries = nullptr;  // query commands: the heap
+    ComputePipeline pipeline;  // dispatches
 };
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
@@ -1028,7 +1050,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         !within(offset + (depth - 1) * slice_pitch, (rows - 1) * placed.row_pitch + row_bytes, buffer.size))
         return ReplayResult::invalid_copy;
     VkBufferImageCopy region{};
-    region.bufferOffset = offset;
+    region.bufferOffset = buffer.buffer_offset + offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
     region.bufferImageHeight = depth > 1 ? std::uint32_t(slice_rows * format.block) : 0;
     region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
@@ -1043,7 +1065,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
 inline ReplayResult prepare_resource_copy(Prepared& p) {
     if (p.binding.buffer && p.source.buffer) {
         if (p.binding.size != p.source.size) return ReplayResult::invalid_copy;
-        p.buffer_copies.push_back({0, 0, p.source.size});
+        p.buffer_copies.push_back({p.source.buffer_offset, p.binding.buffer_offset, p.source.size});
         return ReplayResult::success;
     }
     const ResourceBinding &dst = p.binding, &src = p.source;
@@ -1343,7 +1365,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     !detail::within(buffer_copy->dst_offset, buffer_copy->size, p.binding.size) ||
                     !detail::within(buffer_copy->src_offset, buffer_copy->size, p.source.size))
                     return ReplayResult::invalid_copy;
-                p.buffer_copies.push_back({buffer_copy->src_offset, buffer_copy->dst_offset, buffer_copy->size});
+                p.buffer_copies.push_back({p.source.buffer_offset + buffer_copy->src_offset,
+                                           p.binding.buffer_offset + buffer_copy->dst_offset, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
             } else {
@@ -1430,6 +1453,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                     p.binding.size))
                     return ReplayResult::invalid_query;
             }
+        } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+            if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
+                return ReplayResult::unsupported;
+            const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
+            if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+            p.pipeline = *pipeline;
         }
     }
     return ReplayResult::success;
@@ -1787,6 +1816,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk.fill_buffer(command_buffer, p.binding.buffer, offset, VkDeviceSize(run) * size, 0);
                 index += run;
             }
+        } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+            ShaderUserData data{};
+            std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
+            data.heap_base = vk.heap_base;
+            data.code_base = p.pipeline.code_base;
+            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+            vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         }
     }
     // Predication does not carry over to the next command list.

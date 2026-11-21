@@ -3,7 +3,8 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication, discards, immediate buffer writes, atomic copies and queries. It has no Windows or Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies, queries and dispatches. It has no Windows
+// or Vulkan dependency.
 
 #include <algorithm>
 #include <array>
@@ -342,6 +343,16 @@ struct ResolveSubresource {
     std::optional<ResolveRegion> region = std::nullopt;
 };
 
+// Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
+// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5).
+struct Dispatch {
+    std::uintptr_t pipeline;
+    std::array<std::uint32_t, 32> user_data;
+    std::uint32_t x;
+    std::uint32_t y;
+    std::uint32_t z;
+};
+
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
 inline constexpr std::uint32_t texture_data_pitch_alignment = 256;
 inline constexpr std::uint32_t texture_data_placement_alignment = 512;
@@ -476,7 +487,7 @@ struct ResolveQueries {
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries>;
+                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, Dispatch>;
 
 class CommandList {
 public:
@@ -548,6 +559,13 @@ public:
                 return false;
         }
         return append(resolve);
+    }
+
+    // A dispatch with no groups does nothing in D3D12, and is not recorded.
+    bool dispatch(const Dispatch& dispatch) {
+        if (!dispatch.pipeline) return false;
+        if (!dispatch.x || !dispatch.y || !dispatch.z) return !closed_;
+        return append(dispatch);
     }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
