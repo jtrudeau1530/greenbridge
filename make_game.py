@@ -268,7 +268,14 @@ def shaders(game: str, work: str, jobs: int) -> None:
     if not os.path.isdir(os.path.join(dxbc, "fssm")):
         log("shaders: unpacking native code")
         py("fssm_unpack.py", dxbc)
-    disasm = os.path.join(sh, "disasm")
+    # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
+    # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
+    disasm = os.path.join(dxbc, "disasm")
+    old = os.path.join(sh, "disasm")
+    if os.path.isdir(old) and not os.path.isdir(disasm):
+        log("shaders: moving disasm into the carve folder and translating again")
+        os.rename(old, disasm)
+        shutil.rmtree(os.path.join(sh, "spirv"), ignore_errors=True)
     if not os.path.isdir(disasm) or len(os.listdir(disasm)) < 1000:
         need(os.environ.get("LLVM_MC", "llvm-mc"),
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's full path.")
