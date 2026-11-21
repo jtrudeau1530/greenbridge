@@ -79,7 +79,7 @@ Two observations matter for a decoder:
 +0x08  u64 pointer into 0x50xxxxxx
 +0x10  "0DRP"                  (bytes 30 44 52 50)
 +0x14  u32 122                 (same value in all 22,823)
-+0x20  u64 page count          (observed 1..32)
++0x20  u64 page count          (observed 1..41, 32 distinct values)
 +0x28  four u64 pointers       (0x50xxxxxx)
 +0x48  four u16 values
 ```
@@ -208,8 +208,9 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
   streams accounts for the 11.59 GB above.
 - **No nested zlib:** in eight sampled zero-prefixed pages, none of the `78 01/5E/9C/DA` byte pairs started a
   valid nested zlib stream. The outer zlib stream is the only compression layer observed.
-- **No known codec at the sampled headers:** no zstd or LZ4 frame magic was found in the first 4 KiB of any
-  stream. gzip, bzip2 and lzma byte patterns occur, but none started a valid stream at the sampled positions.
+- **No known codec at the sampled headers:** no zstd or LZ4 frame magic was found in the first 4 KiB of the
+  130,449 indexed streams. gzip, bzip2 and lzma byte patterns occur, but none started a valid stream at the
+  sampled positions.
   No Oodle signature is known from these bytes; none is guessed.
 - **Still opaque:** high-entropy blocks inside `other` and zero-prefixed pages (4 KiB blocks up to 7.96
   bits/byte), the 1,790 packed clip streams, and the fields of `MoVE` beyond the version and size hint.
