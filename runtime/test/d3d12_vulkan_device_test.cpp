@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -770,6 +771,86 @@ int main() {
                     report("resolved texel", row * size + col,
                            down + resolved_place.Offset + row * resolved_place.Footprint.RowPitch + col * 4,
                            resolved_green, 4);
+
+            // Move a cropped two-colour region into a larger red texture.
+            constexpr UINT region_width = 10, region_height = 9;
+            constexpr auto region_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            const auto region_desc =
+                texture_desc(region_width, region_height, region_format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            Ref<ID3D12Resource> region_target;
+            EXPECT(SUCCEEDED(create(default_heap, region_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, region_target)));
+            device->CreateRenderTargetView(region_target.p, nullptr, rtv0);
+            cursor = 0;
+            const auto region_place = place(device.p, region_target.p, 0, cursor);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            barrier = transition(msaa.p, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &barrier);
+            const D3D12_RECT blue_patch{2, 3, 4, 5};
+            list->ClearRenderTargetView(rtv1, blue, 1, &blue_patch);
+            list->ClearRenderTargetView(rtv0, red, 0, nullptr);
+            const D3D12_RESOURCE_BARRIER resolve_barriers[] = {
+                transition(msaa.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+                transition(region_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST)};
+            list->ResourceBarrier(2, resolve_barriers);
+            D3D12_RECT region{1, 2, 5, 5};
+            const auto region_copy = subresource(region_target.p, 0), region_out = footprint(readback.p, region_place);
+            const auto resolve_and_readback = [&](UINT x, D3D12_RECT* rect, UINT64 fence_value) {
+                list7->ResolveSubresourceRegion(region_target.p, 0, x, 1, msaa.p, 0, rect, region_format,
+                                                D3D12_RESOLVE_MODE_AVERAGE);
+                const auto to_copy = transition(region_target.p, D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &to_copy);
+                list->CopyTextureRegion(&region_out, 0, 0, 0, &region_copy, nullptr);
+                if (list->Close() != S_OK) return false;
+                queue->ExecuteCommandLists(1, lists);
+                return rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success &&
+                       SUCCEEDED(queue->Signal(fence.p, fence_value)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr));
+            };
+            EXPECT(resolve_and_readback(4, &region, 5));
+            const std::uint8_t resolved_red[4] = {255, 0, 0, 255}, resolved_blue[4] = {0, 0, 255, 255};
+            for (UINT row = 0; row < region_height; ++row)
+                for (UINT col = 0; col < region_width; ++col) {
+                    const bool in_region = row >= 1 && row < 4 && col >= 4 && col < 8;
+                    const bool in_blue = row >= 2 && row < 4 && col >= 5 && col < 7;
+                    report("partial resolve texel", row * region_width + col,
+                           down + region_place.Offset + row * region_place.Footprint.RowPitch + col * 4,
+                           in_blue ? resolved_blue : in_region ? resolved_green : resolved_red, 4);
+                }
+
+            // A null rectangle resolves the entire source at the destination offset.
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const auto to_resolve = transition(region_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                               D3D12_RESOURCE_STATE_RESOLVE_DEST);
+            list->ResourceBarrier(1, &to_resolve);
+            EXPECT(resolve_and_readback(1, nullptr, 6));
+            for (UINT row = 0; row < region_height; ++row)
+                for (UINT col = 0; col < region_width; ++col) {
+                    const bool in_source = row >= 1 && col >= 1 && col < 9;
+                    const bool in_blue = row >= 4 && row < 6 && col >= 3 && col < 5;
+                    report("whole source at offset", row * region_width + col,
+                           down + region_place.Offset + row * region_place.Footprint.RowPitch + col * 4,
+                           in_blue ? resolved_blue : in_source ? resolved_green : resolved_red, 4);
+                }
+
+            D3D12_RECT out_of_source{0, 0, LONG(size + 1), 1};
+            for (auto [x, rect] : {std::pair{0u, &out_of_source}, std::pair{7u, &region}}) {
+                EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                list->ResourceBarrier(1, &to_resolve);
+                list7->ResolveSubresourceRegion(region_target.p, 0, x, 1, msaa.p, 0, rect, region_format,
+                                                D3D12_RESOLVE_MODE_AVERAGE);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
+            }
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list7->ResolveSubresourceRegion(region_target.p, 0, 4, 1, msaa.p, 0, &region, region_format,
+                                            D3D12_RESOLVE_MODE_MAX);
+            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list7->ResolveSubresourceRegion(region_target.p, 0, 4, 1, msaa.p, 0, &region,
+                                            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, D3D12_RESOLVE_MODE_AVERAGE);
+            EXPECT(list->Close() == E_INVALIDARG);
 
             // A resolve of a resource into itself is refused when it is recorded, one from a single-sampled
             // texture when it is executed; nothing is submitted.

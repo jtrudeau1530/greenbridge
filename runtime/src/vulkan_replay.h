@@ -835,9 +835,7 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     return ReplayResult::success;
 }
 
-// ResolveSubresource through vkCmdResolveImage: a multisampled colour subresource into a single-sampled one of
-// the same size and format. Depth-stencil resolves, and resolves between two formats of a typeless family, are
-// not supported yet.
+// Resolve a multisampled colour image into a single-sampled image of the same format.
 inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared& p) {
     VkImageSubresourceRange dst{}, src{};
     if (!copy_subresource(p.binding, resolve.dst_subresource, dst) ||
@@ -845,13 +843,26 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
         return ReplayResult::invalid_subresource;
     if (p.source.samples <= 1 || p.binding.samples != 1 || p.binding.volume) return ReplayResult::invalid_copy;
     const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
-    if (from.width != to.width || from.height != to.height) return ReplayResult::invalid_copy;
+    VkOffset3D src_offset{}, dst_offset{};
+    VkExtent3D extent{from.width, from.height, 1};
+    if (const auto& region = resolve.region) {
+        dst_offset = {std::int32_t(region->dst_x), std::int32_t(region->dst_y), 0};
+        if (const auto& r = region->src_rect) {
+            if (std::uint32_t(r->right) > from.width || std::uint32_t(r->bottom) > from.height)
+                return ReplayResult::invalid_copy;
+            src_offset = {r->left, r->top, 0};
+            extent = {std::uint32_t(r->right - r->left), std::uint32_t(r->bottom - r->top), 1};
+        }
+        if (!within(region->dst_x, extent.width, to.width) || !within(region->dst_y, extent.height, to.height))
+            return ReplayResult::invalid_copy;
+    } else if (from.width != to.width || from.height != to.height) {
+        return ReplayResult::invalid_copy;
+    }
     if (src.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || dst.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
         p.source.format != p.binding.format)
         return ReplayResult::unsupported;
-    p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, {0, 0, 0},
-                 {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, {0, 0, 0},
-                 {from.width, from.height, 1}};
+    p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, src_offset,
+                 {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, dst_offset, extent};
     p.range = dst;
     p.source_range = src;
     return ReplayResult::success;
