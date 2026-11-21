@@ -149,8 +149,8 @@ What is implemented (all of it testable without the game):
 
 - **IR** (`runtime/src/command_list.h`): legacy barriers (transition, UAV, aliasing; split barriers record their end
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
-  replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles, and
-  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`.
+  replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles,
+  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, and `ResolveSubresource`.
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
@@ -162,6 +162,10 @@ What is implemented (all of it testable without the game):
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
+  `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
+  subresource into a single-sampled one of the same size and format. Depth-stencil resolves, and resolves between
+  two formats of one typeless family, are refused as unsupported. A multisampled texture copies only to one with
+  the same sample count and has no footprint.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -187,10 +191,12 @@ What is implemented (all of it testable without the game):
   - descriptor heaps whose slots are 32 bytes (`GetDescriptorHandleIncrementSize`; the console's increments are
     question 4). RTV/DSV slots hold a `TargetView`; shader-visible heaps return a GPU handle, but nothing reads it
     yet;
-  - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D` and `TEXTURE2DARRAY`;
+  - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D`, `TEXTURE2DMS` and
+    `TEXTURE2DARRAY`;
   - committed buffers (upload and readback heaps mapped persistently and zeroed) and 2D textures in the common
     render-target, depth and texture formats (typeless families become mutable-format images), plus non-attachment
-    3D textures with mipmapped upload, image copy and readback;
+    3D textures with mipmapped upload, image copy and readback, and multisampled 2D textures (single-mip render
+    targets or depth-stencils, in the sample counts the GPU has for the format);
   - `CheckFeatureSupport` for feature levels (up to 12_1) and architecture. Every other query is logged and
     refused until the trace shows what the game asks (question 11);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
@@ -209,7 +215,8 @@ What is implemented (all of it testable without the game):
   `VkQueue` behind a submit lock (question 12).
 
 Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, volume attachment
-views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), MSAA, 1D textures and the swapchain;
+views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves and
+`ResolveSubresourceRegion`, 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
 sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error; the GCL8
@@ -227,6 +234,10 @@ and any validation error fails them.
 - `vk_command_replay_test`, part A: only Vulkan 1.0 functions and no tracker.
 - `vk_command_replay_test`, part B: rectangle clears, a depth clear while the stencil plane is read-only, a promoted
   texture, and enhanced barriers including a discard.
+- `vk_command_replay_test`, part C: a 4x4x4 volume uploaded from a footprint, copied as a 2x2x2 block and whole,
+  and read back; a 4x multisampled target cleared and resolved; and the copies and resolves that must be refused
+  (a z range past the volume or its footprint, a footprint past the buffer, a resolve from a single-sampled
+  texture or into another size, a multisampled texture copied to a footprint or to another sample count).
 - `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
   the CPU has not signalled holds the GPU back.
 - `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
@@ -238,8 +249,10 @@ and any validation error fails them.
   Results come back through D3D12 itself (`CopyTextureRegion` into a readback heap, then `Map`): the render
   target, the depth and stencil planes, and a never-written texture (which must be zero). A second list uploads a
   pattern and copies it on: whole into a texture created in `COMMON`, a boxed part into a smaller texture, a BC1
-  round trip and a buffer region. `GetCopyableFootprints` is compared with the PC runtime's, and a short run
-  repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
+  round trip and a buffer region. A 4x multisampled render target is cleared through a `TEXTURE2DMS` view and
+  resolved into a texture that is read back; the multisampled shapes D3D12 refuses are refused, and so is a
+  resolve from a single-sampled texture. `GetCopyableFootprints` is compared with the PC runtime's, and a short
+  run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.

@@ -1,6 +1,6 @@
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
-// committed buffers and 2D textures, a few feature queries. Everything else is a generated stub that reports
+// committed buffers and textures (2D, multisampled 2D, 3D), a few feature queries. Everything else is a generated stub that reports
 // itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what is still open.
 #include "d3d12_com.h"
 
@@ -110,11 +110,20 @@ struct DeviceState {
     std::unique_ptr<leonida::VulkanContext> context;
     VkPhysicalDeviceMemoryProperties memory{};
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
+    PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
 
     bool depth_usable(VkFormat format) const {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
         return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    }
+
+    // Whether the GPU has this format and usage in this sample count: not every format has every count.
+    bool samples_usable(const VkImageCreateInfo& image) const {
+        VkImageFormatProperties properties{};
+        return image_format_properties(info.physical, image.format, image.imageType, image.tiling, image.usage,
+                                       image.flags, &properties) == VK_SUCCESS &&
+               (properties.sampleCounts & image.samples);
     }
 
     // The first memory type with `required`, preferring one that also has `preferred`.
@@ -234,13 +243,18 @@ public:
         info.extent = {std::uint32_t(desc_.Width), desc_.Height, depth};
         info.mipLevels = desc_.MipLevels;
         info.arrayLayers = volume ? 1 : desc_.DepthOrArraySize;
-        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        const std::uint32_t samples = std::max<UINT>(1, desc_.SampleDesc.Count);
+        info.samples = VkSampleCountFlagBits(samples);
         info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
             info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         if (!(desc_.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (samples > 1 && !device_.samples_usable(info)) {
+            log_once("sample count not supported by the GPU for this format:", int(samples));
+            return E_INVALIDARG;
+        }
         if (vk.vkCreateImage(device_.info.device, &info, nullptr, &image_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
@@ -258,6 +272,7 @@ public:
         binding.array_layers = info.arrayLayers;
         binding.depth = depth;
         binding.volume = volume;
+        binding.samples = samples;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
         // Never used yet: the first command that touches a part zero-fills it and moves it to the layout of the
@@ -321,9 +336,11 @@ public:
             info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
         state_.format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFormatProperties"));
+        state_.image_format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceImageFormatProperties"));
         const auto memory_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties"));
-        if (!get_device || !state_.format_properties || !memory_properties) return;
+        if (!get_device || !state_.format_properties || !state_.image_format_properties || !memory_properties) return;
         memory_properties(info.physical, &state_.memory);
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts);
@@ -410,6 +427,8 @@ public:
             view = {r->id(), 0, 0, rd.DepthOrArraySize};
             if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
                 view = {r->id(), desc->Texture2D.MipSlice, 0, 1};
+            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
+                view = {r->id(), 0, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY) {
                 view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
                         desc->Texture2DArray.ArraySize};
@@ -432,6 +451,8 @@ public:
             view = {r->id(), 0, 0, rd.DepthOrArraySize};
             if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) {
                 view = {r->id(), desc->Texture2D.MipSlice, 0, 1};
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS) {
+                view = {r->id(), 0, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) {
                 view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
                         desc->Texture2DArray.ArraySize};
@@ -461,10 +482,14 @@ public:
         } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                    (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
             log_once("volume attachment views not supported, flags:", int(desc->Flags));
-        } else if (desc->SampleDesc.Count > 1) {
-            log_once("multisampled committed resource not supported, samples:", int(desc->SampleDesc.Count));
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
             hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
+        } else if (const UINT samples = desc->SampleDesc.Count;
+                   samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
+                                   desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                                   !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))) {
+            hr = E_INVALIDARG;  // D3D12: a multisampled texture is a single-mip 2D render target or depth-stencil
         } else {
             Format format = vulkan_format(desc->Format, desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
             if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !state_.depth_usable(format.format)) {
