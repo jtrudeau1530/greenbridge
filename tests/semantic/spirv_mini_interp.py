@@ -436,6 +436,20 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
+        elif op in ("OpConvertUToF", "OpConvertSToF"):
+            x = val(a[1])
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
+                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
+        elif op in ("OpConvertFToU", "OpConvertFToS"):
+            x, bits = val(a[1]), types.bits(a[0])
+            if not isinstance(x, float) or not math.isfinite(x):
+                raise UnsupportedConstruct(f"{op} of a non-finite value (undefined in SPIR-V)")
+            n = math.trunc(x)
+            lo, hi = (0, 1 << bits) if op == "OpConvertFToU" else (-(1 << (bits - 1)), 1 << (bits - 1))
+            if not lo <= n < hi:
+                raise UnsupportedConstruct(f"{op} out of range (undefined in SPIR-V)")
+            values[res] = n & wmask(a[0])
         elif op in ("OpFOrdEqual", "OpFOrdLessThan", "OpFOrdGreaterThan", "OpFOrdGreaterThanEqual",
                     "OpFOrdLessThanEqual", "OpFUnordNotEqual"):
             x, y = val(a[1]), val(a[2])
@@ -484,6 +498,14 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
                 values[res] = f32(abs(args[0]))
+            elif name in ("FMax", "FClamp"):
+                if any(math.isnan(v) for v in args) or (name == "FClamp" and args[1] > args[2]):
+                    raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
+                v = max(args[0], args[1])
+                values[res] = f32(v if name == "FMax" else min(v, args[2]))
+            elif name == "RoundEven":
+                x = args[0]
+                values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":
