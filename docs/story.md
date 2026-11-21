@@ -223,9 +223,8 @@ was found in the inflated sample.
 
 1. The RPF9 TOC key/schema. This project does not search for or distribute keys; without it,
    names, paths and exact entry boundaries remain unavailable.
-2. A recursive RPF9 walker. The flat zlib carve reads across hundreds of embedded sub-archives in
-   `story000` (441 additional RPF9 headers); a decoder needs their spans and TOCs to group
-   resources.
+2. A recursive RPF9 walker. The flat zlib carve does not group streams by the 441 additional RPF9
+   headers in `story000`; a decoder needs their spans and TOCs to group resources.
 3. An `RSC8` header parser and a type map for version 8001. The fixed 0x30-byte header and the
    following name are measured; the payload is not decoded.
 4. A `PSIN` section walker. The tag/length chain is measured; `LSCH`, `LENM`, `LSNS`, `LGID`,
