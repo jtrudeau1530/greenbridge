@@ -968,9 +968,20 @@ class Gen:
                "global_load_ubyte": (8, False), "global_load_sbyte": (8, True)}.get(op)
         n = 1 if (op.endswith("dword") or sub) else int(op.rsplit("x", 1)[1])
         data, vaddr, saddr = (a[0], a[1], a[2]) if load else (a[1], a[0], a[2])
-        inst = next((int(m.split(":")[1], 0) for m in mods if m.startswith("offset:")), 0)
-        if inst & 0x800:
-            inst -= 0x1000            # 12-bit signed offset
+        # The instruction offset is a 12-bit signed byte offset, and llvm-mc prints it signed (offset:-4 for the
+        # field 0xffc; it rejects offset:0xffc and anything outside -2048..2047), which is the only spelling the
+        # disassembler and build.py deliver. RX 6800 (gfx1030): pointer 0x1000, offset:-4 reads byte 0xffc.
+        inst = [m.split(":", 1)[1] for m in mods if m.startswith("offset:")]
+        if len(inst) > 1:
+            raise Unsupported(f"{op} offset form")
+        try:
+            inst = int(inst[0], 0) if inst else 0
+        except ValueError:
+            raise Unsupported(f"{op} offset:{inst[0]}") from None
+        if 0x800 <= inst <= 0xFFF:
+            inst -= 0x1000            # the raw 12-bit field from a tool that prints it unsigned: same offset
+        if not -0x800 <= inst <= 0x7FF:
+            raise Unsupported(f"{op} offset:{inst}")     # not a 12-bit value: don't guess an address
         if saddr["k"] == "sgpr" and saddr.get("n") == 2:
             lo, hi = self.load_reg("sgpr", saddr["r"]), self.load_reg("sgpr", saddr["r"] + 1)
             voff = self.load_reg("vgpr", vaddr["r"])

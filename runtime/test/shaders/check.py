@@ -40,6 +40,10 @@ CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM), ("cs_wave6
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+# Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
+# both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
+GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
+                                                 0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE])]
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
@@ -341,6 +345,8 @@ def main():
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
+    for name, groups, want in GLOBAL_OFFSET:
+        results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))

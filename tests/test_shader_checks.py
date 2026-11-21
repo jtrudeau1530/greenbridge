@@ -23,7 +23,7 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
 # tests, pixel tests, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + len(check.BOUNDS) + 4)  # two mesh fixtures, ps_tex and cs_cmpx_class_f32
+         + len(check.PIXEL_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET) + 4)  # two mesh fixtures, ps_tex and cs_cmpx_class_f32
 
 
 class Wave64Checks(unittest.TestCase):
@@ -62,6 +62,9 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = 305419896 305419896 0 4008636142 4008636142 4008636142 4008636142 4008636142\n"
             if name == "cs_cmpx_class_f32":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CMPX_CLASS_WORDS)) + "\n"
+            if name == "cs_global_neg_offset":
+                self.assertEqual(args[0], "40")
+                return 0, "out[0..7] = " + " ".join(map(str, check.GLOBAL_OFFSET[0][2])) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":
