@@ -339,6 +339,14 @@ class JobsHandlingTest(unittest.TestCase):
 class WavValidationTest(unittest.TestCase):
     """Test --wav validation in preflight and assets stage behavior."""
 
+    def setUp(self):
+        # preflight runs `dotnet --list-sdks` (#223). Follow the test's faked shutil.which instead: the SDK counts as
+        # installed exactly when the test says dotnet is on PATH, so no real dotnet is needed and none is consulted.
+        patcher = patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
     @patch.object(sys, "version_info", (3, 11, 0))
     @patch("make_game.ensure_submodule")
     def test_preflight_wav_requires_ffmpeg_when_assets_included(self, _mock_submodule):
@@ -485,6 +493,13 @@ class WavValidationTest(unittest.TestCase):
 
 class PathContainmentAndDiskSpaceTest(unittest.TestCase):
     """Test rejection of output paths inside game folder and preflight disk space checks."""
+
+    def setUp(self):
+        # preflight runs `dotnet --list-sdks` (#223). Follow the test's faked shutil.which instead: the SDK counts as
+        # installed exactly when the test says dotnet is on PATH, so no real dotnet is needed and none is consulted.
+        patcher = patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_out_inside_game_folder_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

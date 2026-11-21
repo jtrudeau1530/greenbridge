@@ -32,7 +32,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::unresolved_resource: return "unknown resource";
     case leonida::ReplayResult::invalid_subresource: return "invalid subresource";
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
-    case leonida::ReplayResult::invalid_copy: return "invalid copy";
+    case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -158,6 +158,12 @@ public:
 
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
+    }
+
+    // The format picks the member of a typeless family to resolve as; the textures' own format is used.
+    void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
+                                              UINT src_subresource, DXGI_FORMAT) override {
+        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource}));
     }
 
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,

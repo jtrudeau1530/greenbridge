@@ -84,7 +84,7 @@ behaviour. Fixing `fssm_unpack.py` is deliberately out of scope for this change.
 | `0x78` is a `(2,N)` pair; `0x80` is `0x44`/`0x45`. | `docs/fssm-analysis.md` | `0x78` low word is `2` in all; high word is `0` (14,532), `2` (9,282), or `3` (2,689). `0x80` is `0x44` (17,221) or `0x45` (9,282). | **Verified** |
 | Code is padded with `0xBF9F0000` (`s_code_end`) up to `code_end`; `code_end` is the code end. | `fssm_parse.py`, `fssm_to_rdna2.py` | The last `s_endpgm` is immediately followed by a run of `s_code_end` words up to `code_end` in 26,486/26,486 valid blobs. The last `s_endpgm` is the real program end; the filler is not code. Leonida stops at the last `s_endpgm`, SCARAB includes the filler. | **Behavioural difference; Leonida's end is cleaner** |
 | Multiple programs per blob. | Not stated in SCARAB; `branch_report` walks the whole section | In the code range of the 26,486 blobs with a valid `code_end`: `s_endpgm` count is 1 in 18,558; 2 in 5,799; 3 in 1,535; 4 in 232; 5+ in 362. Leonida's last-`s_endpgm` range covers all of them. | **Missing fact in SCARAB** |
-| The post-`code_end` tail is a 20-byte-record binding table, then `[-1][0][u16 len][name]`. | `fssm_parse.py`, `docs/fssm-analysis.md` | Not re-measured here. Leonida does not parse the tail; the RPF name is authoritative. | **Unknown / not needed** |
+| The post-`code_end` tail is 16 bytes of `0xBF9F0000` filler, a u32 header and a zero word, a 20-byte-record table ended by `0xFFFFFFFF`, then `u32 0, u16 0, u16 len, name`. | `fssm_header.binding_table` | 26,503/26,503 blobs parse. 5,640,704 records (mean 212.8, max 385, 17 empty). Header is 4 in 24,572, 3 in 1,914 and 0 in the 17 `code_end = DEAD` blobs. The tail name is a substring of the container name in all 26,503 cases, exact in 691. At least 40 bytes follow the name and are not parsed. | **Verified; layout corrected** |
 
 ### Why `+0x28` matters
 
@@ -182,8 +182,8 @@ PR description.
   established. It is a fixed header, not code.
 - The vendor disassembler's `asic(CI)` label is unexplained; it does not override the
   gfx1013 decode result.
-- The post-`code_end` 20-byte binding table and the `[-1][0][u16 len][name]` record were not
-  re-measured.
+- The post-`code_end` binding table is parsed, but the meaning of its five words and the bytes
+  after the name are not established.
 - The negative prior-art claim (`FSSM`/`0x101`/`0xDEADBEEF` have no public prior art) was
   not re-run; it is a web-search result, not a format fact.
 

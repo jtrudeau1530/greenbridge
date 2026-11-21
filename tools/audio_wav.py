@@ -3,7 +3,8 @@
     python -I audio_wav.py <src dir | .ogg/.opus file> [--out DIR] [--jobs N] [--ffmpeg PATH]
 
 Every .ogg/.opus file under the source is decoded to <out>/<relative path>.wav (the name keeps its directory,
-the extension becomes .wav). Existing .wav files are skipped, so a stopped run continues where it left off, and
+the extension becomes .wav; files that would share a name, such as x.ogg and x.opus, keep their extension:
+x.ogg.wav, x.opus.wav). Existing .wav files are skipped, so a stopped run continues where it left off, and
 .wav inputs are never decoded. With no --out, a source directory writes to <src>/wav and a single file writes
 next to itself.
 
@@ -112,6 +113,31 @@ def collect(src: str):
     return files, not_opus
 
 
+def output_names(items):
+    """Give every input its own output stem, and count how many had to keep their extension.
+
+    x.ogg and x.opus (or x.OPUS, which is the same name on Windows) both became x.wav: two jobs then decoded into
+    the same x.wav.part.wav at once and one result was lost, and with --jobs 1 the second silently replaced the
+    first. Inputs that share a stem now keep their extension (x.ogg.wav, x.opus.wav); a name that still clashes
+    gets ~2, ~3. Names that are unique stay as they were, so existing WAVs are still found and skipped."""
+    count = {}
+    for _, rel in items:
+        key = os.path.normcase(rel)
+        count[key] = count.get(key, 0) + 1
+    named, used, renamed = [], set(), 0
+    for path, rel in items:
+        name = rel
+        if count[os.path.normcase(rel)] > 1:
+            name = rel + os.path.splitext(path)[1]
+            renamed += 1
+        base, n = name, 2
+        while os.path.normcase(name) in used:
+            name, n = f"{base}~{n}", n + 1
+        used.add(os.path.normcase(name))
+        named.append((path, name))
+    return named, renamed
+
+
 def decode(ffmpeg: str, src: str, dst: str):
     """Decode one file to a temporary WAV next to dst, then rename it, so an interrupted run leaves no short WAV."""
     tmp = dst + ".part.wav"
@@ -175,6 +201,11 @@ def main() -> int:
     ffmpeg = find_ffmpeg(a.ffmpeg)
     if not ffmpeg:
         return 2
+
+    items, renamed = output_names(items)
+    if renamed:
+        print(f"{renamed} file(s) share a name with another input (e.g. x.ogg and x.opus) and keep their extension "
+              f"in the WAV name (x.ogg.wav)")
 
     jobs = max(1, a.jobs)
     t0 = time.time()
