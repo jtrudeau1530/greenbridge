@@ -4146,7 +4146,15 @@ class Gen:
             elif kind == "_c_lz":
                 d = self.tmp()
                 self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', '%f0')}")
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, self.tou(d))
+                if d16:
+                    # d16: the compare result is an f16 in the low half, as in the other d16 paths below. Until
+                    # 2026-11-21 it was written as f32 bits, whose low half is 0 for every result (1.0 = 0x3f800000).
+                    v2, r = self.tmp(), self.tmp()
+                    self.emit(f"{v2} = OpCompositeConstruct %v2float {d} %f0")
+                    self.emit(f"{r} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
+                else:
+                    r = self.tou(d)
+                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, r)
                 return
             else:
                 raise Unsupported(op)
