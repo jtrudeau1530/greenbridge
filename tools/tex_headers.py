@@ -164,6 +164,151 @@ def calc_mip_level_bytes(w, h, depth=1, fmt=28, align=1):
     return total
 
 
+# AMD Gfx10 compact mip chain (the TTPF "compact" profile).
+#
+# The 9-bit descriptor mode is a low flag bit plus a 4-bit Gfx10 tile mode at
+# bit 1. Tile mode 0 is SW_64KB_D; the observed 1-3 and 9-12 values are
+# SW_4KB_S. Mips are stored smallest first. The last few mips share one tile at
+# offset 0 instead of getting their own allocation.
+COMPACT_TILE_4K = 4096
+COMPACT_TILE_64K = 65536
+COMPACT_MAX_TAIL_MIPS = {COMPACT_TILE_4K: 8, COMPACT_TILE_64K: 12}
+_COMPACT_ELEMENT_LOG = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}
+_COMPACT_TILE_ORIGIN = {0: (16, 16), 1: (16, 8), 2: (8, 8), 3: (8, 4), 4: (4, 4)}
+
+
+def gfx10_tile_mode(mode):
+    """Return the 4-bit Gfx10 tile mode hidden in the TTPF descriptor mode."""
+    if not isinstance(mode, int) or mode < 0:
+        raise ValueError(f"invalid descriptor mode: {mode!r}")
+    return (mode >> 1) & 0xF
+
+
+def gfx10_tile_bytes(mode):
+    """Tile size for a descriptor mode: 64 KiB only for tile mode 0."""
+    return COMPACT_TILE_64K if gfx10_tile_mode(mode) == 0 else COMPACT_TILE_4K
+
+
+def parse_etpf_texture_record(record):
+    """Parse one 16-byte ETPF texture record (the RDS5 embedded descriptor).
+
+    The fields are the tuple the compact-profile gate checks:
+    ``(mode, width, height, mips, non_tail, element_bytes)``.
+    """
+    if len(record) < 16:
+        raise ValueError(f"ETPF texture record truncated: expected 16 bytes, got {len(record)}")
+    a, b, c, d = struct.unpack_from("<IIII", record, 0)
+    return {
+        "width": (a & 0x3FFF) + 1,
+        "height": ((a >> 14) & 0x3FFF) + 1,
+        "packed_mips": a >> 28,
+        "non_tail": b & 7,
+        "mips": (a >> 28) + (b & 7),
+        "format": (b >> 3) & 255,
+        "depth": ((b >> 11) & 1023) + 1,
+        "dimension": (b >> 21) & 3,
+        "mode": b >> 23,
+        "meta": c >> 21,
+        "extra": d,
+        "base": (c & 0x1FFFFF) * 4096,
+    }
+
+
+def compact_profile_key(descriptor, element_bytes):
+    """The exact tuple a validated compact-profile table is keyed on."""
+    return (descriptor["mode"], descriptor["width"], descriptor["height"],
+            descriptor["mips"], descriptor["non_tail"], element_bytes)
+
+
+def compact_surface_layout(width, height, mips, element_bytes, block=1,
+                           tile=COMPACT_TILE_4K):
+    """Compute the Gfx10 compact mip chain for one 2D texture.
+
+    ``element_bytes`` is the size of one pixel or BC block; ``block`` is 4 for
+    BC formats and 1 for uncompressed formats. Returns the allocation size,
+    the first packed-tail mip, block tile dimensions and one entry per mip
+    with its offset and region size. Raises ValueError for a mip count that
+    cannot describe the surface or a tile/element size outside the measured
+    set.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid surface dimensions {width}x{height}")
+    if element_bytes not in _COMPACT_ELEMENT_LOG:
+        raise ValueError(f"unsupported element size: {element_bytes}")
+    if block not in (1, 4):
+        raise ValueError(f"unsupported block dimension: {block}")
+    if tile not in COMPACT_MAX_TAIL_MIPS:
+        raise ValueError(f"unsupported compact tile size: {tile}")
+    levels = max(width, height).bit_length()
+    if mips < 1 or mips > levels:
+        raise ValueError(f"invalid mip count {mips} for {width}x{height}")
+
+    log = _COMPACT_ELEMENT_LOG[element_bytes]
+    half_bits = 6 if tile == COMPACT_TILE_4K else 8
+    max_tail = COMPACT_MAX_TAIL_MIPS[tile]
+    bw = 1 << (half_bits - log // 2)
+    bh = 1 << (half_bits - (log + 1) // 2)
+    mw, mh = _COMPACT_TILE_ORIGIN[log]
+    ew = (width + block - 1) // block
+    eh = (height + block - 1) // block
+
+    tail = mips
+    sizes = []
+    out = []
+    for i in range(mips):
+        wc = max(1, (ew + (1 << i) - 1) >> i)
+        hc = max(1, (eh + (1 << i) - 1) >> i)
+        if mips > 1 and wc <= bw // 2 and hc <= bh and mips - i <= max_tail:
+            tail = i
+            break
+        pw = (wc + bw - 1) // bw * bw
+        ph = (hc + bh - 1) // bh * bh
+        sizes.append(pw * ph * element_bytes)
+        out.append({
+            "index": i, "blocks_w": wc, "blocks_h": hc, "padded_w": pw, "padded_h": ph,
+            "pixels_w": max(1, width >> i), "pixels_h": max(1, height >> i),
+            "offset": 0, "region": pw * ph * element_bytes, "tile_x": 0, "tile_y": 0,
+            "in_tail": False,
+        })
+
+    off = tile if tail < mips else 0
+    for i in range(tail - 1, -1, -1):
+        out[i]["offset"] = off
+        off += sizes[i]
+    for i in range(tail, mips):
+        entry = max_tail - 1 - (i - tail)
+        moff = (16 << entry) if entry > 6 else entry << 8
+        x = y = 0
+        for bit in range(6):
+            x |= ((moff >> (9 + 2 * bit)) & 1) << bit
+            y |= ((moff >> (8 + 2 * bit)) & 1) << bit
+        wc = max(1, (ew + (1 << i) - 1) >> i)
+        hc = max(1, (eh + (1 << i) - 1) >> i)
+        out.append({
+            "index": i, "blocks_w": wc, "blocks_h": hc, "padded_w": bw, "padded_h": bh,
+            "pixels_w": max(1, width >> i), "pixels_h": max(1, height >> i),
+            "offset": 0, "region": tile, "tile_x": x * mw, "tile_y": y * mh,
+            "in_tail": True, "tail_offset": moff,
+        })
+    return {
+        "size": off, "tile": tile, "first_tail": tail, "block_w": bw, "block_h": bh,
+        "element_bytes": element_bytes, "levels": levels, "mips": out,
+    }
+
+
+def compact_layout_for_dxgi(width, height, fmt, mips, tile=COMPACT_TILE_4K):
+    """Compact layout using tex_headers' DXGI element-size table."""
+    if fmt not in FMT_INFO:
+        raise ValueError(f"unsupported format for compact layout: {fmt}")
+    bpe, blk = FMT_INFO[fmt]
+    return compact_surface_layout(width, height, mips, bpe, blk, tile)
+
+
+def compact_span_matches(layout, span):
+    """True only when an allocation span is byte-exact for the computed chain."""
+    return isinstance(span, int) and span == layout["size"]
+
+
 DDSD_CAPS = 0x00000001
 DDSD_HEIGHT = 0x00000002
 DDSD_WIDTH = 0x00000004

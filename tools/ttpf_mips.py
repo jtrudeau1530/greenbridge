@@ -3,9 +3,11 @@
 The compact profile in `TtpfReader` is the AMD Gfx10 mip-tail layout: mips smaller
 than half a tile share one tile at offset 0, and the rest are standalone, smallest
 first. `TtpfReader` only trusts a hand-validated tuple table and stops at the
-descriptor's `nonTail` field, which is not the layout boundary. This tool computes
-the layout from the descriptor and validates it against the native allocation span,
-then decodes the mips that are zlib/raw (no BCPack backend is used or guessed).
+descriptor's `nonTail` field, which is not the layout boundary. The layout rule lives
+in `tex_headers.py` (`compact_surface_layout` and the helpers around it); this tool
+supplies the RDS5 reader, decoders and commands. It computes the layout from the
+descriptor, validates it against the native allocation span, then decodes the mips
+that are zlib/raw (no BCPack backend is used or guessed).
 
 Read-only: no texture bytes are printed or committed. `scan` emits aggregate
 counters only. `layout` prints descriptor fields and offsets. `check` prints the
@@ -14,7 +16,7 @@ BC1, BC3, BC4_UNORM and BC5_UNORM (BC2, the SNORM BC4/5 variants, BC6H and BC7
 are sized but not decoded, and uncompressed tiling is not validated). `export`
 writes a full BC chain only when every source mip is zlib/raw.
 
-    python -I tools/ttpf_mips.py scan <game root or pool paths...> [--json out]
+    python -I tools/ttpf_mips.py scan <game root or pool paths...> [--json out] [--tuples]
     python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
     python -I tools/ttpf_mips.py check <pool.ttpf> <index>
     python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--mips N] [--force]
@@ -31,6 +33,12 @@ import os
 import struct
 import sys
 import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tex_headers import (  # noqa: E402
+    compact_surface_layout, gfx10_tile_bytes, gfx10_tile_mode,
+    parse_etpf_texture_record,
+)
 
 MAX_OUTPUT = 256 * 1024 * 1024
 MAX_TEXTURES = 250_000
@@ -151,12 +159,12 @@ def align(v, n):
 
 def tile_mode(mode):
     """Descriptor mode is a flag bit plus a 4-bit Gfx10 tile mode at bit 1."""
-    return (mode >> 1) & 0xF
+    return gfx10_tile_mode(mode)
 
 
 def tile_bytes(mode):
     # Tile mode 0 is SW_64KB_D; 1-3 are SW_4KB_S; 9-12 appear only on arrays.
-    return 65536 if tile_mode(mode) == 0 else 4096
+    return gfx10_tile_bytes(mode)
 
 
 def element_bytes(fmt):
@@ -166,62 +174,12 @@ def element_bytes(fmt):
 
 
 def surface_layout(width, height, fmt, mips, tile=4096):
-    """AMD Gfx10 surface layout: standalone mips smallest-first, then one tail tile.
-
-    Returns a dict with the allocation size, the first tail mip index, block
-    dimensions and a per-mip list. `offset` is relative to the allocation base.
-    """
-    eb = element_bytes(fmt)
-    log = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]
-    px = 4 if fmt in BC_FORMATS else 1
-    levels = 1
-    v = max(width, height)
-    while v > 1:
-        levels += 1
-        v >>= 1
-    if mips < 1 or mips > levels:
-        raise LayoutError(f"invalid mip count {mips} for {width}x{height}")
-    half_bits = 6 if tile == 4096 else 8
-    max_tail = 8 if tile == 4096 else 12
-    bw = 1 << (half_bits - log // 2)
-    bh = 1 << (half_bits - (log + 1) // 2)
-    mw, mh = {0: (16, 16), 1: (16, 8), 2: (8, 8), 3: (8, 4)}.get(log, (4, 4))
-    ew = (width + px - 1) // px
-    eh = (height + px - 1) // px
-    tail = mips
-    sizes = []
-    out = []
-    for i in range(mips):
-        wc = max(1, (ew + (1 << i) - 1) >> i)
-        hc = max(1, (eh + (1 << i) - 1) >> i)
-        if mips > 1 and wc <= bw // 2 and hc <= bh and mips - i <= max_tail:
-            tail = i
-            break
-        pw = align(wc, bw)
-        ph = align(hc, bh)
-        sizes.append(pw * ph * eb)
-        out.append(dict(index=i, blocks_w=wc, blocks_h=hc, padded_w=pw, padded_h=ph,
-                        pixels_w=max(1, width >> i), pixels_h=max(1, height >> i),
-                        offset=0, region=pw * ph * eb, tile_x=0, tile_y=0, in_tail=False))
-    off = tile if tail < mips else 0
-    for i in range(tail - 1, -1, -1):
-        out[i]["offset"] = off
-        off += sizes[i]
-    for i in range(tail, mips):
-        entry = max_tail - 1 - (i - tail)
-        moff = (16 << entry) if entry > 6 else entry << 8
-        x = y = 0
-        for bit in range(6):
-            x |= ((moff >> (9 + 2 * bit)) & 1) << bit
-            y |= ((moff >> (8 + 2 * bit)) & 1) << bit
-        wc = max(1, (ew + (1 << i) - 1) >> i)
-        hc = max(1, (eh + (1 << i) - 1) >> i)
-        out.append(dict(index=i, blocks_w=wc, blocks_h=hc, padded_w=bw, padded_h=bh,
-                        pixels_w=max(1, width >> i), pixels_h=max(1, height >> i),
-                        offset=0, region=tile, tile_x=x * mw, tile_y=y * mh,
-                        in_tail=True, tail_offset=moff))
-    return dict(size=off, tile=tile, first_tail=tail, block_w=bw, block_h=bh,
-                element_bytes=eb, mips=out)
+    """AMD Gfx10 surface layout: standalone mips smallest-first, then one tail tile."""
+    try:
+        return compact_surface_layout(width, height, mips, element_bytes(fmt),
+                                      4 if fmt in BC_FORMATS else 1, tile)
+    except ValueError as exc:
+        raise LayoutError(str(exc)) from exc
 
 
 def detile(layout, mip, tiled):
@@ -407,17 +365,13 @@ class Pool:
     def descriptor(self, index):
         if not 0 <= index < self.textures:
             raise IndexError(index)
-        a, b, c, d = struct.unpack_from("<IIII", self.records, index * 16)
-        return dict(
-            index=index, width=(a & 0x3FFF) + 1, height=((a >> 14) & 0x3FFF) + 1,
-            mips=(a >> 28) + (b & 7), packed_mips=a >> 28, non_tail=b & 7,
-            format=(b >> 3) & 255, depth=((b >> 11) & 1023) + 1,
-            dimension=(b >> 21) & 3, mode=b >> 23, meta=c >> 21, extra=d,
-            base=(c & 0x1FFFFF) * 4096, asset_key_at=(
-                u64(self.records, self.textures * 16 + index * 8)
-                if (self.textures * 16 + index * 8 + 8 <= len(self.records))
-                else None),
-        )
+        d = parse_etpf_texture_record(self.records[index * 16:index * 16 + 16])
+        d["index"] = index
+        d["asset_key_at"] = (
+            u64(self.records, self.textures * 16 + index * 8)
+            if (self.textures * 16 + index * 8 + 8 <= len(self.records))
+            else None)
+        return d
 
     def chunks_for(self, start, size):
         import bisect
@@ -549,12 +503,15 @@ def find_pools(arg):
     return pools
 
 
-def scan_pools(paths, as_json=None):
+def scan_pools(paths, as_json=None, include_tuples=False):
     total = dict(pools=0, entries=0, arrays=0, unsupported_format=0, format11=0,
                  layout_mismatch=0, reader_full=0, reader_partial=0,
                  reader_skip_bcpack=0, whitelist_gated=0, gated_layout_ok=0,
                  gated_full_chain=0, gated_full_mips=0, gated_full_bytes=0,
-                 gated_tail_only=0, gated_by_mode={},
+                 gated_tail_only=0, gated_partial=0, gated_no_contiguous=0,
+                 gated_no_layout=0, gated_unknown_format=0,
+                 gated_other_layout_error=0, gated_span_mismatch=0,
+                 gated_unreadable_range=0, gated_tuple_distinct=0, gated_by_mode={},
                  compact_partial_rows=0, compact_missing_mips=0,
                  compact_decodable_mips=0, compact_decodable_bytes=0,
                  compact_missing_standalone=0, compact_missing_tail=0,
@@ -562,6 +519,7 @@ def scan_pools(paths, as_json=None):
                  compact_standalone_beyond_limit=0,
                  compact_standalone_decodable_beyond_limit=0,
                  compact_full_rows=0, tile_modes={})
+    gated_tuples = {}
     for path in paths:
         pool = Pool(path)
         try:
@@ -592,10 +550,18 @@ def scan_pools(paths, as_json=None):
                         total["format11"] += 1
                     if gated:
                         total["whitelist_gated"] += 1
+                        total["gated_no_layout"] += 1
+                        if d["format"] not in ELEMENT_BYTES:
+                            total["gated_unknown_format"] += 1
+                        else:
+                            total["gated_other_layout_error"] += 1
                     continue
                 span = pool.span(i, d["base"])
                 if d["base"] == 0 or span != layout["size"]:
                     total["layout_mismatch"] += 1
+                    if gated:
+                        total["whitelist_gated"] += 1
+                        total["gated_span_mismatch"] += 1
                     continue
                 avail = []
                 for mip in layout["mips"]:
@@ -606,21 +572,45 @@ def scan_pools(paths, as_json=None):
                         break
                 if not avail:
                     total["layout_mismatch"] += 1
+                    if gated:
+                        total["whitelist_gated"] += 1
+                        total["gated_unreadable_range"] += 1
                     continue
                 if gated:
                     total["whitelist_gated"] += 1
                     total["gated_layout_ok"] += 1
                     key = str(d["mode"])
                     total["gated_by_mode"][key] = total["gated_by_mode"].get(key, 0) + 1
+                    tuple_key = (d["mode"], d["width"], d["height"], d["mips"],
+                                 d["non_tail"], layout["element_bytes"])
+                    gated_tuples[tuple_key] = gated_tuples.get(tuple_key, 0) + 1
+                    first_tail = layout["first_tail"]
                     if all(avail):
                         total["gated_full_chain"] += 1
                         total["gated_full_mips"] += d["mips"]
                         total["gated_full_bytes"] += sum(
                             mip["blocks_w"] * mip["blocks_h"] * layout["element_bytes"]
                             for mip in layout["mips"])
-                    elif (layout["first_tail"] < d["mips"] and
-                          all(avail[k] for k in range(layout["first_tail"], d["mips"]))):
-                        total["gated_tail_only"] += 1
+                    else:
+                        # After the layout fix the export limit is the usable
+                        # tail tile, or the computed tail boundary when it is
+                        # not. Count what would still export and what would not.
+                        usable_tail = (first_tail < d["mips"] and
+                                       all(avail[first_tail:]))
+                        if usable_tail:
+                            total["gated_tail_only"] += 1
+                            limit = d["mips"]
+                        else:
+                            limit = min(first_tail, len(avail))
+                        base_mip = next((k for k in range(limit) if avail[k]), None)
+                        exported = 0
+                        if base_mip is not None:
+                            while base_mip + exported < limit and avail[base_mip + exported]:
+                                exported += 1
+                        if exported:
+                            total["gated_partial"] += 1
+                        else:
+                            total["gated_no_contiguous"] += 1
                     continue
                 is_compact = compact_row(d)
                 limit = min(d["non_tail"], len(avail)) if is_compact else len(avail)
@@ -664,6 +654,21 @@ def scan_pools(paths, as_json=None):
                             1 for k in range(d["non_tail"], layout["first_tail"]) if avail[k])
         finally:
             pool.close()
+    total["gated_accounted"] = total["gated_layout_ok"] + total["gated_no_layout"]
+    total["gated_tuple_distinct"] = len(gated_tuples)
+    # Projected split once the reader uses the computed layout: existing full
+    # exports plus compact partials that complete plus gated records that
+    # complete; partials lose the completed rows and gain the gated partials.
+    total["after_full"] = (total["reader_full"] + total["compact_full_rows"] +
+                           total["gated_full_chain"])
+    total["after_partial"] = (total["reader_partial"] - total["compact_full_rows"] +
+                              total["gated_partial"])
+    total["after_skip"] = total["entries"] - total["after_full"] - total["after_partial"]
+    if include_tuples:
+        total["gated_tuples"] = [
+            {"tuple": list(key), "count": count}
+            for key, count in sorted(gated_tuples.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
     report = dict(total=total)
     if as_json:
         with open(as_json, "w", encoding="utf-8") as f:
@@ -810,6 +815,8 @@ def main(argv=None):
     ps = sub.add_parser("scan", help="aggregate counters over pools")
     ps.add_argument("paths", nargs="+")
     ps.add_argument("--json")
+    ps.add_argument("--tuples", action="store_true",
+                    help="include the distinct rejected compact-profile tuples")
     pl = sub.add_parser("layout", help="descriptor fields and mip offsets")
     pl.add_argument("pool")
     pl.add_argument("index", type=int)
@@ -827,7 +834,7 @@ def main(argv=None):
         pools = []
         for p in a.paths:
             pools += find_pools(p)
-        scan_pools(pools, a.json)
+        scan_pools(pools, a.json, a.tuples)
         return 0
     pool = Pool(a.pool)
     try:

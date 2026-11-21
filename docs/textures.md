@@ -20,21 +20,36 @@ not decodable from public facts. No BCPack decoder is added. The compact mip cha
 first measurement called the next tractable work, is now decoded and validated below; the
 remaining gap is BCPack.
 
+The compact layout rule moves 206,661 textures into complete exports and 1,218 more into
+partial exports. After it, the totals are 305,264 complete, 16,419 partial and 35,432 skipped
+(48,220 − 12,788). The complete count equals the 305,264 all-zlib/raw textures in the storage
+table below, which is the consistency check: every texture with no BCPack mip now exports its
+whole chain.
+
 This is the same 308,895 / 48,220 total already recorded in `docs/design.md`. The recount
 splits the 48,220 by cause: the old "(BCPack or unmapped)" label hides 14,713 skips whose
 recorded limitation is a layout/format check, not the codec, and overstates unmapped, which
-is zero.
+is zero. The compact layout rule resolves 12,788 of those 14,713; 1,925 remain layout or
+format cases (1,223 compact all-BCPack, 19 compact unknown element size, 678 arrays/volumes
+and 5 DXGI 11).
 
 ## Skip breakdown
 
-| Cause | Textures |
-|---|---:|
-| BCPack blocks every usable mip (`TtpfReader`: "All source mips require…") | 33,507 |
-| compact mip mapping not in the validated profile table | 14,030 |
-| 2D array / volume descriptor (`dimension != 1` or `depth != 1`) | 678 |
-| element format not in the parser table (DXGI 11, `R16G16B16A16_UNORM`) | 5 |
-| no mapped allocation ("unmapped shard") | 0 |
-| **total** | **48,220** |
+| Cause | Before | After |
+|---|---:|---:|
+| BCPack blocks every usable mip (`TtpfReader`: "All source mips require…") | 33,507 | 33,507 |
+| compact mip mapping not in the validated profile table | 14,030 | 0 |
+| compact layout resolved, but every mip is BCPack | — | 1,223 |
+| compact element size unknown (DXGI 156/199/211/226) | — | 19 |
+| 2D array / volume descriptor (`dimension != 1` or `depth != 1`) | 678 | 678 |
+| element format not in the parser table (DXGI 11, `R16G16B16A16_UNORM`) | 5 | 5 |
+| no mapped allocation ("unmapped shard") | 0 | 0 |
+| **total** | **48,220** | **35,432** |
+
+The "before" compact row becomes two measured rows after the layout rule: records the rule
+sizes but cannot decode because every mip is BCPack, and records whose element size is still
+unknown. The 1,218 mixed compact records that become partial exports are not skips; they are
+counted in the partial table below.
 
 The compact row is not one thing:
 
@@ -44,8 +59,9 @@ The compact row is not one thing:
 - 11,570 of the 14,030 have no BCPack chunk anywhere. They fail because
   `ValidatedCompactProfile` has no entry for their
   `(mode, width, height, mips, nonTail, bytes)` tuple, not because of a codec.
-- 19 compact records could not be mapped to a layout for the storage cross-tab. They are
-  included in the 14,030 and also fail the profile table.
+- 19 compact records have no element-size mapping. All 19 are mode 1 (64 KiB): DXGI 156 (7),
+  199 (6), 211 (5) and 226 (1), at 256×256 with 7 mips (2) or 512×512 with 8 mips (17).
+  They are included in the 14,030 and also fail the profile table.
 
 The five format-11 records are 4×4, 8×4 or 128×4 `R16G16B16A16_UNORM`; the parser's
 element-size table has no 8-byte entry for format 11. The 678 array/volume records are
@@ -105,8 +121,10 @@ tail" is standalone mips the reader drops.
 ## The compact mip chain
 
 The 196,257 partial exports and the 14,030 compact-profile skips are the same layout
-problem, not a codec problem. `tools/ttpf_mips.py` measures and decodes it; the counts below
-come from its `scan` and `check` over the same 57 pools.
+problem, not a codec problem. `tools/tex_headers.py` now carries the layout rule as pure
+functions, `tools/ttpf_mips.py` measures and decodes with it, and `tests/test_tex_headers.py`
+covers the rule on synthetic chains. The counts below come from `scan` and `check` over the
+same 57 pools.
 
 ### The descriptor mode is a flag plus a tile mode
 
@@ -126,9 +144,9 @@ Modes 9–12 are exactly the 567 cube descriptors; the other 111 array/volume re
 mode 0 or 1. Bit 0 of the field is independent: modes 4/5 share tile mode 2, 6/7 share tile
 mode 3, and 36/38 share tile modes 2/3. The reader's `mode == 0` test therefore gives a 4 KiB
 layout to modes 1 and 32, which are 64 KiB. Fifteen mode 1/32 descriptors have a known element
-size; all fifteen match a 64 KiB allocation span and one (`maps_4_7` #6034) decodes at
-0.00–0.33 levels (see below). The other 19 mode 1/32 records are the unknown-format ones in
-the table below.
+size (4 mode 1, 11 mode 32); all fifteen match a 64 KiB allocation span and one (`maps_4_7`
+#6034) decodes at 0.00–0.33 levels (see below). The other 19 mode 1 records are the
+unknown-format ones in the table below.
 
 ### The layout is the AMD mip tail
 
@@ -142,6 +160,28 @@ exports, the 14,011 layout-capable records the profile table rejects, and every 
 mode — the computed size equals `next_allocation - base`. There are **0 mismatches**. The
 remaining 702 descriptors are 678 arrays/volumes and 24 formats without an element-size
 mapping.
+
+`tools/tex_headers.py` exposes the rule without any container dependency:
+
+- `gfx10_tile_mode(mode)` / `gfx10_tile_bytes(mode)` split the descriptor field into the
+  flag bit and tile mode and pick 64 KiB only for tile mode 0.
+- `parse_etpf_texture_record(record)` decodes the 16-byte ETPF record, including the 4-bit
+  packed mip count plus the 3-bit `non_tail` field that make up the total mip count.
+- `compact_surface_layout(width, height, mips, element_bytes, block, tile)` computes the
+  allocation size and every mip's offset, region and in-tile origin. It rejects a mip count
+  that cannot describe the surface, an element size outside 1/2/4/8/16 bytes, a block size
+  other than 1 or 4, and any tile other than 4 or 64 KiB.
+- `compact_layout_for_dxgi` applies `FMT_INFO` to that function; `compact_profile_key`
+  returns the exact `(mode, width, height, mips, non_tail, bytes)` tuple; and
+  `compact_span_matches` accepts an allocation span only when it is byte-exact.
+
+`tools/ttpf_mips.py` uses those functions for `scan`, `layout`, `check` and `export`, so the
+measurement and the proposed reader rule cannot drift apart.
+
+The rule is only claimed for 2D descriptors with a 1/2/4/8/16-byte element. The 12-byte DXGI
+formats 6/7/8 do not occur in the measured 2D set, so `compact_surface_layout` rejects them
+rather than guessing a Gfx10 log pattern. Uncompressed tiling is also not validated: the
+allocation size is computed, but no DDS is written for those formats.
 
 ### `non_tail` is not the layout boundary
 
@@ -170,11 +210,41 @@ tile. The allocation spans and the decoded content both put the tail at the comp
 | format without an element-size mapping | 19 |
 | **total** | **14,030** |
 
-- 11,570 have every mip in a zlib/raw chunk: all 35,727 mips decode (2.91 GiB decompressed).
-- 469 more have a zlib/raw tail tile but a BCPack larger mip, so only their lower mips can be
-  exported.
-- The 19 blocked records are mode 1 (64 KiB) with DXGI formats 156, 199, 211 and 226; the
-  format-to-element-size mapping is the only unknown, not the mip layout.
+The rejected records contain 84 distinct six-tuples with a known element size, plus 4
+unknown-size tuples shared by the 19 records above (88 total). The ten largest known-size
+tuples are:
+
+| `mode` | Width×height | Mips | `non_tail` | Element bytes | Records |
+|---:|---|---:|---:|---:|---:|
+| 4 | 512×512 | 3 | 3 | 16 | 8,823 |
+| 4 | 256×256 | 2 | 1 | 16 | 1,831 |
+| 4 | 256×256 | 3 | 1 | 8 | 1,744 |
+| 4 | 512×256 | 3 | 1 | 8 | 344 |
+| 4 | 256×128 | 3 | 1 | 8 | 319 |
+| 4 | 1024×512 | 3 | 3 | 8 | 191 |
+| 4 | 512×256 | 9 | 1 | 8 | 68 |
+| 4 | 256×256 | 2 | 1 | 8 | 66 |
+| 4 | 512×32 | 4 | 1 | 8 | 62 |
+| 4 | 512×512 | 10 | 3 | 16 | 58 |
+
+None of these needs a new table row: every one has zero allocation-span mismatches under the
+computed rule. `scan --tuples` emits the complete list without texture bytes.
+
+What the layout change does to the 14,030:
+
+| | Textures |
+|---|---:|
+| complete zlib/raw chain | 11,570 |
+| partial export: some readable contiguous mip range | 1,218 |
+| still skipped: every mip is BCPack | 1,223 |
+| still skipped: element size unknown | 19 |
+| **total** | **14,030** |
+
+- The 11,570 complete records hold all 35,727 mips (2.91 GiB decompressed).
+- 469 of the 1,218 partial records have a readable tail tile while at least one larger mip is
+  BCPack; the other 749 export some contiguous mip range.
+- The 1,223 BCPack skips are compact records whose every mip is BCPack; they were counted in
+  the 14,030 before and are not part of the 33,507.
 
 The five DXGI 11 (`R16G16B16A16_UNORM`) records are a separate one-line gap: DXGI 11 is 8
 bytes per element, but the vendored element table has no entry. Their layout then matches,
@@ -224,10 +294,21 @@ chunk size, which includes tile padding.
 |---|---:|---:|---:|
 | partial exports that become complete | 195,091 | 1,065,138 | 1.69 GiB |
 | compact skips that become complete | 11,570 | 35,727 | 2.91 GiB |
-| **total** | **206,661** | **1,100,865** | **4.59 GiB** |
+| **newly complete** | **206,661** | **1,100,865** | **4.59 GiB** |
 
-1,166 of the 196,257 partials still miss 6,930 mips that touch BCPack; those and the 33,507
-fully blocked textures wait on the codec. Nothing here decodes BCPack.
+The total export split before and after the layout rule:
+
+| | Before | After | Change |
+|---|---:|---:|---:|
+| complete chain | 98,603 | 305,264 | +206,661 |
+| partial | 210,292 | 16,419 | −193,873 |
+| skipped | 48,220 | 35,432 | −12,788 |
+| **total** | **357,115** | **357,115** | |
+
+The 35,432 remaining skips are exactly 33,507 BCPack + 1,223 compact all-BCPack + 19 compact
+unknown-size + 678 arrays/volumes + 5 DXGI 11. The 16,419 partials are 1,166 compact records
+that still miss BCPack mips, 14,035 other partials, and the 1,218 compact records converted
+from a skip to a partial export. Nothing here decodes BCPack.
 
 ## What BCPack is
 
@@ -395,11 +476,11 @@ and the algorithm class are known; the bitstream is not.
 
 ## Next step
 
-1. **Port the tile-mode split and the computed tail boundary.** In `TtpfReader`, select
-   `tile = 65536` when `((mode >> 1) & 0xF) == 0` and 4096 otherwise, replace
-   `ValidatedCompactProfile` with the allocation-span check, and set `UsableMipLimit` to the
-   computed `FirstTail` (or `mips` when the tail tile is zlib/raw). On this install that
-   completes 206,661 textures without touching BCPack.
+1. **Port the rule to `TtpfReader`.** The rule is implemented and tested in
+   `tools/tex_headers.py`; in the reader, select `tile = 65536` when `((mode >> 1) & 0xF) == 0`
+   and 4096 otherwise, replace `ValidatedCompactProfile` with the allocation-span check, and
+   set `UsableMipLimit` to the computed `FirstTail` (or `mips` when the tail tile is
+   zlib/raw). On this install that completes 206,661 textures without touching BCPack.
 2. **Decode BC6H/BC7 in the validator.** `tools/ttpf_mips.py` decodes BC1/3/4/5; the BC7
    samples were checked with an external decoder. The layout is the same formula (16-byte
    elements), so this is validation breadth, not a new mapping.
@@ -421,16 +502,21 @@ and the algorithm class are known; the bitstream is not.
 `tools/ttpf_mips.py` is the read-only measurement and decode tool:
 
 ```
-python -I tools/ttpf_mips.py scan <game root> --json scan.json
+python -I tools/ttpf_mips.py scan <game root> --json scan.json [--tuples]
 python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
 python -I tools/ttpf_mips.py check <pool.ttpf> <index>
 python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds>
+python -I tests/test_tex_headers.py
+python -I tests/test_ttpf_mips.py
 ```
 
-`scan` reproduces the 357,115 / 98,603 / 210,292 / 48,220 split of this note and adds the
-layout and recovery columns. `check` reports the per-mip downsample error. `export` writes a
-full BC chain only when every source mip is zlib/raw. The tool writes no texture data and
-`tests/test_ttpf_mips.py` runs on a synthetic RDS5 pool, so the test needs no game files.
+`scan` reproduces the 357,115 / 98,603 / 210,292 / 48,220 split of this note, reports the
+projected `after_full` / `after_partial` / `after_skip` split, and adds the layout and
+recovery counters; `--tuples` adds the 84 known-size rejected tuples. `check` reports the
+per-mip downsample error. `export` writes a full BC chain only when every source mip is
+zlib/raw. The tool writes no texture data. `tests/test_tex_headers.py` tests the layout rule
+on synthetic headers and `tests/test_ttpf_mips.py` builds a synthetic RDS5 pool, so neither
+test needs game files.
 
 `rpf9dump ttpf` writes one `manifest.json` per pool with a `Limitation` field for every
 catalog record, and its summary line has the same `ok` / `skip` totals. The first split above
