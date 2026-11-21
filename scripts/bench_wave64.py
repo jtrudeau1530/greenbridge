@@ -1,0 +1,101 @@
+"""Time a wave64 compute shader (runtime/test/shaders/cs_bench_mix.asm) native and emulated, on the AMD and NVIDIA GPU.
+
+    python -I scripts/bench_wave64.py [--build DIR] [--llvm-mc PATH] [--groups N] [--reps N] [--procs N] [--shader NAME]
+
+Three configurations: AMD with its native 64-wide subgroup (no flag), AMD with --wave64-emulate, NVIDIA with
+--wave64-emulate (the GPU is chosen with VK_LOADER_DRIVERS_SELECT='*amd*' / '*nv*'). Each runs `procs` processes of
+vk_compute_test with VKC_BENCH=`reps` timed dispatches of `groups` workgroups; the table gives the median over all
+dispatches, the spread of the per-process medians (other programs share the GPU, so look at it), the number of
+translated segments (static: blocks + continuation segments; every continuation segment is one more workgroup barrier
+on the path through it) and whether the output bytes are the same in every configuration (they must be).
+"""
+import argparse
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUILD_PY = os.path.join(ROOT, "runtime", "test", "shaders", "build.py")
+CONFIGS = [("AMD native", "*amd*", False), ("AMD --wave64-emulate", "*amd*", True),
+           ("NVIDIA --wave64-emulate", "*nv*", True)]
+
+
+def build(work, name, emulate, llvm_mc):
+    out = os.path.join(work, "emu" if emulate else "native")
+    env = dict(os.environ, LLVM_MC=llvm_mc)
+    env.pop("LEONIDA_W64_EMULATE", None)
+    if emulate:
+        env["LEONIDA_W64_EMULATE"] = "1"
+    r = subprocess.run([sys.executable, "-I", BUILD_PY, out, name], env=env, capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stdout + r.stderr)
+    return os.path.join(out, "spirv", name + ".spv")
+
+
+def segments(spv):
+    """(segments, continuation segments) of an emulated module: the cases of the scheduler's OpSwitch."""
+    text = open(spv[:-4] + ".spvasm", encoding="utf-8").read()
+    m = re.search(r"OpSwitch %pcv %sw_default ([^\n]+)", text)
+    if not m:
+        return None
+    cases = [int(x) for x in re.findall(r"(\d+) %blk\d+", m.group(1))]
+    blocks = next((i for i, c in enumerate(cases) if c != i), len(cases))   # blocks 0..n-1, then "done" = n, then segments
+    return len(cases), len(cases) - blocks
+
+
+def run(tools, spv, groups, reps, driver, emulate):
+    env = dict(os.environ, VK_LOADER_DRIVERS_SELECT=driver, VKC_BENCH=str(reps))
+    args = [os.path.join(tools, "vk_compute_test" + (".exe" if os.name == "nt" else "")), spv, str(groups), "dump"]
+    if not emulate:
+        args.append("--require-wave64")
+    r = subprocess.run(args, env=env, capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    m = re.search(r"bench ms: median=([\d.]+) min=([\d.]+) max=([\d.]+)", out)
+    h = re.search(r"bench out fnv1a: (\w+)", out)
+    dev = re.search(r"device: (.*) \(subgroup", out)
+    if r.returncode or not m or "0 mismatches" not in out:
+        return None, out.strip().splitlines()[-1:] or ["no output"], None
+    return (float(m.group(1)), float(m.group(2))), h.group(1), dev.group(1) if dev else "?"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
+    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
+    ap.add_argument("--groups", type=int, default=65536)
+    ap.add_argument("--reps", type=int, default=30)
+    ap.add_argument("--procs", type=int, default=5)
+    ap.add_argument("--shader", default="cs_bench_mix")
+    a = ap.parse_args()
+    with tempfile.TemporaryDirectory(prefix="bench-w64-") as work:
+        spv = {False: build(work, a.shader, False, a.llvm_mc), True: build(work, a.shader, True, a.llvm_mc)}
+        seg = segments(spv[True])
+        print(f"{a.shader}: {a.groups} workgroups of the shader's group size, {a.procs} x {a.reps} timed dispatches")
+        if seg:
+            print(f"emulated: {seg[0]} segments, {seg[1]} of them continuation segments (one extra round each)")
+        hashes, rows = set(), []
+        for name, driver, emulate in CONFIGS:
+            med, mins, dev = [], [], None
+            for _ in range(a.procs):
+                t, h, dev = run(a.build, spv[emulate], a.groups, a.reps, driver, emulate)
+                if t is None:
+                    med = None
+                    print(f"{name}: failed or unsupported: {h}")
+                    break
+                med.append(t[0])
+                mins.append(t[1])
+                hashes.add(h)
+            if med:
+                rows.append((name, dev, statistics.median(med), min(mins), min(med), max(med)))
+        for name, dev, m, lo, a_, b_ in rows:
+            print(f"{name:26} {dev:34} median {m:8.3f} ms   best {lo:8.3f}   process medians {a_:.3f}..{b_:.3f}")
+        print("output identical in every configuration" if len(hashes) == 1 else f"OUTPUT DIFFERS: {sorted(hashes)}")
+        return 0 if len(hashes) <= 1 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

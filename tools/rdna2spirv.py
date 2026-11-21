@@ -130,6 +130,9 @@ class Gen:
         self.x_spills = []         # emulate: (Function variable, pointer type) carrying a value across a round
         self.x_ptr_types = {}      # emulate: value type -> Function pointer type declared for spills
         self.x_dirty = set()       # emulate: (memory kind "lds"/"mem", "r"/"w") accessed since the last round
+        self.x_tok = {}            # emulate: register -> the SSA id last stored to it in this block (its value's identity)
+        self.x_gen = 0             # emulate: bumped at every label (control flow inside a block): forgets x_tok
+        self.x_mcache = {}         # emulate: wave_mask key -> (lo, hi) already exchanged in this block
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
         self.uses_storage3d = False
         self.uses_heap = False
@@ -160,6 +163,12 @@ class Gen:
 
     def emit(self, s):
         self.body.append("         " + s)
+        if self.emulate:
+            if s.startswith(("OpStore %vcc ", "OpStore %active ")):
+                reg, val = s.split()[1:3]
+                self.x_tok[reg] = val
+            elif s.endswith("= OpLabel"):
+                self.x_gen += 1
 
     # ---- register access ----
     def load_reg(self, kind, r):
@@ -171,6 +180,7 @@ class Gen:
 
     def store_reg(self, kind, r, val):
         if kind == "sgpr":
+            self.x_tok[("sgpr", r)] = val
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
@@ -1641,9 +1651,25 @@ class Gen:
         they saw the one lane, so the lane count of a wave was 64 or 0 and its first lane 0 or none."""
         self.uses_subgroup = self.uses_wave_bits = True
         special = a["k"] == "special" and a.get("t", "").startswith("exec")
+        key = None
+        if self.emulate:
+            # The same value of the same register needs no second exchange: the lanes' bits are what they were.
+            # Values are told apart by the SSA id last stored to the register in this block (x_tok, forgotten at
+            # a label); a register not written yet has its value from the start of the block.
+            if special:
+                key = ("exec", self.x_gen, self.x_tok.get("%active", "start"))
+            elif a["k"] == "sgpr":
+                key = ("v", self.x_gen, self.x_tok.get(("sgpr", a["r"]), ("start", a["r"])))
+            elif a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
+                key = ("v", self.x_gen, self.x_tok.get("%vcc", ("start", "vcc")))
+            if key in self.x_mcache:
+                return self.x_mcache[key]
         mine = self.tmp_bool_nz(self.exec_value() if special else self.mask_src(a))
         if self.emulate:
-            return self.x_round(bits=self.lane_bits(mine))[1]
+            res = self.x_round(bits=self.lane_bits(mine))[1]
+            if key is not None:
+                self.x_mcache[key] = res
+            return res
         lane = self.wave_lane()
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
         self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")
@@ -5224,7 +5250,8 @@ def assemble(gen):
           "%active = OpVariable %_ptr_Function_bool Function %true"]
     if gen.emulate:
         fn += ["%x_it = OpVariable %_ptr_Function_uint Function %c0",
-               "%x_bar = OpVariable %_ptr_Function_bool Function %false"]
+               "%x_bar = OpVariable %_ptr_Function_bool Function %false",
+               "%x_chain = OpVariable %_ptr_Function_bool Function %false"]
         fn += [f"{var} = OpVariable {ptr} Function" for var, ptr in gen.x_spills]
     # User data: s0..s31 are loaded at entry from a push-constant block (the driver's user-SGPR setup).
     if gen.uses_heap:
@@ -5987,6 +6014,8 @@ def translate(path):
         g.body = []
         g.block_label = f"%blk{n}"
         g.x_marks, g.x_dirty = [], set()
+        g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
+        g.x_gen += 1
         g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
         term = None
         for ins in blk:
@@ -6018,6 +6047,10 @@ def translate(path):
                 r = g.tmp()
                 g.emit(f"{r} = OpSelect %uint {cond} {g.cu(tgt)} {alt}")
                 g.emit(f"OpStore %pc {r}")
+                if g.emulate and op in ("s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz"):
+                    # This segment only reads the vote and sets %pc, and the code before the vote ran in an earlier
+                    # round: the successor can start in this one (x_scheduler).
+                    g.emit("OpStore %x_chain %true")
                 g.succ.append(list(dict.fromkeys([tgt] + ([fall] if fall is not None else []))))
         lines = [l.strip() for l in g.body]
         if g.x_marks:
@@ -6136,7 +6169,11 @@ def x_scheduler(gen, threads):
           "%x_d = OpLoad %bool %done", "%x_b = OpLoad %bool %x_bar", "%x_nd = OpLogicalNot %bool %x_d",
           "%x_nb = OpLogicalNot %bool %x_b", "%x_run = OpLogicalAnd %bool %x_nd %x_nb",
           "OpSelectionMerge %x_ran None", "OpBranchConditional %x_run %dispatch %x_ran",
-          "%dispatch = OpLabel", "%pcv = OpLoad %uint %pc", "OpSelectionMerge %sw_merge None",
+          # A segment that only reads a vote and picks the next block sets %x_chain: that block runs in the same
+          # round (its code before the vote was in an earlier one, and it starts a fresh segment).
+          "%dispatch = OpLabel", "OpBranch %x_ch_head", "%x_ch_head = OpLabel",
+          "OpLoopMerge %x_ch_merge %x_ch_cont None", "OpBranch %x_ch_body", "%x_ch_body = OpLabel",
+          "%pcv = OpLoad %uint %pc", "OpSelectionMerge %sw_merge None",
           "OpSwitch %pcv %sw_default " + " ".join(f"{i} %blk{i}" for i in
                                                   sorted(list(range(len(gen.blocks))) + list(gen.x_segs)))]
     return L
@@ -6147,7 +6184,10 @@ def x_scheduler_tail(gen):
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
     _, _, x_sched, _ = gen.x_sizes()
     return ["%sw_default = OpLabel", "OpStore %done %true", "OpBranch %sw_merge",
-            "%sw_merge = OpLabel", "OpBranch %x_ran", "%x_ran = OpLabel",
+            "%sw_merge = OpLabel", "OpBranch %x_ch_cont", "%x_ch_cont = OpLabel",
+            "%x_chv = OpLoad %bool %x_chain", "OpStore %x_chain %false",
+            "OpBranchConditional %x_chv %x_ch_head %x_ch_merge", "%x_ch_merge = OpLabel",
+            "OpBranch %x_ran", "%x_ran = OpLabel",
             "%x_d2 = OpLoad %bool %done", "%x_b2 = OpLoad %bool %x_bar",
             "%x_nd2 = OpLogicalNot %bool %x_d2", "%x_nb2 = OpLogicalNot %bool %x_b2",
             "%x_w = OpLogicalAnd %bool %x_nd2 %x_nb2",
