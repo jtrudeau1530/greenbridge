@@ -359,11 +359,30 @@ if(Vulkan_FOUND)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
 
-    # Descriptors through the proxy: copies between heaps.
-    add_executable(d3d12_descriptor_test test/d3d12_descriptor_test.cpp shims/d3d12_xs_device.cpp)
+    # Descriptors through the proxy: copies between heaps, what texture views and samplers write into their slots,
+    # and (where glslangValidator is found) a compute shader the test runs on the device's bindless set, which
+    # finds a T# and an S# through the hash table and samples. The shader is GLSL, compiled here.
+    add_executable(d3d12_descriptor_test test/d3d12_descriptor_test.cpp)
     target_link_libraries(d3d12_descriptor_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_descriptor_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_descriptor_test PRIVATE /W4 /permissive- /utf-8)
+    if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    endif()
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_CS_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_sample.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_SAMPLE}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_SAMPLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sample.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sample.comp
+        COMMENT "Compiling the descriptor test shader"
+        VERBATIM)
+      target_sources(d3d12_descriptor_test PRIVATE ${LEONIDA_TEST_CS_SAMPLE})
+      target_compile_definitions(d3d12_descriptor_test PRIVATE LEONIDA_TEST_CS_SAMPLE_SPV="${LEONIDA_TEST_CS_SAMPLE}")
+    else()
+      message(STATUS "glslangValidator not found: d3d12_descriptor_test skips its shader")
+    endif()
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_uint_clear_test test/d3d12_uint_clear_test.cpp)
