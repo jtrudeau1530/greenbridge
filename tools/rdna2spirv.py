@@ -3607,7 +3607,7 @@ class Gen:
         return not open_
 
     # SQ_IMG_SAMP_WORD0 address modes (Mesa src/amd/registers/gfx10-rsrc.json: CLAMP_X = bits [2:0], CLAMP_Y = [5:3];
-    # values are Mesa's V_008F30_SQ_TEX_*): 0 wrap, 1 mirror, 2 clamp last texel, 3 mirror once last texel,
+    # values: SQ_TEX_* in Mesa's gfx6.json, as RADV's radv_tex_wrap maps VkSamplerAddressMode onto them): 0 wrap, 1 mirror, 2 clamp last texel, 3 mirror once last texel,
     # 4 clamp half border, 5 mirror once half border, 6 clamp border, 7 mirror once border.
     def gather_addr_modes(self, s_op):
         """(x, y) address modes of an S# for the gather emulation, each either a Python int (the S# word 0 is a
@@ -3615,7 +3615,8 @@ class Gen:
 
         A literal S# whose mode needs a border colour (4..7), or that sets FORCE_UNNORMALIZED, is Unsupported: the
         four fetches can't reproduce it. A run-time S# can't be judged at translation time, so modes 4..7 are
-        treated as clamp-to-edge there (the one remaining approximation)."""
+        treated as clamp-to-edge there, and FORCE_UNNORMALIZED (bit 15) is not applied (the two remaining
+        approximations)."""
         if s_op["k"] != "sgpr" or s_op.get("n", 1) < 4:
             raise Unsupported("descriptor operand")
         lit = self.sgpr_imm.get(s_op["r"])
@@ -3638,34 +3639,42 @@ class Gen:
         """Texel coordinate c (int id) after the address mode (int, or a uint id) for an axis of n texels (int id):
         wrap: c mod n; mirror: c mod 2n, reflected in the upper half; mirror once: the negative side reflected
         (-1 - c), then clamped; otherwise (clamp, and border modes at run time) clamped to [0, n-1]. As in the
-        Vulkan address-mode definitions."""
+        Vulkan address-mode definitions (and RADV's radv_tex_wrap mapping of them onto SQ_TEX_*). A literal mode
+        emits only the code it needs; a run-time one emits all four and selects."""
         zero, one = self.as_int(self.cu(0)), self.as_int(self.cu(1))
-        nm1, n2 = self.tmp(), self.tmp()
+        static = isinstance(mode, int)
+        want = {mode if mode <= 3 else 2} if static else {0, 1, 2, 3}
+        nm1 = self.tmp()
         self.emit(f"{nm1} = OpISub %int {n} {one}")
-        self.emit(f"{n2} = OpIAdd %int {n} {n}")
-        clamp = self.tmp()
-        self.emit(f"{clamp} = OpExtInst %int %glsl SClamp {c} {zero} {nm1}")
-        if mode == 2 or (isinstance(mode, int) and mode > 3):
-            return clamp
-        wrap, p, hi, rf, lt, mirror, neg, ge, refl, mo, once = (self.tmp() for _ in range(11))
-        self.emit(f"{wrap} = OpSMod %int {c} {n}")
-        self.emit(f"{p} = OpSMod %int {c} {n2}")
-        self.emit(f"{hi} = OpISub %int {n2} {one}")
-        self.emit(f"{rf} = OpISub %int {hi} {p}")
-        self.emit(f"{lt} = OpSLessThan %bool {p} {n}")
-        self.emit(f"{mirror} = OpSelect %int {lt} {p} {rf}")
-        self.emit(f"{neg} = OpISub %int {zero} {c}")
-        self.emit(f"{refl} = OpISub %int {neg} {one}")
-        self.emit(f"{ge} = OpSGreaterThanEqual %bool {c} {zero}")
-        self.emit(f"{mo} = OpSelect %int {ge} {c} {refl}")
-        self.emit(f"{once} = OpExtInst %int %glsl SClamp {mo} {zero} {nm1}")
-        if isinstance(mode, int):
-            return {0: wrap, 1: mirror, 3: once}[mode]
-        r = clamp
-        for val, res in ((3, once), (1, mirror), (0, wrap)):
+        res = {}
+        if 2 in want:
+            res[2] = self.tmp()
+            self.emit(f"{res[2]} = OpExtInst %int %glsl SClamp {c} {zero} {nm1}")
+        if 0 in want:
+            res[0] = self.tmp()
+            self.emit(f"{res[0]} = OpSMod %int {c} {n}")
+        if 1 in want:
+            n2, p, hi, rf, lt, res[1] = (self.tmp() for _ in range(6))
+            self.emit(f"{n2} = OpIAdd %int {n} {n}")
+            self.emit(f"{p} = OpSMod %int {c} {n2}")
+            self.emit(f"{hi} = OpISub %int {n2} {one}")
+            self.emit(f"{rf} = OpISub %int {hi} {p}")
+            self.emit(f"{lt} = OpSLessThan %bool {p} {n}")
+            self.emit(f"{res[1]} = OpSelect %int {lt} {p} {rf}")
+        if 3 in want:
+            neg, refl, ge, mo, res[3] = (self.tmp() for _ in range(5))
+            self.emit(f"{neg} = OpISub %int {zero} {c}")
+            self.emit(f"{refl} = OpISub %int {neg} {one}")
+            self.emit(f"{ge} = OpSGreaterThanEqual %bool {c} {zero}")
+            self.emit(f"{mo} = OpSelect %int {ge} {c} {refl}")
+            self.emit(f"{res[3]} = OpExtInst %int %glsl SClamp {mo} {zero} {nm1}")
+        if static:
+            return res[mode if mode <= 3 else 2]
+        r = res[2]
+        for val in (3, 1, 0):
             eq, nr = self.tmp(), self.tmp()
             self.emit(f"{eq} = OpIEqual %bool {mode} {self.cu(val)}")
-            self.emit(f"{nr} = OpSelect %int {eq} {res} {r}")
+            self.emit(f"{nr} = OpSelect %int {eq} {res[val]} {r}")
             r = nr
         return r
 

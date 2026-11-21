@@ -433,31 +433,30 @@ def _gather_l(s_word0, dynamic=False):
         "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
 
 
-@pytest.mark.parametrize("word0,ops", [
-    (0, ("OpSMod",)),                    # wrap x and y
-    (0x09, ("OpSMod", "OpSLessThan")),   # mirror x, wrap y
-    (0x1B, ("OpSGreaterThanEqual",)),    # mirror-once x, mirror y
-])
-def test_gather4_l_literal_sampler_uses_its_address_mode(word0, ops, make_shader):
-    shader = make_shader(_gather_l(word0))
+def _count(text, op):
+    return len(re.findall(rf"= {op} ", text))
+
+
+@pytest.mark.parametrize("mx", range(4))
+@pytest.mark.parametrize("my", range(4))
+def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
+    """CLAMP_X = bits [2:0], CLAMP_Y = [5:3]; 0 wrap, 1 mirror, 2 clamp, 3 mirror once. Each axis maps its two
+    texel coordinates: wrap = 1 OpSMod, mirror = 1 OpSMod + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual."""
+    shader = make_shader(_gather_l(mx | my << 3))
     text = shader.translate()
     shader.validate(text)
-    assert all(op in text for op in ops)
+    assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
+    assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
+    assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
     assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
-
-
-def test_gather4_l_clamp_sampler_has_no_wrap_code(make_shader):
-    shader = make_shader(_gather_l(0x12))
-    text = shader.translate()
-    shader.validate(text)
-    assert "OpSMod" not in text
 
 
 def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     shader = make_shader(_gather_l(0x12, dynamic=True))
     text = shader.translate()
     shader.validate(text)
-    assert "OpBitFieldUExtract" in text and "OpSMod" in text
+    assert _count(text, "OpBitFieldUExtract") == 2          # CLAMP_X and CLAMP_Y
+    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
 
 
 @pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])

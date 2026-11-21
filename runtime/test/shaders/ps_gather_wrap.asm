@@ -1,7 +1,7 @@
 ; image_gather4_l_o at the image border under each S# address mode (SHADER-36). The 2x2 gather footprint is built from four
 ; OpImageFetch (core Vulkan has no explicit-LOD gather), so the translator runs every texel coordinate through the S#'s own
 ; CLAMP_X/CLAMP_Y. S# word0: CLAMP_X = [2:0], CLAMP_Y = [5:3]; 0 wrap, 1 mirror, 2 clamp to last texel, 3 mirror once
-; (Mesa src/amd/registers/gfx10-rsrc.json for the fields, V_008F30_SQ_TEX_* for the values). Cases 1, 3, 5 use a literal S#
+; (Mesa src/amd/registers/gfx10-rsrc.json for the fields, SQ_TEX_* in gfx6.json for the values, as RADV's radv_tex_wrap maps Vulkan address modes onto them). Cases 1, 3, 5 use a literal S#
 ; (the translator reads the mode at translation time); cases 2, 4, 6 add 0 to s16 first, so the mode is read from the SGPR
 ; at run time.
 ; Run: vk_texture_test <vs_ids.spv> <ps_gather_wrap.spv> out.raw 0 92 c00000 14500000 0 -> RGBA32F pixels, all the same.
