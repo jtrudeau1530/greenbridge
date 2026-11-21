@@ -1,5 +1,6 @@
 // Optional Windows test: map the package's XboxBvhBuilder.dll through rt::Loader, bring it up (TLS and unwind from
 // the loader, then DllMain), and construct an XboxBvhBuilder on a PC D3D12 device behind the Xbox-ABI device proxy.
+// Needs the proxy's slot-62 shape (desc, w2, w3, riid, out). Results: docs/d3d12_vulkan.md, Appendix A.2.
 // It records what the constructor does: how much of the object it writes, which device slots it calls, what it
 // prints through OutputDebugString, and whether it gives up through TerminateProcess.
 //
@@ -264,8 +265,11 @@ bool looks_like_iid(uint64_t p, const IID& iid) {
     }
 }
 
+uint64_t g_slot62_ok = 0, g_slot62_failed = 0;
+
 uint64_t WINAPI record_slot62(void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
-    if (g_slot62_logged++ < 3) {
+    const int n = g_slot62_logged++;
+    if (n < 1) {
         std::printf("  slot62 args: a1=%#llx a2=%#llx a3=%#llx a4=%#llx a5=%#llx a6=%#llx\n",
                     (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4,
                     (unsigned long long)a5, (unsigned long long)a6);
@@ -274,7 +278,14 @@ uint64_t WINAPI record_slot62(void* self, uint64_t a1, uint64_t a2, uint64_t a3,
             if (looks_like_iid(args[i], __uuidof(ID3D12PipelineState)))
                 std::printf("  slot62: a%d points at IID_ID3D12PipelineState\n", i + 1);
     }
-    return g_slot62(self, a1, a2, a3, a4, a5, a6);
+    const auto* desc = reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1);
+    const uint64_t r = g_slot62(self, a1, a2, a3, a4, a5, a6);
+    const auto hr = static_cast<HRESULT>(static_cast<uint32_t>(r));
+    (SUCCEEDED(hr) ? g_slot62_ok : g_slot62_failed)++;
+    std::printf("  slot62 #%d: CS bytecode %llu bytes, root signature %s, node mask %u, flags %#x -> hr %#010lx\n", n + 1,
+                desc ? (unsigned long long)desc->CS.BytecodeLength : 0ull, desc && desc->pRootSignature ? "set" : "null",
+                desc ? desc->NodeMask : 0u, desc ? (unsigned)desc->Flags : 0u, static_cast<unsigned long>(hr));
+    return r;
 }
 
 void** g_proxy_vtable_copy = nullptr;
@@ -296,6 +307,7 @@ constexpr uint8_t kSentinel = 0xCD;
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep every line if the DLL takes the process down
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
@@ -375,7 +387,9 @@ int main() {
              " bytes differ from the sentinel): sizeof(XboxBvhBuilder) >= " + std::to_string(last));
         print_slot_hits(proxy);
         print_debug_messages(pc);
-        note("slot 62 (Xbox CreateComputePipelineState) calls: " + std::to_string(rt::d3d12_xs::device_slot_hits(62)));
+        note("slot 62 (Xbox CreateComputePipelineState) calls: " + std::to_string(rt::d3d12_xs::device_slot_hits(62)) +
+             (g_slot62_logged ? ", succeeded " + std::to_string(g_slot62_ok) + ", failed " + std::to_string(g_slot62_failed)
+                              : std::string()));
         note("OutputDebugString calls: " + std::to_string(g_debug_strings) + ", TerminateProcess calls: " +
              std::to_string(g_terminate_calls));
         check(!c.faulted || c.code == kTerminateCalled, "constructor returns or gives up through TerminateProcess, no fault");

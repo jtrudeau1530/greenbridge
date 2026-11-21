@@ -1302,6 +1302,25 @@ The file is an XVD container, not a PE; PE-oriented import tools do not apply.
 Reproduce: `rea.inspect_native_exports` and `rea.inspect_pe_imports` on the DLL, then a byte scan for the
 little-endian GUIDs from `d3d12.h`.
 
+Constructed by `runtime/test/bvh_builder_test.cpp` (1.0.2.1, `rt::Loader` with #93, `DllMain`, then
+`XboxBvhBuilder(ID3D12Device11*, bool)` on a PC device behind the Xbox-ABI proxy). Measured:
+
+- 0 unimplemented imports; `D3D12SerializeVersionedRootSignature`, `XMemVirtualQuery` and (from #93)
+  `_CxxThrowException` bind to shims. The constructor writes 24 bytes of the object (`sizeof(XboxBvhBuilder)` >= 24;
+  the rest of its state is elsewhere). It prints nothing through `OutputDebugString` and never calls
+  `TerminateProcess`. On failure it throws the failing `HRESULT` as a C++ `long`.
+- **Device slot 62 is called as `(desc, 0, 0, &IID_ID3D12PipelineState, out)`**, with a plain
+  `D3D12_COMPUTE_PIPELINE_STATE_DESC` (root signature set, node mask 0, flags 0). The proxy used to read
+  `(desc, riid, out)`, so the first call returned `E_POINTER` and the constructor threw it.
+- With slot 62 read that way, on **WARP** the constructor returns after 62 ms: 17 root signatures (slot 16) and 53
+  compute PSOs (slot 62, 53 of 53 `S_OK`), CS bytecode 4–75 KB each. `~XboxBvhBuilder` returns and makes no device
+  call. Created is not the same as correct: the shaders are Xbox DXIL with `@xbox.*` intrinsics (section 7.2), and
+  nothing has been dispatched yet.
+- On an **RTX 4090** (driver 621.24) the first 48 PSOs return `S_OK`, and creating the 49th ends the process
+  with `0xC0000409` (fail-fast) on repeated runs; one run returned `E_OUTOFMEMORY` for it instead, which the
+  constructor threw. So the NVIDIA driver does not survive the builder's shaders as they are. The layer should not
+  hand Xbox DXIL to the PC driver.
+
 ### A.3 `amd_fidelityfx_upscaler_xbox.dll`
 
 - Size 786,432 bytes; PE32+ x86-64.
