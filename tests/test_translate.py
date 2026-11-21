@@ -141,6 +141,19 @@ def test_mesh_v5_seed_and_threads_constant(make_shader, threads):
     assert "%v5p = OpAccessChain %_ptr_Function_uint %vgpr %c5" in spvasm
     assert "OpStore %v5p %v5v" in spvasm
     shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+def test_mesh_cull_primitive_is_block_bool(make_shader):
+    """CullPrimitiveEXT must be a Block bool member (VUID-07036); array-of-bool trips SPIRV-Tools ≤2025.1."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_v5_workgroup.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_v5_workgroup", dxbc=SAMPLE_DXBC["ms_v5_workgroup"])
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpDecorate %ms_cull_blk Block" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT" in spvasm
+    assert "%ms_cull_blk = OpTypeStruct %bool" in spvasm
+    assert re.search(r"%ms_arr_cull = OpTypeArray %ms_cull_blk %c\w+", spvasm)
+    assert "OpDecorate %ms_cull BuiltIn CullPrimitiveEXT" not in spvasm
+    assert re.search(r"OpAccessChain %_ptr_Out_bool_ms %ms_cull %\w+ %c0", spvasm)
 
 
 # ---- pos1..pos3: ClipDistance / CullDistance / misc exports (VS & MS) ----

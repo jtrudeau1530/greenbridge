@@ -5009,8 +5009,13 @@ def assemble(gen):
                 mi += 1
         else:
             dec.append("OpDecorate %ms_out_pos BuiltIn Position")
+        # CullPrimitiveEXT as Block+bool member (VUID-07036): array-of-bool is also legal, but
+        # SPIRV-Tools ≤2025.1 falsely rejects it (#5980); the Block form passes both old and new validators.
+        # PerPrimitiveEXT is a MemberDecorate on the bool (glslang / SPIRV-Tools MeshEXT tests).
         dec += ["OpDecorate %ms_prim_idx BuiltIn PrimitiveTriangleIndicesEXT",
-                "OpDecorate %ms_cull BuiltIn CullPrimitiveEXT", "OpDecorate %ms_cull PerPrimitiveEXT"]
+                "OpDecorate %ms_cull_blk Block",
+                "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT",
+                "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT"]
         dec += [f"OpDecorate %ms_out_param{n} Location {n}" for n in sorted(gen.ms_params)]
     if vs:
         if gen.uses_clip:
@@ -5182,7 +5187,9 @@ def assemble(gen):
                   "%_ptr_Out_v4_ms = OpTypePointer Output %v4float",
                   f"%ms_arr_idx = OpTypeArray %v3uint {maxp}", "%_ptr_Out_ms_arr_idx = OpTypePointer Output %ms_arr_idx",
                   "%_ptr_Out_v3u_ms = OpTypePointer Output %v3uint",
-                  f"%ms_arr_cull = OpTypeArray %bool {maxp}", "%_ptr_Out_ms_arr_cull = OpTypePointer Output %ms_arr_cull",
+                  "%ms_cull_blk = OpTypeStruct %bool",
+                  f"%ms_arr_cull = OpTypeArray %ms_cull_blk {maxp}",
+                  "%_ptr_Out_ms_arr_cull = OpTypePointer Output %ms_arr_cull",
                   "%_ptr_Out_bool_ms = OpTypePointer Output %bool",
                   "%_ptr_Function_v4_ms = OpTypePointer Function %v4float",
                   "%_ptr_Function_bool_ms = OpTypePointer Function %bool",
@@ -5514,7 +5521,7 @@ def assemble(gen):
               "%mix = OpCompositeConstruct %v3uint %mi0 %mi1 %mi2",
               "%mixp = OpAccessChain %_ptr_Out_v3u_ms %ms_prim_idx %mli", "OpStore %mixp %mix",
               f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}", "%mnull = OpINotEqual %bool %mnb %c0",
-              "%mcp = OpAccessChain %_ptr_Out_bool_ms %ms_cull %mli", "OpStore %mcp %mnull",
+              f"%mcp = OpAccessChain %_ptr_Out_bool_ms %ms_cull %mli {c(0)}", "OpStore %mcp %mnull",
               "OpBranch %ms_pend", "%ms_pend = OpLabel"]
         end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
     if gen.uses_active and gen.stage == "ps":

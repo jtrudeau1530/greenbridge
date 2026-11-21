@@ -82,6 +82,11 @@ produces 24 triangles. A stencil countdown lets pixel *i* record only triangle *
 For `g = x + 2*y + 6*z`, the CPU compares each pixel with `(32*g, 32*g + 1, 32*g + 31, 1)` (the 32-thread fixture's `g * NumThreads + lane` values). This checks the translator's register mapping on the host GPU.
 SPIRV-Tools 2026.1 validates this fixture. Version 2025.1 reports a known error on `CullPrimitiveEXT`.
 [Vulkan mesh rasterization order](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_mesh_shader.html) · [Validator fix](https://github.com/KhronosGroup/SPIRV-Tools/pull/6155).
+The CPU compares each pixel with `x + 2*y + 6*z`. This checks the translator's register mapping on the host GPU.
+`CullPrimitiveEXT` is emitted as a `Block` struct with a bool member (VUID-07036 also allows an array of
+bool). The Block form keeps SPIRV-Tools 2025.1 happy; array-of-bool was falsely rejected there (#5980) until
+[PR #6155](https://github.com/KhronosGroup/SPIRV-Tools/pull/6155).
+[Vulkan mesh rasterization order](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_mesh_shader.html).
 
 ## Build the runtime
 
