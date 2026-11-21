@@ -101,8 +101,9 @@ The design is therefore an **IR per command list**:
 - `SetPipelineState`, root arguments, vertex/index buffers, viewport/scissor, render targets, descriptor-heap
   bindings and the other sticky state update a state block.
 - Each draw/dispatch/copy/barrier appends a compact command with a snapshot of the state that affects it.
-  Descriptor *handles* are snapshotted; descriptor *contents* are resolved at execution, which matches D3D12's
-  "descriptors are read when the command executes" rule.
+  GPU descriptor tables can refer to shader-visible heap entries at execution. CPU descriptors such as RTVs
+  are consumed while recording, so their view contents go into the IR. An application can reuse the CPU
+  descriptor slot after the call. See Microsoft's [descriptor overview][descriptor-overview].
 - `ExecuteCommandLists` replays the IR into a fresh `VkCommandBuffer`, resolving descriptors, uploading dirty
   descriptor ranges and the hash table, and emitting barriers. Bundles are inlined at record time.
 - `Reset` on a command list discards its IR; the allocator owns the memory. D3D12 already requires the application
@@ -134,8 +135,20 @@ The command-list surface maps to the IR as follows:
 The IR is the place to add the trace, validation and "unsupported call" reporting. It also lets the layer replay a
 frame deterministically from a capture, which is valuable for comparing against the game.
 
+`runtime/src/clear_commands.h` implements the initial full-view color-clear slice of the IR. It copies the
+resource ID, mip, array-layer range and RGBA values while recording. `runtime/src/vulkan_clear.h` resolves
+those stable resource IDs to Vulkan images and emits ordered transfer clears. This slice supports 2D images
+and arrays with matching float or normalized view formats. The caller owns image lifetime and layout
+transitions. COM command-list and queue wiring, state tracking, and rectangle clears are future work.
+
+Build `runtime/` and run `ctest --test-dir <build> --output-on-failure` for the CPU recorder test. With Vulkan
+headers available, build and run `vk_clear_replay_test` for a 4×4 offscreen readback. It overwrites the CPU
+descriptor, then verifies both recorded layer targets and the final color after repeated clears.
+
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
+
+[descriptor-overview]: https://learn.microsoft.com/en-us/windows/win32/direct3d12/descriptors-overview
 
 ### 3.3 One GPU address space
 
