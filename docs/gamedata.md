@@ -76,6 +76,40 @@ The four non-XML structured payloads are the only readable binary metadata here:
 The two large opaque blobs (1.04 MB and 3.27 MB) have no recognised header and are left as binary. No model,
 texture or audio signature is present in `common.rpf`; the two opaque blobs are not identified.
 
+## MHIU and PAMH arrays
+
+`tools/gamedata_maps.py` decodes both map payloads. It reads a carve directory, groups the 64 KiB
+streams and prints or writes header fields and grid dimensions only; the grid bytes stay local.
+
+```powershell
+python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
+```
+
+Both payloads start with a 44-byte header. The checksum field is not CRC32 or Adler32 of the payload;
+the algorithm is still unknown.
+
+| Header field | `MHIU` | `PAMH` |
+|---|---|---|
+| `magic` | 0x00 | 0x00 |
+| `version` / second u16 | 0x04 / 0x06 | 0x04 / 0x06 |
+| checksum | 0x28 | 0x08 |
+| width, height (`u16` each) | not in the header | 0x0C, 0x0E |
+| six `float32` bounds | 0x0C | 0x10 |
+| data size | 0x24 | 0x28 |
+
+`PAMH` stores its grid dimensions in the header. Its data is `height` records of eight bytes
+`{u16 reserved = 0, u16 width, u32 row * width}`, followed by `width * height` little-endian `u16`
+values. The measured payload is 144 x 164, with 164 row records and 23,616 cells.
+
+`MHIU` does not store a grid edge. Its data is a zero-filled prefix followed by a square byte grid
+that ends at the payload end; the reader takes the largest square with an all-zero prefix. The two
+measured payloads resolve to 1090 x 1090 after a 1,027-byte prefix and 1100 x 1100 after a 432-byte
+prefix. The role of that prefix is not decoded.
+
+The grids are stored as raw normalized values. A mapping from the values to the world Z bounds is
+possible but not confirmed, so the reader reports the arrays and dimensions without interpreting
+them as heights.
+
 ## XML documents
 
 257 documents start with an XML declaration and all 257 parse as well-formed XML with a standard parser.
@@ -266,8 +300,8 @@ resolved without the table of contents. No XInclude (`xi:include`) elements occu
 ## Readable vs binary
 
 Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` blobs plus `PAMH`/`SPS1Z` headers.
-The XML is ordinary text and can be consumed by any parser. The `MHIU` payloads carry a 4-byte magic and
-low-valued arrays; `PAMH` has a 4-byte magic and a header. Neither is decoded here. `SPS1Z` is a NUL-separated
+The XML is ordinary text and can be consumed by any parser. `tools/gamedata_maps.py` decodes the `MHIU`
+headers and square byte grids and the `PAMH` header, row table and u16 grid. `SPS1Z` is a NUL-separated
 table of path/key strings with per-entry type/length markers; its structure is visible but its consumer is not
 implemented.
 
@@ -287,5 +321,6 @@ it applies to this note as well.
 
 The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
 RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
-turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The second candidate
-is decoding the `MHIU`/`PAMH` arrays, the only structured binary payloads in this archive.
+turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
+arrays are decoded by `tools/gamedata_maps.py`; their checksum algorithm, the MHIU prefix and the value-to-Z
+mapping remain open.

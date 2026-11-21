@@ -250,6 +250,10 @@ python -I tools/rpf9_carve.py <archive.rpf> <out_dir> --index-only [--start N] [
 python -I tests/test_story_index.py
 ```
 
+`--start` must be 0 or more and `--limit` at least 1 (decimal or `0x` hex). A value outside that, or a `--start`
+past the end of the archive, stops `story_index.py` with a one-line error and exit code 2 and writes nothing.
+An empty archive gives an index with no files.
+
 `story_index.py` is stdlib-only. It classifies the same zlib/Bink walk as `rpf9_carve.py`, parses
 the `PSIN` section chain, and reports `0DRP`/`RSC8`/`9FPR` headers when they start a stream or a
 carved file. It does not recurse into the raw embedded archives.

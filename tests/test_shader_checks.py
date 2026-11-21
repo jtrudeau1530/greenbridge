@@ -3,6 +3,7 @@ import contextlib
 import io
 import struct
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -183,6 +184,52 @@ class PixelDeviceLimits(unittest.TestCase):
     def test_bitmask_perm_is_judged_at_32_lanes(self):
         out = "device: fake (subgroup 32..32)\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
+
+    def test_bitmask_perm_skips_when_the_frame_is_short_below_32_lanes(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=b"short")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("narrower than 32 lanes", problem)
+
+    def test_bitmask_perm_skips_without_a_subgroup_width(self):
+        problem = self.run_pixel("ps_bitmask_perm", 0, "ok 64x64\n", data=self.bitmask_pixels(32))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("no subgroup width", problem)
+
+
+class SeededPixelTests(unittest.TestCase):
+    """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""
+
+    def run_pixel_test(self, words, code=0, out=""):
+        seen = {}
+
+        def harness(_tool, _vs, _fs, raw, env=None):
+            seen["env"] = env
+            if not code:
+                Path(raw).write_bytes(struct.pack("<4I", *words) * (64 * 64))
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_vcc_x2.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                problem = check.pixel_test(tmp, tmp, "ps_vcc_x2")
+        return problem, seen["env"] or {}
+
+    def test_v_sharp_and_heap_reach_the_harness(self):
+        problem, env = self.run_pixel_test((0x11223344, 0x55667788, 0, 0))
+        self.assertEqual(problem, "")
+        self.assertEqual(env.get("VKH_SGPRS"), "0x1000,0,16,0")
+        self.assertEqual(env.get("VKH_HEAP"), "0x1000=0x11223344,0x1004=0x55667788")
+
+    def test_unseeded_result_fails(self):
+        problem, _ = self.run_pixel_test((0, 0, 0, 0))
+        self.assertIn("4096 of 4096 pixels differ", problem)
+
+    def test_device_without_buffer_addresses_skips(self):
+        problem, _ = self.run_pixel_test((), code=77, out="unsupported: VKH_HEAP needs bufferDeviceAddress\n")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("needs bufferDeviceAddress", problem)
+
 
 
 class TextureMipChecks(unittest.TestCase):
