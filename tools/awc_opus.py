@@ -6,7 +6,7 @@ AWC layout (little-endian "ADAT"), as read by rpf9-explorer's OpusPreview.cpp: a
 (id[28:0] | tag count[31:29]), then 8-byte tags (type[63:56], size[55:28], offset[27:0]). Tag 0x55 = data,
 0x76 = format (u32 samples, u16 rate at +8, codec at +28, channels at +29). Codec 0x0B = Opus at 48 kHz: data is
 2048-byte blocks of [u16 length][packet] ..., a zero length pads the rest of the block. Codec 0 = PCM16 (written as
-.wav). Streamed music (tag 0x48, multi-channel interleaved blocks) is not handled here yet.
+.wav). Codec 2 = 32-bit float PCM (float .wav). Streamed music (tag 0x48, multi-channel interleaved blocks) is not handled here yet.
 
 Streamed music (tag 0x48 descriptor: u32 blocks, u32 chunk size, u32 channels, then 16 bytes per channel: id,
 samples, rate at +10, codec at +12) is split into one mono Ogg Opus per channel: each chunk starts with a
@@ -94,9 +94,10 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
     return granule
 
 
-def write_wav(path: str, pcm: bytes, rate: int, channels: int) -> None:
+def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = False) -> None:
+    bits = 32 if float32 else 16
     hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack(
-        "<IHHIIHH", 16, 1, channels, rate, rate * channels * 2, channels * 2, 16) + b"data" + struct.pack("<I", len(pcm))
+        "<IHHIIHH", 16, 3 if float32 else 1, channels, rate, rate * channels * bits // 8, channels * bits // 8, bits) +         b"data" + struct.pack("<I", len(pcm))
     with open(path, "wb") as f:
         f.write(hdr + pcm)
 
@@ -209,6 +210,11 @@ def export_bank(path: str, out_dir: str):
                 write_ogg_opus(os.path.join(od, f"{s['id']:08X}.ogg"), pk, s["channels"], s["id"], n48)
                 counts["opus"] += 1
                 continue
+        if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:
+            # codec 2: 32-bit float PCM (4 bytes per sample; values can exceed +-1, e.g. impulse responses)
+            write_wav(os.path.join(od, f"{s['id']:08X}.wav"), d[at:at + size], s["rate"], s["channels"], True)
+            counts["pcm"] += 1
+            continue
         if s["codec"] == 0 and s["channels"] in (1, 2):
             write_wav(os.path.join(od, f"{s['id']:08X}.wav"), d[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
