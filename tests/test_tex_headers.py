@@ -22,12 +22,6 @@ if TOOLS_DIR not in sys.path:
 
 import tex_headers
 
-try:
-    import numpy as np
-    HAVE_NUMPY = True
-except ImportError:
-    HAVE_NUMPY = False
-
 
 class TestGFX10FormatMapping(unittest.TestCase):
     def test_known_bc_format_mappings(self):
@@ -292,7 +286,6 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
             tex_headers.parse_dds_header(bytes(bad_dx10))
 
 
-@unittest.skipUnless(HAVE_NUMPY, "numpy required for scan_archive")
 class TestTextureDescriptorParsing(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -457,6 +450,40 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         self.assertEqual(data[0]["w"], 512)
         self.assertEqual(data[0]["h"], 512)
         self.assertEqual(data[0]["fmt_name"], "BC1_UNORM")
+
+    def test_stdlib_qword_scanner_edge_cases_and_parity(self):
+        # Empty / short (<8 bytes) buffers yield no hits.
+        q_empty, hits_empty = tex_headers._find_gpu_ptr_qwords_stdlib(b"\x00\x01\x02")
+        self.assertEqual(len(q_empty), 0)
+        self.assertEqual(hits_empty, [])
+
+        # Matches only [0x60000000, 0x6FFFFFFF]; ignores 0x5FFFFFFF, 0x70000000, and high-32-bit 0x160000000.
+        vals = [
+            0x5FFFFFFF,
+            0x60000000,
+            0x60001000,
+            0x6FFFFFFF,
+            0x70000000,
+            0x0000000160000000,
+            0xFFFFFFFF60000000,
+        ]
+        # Include trailing unaligned bytes (<8) to verify truncation matches numpy path.
+        blob = struct.pack(f"<{len(vals)}Q", *vals) + b"\xAA\xBB\xCC"
+        q_std, hits_std = tex_headers._find_gpu_ptr_qwords_stdlib(blob)
+        self.assertEqual(len(q_std), len(vals))
+        self.assertEqual(hits_std, [1, 2, 3])
+
+        # Verify scan_archive works when numpy is forced unavailable.
+        self._make_synthetic_texture_blobs(w=256, h=128, fmt=77, data_off=0x3000, mips=8)
+        with mock.patch.object(tex_headers, "_find_gpu_ptr_qwords", tex_headers._find_gpu_ptr_qwords_stdlib):
+            res = tex_headers.scan_archive(self.carve, self.arch)
+        self.assertEqual(len(res), 1)
+        self.assertEqual((res[0]["w"], res[0]["h"], res[0]["fmt_name"]), (256, 128, "BC3_UNORM"))
+
+        # Verify exact parity with the active _find_gpu_ptr_qwords path (numpy if installed, stdlib otherwise).
+        q_active, hits_active = tex_headers._find_gpu_ptr_qwords(blob)
+        self.assertEqual([int(v) for v in q_active], [int(v) for v in q_std])
+        self.assertEqual([int(k) for k in hits_active], hits_std)
 
 
 if __name__ == "__main__":
