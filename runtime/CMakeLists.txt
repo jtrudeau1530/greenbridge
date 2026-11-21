@@ -285,7 +285,8 @@ endif()
 # GPU test and pipeline tools load Vulkan at run time.
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
-  foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test)
+  foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
+          vk_bindless_test)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
@@ -329,6 +330,12 @@ if(Vulkan_FOUND)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
 
+    # Descriptors through the proxy: copies between heaps.
+    add_executable(d3d12_descriptor_test test/d3d12_descriptor_test.cpp shims/d3d12_xs_device.cpp)
+    target_link_libraries(d3d12_descriptor_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_descriptor_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_descriptor_test PRIVATE /W4 /permissive- /utf-8)
+
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
@@ -346,7 +353,12 @@ if(Vulkan_FOUND)
       target_compile_definitions(d3d12_state_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME d3d12_state_map COMMAND d3d12_state_map_test)
+    # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
+    add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
+    target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
+    add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
 else()
-  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check and d3d12_state_map_test are not built")
+  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
+                 "gfx10_descriptors_test are not built")
 endif()

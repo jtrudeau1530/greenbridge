@@ -480,6 +480,38 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
     }
 
+    // A descriptor is its slot's bytes (a TargetView in RTV and DSV heaps, otherwise what the shader loads), so a
+    // copy is a byte copy. D3D12 walks the destination and source ranges together, one descriptor at a time; a
+    // null size array means every range holds one descriptor. Whichever side runs out first ends the copy.
+    void STDMETHODCALLTYPE CopyDescriptors(UINT destination_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* destinations,
+                                           const UINT* destination_sizes, UINT source_ranges,
+                                           const D3D12_CPU_DESCRIPTOR_HANDLE* sources, const UINT* source_sizes,
+                                           D3D12_DESCRIPTOR_HEAP_TYPE) override {
+        if (!destinations || !sources) return;
+        UINT d = 0, s = 0, d_at = 0, s_at = 0;  // the range on each side, and the position in it
+        while (d < destination_ranges && s < source_ranges) {
+            if (d_at >= (destination_sizes ? destination_sizes[d] : 1) || !destinations[d].ptr) {
+                ++d;
+                d_at = 0;
+            } else if (s_at >= (source_sizes ? source_sizes[s] : 1) || !sources[s].ptr) {
+                ++s;
+                s_at = 0;
+            } else {
+                std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at++) * kDescriptorSize,
+                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * kDescriptorSize,
+                             kDescriptorSize);
+            }
+        }
+    }
+
+    void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE destination,
+                                                 D3D12_CPU_DESCRIPTOR_HANDLE source,
+                                                 D3D12_DESCRIPTOR_HEAP_TYPE) override {
+        if (!destination.ptr || !source.ptr) return;
+        std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
+                     std::size_t(count) * kDescriptorSize);
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                       const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
