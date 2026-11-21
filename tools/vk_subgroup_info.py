@@ -33,6 +33,7 @@ VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
 VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU = 2
 VK_API_VERSION_1_3 = (1 << 22) | (3 << 12)
+VK_INCOMPLETE = 5
 
 PROPS_SIZE = 824            # sizeof(VkPhysicalDeviceProperties) on 64-bit
 FEATURES2_SIZE = 240        # sizeof(VkPhysicalDeviceFeatures2): 16 + 55 VkBool32, padded to 8
@@ -94,6 +95,24 @@ def load_vulkan():
     raise RuntimeError("no Vulkan loader found (" + ", ".join(names) + ")")
 
 
+def physical_devices(vk, instance):
+    # The list can grow between the count and fetch. Recount, with a bound for a changing driver.
+    for _ in range(3):
+        count = ctypes.c_uint32()
+        result = vk.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), None)
+        if result != 0:
+            raise RuntimeError(f"vkEnumeratePhysicalDevices count failed ({result})")
+        if not count.value:
+            return []
+        devices = (ctypes.c_void_p * count.value)()
+        result = vk.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), devices)
+        if result == 0:
+            return devices[:count.value]
+        if result != VK_INCOMPLETE:
+            raise RuntimeError(f"vkEnumeratePhysicalDevices failed ({result})")
+    raise RuntimeError("vkEnumeratePhysicalDevices repeatedly returned VK_INCOMPLETE")
+
+
 def query() -> dict:
     """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
     if sys.maxsize <= 2**32:
@@ -114,14 +133,11 @@ def query() -> dict:
     if r != 0:
         raise RuntimeError(f"vkCreateInstance failed ({r})")
     try:
-        n = ctypes.c_uint32(0)
-        vk.vkEnumeratePhysicalDevices(inst, ctypes.byref(n), None)
-        if n.value == 0:
+        devs = physical_devices(vk, inst)
+        if not devs:
             raise RuntimeError("no Vulkan device")
-        devs = (ctypes.c_void_p * n.value)()
-        vk.vkEnumeratePhysicalDevices(inst, ctypes.byref(n), devs)
         chosen = None
-        for d in devs[: n.value]:
+        for d in devs:
             d = ctypes.c_void_p(d)
             sg = SubgroupSizeControl(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES)
             props = block(16 + PROPS_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2)
