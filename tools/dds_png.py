@@ -214,6 +214,7 @@ def _decode_uncompressed_32(
     b_shift, b_max = _validate_mask(masks[2])
     a_shift, a_max = _validate_mask(masks[3])
 
+    out = bytearray(len(src))
     # Fast path when all non-zero masks are byte-aligned 8-bit lanes.
     if (
         (r_max in (0, 255) and (r_shift & 7) == 0)
@@ -221,7 +222,6 @@ def _decode_uncompressed_32(
         and (b_max in (0, 255) and (b_shift & 7) == 0)
         and (a_max in (0, 255) and (a_shift & 7) == 0)
     ):
-        out = bytearray(expected)
         if r_max:
             out[0::4] = src[r_shift >> 3 :: 4]
         if g_max:
@@ -235,7 +235,6 @@ def _decode_uncompressed_32(
         return bytes(out)
 
     # General bitmask fallback (e.g. R10G10B10A2).
-    out = bytearray(expected)
     r_half = r_max >> 1
     g_half = g_max >> 1
     b_half = b_max >> 1
