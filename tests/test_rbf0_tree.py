@@ -208,6 +208,27 @@ class ParseTest(unittest.TestCase):
         self.assertIn("word is not zero", doc["error"])
         self.assertIsNone(doc["tree"])
 
+    def test_string_keeps_a_trailing_nul(self):
+        b = WIDE + _open(0, b"TestRoot") + _value(1, 0x60, struct.pack("<H", 2) + b"a\x00", b"label") + CLOSE
+        doc = rbf0_tree.parse_resource(b)
+        value = doc["tree"]["content"][0]
+        self.assertEqual(value["value"], "a\x00")
+        self.assertTrue(value["nul_terminated"])
+        self.assertEqual(value["byte_length"], 2)
+
+    def test_non_finite_float_is_json_safe(self):
+        b = WIDE + _open(0, b"TestRoot") + _value(1, 0x40, struct.pack("<d", float("nan")), b"ratio") + CLOSE
+        doc = rbf0_tree.parse_resource(b)
+        value = doc["tree"]["content"][0]
+        self.assertIsNone(value["value"])
+        self.assertEqual(value["float_special"], "nan")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "tree.json")
+            rbf0_tree.write_json(path, [doc], {"resources": 1})
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+        self.assertIsNone(loaded["resources"][0]["tree"]["content"][0]["value"])
+
     def test_not_rbf0(self):
         with self.assertRaises(rbf0_tree.TreeError):
             rbf0_tree.parse_resource(b"PSIN" + bytes(16))
@@ -253,6 +274,13 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(docs[0]["root_name"], "TestRoot")
         self.assertEqual(summary["ok"], 1)
 
+    def test_source_without_rbf0(self):
+        path = os.path.join(self.root, "not-rbf0.bin")
+        with open(path, "wb") as f:
+            f.write(b"PSIN" + bytes(16))
+        with self.assertRaises(SystemExit):
+            rbf0_tree.decode_source(path)
+
 
 class OutputTest(unittest.TestCase):
     def setUp(self):
@@ -294,6 +322,8 @@ class OutputTest(unittest.TestCase):
         texts = root.findall(".//text")
         self.assertEqual(texts[0].text, "a < b & c")
         self.assertEqual(texts[1].text, "a\ufffdb")  # XML 1.0 control bytes are replaced, not emitted
+        rbf0_tree.write_xml(xml_dir, doc["resources"])  # a rerun overwrites, it does not add -0000 duplicates
+        self.assertEqual(len(os.listdir(xml_dir)), 1)
 
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:

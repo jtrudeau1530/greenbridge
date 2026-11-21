@@ -322,8 +322,9 @@ class Parser:
             n = struct.unpack("<H", self.take(2, "string length"))[0]
             raw = self.take(n, "string")
             payload_at = self.p - n
-            body = raw[:-1] if raw.endswith(b"\x00") else raw
-            value, valid = _utf8(body)
+            # The measured string form is length-prefixed, not NUL-terminated. Keep every byte even if the last
+            # one is zero; only the text record (whose u32 length includes a terminator in this corpus) is trimmed.
+            value, valid = _utf8(raw)
             if not valid:
                 self.invalid_utf8 += 1
             extra = {"byte_length": n, "nul_terminated": raw.endswith(b"\x00"), "utf8_valid": valid}
@@ -390,6 +391,8 @@ def decode_source(source, roots=None, offset=None, limit=None, progress=None):
     """Decode every RBF0 start in `source`, joining 64 KiB continuations. Returns (docs, summary)."""
     rows, read = _rows(source)
     starts = [i for i, row in enumerate(rows) if row["head"][:4] == MAGIC]
+    if not starts:
+        raise SystemExit(f"no RBF0 resource in {source}")
     if offset is not None:
         starts = [i for i in starts if rows[i]["offset"] == offset]
         if not starts:
@@ -496,6 +499,7 @@ def write_xml(directory, docs):
     """Write one generic XML file per resource. Element names are fixed, so any descriptor name is safe."""
     os.makedirs(directory, exist_ok=True)
     paths = []
+    used = set()
     for i, doc in enumerate(docs):
         root = ET.Element("rbf0", {
             "root": _xml_safe(doc["root_name"]), "layout": doc["layout"],
@@ -507,9 +511,10 @@ def write_xml(directory, docs):
         tree = ET.ElementTree(root)
         ET.indent(tree, space=" ")
         name = f"{doc['offset']:08x}.xml"
+        if name in used:
+            name = f"{doc['offset']:08x}-{i:04d}.xml"
+        used.add(name)
         path = os.path.join(directory, name)
-        if os.path.exists(path):
-            path = os.path.join(directory, f"{doc['offset']:08x}-{i:04d}.xml")
         tree.write(path, encoding="utf-8", xml_declaration=True)
         paths.append(path)
     return paths
