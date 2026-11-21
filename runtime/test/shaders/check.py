@@ -83,12 +83,13 @@ class Skip(str):
 
 def partial_wave_test(tools, spirv, name, expected_words):
     """A group smaller than a wave: run with subgroup size 64 requested (no full subgroups); None if the device
-    has no 64-wide subgroup (unless LEONIDA_W64_EMULATE=1)."""
+    has no 64-wide subgroup. With LEONIDA_W64_EMULATE=1 it asks for 32 instead, the width the emulation is for, so
+    a device that defaults to 64 (AMD) runs the emulated path at 32 too (#166)."""
     shader = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(shader):
         return f"missing {name}.spv"
     old = os.environ.get("VKC_SUBGROUP_SIZE")
-    os.environ["VKC_SUBGROUP_SIZE"] = "64"
+    os.environ["VKC_SUBGROUP_SIZE"] = "32" if W64_EMULATED else "64"
     try:
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump")
     finally:
