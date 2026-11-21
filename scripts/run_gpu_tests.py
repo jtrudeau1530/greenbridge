@@ -410,11 +410,35 @@ def with_draw_shaders(asm_files: list[str]) -> list[str]:
     return build
 
 
+# Multi-config CMake generators (Visual Studio, Xcode, Ninja Multi-Config) put each program in build/<Config>.
+CONFIG_DIRS = ("RelWithDebInfo", "Release", "Debug", "MinSizeRel")
+
+
+def resolve_build_dir(build: str, programs: tuple[str, ...]) -> str:
+    """The folder that holds all of `programs` (file names with their extension).
+
+    Makefile and Ninja builds leave them in `build`. With the Visual Studio generator they land in
+    build/RelWithDebInfo, build/Release and so on. `build` itself wins when it has them all; otherwise the
+    configuration folder that has them all and was built last. If none has them, `build` is returned, so the
+    caller's "not found" message names the folder the user gave."""
+    def complete(d: str) -> bool:
+        return all(os.path.isfile(os.path.join(d, n)) for n in programs)
+
+    if complete(build):
+        return build
+    found = [d for d in (os.path.join(build, c) for c in CONFIG_DIRS) if complete(d)]
+    if not found:
+        return build
+    return max(found, key=lambda d: max(os.path.getmtime(os.path.join(d, n)) for n in programs))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
                     help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'")
-    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
+    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
+                    help="CMake build folder; with the Visual Studio generator the RelWithDebInfo/Release/... "
+                         "subfolder that has the test programs is found by itself")
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")
     a = ap.parse_args()
@@ -425,8 +449,9 @@ def main() -> int:
         a.work = os.path.abspath(a.work)
 
     ext = ".exe" if os.name == "nt" else ""
-    missing = [t + ext for t in ("vk_compute_test", "vk_store_test", "vk_harness")
-               if not os.path.isfile(os.path.join(a.build, t + ext))]
+    required = tuple(t + ext for t in ("vk_compute_test", "vk_store_test", "vk_harness"))
+    a.build = resolve_build_dir(a.build, required)
+    missing = [t for t in required if not os.path.isfile(os.path.join(a.build, t))]
     if missing:
         sys.exit(f"Test programs not found in {a.build}:{', '.join(missing)}\n"
                  "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
