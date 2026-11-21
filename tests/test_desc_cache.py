@@ -1,0 +1,112 @@
+"""The per-basic-block descriptor lookup cache of tools/rdna2spirv.py (standard library only: no GPU, LLVM or SPIRV-Tools).
+
+    python -I tests/test_desc_cache.py
+
+Every image instruction needs the bindless index of its T# (8 SGPRs) and S# (4 SGPRs): a call of %desc_lookup_fn. A
+second instruction on the same descriptors in the same basic block reuses the first one's result as long as no SGPR
+of the descriptor was written in between. These tests translate small pixel shaders (the .s text is made here, with
+encodings of the right length so that branch targets work out) and count the calls in the SPIR-V.
+"""
+import gc
+import os
+import struct
+import sys
+import tempfile
+import warnings
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import rdna2spirv  # noqa: E402
+
+CALL = "OpFunctionCall %uint %desc_lookup_fn"
+STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+SAMPLE = "image_sample v[4:7], v[0:1], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D"
+LOAD = "image_load v[4:7], v[0:1], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm"
+EXP = "exp mrt0 v4, v5, v6, v7 done vm"
+
+
+def words(line):
+    """Encoding length in dwords of one line of the shaders below (only the length matters to the translator)."""
+    op = line.split()[0]
+    if op.startswith(("image_", "exp", "buffer_")):
+        return 2
+    return 1
+
+
+def translate(lines):
+    """SPIR-V assembly text of a pixel shader made of these instruction lines."""
+    out, pc = ["; ps_desc_cache  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words"], 0
+    for ln in lines:
+        n = words(ln)
+        enc = ", ".join(f"0x{(pc + i) & 0xFF:02x}" for i in range(4 * n))
+        if ln.startswith("s_endpgm"):
+            enc = "0x00, 0x00, 0x81, 0xbf"
+        out.append(f"\t{ln} ; encoding: [{enc}]")
+        pc += 4 * n
+    with tempfile.TemporaryDirectory() as tmp:
+        os.mkdir(os.path.join(tmp, "disasm"))
+        with open(os.path.join(tmp, "disasm", "ps_desc_cache.s"), "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        with open(os.path.join(tmp, "ps_desc_cache.dxbc"), "wb") as f:
+            f.write(STUB_DXBC)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = rdna2spirv.translate(os.path.join(tmp, "disasm", "ps_desc_cache.s"))
+            gc.collect()
+        return result
+
+
+def calls(*lines):
+    return translate(list(lines) + [EXP, "s_endpgm"]).count(CALL)
+
+
+def test_one_lookup_per_descriptor():
+    # Three samples on one T#/S#: one lookup for the T#, one for the S#.
+    assert calls(SAMPLE, SAMPLE, SAMPLE) == 2
+    # A different T# is another lookup; the S# is shared.
+    assert calls(SAMPLE, "image_sample v[4:7], v[0:1], s[24:31], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D") == 3
+    # image_load looks its T# up once (it used to look it up a second time for the typed read).
+    assert calls(LOAD) == 1
+    assert calls(LOAD, LOAD, LOAD) == 1
+
+
+def test_sgpr_write_inside_the_descriptor_makes_a_new_lookup():
+    # Any SGPR of the T# (s8..s15): a scalar move, a 64-bit move, a v_readfirstlane, a load.
+    for write in ("s_mov_b32 s9, 5", "s_mov_b32 s8, 5", "s_mov_b32 s15, 5", "s_mov_b64 s[14:15], 0",
+                  "s_mov_b64 s[6:7], 0x1234", "v_readfirstlane_b32 s12, v0", "s_load_dwordx2 s[10:11], s[0:1], 0x0"):
+        n = calls(SAMPLE, write, SAMPLE)
+        # 2 calls first, then only the T# again (the S#, s16..s19, is untouched). s[6:7] is outside both.
+        want = 2 if write.startswith("s_mov_b64 s[6:7]") else 3
+        assert n == want, (write, n, want)
+    # An SGPR of the S# only: the S# is looked up again, the T# is not.
+    assert calls(SAMPLE, "s_mov_b32 s17, 5", SAMPLE) == 3
+    assert calls(SAMPLE, "s_mov_b32 s19, 5", SAMPLE) == 3
+    # Both written: both again.
+    assert calls(SAMPLE, "s_mov_b32 s9, 5", "s_mov_b32 s16, 5", SAMPLE) == 4
+    # Neighbours of the ranges: s7 and s20 are in neither, so there is no new lookup.
+    assert calls(SAMPLE, "s_mov_b32 s7, 5", "s_mov_b32 s20, 5", SAMPLE) == 2
+    # After the write the new lookup is cached again.
+    assert calls(SAMPLE, "s_mov_b32 s9, 5", SAMPLE, SAMPLE) == 3
+
+
+def test_cache_is_per_basic_block():
+    # Block 0 (two samples), block 1 (two samples), block 2 (one): each block looks the descriptors up once.
+    n = calls(SAMPLE, SAMPLE, "s_cmp_eq_u32 s0, 0", "s_cbranch_scc1 5", SAMPLE, SAMPLE, "s_branch 0", SAMPLE)
+    # (branch offsets count dwords from the next instruction: scc1 skips block 1's two samples and the s_branch)
+    assert n == 6, n
+    # The same code without the branch would be one block: two lookups.
+    assert calls(SAMPLE, SAMPLE, "s_cmp_eq_u32 s0, 0", SAMPLE, SAMPLE, SAMPLE) == 2
+
+
+def test_lookups_around_image_load_constructs():
+    # An image_load opens selection constructs for the typed read. Lookups made after it still hit the cache made
+    # before it (the id dominates), and the construct itself added no lookup.
+    assert calls(LOAD, SAMPLE, LOAD, SAMPLE) == 2
+
+
+if __name__ == "__main__":
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+    print("ok")
