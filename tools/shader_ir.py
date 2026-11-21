@@ -27,6 +27,15 @@ def operand(tok):
     absm = core.startswith("|") and core.endswith("|")
     if absm:
         core = core[1:-1]
+    m = re.fullmatch(r"neg\((.+)\)", core)
+    if m:  # VOP3 negation of an inline constant, printed as neg(0) / neg(1.0)
+        inner = operand(m.group(1))
+        if inner.get("k") == "imm":
+            return {"k": "fimm", "v": -float(inner["v"]), "abs": False} if inner["v"] == 0 else {"k": "imm", "v": -inner["v"]}
+        if inner.get("k") == "fimm":
+            return {**inner, "v": -inner["v"]}
+        inner["neg"] = not inner.get("neg", False)
+        return inner
     m = re.fullmatch(r"sext\((.+)\)", core)
     if m:  # SDWA integer sign-extension of the selected source bits
         inner = operand(m.group(1))

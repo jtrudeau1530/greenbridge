@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -96,6 +97,14 @@ int main(int argc, char** argv) {
         enable.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
         lock.fragmentShaderPixelInterlock = VK_TRUE; lock.pNext = chain; chain = &lock;
     }
+    // VKH_MESH=1: the first shader is a mesh shader (VK_EXT_mesh_shader), drawn with vkCmdDrawMeshTasksEXT(1,1,1).
+    const bool mesh = std::getenv("VKH_MESH") != nullptr;
+    VkPhysicalDeviceMeshShaderFeaturesEXT meshf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    if (mesh) {
+        if (!has(VK_EXT_MESH_SHADER_EXTENSION_NAME)) { std::fprintf(stderr, "no VK_EXT_mesh_shader\n"); return 1; }
+        enable.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+        meshf.meshShader = VK_TRUE; meshf.pNext = chain; chain = &meshf;
+    }
     if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
         enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
@@ -105,6 +114,11 @@ int main(int argc, char** argv) {
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     dci.pNext = chain;
+    // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders.
+    const char* gs_path = std::getenv("VKH_GS");
+    VkPhysicalDeviceFeatures feats{};
+    feats.geometryShader = gs_path ? VK_TRUE : VK_FALSE;
+    dci.pEnabledFeatures = &feats;
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
@@ -159,10 +173,19 @@ int main(int argc, char** argv) {
     };
     VkShaderModule vs, fs;
     CHECK(module(argv[1], &vs)); CHECK(module(argv[2], &fs));
-    VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+    VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                              {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "main";
+    stages[0].stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs; stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = "main";
+    uint32_t nstages = 2;
+    if (gs_path) {
+        VkShaderModule gsm;
+        CHECK(module(gs_path, &gsm));
+        stages[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT; stages[2].module = gsm; stages[2].pName = "main";
+        nstages = 3;
+    }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -177,12 +200,15 @@ int main(int argc, char** argv) {
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
     // Translated shaders declare a 136-byte push-constant block (user SGPRs + heap base); zeros here.
-    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 144};
+    const VkShaderStageFlags pcs = (mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
+                                   VK_SHADER_STAGE_FRAGMENT_BIT | (gs_path ? VK_SHADER_STAGE_GEOMETRY_BIT : 0);
+    VkPushConstantRange pcr{pcs, 0, 144};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    gpi.stageCount = 2; gpi.pStages = stages; gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+    gpi.stageCount = nstages; gpi.pStages = stages;
+    gpi.pVertexInputState = mesh ? nullptr : &vin; gpi.pInputAssemblyState = mesh ? nullptr : &ia;
     gpi.pViewportState = &vps; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms; gpi.pColorBlendState = &cb;
     gpi.layout = pl; gpi.renderPass = rp;
     VkPipeline pipe; CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe));
@@ -210,8 +236,11 @@ int main(int argc, char** argv) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     uint32_t zeros[36] = {};
     reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"))(
-        cmd, pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(zeros), zeros);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+        cmd, pl, pcs, 0, sizeof(zeros), zeros);
+    if (mesh)
+        reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT"))(cmd, 1, 1, 1);
+    else
+        vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
