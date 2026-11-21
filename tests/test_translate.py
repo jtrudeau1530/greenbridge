@@ -163,7 +163,4 @@ def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
     )
     asm_vcc = vcc_half.translate()
     vcc_half.validate(asm_vcc)
-    if asm_vcc.count("OpBitCount %uint %c0") != 2:
-        # Known gap: a vcc_lo / vcc_hi copied into a 32-bit SGPR is still counted as the whole wave (both halves
-        # rebuilt with subgroup ops), so s_bcnt1_i32_b32 counts the other half too. Fails on #73's own branch.
-        pytest.xfail("wave64: half identity of vcc_lo/vcc_hi copies is not tracked into s_bcnt1_i32_b32 yet")
+    assert asm_vcc.count("OpBitCount %uint %c0") == 2
