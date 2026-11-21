@@ -65,10 +65,29 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
 
 
+# Windows error codes for a program the system refuses to start, and who refused it.
+BLOCKED_BY = {4551: "Windows Application Control (Smart App Control or an App Control policy)",
+              1260: "a Windows software restriction policy",
+              225: "Microsoft Defender, which reported it as a threat"}
+
+
+def start_failure(exe, err):
+    """One result line for a test program that could not be started, instead of a traceback that ends the run.
+    Smart App Control blocks unsigned programs it has no reputation for, so a fresh build can be refused."""
+    name = os.path.basename(str(exe))
+    who = BLOCKED_BY.get(getattr(err, "winerror", None))
+    if who is None:
+        return f"could not start {name}: {err}"
+    return (f"could not start {name}: blocked by {who}. A freshly built test program has no reputation yet: "
+            "allow it, or turn Smart App Control off (Windows Security > App & browser control), and run again")
+
+
 def run(*cmd, env=None):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    except FileNotFoundError:
+    except OSError as e:
+        if not isinstance(e, FileNotFoundError):
+            return 1, start_failure(cmd[0], e)
         tools = os.path.abspath(os.path.dirname(cmd[0]))
         missing = [t + EXE for t in ("vk_compute_test", "vk_store_test", "vk_harness")
                    if not os.path.isfile(os.path.join(tools, t + EXE))]
@@ -185,7 +204,11 @@ def mesh_w64x_test(tools, spirv, name):
         env["VKH_SUBGROUP_SIZE"] = "64"
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         raw = Path(tmp) / "pixels.raw"
-        r = subprocess.run([os.path.join(tools, "vk_harness" + EXE), shader, fs, raw], capture_output=True, text=True, env=env)
+        harness = os.path.join(tools, "vk_harness" + EXE)
+        try:
+            r = subprocess.run([harness, shader, fs, raw], capture_output=True, text=True, env=env)
+        except OSError as e:
+            return start_failure(harness, e)
         if r.returncode == UNSUPPORTED:   # vk_harness: the device has no VK_EXT_mesh_shader
             m = re.search(r"unsupported: .*", r.stderr)
             return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
@@ -253,7 +276,7 @@ def pixel_test(tools, spirv, name):
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
     if not px:
-        return "vk_harness failed or returned no pixels"
+        return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
     n = len(px)
     if name in PIXEL_BITS:
         wrong = sum(p != PIXEL_BITS[name] for p in px)
