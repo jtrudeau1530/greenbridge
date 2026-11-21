@@ -27,6 +27,21 @@ std::vector<uint8_t> read_file(const std::filesystem::path& p) {
 template <class T>
 T* at(uint8_t* base, uint32_t rva) { return reinterpret_cast<T*>(base + rva); }
 
+// Every RVA followed below comes out of the image itself, so each one is checked first. A truncated or corrupt
+// image then fails with a message instead of reading, writing or protecting memory outside its allocation.
+void require_range(const std::string& name, uint64_t rva, uint64_t len, uint32_t image_size, const char* what) {
+    if (rva > image_size || len > image_size - rva)
+        throw std::runtime_error(name + ": " + what + " runs past the image");
+}
+
+std::string read_string(const std::string& name, uint8_t* base, uint32_t image_size, uint32_t rva, const char* what) {
+    if (rva >= image_size) throw std::runtime_error(name + ": " + what + " is outside the image");
+    auto* s = reinterpret_cast<const char*>(base + rva);
+    auto* end = static_cast<const char*>(std::memchr(s, 0, image_size - rva));
+    if (!end) throw std::runtime_error(name + ": " + what + " isn't terminated inside the image");
+    return {s, end};
+}
+
 // The Xbox builds of the MSVC runtime import the same CRT the desktop does, so the host's own copies are used.
 bool prefer_host_copy(const std::string& dll) {
     static const char* names[] = {"vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
@@ -57,16 +72,28 @@ Module& Loader::load(const std::filesystem::path& image) {
 
 Module& Loader::map_image(const std::filesystem::path& path) {
     auto file = read_file(path);
+    const std::string name = path.filename().string();
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(file.data());
     if (file.size() < sizeof(IMAGE_DOS_HEADER) || dos->e_magic != IMAGE_DOS_SIGNATURE)
         throw std::runtime_error(path.string() + ": not an MZ image");
+    if (dos->e_lfanew < 0 || static_cast<uint64_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > file.size())
+        throw std::runtime_error(name + ": the NT headers are outside the file");
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(file.data() + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
-        throw std::runtime_error(path.string() + ": not an x86-64 PE");
+        throw std::runtime_error(name + ": not an x86-64 PE");
+    if (nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        throw std::runtime_error(name + ": not a PE32+ image");
     auto& oh = nt->OptionalHeader;
+    uint64_t sections = static_cast<uint64_t>(dos->e_lfanew) + 4 + sizeof(IMAGE_FILE_HEADER) +
+                        nt->FileHeader.SizeOfOptionalHeader;
+    if (sections + static_cast<uint64_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER) > file.size())
+        throw std::runtime_error(name + ": the section table runs past the end of the file");
+    if (!oh.SizeOfImage || oh.SizeOfHeaders > oh.SizeOfImage || oh.SizeOfHeaders > file.size())
+        throw std::runtime_error(name + ": SizeOfHeaders and SizeOfImage don't fit the file");
 
     auto* m = new Module;
-    m->name = path.filename().string();
+    m->name = name;
     m->path = path;
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
@@ -88,25 +115,36 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
         uint32_t n = std::min(sec->SizeOfRawData, sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData);
-        if (n && sec->PointerToRawData + n <= file.size())
-            std::memcpy(m->base + sec->VirtualAddress, file.data() + sec->PointerToRawData, n);
+        if (!n) continue;
+        if (sec->PointerToRawData > file.size() || n > file.size() - sec->PointerToRawData)
+            throw std::runtime_error(m->name + ": section " + std::to_string(i) + " reads past the end of the file");
+        require_range(m->name, sec->VirtualAddress, n, m->size, "a section's data");
+        std::memcpy(m->base + sec->VirtualAddress, file.data() + sec->PointerToRawData, n);
     }
 
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
     if (delta) {
         m->relocated = true;
         auto& dir = oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (!dir.Size) throw std::runtime_error(m->name + ": the image has no relocations and isn't at its base");
+        require_range(m->name, dir.VirtualAddress, dir.Size, m->size, "the relocation table");
         auto* block = at<IMAGE_BASE_RELOCATION>(m->base, dir.VirtualAddress);
         auto* end = reinterpret_cast<uint8_t*>(block) + dir.Size;
-        while (reinterpret_cast<uint8_t*>(block) < end && block->SizeOfBlock) {
+        while (reinterpret_cast<uint8_t*>(block) < end) {
+            if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                reinterpret_cast<uint8_t*>(block) + block->SizeOfBlock > end)
+                throw std::runtime_error(m->name + ": a relocation block doesn't fit the relocation table");
             auto* entries = reinterpret_cast<uint16_t*>(block + 1);
             size_t count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
             for (size_t i = 0; i < count; ++i) {
                 uint16_t type = entries[i] >> 12, off = entries[i] & 0xFFF;
-                if (type == IMAGE_REL_BASED_DIR64)
+                if (type == IMAGE_REL_BASED_DIR64) {
+                    require_range(m->name, static_cast<uint64_t>(block->VirtualAddress) + off, sizeof(uint64_t), m->size,
+                                  "a relocation");
                     *at<uint64_t>(m->base, block->VirtualAddress + off) += delta;
-                else if (type != IMAGE_REL_BASED_ABSOLUTE)
+                } else if (type != IMAGE_REL_BASED_ABSOLUTE) {
                     throw std::runtime_error(m->name + ": unsupported relocation type " + std::to_string(type));
+                }
             }
             block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uint8_t*>(block) + block->SizeOfBlock);
         }
@@ -119,14 +157,24 @@ void Loader::parse_exports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!dir.Size) return;
+    require_range(m.name, dir.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY), m.size, "the export directory");
     auto* ed = at<IMAGE_EXPORT_DIRECTORY>(m.base, dir.VirtualAddress);
+    require_range(m.name, ed->AddressOfFunctions, static_cast<uint64_t>(ed->NumberOfFunctions) * sizeof(uint32_t), m.size,
+                  "the export address table");
+    require_range(m.name, ed->AddressOfNames, static_cast<uint64_t>(ed->NumberOfNames) * sizeof(uint32_t), m.size,
+                  "the export name table");
+    require_range(m.name, ed->AddressOfNameOrdinals, static_cast<uint64_t>(ed->NumberOfNames) * sizeof(uint16_t), m.size,
+                  "the export ordinal table");
     auto* funcs = at<uint32_t>(m.base, ed->AddressOfFunctions);
     auto* names = at<uint32_t>(m.base, ed->AddressOfNames);
     auto* ords = at<uint16_t>(m.base, ed->AddressOfNameOrdinals);
     for (uint32_t i = 0; i < ed->NumberOfFunctions; ++i)
         if (funcs[i]) m.exports["#" + std::to_string(ed->Base + i)] = m.base + funcs[i];
-    for (uint32_t i = 0; i < ed->NumberOfNames; ++i)
-        m.exports[at<char>(m.base, names[i])] = m.base + funcs[ords[i]];
+    for (uint32_t i = 0; i < ed->NumberOfNames; ++i) {
+        if (ords[i] >= ed->NumberOfFunctions)
+            throw std::runtime_error(m.name + ": an export name points past the address table");
+        m.exports[read_string(m.name, m.base, m.size, names[i], "an export name")] = m.base + funcs[ords[i]];
+    }
     // Forwarded exports (RVA inside the export directory) aren't followed yet; none of the bundled DLLs use them.
 }
 
@@ -162,30 +210,48 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
 void Loader::bind_imports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
 
-    auto bind_thunks = [&](const std::string& dll, IMAGE_THUNK_DATA64* lookup, IMAGE_THUNK_DATA64* iat) {
-        for (; lookup->u1.AddressOfData; ++lookup, ++iat) {
+    // Thunk tables have no length field: they end at a zero entry, so each step is checked against the image.
+    auto bind_thunks = [&](const std::string& dll, uint64_t lookup_rva, uint64_t iat_rva) {
+        for (;; lookup_rva += sizeof(IMAGE_THUNK_DATA64), iat_rva += sizeof(IMAGE_THUNK_DATA64)) {
+            require_range(m.name, lookup_rva, sizeof(IMAGE_THUNK_DATA64), m.size, "an import lookup table");
+            require_range(m.name, iat_rva, sizeof(IMAGE_THUNK_DATA64), m.size, "an import address table");
+            auto* lookup = at<IMAGE_THUNK_DATA64>(m.base, static_cast<uint32_t>(lookup_rva));
+            if (!lookup->u1.AddressOfData) return;
             bool by_ord = IMAGE_SNAP_BY_ORDINAL64(lookup->u1.Ordinal);
             uint16_t ord = by_ord ? (uint16_t)IMAGE_ORDINAL64(lookup->u1.Ordinal) : 0;
-            std::string name = by_ord ? "" : at<IMAGE_IMPORT_BY_NAME>(m.base, (uint32_t)lookup->u1.AddressOfData)->Name;
-            iat->u1.Function = reinterpret_cast<uint64_t>(resolve(m, dll, name, ord, by_ord));
+            std::string name;
+            if (!by_ord) {
+                uint32_t hint = static_cast<uint32_t>(lookup->u1.AddressOfData);
+                require_range(m.name, hint, sizeof(uint16_t), m.size, "an import name");
+                name = read_string(m.name, m.base, m.size, hint + sizeof(uint16_t), "an import name");
+            }
+            at<IMAGE_THUNK_DATA64>(m.base, static_cast<uint32_t>(iat_rva))->u1.Function =
+                reinterpret_cast<uint64_t>(resolve(m, dll, name, ord, by_ord));
         }
     };
 
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (dir.Size) {
-        for (auto* d = at<IMAGE_IMPORT_DESCRIPTOR>(m.base, dir.VirtualAddress); d->Name; ++d) {
-            std::string dll = at<char>(m.base, d->Name);
+        for (uint64_t i = 0;; ++i) {
+            uint64_t rva = dir.VirtualAddress + i * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            require_range(m.name, rva, sizeof(IMAGE_IMPORT_DESCRIPTOR), m.size, "the import table");
+            auto* d = at<IMAGE_IMPORT_DESCRIPTOR>(m.base, static_cast<uint32_t>(rva));
+            if (!d->Name) break;
+            std::string dll = read_string(m.name, m.base, m.size, d->Name, "an imported DLL name");
             uint32_t lookup = d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk;
-            bind_thunks(dll, at<IMAGE_THUNK_DATA64>(m.base, lookup), at<IMAGE_THUNK_DATA64>(m.base, d->FirstThunk));
+            bind_thunks(dll, lookup, d->FirstThunk);
         }
     }
     // Delay imports are bound eagerly: simpler, and the full import surface shows up in --dry-run.
     auto& ddir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
     if (ddir.Size) {
-        for (auto* d = at<IMAGE_DELAYLOAD_DESCRIPTOR>(m.base, ddir.VirtualAddress); d->DllNameRVA; ++d) {
-            std::string dll = at<char>(m.base, d->DllNameRVA);
-            bind_thunks(dll, at<IMAGE_THUNK_DATA64>(m.base, d->ImportNameTableRVA),
-                        at<IMAGE_THUNK_DATA64>(m.base, d->ImportAddressTableRVA));
+        for (uint64_t i = 0;; ++i) {
+            uint64_t rva = ddir.VirtualAddress + i * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+            require_range(m.name, rva, sizeof(IMAGE_DELAYLOAD_DESCRIPTOR), m.size, "the delay-import table");
+            auto* d = at<IMAGE_DELAYLOAD_DESCRIPTOR>(m.base, static_cast<uint32_t>(rva));
+            if (!d->DllNameRVA) break;
+            std::string dll = read_string(m.name, m.base, m.size, d->DllNameRVA, "a delay-imported DLL name");
+            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA);
         }
     }
 }
@@ -198,8 +264,10 @@ void Loader::protect_sections(Module& m) {
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
         bool x = sec->Characteristics & IMAGE_SCN_MEM_EXECUTE, w = sec->Characteristics & IMAGE_SCN_MEM_WRITE;
         DWORD prot = x ? (w ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ) : (w ? PAGE_READWRITE : PAGE_READONLY);
-        SIZE_T size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
-        if (size) VirtualProtect(m.base + sec->VirtualAddress, size, prot, &old);
+        uint64_t size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        if (sec->VirtualAddress >= m.size) continue;
+        size = std::min<uint64_t>(size, m.size - sec->VirtualAddress);
+        if (size) VirtualProtect(m.base + sec->VirtualAddress, static_cast<SIZE_T>(size), prot, &old);
     }
     FlushInstructionCache(GetCurrentProcess(), m.base, m.size);
 }
