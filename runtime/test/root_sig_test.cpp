@@ -51,6 +51,16 @@ D3D12_ROOT_SIGNATURE_DESC1 make_legacy_desc1(uint32_t flags) {
     return desc;
 }
 
+D3D12_ROOT_SIGNATURE_DESC2 make_legacy_desc2(uint32_t flags) {
+    D3D12_ROOT_SIGNATURE_DESC2 desc{};
+    desc.NumParameters = 0;
+    desc.pParameters = nullptr;
+    desc.NumStaticSamplers = 0;
+    desc.pStaticSamplers = nullptr;
+    desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags);
+    return desc;
+}
+
 void test_versioned_1_0() {
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC xbox{};
     xbox.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
@@ -96,6 +106,29 @@ void test_versioned_1_1() {
     Blobs blobs;
     HRESULT hr = D3D12SerializeVersionedRootSignature(&cleared, &blobs.blob, &blobs.error);
     check(SUCCEEDED(hr), "versioned 1.1 copy with cleared flags is accepted by the PC serializer");
+}
+
+void test_versioned_1_2() {
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC xbox{};
+    xbox.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+    xbox.Desc_1_2 = make_legacy_desc2(kXboxFlags);
+
+    {
+        Blobs blobs;
+        HRESULT hr = D3D12SerializeVersionedRootSignature(&xbox, &blobs.blob, &blobs.error);
+        check(FAILED(hr), "versioned 1.2 with Xbox flags 0x03000000 is rejected by the PC serializer");
+    }
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC cleared{};
+    bool known = rt::d3d12_xs::copy_versioned_root_signature_desc_clear_xbox_flags(xbox, cleared);
+    check(known, "versioned 1.2 descriptor version is recognised");
+    check(cleared.Desc_1_2.Flags == 0, "versioned 1.2 copy has the high flag byte cleared");
+    check(xbox.Desc_1_2.Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
+          "versioned 1.2 original descriptor is unchanged");
+
+    Blobs blobs;
+    HRESULT hr = D3D12SerializeVersionedRootSignature(&cleared, &blobs.blob, &blobs.error);
+    check(SUCCEEDED(hr), "versioned 1.2 copy with cleared flags is accepted by the PC serializer");
 }
 
 void test_legacy_entry_point() {
@@ -165,6 +198,16 @@ void test_registered_shim() {
     check(SUCCEEDED(hr), "registered shim clears the Xbox flag byte and the PC serializer accepts the result");
     check(xbox.Desc_1_0.Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
           "registered shim leaves the caller's descriptor unchanged");
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC xbox12{};
+    xbox12.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+    xbox12.Desc_1_2 = make_legacy_desc2(kXboxFlags);
+
+    Blobs blobs12;
+    HRESULT hr12 = fn(&xbox12, &blobs12.blob, &blobs12.error);
+    check(SUCCEEDED(hr12), "registered shim clears the Xbox flag byte for 1.2 and the PC serializer accepts");
+    check(xbox12.Desc_1_2.Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
+          "registered shim leaves the caller's 1.2 descriptor unchanged");
 }
 
 }  // namespace
@@ -173,6 +216,7 @@ int main() {
     std::printf("root_sig_test: PC d3d12.dll root-signature flag handling\n");
     test_versioned_1_0();
     test_versioned_1_1();
+    test_versioned_1_2();
     test_legacy_entry_point();
     test_preserves_low_bits_and_unknown_versions();
     test_registered_shim();
