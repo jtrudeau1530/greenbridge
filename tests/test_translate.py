@@ -5,6 +5,7 @@ Needs llvm-mc (AMDGPU target) and spirv-tools; the tests skip themselves when th
 """
 import glob
 import os
+import re
 
 import pytest
 
@@ -126,16 +127,40 @@ def test_mesh_without_psv0_is_rejected(make_shader):
 
 
 def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
-    """Wave64 s_bfm_b64 must reconstruct the 64-bit wave mask, and 32-bit half compare must guard its half."""
+    """Wave64 s_bfm_b64 must use wave_lane() and reconstruct the 64-bit mask; 32-bit half ops must guard their half."""
     bfm = make_shader("s_mov_b64 exec, -1\ns_bfm_b64 s[6:7], 16, 8\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n",
                       name="cs_bfm64_ci")
     asm_bfm = bfm.translate()
     bfm.validate(asm_bfm)
     assert "OpGroupNonUniformBitwiseOr" in asm_bfm
+    assert "OpLoad %v3uint %local_id" in asm_bfm and "OpLoad %uint %sg_lane" not in asm_bfm
 
     hcmp = make_shader("s_mov_b32 exec_lo, 0\ns_mov_b32 exec_hi, 0xffff\ns_mov_b64 s[6:7], exec\n"
-                       "s_cmp_eq_u32 s6, 0\ns_endpgm\n", name="cs_halfcmp_ci")
+                       "s_cmp_eq_u32 s6, 0\ns_cmp_lg_u32 s7, 0\ns_endpgm\n", name="cs_halfcmp_ci")
     asm_hcmp = hcmp.translate()
     hcmp.validate(asm_hcmp)
-    assert "OpGroupNonUniformAll" in asm_hcmp
-    assert asm_hcmp.count("OpULessThan %bool") >= 2  # exec_lo write + half-mask guard before All
+    # Low-half s_cmp_eq_u32: lane < 32 (%c20) guards OpSelect(..., %true) feeding OpGroupNonUniformAll.
+    assert re.search(
+        r"(%t\d+) = OpULessThan %bool %t\d+ %c20\n\s*"
+        r"(%t\d+) = OpSelect %bool \1 %t\d+ %true\n\s*"
+        r"%t\d+ = OpGroupNonUniformAll %bool %c3 \2",
+        asm_hcmp,
+    ), "low-half s_cmp_eq_u32 did not guard OpGroupNonUniformAll with lane < 32"
+    # High-half s_cmp_lg_u32: lane >= 32 (%c20) guards OpLogicalAnd feeding OpGroupNonUniformAny.
+    assert re.search(
+        r"(%t\d+) = OpUGreaterThanEqual %bool %t\d+ %c20\n\s*"
+        r"(%t\d+) = OpLogicalAnd %bool \1 %t\d+\n\s*"
+        r"%t\d+ = OpGroupNonUniformAny %bool %c3 \2",
+        asm_hcmp,
+    ), "high-half s_cmp_lg_u32 did not guard OpGroupNonUniformAny with lane >= 32"
+
+    # Copying vcc_lo / vcc_hi to a 32-bit SGPR preserves half identity for wave64 s_bcnt1_i32_b32.
+    vcc_half = make_shader(
+        "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\n"
+        "s_mov_b32 s6, vcc_lo\ns_bcnt1_i32_b32 s8, s6\n"
+        "s_mov_b32 s7, vcc_hi\ns_bcnt1_i32_b32 s9, s7\ns_endpgm\n",
+        name="cs_vcchalf_ci",
+    )
+    asm_vcc = vcc_half.translate()
+    vcc_half.validate(asm_vcc)
+    assert asm_vcc.count("OpBitCount %uint %c0") == 2

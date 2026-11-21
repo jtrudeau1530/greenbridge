@@ -8,9 +8,9 @@ The same instructions also run on plain 64-bit data, such as a light mask read f
 instruction says which of the two it has, so this module works it out from what wrote the register.
 
     masks, writes = analyse(blocks, succ)   # blocks: lists of instructions; succ: successor block numbers per block
-    masks[id(ins)]                      # registers holding a lane mask on every path to ins: SGPR numbers, "vcc",
-                                        # ("lane", vgpr, lane): a mask parked in one lane of a VGPR,
-                                        # ("v", vgpr): a mask on its way through a VGPR
+    masks[id(ins)]                      # dict mapping each register holding a lane mask on every path to ins
+                                        # (SGPR number, "vcc", ("lane", vgpr, lane) parked in a VGPR lane, or
+                                        # ("v", vgpr) passing through a VGPR) to its kind (MASK, MASK_LO, MASK_HI)
     id(ins) in writes                   # ins writes a mask to a VGPR
 
 A register counts as a mask only if every path to the instruction wrote a mask to it. Anything else is treated
@@ -56,7 +56,14 @@ def kind(state, a):
             return MASK_HI
         if t == "exec":
             return MASK
-        return state.get("vcc") if t in ("vcc", "vcc_lo") else None
+        if t == "vcc":
+            return state.get("vcc")
+        if t in ("vcc_lo", "vcc_hi"):
+            vk = state.get("vcc")
+            if vk in MASK_KINDS:
+                return MASK_LO if t == "vcc_lo" else MASK_HI
+            return vk if t == "vcc_lo" else None
+        return None
     if a["k"] == "sgpr":
         n = a.get("n", 1)
         ks = [state.get(a["r"] + i) for i in range(n)]
@@ -99,7 +106,7 @@ def lane_slot(vgpr, lane):
 
 
 def step(state, ins):
-    """Update `state` (register -> MASK | EITHER) for one instruction. True if it writes a mask to a VGPR."""
+    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return

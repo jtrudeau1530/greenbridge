@@ -119,8 +119,6 @@ def test_masks_through_a_vgpr():
     assert L.analyse(blocks, [[]]) == ({id(i): {} for i in blocks[0]}, set())
 
 
-
-
 def test_bfm64_and_half_kinds():
     # s_bfm_b64 produces a 64-bit lane mask (low half in s6, high half in s7).
     use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
@@ -129,6 +127,13 @@ def test_bfm64_and_half_kinds():
     # exec_lo / exec_hi preserve half identity on 32-bit copies.
     got2 = L.analyse([[ins("s_mov_b32", s(6), sp("exec_lo")), ins("s_mov_b32", s(7), sp("exec_hi")), use]], [[]])[0][id(use)]
     assert got2 == {6: L.MASK_LO, 7: L.MASK_HI}
+    # vcc_lo / vcc_hi map to MASK_LO / MASK_HI when vcc holds a lane mask, and None when vcc is data.
+    vcmp = ins("v_cmp_gt_u32_e32", sp("vcc_lo"), imm(16), v(0))
+    got_vcc = L.analyse([[vcmp, ins("s_mov_b32", s(6), sp("vcc_lo")), ins("s_mov_b32", s(7), sp("vcc_hi")), use]], [[]])[0][id(use)]
+    assert got_vcc == {"vcc": L.MASK, 6: L.MASK_LO, 7: L.MASK_HI}
+    got_vcc_data = L.analyse([[ins("s_buffer_load_dword", sp("vcc_lo"), s(0, 4), imm(0)),
+                               ins("s_mov_b32", s(6), sp("vcc_lo")), ins("s_mov_b32", s(7), sp("vcc_hi")), use]], [[]])[0][id(use)]
+    assert got_vcc_data == {}
     # Merging low half and high half yields generic MASK (unknown half -> keep both halves).
     got3 = L.analyse([[ins("s_nop")], [ins("s_mov_b32", s(6), sp("exec_lo"))],
                       [ins("s_mov_b32", s(6), sp("exec_hi"))], [use]], [[1, 2], [3], [3], []])[0][id(use)]

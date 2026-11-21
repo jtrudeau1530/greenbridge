@@ -164,9 +164,10 @@ class Gen:
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %m0")
         elif k == "special" and a["t"] == "vcc_hi":
-            # wave32: vcc_hi is an ordinary SGPR (the lane mask lives in vcc_lo).
+            # wave64: vcc_hi is the upper half of VCC when VCC holds a lane mask (each lane's bit lives in %vcc).
+            # wave32 (or plain data): vcc_hi is an ordinary SGPR.
             v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint %vcc_hi")
+            self.emit(f"{v} = OpLoad %uint {'%vcc' if (self.wave64 and 'vcc' in self.cur_masks) else '%vcc_hi'}")
         elif k == "special" and a["t"] == "scc":
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %scc")
@@ -1324,7 +1325,7 @@ class Gen:
             t = a.get("t", "")
             if t in ("exec_lo", "vcc_lo"):
                 return "lo"
-            if t == "exec_hi":
+            if t in ("exec_hi", "vcc_hi"):
                 return "hi"
             return None
         if a["k"] == "sgpr" and a.get("n", 1) == 1:
@@ -1360,7 +1361,8 @@ class Gen:
         written as a mask on every path. An SGPR pair filled from a buffer (a light mask, say) is data."""
         if a["k"] == "special":
             t = a.get("t", "")
-            return t.startswith("exec") or (t in ("vcc", "vcc_lo") and "vcc" in self.cur_masks)
+            return t.startswith("exec") or (t in ("vcc", "vcc_lo") and "vcc" in self.cur_masks) or \
+                (t == "vcc_hi" and self.wave64 and "vcc" in self.cur_masks)
         return a["k"] == "sgpr" and all(a["r"] + i in self.cur_masks for i in range(a.get("n", 1)))
 
     def wave_mask(self, a):
@@ -1387,7 +1389,7 @@ class Gen:
         """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane."""
         if a["k"] == "sgpr":
             return self.load_reg("sgpr", a["r"])
-        if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo"):
+        if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
             return v
@@ -1898,9 +1900,8 @@ class Gen:
             # D = ((1 << size) - 1) << offset as a lane mask: in the per-lane model this lane's bit is
             # offset <= lane < offset + size (size/offset taken mod 64).
             size, off = self.src_u(a[1]), self.src_u(a[2])
-            self.uses_subgroup = True
-            lane, sz, of, end, ge, lt, on, m = (self.tmp() for _ in range(8))
-            self.emit(f"{lane} = OpLoad %uint %sg_lane")
+            lane = self.wave_lane()
+            sz, of, end, ge, lt, on, m = (self.tmp() for _ in range(7))
             self.emit(f"{sz} = OpBitwiseAnd %uint {size} {self.cu(63)}")
             self.emit(f"{of} = OpBitwiseAnd %uint {off} {self.cu(63)}")
             self.emit(f"{end} = OpIAdd %uint {of} {sz}")
