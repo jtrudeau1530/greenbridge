@@ -8,27 +8,19 @@ Semantics (Mesa ACO ``can_use_opsel`` / AMD RDNA2 ISA, VOP3 ``op_sel``): bit i <
 bit nsrc selects the high half of the destination. The half of the destination that is not written is kept.
 """
 import re
-import struct
 
 import pytest
 
 import rdna2spirv
-
-EMPTY_DXBC = b"DXBC" + bytes(16) + struct.pack("<III", 1, 32, 0)
+from listing import translate_listing
 
 # Result register v3 is initialised first: an f16 write keeps the other half, so it reads the old value, and the
 # translator rejects pixel shaders that read v0/v1 before writing them.
 PROLOGUE = "v_mov_b32 v3, 0x12345678\nv_mov_b32 v1, 0x3c004000"
-EPILOGUE = "v_mov_b32 v8, v3\nexp mrt0 v8, v8, v8, v8 done vm\ns_endpgm"
 
 
 def translate(tmp_path, instruction):
-    (tmp_path / "disasm").mkdir(exist_ok=True)
-    (tmp_path / "ps_opsel.dxbc").write_bytes(EMPTY_DXBC)
-    asm = "\n".join([PROLOGUE, instruction, EPILOGUE])
-    path = tmp_path / "disasm" / "ps_opsel.s"
-    path.write_text("".join("\t" + line + "\n" for line in asm.splitlines()))
-    return rdna2spirv.translate(str(path))
+    return translate_listing(tmp_path, PROLOGUE + "\n" + instruction)
 
 
 def high_extracts(spv):
