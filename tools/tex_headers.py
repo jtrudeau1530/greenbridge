@@ -12,11 +12,14 @@ Usage:
     python -I tex_headers.py <carve dir> [--archives a,b] [--out textures_index.json]
 """
 import argparse
+import array
 import json
 import os
 import struct
 import sys
 from collections import Counter
+
+_UINT64_CODE = "Q" if array.array("Q").itemsize == 8 else None
 
 DXGI = {
     2: "R32G32B32A32_FLOAT", 3: "R32G32B32A32_UINT", 4: "R32G32B32A32_SINT",
@@ -263,13 +266,35 @@ def parse_dds_header(data):
     return info
 
 
-def scan_archive(carve, arch):
-    # numpy is only needed for the descriptor scan; keeping it out of the module import lets the
-    # standard-library tests run on a Python without numpy.
+def _find_gpu_ptr_qwords_stdlib(buf: bytes):
+    """Return (qwords, hit_indices) for 64-bit GPU pointers matching 0x60000000..0x6FFFFFFF."""
+    n_qwords = len(buf) // 8
+    if n_qwords == 0:
+        return (), []
+    trimmed = memoryview(buf)[: n_qwords * 8]
+    if _UINT64_CODE is not None:
+        q = array.array(_UINT64_CODE)
+        q.frombytes(trimmed)
+        if sys.byteorder != "little":
+            q.byteswap()
+    else:
+        q = struct.unpack(f"<{n_qwords}Q", trimmed)
+    hits = [k for k, v in enumerate(q) if 0x60000000 <= v <= 0x6FFFFFFF]
+    return q, hits
+
+
+def _find_gpu_ptr_qwords(buf: bytes):
+    """Scan aligned little-endian u64 qwords, using numpy when installed or stdlib fallback."""
     try:
         import numpy as np
-    except ImportError as exc:
-        raise RuntimeError("scan_archive needs numpy (pip install numpy)") from exc
+    except ImportError:
+        return _find_gpu_ptr_qwords_stdlib(buf)
+    q = np.frombuffer(buf[: len(buf) // 8 * 8], "<u8")
+    hits = np.nonzero(((q >> 28) == 6) & ((q >> 32) == 0))[0]
+    return q, hits
+
+
+def scan_archive(carve, arch):
     with open(os.path.join(carve, arch, "index.json"), encoding="utf-8") as f:
         files = sorted(json.load(f)["files"], key=lambda r: r["off"])
     out = []
@@ -291,9 +316,9 @@ def scan_archive(carve, arch):
             chain.append([r["off"], r["size"]])
         with open(os.path.join(carve, arch, f"{v['off']:012x}.bin"), "rb") as f:
             V = f.read()
-        q = np.frombuffer(V[: len(V) // 8 * 8], "<u8")
+        q, hits = _find_gpu_ptr_qwords(V)
         # Any GPU pointer whose header (4 qwords later) decodes to sane dimensions and a known DXGI format.
-        for k in np.nonzero(((q >> 28) == 6) & ((q >> 32) == 0))[0]:
+        for k in hits:
             k = int(k)
             if k < 2 or k + 5 >= len(q):
                 continue

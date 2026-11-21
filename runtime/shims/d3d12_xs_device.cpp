@@ -346,9 +346,18 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     return hr;
 }
 
+// The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured
+// on the package's XboxBvhBuilder.dll (its constructor passes w2 = w3 = 0 and IID_ID3D12PipelineState in the fourth
+// argument), as the prior art had recorded. Their meaning is unknown; non-zero values are logged once.
 HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
-                                            const IID* riid, void** out) {
+                                            std::uint64_t w2, std::uint64_t w3, const IID* riid, void** out) {
     note_slot(62);
+    if (w2 || w3) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 62 extra words 0x%llx 0x%llx (ignored)\n",
+                         static_cast<unsigned long long>(w2), static_cast<unsigned long long>(w3));
+    }
     if (!riid) return E_POINTER;
     if (!out) return E_POINTER;
     return self->real->CreateComputePipelineState(desc, *riid, out);
@@ -399,8 +408,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
-            self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1),
-            reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+            self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
+            reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),

@@ -94,7 +94,7 @@ std::filesystem::path write_image_as(const std::vector<uint8_t>& bytes, const st
 // export directory, which is how a forwarder is encoded.
 std::vector<uint8_t> make_forwarder_image(const char* target, uint64_t image_base) {
     auto img = make_image();
-    std::fill(img.begin() + 0x200, img.begin() + 0x400, 0);  // real tables end in a zero descriptor
+    std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});  // real tables end in a zero descriptor
     nt_of(img)->OptionalHeader.ImageBase = image_base;
     auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
     ed->Base = 1;
@@ -117,7 +117,7 @@ std::vector<uint8_t> make_forwarder_image(const char* target, uint64_t image_bas
 // An image importing `dll`!`symbol` by name.
 std::vector<uint8_t> make_import_image(const char* dll, const char* symbol) {
     auto img = make_image();
-    std::fill(img.begin() + 0x200, img.begin() + 0x400, 0);
+    std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
     auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(img.data() + 0x200);
     d->Name = 0x1060;  // past the zero descriptor that ends the table
     d->OriginalFirstThunk = 0x1100;
@@ -589,7 +589,7 @@ void test_delay_descriptor_fields() {
     {
         // Without dlattrRva the fields are 32-bit virtual addresses, which cannot address an x64 image.
         auto img = make_image();
-        std::fill(img.begin() + 0x200, img.begin() + 0x400, 0);
+        std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
         auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
         d->Attributes.AllAttributes = 0;
         d->DllNameRVA = 0x1060;  // past the zero descriptor that ends the table
@@ -603,7 +603,7 @@ void test_delay_descriptor_fields() {
     {
         const char* what = "a delay import with no name table binds through its address table";
         auto img = make_image();
-        std::fill(img.begin() + 0x200, img.begin() + 0x400, 0);
+        std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
         auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
         d->Attributes.AllAttributes = 1;  // dlattrRva
         d->DllNameRVA = 0x1060;  // past the zero descriptor that ends the table

@@ -21,12 +21,6 @@ import rtti_scan
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "rtti_scan.py")
 
-try:
-    import pefile
-    HAS_PEFILE = True
-except ImportError:
-    HAS_PEFILE = False
-
 
 def make_synthetic_pe(text_bytes: bytes = b"", rdata_bytes: bytes = b"", image_base: int = 0x140000000) -> bytes:
     """Build a minimal valid 64-bit PE image in memory with .text and .rdata sections."""
@@ -94,7 +88,6 @@ class SimpleNameTest(unittest.TestCase):
         self.assertEqual(rtti_scan.simple_name(""), "")
 
 
-@unittest.skipUnless(HAS_PEFILE, "pefile is required to scan PE images")
 class RttiScanCoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -352,6 +345,34 @@ class RttiScanCoreTest(unittest.TestCase):
         with open(expected_json, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.assertEqual(data["type_descriptors"], 1)
+
+    def test_invalid_pe_images_rejected_cleanly(self):
+        good = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 16, rdata_bytes=b"\x00" * 16))
+        bad_pe32 = bytearray(good)
+        struct.pack_into("<H", bad_pe32, 0x80 + 24, 0x010B)  # PE32 (32-bit), not PE32+
+        bad_sig = bytearray(good)
+        bad_sig[0x80:0x84] = b"NOPE"
+        bad_sec = bytearray(good)
+        struct.pack_into("<H", bad_sec, 0x80 + 6, 999)  # section count exceeds file size
+
+        for label, payload in [
+            ("empty", b""),
+            ("not MZ", b"NO" + b"\x00" * 128),
+            ("bad PE signature", bytes(bad_sig)),
+            ("32-bit PE32", bytes(bad_pe32)),
+            ("truncated section table", bytes(bad_sec)),
+        ]:
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    rtti_scan.load_pe64_image(payload)
+
+        # CLI returns exit code 1 with clear error message on invalid PE.
+        bad_path = os.path.join(self.tmp.name, "not_a_pe.exe")
+        with open(bad_path, "wb") as f:
+            f.write(b"NOT_A_PE")
+        p = self.run_tool(bad_path)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("ERROR:", p.stderr)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, committed buffers and 2D textures, copies) runs behind the Xbox-ABI device proxy
+render-target and depth views, committed buffers, 2D textures and 3D texture transfers) runs behind the Xbox-ABI device proxy
 (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is set and the host PC device otherwise.
 Shader views, root signatures, PSOs, draws and the swapchain are not implemented.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
@@ -161,7 +161,7 @@ What is implemented (all of it testable without the game):
   block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not). Each
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
-  2D only: 3D boxes and depth slices are rejected as unsupported.
+  A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -172,12 +172,15 @@ What is implemented (all of it testable without the game):
   `VulkanQueue` (`ExecuteCommandLists` prepares every list before writing any, so a bad list submits nothing and
   leaves the tracker as it was; `Signal`; `Wait`, which is attached to the next submission because a Vulkan wait
   only holds back its own batch) and `VulkanFence` (a timeline semaphore).
-- **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList7`, `ID3D12CommandQueue`,
-  `ID3D12CommandAllocator` and `ID3D12Fence1` (with `SetEventOnCompletion` events). Every method they do not
-  implement is a stub generated at build time from the SDK's `d3d12.h` by `tools/gen_d3d12_stubs.py`. The stub
-  reports its name once, so the vtables follow the SDK order exactly and nothing derived from the SDK is checked
-  in. Unknown IIDs are logged and refused. Resources are identified by their `ID3D12Resource` pointer, and
-  RTV/DSV CPU handles point at a `TargetView`.
+- **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList8` (the GCL7 chain plus
+  `OMSetFrontAndBackStencilRef`), `ID3D12CommandQueue`, `ID3D12CommandAllocator` and `ID3D12Fence1` (with
+  `SetEventOnCompletion` events). Every method they do not implement is a stub generated at build time from the
+  SDK's `d3d12.h` by `tools/gen_d3d12_stubs.py`. The stub reports its name once, so the vtables follow the SDK
+  order exactly and nothing derived from the SDK is checked in. Unknown IIDs are logged and refused. Resources
+  are identified by their `ID3D12Resource` pointer, and RTV/DSV CPU handles point at a `TargetView`.
+  `OMSetFrontAndBackStencilRef` records its two `UINT`s on the list (and `Reset` clears them), but nothing applies
+  them yet: Vulkan can set the faces with `vkCmdSetStencilReference` and a face mask, but only a pipeline that
+  consumes the dynamic state can, and this layer has no pipeline or draw path.
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
   work unchanged. It creates the objects above, plus:
@@ -186,11 +189,12 @@ What is implemented (all of it testable without the game):
     yet;
   - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D` and `TEXTURE2DARRAY`;
   - committed buffers (upload and readback heaps mapped persistently and zeroed) and 2D textures in the common
-    render-target, depth and texture formats (typeless families become mutable-format images);
+    render-target, depth and texture formats (typeless families become mutable-format images), plus non-attachment
+    3D textures with mipmapped upload, image copy and readback;
   - `CheckFeatureSupport` for feature levels (up to 12_1) and architecture. Every other query is logged and
     refused until the trace shows what the game asks (question 11);
-  - `GetCopyableFootprints` for buffers and 2D textures, including BC1–7 and the two-plane depth-stencil formats.
-    The test compares every output with the PC runtime's for 13 descriptions; that comparison found that planar
+  - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
+    The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
 
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
@@ -204,11 +208,13 @@ What is implemented (all of it testable without the game):
   the inner device, so `GetDevice` always returns the Xbox-ABI object. All D3D12 queues share one graphics
   `VkQueue` behind a submit lock (question 12).
 
-Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, 3D and array
-copies through footprints with depth, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), MSAA, 1D/3D textures and the swapchain;
+Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, volume attachment
+views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), MSAA, 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
-sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error.
+sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error; the GCL8
+front/back stencil references are recorded but not applied, because there is no pipeline or draw path for them to
+affect.
 
 Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <build> --output-on-failure` for the
 CPU tests:
@@ -223,6 +229,9 @@ and any validation error fails them.
   texture, and enhanced barriers including a discard.
 - `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
   the CPU has not signalled holds the GPU back.
+- `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
+  `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
+  creates only an allocator and a list, so it needs no GPU or Vulkan loader.
 - `d3d12_vulkan_device_test`: the Vulkan device behind the Xbox-ABI proxy, called the way the game will call it.
   It creates heaps through slot 14 and reads their start handles in RAX, creates a render target through slot 76
   with the Xbox layout word, then creates views, records clears and barriers, executes and waits on a fence.
@@ -497,7 +506,7 @@ The trace will enumerate them.
 | `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
 | `ID3D12CommandQueue` | `Queue` over one or more `VkQueue`s | Start with one graphics+compute+transfer queue; add dedicated queues when the game uses async compute. `PresentX` is Xbox-specific and not in the public vtable (**Open**). |
 | `ID3D12CommandAllocator` | IR arena + `VkCommandPool` | Reset only when the previous submission's fence is complete. |
-| `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers, front/back stencil ref. |
+| `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). |
 | `ID3D12RootSignature` | `RootSignature` + `VkPipelineLayout` | Deserialize the blob with the host `D3D12CreateVersionedRootSignatureDeserializer` when possible; clear the measured `0x03000000` flag byte on a copy first; fall back to a local parser. Build the user-SGPR map and static samplers. |
 | `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash → SPIR-V + index entry; PSO state → Vulkan state; dynamic state where possible. The BVH builder's compute PSOs arrive at device slot 62 with a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`. |
 | `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. Increments are layer-chosen (32/32) pending the console value. |

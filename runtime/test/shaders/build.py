@@ -6,8 +6,9 @@ Each .asm is RDNA2 assembly. It is assembled with llvm-mc (LLVM 21+ with the AMD
 path, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are staged in a temporary
 directory. After validation, the build writes <out>/spirv/<name>.spv and the translator metadata.
 
-Compute shaders get the header specified in compute_fixture.py. The stage comes from the name's prefix. Mesh and
-geometry shaders (ms_, gs_) also need a DXBC container with their signatures, which this doesn't make.
+Compute shaders can override the default header with leading "; group: X,Y,Z" and "; rsrc2: 0x..." comments.
+The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
+their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
 """
 import json
@@ -56,10 +57,13 @@ def translate_tests(work, names):
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
         (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
         if n.startswith("cs_"):
-            (fssm / (n + ".fssm")).write_bytes(compute_header(n))
+            (fssm / (n + ".fssm")).write_bytes(compute_header(asm_path))
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
-    return subprocess.run([sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]).returncode
+    cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
+    if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
+        cmd.append("--wave64-emulate")
+    return subprocess.run(cmd).returncode
 
 
 def main():

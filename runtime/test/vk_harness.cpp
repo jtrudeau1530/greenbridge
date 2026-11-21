@@ -130,6 +130,8 @@ int main(int argc, char** argv) {
     const char* gs_path = std::getenv("VKH_GS");
     VkPhysicalDeviceFeatures feats{};
     feats.geometryShader = gs_path ? VK_TRUE : VK_FALSE;
+    feats.shaderClipDistance = f2q.features.shaderClipDistance;
+    feats.shaderCullDistance = f2q.features.shaderCullDistance;
     dci.pEnabledFeatures = &feats;
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));

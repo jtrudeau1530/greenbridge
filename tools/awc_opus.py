@@ -92,17 +92,29 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
             out.append(ogg_page(serial, seq, g, pending, 0x04 if last else 0x00))
             seq += 1
             pending, size = [], 0
-    with open(path, "wb") as f:
-        f.write(b"".join(out))
+    write_file(path, b"".join(out))
     return granule
+
+
+def write_file(path: str, data: bytes) -> None:
+    """Write under a temporary name and rename into place: a stopped run or a full disk never leaves a short file
+    under the final name, where a later run would keep it."""
+    tmp = path + ".part"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        raise
 
 
 def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = False) -> None:
     bits = 32 if float32 else 16
     hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack(
         "<IHHIIHH", 16, 3 if float32 else 1, channels, rate, rate * channels * bits // 8, channels * bits // 8, bits) +         b"data" + struct.pack("<I", len(pcm))
-    with open(path, "wb") as f:
-        f.write(hdr + pcm)
+    write_file(path, hdr + pcm)
 
 
 # ---- AWC ----
@@ -193,7 +205,8 @@ def opus_packets(d: bytes, at: int, size: int):
 
 
 def export_bank(path: str, out_dir: str):
-    d = open(path, "rb").read()
+    with open(path, "rb") as f:
+        d = f.read()
     name = os.path.splitext(os.path.basename(path))[0]
     od = os.path.join(out_dir, name)
     os.makedirs(od, exist_ok=True)
@@ -250,8 +263,16 @@ def main() -> int:
         for k in tot:
             tot[k] += c[k]
 
+    failed = []
+
     def skipped(b, e):
-        print(f"  skip {os.path.basename(b)}: {e}")
+        # A bank that does not parse is skipped for good: running again gives the same result. A read or write
+        # error (full disk, file in use) is not: it fails the run, so make_game.py runs this step again.
+        if isinstance(e, OSError):
+            failed.append((b, e))
+            print(f"  FAILED {os.path.basename(b)}: {e}")
+        else:
+            print(f"  skip {os.path.basename(b)}: {e}")
 
     if jobs == 1:
         for i, b in enumerate(banks):
@@ -275,6 +296,11 @@ def main() -> int:
                     print(f"  {i}/{len(banks)} banks: {tot}", flush=True)
     print(f"{len(banks)} banks: {tot['opus']} Ogg Opus, {tot['music']} music channels (Ogg Opus), {tot['pcm']} WAV, "
           f"{tot['other']} not handled (XMA/other)")
+    if failed:
+        b, e = failed[0]
+        print(f"ERROR: {len(failed)} bank(s) could not be read or written, first {os.path.basename(b)}: {e}",
+              file=sys.stderr)
+        return 1
     return 0
 
 

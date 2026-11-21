@@ -305,6 +305,37 @@ def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
     return (bad == 0), (first if bad else "4096/4096 pixels exact")
 
 
+def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
+    """Check 64x64 output with ClipDistance[0] = NDC x: left half (x < 32) clipped to clear (-1),
+    right half (x >= 32) covered (2048/4096 pixels) with the gradient."""
+    px = read_raw_rgba32f(raw_path)
+    if len(px) != 64 * 64:
+        return False, f"expected 4096 pixels, got {len(px)}"
+    covered = 0
+    bad = 0
+    first = ""
+    for i, (r, g, b, a) in enumerate(px):
+        x, y = i % 64, i // 64
+        is_clear = (r == -1.0 and g == -1.0 and b == -1.0 and a == -1.0)
+        if not is_clear:
+            covered += 1
+        if x < 32:
+            if not is_clear:
+                if not bad:
+                    first = f"unclipped pixel at ({x},{y}): got ({r:.4f},{g:.4f},{b:.4f},{a:.4f})"
+                bad += 1
+        else:
+            wx = (x + 0.5) / 64.0
+            wy = (y + 0.5) / 64.0
+            if is_clear or abs(r - wx) > 1e-3 or abs(g - wy) > 1e-3 or abs(b - want_b) > 1e-3 or abs(a - want_a) > 1e-3:
+                if not bad:
+                    first = f"at ({x},{y}): got ({r:.4f},{g:.4f},{b:.4f},{a:.4f}), want ({wx:.4f},{wy:.4f},{want_b},{want_a})"
+                bad += 1
+    ok = (bad == 0 and covered == 2048)
+    detail = f"{covered}/4096 pixels covered (expected 2048)" if ok else f"covered={covered}/2048; {first}"
+    return ok, detail
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
@@ -312,6 +343,15 @@ def main() -> int:
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")
     a = ap.parse_args()
+
+    ext = ".exe" if os.name == "nt" else ""
+    missing = [t + ext for t in ("vk_compute_test", "vk_store_test", "vk_harness")
+               if not os.path.isfile(os.path.join(a.build, t + ext))]
+    if missing:
+        sys.exit(f"Test programs not found in {os.path.abspath(a.build)}: {', '.join(missing)}\n"
+                 "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
+                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
+                 "Vulkan headers (vulkan-headers on Arch) and configure again.")
 
     work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
     try:
@@ -341,19 +381,28 @@ def run_suite(a, work: str) -> int:
                 (b"ISG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
                 (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
             ])
-        elif name == "ms_tri":
+        elif name in ("ms_tri", "ms_w64x_ballot"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
+        elif name == "ms_clip":
+            dxbc = make_dxbc([
+                (b"PSV0", make_ms_psv0(128, 64, 64, 2)),
+                # OSG1: SV_Position (sysv=1) reg 0 xyzw, SV_ClipDistance (sysv=2) reg 1 x
+                (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (2, 3, 1, 0x1, 0xE)])),
+            ])
         else:
             dxbc = make_dxbc([])
         with open(os.path.join(work, f"{name}.dxbc"), "wb") as f:
             f.write(dxbc)
         if name.startswith("cs_"):
             with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
-                f.write(compute_header(name))
+                f.write(compute_header(os.path.join(SHADER_DIR, fname)))
         assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), os.path.join(disasm_dir, f"{name}.s"), name)
 
     # 2. Translate all .s -> .spv
-    rc, out = run_cmd([sys.executable, "-I", TRANSLATOR, disasm_dir, "--out", spirv_dir])
+    cmd = [sys.executable, "-I", TRANSLATOR, disasm_dir, "--out", spirv_dir]
+    if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 compute/mesh exact on any subgroup size
+        cmd.append("--wave64-emulate")
+    rc, out = run_cmd(cmd)
     print("=== rdna2spirv.py ===")
     print(out)
     if rc != 0:
@@ -412,7 +461,10 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"))
             else:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl"):
+        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
+                      "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
+                      "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
+                      "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
@@ -420,14 +472,34 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_half_cmp": [1, 0, 1, 1],
                 "cs_wm_bfm64": [16, 8, 8, 40],
                 "cs_wm_scc_rfl": [55, 48],
+                # cross-half tests (derivations in each .asm); need exact wave64 or its emulation
+                "cs_w64x_readlane": [121, 121, 16, 97, 16, 100, 100, 121],
+                "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 4660, 99],
+                "cs_w64x_readfirstlane": [140, 140, 163, 132, 100, 105, 133, 48],
+                "cs_w64x_bpermute": [36, 316, 253, 218, 435, 225, 0, 442],
+                "cs_w64x_branch": [0, 0, 0, 0, 5, 5, 9, 9],
+                "cs_w64x_ballot": [2053, 2061, 2069, 2077, 2085, 2093, 2101, 2109],
+                "cs_w64x_wg128_branches": [121, 121, 343, 343, 14, 31, 19812, 22728],
+                "cs_w64x_lds_raw": [132, 137, 100, 108, 131, 101, 149, 118],
+                "cs_w64x_lds_war": [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031],
+                "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
+                "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
+                "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
             # check.py does, where the device has none (vk_compute_test exits 77) instead of reporting a failure.
-            wave64 = name != "cs_store"
+            # With LEONIDA_W64_EMULATE=1 they were translated with --wave64-emulate and run on any subgroup size.
+            # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
+            emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
+            partial = name == "cs_w64x_partial"
+            wave64 = name != "cs_store" and not emulated and not partial
+            if partial and not emulated:
+                cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
             dump_line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
-            if wave64 and rc == 77:
+            no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
+            if (wave64 and rc == 77) or (no64 and rc == 0):
                 results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
             elif rc == 0 and dump_line:
                 vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
@@ -482,14 +554,29 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_grad(raw, 0.0, 0.0)
                 results.append((name, ok, detail))
-        elif name == "ms_tri":
+        elif name in ("ms_tri", "ms_w64x_ballot"):
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            env = dict(gfx_env or os.environ, VKH_MESH="1")
+            rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
+            # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
+            # the wave64 compute dumps are.
+            no64 = (name == "ms_w64x_ballot" and os.environ.get("LEONIDA_W64_EMULATE") != "1" and
+                    not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
+            if rc != 0:
+                results.append((name, False, msg))
+            elif no64:
+                results.append((name, None, "SKIP (no 64-wide subgroup on this device)"))
+            else:
+                ok, detail = check_grad(raw, 0.5, 1.0)
+                results.append((name, ok, detail))
+        elif name == "ms_clip":
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_MESH="1")
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
             if rc != 0:
                 results.append((name, False, msg))
             else:
-                ok, detail = check_grad(raw, 0.5, 1.0)
+                ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
 
     print("\n=== GPU TEST RESULTS ===")

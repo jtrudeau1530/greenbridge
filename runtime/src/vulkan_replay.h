@@ -50,6 +50,8 @@ struct ResourceBinding {
     bool not_zeroed = false;           // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: first use skips the zero fill
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
     VkDeviceSize size = 0;             // its size in bytes
+    std::uint32_t depth = 1;
+    bool volume = false;               // one array layer, including at mips with a single slice
 };
 
 struct VulkanAccess {
@@ -605,25 +607,27 @@ inline bool copy_subresource(const ResourceBinding& resource, std::uint32_t subr
 }
 
 // CopyTextureRegion: texture to texture, footprint to texture (upload) or texture to footprint (readback).
-// 2D only. Block-compressed footprints are padded to whole blocks; the Vulkan extent stops at the mip edge.
+// Block-compressed footprints are padded to whole blocks; the Vulkan extent stops at the mip edge.
 inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
-    if (copy.z != 0 || (copy.has_box && (copy.box.front != 0 || copy.box.back != 1))) return ReplayResult::unsupported;
     if (!copy.dst.footprint && !copy.src.footprint) {
         VkImageSubresourceRange dst{}, src{};
         if (!copy_subresource(p.binding, copy.dst.subresource, dst) ||
             !copy_subresource(p.source, copy.src.subresource, src))
             return ReplayResult::invalid_subresource;
-        if (dst.aspectMask != src.aspectMask) return ReplayResult::invalid_copy;
+        if (dst.aspectMask != src.aspectMask || p.binding.volume != p.source.volume) return ReplayResult::invalid_copy;
         const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
-        const CopyBox box = copy.has_box ? copy.box : CopyBox{0, 0, 0, from.width, from.height, 1};
-        if (box.right > from.width || box.bottom > from.height) return ReplayResult::invalid_copy;
-        const std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
-        if (copy.x + w > to.width || copy.y + h > to.height) return ReplayResult::invalid_copy;
+        const auto from_depth = std::max(1u, p.source.depth >> src.baseMipLevel);
+        const auto to_depth = std::max(1u, p.binding.depth >> dst.baseMipLevel);
+        const CopyBox box = copy.has_box ? copy.box : CopyBox{0, 0, 0, from.width, from.height, from_depth};
+        if (box.right > from.width || box.bottom > from.height || box.back > from_depth) return ReplayResult::invalid_copy;
+        const std::uint32_t w = box.right - box.left, h = box.bottom - box.top, d = box.back - box.front;
+        if (!within(copy.x, w, to.width) || !within(copy.y, h, to.height) || !within(copy.z, d, to_depth))
+            return ReplayResult::invalid_copy;
         p.image_copies.push_back({{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1},
-                                  {std::int32_t(box.left), std::int32_t(box.top), 0},
+                                  {std::int32_t(box.left), std::int32_t(box.top), std::int32_t(box.front)},
                                   {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1},
-                                  {std::int32_t(copy.x), std::int32_t(copy.y), 0},
-                                  {w, h, 1}});
+                                  {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)},
+                                  {w, h, d}});
         p.range = dst;
         p.source_range = src;
         return ReplayResult::success;
@@ -638,36 +642,51 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     VkImageSubresourceRange range{};
     if (!copy_subresource(image, texture.subresource, range)) return ReplayResult::invalid_subresource;
     const BlockFormat format = block_format(image.format, range.aspectMask);
-    if (!format.bytes || placed.depth != 1 || placed.row_pitch % format.bytes) return ReplayResult::unsupported;
+    if (!format.bytes || placed.row_pitch % format.bytes) return ReplayResult::unsupported;
     const VkExtent2D mip = mip_extent(image, range.baseMipLevel);
+    const auto mip_depth = std::max(1u, image.depth >> range.baseMipLevel);
     // The box is in the source's coordinates: the footprint for an upload, the texture for a readback.
     const CopyBox box = copy.has_box ? copy.box
-                        : upload     ? CopyBox{0, 0, 0, placed.width, placed.height, 1}
-                                     : CopyBox{0, 0, 0, mip.width, mip.height, 1};
+                        : upload     ? CopyBox{0, 0, 0, placed.width, placed.height, placed.depth}
+                                     : CopyBox{0, 0, 0, mip.width, mip.height, mip_depth};
     const std::uint32_t texture_x = upload ? copy.x : box.left, texture_y = upload ? copy.y : box.top;
     const std::uint32_t placed_x = upload ? box.left : copy.x, placed_y = upload ? box.top : copy.y;
     std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
-    if (placed_x + w > placed.width || placed_y + h > placed.height) return ReplayResult::invalid_copy;
+    const auto texture_z = upload ? copy.z : box.front, placed_z = upload ? box.front : copy.z;
+    const auto depth = box.back - box.front;
+    if (!depth || !within(placed_z, depth, placed.depth) || !within(texture_z, depth, mip_depth) ||
+        !within(placed_x, w, placed.width) || !within(placed_y, h, placed.height)) return ReplayResult::invalid_copy;
     if (texture_x >= mip.width || texture_y >= mip.height) return ReplayResult::invalid_copy;
     if (format.block > 1) {
         w = std::min(w, mip.width - texture_x);
         h = std::min(h, mip.height - texture_y);
     }
-    if (texture_x + w > mip.width || texture_y + h > mip.height) return ReplayResult::invalid_copy;
+    if (!within(texture_x, w, mip.width) || !within(texture_y, h, mip.height)) return ReplayResult::invalid_copy;
     if ((placed_x | placed_y | texture_x | texture_y) % format.block) return ReplayResult::invalid_copy;
-    const std::uint64_t offset = placed.offset + std::uint64_t(placed_y / format.block) * placed.row_pitch +
-                                 std::uint64_t(placed_x / format.block) * format.bytes;
+    const auto slice_rows = (std::uint64_t(placed.height) + format.block - 1) / format.block;
+    const std::uint64_t slice_pitch = slice_rows * placed.row_pitch;
+    if (!slice_pitch || placed.offset > buffer.size || placed_z > (buffer.size - placed.offset) / slice_pitch)
+        return ReplayResult::invalid_copy;
+    const auto slice_start = placed.offset + placed_z * slice_pitch;
+    const auto in_slice = std::uint64_t(placed_y / format.block) * placed.row_pitch +
+                          std::uint64_t(placed_x / format.block) * format.bytes;
+    if (!within(slice_start, in_slice, buffer.size)) return ReplayResult::invalid_copy;
+    const auto offset = slice_start + in_slice;
     const std::uint32_t alignment = (range.aspectMask & depth_stencil_aspects) ? 4 : format.bytes;
     if (offset % alignment) return ReplayResult::unsupported;
-    const std::uint64_t rows = (h + format.block - 1) / format.block;
-    const std::uint64_t row_bytes = std::uint64_t((w + format.block - 1) / format.block) * format.bytes;
-    if (!within(offset, (rows - 1) * placed.row_pitch + row_bytes, buffer.size)) return ReplayResult::invalid_copy;
+    const std::uint64_t rows = (std::uint64_t(h) + format.block - 1) / format.block;
+    const std::uint64_t row_bytes = (std::uint64_t(w) + format.block - 1) / format.block * format.bytes;
+    if (!rows || !row_bytes || !within(std::uint64_t(placed_x / format.block) * format.bytes, row_bytes, placed.row_pitch) ||
+        depth - 1 > (buffer.size - offset) / slice_pitch ||
+        !within(offset + (depth - 1) * slice_pitch, (rows - 1) * placed.row_pitch + row_bytes, buffer.size))
+        return ReplayResult::invalid_copy;
     VkBufferImageCopy region{};
     region.bufferOffset = offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
+    region.bufferImageHeight = depth > 1 ? std::uint32_t(slice_rows * format.block) : 0;
     region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
-    region.imageOffset = {std::int32_t(texture_x), std::int32_t(texture_y), 0};
-    region.imageExtent = {w, h, 1};
+    region.imageOffset = {std::int32_t(texture_x), std::int32_t(texture_y), std::int32_t(texture_z)};
+    region.imageExtent = {w, h, depth};
     p.buffer_image_copies.push_back(region);
     (upload ? p.range : p.source_range) = range;
     return ReplayResult::success;
@@ -682,7 +701,8 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     }
     const ResourceBinding &dst = p.binding, &src = p.source;
     if (!dst.image || !src.image || dst.width != src.width || dst.height != src.height ||
-        dst.mip_levels != src.mip_levels || dst.array_layers != src.array_layers || dst.aspects != src.aspects ||
+        dst.depth != src.depth || dst.volume != src.volume || dst.mip_levels != src.mip_levels ||
+        dst.array_layers != src.array_layers || dst.aspects != src.aspects ||
         block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
         return ReplayResult::invalid_copy;
     for (const VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
@@ -690,7 +710,7 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
         for (std::uint32_t mip = 0; mip < dst.mip_levels; ++mip) {
             const VkExtent2D extent = mip_extent(dst, mip);
             p.image_copies.push_back({{aspect, mip, 0, dst.array_layers}, {0, 0, 0}, {aspect, mip, 0, dst.array_layers},
-                                      {0, 0, 0}, {extent.width, extent.height, 1}});
+                                      {0, 0, 0}, {extent.width, extent.height, std::max(1u, src.depth >> mip)}});
         }
     }
     p.range = {dst.aspects, 0, dst.mip_levels, 0, dst.array_layers};

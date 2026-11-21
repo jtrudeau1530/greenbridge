@@ -24,11 +24,11 @@ if (mode == "ttpf")
         if (!t.CanExtract) { skip++; continue; }
         string path = Path.Combine(outDir, name);
         if (File.Exists(path)) { ok++; continue; }
-        try { File.WriteAllBytes(path, TtpfReader.CreateDds(src, t.Index)); ok++; }
+        try { Util.WriteAllBytes(path, TtpfReader.CreateDds(src, t.Index)); ok++; }
         catch (Exception e) { fail++; if (fail <= 5) Console.WriteLine($"  fail {t.Index}: {e.GetType().Name} {e.Message}"); }
         if ((ok + fail) % 5000 == 0) Console.WriteLine($"  {ok + fail}/{info.Textures.Count}");
     }
-    File.WriteAllText(Path.Combine(outDir, "manifest.json"), JsonSerializer.Serialize(new { src, info.Version, Count = info.Textures.Count, info.Metadata, Textures = rows }, json));
+    Util.WriteAllText(Path.Combine(outDir, "manifest.json"), JsonSerializer.Serialize(new { src, info.Version, Count = info.Textures.Count, info.Metadata, Textures = rows }, json));
 }
 else if (mode == "audio")
 {
@@ -50,7 +50,7 @@ else if (mode == "audio")
     ok = banks.Count;
     var rows = banks.Select(e => { var info = AwcInfo.Inspect(src, e.Offset, e.Size);
         return new { e.Path, e.Offset, e.Size, Streams = info?.Streams.Select(s => new { s.Index, Id = s.Id.ToString("X8"), s.Codec, s.Channels, s.SampleRate, s.DurationSeconds, s.IsStreamed }) }; }).ToList();
-    File.WriteAllText(Path.Combine(outDir, "audio_manifest.json"), JsonSerializer.Serialize(new { src, Count = banks.Count, Banks = rows }, json));
+    Util.WriteAllText(Path.Combine(outDir, "audio_manifest.json"), JsonSerializer.Serialize(new { src, Count = banks.Count, Banks = rows }, json));
 }
 else if (mode == "xma")
 {
@@ -68,7 +68,7 @@ else if (mode == "xma")
             Directory.CreateDirectory(dir);
             string path = Path.Combine(dir, $"{st.Id:X8}.xma.wav");
             if (File.Exists(path)) { ok++; continue; }
-            try { AwcRecovery.WriteXmaWave(src, e.Offset, e.Size, st.Index, path); ok++; }
+            try { Util.WriteAtomic(path, tmp => AwcRecovery.WriteXmaWave(src, e.Offset, e.Size, st.Index, tmp)); ok++; }
             catch (Exception ex) { fail++; if (fail <= 5) Console.WriteLine($"  fail {e.Name}#{st.Index}: {ex.GetType().Name} {ex.Message}"); }
         }
     }
@@ -133,7 +133,7 @@ else if (mode is "models" or "textures")
                     continue;
                 }
                 string obj = Path.Combine(sub, stem + ".obj");
-                if (!File.Exists(obj)) File.WriteAllText(obj, RageModelDecoder.CreateObj(m));
+                if (!File.Exists(obj)) Util.WriteAllText(obj, RageModelDecoder.CreateObj(m));
                 if (m.EmbeddedTextures != null && m.EmbeddedTextureDictionaryOffset is int dOff)
                 {
                     string td = Path.Combine(sub, stem + "_tex"); Directory.CreateDirectory(td);
@@ -141,7 +141,7 @@ else if (mode is "models" or "textures")
                     {
                         string p = Path.Combine(td, $"{t.Index:D3}_{Util.Safe(t.Name)}.dds");
                         if (File.Exists(p)) { embedded++; continue; }
-                        try { File.WriteAllBytes(p, Util.BgraDds(RageTextureDecoder.DecodeEmbeddedTexturePixels(sys, gfx, dOff, t.Index))); embedded++; } catch { }
+                        try { Util.WriteAllBytes(p, Util.BgraDds(RageTextureDecoder.DecodeEmbeddedTexturePixels(sys, gfx, dOff, t.Index))); embedded++; } catch { }
                     }
                 }
                 Row(new { e.Offset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
@@ -160,7 +160,7 @@ else if (mode is "models" or "textures")
                 foreach (var t in dict.Textures)
                 {
                     string p = Path.Combine(td, $"{t.Index:D3}_{Util.Safe(t.Name)}.dds");
-                    try { if (!File.Exists(p)) File.WriteAllBytes(p, RageTextureDecoder.CreateDds(sys, gfx, t.Index)); ok++; } catch { fail++; }
+                    try { if (!File.Exists(p)) Util.WriteAllBytes(p, RageTextureDecoder.CreateDds(sys, gfx, t.Index)); ok++; } catch { fail++; }
                 }
                 Row(new { e.Offset, Dir = stem, Textures = dict.Textures.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, t.MipCount, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray() });
             }
@@ -184,22 +184,3 @@ else if (mode is "models" or "textures")
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
 return 0;
-
-static class Util
-{
-    public static string Safe(string s)
-    {
-        var bad = Path.GetInvalidFileNameChars();
-        var c = s.Select(ch => bad.Contains(ch) || char.IsControl(ch) ? '_' : ch).ToArray();
-        var v = new string(c).Trim(' ', '.'); return v.Length == 0 ? "x" : v[..Math.Min(120, v.Length)];
-    }
-    // Uncompressed 32-bit BGRA DDS (legacy header, A8R8G8B8 masks).
-    public static byte[] BgraDds(RageTexturePixels px)
-    {
-        var o = new byte[128 + px.Bgra32.Length];
-        void U(int at, uint v) => BitConverter.TryWriteBytes(o.AsSpan(at), v);
-        U(0, 0x20534444); U(4, 124); U(8, 0x100F); U(12, (uint)px.Height); U(16, (uint)px.Width); U(20, (uint)(px.Width * 4));
-        U(76, 32); U(80, 0x41); U(88, 32); U(92, 0x00FF0000); U(96, 0x0000FF00); U(100, 0x000000FF); U(104, 0xFF000000); U(108, 0x1000);
-        px.Bgra32.CopyTo(o, 128); return o;
-    }
-}
