@@ -16,7 +16,9 @@ under random EXEC masks (an inactive source lane reads 0). Swizzle offsets are
 limited to the two patterns the LLVM swizzle() macros encode: bit 15 set = quad permute (4 x 2-bit selectors in
 bits 7:0), clear = bit mask (and = bits 4:0, or = bits 9:5, xor = bits 14:10, within each 32-lane group).
 
-Exit code: 0 when every program matches, 1 on a mismatch (the first is printed with its program), 2 on errors.
+Each mismatch is printed with the words that differ and the op that last wrote them, and a --show line that
+prints the program. Exit code: 0 when every program that ran matches, 1 on a mismatch, 2 on a harness error
+(assembler, translator or vk_compute_test failure) or when no program could run (every one skipped).
 """
 import argparse
 import json
@@ -25,6 +27,7 @@ import random
 import struct
 import subprocess
 import sys
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -59,6 +62,7 @@ WRITES = {  # name: (bytes, data bit offset)
 }
 SHARED_ATOMICS = ("add", "sub", "min_i32", "max_i32", "min_u32", "max_u32", "and", "or", "xor")
 RTN_ATOMICS = SHARED_ATOMICS
+EXEC_KINDS = ("atomic", "atomic_rtn", "bpermute", "cmpst", "read", "read2", "write", "write2", "wrxchg")
 ATOMIC_NAME = {"add": "ds_add%s_u32", "sub": "ds_sub%s_u32", "min_i32": "ds_min%s_i32", "max_i32": "ds_max%s_i32",
                "min_u32": "ds_min%s_u32", "max_u32": "ds_max%s_u32", "and": "ds_and%s_b32", "or": "ds_or%s_b32",
                "xor": "ds_xor%s_b32"}
@@ -115,8 +119,6 @@ class Program:
         for op in self.ops:      # the mask is still drawn, so the rest of the program is the same
             if op["kind"] in no_exec:
                 op["exec"] = None
-
-    # ---- generation -------------------------------------------------------------------------------------------
 
     def exec_mask(self):
         rng = self.rng
@@ -253,8 +255,6 @@ class Program:
                     "dst": rng.choice(POOL), "exec": self.exec_mask()}
         raise ValueError(kind)
 
-    # ---- assembly ---------------------------------------------------------------------------------------------
-
     def asm(self):
         w64 = self.wave == 64
         out = [f"; {self.name}: tools/lds_fuzz.py (FUZZ-6)", "; group: 64,1,1", f"; rsrc2: {RSRC2:#x}"]
@@ -264,7 +264,7 @@ class Program:
         out.append(full)
         for r, (k, c) in self.pool_init.items():
             out += [f"v_mul_u32_u24_e32 v{r}, {k:#x}, v0", f"v_xor_b32_e32 v{r}, {c:#x}, v{r}"]
-        for j in range(LDS_DWORDS // THREADS):          # LDS[i] = (i * mul) ^ xor
+        for j in range(LDS_DWORDS // THREADS):
             out += [f"v_add_nc_u32_e32 v{TMP}, {64 * j}, v0",
                     f"v_lshlrev_b32_e32 v{ADDR}, 2, v{TMP}",
                     f"v_mul_lo_u32 v{TMP}, v{TMP}, {self.lds_mul:#x}",
@@ -274,10 +274,10 @@ class Program:
         for op in self.ops:
             out += self.asm_op(op, w64, full)
             out += ["s_waitcnt lgkmcnt(0)", "s_barrier"]
-        for i, r in enumerate(POOL):                     # out[t * 16 + i] = v[POOL[i]]
+        for i, r in enumerate(POOL):
             out += [f"v_mul_u32_u24_e32 v{ADDR}, {4 * len(POOL)}, v0",
                     f"buffer_store_dword v{r}, v{ADDR}, s[0:3], 0 offen offset:{4 * i}"]
-        for j in range(LDS_DWORDS // THREADS):           # out[1024 + 64 j + t] = LDS[64 j + t]
+        for j in range(LDS_DWORDS // THREADS):
             out += [f"v_add_nc_u32_e32 v{TMP}, {64 * j}, v0",
                     f"v_lshlrev_b32_e32 v{TMP}, 2, v{TMP}",
                     f"ds_read_b32 v{ADDR}, v{TMP}",
@@ -342,8 +342,6 @@ class Program:
             lines.append(full)
         return lines
 
-    # ---- model ------------------------------------------------------------------------------------------------
-
     def model(self):
         """Run the program on the reference model. Returns (regs[t][r], lds bytearray)."""
         regs = [{r: ((t * k) & M32) ^ c for r, (k, c) in self.pool_init.items()} for t in range(THREADS)]
@@ -352,13 +350,27 @@ class Program:
             struct.pack_into("<I", lds, 4 * i, ((i * self.lds_mul) & M32) ^ self.lds_xor)
         self.writer = [{r: None for r in POOL} for _ in range(THREADS)]
         for i, op in enumerate(self.ops):
-            before = [dict(r) for r in regs]
+            if op["kind"] == "cmpst" and op["cmp_hit"]:
+                for t in range(THREADS):
+                    self.writer[t][op["src"]] = i
             self.model_op(op, regs, lds)
             for t in range(THREADS):
-                for r in POOL:
-                    if regs[t][r] != before[t][r] or (op.get("dst") is not None and r == op["dst"]):
+                if self.active(t, op["exec"]):
+                    for r in self.dst_regs(op):
                         self.writer[t][r] = i
         return regs, lds
+
+    @staticmethod
+    def dst_regs(op):
+        k = op["kind"]
+        if k == "read":
+            size = READS[op["name"]][0]
+            return range(op["dst"], op["dst"] + (size // 4 if size >= 4 else 1))
+        if k == "read2":
+            return range(op["dst"], op["dst"] + 2)
+        if k in ("atomic_rtn", "wrxchg", "cmpst", "swizzle", "bpermute"):
+            return (op["dst"],)
+        return ()
 
     def describe(self, i):
         if i is None:
@@ -366,7 +378,7 @@ class Program:
         op = self.ops[i]
         what = op.get("name") or op.get("op") or ("st64" if op.get("st64") else "")
         mask = "" if op["exec"] is None else f", EXEC {op['exec']:#x}"
-        return f"op {i} {op['kind']} {what}{mask}".replace("  ", " ")
+        return " ".join(x for x in (f"op {i}", op["kind"], what) if x) + mask
 
     def active(self, t, mask):
         if mask is None:
@@ -508,8 +520,11 @@ def compare(p, got_regs, got_lds):
 
 def translate(progs, work, emulate):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
+    for d in (disasm, fssm, spirv):   # a reused --work must not leave an earlier run's listings or SPIR-V behind
+        if d.exists():
+            shutil.rmtree(d)
     for d in (disasm, fssm):
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True)
     mc = mc_command.mc_command()
     for p in progs:
         text = p.asm()
@@ -527,8 +542,10 @@ def translate(progs, work, emulate):
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
-    subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
     index = spirv / "index.json"
+    if not index.exists():
+        raise RuntimeError(f"rdna2spirv.py exited {r.returncode} without an index.json:\n{(r.stdout + r.stderr)[-2000:]}")
     return json.loads(index.read_text(encoding="utf-8")) if index.exists() else {}
 
 
@@ -546,8 +563,8 @@ def run_gpu(p, spv, build, index_entry, emulate, dump):
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
-def show(seed, index, wave):
-    p = Program(seed, index, wave)
+def show(seed, index, wave, no_exec=()):
+    p = Program(seed, index, wave, no_exec)
     print(p.asm())
     regs, _ = p.model()
     print("; model, thread 0:", " ".join(f"v{r}={regs[0][r]:#x}" for r in POOL))
@@ -564,12 +581,12 @@ def main():
     ap.add_argument("--model-only", action="store_true")
     ap.add_argument("--show", default=None, metavar="SEED:INDEX[:WAVE]")
     ap.add_argument("--max-report", type=int, default=12)
-    ap.add_argument("--no-exec", action="append", default=[], metavar="KIND",
+    ap.add_argument("--no-exec", action="append", default=[], choices=EXEC_KINDS,
                     help="run this op kind (e.g. bpermute) with all lanes active, to isolate a known finding")
     a = ap.parse_args()
     if a.show:
         parts = a.show.split(":")
-        show(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 64)
+        show(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 64, tuple(a.no_exec))
         return 0
     waves = (64, 32) if a.wave == "both" else (int(a.wave),)
     progs = programs(a.seed, a.programs, waves, tuple(a.no_exec))
@@ -585,7 +602,8 @@ def main():
     except RuntimeError as e:
         print(e)
         return 2
-    failed = untranslated = 0
+    failed = untranslated = skipped = errors = 0
+    no_exec = "".join(f" --no-exec {k}" for k in a.no_exec)
     for p in progs:
         spv = work / "spirv" / (p.name + ".spv")
         if p.name not in index or not spv.is_file():
@@ -593,25 +611,31 @@ def main():
             print(f"NOT TRANSLATED {p.name}")
             continue
         dump = work / (p.name + ".bin")
+        dump.unlink(missing_ok=True)
         rc, msg = run_gpu(p, spv, a.build, index[p.name], a.emulate, dump)
         if rc == 77:
+            skipped += 1
             print(f"SKIP {p.name}: {msg.splitlines()[-1] if msg else 'unsupported'}")
             continue
-        if rc not in (0, 1) or not dump.is_file():
-            failed += 1
-            print(f"ERROR {p.name}: exit {rc}: {msg[-400:]}")
+        data = dump.read_bytes() if dump.is_file() else b""
+        if rc != 0 or len(data) != 4 * OUT_WORDS:   # dump mode itself never fails a run
+            errors += 1
+            print(f"ERROR {p.name}: exit {rc}, {len(data)} of {4 * OUT_WORDS} dump bytes: {msg[-400:]}")
             continue
-        regs, lds = parse_dump(dump.read_bytes())
+        regs, lds = parse_dump(data)
         diffs = compare(p, regs, lds)
         if diffs:
             failed += 1
-            print(f"MISMATCH {p.name} ({len(diffs)} words), seed {a.seed}; rerun with --show {a.seed}:"
-                  f"{p.name.split('_')[3]}:{p.wave}")
+            print(f"MISMATCH {p.name} ({len(diffs)} words); print it with --show {a.seed}:"
+                  f"{p.name.split('_')[3]}:{p.wave}{no_exec}")
             for d in diffs[:a.max_report]:
                 print("   ", d)
     mode = "emulated" if a.emulate else "native"
-    print(f"{len(progs) - failed - untranslated}/{len(progs)} programs match ({mode}), {failed} mismatched or failed, "
-          f"{untranslated} not translated; work dir {work}")
+    ran = len(progs) - untranslated - skipped - errors
+    print(f"{ran - failed}/{ran} programs that ran match ({mode}); {failed} mismatched, {skipped} skipped, "
+          f"{untranslated} not translated, {errors} harness errors; work dir {work}")
+    if errors or ran == 0:
+        return 2
     return 1 if failed or untranslated else 0
 
 

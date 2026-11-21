@@ -123,5 +123,64 @@ class Model(unittest.TestCase):
             self.assertEqual(regs[t][22], regs[t][20])            # returns the old word, which was the compare value
 
 
+class Runner(unittest.TestCase):
+    """main() with the translator and the GPU run faked: what counts as a match, a skip and a harness error."""
+
+    def run_main(self, gpu, extra=()):
+        import contextlib
+        import io
+        import tempfile
+        from unittest.mock import patch
+
+        def translate(progs, work, _emulate):
+            (work / "spirv").mkdir(parents=True, exist_ok=True)
+            for p in progs:
+                (work / "spirv" / (p.name + ".spv")).touch()
+            return {p.name: {} for p in progs}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ["lds_fuzz.py", "--programs", "2", "--wave", "64", "--work", tmp, *extra]
+            out = io.StringIO()
+            with (patch.object(sys, "argv", argv), patch.object(f, "translate", side_effect=translate),
+                  patch.object(f, "run_gpu", side_effect=gpu), contextlib.redirect_stdout(out)):
+                status = f.main()
+        return status, out.getvalue()
+
+    @staticmethod
+    def correct_dump(p, dump):
+        regs, lds = p.model()
+        words = [regs[t][r] for t in range(f.THREADS) for r in f.POOL] + list(struct.unpack(f"<{f.LDS_DWORDS}I", lds))
+        dump.write_bytes(struct.pack(f"<{len(words)}I", *words))
+
+    def test_matching_dumps_pass(self):
+        def gpu(p, _spv, _build, _entry, _emulate, dump):
+            self.correct_dump(p, dump)
+            return 0, ""
+        status, out = self.run_main(gpu)
+        self.assertEqual(status, 0, out)
+        self.assertIn("2/2 programs that ran match", out)
+
+    def test_all_skipped_is_not_a_pass(self):
+        status, out = self.run_main(lambda *_: (77, "full 64-wide compute subgroups unavailable"))
+        self.assertEqual(status, 2, out)
+        self.assertIn("2 skipped", out)
+
+    def test_failed_run_with_an_old_dump_is_a_harness_error(self):
+        def gpu(p, _spv, _build, _entry, _emulate, dump):
+            self.assertFalse(dump.exists(), "the previous run's dump must be gone")
+            return 1, "FAILED vkCreateComputePipelines -> -3"
+        status, out = self.run_main(gpu)
+        self.assertEqual(status, 2, out)
+        self.assertIn("harness errors", out)
+
+    def test_short_dump_is_a_harness_error(self):
+        def gpu(_p, _spv, _build, _entry, _emulate, dump):
+            dump.write_bytes(bytes(256))
+            return 0, ""
+        status, out = self.run_main(gpu)
+        self.assertEqual(status, 2, out)
+        self.assertIn("256 of", out)
+
+
 if __name__ == "__main__":
     unittest.main()

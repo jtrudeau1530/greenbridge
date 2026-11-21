@@ -255,7 +255,8 @@ int main(int argc, char** argv) {
     if (dump_path) {
         std::ofstream dump(dump_path, std::ios::binary);
         dump.write(static_cast<const char*>(map), std::streamsize(bytes));
-        if (!dump) {
+        dump.close();
+        if (dump.fail()) {
             std::fprintf(stderr, "VKC_DUMP: could not write %s\n", dump_path);
             return 1;
         }
