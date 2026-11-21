@@ -3,6 +3,7 @@
     python -I tests/test_rpf_probe.py
 """
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -161,6 +162,26 @@ class MainTests(unittest.TestCase):
                     self.assertEqual(probe.main(), 2)
                 self.assertIn(source, err.getvalue())
                 self.assertEqual(self.rows(), before)
+
+    def test_unreadable_subdirectory_preserves_the_existing_report(self):
+        self.write("a.rpf", archive_bytes())
+        blocked = os.path.dirname(self.write("blocked/b.rpf", archive_bytes()))
+        self.run_main()
+        before = self.rows()
+        scandir = os.scandir
+
+        def deny_subdirectory(path):
+            if path == blocked:
+                raise PermissionError(errno.EACCES, "Permission denied", path)
+            return scandir(path)
+
+        err = io.StringIO()
+        argv = ["rpf_probe.py", self.game, "--out", self.out]
+        with (mock.patch("sys.argv", argv), mock.patch.object(os, "scandir", side_effect=deny_subdirectory),
+              contextlib.redirect_stderr(err)):
+            self.assertEqual(probe.main(), 2)
+        self.assertIn(blocked, err.getvalue())
+        self.assertEqual(self.rows(), before)
 
 
 if __name__ == "__main__":
