@@ -76,35 +76,44 @@ def build(root):
     return sh, index
 
 
-with tempfile.TemporaryDirectory() as tmp:
-    sh, index = build(tmp)
-    d = F.scan_dxbc(os.path.join(sh, "dxbc"), index)
-    check(d["stages"]["ps"] == 2 and d["stages"]["gs"] == 1 and d["stages"]["hs"] == 0 and d["stages"]["as"] == 0,
-          "stage census counts each stage and lists the absent ones as 0")
-    check(d["sfi0"].get("ROVS") == {"ps": 1} and d["sfi0"].get("SHADING_RATE") == {"ps": 1},
-          "SFI0 bits 0x1000 and 0x80000 decode to ROVS and SHADING_RATE")
-    check(d["sfi0"].get("WAVE_MMA") == {"cs": 1}, "SFI0 bit 0x8000000 decodes to WAVE_MMA")
-    check(d["output_on_stream_other_than_0"] == {"gs": 1} and d["gs_output_stream_count"] == {2: 1},
-          "an OSG1 element on stream 1 is counted, stream 0 alone is not")
+def test_feature_scan():
+    """Runs under pytest (CI's translator-tests job) and as a plain script."""
+    with tempfile.TemporaryDirectory() as tmp:
+        sh, index = build(tmp)
+        d = F.scan_dxbc(os.path.join(sh, "dxbc"), index)
+        check(d["stages"]["ps"] == 2 and d["stages"]["gs"] == 1 and d["stages"]["hs"] == 0 and d["stages"]["as"] == 0,
+              "stage census counts each stage and lists the absent ones as 0")
+        check(d["sfi0"].get("ROVS") == {"ps": 1} and d["sfi0"].get("SHADING_RATE") == {"ps": 1},
+              "SFI0 bits 0x1000 and 0x80000 decode to ROVS and SHADING_RATE")
+        check(d["sfi0"].get("WAVE_MMA") == {"cs": 1}, "SFI0 bit 0x8000000 decodes to WAVE_MMA")
+        check(d["output_on_stream_other_than_0"] == {"gs": 1} and d["gs_output_stream_count"] == {2: 1},
+              "an OSG1 element on stream 1 is counted, stream 0 alone is not")
 
-    stage_of = {e["name"]: e["stage"] for e in index}
-    s = F.scan_disasm(os.path.join(sh, "dxbc", "disasm"), stage_of)
-    check(s["files"] == 5, "five listings scanned")
-    check(s["getpc_for_data_shaders"] == {"vs": 1},
-          "s_getpc kept for data counts as a code base, s_getpc into s_setpc (far branch) does not")
-    check(s["wave_mma_shaders"] == {"cs": 1} and "v_mfma_f32_32x32x8f16" in s["wave_mma_ops"], "v_mfma is found")
-    check(s["ordered_or_gws_shaders"] == {"gs": 1} and s["gds_shaders"] == {"gs": 1},
-          "ds_ordered_count with gds is found")
-    check("ps" not in s["wave_mma_shaders"] and "ps" not in s["gds_shaders"], "a plain listing has neither")
+        stage_of = {e["name"]: e["stage"] for e in index}
+        s = F.scan_disasm(os.path.join(sh, "dxbc", "disasm"), stage_of)
+        check(s["files"] == 5, "five listings scanned")
+        check(s["getpc_for_data_shaders"] == {"vs": 1},
+              "s_getpc kept for data counts as a code base, s_getpc into s_setpc (far branch) does not")
+        check(s["wave_mma_shaders"] == {"cs": 1} and "v_mfma_f32_32x32x8f16" in s["wave_mma_ops"], "v_mfma is found")
+        check(s["ordered_or_gws_shaders"] == {"gs": 1} and s["gds_shaders"] == {"gs": 1},
+              "ds_ordered_count with gds is found")
+        check("ps" not in s["wave_mma_shaders"] and "ps" not in s["gds_shaders"], "a plain listing has neither")
 
-    sp = F.scan_spirv(os.path.join(sh, "spirv", "index.json"))
-    check(sp["uses_code_base"] == {"ps": 1} and sp["translated"] == {"ps": 1, "vs": 1}, "uses_code_base per stage")
+        sp = F.scan_spirv(os.path.join(sh, "spirv", "index.json"))
+        check(sp["uses_code_base"] == {"ps": 1} and sp["translated"] == {"ps": 1, "vs": 1}, "uses_code_base per stage")
 
-    r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh, "--out",
-                        os.path.join(tmp, "out.json")], capture_output=True, text=True)
-    check(r.returncode == 0 and "SFI0 WAVE_MMA: 1" in r.stdout and "hs 0" in r.stdout, "the CLI prints the summary")
-    check(os.path.isfile(os.path.join(tmp, "out.json")), "--out writes the JSON")
-    check("a_ps" not in r.stdout and "b_gs" not in r.stdout, "the summary prints counts, not shader names")
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh, "--out",
+                            os.path.join(tmp, "out.json")], capture_output=True, text=True)
+        check(r.returncode == 0 and "SFI0 WAVE_MMA: 1" in r.stdout and "hs 0" in r.stdout, "the CLI prints the summary")
+        check(os.path.isfile(os.path.join(tmp, "out.json")), "--out writes the JSON")
+        check("a_ps" not in r.stdout and "b_gs" not in r.stdout, "the summary prints counts, not shader names")
+    assert failures == 0, f"{failures} feature_scan check(s) failed"
 
-print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")
-sys.exit(1 if failures else 0)
+
+if __name__ == "__main__":
+    try:
+        test_feature_scan()
+    except AssertionError:
+        pass
+    print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")
+    sys.exit(1 if failures else 0)
