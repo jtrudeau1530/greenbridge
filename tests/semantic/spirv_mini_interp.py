@@ -13,6 +13,7 @@ Design rules (see tests/semantic/README.md):
 Values: uint/int are Python ints in [0, 2**32) (signedness is applied by the operation, as in SPIR-V);
 float is a Python float rounded to binary32; vectors are tuples; arrays are lists; bool is bool.
 """
+import math
 import re
 import struct
 
@@ -26,8 +27,8 @@ class UnsupportedConstruct(NotImplementedError):
 # Instructions that carry no runtime semantics for a single-entry-point, straight-line module.
 _IGNORED = frozenset({
     "OpCapability", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode", "OpDecorate",
-    "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpReturn", "OpFunctionEnd",
-    "OpName", "OpSource",
+    "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpSelectionMerge", "OpReturn",
+    "OpFunctionEnd", "OpName", "OpSource",
 })
 
 _LINE = re.compile(r"^(?:(%\S+)\s*=\s*)?(Op\w+)\s*(.*)$")
@@ -184,8 +185,25 @@ def run_fragment(text):
         box, i = p
         return box[i]
 
-    for res, op, a, line in body:
+    labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
+    pc = 0
+    killed = False
+    while pc < len(body):
+        res, op, a, line = body[pc]
+        pc += 1
         if op in _IGNORED:
+            continue
+        if op == "OpKill":
+            killed = True
+            break
+        if op == "OpBranchConditional":
+            cond = val(a[0])
+            if not isinstance(cond, bool):
+                raise UnsupportedConstruct("OpBranchConditional with a non-bool condition")
+            target = a[1] if cond else a[2]
+            if target not in labels or labels[target] < pc:
+                raise UnsupportedConstruct("non-forward branch")
+            pc = labels[target]
             continue
         if op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
@@ -249,14 +267,53 @@ def run_fragment(text):
             values[res] = val(a[1]) & val(a[2])
         elif op == "OpBitwiseOr":
             values[res] = val(a[1]) | val(a[2])
+        elif op == "OpBitwiseXor":
+            values[res] = val(a[1]) ^ val(a[2])
+        elif op == "OpNot":
+            values[res] = (~val(a[1])) & MASK
         elif op == "OpShiftLeftLogical":
             if val(a[2]) >= 32:
                 raise UnsupportedConstruct("shift amount >= 32 (undefined in SPIR-V)")
             values[res] = (val(a[1]) << val(a[2])) & MASK
+        elif op == "OpShiftRightLogical":
+            if val(a[2]) >= 32:
+                raise UnsupportedConstruct("shift amount >= 32 (undefined in SPIR-V)")
+            values[res] = (val(a[1]) & MASK) >> val(a[2])
         elif op == "OpIAdd":
             values[res] = (val(a[1]) + val(a[2])) & MASK
         elif op == "OpISub":
             values[res] = (val(a[1]) - val(a[2])) & MASK
+        elif op == "OpIMul":
+            values[res] = (val(a[1]) * val(a[2])) & MASK
+        elif op == "OpISubBorrow":
+            x, y = val(a[1]) & MASK, val(a[2]) & MASK
+            values[res] = ((x - y) & MASK, 1 if x < y else 0)
+        elif op == "OpIEqual":
+            values[res] = (val(a[1]) & MASK) == (val(a[2]) & MASK)
+        elif op == "OpINotEqual":
+            values[res] = (val(a[1]) & MASK) != (val(a[2]) & MASK)
+        elif op == "OpSLessThan":
+            values[res] = _s32(val(a[1])) < _s32(val(a[2]))
+        elif op == "OpLogicalAnd":
+            x, y = val(a[1]), val(a[2])
+            if not (isinstance(x, bool) and isinstance(y, bool)):
+                raise UnsupportedConstruct("OpLogicalAnd on non-bool")
+            values[res] = x and y
+        elif op == "OpLogicalOr":
+            x, y = val(a[1]), val(a[2])
+            if not (isinstance(x, bool) and isinstance(y, bool)):
+                raise UnsupportedConstruct("OpLogicalOr on non-bool")
+            values[res] = x or y
+        elif op == "OpFMul":
+            x, y = val(a[1]), val(a[2])
+            if not (isinstance(x, float) and isinstance(y, float)):
+                raise UnsupportedConstruct("OpFMul on non-float")
+            values[res] = f32(x * y)
+        elif op == "OpFOrdEqual":
+            x, y = val(a[1]), val(a[2])
+            if not (isinstance(x, float) and isinstance(y, float)):
+                raise UnsupportedConstruct("OpFOrdEqual on non-float")
+            values[res] = (not math.isnan(x)) and (not math.isnan(y)) and x == y
         elif op in ("OpBitFieldUExtract", "OpBitFieldSExtract"):
             base, off, cnt = val(a[1]), val(a[2]), val(a[3])
             if off + cnt > 32:
@@ -291,11 +348,23 @@ def run_fragment(text):
                 values[res] = min(args)
             elif name == "SMax":
                 values[res] = max(args, key=_s32)
+            elif name == "FindSMsb":
+                x = _s32(args[0])
+                if x in (0, -1):
+                    values[res] = MASK
+                elif x > 0:
+                    values[res] = x.bit_length() - 1
+                else:
+                    values[res] = (~x).bit_length() - 1
+            elif name == "Sin":
+                values[res] = f32(math.sin(args[0]))
             else:
                 raise UnsupportedConstruct(f"GLSL.std.450 {name}")
         else:
             raise UnsupportedConstruct(op)
 
+    if killed:
+        return {}
     result = {}
     for name in outputs:
         v = var_box[name][0]

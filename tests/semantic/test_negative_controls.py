@@ -12,6 +12,11 @@ CONTROLS = [
     ("ps_ops", sem.EXPECTED_PS_OPS, "OpBitFieldSExtract", "OpBitFieldUExtract", "v_bfe_i32 treated as unsigned"),
     ("ps_ops", sem.EXPECTED_PS_OPS, "glsl UMin", "glsl SMax", "v_min3_u32 computing a (signed) maximum"),
     ("ps_ops", sem.EXPECTED_PS_OPS, "glsl SMax", "glsl UMin", "v_max3_i32 treated as unsigned"),
+    ("ps_ops2", sem.EXPECTED_PS_OPS2, "%c10 %c10", "%c0 %c10", "v_fma_f16 op_sel dst high-half insert offset zeroed"),
+    ("ps_ops3", sem.EXPECTED_PS_OPS3, "OpBitFieldSExtract", "OpBitFieldUExtract", "v_mul_i32_i24 treated as unsigned"),
+    ("ps_ops3", sem.EXPECTED_PS_OPS3, "OpNot %uint", "OpCopyObject %uint", "v_xnor_b32 missing final bitwise invert"),
+    ("ps_ops4", sem.EXPECTED_PS_OPS4, "OpShiftRightLogical", "OpShiftLeftLogical", "v_pk_lshrrev_b16 shifting left"),
+    ("ps_legacy_mul", sem.EXPECTED_PS_LEGACY_MUL, "OpLogicalOr %bool", "OpLogicalAnd %bool", "v_mul_legacy_f32 requiring both operands zero"),
 ]
 
 

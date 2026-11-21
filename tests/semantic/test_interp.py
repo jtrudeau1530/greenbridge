@@ -38,6 +38,7 @@ OpEntryPoint Fragment %main "main" %out
 %_ptr_Function_arr = OpTypePointer Function %arr
 %null_arr = OpConstantNull %arr
 %ud = OpTypeStruct %uint
+%umul = OpTypeStruct %uint %uint
 %_ptr_PC = OpTypePointer PushConstant %ud
 %pc = OpVariable %_ptr_PC PushConstant
 %_ptr_PC_uint = OpTypePointer PushConstant %uint
@@ -85,7 +86,44 @@ class InterpreterTests(unittest.TestCase):
     def test_integer_ops_wrap(self):
         self.assertEqual(run_word("%res = OpIAdd %uint %cFF %c2\n"), 1)
         self.assertEqual(run_word("%res = OpISub %uint %c1 %c2\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpIMul %uint %cFF %c2\n"), 0xFFFFFFFE)
         self.assertEqual(run_word("%res = OpShiftLeftLogical %uint %cFF %c4\n"), 0xFFFFFFF0)
+        self.assertEqual(run_word("%res = OpShiftRightLogical %uint %cF0 %c4\n"), 0x0FFFFFFF)
+        self.assertEqual(run_word("%res = OpBitwiseXor %uint %cF0 %cFF\n"), 0xF)
+        self.assertEqual(run_word("%res = OpNot %uint %cF0\n"), 0xF)
+
+    def test_sub_borrow_and_comparisons(self):
+        self.assertEqual(run_word("%s = OpISubBorrow %umul %c1 %c2\n"
+                                  "%d = OpCompositeExtract %uint %s 0\n"
+                                  "%b = OpCompositeExtract %uint %s 1\n"
+                                  "%res = OpBitwiseAnd %uint %d %b\n"), 1)
+        self.assertEqual(run_word("%s = OpISubBorrow %umul %c2 %c1\n"
+                                  "%res = OpCompositeExtract %uint %s 1\n"), 0)
+        self.assertEqual(run_word("%b = OpIEqual %bool %c2 %c2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpINotEqual %bool %c2 %c1\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpSLessThan %bool %cFF %c0\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpLogicalAnd %bool %t %f\n%res = OpSelect %uint %b %c1 %c2\n"), 2)
+        self.assertEqual(run_word("%b = OpLogicalOr %bool %f %t\n%res = OpSelect %uint %b %c1 %c2\n"), 1)
+
+    def test_float_mul_ord_equal_findsmsb_sin(self):
+        self.assertEqual(run_word("%x = OpFMul %float %f2 %f3\n%res = OpBitcast %uint %x\n"), 0x40C00000)
+        self.assertEqual(run_word("%b = OpFOrdEqual %bool %f2 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%nf = OpBitcast %float %cFF\n"
+                                  "%b = OpFOrdEqual %bool %nf %nf\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %c0\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %cFF\n"), 0xFFFFFFFF)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %c80\n"), 7)
+        self.assertEqual(run_word("%res = OpExtInst %uint %glsl FindSMsb %cF0\n"), 3)
+        self.assertEqual(run_word("%x = OpBitcast %float %c0\n%s = OpExtInst %float %glsl Sin %x\n"
+                                  "%res = OpBitcast %uint %s\n"), 0)
+
+    def test_forward_branch_and_kill(self):
+        live = (HEADER + "OpStore %out %c1\nOpSelectionMerge %live None\n"
+                "OpBranchConditional %t %live %dead\n%dead = OpLabel\nOpKill\n%live = OpLabel\n" + FOOTER)
+        dead = (HEADER + "OpStore %out %c1\nOpSelectionMerge %live None\n"
+                "OpBranchConditional %f %live %dead\n%dead = OpLabel\nOpKill\n%live = OpLabel\n" + FOOTER)
+        self.assertEqual(si.run_fragment(live)["%out"][0], 1)
+        self.assertEqual(si.run_fragment(dead), {})
 
     def test_function_array_access(self):
         self.assertEqual(run_word("%arr_v = OpVariable %_ptr_Function_arr Function %null_arr\n"
@@ -95,12 +133,14 @@ class InterpreterTests(unittest.TestCase):
                                   "%res = OpLoad %uint %q\n"), 0xFFFFFFF0)
 
     def test_unsupported_constructs_are_rejected(self):
-        for body in ("%res = OpIMul %uint %c2 %c2\n",                                     # opcode not modelled
+        for body in ("%res = OpUDiv %uint %c2 %c1\n",                                     # opcode not modelled
                      "%res = OpExtInst %uint %glsl FindUMsb %c2\n",                      # ext inst not modelled
                      "%res = OpBitFieldUExtract %uint %cFF %c32 %c1\n",                  # undefined per spec
                      "%res = OpShiftLeftLogical %uint %cFF %c32\n",                     # undefined per spec
+                     "%res = OpShiftRightLogical %uint %cFF %c32\n",                    # undefined per spec
                      "%res = OpSelect %uint %c1 %c1 %c2\n",                              # condition not a bool
-                     "OpBranch %entry\n%res = OpCopyObject %uint %c1\n"):                # control flow
+                     "OpBranch %entry\n%res = OpCopyObject %uint %c1\n",                 # unconditional branch
+                     "OpBranchConditional %t %entry %entry\n%res = OpCopyObject %uint %c1\n"):  # backward branch
             with self.subTest(body=body.splitlines()[0]):
                 with self.assertRaises(si.UnsupportedConstruct):
                     run_word(body)
