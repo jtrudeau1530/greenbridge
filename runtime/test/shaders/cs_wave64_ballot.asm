@@ -1,14 +1,19 @@
 ; Wave64 ballot: s_bcnt1_i32_b64 and s_ff1_i32_b64 on 64-lane comparison masks and EXEC.
+; Uses v_cmp_*_e32 vcc_lo + s_mov_b64 so llvm-mc (-mcpu=gfx1013 default wave32) produces valid
+; 64-bit SGPR mask pairs rather than wave32 single-SGPR v_cmp_*_e64 destinations.
 ; Case 1: lanes 16..47 -> s[4:5] -> bcnt=32, ff1=16
 ; Case 2: lanes 40..63 (strictly upper half) -> s[10:11] -> bcnt=24, ff1=40
 ; Case 3: exec = lanes 48..55 -> bcnt=8, ff1=48
 ; Run: vk_compute_test cs_wave64_ballot.spv 1 dump -> out[0..5] = 32, 16, 24, 40, 8, 48
-v_cmp_ge_u32_e64 s4, v0, 16
-v_cmp_lt_u32_e64 s6, v0, 48
+v_cmp_le_u32_e32 vcc_lo, 16, v0
+s_mov_b64 s[4:5], vcc
+v_cmp_gt_u32_e32 vcc_lo, 48, v0
+s_mov_b64 s[6:7], vcc
 s_and_b64 s[4:5], s[4:5], s[6:7]
 s_bcnt1_i32_b64 s8, s[4:5]
 s_ff1_i32_b64 s9, s[4:5]
-v_cmp_ge_u32_e64 s10, v0, 40
+v_cmp_le_u32_e32 vcc_lo, 40, v0
+s_mov_b64 s[10:11], vcc
 s_bcnt1_i32_b64 s12, s[10:11]
 s_ff1_i32_b64 s13, s[10:11]
 s_mov_b32 exec_lo, 0
