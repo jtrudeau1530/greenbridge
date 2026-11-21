@@ -12,7 +12,7 @@ import check
 
 
 # The other wave64-only dump tests (#73's cs_wm_*): name -> expected out[] words.
-WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS if n not in ("cs_store", "cs_wave64_ballot")}
+WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS if n not in (*check.WAVE32_DUMPS, "cs_wave64_ballot")}
 
 
 TOTAL = len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + 2 + len(check.PIXEL_TESTS)   # every test check.py runs: compute, cs_wavemask, dumps, the two store tests, pixel
@@ -37,6 +37,8 @@ class Wave64Checks(unittest.TestCase):
             self.assertNotIn("--require-wave64", args)
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
+            if name == "cs_smem_soffset_imm":
+                return 0, "out[0..7] = " + " ".join(map(str, check.CS_SMEM)) + "\n"
             if name in ("cs_imgstore", "cs_imgload"):
                 return 0, "0 bad\n0 bad\n0 bad\n"
             return 0, "0 mismatches\n"

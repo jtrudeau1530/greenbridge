@@ -414,9 +414,13 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"))
             else:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl"):
+        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp",
+                      "cs_wm_bfm64", "cs_wm_scc_rfl"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
+                # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
+                "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
+                                        0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -424,9 +428,10 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_scc_rfl": [55, 48],
             }
             want = cs_dump_wants[name]
-            # Every dump but cs_store is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
-            # check.py does, where the device has none (vk_compute_test exits 77) instead of reporting a failure.
-            wave64 = name != "cs_store"
+            # Every dump but cs_store and cs_smem_soffset_imm is a whole-wave (wave64) mask test: ask for a
+            # 64-wide subgroup and skip, as check.py does, where the device has none (vk_compute_test exits 77)
+            # instead of reporting a failure.
+            wave64 = name not in ("cs_store", "cs_smem_soffset_imm")
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
             dump_line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
             if wave64 and rc == 77:
@@ -434,7 +439,7 @@ def run_suite(a, work: str) -> int:
             elif rc == 0 and dump_line:
                 vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
                 ok = vals == want
-                fmt = hex if name == "cs_store" else str
+                fmt = hex if name in ("cs_store", "cs_smem_soffset_imm") else str
                 results.append((name, ok, " ".join(fmt(x) for x in vals)))
             else:
                 results.append((name, False, msg))

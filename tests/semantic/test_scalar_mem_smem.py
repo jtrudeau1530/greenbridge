@@ -13,6 +13,8 @@ Covers AMD RDNA2 / GFX10 SMEM (Scalar Memory) ISA semantics and tools/rdna2spirv
   * Multi-dword scalar loads (s_load_dword, s_load_dwordx2, x4, x8, x16) with sequential 4-byte address strides
   * Destination register targeting: SGPR ranges and special registers (vcc_lo, vcc_hi, vcc pair, m0)
   * tools/rdna2spirv.py translator validation (Gen.scalar_load instruction sequences and operand validation)
+  * SMEM loads with a register offset and an immediate at once ("sOFF offset:IMM"): address = base + sOFF + IMM,
+    checked by running the emitted code (SmemBodyEvaluator, SmemSoffsetImmTranslatorTests)
   * spirv_mini_interp strictness validation (rejecting unmodelled 64-bit types and PhysicalStorageBuffer)
 """
 import os
@@ -370,6 +372,207 @@ class SmemTranslatorGenTests(unittest.TestCase):
         ins_vgpr_base = parse_line("s_load_dword s0, v[0:1], 0")
         with self.assertRaises(rdna2spirv.Unsupported):
             g.scalar_load(ins_vgpr_base["op"], ins_vgpr_base["args"], ins_vgpr_base["mods"])
+
+
+class SmemBodyEvaluator:
+    """Runs the straight-line SPIR-V that Gen.scalar_load emits, against concrete SGPR values and a dword memory.
+
+    spirv_mini_interp refuses 64-bit integers and PhysicalStorageBuffer by design, so the address a scalar load
+    reads cannot be checked there. This evaluator knows only the handful of instructions scalar_load uses and
+    raises on anything else, so a change in the emitted code cannot be approximated silently. The heap base (push
+    constant dwords 32..33) is 0 unless given, which makes every address read an Xbox VA.
+    """
+
+    def __init__(self, gen, sgpr, memory, heap_base=0):
+        self.consts = {name: value for value, name in gen.consts.items()}
+        self.sgpr = dict(sgpr)
+        self.memory = memory
+        self.heap_base = heap_base
+        self.ids = {}
+        self.reads = []          # byte address of every PhysicalStorageBuffer dword load, in order
+        for line in gen.body:
+            self._step(line.split())
+
+    def _value(self, name):
+        if name == "%c64_32":
+            return 32
+        if name in self.ids:
+            return self.ids[name]
+        if name in self.consts:
+            return self.consts[name]
+        raise AssertionError(f"unknown id {name}")
+
+    def _step(self, words):
+        if words[0] == "OpStore":
+            kind, index = self._value(words[1])
+            if kind != "sgpr":
+                raise AssertionError(f"store through {kind}")
+            self.sgpr[index] = self._value(words[2])
+            return
+        if len(words) < 4 or words[1] != "=":
+            raise AssertionError("unmodelled line: " + " ".join(words))
+        result, op, ty, args = words[0], words[2], words[3], words[4:]
+        if op == "OpAccessChain" and ty == "%_ptr_Function_uint" and args[0] == "%sgpr":
+            value = ("sgpr", self._value(args[1]))
+        elif op == "OpAccessChain" and ty == "%_ptr_PSB_uint":
+            kind, address = self._value(args[0])
+            if kind != "psb":
+                raise AssertionError(f"PSB access chain on {kind}")
+            value = ("mem", (address + 4 * self._value(args[1])) & MASK64)
+        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_lo_p":
+            value = self.heap_base & MASK32
+        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_hi_p":
+            value = (self.heap_base >> 32) & MASK32
+        elif op == "OpLoad" and ty == "%uint":
+            kind, where = self._value(args[0])
+            if kind == "sgpr":
+                value = self.sgpr.get(where, 0) & MASK32
+            elif kind == "mem" and args[1:] == ["Aligned", "4"]:
+                self.reads.append(where)
+                value = self.memory.read_dword(where)
+            else:
+                raise AssertionError("unmodelled load: " + " ".join(words))
+        elif op == "OpBitwiseAnd" and ty == "%uint":
+            value = self._value(args[0]) & self._value(args[1])
+        elif op == "OpIAdd" and ty == "%uint":
+            value = (self._value(args[0]) + self._value(args[1])) & MASK32
+        elif op == "OpUConvert" and ty == "%ulong":
+            value = self._value(args[0]) & MASK32
+        elif op == "OpShiftLeftLogical" and ty == "%ulong":
+            value = (self._value(args[0]) << self._value(args[1])) & MASK64
+        elif op == "OpBitwiseOr" and ty == "%ulong":
+            value = self._value(args[0]) | self._value(args[1])
+        elif op == "OpIAdd" and ty == "%ulong":
+            value = (self._value(args[0]) + self._value(args[1])) & MASK64
+        elif op == "OpConvertUToPtr" and ty == "%_ptr_PSB_arr":
+            value = ("psb", self._value(args[0]))
+        else:
+            raise AssertionError("unmodelled instruction: " + " ".join(words))
+        self.ids[result] = value
+
+
+class SmemSoffsetImmTranslatorTests(unittest.TestCase):
+    """SMEM loads that carry a register offset and an immediate at once: llvm-mc prints "sOFF offset:IMM".
+
+    Rule: address = base + soffset + imm (+ 4*i for dword i).
+    Measured on an AMD Radeon RX 6800 (gfx1030) by running s_buffer_load_dword/x2/x4/x8 as a raw compute kernel:
+    soffset 8 + imm 4 reads the dword at +12. s_load_dword* with both offsets was not measured; it shares the SMEM
+    encoding (soffset_en + imm), so the same rule is applied to it as an inference.
+    The hardware also truncates base, soffset and imm each to a multiple of 4 and returns 0 past NUM_RECORDS; the
+    translator does neither, so every case here is dword-aligned and in bounds.
+
+    The instruction lines are hand-written. Each case runs the code Gen.scalar_load emits with SmemBodyEvaluator
+    and asserts both the addresses read and the values that land in the destination SGPRs.
+    """
+
+    VSHARP_BASE = 0x0000000200001000        # s24 = 0x00001000, s25 = 0x80040002 (flags above bit 15 are not address)
+    POINTER = 0x0000000300004000            # s[24:25] for s_load
+
+    def run_load(self, line, pointer=False):
+        ins = parse_line(line)
+        g = rdna2spirv.Gen("ps")
+        g.scalar_load(ins["op"], ins["args"], ins["mods"])
+        base = self.POINTER if pointer else self.VSHARP_BASE
+        bank = SmemMemoryBank()
+        for off in range(0, 0x40, 4):       # every dword near the base holds its own offset, tagged
+            bank.write_dword(base + off, 0x5EED0000 | off)
+        sgpr = {40: 8}                      # the register offset used by every case
+        if pointer:
+            sgpr.update({24: 0x00004000, 25: 0x00000003})
+        else:
+            sgpr.update({24: 0x00001000, 25: 0x80040002, 26: 0x00010000, 27: 0x00140000})
+        ev = SmemBodyEvaluator(g, sgpr, bank)
+        return ev, [a - base for a in ev.reads], g
+
+    def test_s_buffer_load_dword_soffset_plus_imm(self):
+        # The measured case: soffset 8 + imm 4 reads the dword at +12 (not +8, which is what dropping the imm gives).
+        ev, offsets, _ = self.run_load("s_buffer_load_dword s12, s[24:27], s40 offset:0x4")
+        self.assertEqual(offsets, [12])
+        self.assertEqual(ev.sgpr[12], 0x5EED000C)
+
+    def test_s_load_dword_soffset_plus_imm(self):
+        # Inferred from the shared SMEM encoding; not measured on hardware.
+        ev, offsets, _ = self.run_load("s_load_dword s12, s[24:25], s40 offset:0x4", pointer=True)
+        self.assertEqual(offsets, [12])
+        self.assertEqual(ev.sgpr[12], 0x5EED000C)
+
+    def test_multi_dword_soffset_plus_imm(self):
+        cases = [
+            ("s_buffer_load_dwordx2 s[12:13], s[24:27], s40 offset:0x4", False, 2, 0x0C),
+            ("s_buffer_load_dwordx4 s[12:15], s[24:27], s40 offset:0x10", False, 4, 0x18),
+            ("s_buffer_load_dwordx8 s[12:19], s[24:27], s40 offset:0x14", False, 8, 0x1C),
+            ("s_load_dwordx2 s[12:13], s[24:25], s40 offset:0x4", True, 2, 0x0C),
+            ("s_load_dwordx4 s[12:15], s[24:25], s40 offset:0x10", True, 4, 0x18),
+        ]
+        for line, pointer, n, first in cases:
+            with self.subTest(line=line):
+                ev, offsets, _ = self.run_load(line, pointer)
+                self.assertEqual(offsets, [first + 4 * i for i in range(n)])
+                self.assertEqual([ev.sgpr[12 + i] for i in range(n)], [0x5EED0000 | (first + 4 * i) for i in range(n)])
+
+    def test_imm_only_and_soffset_only_addresses_unchanged(self):
+        cases = [
+            ("s_buffer_load_dword s12, s[24:27], 0x4", False, [0x04]),
+            ("s_buffer_load_dword s12, s[24:27], s40", False, [0x08]),
+            ("s_buffer_load_dwordx2 s[12:13], s[24:27], 0x10", False, [0x10, 0x14]),
+            ("s_buffer_load_dwordx4 s[12:15], s[24:27], s40", False, [0x08, 0x0C, 0x10, 0x14]),
+            ("s_load_dword s12, s[24:25], 0x4", True, [0x04]),
+            ("s_load_dword s12, s[24:25], s40", True, [0x08]),
+            ("s_load_dwordx2 s[12:13], s[24:25], 0", True, [0x00, 0x04]),
+            ("s_load_dwordx2 s[12:13], s[24:25], s40", True, [0x08, 0x0C]),
+        ]
+        for line, pointer, want in cases:
+            with self.subTest(line=line):
+                ev, offsets, _ = self.run_load(line, pointer)
+                self.assertEqual(offsets, want)
+                self.assertEqual([ev.sgpr[12 + i] for i in range(len(want))], [0x5EED0000 | o for o in want])
+
+    def test_zero_imm_with_soffset_reads_the_soffset_address(self):
+        ev, offsets, _ = self.run_load("s_buffer_load_dword s12, s[24:27], s40 offset:0x0")
+        self.assertEqual(offsets, [8])
+        self.assertEqual(ev.sgpr[12], 0x5EED0008)
+
+    def test_non_sgpr_scalar_register_offset_plus_imm(self):
+        # llvm-mc also accepts m0, vcc_lo or null as the register offset. null reads as zero; m0 is not an SGPR slot,
+        # so only check that the form still translates and that the immediate changes the code.
+        ev, offsets, _ = self.run_load("s_buffer_load_dword s12, s[24:27], null offset:0x14")
+        self.assertEqual(offsets, [0x14])
+        self.assertEqual(ev.sgpr[12], 0x5EED0014)
+        bodies = []
+        for line in ("s_buffer_load_dword s12, s[24:27], m0", "s_buffer_load_dword s12, s[24:27], m0 offset:0x4"):
+            ins = parse_line(line)
+            g = rdna2spirv.Gen("ps")
+            g.scalar_load(ins["op"], ins["args"], ins["mods"])
+            bodies.append(g.body)
+        self.assertNotEqual(bodies[0], bodies[1])
+
+    def test_offset_modifier_changes_the_emitted_code(self):
+        for line, pointer in (("s_buffer_load_dword s12, s[24:27], s40", False),
+                              ("s_load_dword s12, s[24:25], s40", True)):
+            with self.subTest(line=line):
+                _, _, plain = self.run_load(line, pointer)
+                _, _, both = self.run_load(line + " offset:0x4", pointer)
+                self.assertNotEqual(plain.body, both.body)
+
+    def test_heap_base_is_added_once(self):
+        ins = parse_line("s_buffer_load_dword s12, s[24:27], s40 offset:0x4")
+        g = rdna2spirv.Gen("ps")
+        g.scalar_load(ins["op"], ins["args"], ins["mods"])
+        ev = SmemBodyEvaluator(g, {24: 0x1000, 25: 0, 40: 8}, SmemMemoryBank(), heap_base=0x0000007F00000000)
+        self.assertEqual(ev.reads, [0x0000007F00000000 + 0x1000 + 12])
+
+    def test_offset_forms_the_assembler_rejects_raise(self):
+        # llvm-mc accepts none of these; hand-written or damaged listings must not translate to a guessed address.
+        for line in ("s_buffer_load_dword s12, s[24:27], 0x8 offset:0x4",       # immediate operand and offset modifier
+                     "s_buffer_load_dword s12, s[24:27], s40 offset:zz",        # unparseable immediate
+                     "s_buffer_load_dword s12, s[24:27], s40 offset:0x4 offset:0x8",
+                     "s_buffer_load_dword s12, s[24:27], s40, 0x4",             # a fourth operand
+                     "s_load_dword s12, s[24:25], 0x8 offset:0x4"):
+            with self.subTest(line=line):
+                ins = parse_line(line)
+                g = rdna2spirv.Gen("ps")
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    g.scalar_load(ins["op"], ins["args"], ins["mods"])
 
 
 class SmemMiniInterpStrictnessTests(unittest.TestCase):

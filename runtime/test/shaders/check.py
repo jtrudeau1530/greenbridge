@@ -23,7 +23,9 @@ UNSUPPORTED = 77                                       # a test tool exits with 
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
-CS_DUMPS = [("cs_store", CS_STORE), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
+CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
+WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm")
+CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48])]
 PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
@@ -131,8 +133,8 @@ def main():
     for name, groups, expect in COMPUTE:
         results.append((name, compute_test(tools, spirv, name, groups, expect)))
     results.append(("cs_wavemask", compute_test(tools, spirv, "cs_wavemask", "1", "wavemask", require_wave64=True)))
-    for name, want in CS_DUMPS:   # all but cs_store need a 64-wide subgroup (skipped where the GPU has none)
-        results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=name != "cs_store",
+    for name, want in CS_DUMPS:   # all but WAVE32_DUMPS need a 64-wide subgroup (skipped where the GPU has none)
+        results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=name not in WAVE32_DUMPS,
                                            expected_words=want)))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
