@@ -5,7 +5,10 @@
 // four of a sampler slot. It looks both up in the hash table at set 0 binding 2 (FNV-1a over the eight key dwords,
 // eight probes, a miss is index 0; an S# key is its four dwords and four of 0xFFFFFFFF), samples the 2D image
 // array at binding 0 with the sampler array at binding 1, and writes
-//   result[first + i] = the texel at ((i % 8) + 0.5, (i / 8) + 0.5) / 8, as RGBA8 with red in the low byte.
+//   result[first + i] = the texel at ((i % 8) + 0.5, (i / 8) + 0.5) / 8 + (1, 0), as RGBA8 with red in the low byte.
+// The whole tile to the right in U: a sampler that wraps in U gives the texel at the same place in the image,
+// one that clamps (as the fallback sampler at index 0 does) the image's right edge. So the result shows that
+// the S# was found, not only the T#.
 // Set 0 is the device's bindless set; set 1 is the test's output buffer.
 #extension GL_EXT_nonuniform_qualifier : require
 
@@ -47,7 +50,7 @@ void main() {
         sampler_key[k] = k < 4 ? pc.ssharp[k] : 0xffffffffu;
     }
     const uint image = lookup(image_key), smp = lookup(sampler_key);
-    const vec2 uv = (vec2(i % 8, i / 8) + 0.5) / 8.0;
+    const vec2 uv = (vec2(i % 8, i / 8) + 0.5) / 8.0 + vec2(1.0, 0.0);
     const vec4 texel = textureLod(sampler2D(images[image], samplers[smp]), uv, 0.0);
     result[pc.first + i] = packUnorm4x8(texel);
 }

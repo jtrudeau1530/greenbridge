@@ -5,7 +5,9 @@
 //     sampler into the device's bindless set 0. The slots are decoded and checked. Then a compute shader samples
 //     an uploaded 8x8 texture by those bytes: it looks the T# and the S# up in the descriptor hash table, as a
 //     translated shader does. It runs three times: with the view's own slot, with a copy of it in another slot,
-//     and with a slot holding bytes no view was made for, which must give the fallback image.
+//     and with a slot holding bytes no view was made for, which must give the fallback image. The sampler wraps
+//     in U and the shader samples one tile to the right, so a missed S# would show as well (the fallback
+//     sampler clamps).
 // The device has no pipelines yet, so the test makes that one pipeline in Vulkan itself and binds the device's set
 // (rt::d3d12::bindless_set). The shader is test/glsl/cs_sample.comp; without glslangValidator at build time the
 // sampling is skipped. No game data.
@@ -333,8 +335,11 @@ int main() {
         EXPECT(std::memcmp(view_bytes(copied), view_bytes(own), step) == 0);
         std::memset(view_bytes(unknown), 0x5a, step);
         D3D12_SAMPLER_DESC sampler_desc{};
+        // Wrapping in U, so that it differs from the fallback sampler (nearest, clamping): the shader samples one
+        // tile to the right, which gives the texture with this sampler and its right edge with the fallback.
         sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sampler_desc.AddressV = sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         sampler_desc.MaxAnisotropy = 1;
         sampler_desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
@@ -364,7 +369,8 @@ int main() {
         const g::Sampler sampler = g::decode(sampler_words);
         EXPECT(sampler.mag_filter == g::Filter::point && sampler.min_filter == g::Filter::point);
         EXPECT(sampler.mip_filter == g::MipFilter::point && sampler.max_anisotropy == 1);
-        EXPECT(sampler.address_u == g::AddressMode::clamp_last_texel && sampler.address_w == sampler.address_u);
+        EXPECT(sampler.address_u == g::AddressMode::wrap && sampler.address_v == g::AddressMode::clamp_last_texel &&
+               sampler.address_w == g::AddressMode::clamp_last_texel);
         EXPECT(sampler.compare == g::CompareFunction::never && sampler.min_lod == 0.0f && sampler.max_lod > 14.9f);
 
         // A view with every field away from its default: mips 1 and 2 of a BGRA cube, with the view's mapping

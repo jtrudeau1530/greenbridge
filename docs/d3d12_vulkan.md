@@ -337,10 +337,11 @@ and any validation error fails them.
     past the mips and a volume.
   - That set 0 holds them: a compute shader (`test/glsl/cs_sample.comp`, GLSL, compiled with `glslangValidator`;
     skipped without it) is handed a slot's T# and the sampler's S#, looks them up in the hash table as a
-    translated shader does, and samples. The layer has no pipelines yet, so the test creates this one in Vulkan
-    and binds the device's set. It reads the texture through the view's own slot and through a copy of it, and
-    gets the fallback from a slot of bytes no view was made for and, after the texture is destroyed, from the
-    view's own bytes.
+    translated shader does, and samples. The sampler wraps in U and the shader samples one tile to the right,
+    so a missed S# shows too: the fallback sampler clamps. The layer has no pipelines yet, so the test creates
+    this one in Vulkan and binds the device's set. It reads the texture through the view's own slot and through
+    a copy of it, and gets the fallback from a slot of bytes no view was made for and, after the texture is
+    destroyed, from the view's own bytes.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
