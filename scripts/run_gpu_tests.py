@@ -407,9 +407,14 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_scc_rfl": [55, 48],
             }
             want = cs_dump_wants[name]
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            # Every dump but cs_store is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
+            # check.py does, where the device has none (vk_compute_test exits 77) instead of reporting a failure.
+            wave64 = name != "cs_store"
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
             dump_line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
-            if rc == 0 and dump_line:
+            if wave64 and rc == 77:
+                results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
+            elif rc == 0 and dump_line:
                 vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
                 ok = vals == want
                 fmt = hex if name == "cs_store" else str
@@ -471,14 +476,14 @@ def run_suite(a, work: str) -> int:
                 results.append((name, ok, detail))
 
     print("\n=== GPU TEST RESULTS ===")
-    passed = 0
+    passed = skipped = 0
     for name, ok, detail in results:
-        tag = "PASS" if ok else "FAIL"
-        if ok:
-            passed += 1
+        tag = "SKIP" if ok is None else "PASS" if ok else "FAIL"
+        passed += ok is True
+        skipped += ok is None
         print(f"  {tag:4s}  {name:<20s}  {detail}")
-    print(f"\n{passed}/{len(results)} passed")
-    return 0 if passed == len(results) else 1
+    print(f"\n{passed}/{len(results)} passed" + (f", {skipped} skipped" if skipped else ""))
+    return 0 if passed + skipped == len(results) else 1
 
 
 if __name__ == "__main__":
