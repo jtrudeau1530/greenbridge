@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -498,6 +499,32 @@ struct Prepared {
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
 };
+
+// ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
+// the device, Windows D3D12 (WARP and AMD) clamps to the component range and truncates fractions. Vulkan
+// instead interprets the matching union member as an integer already; copying float bits changes the value.
+inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
+    std::uint32_t maximum = 0;
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UINT: maximum = 255; break;
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32B32A32_UINT: maximum = std::numeric_limits<std::uint32_t>::max(); break;
+    default: break;
+    }
+    VkClearColorValue value{};
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        if (!maximum) {
+            value.float32[i] = input[i];
+        } else if (!(input[i] > 0.0f)) {
+            value.uint32[i] = 0; // NaN, negative values and either zero; no out-of-range float-to-int cast.
+        } else if (double(input[i]) >= double(maximum)) {
+            value.uint32[i] = maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
+        } else {
+            value.uint32[i] = static_cast<std::uint32_t>(input[i]);
+        }
+    }
+    return value;
+}
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
                        VkImageSubresourceRange& out) {
@@ -1012,8 +1039,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            VkClearColorValue color{};
-            std::copy(color_clear->color.begin(), color_clear->color.end(), color.float32);
+            const VkClearColorValue color = detail::render_target_clear_color(p.binding.format, color_clear->color);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
