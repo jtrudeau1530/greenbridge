@@ -225,7 +225,8 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
 // u32 num_static_samplers, u32 flags, then per-parameter fields in d3d12.h
 // order. Static samplers follow the same field order as D3D12_STATIC_SAMPLER_DESC.
 // Anything else (v1.2 blobs, extra dwords, truncation) is a hard error.
-DecodeResult parse_rts0(const uint8_t* data, size_t size) {
+// Payload decoder: the RTS0 chunk contents (see header for the hypothesis).
+static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
     DecodeResult out;
     Reader r(data == nullptr ? reinterpret_cast<const uint8_t*>("") : data, size);
     uint32_t ver = 0, nparams = 0, nsamplers = 0, flags = 0;
@@ -321,6 +322,67 @@ DecodeResult parse_rts0(const uint8_t* data, size_t size) {
         return out;
     }
     out.ok = true;
+    return out;
+}
+
+DecodeResult parse_rts0(const uint8_t* data, size_t size) {
+    DecodeResult out;
+    if ((data == nullptr && size != 0) || (data != nullptr && size < 4)) {
+        out.error = "blob too small for a DXBC container";
+        return out;
+    }
+    if (data == nullptr) {
+        out.error = "null blob";
+        return out;
+    }
+    // A bare payload (unit-test path) has no DXBC magic: decode directly.
+    if (!(data[0] == 'D' && data[1] == 'X' && data[2] == 'B' && data[3] == 'C')) {
+        return parse_rts0_payload(data, size);
+    }
+    // DXBC container walk (mirrors input_signature in tools/rdna2spirv.py):
+    // +28: chunk count, +32: chunk offsets, each chunk is FourCC + u32 size.
+    auto at = [&](size_t off, uint32_t& v) {
+        if (off + 4 > size) return false;
+        v = static_cast<uint32_t>(data[off]) | (static_cast<uint32_t>(data[off + 1]) << 8) |
+            (static_cast<uint32_t>(data[off + 2]) << 16) | (static_cast<uint32_t>(data[off + 3]) << 24);
+        return true;
+    };
+    uint32_t nchunks = 0;
+    if (!at(28, nchunks)) {
+        out.error = "truncated DXBC header";
+        return out;
+    }
+    if (nchunks > 1024) {
+        out.error = "absurd DXBC chunk count";
+        return out;
+    }
+    for (uint32_t k = 0; k < nchunks; ++k) {
+        uint32_t off = 0;
+        // NOTE: off and payload_size are u32; promote to size_t BEFORE adding
+        // or a hostile container wraps the check and turns it into an OOB read.
+        if (!at(32 + 4 * static_cast<size_t>(k), off) ||
+            static_cast<size_t>(off) + 8 > size) {
+            out.error = "truncated DXBC chunk table";
+            return out;
+        }
+        if (data[off] == 'R' && data[off + 1] == 'T' && data[off + 2] == 'S' && data[off + 3] == '0') {
+            uint32_t payload_size = 0;
+            if (static_cast<size_t>(off) + 8 > size) {
+                out.error = "truncated RTS0 chunk header";
+                return out;
+            }
+            payload_size = static_cast<uint32_t>(data[off + 4]) |
+                           (static_cast<uint32_t>(data[off + 5]) << 8) |
+                           (static_cast<uint32_t>(data[off + 6]) << 16) |
+                           (static_cast<uint32_t>(data[off + 7]) << 24);
+            if (static_cast<size_t>(off) + 8 + payload_size > size) {
+                out.error = "RTS0 chunk overruns its container";
+                return out;
+            }
+            return parse_rts0_payload(data + off + 8, payload_size);
+        }
+    }
+    out.error = "no RTS0 chunk in DXBC container";
     return out;
 }
 

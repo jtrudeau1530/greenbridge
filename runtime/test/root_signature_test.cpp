@@ -167,6 +167,40 @@ int main() {
         check(!parse_rts0(cut.data(), cut.size()).ok, "truncated RTS0 rejected");
     }
 
+    // DXBC container walk: a hand-built container with one RTS0 chunk parses
+    // through the chunk table (same path the MS serializer blob takes).
+    {
+        std::vector<uint8_t> payload;
+        put_u32(payload, 2);  // version 1.1
+        put_u32(payload, 1);  // 1 param
+        put_u32(payload, 0);  // 0 samplers
+        put_u32(payload, 0);  // flags
+        put_u32(payload, 0);  // Constants
+        put_u32(payload, 0);  // visibility All
+        put_u32(payload, 0);  // register
+        put_u32(payload, 0);  // space
+        put_u32(payload, 2);  // 2 values
+        std::vector<uint8_t> blob;
+        blob.insert(blob.end(), {'D', 'X', 'B', 'C'});
+        blob.insert(blob.end(), 16, 0);  // hash
+        put_u32(blob, 1);  // version
+        put_u32(blob, 0);  // file size (patched below)
+        put_u32(blob, 1);  // 1 chunk
+        put_u32(blob, 36);  // chunk offset: 4 magic + 16 hash + 4 ver + 4 size + 4 count + 4 offset
+        blob.insert(blob.end(), {'R', 'T', 'S', '0'});
+        put_u32(blob, static_cast<uint32_t>(payload.size()));
+        blob.insert(blob.end(), payload.begin(), payload.end());
+        const uint32_t total = static_cast<uint32_t>(blob.size());
+        blob[24] = static_cast<uint8_t>(total);
+        blob[25] = static_cast<uint8_t>(total >> 8);
+        blob[26] = static_cast<uint8_t>(total >> 16);
+        blob[27] = static_cast<uint8_t>(total >> 24);
+        const DecodeResult d = parse_rts0(blob.data(), blob.size());
+        check(d.ok, "DXBC container walk finds RTS0");
+        check(d.sig.params.size() == 1 && d.sig.params[0].num_values == 2,
+              "walked RTS0 model matches payload");
+    }
+
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
