@@ -93,6 +93,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         ".glb": "model/gltf-binary",
     }
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The viewer can cancel a chunk download while its response is being sent.
+            pass
+
     def send_head(self):
         if not host_allowed(self.headers.get("Host")):
             self.send_error(403, "Forbidden: open the viewer at http://127.0.0.1 or http://localhost")
