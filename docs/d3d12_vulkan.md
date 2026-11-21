@@ -383,7 +383,8 @@ This is the least verifiable part of the layer. D3D12 gives the application a ro
 turns it into the user SGPRs (`s0..s31`) that the shader reads. The translator already copies those 32 dwords from
 push constants into `s0..s31`. The layer must produce them.
 
-The default mapping (**Assumption**) follows root parameter order:
+The default mapping (implemented by `rt::rootsig::pack` in `runtime/src/root_signature.{h,cpp}`) follows root
+parameter order:
 
 | Root parameter | User-data dwords |
 |---|---|
@@ -394,6 +395,15 @@ The default mapping (**Assumption**) follows root parameter order:
 
 Before the draw/dispatch, the layer copies the current root arguments into a 32-dword block in that order and
 uploads it as push constants. Missing parameters are zero.
+
+Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
+refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
+`__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
+
+Reconciliation: `tools/root_sig_contract.py` checks a candidate root signature against every shader's
+`user_sgpr_reads` from `spirv/index.json` (const32 vs constant dwords, 64-bit VAs vs view/table pairs) and fails
+the build on the first contradiction. Until the console mapping in §3.5 is confirmed by a PSO, this check — not
+a rendered frame — is the acceptance gate for the mapping above.
 
 **Root-signature flag quirk.** Prior art measured Xbox root-signature descriptors carrying flags `0x03000000`; the
 PC serializer rejects them with `E_INVALIDARG` because its flags live in the low 16 bits. Clear the high byte on a
@@ -756,7 +766,7 @@ store, load, mesh, geometry and BVH tests; this layer is the other half.
 | `s0..s31` user data | Root signature state at draw/dispatch: root constants copied, root CBV/SRV/UAV addresses and descriptor-table base addresses as 64-bit console VAs. Mapping per section 3.5; absent parameters zero. |
 | `heap_base` (dwords 32–33) | The arena's `vkGetBufferDeviceAddress`. One value per command buffer; updated only if the arena is recreated. |
 | `code_base` (dwords 34–35) | The console VA of the current shader's FSSM blob in the arena. Per-stage conflict: see below. |
-| Descriptor hash table (set 0, binding 2) | `uint mask` + entries of `key[8], index, pad`; FNV-1a over the 8 key dwords; linear probe up to 8; miss = index 0. The layer inserts every T#/S# it sees and keeps a fallback image/sampler at index 0. |
+| Descriptor hash table (set 0, binding 2) | `uint mask` + entries of `key[8], index, pad`; FNV-1a over the 8 key dwords; linear probe up to 8; miss = index 0. Implemented in `runtime/src/descriptor_table.h` (`DescriptorTable`). The layer inserts every T#/S# it sees and keeps a fallback image/sampler at index 0. |
 | Bindless images (bindings 0, 3, 5, 6) | 2D, 2D-array/cube, 1D, 3D sampled-image arrays; one `VkImageView` per distinct T#. Cube textures are 6-layer 2D arrays, as the translator expects. |
 | Samplers (binding 1) | One `VkSampler` per distinct S#; literal S# values from shader constants are pre-registered. |
 | Storage images (bindings 4, 7, 8–19) | r32ui/float/sint views by dimension and numeric class; the layer binds each storage image into the float/uint/sint arrays of its dimension (the translator picks by the T# format at run time), with all three arrays as the safe default. |

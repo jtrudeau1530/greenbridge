@@ -103,8 +103,11 @@ MUTATIONS = [
 
 
 def run_semantics(tools_dir):
-    env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1")
-    p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], cwd=HERE, env=env,
+    # The child finds test_ps_semantics through PYTHONPATH, not cwd=HERE: Windows refuses a working directory longer
+    # than 258 characters (WinError 267), which a checkout in a deep folder reaches.
+    path = os.pathsep.join(filter(None, [HERE, os.environ.get("PYTHONPATH")]))
+    env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=path)
+    p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], env=env,
                        capture_output=True, text=True, timeout=300)
     return p.returncode, p.stdout + p.stderr
 

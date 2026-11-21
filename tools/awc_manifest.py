@@ -13,8 +13,9 @@ streamed_music, data_offset, data_size, bank_size, notes. JSON is an object with
 stream_count, streamed_music_channel_count and a streams list of the same fields (booleans and
 numbers keep their types). duration_s is the AWC header's declared samples / sample rate; notes
 flags values that look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
-A streamed-music descriptor contributes one row per mono channel; data_offset/size is its shared
-data tag.
+A streamed-music descriptor contributes one row per channel group; `channels` is the packet channel count read
+from the Opus TOC stereo bit, and `declared_samples`/`duration_s` are per channel (the descriptor stores the
+interleaved count). `data_offset`/`size` is the shared data tag.
 """
 import argparse
 import csv
@@ -108,8 +109,8 @@ def _bank_rows(path: str) -> list:
             print(f"awc_manifest: warning: {bank}: ignored malformed streamed-music descriptor",
                   file=sys.stderr)
             continue
-        for cid, samples, rate, codec, _packets in channels:
-            rows[cid] = _row(bank, cid, codec, 1, rate, samples, data, bank_size, True)
+        for cid, samples, rate, codec, _packets, packet_channels in channels:
+            rows[cid] = _row(bank, cid, codec, packet_channels, rate, samples, data, bank_size, True)
     return list(rows.values())
 
 

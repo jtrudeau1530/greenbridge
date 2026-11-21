@@ -21,9 +21,10 @@ method, scope and caveats. No game data is included.
 | [animation.md](animation.md) | 130,470 `anim.rpf` streams, 95.4% readable; 1,126 rig sets / 6,677 source-to-rig entries / 3,669 rigs. |
 | [navmesh.md](navmesh.md) | 90,295 `navmeshes.rpf` streams, 97.5% readable; `0DRP` pages, no navmesh-specific magic. |
 | [bvh.md](bvh.md) | 565,596 `core_bvh4.rpf` streams; 271,627 BVH4 streams and 269,106 instances, prebuilt acceleration data. |
-| [rbf0.md](rbf0.md) | 1,263 RBF0 resources, 475,461 elements; UI/Scaleform definitions, not a sectioned container. |
+| [rbf0.md](rbf0.md) | 1,263 RBF0 resources, 475,461 elements; UI/Scaleform definitions, not a sectioned container; strict JSON/XML tree decoder. |
 | [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN. |
 | [world.md](world.md) | `levels.rpf` placement: 9,918 map files / 680,228 entities measured in 55% of the archive (lower bound; estimate 16k-39.6k / 1.03M-2.64M); `0x7a` resource layout. |
+| [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact. |
 | [page_directory.md](page_directory.md) | RPF9 `0DRP`: 0x60-byte header, `q38` 16-byte records; 15,768 pages / 60,880 records in `data.rpf`; targets and sizes, names still TOC-only. |
 | [psin.md](psin.md) | PSIN metadata container: header, section walk, 671 streams in the `script.rpf` carve. |
 | [story.md](story.md) | `story000.rpf` 18.65 GiB mixed: 264 Bink 2 streams / 3.33 GB, 225,281 `RSC8` headers, 442 nested RPF9; `story000_script` PSIN, `shared_minigame` mixed content. |

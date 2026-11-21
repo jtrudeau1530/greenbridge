@@ -29,7 +29,9 @@ UNSUPPORTED = 77                                       # a test tool exits with 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
-CS_DUMPS = [("cs_store", CS_STORE), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
+CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
+WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm")
+CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48])]
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
@@ -229,7 +231,7 @@ def main():
                                                 require_wave64=not W64_EMULATED)))
     for name, want in CS_DUMPS:   # all but cs_store need a 64-wide subgroup unless wave64 is emulated
         results.append((name, compute_test(tools, spirv, name, "1", "dump",
-                                           require_wave64=name != "cs_store" and not W64_EMULATED,
+                                           require_wave64=name not in WAVE32_DUMPS and not W64_EMULATED,
                                            expected_words=want)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,

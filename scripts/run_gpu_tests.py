@@ -1,7 +1,9 @@
 """Assemble, translate, and run the synthetic RDNA2->SPIR-V GPU test suite on Vulkan.
 
 Usage:
-    python -I scripts/run_gpu_tests.py [--llvm-mc PATH] [--build DIR] [--work DIR] [--filter SUBSTR]
+    python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR]
+
+--llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc".
 """
 import argparse
 import json
@@ -16,6 +18,8 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from compute_fixture import compute_header
 
@@ -61,7 +65,7 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2) -> byt
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     raw = open(asm_path, encoding="utf-8").read()
-    cmd = [llvm_mc, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+    cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
     for ln in raw.splitlines():
         s = ln.strip()
         if not s:
@@ -338,7 +342,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
+    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
+                    help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")
@@ -372,9 +377,13 @@ def run_suite(a, work: str) -> int:
     asm_files = sorted(f for f in os.listdir(SHADER_DIR) if f.endswith(".asm"))
     if a.filter:
         asm_files = [f for f in asm_files if a.filter in f]
+    # Shaders a selected test draws with are built even when the filter leaves them out (#192): ps_flat uses vs_ids.
+    build_files = list(asm_files)
+    if any(f.startswith("ps_flat") for f in asm_files) and "vs_ids.asm" not in build_files:
+        build_files.append("vs_ids.asm")
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
-    for fname in asm_files:
+    for fname in build_files:
         name = os.path.splitext(fname)[0]
         if name == "gs_tri":
             dxbc = make_dxbc([
@@ -461,12 +470,15 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"))
             else:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
+        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
+                # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
+                "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
+                                        0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -487,13 +499,13 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
             }
             want = cs_dump_wants[name]
-            # Every dump but cs_store is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
+            # Every dump but cs_store and cs_smem_soffset_imm is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
             # check.py does, where the device has none (vk_compute_test exits 77) instead of reporting a failure.
             # With LEONIDA_W64_EMULATE=1 they were translated with --wave64-emulate and run on any subgroup size.
             # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
             emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
             partial = name == "cs_w64x_partial"
-            wave64 = name != "cs_store" and not emulated and not partial
+            wave64 = name not in ("cs_store", "cs_smem_soffset_imm") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
@@ -504,7 +516,7 @@ def run_suite(a, work: str) -> int:
             elif rc == 0 and dump_line:
                 vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
                 ok = vals == want
-                fmt = hex if name == "cs_store" else str
+                fmt = hex if name in ("cs_store", "cs_smem_soffset_imm") else str
                 results.append((name, ok, " ".join(fmt(x) for x in vals)))
             else:
                 results.append((name, False, msg))

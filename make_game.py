@@ -210,7 +210,8 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
         if not tool_available(llvm):
             missing.append(
                 "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
-                "target: install llvm-21 in WSL and set LLVM_MC to the whole command, e.g. "
+                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
+                "LLVM_MC to the whole command, e.g. "
                 "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)")
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
@@ -302,7 +303,7 @@ def shaders(game: str, work: str, jobs: int) -> None:
         shutil.rmtree(spirv, ignore_errors=True)
     if not os.path.isfile(disassembled):
         need(os.environ.get("LLVM_MC", "llvm-mc"),
-             "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's full path.")
+             "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's path or whole command.")
         log("shaders: disassembling (gfx1013)")
         drop(translated)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)

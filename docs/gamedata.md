@@ -176,6 +176,60 @@ A runtime consumer needs:
 - strict handling of the 9 tail-only and 1 unattributed blocks: they are incomplete evidence, not documents
   to guess at.
 
+## XML catalog
+
+`tools/gamedata_xml.py` turns a carve into a per-file and per-root catalog. It is stdlib-only and rebuilds
+multi-stream documents with `gamedata_index.py`, so it reads the same 267 XML payloads the index reports:
+
+```powershell
+python -I tools/gamedata_xml.py <work>\carve\common --json xml.json --csv xml.csv --check
+```
+
+The file rows carry offset/bytes/chunks, root, category, element count, maximum depth, attribute names, `$(name)`
+and `platform:/` counts, include-like counts and the well-formed/fragment flags. The root rows add the
+element-name and attribute histograms and the reference targets. `--check` separates a rootless fragment, a
+tail-only document and a malformed document instead of treating all three as parse failures.
+
+Measured over the 267 payloads (43,284,925 B):
+
+| Measure | Value |
+|---|---:|
+| Well-formed | 259 (257 with a declaration, 2 tail-only) |
+| Truncated at the start | 7 |
+| Rootless fragment | 1 |
+| Malformed | 0 |
+| Named roots / catalogued roots | 118 (+1 unattributed) / 118 |
+| Elements / distinct element names | 428,611 / 5,293 |
+| Attribute names / `type` values / `content` kinds | 33 / 318 / 7 |
+| Maximum depth | 17 |
+| Comment starts (all / declaration-bearing) | 507 / 412 |
+| `filename` / `parentPath` / `parentFile` / XInclude | 3,315 / 40 / 3 / 0 |
+| `platform:/` references (levels / other) | 2,674 (2,346 / 328) |
+| `$(common)` / `$(root)` / `$(target)` references | 588 / 28 / 23 |
+
+Macro counts cover all element text; 587 of the 588 `$(common)` hits are in `<filename>` elements, which is the
+filename-only bucket in the table above.
+
+The root and element distribution is the one in the tables above: the five repeated roots hold 141 of the 266
+documents, and the element histogram is dominated by the general node names `Item` (118,179), `item` (16,316)
+and `Name` (12,850). The long tail is per-system parameter names; the manifest and timecycle names are a small
+part of it. A category is a dispatch bucket, not a schema: for the 266 documents the catalog reproduces the
+file and root counts in the functional table and assigns each root one category. No root has more than one
+handler.
+
+Reference handling is narrow. Every `$(...)` and `platform:/` string is element text, not an attribute; no
+document uses XInclude. The macro alphabet is `$(common)`, `$(target)` and `$(root)`, and the platform targets
+split into `platform:/levels/` and everything else. `filename` is the only include-like element with a large
+population; `parentPath`/`parentFile` are the only relative references outside it. A resolver therefore needs
+four prefix rules and a content-set/mount walk, not a general include processor.
+
+A runtime dispatcher needs the 118-root table (or an RTTI class bridge), the 12 category buckets, the 318-value
+`type` registry, the 33-name attribute whitelist, the `content=` array decoders and a streaming reader for the
+14 MB document. It also needs to mark the 9 tail-only documents and the one rootless block as incomplete
+evidence: `gamedata_xml.py --check` is the reference for that split. The catalog is a local work product. Only
+aggregate counts and schema/root/element/attribute names belong in git; the CSV/JSON, the element values, the
+`type`/`content` values and per-file paths stay on the local machine. The tests are synthetic.
+
 ## Relationship to `data.rpf` and `script.rpf`
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |

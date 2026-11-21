@@ -51,6 +51,9 @@ def main() -> int:
                 break
             s = mt.start()
             if m[s:s + 3] == b"KB2":
+                if s + 0x1C > size:   # header cut off by the end of the file (a truncated copy): not a video
+                    pos = s + 1
+                    continue
                 blen = struct.unpack_from("<I", m, s + 4)[0] + 8
                 w, h = struct.unpack_from("<II", m, s + 0x14)
                 if not (64 <= blen <= size - s and 16 <= w <= 8192 and 16 <= h <= 8192):
@@ -117,6 +120,7 @@ def main() -> int:
     with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "files": rows}, f)
     print(json.dumps(summary, indent=1))
+    span = max(1, span)   # an empty data area (or --start at the end) has nothing to divide by
     print(f"readable: {total / span:.1%}, zero padding {zero / span:.1%}, unread {unread / span:.1%}")
     return 0
 
