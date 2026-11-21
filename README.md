@@ -94,6 +94,18 @@ Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creat
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: several
 hours on one core for now.
 
+### Vulkan diagnostics on Linux
+
+With CMake 3.24+, a C++20 compiler, and Vulkan development headers and loader installed:
+
+```sh
+cmake -S runtime -B runtime/build/linux
+cmake --build runtime/build/linux --parallel
+./runtime/build/linux/vk_pipeline_check /path/to/spirv
+```
+
+Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
+
 ## How it works
 
 | Piece | What it does | Where |
