@@ -31,6 +31,7 @@ if ((Test-Path $cmake) -and (Test-Path $ninja)) {
     $body = @"
 cd /d "$out" || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /Zi $opt /MP$jobs /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE $($files -join ' ') /Fe:gta6rt.exe /link /OPT:NOREF psapi.lib || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" "$src\test\vk_pipeline_check.cpp" /Fe:vk_pipeline_check.exe || exit /b 1
 "@
 }
 

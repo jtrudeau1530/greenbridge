@@ -18,6 +18,8 @@ Stages, in order (each skips work that is already done, so a stopped build conti
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC)
     runtime   build the loader (needs the game's executable to run, not to build)
+    pipelines create every translated shader on your GPU's driver (and every compute pipeline), report anything
+              the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
 """
 import argparse
 import json
@@ -30,7 +32,7 @@ import time
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 VERSIONS = os.path.join(ROOT, "game")
-STAGES = ["check", "shaders", "assets", "runtime"]
+STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
 # Archives scanned for models and texture dictionaries, small to large.
 MODEL_ARCHIVES = [
     "common.rpf", "textures.rpf", "data.rpf",
@@ -343,6 +345,19 @@ def runtime(game: str, out: str, v: dict) -> None:
         log(f"runtime: done. Start {os.path.join(out, 'gta6rt.exe')}")
 
 
+def pipelines(work: str, out: str) -> None:
+    exe = os.path.join(ROOT, "runtime", "build", "vk_pipeline_check.exe")
+    spirv = os.path.join(work, "shaders", "spirv")
+    if not os.path.isfile(exe):
+        fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
+    if not os.path.isfile(os.path.join(spirv, "index.json")):
+        fail("No translated shaders yet: run the shaders stage first.")
+    log("pipelines: creating every shader module and compute pipeline on this GPU")
+    os.makedirs(out, exist_ok=True)
+    run([exe, spirv, os.path.join(out, "pipeline_cache.bin")])
+    log("pipelines: done")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
@@ -387,6 +402,8 @@ def main() -> int:
         assets(game, work)
     if "runtime" in stages:
         runtime(game, out, v)
+    if "pipelines" in stages:
+        pipelines(work, out)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 
