@@ -16,8 +16,9 @@ field.
 | skipped | 48,220 |
 
 **Bottom line:** the gap is measurable and the codec mapping is certain, but BCPack itself is
-not decodable from public facts. No decoder is added; the next tractable work is the compact
-packed tail, not BCPack.
+not decodable from public facts. No BCPack decoder is added. The compact mip chain, which the
+first measurement called the next tractable work, is now decoded and validated below; the
+remaining gap is BCPack.
 
 This is the same 308,895 / 48,220 total already recorded in `docs/design.md`. The recount
 splits the 48,220 by cause: the old "(BCPack or unmapped)" label hides 14,713 skips whose
@@ -96,8 +97,134 @@ The partial exports are a separate gap. Of the 210,292:
 
 The packed-tail gap affects more textures than the BCPack skip count (196,257 partial
 exports vs 33,507 skips), but it loses only the small mips. It is also not a BCPack problem:
-196,257 textures stop at the last standalone mip because `UsableMipLimit = NonTailMipCount`
-for compact profiles, regardless of codec.
+196,257 textures stop at the descriptor's `non_tail` field because `UsableMipLimit =
+NonTailMipCount` for compact profiles, regardless of codec. The next section measures that
+field against the layout and finds that it is not the tail boundary: most of the "packed
+tail" is standalone mips the reader drops.
+
+## The compact mip chain
+
+The 196,257 partial exports and the 14,030 compact-profile skips are the same layout
+problem, not a codec problem. `tools/ttpf_mips.py` measures and decodes it; the counts below
+come from its `scan` and `check` over the same 57 pools.
+
+### The descriptor mode is a flag plus a tile mode
+
+`TtpfReader` reads the descriptor mode as one number (`b >> 23`) and selects a 64 KiB tile
+only for mode 0. The observed values split into a low flag bit and a 4-bit Gfx10 tile mode at
+bit 1:
+
+| `(mode >> 1) & 0xF` | Gfx10 mode | Tile | Descriptors |
+|---:|---|---:|---:|
+| 0 | `SW_64KB_D` | 64 KiB | 39,283 |
+| 1 | `SW_4KB_S` | 4 KiB | 70,497 |
+| 2 | `SW_4KB_S` | 4 KiB | 195,957 |
+| 3 | `SW_4KB_S` | 4 KiB | 50,811 |
+| 9–12 | array/volume | — | 567 |
+
+Modes 9–12 are exactly the 567 cube descriptors; the other 111 array/volume records use tile
+mode 0 or 1. Bit 0 of the field is independent: modes 4/5 share tile mode 2, 6/7 share tile
+mode 3, and 36/38 share tile modes 2/3. The reader's `mode == 0` test therefore gives a 4 KiB
+layout to modes 1 and 32, which are 64 KiB. Fifteen mode 1/32 descriptors have a known element
+size; all fifteen match a 64 KiB allocation span and one (`maps_4_7` #6034) decodes at
+0.00–0.33 levels (see below). The other 19 mode 1/32 records are the unknown-format ones in
+the table below.
+
+### The layout is the AMD mip tail
+
+The compact profile is the Gfx10 mip chain: standalone mips are padded to whole blocks and
+stored smallest-first; a mip whose element count fits half a tile width and a tile height,
+among the last 8 (4 KiB) or 12 (64 KiB) mips, goes into one shared tile at offset 0 at the
+AMD entry offset (`m = max_tail - 1 - k`; `entry = m > 6 ? 16 << m : m << 8`).
+
+On all 356,413 2D descriptors with a known element size — the 232,789 already-trusted compact
+exports, the 14,011 layout-capable records the profile table rejects, and every non-compact
+mode — the computed size equals `next_allocation - base`. There are **0 mismatches**. The
+remaining 702 descriptors are 678 arrays/volumes and 24 formats without an element-size
+mapping.
+
+### `non_tail` is not the layout boundary
+
+The descriptor's 3-bit `non_tail` field (`b & 7`) is where the reader stops, and its note calls
+the remaining mips "packed tail". The bytes do not follow that split:
+
+- 177,111 of the 232,789 compact exports have `non_tail < first_tail`; 204,108 standalone mips
+  lie beyond the limit.
+- 196,257 partial exports stop exactly at `non_tail`; 158,272 of them stop **before** the
+  computed tail boundary, and only 37,985 stop at it.
+- Of the 1,072,068 missing mips, 1,065,138 are in zlib/raw chunks. That decodable part splits
+  into 193,019 standalone mips and 872,119 packed-tail mips; the other 6,930 missing mips (in
+  1,166 textures) touch BCPack.
+
+`UsableMipLimit = NonTailMipCount` therefore drops decodable standalone mips, not only the
+tile. The allocation spans and the decoded content both put the tail at the computed index.
+
+### The 14,030 profile-table records
+
+| | Textures |
+|---|---:|
+| same layout, new tuple (4 KiB) | 13,956 |
+| same layout, modes 5/7/34/38 | 40 |
+| same layout, 64 KiB (modes 1/32) | 15 |
+| **layout resolved** | **14,011** |
+| format without an element-size mapping | 19 |
+| **total** | **14,030** |
+
+- 11,570 have no BCPack chunk: all 35,727 mips decode (2.91 GiB decompressed).
+- 469 more have a zlib/raw tail tile but a BCPack larger mip, so only their lower mips can be
+  exported.
+- The 19 blocked records are mode 1 (64 KiB) with DXGI formats 156, 199, 211 and 226; the
+  format-to-element-size mapping is the only unknown, not the mip layout.
+
+The five DXGI 11 (`R16G16B16A16_UNORM`) records are a separate one-line gap: DXGI 11 is 8
+bytes per element, but the vendored element table has no entry. Their layout then matches,
+but uncompressed tiling is not validated, so they are not exported here.
+
+### Sample validation
+
+`tools/ttpf_mips.py check` detiles one chain, decodes BC1/BC3/BC4/BC5 and compares each mip
+with a 2x2 box downsample of its parent at BC-block resolution (one block is 4x4 pixels). A
+correct chain is 0–4 levels, as in the SixNG notes; the control is the first tail mip detiled
+at origin (0,0).
+
+| Pool # | Descriptor | Mips | non_tail / first_tail | Max error | Tail control |
+|---|---|---:|---:|---:|---:|
+| `interiors_0_3` #19 | 512×256 BC1 | 7 | 1 / 3 | 0.38 | 126.06 |
+| `interiors_0_3` #10 | 512×512 BC1 | 8 | 3 / 3 | 0.46 | 57.94 |
+| `graphics` #43 | 64×512 BC1 | 10 | 1 / 3 | 1.08 | 132.31 |
+| `interiors_2_3` #468 | 512×512 BC1 | 8 | 3 / 3 | 0.60 | 113.83 |
+| `maps_0_7` #3217 | 128×128 BC1 | 6 | 0 / 1 | 0.79 | 114.71 |
+| `peds_1_3` #527 | 512×512 BC1 | 8 | 3 / 3 | 3.87 | 83.83 |
+| `maps_1_7` #1500 | 128×256 BC4 | 6 | 1 / 2 | 0.34 | 72.08 |
+| `decorations_0_3` #818 | 128×128 BC5 | 6 | 1 / 2 | 0.02 | 85.48 |
+| `interiors_1_3` #507 | 256×256 BC3 | 7 | 1 / 2 | 1.21 | 51.84 |
+
+`interiors_0_3` #19 is a partial export: the reader emits one mip, while all seven decode and
+match. `graphics` #43 and `interiors_2_3` #468 are tuples outside the table; `maps_0_7` #3217
+is mode 34 with `non_tail = 0`, which would leave zero standalone mips even if the mode gate
+passed.
+
+BC7 was checked on two samples with an external decoder (Pillow, not a dependency of the
+tool): `terrain_4_7` #23 (512×512, 3 mips, 0.35–0.49) and `maps_4_7` #6034 (1024×1024, mode
+32, 64 KiB, 0.00–0.33, control 4.44).
+
+For `interiors_0_3` #19 the tool reports the byte layout: mip 0 (512×256, 128×64 blocks) at
+24,576, mip 1 (256×128, 64×32) at 8,192, mip 2 (128×64, 32×16) at 4,096, then the 4 KiB tile
+at 0 with mip 3 (64×32 px, 16×8 blocks) at origin (16,0), mip 4 (32×16 px, 8×4) at (8,8),
+mip 5 (16×8 px, 4×2) at (0,12) and mip 6 (8×4 px, 2×1) at (0,8). The mip byte sizes 65,536 /
+16,384 / 4,096 / 1,024 / 256 / 64 / 16 are exactly the BC1 block counts, and the exported DDS
+is 87,524 bytes (148 + 87,376).
+
+### What this unlocks
+
+| | Textures | New mips | Decompressed |
+|---|---:|---:|---:|
+| partial exports that become complete | 195,091 | 1,065,138 | 1.69 GiB |
+| compact skips that become complete | 11,570 | 35,727 | 2.91 GiB |
+| **total** | **206,661** | **1,100,865** | **4.59 GiB** |
+
+1,166 of the 196,257 partials still miss 6,930 mips that touch BCPack; those and the 33,507
+fully blocked textures wait on the codec. Nothing here decodes BCPack.
 
 ## What BCPack is
 
@@ -265,25 +392,46 @@ and the algorithm class are known; the bitstream is not.
 
 ## Next step
 
-1. **Do not fake a BCPack decoder.** The current fallback (export the largest lower mip that
-   is zlib/raw) is used by 5,845 textures and should stay.
-2. **Fix the compact packed tail first.** 196,257 of the 210,292 partial exports stop at
-   `NonTailMipCount`; the tail layout is documented (SixNG §5) and needs no BCPack decoder.
-   This is the largest tractable texture gap.
-3. **Then the small independent gaps:** 678 array/volume layouts and 5 DXGI 11 textures.
-   Neither needs BCPack.
-4. **If a public decoder or bitstream spec appears under a compatible licence,** add it behind
-   `TtpfReader.DecodeChunk`; the container already carries the mode (codec id) and decoded
-   size, so no index work is needed.
-5. **If someone resumes the reverse engineering,** use the hard check the SixNG notes propose:
-   every lane must consume exactly its byte budget and finish at the rANS lower bound, with a
-   fixed symbol count. Reference blocks are the missing input; none are public.
+1. **Port the tile-mode split and the computed tail boundary.** In `TtpfReader`, select
+   `tile = 65536` when `((mode >> 1) & 0xF) == 0` and 4096 otherwise, replace
+   `ValidatedCompactProfile` with the allocation-span check, and set `UsableMipLimit` to the
+   computed `FirstTail` (or `mips` when the tail tile is zlib/raw). On this install that
+   completes 206,661 textures without touching BCPack.
+2. **Decode BC6H/BC7 in the validator.** `tools/ttpf_mips.py` decodes BC1/3/4/5; the BC7
+   samples were checked with an external decoder. The layout is the same formula (16-byte
+   elements), so this is validation breadth, not a new mapping.
+3. **Identify DXGI 156/199/211/226 (19 records) and validate uncompressed tiling (formats
+   11, 28, 49, 56).** These are the remaining non-BCPack blockers besides arrays.
+4. **Arrays/volumes: 678 descriptors.** 567 use tile modes 9–12 and 111 are 2-slice; no
+   validated slice layout exists yet.
+5. **Do not fake a BCPack decoder.** The current fallback (export the largest lower mip that
+   is zlib/raw) is used by 5,845 textures and should stay. If a public decoder or bitstream
+   spec appears under a compatible licence, add it behind `TtpfReader.DecodeChunk`; the
+   container already carries the mode (codec id) and decoded size, so no index work is
+   needed.
+6. **If someone resumes the BCPack reverse engineering,** use the hard check the SixNG notes
+   propose: every lane must consume exactly its byte budget and finish at the rANS lower
+   bound, with a fixed symbol count. Reference blocks are the missing input; none are public.
 
 ## Reproduce
 
+`tools/ttpf_mips.py` is the read-only measurement and decode tool:
+
+```
+python -I tools/ttpf_mips.py scan <game root> --json scan.json
+python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
+python -I tools/ttpf_mips.py check <pool.ttpf> <index>
+python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds>
+```
+
+`scan` reproduces the 357,115 / 98,603 / 210,292 / 48,220 split of this note and adds the
+layout and recovery columns. `check` reports the per-mip downsample error. `export` writes a
+full BC chain only when every source mip is zlib/raw. The tool writes no texture data and
+`tests/test_ttpf_mips.py` runs on a synthetic RDS5 pool, so the test needs no game files.
+
 `rpf9dump ttpf` writes one `manifest.json` per pool with a `Limitation` field for every
-catalog record, and its summary line has the same `ok` / `skip` totals. The split above comes
-from a read-only mirror of `TtpfReader`'s catalog checks: it mmaps each pool and reads only
-the 24-byte RDS5 header, the chunk table, the ETPF records and the chunk ranges. It writes no
-texture data. The mirror is not committed because it duplicates `TtpfReader`; the counts are
-the evidence.
+catalog record, and its summary line has the same `ok` / `skip` totals. The first split above
+came from a read-only mirror of `TtpfReader`'s catalog checks: it mmapped each pool and read
+only the 24-byte RDS5 header, the chunk table, the ETPF records and the chunk ranges, and it
+wrote no texture data. `tools/ttpf_mips.py scan` is that mirror, now committed with the
+compact-layout work; it reproduces the split and adds the recovery columns.
