@@ -8,6 +8,9 @@ Texture descriptor layout (qwords, found in GTA VI's resource CPU segments):
   q[k+5]  tiling / flags (0x0001 = AMD SW_4K_S verified on an R16 texture)
 The GPU segment is the carved blob that follows the CPU blob.
 
+This module also carries the Gfx10 compact mip layout rule used by the RDS5/TTPF pools
+(`tools/ttpf_mips.py`): tile-mode selection, the packed tail, and the allocation-span check.
+
 Usage:
     python -I tex_headers.py <carve dir> [--archives a,b] [--out textures_index.json]
 """
