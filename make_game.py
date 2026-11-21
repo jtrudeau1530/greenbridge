@@ -356,11 +356,20 @@ WAVE64_MODES = ("auto", "on", "off")
 
 def smallest_max_subgroup(vulkaninfo_text: str):
     """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
-    sizes = [int(n) for n in re.findall(r'maxSubgroupSize"?\s*[=:]\s*(\d+)', vulkaninfo_text)]
-    devices = len(re.findall(r'deviceName"?\s*[=:]', vulkaninfo_text))
-    if devices > len(sizes):
-        return None     # a device that prints no subgroup size must not be left out of the smallest
-    return min(sizes) if sizes else None
+    size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
+    starts = [m.start() for m in re.finditer(r'deviceName"?\s*[=:]', vulkaninfo_text)]
+    if not starts:
+        sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
+        return min(sizes) if sizes else None
+    # One section per device (a 1.3 device can print the size twice, in two property structs): one value each,
+    # and a device that prints none makes the answer unknown rather than being left out of the smallest.
+    per_device = []
+    for a, b in zip(starts, starts[1:] + [len(vulkaninfo_text)]):
+        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[a:b])]
+        if not sizes:
+            return None
+        per_device.append(min(sizes))
+    return min(per_device)
 
 
 def wave64_emulate(mode: str) -> bool:

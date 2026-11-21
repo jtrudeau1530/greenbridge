@@ -118,6 +118,20 @@ class DetectionGapsTest(unittest.TestCase):
         text = real_format(("Big GPU", 64, ALL)) + "VkPhysicalDeviceProperties:\n\tdeviceName        = Old GPU\n"
         self.assertIsNone(make_game.smallest_max_subgroup(text))      # one device says nothing: unknown, so on
 
+    def test_a_device_printing_the_size_twice_does_not_hide_one_that_prints_none(self):
+        twice = ("VkPhysicalDeviceProperties:\n\tdeviceName        = A\n"
+                 "VkPhysicalDeviceSubgroupSizeControlProperties:\n\tmaxSubgroupSize = 64\n"
+                 "VkPhysicalDeviceVulkan13Properties:\n\tmaxSubgroupSize = 64\n")
+        never = "VkPhysicalDeviceProperties:\n\tdeviceName        = B\n"
+        self.assertEqual(make_game.smallest_max_subgroup(twice), 64)
+        self.assertIsNone(make_game.smallest_max_subgroup(twice + never))
+        self.assertIsNone(make_game.smallest_max_subgroup(never + twice))
+
+    def test_a_device_printing_the_size_twice_counts_once(self):
+        a = ("VkPhysicalDeviceProperties:\n\tdeviceName = A\n\tmaxSubgroupSize = 64\n\tmaxSubgroupSize = 64\n")
+        b = "VkPhysicalDeviceProperties:\n\tdeviceName = B\n\tmaxSubgroupSize = 32\n"
+        self.assertEqual(make_game.smallest_max_subgroup(a + b), 32)
+
     def test_real_format_still_reads(self):
         self.assertEqual(make_game.smallest_max_subgroup(real_format(("A", 64, ALL))), 64)
         self.assertEqual(make_game.smallest_max_subgroup(real_format(("A", 64, ALL), ("B", 32, ALL))), 32)
@@ -188,6 +202,16 @@ class SubgroupInfoToolTest(unittest.TestCase):
         self.assertEqual((ctypes.sizeof(v.SubgroupSizeControl), ctypes.sizeof(v.AppInfo),
                           ctypes.sizeof(v.InstanceInfo)), (32, 48, 64))
         self.assertEqual((v.VK_SHADER_STAGE_COMPUTE_BIT, v.VK_SHADER_STAGE_MESH_BIT_EXT), (0x20, 0x80))
+
+    def test_a_32_bit_python_gets_an_error_not_a_crash(self):
+        import json
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import vk_subgroup_info as v
+        with mock.patch.object(v.sys, "maxsize", 2**31 - 1), mock.patch.object(v, "load_vulkan") as load, \
+                mock.patch("builtins.print") as pr:
+            self.assertEqual(v.main(), 1)
+        load.assert_not_called()
+        self.assertIn("64-bit", json.loads(pr.call_args[0][0])["error"])
 
     def test_script_runs_isolated_and_prints_one_json_line(self):
         import json

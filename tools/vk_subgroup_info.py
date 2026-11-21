@@ -96,6 +96,9 @@ def load_vulkan():
 
 def query() -> dict:
     """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
+    if sys.maxsize <= 2**32:
+        # the struct sizes below are the 64-bit ones, and 32-bit Windows Vulkan is stdcall, not CDLL's cdecl
+        raise RuntimeError("needs a 64-bit Python")
     vk = load_vulkan()
     vp = ctypes.c_void_p
     vk.vkCreateInstance.argtypes = [vp, vp, vp]
