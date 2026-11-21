@@ -164,6 +164,15 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%b = OpLogicalAnd %bool %t %f\n%res = OpSelect %uint %b %c1 %c2\n"), 2)
         self.assertEqual(run_word("%b = OpLogicalOr %bool %f %t\n%res = OpSelect %uint %b %c1 %c2\n"), 1)
 
+    def test_add_carry(self):
+        # 0xFFFFFFFF + 2 = 1, carry 1; 1 + 2 = 3, carry 0
+        self.assertEqual(run_word("%s = OpIAddCarry %umul %cFF %c2\n"
+                                  "%d = OpCompositeExtract %uint %s 0\n"
+                                  "%k = OpCompositeExtract %uint %s 1\n"
+                                  "%res = OpBitwiseAnd %uint %d %k\n"), 1)
+        self.assertEqual(run_word("%s = OpIAddCarry %umul %c1 %c2\n%res = OpCompositeExtract %uint %s 0\n"), 3)
+        self.assertEqual(run_word("%s = OpIAddCarry %umul %c1 %c2\n%res = OpCompositeExtract %uint %s 1\n"), 0)
+
     def test_float_mul_ord_equal_findsmsb_sin(self):
         self.assertEqual(run_word("%x = OpFMul %float %f2 %f3\n%res = OpBitcast %uint %x\n"), 0x40C00000)
         self.assertEqual(run_word("%b = OpFOrdEqual %bool %f2 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)

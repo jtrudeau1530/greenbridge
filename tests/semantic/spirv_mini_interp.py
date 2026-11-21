@@ -407,6 +407,9 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 x, y = _s32(x), _s32(y)
             p = (x * y) & 0xFFFFFFFFFFFFFFFF
             values[res] = (p & MASK, p >> 32)
+        elif op == "OpIAddCarry":
+            x, y = val(a[1]) & MASK, val(a[2]) & MASK
+            values[res] = ((x + y) & MASK, (x + y) >> 32)
         elif op == "OpIEqual":
             values[res] = val(a[1]) == val(a[2])
         elif op == "OpINotEqual":
