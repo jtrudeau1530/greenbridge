@@ -10,6 +10,7 @@
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_bindless.h"
+#include "../src/resource_tiling.h"
 
 #include <algorithm>
 #include <atomic>
@@ -524,7 +525,18 @@ public:
 
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
 
+    // A reserved resource is a committed one underneath (docs/d3d12_vulkan.md section 4.2); it reports the layout it
+    // was created with and has no heap of its own.
+    void make_reserved(D3D12_TEXTURE_LAYOUT layout) {
+        reserved_ = true;
+        desc_.Layout = layout;
+    }
+    bool reserved() const { return reserved_; }
+
+    // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
+    // runtime).
     HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) override {
+        if (reserved_) return E_INVALIDARG;
         if (properties) *properties = heap_;
         if (flags) *flags = heap_flags_;
         return S_OK;
@@ -556,6 +568,7 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects_ = 0;
     std::uint64_t image_address_ = 0;
+    bool reserved_ = false;
 };
 
 // A view of a texture as Create*View describes it, before the resource's own shape is applied.
@@ -1064,6 +1077,67 @@ public:
         return hand_out(resource, riid, out);
     }
 
+    // Reserved (tiled) resources, for the first boot (docs/d3d12_vulkan.md section 4.2): the whole resource is
+    // reserved linearly and backed at creation, as a committed resource on a default heap would be. Tile mappings
+    // are not emulated (queue UpdateTileMappings and CopyTileMappings log and do nothing), so every tile reads and
+    // writes its own memory; unmapped tiles start zeroed, as D3D12 tier 2 reads them. The rules for the description
+    // are D3D12's: buffers are ROW_MAJOR, textures 64KB_UNDEFINED_SWIZZLE in a format with a tile shape
+    // (64KB_STANDARD_SWIZZLE needs StandardSwizzle64KBSupported, which CheckFeatureSupport reports as FALSE). The
+    // Xbox tiled layout word 0x101 (slot 76, section 4.2) is accepted as 64KB_UNDEFINED_SWIZZLE; that the console
+    // uses it for reserved resources too is an assumption.
+    HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                                     const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+        return create_reserved(desc, riid, out);
+    }
+
+    // Device4. Protected sessions are not supported.
+    HRESULT STDMETHODCALLTYPE CreateReservedResource1(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                                      const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession* session,
+                                                      REFIID riid, void** out) override {
+        if (session) {
+            if (out) *out = nullptr;
+            log_once("CreateReservedResource1 with a protected session not supported:", 1);
+            return E_NOTIMPL;
+        }
+        return create_reserved(desc, riid, out);
+    }
+
+    // Device10: an initial layout instead of a state (resources start in their first use's layout here anyway).
+    // Castable formats are not used: typeless resources are already mutable-format images.
+    HRESULT STDMETHODCALLTYPE CreateReservedResource2(const D3D12_RESOURCE_DESC* desc, D3D12_BARRIER_LAYOUT,
+                                                      const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession* session,
+                                                      UINT32 castable_formats, const DXGI_FORMAT*, REFIID riid,
+                                                      void** out) override {
+        if (castable_formats) log_once("CreateReservedResource2: castable formats ignored, count", int(castable_formats));
+        return CreateReservedResource1(desc, D3D12_RESOURCE_STATE_COMMON, nullptr, session, riid, out);
+    }
+
+    // Tiling of a reserved resource (src/resource_tiling.h). Anything else, as on the PC runtime, has no tiles:
+    // every output is zero and no subresource tiling is written.
+    void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource* resource, UINT* total, D3D12_PACKED_MIP_INFO* packed,
+                                             D3D12_TILE_SHAPE* shape, UINT* count, UINT first,
+                                             D3D12_SUBRESOURCE_TILING* tilings) override {
+        leonida::ResourceTiling tiling;
+        Resource* r = Resource::from<Resource>(resource);
+        const bool ok = r && r->reserved() && resource_tiling(r->GetDesc(), tiling);
+        if (total) *total = ok ? tiling.total_tiles : 0;
+        if (packed)
+            *packed = ok ? D3D12_PACKED_MIP_INFO{UINT8(tiling.standard_mips), UINT8(tiling.packed_mips),
+                                                 tiling.packed_tiles, tiling.packed_start}
+                         : D3D12_PACKED_MIP_INFO{};
+        if (shape)
+            *shape = ok ? D3D12_TILE_SHAPE{tiling.shape.width, tiling.shape.height, tiling.shape.depth}
+                        : D3D12_TILE_SHAPE{};
+        if (!count) return;
+        const UINT available = ok && first < tiling.subresources.size() ? UINT(tiling.subresources.size() - first) : 0;
+        const UINT n = tilings ? std::min(*count, available) : 0;
+        for (UINT i = 0; i < n; ++i) {
+            const leonida::SubresourceTiling& s = tiling.subresources[first + i];
+            tilings[i] = {s.width, UINT16(s.height), UINT16(s.depth), s.start};
+        }
+        *count = n;
+    }
+
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
     // depth-stencil), subresources placed at D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, block-compressed sizes rounded up to whole blocks, depth-stencil
     // formats as two planes. d3d12_vulkan_device_test compares every output with the PC runtime's.
@@ -1386,6 +1460,69 @@ private:
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(), storage);
+    }
+
+    // D3D12's layout rules for a reserved resource, then a committed resource on a default heap under it.
+    HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, REFIID riid, void** out) {
+        if (out) *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        constexpr auto xbox_tiled = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+        D3D12_RESOURCE_DESC backing = *desc;
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+        } else {
+            if (desc->Layout == xbox_tiled) {
+                log_once("reserved resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
+                         desc->Dimension);
+            } else if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
+                return E_INVALIDARG;  // 64KB_STANDARD_SWIZZLE too: CheckFeatureSupport reports it unsupported
+            }
+            backing.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            leonida::ResourceTiling tiling;
+            backing.MipLevels = std::max<UINT16>(desc->MipLevels, 1);  // any count: only the format is checked here
+            if (!resource_tiling(backing, tiling)) {
+                log_once("reserved texture format has no tile shape:", desc->Format);
+                return E_INVALIDARG;
+            }
+            backing.MipLevels = desc->MipLevels;
+        }
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        ID3D12Resource* resource = nullptr;
+        HRESULT hr = CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &backing, D3D12_RESOURCE_STATE_COMMON,
+                                             nullptr, IID_PPV_ARGS(&resource));
+        if (FAILED(hr)) return hr;
+        Resource::from<Resource>(resource)->make_reserved(desc->Layout);
+        if (!out) {  // a capability check: D3D12 allows a null output
+            resource->Release();
+            return S_FALSE;
+        }
+        hr = resource->QueryInterface(riid, out);
+        resource->Release();
+        return hr;
+    }
+
+    // The tiling of a reserved resource's description; false for formats without a tile shape (three- and
+    // twelve-byte texels, two-plane depth-stencil).
+    static bool resource_tiling(const D3D12_RESOURCE_DESC& desc, leonida::ResourceTiling& out) {
+        leonida::TilingDesc tiling{};
+        tiling.width = desc.Width;
+        tiling.height = desc.Height;
+        tiling.depth_or_layers = desc.DepthOrArraySize;
+        tiling.mips = desc.MipLevels;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            tiling.kind = leonida::TiledKind::buffer;
+            return leonida::resource_tiling(tiling, out);
+        }
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            return false;
+        tiling.kind = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? leonida::TiledKind::texture3d
+                                                                           : leonida::TiledKind::texture2d;
+        const Format format = vulkan_format(desc.Format, false);
+        if (!format.format || (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) return false;
+        const leonida::BlockFormat block = leonida::block_format(format.format, format.aspects);
+        tiling.element_bytes = block.bytes;
+        tiling.block = block.block;
+        return leonida::resource_tiling(tiling, out);
     }
 
     DeviceState state_;
