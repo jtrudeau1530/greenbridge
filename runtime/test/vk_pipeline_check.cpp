@@ -6,6 +6,7 @@
 // so a first boot doesn't compile these again.
 #include "vulkan_loader.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -16,11 +17,16 @@
 
 static PFN_vkGetInstanceProcAddr gipa;
 
-// Minimal reader for the index: {"name": {"stage": "cs", ...}, ...}. Only names and stages are needed.
-static std::map<std::string, std::string> read_index(const std::string& path) {
+// Minimal reader for the index: {"name": {"stage": "cs", "subgroup_size": 64, ...}, ...}.
+struct ShaderMeta {
+    std::string stage;
+    uint32_t subgroup_size = 0;
+};
+
+static std::map<std::string, ShaderMeta> read_index(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     std::string s((std::istreambuf_iterator<char>(f)), {});
-    std::map<std::string, std::string> out;
+    std::map<std::string, ShaderMeta> out;
     size_t i = 0;
     int depth = 0;
     std::string key;
@@ -35,8 +41,21 @@ static std::map<std::string, std::string> read_index(const std::string& path) {
             if (depth == 1) { key = tok; continue; }
             if (depth == 2 && tok == "stage") {
                 size_t a = s.find('"', i), b = s.find('"', a + 1);
-                out[key] = s.substr(a + 1, b - a - 1);
+                out[key].stage = s.substr(a + 1, b - a - 1);
                 i = b + 1;
+            } else if (depth == 2 && tok == "subgroup_size") {
+                size_t a = s.find(':', i);
+                if (a != std::string::npos) {
+                    a++;
+                    while (a < s.size() && (s[a] == ' ' || s[a] == '\t')) a++;
+                    uint32_t val = 0;
+                    while (a < s.size() && s[a] >= '0' && s[a] <= '9') {
+                        val = val * 10 + uint32_t(s[a] - '0');
+                        a++;
+                    }
+                    out[key].subgroup_size = val;
+                    i = a;
+                }
             }
             continue;
         }
@@ -61,6 +80,7 @@ int main(int argc, char** argv) {
     ici.pApplicationInfo = &app;
     if (vkCreateInstance(&ici, nullptr, &inst)) return 1;
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
+    LOADI(vkGetPhysicalDeviceProperties2);
     LOADI(vkGetDeviceProcAddr); LOADI(vkEnumerateDeviceExtensionProperties); LOADI(vkGetPhysicalDeviceFeatures2);
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
@@ -72,7 +92,11 @@ int main(int argc, char** argv) {
         if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
-    std::fprintf(stderr, "device: %s\n", props.deviceName);
+    VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2.pNext = &sgProps;
+    vkGetPhysicalDeviceProperties2(pd, &props2);
+    std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
     uint32_t en = 0;
     vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr);
     std::vector<VkExtensionProperties> exts(en);
@@ -138,8 +162,11 @@ int main(int argc, char** argv) {
     VkPipelineCache cache; vkCreatePipelineCache(dev, &pci, nullptr, &cache);
 
     std::map<std::string, uint32_t> modules_ok, modules_bad, pipes_ok, pipes_bad;
-    uint32_t done = 0;
-    for (auto& [name, stage] : index) {
+    uint32_t cs_w32_ok = 0, cs_w32_bad = 0, cs_w64_ok = 0, cs_w64_bad = 0;
+    uint32_t done = 0, cs_done = 0;
+    const auto t_start = std::chrono::steady_clock::now();
+    for (auto& [name, meta] : index) {
+        const std::string& stage = meta.stage;
         std::ifstream f(dir + "/" + name + ".spv", std::ios::binary);
         std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
         if (code.empty()) { modules_bad[stage]++; continue; }
@@ -149,23 +176,47 @@ int main(int argc, char** argv) {
         if (vkCreateShaderModule(dev, &smi, nullptr, &sm)) { modules_bad[stage]++; std::printf("MODULE FAIL %s\n", name.c_str()); continue; }
         modules_ok[stage]++;
         if (stage == "cs") {
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+            reqSg.requiredSubgroupSize = meta.subgroup_size;
             VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
+            if (f13.subgroupSizeControl &&
+                meta.subgroup_size >= sgProps.minSubgroupSize &&
+                meta.subgroup_size <= sgProps.maxSubgroupSize &&
+                (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+                cpi.stage.pNext = &reqSg;
+            }
             cpi.layout = pl;
             VkPipeline p;
-            if (VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p)) {
-                pipes_bad[stage]++; std::printf("PIPELINE FAIL %s (%d)\n", name.c_str(), r);
+            const auto t0 = std::chrono::steady_clock::now();
+            VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (sec > 2.0) std::fprintf(stderr, "  SLOW CS %s (%.2fs)\n", name.c_str(), sec);
+            if (r) {
+                pipes_bad[stage]++;
+                if (meta.subgroup_size == 64) cs_w64_bad++; else cs_w32_bad++;
+                std::printf("PIPELINE FAIL %s (w%u, %d)\n", name.c_str(), meta.subgroup_size, r);
             } else {
-                pipes_ok[stage]++; vkDestroyPipeline(dev, p, nullptr);
+                pipes_ok[stage]++;
+                if (meta.subgroup_size == 64) cs_w64_ok++; else cs_w32_ok++;
+                vkDestroyPipeline(dev, p, nullptr);
+            }
+            if (++cs_done % 50 == 0) {
+                double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                std::fprintf(stderr, "  cs %u (%.1fs elapsed)\n", cs_done, el);
             }
         }
         vkDestroyShaderModule(dev, sm, nullptr);
         if (++done % 2000 == 0) std::fprintf(stderr, "  %u/%zu\n", done, index.size());
     }
-    for (auto& [st, c] : modules_ok) std::printf("%s: %u modules ok, %u failed", st.c_str(), c, modules_bad[st]);
-    std::printf("\n");
-    for (auto& [st, c] : pipes_ok) std::printf("%s pipelines: %u ok, %u failed\n", st.c_str(), c, pipes_bad[st]);
+    for (auto& [st, c] : modules_ok) std::printf("%s: %u modules ok, %u failed\n", st.c_str(), c, modules_bad[st]);
+    if (cs_done > 0) {
+        std::printf("cs pipelines: %u ok, %u failed\n", pipes_ok["cs"], pipes_bad["cs"]);
+        std::printf("  cs wave32: %u ok, %u failed; wave64: %u ok, %u failed\n",
+                    cs_w32_ok, cs_w32_bad, cs_w64_ok, cs_w64_bad);
+    }
     if (argc > 2) {
         size_t sz = 0;
         vkGetPipelineCacheData(dev, cache, &sz, nullptr);
