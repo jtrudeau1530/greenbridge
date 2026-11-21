@@ -283,5 +283,69 @@ class PeInspectTest(unittest.TestCase):
         self.assertIn("not a PE image", err.getvalue())
 
 
+class TruncatedImageTest(unittest.TestCase):
+    """A file cut off inside a header or table is a bad image, not a struct.error that stops the run."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def write(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def cut_inside(self, full: bytes, index: int, into: int) -> bytes:
+        """The image cut `into` bytes after the start of data directory `index`."""
+        rva, _size = pe_inspect.PeImage(full).directory(index)
+        return full[:pe_inspect.PeImage(full).offset(rva) + into]
+
+    def test_each_table_cut_short_is_a_pe_format_error(self):
+        for is64 in (True, False):
+            full = build_image(is64=is64)
+            cases = {
+                "optional header": full[:0x58 + 2 + 16],     # magic present, AddressOfEntryPoint cut off
+                "export directory": self.cut_inside(full, pe_inspect.DIR_EXPORT, 10),
+                "tls directory": self.cut_inside(full, pe_inspect.DIR_TLS, 20 if is64 else 10),
+            }
+            for what, data in cases.items():
+                with self.subTest(is64=is64, cut=what):
+                    path = self.write("cut.dll", data)
+                    with self.assertRaises(pe_inspect.PeFormatError):
+                        pe_inspect.inspect(path, None)
+
+    def test_every_cut_length_gives_a_report_or_a_pe_format_error(self):
+        for is64 in (True, False):
+            full = build_image(is64=is64)
+            for n in range(0, len(full), 16):
+                with self.subTest(is64=is64, length=n):
+                    path = self.write("sweep.dll", full[:n])
+                    try:
+                        pe_inspect.inspect(path, None)
+                    except pe_inspect.PeFormatError:
+                        pass
+
+    def test_cli_reports_a_truncated_file_and_keeps_going(self):
+        cut = self.write("cut.dll", build_image()[:0x58 + 2 + 16])
+        good = self.write("good.dll", build_image())
+        out = os.path.join(self.dir, "reports")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([cut, good, "--out", out]), 1)
+        self.assertIn("cut.dll: not a PE image (truncated optional header)", err.getvalue())
+        self.assertEqual(sorted(os.listdir(out)), ["good.json", "good.md"])
+
+    def test_export_counts_past_the_table_cap_do_not_run_away(self):
+        full = bytearray(build_image())
+        img = pe_inspect.PeImage(bytes(full))
+        at = img.offset(img.directory(pe_inspect.DIR_EXPORT)[0])
+        struct.pack_into("<I", full, at + 20, 0xFFFFFFFF)  # NumberOfFunctions
+        path = self.write("huge_exports.dll", bytes(full))
+        exports = pe_inspect.inspect(path, None)["exports"]
+        self.assertLessEqual(len(exports), pe_inspect.MAX_ENTRIES + 2)
+
+
 if __name__ == "__main__":
     unittest.main()

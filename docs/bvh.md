@@ -67,25 +67,88 @@ inflated bytes belong to the BVH family. The archive is not a mixed asset pack.
 
 **Verified** on 271,627 complete streams and 10 chunked streams (271,637/271,637):
 
-* 32-bit tag `0x81020006` at offset `0x100`.
-* `u32@0x104` = size of the node area in 64-byte units.
-* `u32@0x20` = `0x140 + 64 * size_in_64b_units` (end of the declared node area).
-* `u32@0x28` = `u32@0x20 - 0x100` (a 256-byte tail table inside the node area).
-* `0x140` is the first 64-byte node; the declared node area ends at `u32@0x20`.
-* `0x110` holds six floats consistent with a 3D AABB (`min xyz`, `max xyz`). In `core_bvh4.rpf` all 271,627
-  complete streams are ordered (`min <= max` on every axis); in `shared_minigame000_bvh4.rpf` 1,184 of 1,237 are
-  ordered and 53 are not (sentinel or non-finite values).
-* `0x108` is a hash-like 32-bit value; `0x10C` is a small varying word.
-* `0x130`/`0x134`/`0x138` are an offset, an even byte size and a signed base. The pointed range is inside the
-  stream and is often a near-monotonic `u16` sequence (274/400 sampled streams non-zero; 127/400 monotonic). This
-  is consistent with a primitive/index remap table, not with a vertex buffer, but the exact role is **Open**.
-* The 256-byte tail at `u32@0x28` contains `u32` tables, including groups of four references that begin with
-  `0x04000000` in the sample. The node/table encoding was not decoded.
+* The 64-byte `XboxBvh4Header` begins at payload offset `0x100`. Its `flags` word is `0x81020006` in these
+  packs.
+* `u32@0x20` = `0x140 + 64 * totalSizeIn64BNodes` (the declared end of the 64-byte node address space).
+* `u32@0x28` = `u32@0x20 - 0x100`. These two words sit before the header and are not header fields.
+* `0x110` holds six floats for `sceneBounds` (`min xyz`, `max xyz`). In `core_bvh4.rpf` all 271,627 complete
+  streams are ordered (`min <= max` on every axis); in `shared_minigame000_bvh4.rpf` 1,184 of 1,237 are ordered
+  and 53 are not (sentinel or non-finite values).
+
+The field names and offsets now match the public `XboxBvh4Header` used by the Xbox DXR traversal shaders:
+
+| header offset | field | sample value |
+|---|---|---:|
+| `0x100` | `flags` | `0x81020006` |
+| `0x104` | `totalSizeIn64BNodes` | 9,943 |
+| `0x108` | `crc32` | `0xeab7667e` |
+| `0x10c` | `numElements` | 5,447 |
+| `0x110` | `sceneBounds.min` (3 floats) | `-47.416, -25.742, -5.624` |
+| `0x11c` | `sceneBounds.max` (3 floats) | `47.416, 25.742, 5.624` |
+| `0x128` | `offsetToNodes` | `0x59480` |
+| `0x12c` | `offsetToPrimRemap` | 0 |
+| `0x130` | `rootNodePtr` | `0x136ac` |
+| `0x134` | `offsetToElements` | `0x4280` |
+| `0x138` | `offsetToParents` | `0xffffab40` |
+| `0x13c` | `compressionParams` | `0x808c8a89` |
+
+The offsets are relative to the header at `0x100`, not to the start of the payload. In the sample,
+`offsetToNodes` therefore addresses `0x59580` and `offsetToElements` addresses `0x4380`. The node and element
+regions are not necessarily the simple `0x140` onward array that the first indexer assumed. `offsetToParents`
+is a raw `u32`; its signed/relative interpretation is still **Open**.
+
+The `flags` word has version `6` in its low 16 bits. It also sets `0x80000000` (bottom level), `0x00020000`
+(offline) and `0x01000000` (dehydrated). It does not set `0x00010000` (compressed). The sample is therefore a
+bottom-level, offline, dehydrated BVH, not a ready-to-traverse runtime tree.
 
 The name "BVH4" is the builder's own: `XboxBvh4Header`, `ConstructBVH4`, `RefitBVH4`, `PT_ConstructBVH4` and
 `totalSizeIn64BNodes` appear in `XboxBvhBuilder.dll`. The measured field at `0x104` is a count of 64-byte units
 whose product plus `0x140` lands exactly on the end pointer in 271,627/271,627 complete streams. That agrees with
-the builder's naming but does not prove that `0x81020006` is the builder's header tag.
+the builder's naming.
+
+#### Node pointers and the runtime node records
+
+A `rootNodePtr` or child pointer packs the node type in the low three bits and a 64-byte unit index in the high
+29 bits:
+
+```
+type = ptr & 7
+node_address = header + (ptr >> 3) * 64
+```
+
+The type values are `0..3` = `TRI0..TRI3`, `4` = `BOX16`, `5` = `BOX32`, `6` = `INSTANCE`, `7` =
+`AABB_GEOMETRY`. `0xffffffff` is the invalid pointer. A `BOX32` node occupies 128 bytes, so it consumes two
+64-byte units; all other node records occupy 64 bytes.
+
+The runtime records, which are what the traversal shaders read, are:
+
+| record | size | layout |
+|---|---:|---|
+| `Node16` | 64 | four `u32` children at `+0`; four 12-byte half-float bounds at `+16` |
+| `Node32` | 128 | four `u32` children at `+0`; four 24-byte float bounds at `+16`; four padding words at `+112` |
+| `Leaf` | 64 | four `float3` vertices at `+0`; `GeometryIndexAndFlags` at `+48`; `BasePrimitiveIndex` at `+52`; `PrimitiveIndex2` at `+56`; `baryRemap` at `+60` |
+
+The `Node16` bounds are six IEEE half values packed into three `u32` words. The shader expands them with
+`XdxrDecompressBox16`; the first word holds `min.x`/`min.y`, the second `min.z`/`max.x`, and the third
+`max.y`/`max.z`.
+
+For the sample, `rootNodePtr = 0x136ac` decodes to index 9941, type `BOX16`, at payload address `0x9b640`.
+That record begins `0x04000000, 0x13694, 0x1369c, 0x117b5`, so its first child is not a valid runtime
+pointer. This is the dehydrated form, not a runtime `Node16`.
+
+#### Packed dehydrated forms
+
+The same public headers define the packed records used before rehydration:
+
+| record | size | layout |
+|---|---:|---|
+| `NodePacked` | 16 | four `u32` children |
+| `LeafPacked` | 12 | `GeometryIndexAndFlags`, `BasePrimitiveIndex`, `PrimitiveIndex2AndBaryRemap` |
+| `BVVDHeader` | 8 | `variantNodeIndex` plus a six-bit mask and two-bit child selector |
+
+The dehydrated stream is not a contiguous array of runtime `Node16` records. Its record order, the `BVVDHeader`
+table and the exact traversal of `NodePacked`/`LeafPacked` remain **Open**. A decoder must not feed the sample
+root to the runtime traversal path until that packing is understood.
 
 ### 3.2 Instance descriptor (208 bytes)
 
@@ -184,21 +247,23 @@ into three 64 KiB/26 KiB chunks. These list the per-tile BVH packs; they are the
 3. **Pair descriptor to buffer.** The 208-byte descriptor precedes its BVH chunk in stream order in
    269,106/269,106 cases. The other descriptor sizes account for 2,528 more BVH buffers; 3 more are preceded by
    other streams.
-4. **Parse the header, then stop guessing.** `0x81020006`, `n64`, end, root, AABB and the `0x130` table can be read
-   now. The 64-byte node encoding (child references, box encoding, leaf form) is still **Open** and must be
-   recovered against `XboxBvh4Header`/`ConstructBVH4` or by validation, not assumed.
+4. **Parse the header, then stop guessing.** The exact header table, node pointer encoding and runtime
+   `Node16`/`Node32`/`Leaf` records are in section 3.1. The packed dehydrated stream (`NodePacked`, `LeafPacked`,
+   `BVVDHeader`) remains **Open**; do not infer a runtime child array from the `0x140` slot space.
 5. **Skip fill.** Ignore all-zero nodes and the `0x81`/`0x94`/`0x29` repeated blocks; they are not primitives.
 6. **Do not feed these nodes to the AMD traversal.** The translator's `image_bvh_intersect_ray` path expects the
-   AMD hardware node format (256-byte base units), while these payloads use the builder's 64-byte units. A
-   converter or a rebuild is required; see `docs/d3d12_vulkan.md` §4.8.
-7. **Result format.** Any decoder should emit world-space bounds plus primitive references, and validate counts
-   against the header (`0x140 + 64*n == end`, ordered AABB) before use.
+   AMD hardware node format (256-byte base units), while these payloads use the builder's 64-byte units. The
+   sample is also dehydrated, so its root is not a runtime child array. A rehydrator, converter or rebuild is
+   required; see `docs/d3d12_vulkan.md` §4.8.
+7. **Result format.** Any decoder should emit world-space bounds plus primitive references, and validate the
+   wrapper (`0x140 + 64*n == end`, `u32@0x28 == end - 0x100`) and ordered AABB before use.
 
 ## 7. Tooling
 
 `tools/bvh_index.py` (standard library only) scans an RPF9 archive or a directory of `.rpf`/`.bin` payloads and
-writes JSON and/or CSV with offset, stored size, inflated size, kind, signature, node count, root offset, declared
-bytes, bounds, descriptor key/transform and fill counts. It reads only headers and emits no payload bytes.
+writes JSON and/or CSV with offset, stored size, inflated size, kind, signature, node count, tail offset, the
+`XboxBvh4Header` fields, root pointer/index/type, declared bytes, bounds, descriptor key/transform and fill
+counts. It reads only headers and emits no payload bytes.
 
 ```powershell
 python -I tools/bvh_index.py <archive.rpf> --out index.json --csv index.csv
@@ -211,10 +276,11 @@ the end of the archive, stops the tool with a one-line error and exit code 2. An
 than its 8-byte header, has no streams. In directory mode an archive that cannot be read is reported on stderr as
 `skipped` and the other archives are still indexed.
 
-The `bvh4` signature is reported only when the tag, the `0x140 + 64*n == end` formula and the `root == end - 0x100`
-relation all hold; a larger payload whose declared end is past the chunk but which is a 64 KiB multiple is reported
-as `bvh4-chunk`. The synthetic tests cover the tag, the formula rejection, the chunk case, the 208-byte template,
-the other descriptor template, XML and XML fragments, the two-stream advance bug and CSV/JSON output.
+The `bvh4` signature is reported only when `flags == 0x81020006`, the `0x140 + 64*n == end` formula and the
+`u32@0x28 == end - 0x100` wrapper relation all hold; a larger payload whose declared end is past the chunk but
+which is a 64 KiB multiple is reported as `bvh4-chunk`. The synthetic tests cover the tag, the formula rejection,
+the exact header fields and root pointer/type, the chunk case, the 208-byte template, the other descriptor
+template, XML and XML fragments, the two-stream advance bug and CSV/JSON output.
 
 Measured with the tool on `shared_minigame000_bvh4.rpf`: 2,560 streams, 59,142,787 stored, 970,044,012 inflated,
 1,237 complete `bvh4`, 1,233 `instance208`, 85 descriptors, 5 XML. That matches the carver summary exactly.

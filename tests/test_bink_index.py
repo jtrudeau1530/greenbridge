@@ -2,8 +2,10 @@
 
     python -I tests/test_bink_index.py
 """
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import os
 import struct
@@ -114,6 +116,37 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(doc["summary"]["streams"], 1)
         self.assertEqual(doc["streams"][0]["width"], 320)
         self.assertNotIn("decodes", doc["streams"][0])
+
+
+class TestCommandLine(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "one.bk2")
+        with open(self.path, "wb") as fh:
+            fh.write(make_stream(frames=7))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_csv_on_stdout_has_one_line_end_per_row(self):
+        # A text stream that writes "\n" as "\r\n", as Windows' stdout does, on any platform.
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(bink.main([self.path]), 0)
+        out.flush()
+        data = raw.getvalue()
+        self.assertNotIn(b"\r\r\n", data)
+        rows = list(csv.reader(io.StringIO(data.decode("utf-8"), newline="")))
+        self.assertEqual(len(rows), 2)   # header and the one stream, no blank rows
+        self.assertEqual(rows[0][:len(bink.BASE_FIELDS)], bink.BASE_FIELDS)
+
+    def test_missing_target_is_an_error_not_a_traceback(self):
+        missing = os.path.join(self.tmp.name, "nonexistent.bk2")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([missing]), 2)
+        self.assertIn("no such file or directory", err.getvalue())
 
 
 if __name__ == "__main__":

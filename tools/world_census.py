@@ -495,6 +495,8 @@ def _audit_gap(m, a, b, result, allow_zlib):
 
 
 def _expected_shards(start, end, shard_size):
+    if shard_size < 1:  # pos would never advance, and the list would grow until memory ran out
+        raise ValueError(f"shard_size must be at least 1, not {shard_size}")
     out = []
     index = 0
     pos = start
@@ -626,12 +628,23 @@ def summarize(archive, outdir, start, end, shard_size, data_start):
     return summary
 
 
+def positive_int(text):
+    """--shard-size 0 or less never finished planning shards, and --jobs 0 made ProcessPoolExecutor raise."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
     ap.add_argument("--out", default=os.path.join("work", "world", "census"))
-    ap.add_argument("--shard-size", type=int, default=2 << 30)
-    ap.add_argument("--jobs", type=int, default=max(1, min(12, (os.cpu_count() or 2) // 2)))
+    ap.add_argument("--shard-size", type=positive_int, default=2 << 30)
+    ap.add_argument("--jobs", type=positive_int, default=max(1, min(12, (os.cpu_count() or 2) // 2)))
     ap.add_argument("--start", type=int)
     ap.add_argument("--limit", type=int)
     ap.add_argument("--resume", action="store_true")
