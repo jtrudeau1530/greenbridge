@@ -45,7 +45,7 @@ work on booting can start as soon as one is available to a developer.
 | Shader translator checked on a real GPU | ⚠️ Vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches and compute (LDS, barriers, buffer stores) checked on one GPU |
 | Models (OBJ with real names, UVs, material references) | ✅ Exported. Not all layouts are decoded yet |
 | Texture dictionaries and world texture pools (DDS) | ✅ Exported. Some pool entries (BCPack) are skipped |
-| Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Decoding to WAV is not done yet |
+| Audio banks (AWC: Opus, XMA2) | ✅ Exported whole: Opus repackaged as Ogg Opus, PCM as WAV, XMA2 decoded with ffmpeg. `--wav` also writes 16-bit PCM WAV |
 | PE loader and import shims | ⚠️ Skeleton. Untested against the real executable |
 | Xbox D3D12 → Vulkan | ❌ Not started |
 | Booting, story mode, anything playable | ❌ No |
@@ -83,6 +83,7 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
   `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see [docs/design.md](docs/design.md#disassembling-shaders)).
   On Linux, `llvm-mc` on PATH is enough.
 - Visual Studio 2022 with **Desktop development with C++**, for the runtime stage.
+- [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
 **From a terminal**, with the same behaviour and more control:
 
@@ -91,11 +92,15 @@ python -I make_game.py --find                          # list the copies found o
 python -I make_game.py --check                         # check your copy, build nothing
 python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # only some stages
+python -I make_game.py --game "D:\path\to\your\package" --wav   # also decode Opus to PCM WAV (large)
 ```
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
 on `--jobs` processes (half the CPU threads by default).
+
+`--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
+Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.
 
 ## How it works
 
@@ -116,7 +121,6 @@ The biggest open pieces:
 
 - **Compute, mesh and geometry shaders**: their per-stage system-value register layout.
 - **Xbox D3D12 → Vulkan**: the `d3d12_xs` command list and descriptor heap model.
-- **Audio decoding**: Opus/XMA2 streams in AWC banks to PCM.
 - **Model layouts** the decoder rejects today.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted assets or generated shaders to issues or
