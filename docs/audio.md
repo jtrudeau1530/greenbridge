@@ -154,6 +154,10 @@ a dry music bed or like pure audience noise; the in-game result is the mix.
 Use the bank name, stream count, duration and channel count together before deciding what a bank is. Station
 programming is assembled by the game from many assets, so a lone AWC is rarely a complete station.
 
+The music/radio **config table** is a separate structure: 1,589 records with exact durations, AWC stream ids,
+contiguous station grouping and no per-track start offsets. See [audio_config.md](audio_config.md) for the record
+layout and the station-content references.
+
 ## Never commit or share extracted audio
 
 Extracted banks, Ogg Opus, WAV, XMA2 and the manifest are game data. Keep them in the work folder, never in the
