@@ -463,10 +463,13 @@ def run_suite(a, work: str) -> int:
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
-            rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", "--require-wave64"], env=cs_env)
-            if rc == 77:
+            # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
+            emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
+            args = [] if emulated else ["--require-wave64"]
+            rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", *args], env=cs_env)
+            if not emulated and rc == 77:
                 results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
-            elif rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
+            elif not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
                 results.append((name, False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"))
             else:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
