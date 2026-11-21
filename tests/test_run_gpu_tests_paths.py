@@ -137,19 +137,20 @@ class BuildConfigurations(unittest.TestCase):
             self.assertIsNone(run_gpu_tests.find_test_programs(str(build), ".exe"))
 
     def test_missing_program_error_lists_per_directory_files(self):
+        ext = ".exe" if os.name == "nt" else ""
         with tempfile.TemporaryDirectory() as tmp:
             build = Path(tmp) / "build output"
             rel = build / "RelWithDebInfo"
             rel.mkdir(parents=True)
-            (rel / "vk_compute_test.exe").touch()
-            (rel / "vk_store_test.exe").touch()
+            (rel / ("vk_compute_test" + ext)).touch()
+            (rel / ("vk_store_test" + ext)).touch()
             with (patch.object(sys, "argv", ["run_gpu_tests.py", "--build", str(build)]),
                   self.assertRaises(SystemExit) as caught):
                 run_gpu_tests.main()
             message = str(caught.exception)
             self.assertIn(str(build), message)
             self.assertIn(str(rel), message)
-            self.assertIn("vk_harness.exe", message)
+            self.assertIn("vk_harness" + ext, message)
             self.assertIn("--config RelWithDebInfo", message)
             self.assertIn("--target vk_compute_test vk_store_test vk_harness", message)
 
