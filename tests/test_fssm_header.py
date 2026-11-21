@@ -39,6 +39,29 @@ def record(semantic, mask, index, slot, flags, kind=6):
     return (kind, semantic, mask, index, 0, 0, slot, flags)
 
 
+def tail_blob(records=(), name=b"shader", header=3, declared_end=None, tail_at=0x120,
+              filler=0xBF9F0000, pad_word=0, name_length=None):
+    """Build an FSSM blob with a post-code binding table at tail_at."""
+    data = bytearray(0x400)
+    data[0:4] = b"FSSM"
+    struct.pack_into("<Q", data, 0xC0, 0x100)
+    struct.pack_into("<Q", data, 0xC8, 0x20)
+    struct.pack_into("<Q", data, 0xE8, tail_at if declared_end is None else declared_end)
+    for i in range(4):
+        struct.pack_into("<I", data, tail_at + 4 * i, filler)
+    struct.pack_into("<I", data, tail_at + 16, header)
+    offset = tail_at + 24
+    for words in records:
+        struct.pack_into("<5I", data, offset, *words)
+        offset += 20
+    struct.pack_into("<I", data, offset, 0xFFFFFFFF)
+    struct.pack_into("<I", data, offset + 4, 0)
+    struct.pack_into("<H", data, offset + 8, pad_word)
+    struct.pack_into("<H", data, offset + 10, len(name) if name_length is None else name_length)
+    data[offset + 12:offset + 12 + len(name)] = name
+    return bytes(data)
+
+
 class PixelInputTest(unittest.TestCase):
     def test_two_records_keep_their_fields(self):
         b = blob([record(4, 0x7, 1, 9, 0x12), record(7, 0x3, 2, 10, 0x08)])
@@ -83,6 +106,48 @@ class DirectoryTest(unittest.TestCase):
         self.assertFalse(fssm_header.directory_ok(b"FSSM"))
 
 
+class BindingTableTest(unittest.TestCase):
+    def test_records_header_and_name(self):
+        table = fssm_header.binding_table(
+            tail_blob([(1, 2, 3, 4, 5), (6, 7, 8, 9, 10)], b"shader_ps"))
+        self.assertEqual(table["code_end"], 0x120)
+        self.assertEqual(table["header"], 3)
+        self.assertEqual(table["records"], [(1, 2, 3, 4, 5), (6, 7, 8, 9, 10)])
+        self.assertEqual(table["name"], "shader_ps")
+        self.assertEqual(table["trailing"], 0x400 - (0x120 + 24 + 40 + 12 + 9))
+
+    def test_empty_table_still_has_a_name(self):
+        table = fssm_header.binding_table(tail_blob(name=b"x"))
+        self.assertEqual(table["records"], [])
+        self.assertEqual(table["name"], "x")
+
+    def test_unset_code_end_falls_back_to_code_size(self):
+        table = fssm_header.binding_table(
+            tail_blob([(1, 2, 3, 4, 5)], b"x", declared_end=0xDEADBEEFDEADBEEF))
+        self.assertEqual(table["code_end"], 0x120)
+        self.assertEqual(table["name"], "x")
+
+    def test_missing_filler_is_rejected(self):
+        self.assertIsNone(fssm_header.binding_table(tail_blob(filler=0)))
+
+    def test_nonzero_pad_after_sentinel_is_rejected(self):
+        self.assertIsNone(fssm_header.binding_table(tail_blob(pad_word=1)))
+
+    def test_non_printable_name_is_rejected(self):
+        self.assertIsNone(fssm_header.binding_table(tail_blob(name_length=0x100)))
+
+    def test_name_past_end_is_rejected(self):
+        self.assertIsNone(fssm_header.binding_table(tail_blob(name_length=0x400)))
+
+    def test_missing_sentinel_is_rejected(self):
+        data = bytearray(tail_blob())
+        struct.pack_into("<I", data, 0x120 + 24, 1)
+        self.assertIsNone(fssm_header.binding_table(bytes(data)))
+
+    def test_short_blob_is_rejected(self):
+        self.assertIsNone(fssm_header.binding_table(b"FSSM"))
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -113,6 +178,33 @@ class CliTest(unittest.TestCase):
         doc = json.loads(p.stdout)
         self.assertEqual(doc["tally"]["ps_with_table"], 1)
         self.assertEqual(doc["tally"]["entries"], 2)
+
+
+class BindingCliTest(unittest.TestCase):
+    def test_bindings_flag_reports_the_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fssm_dir = os.path.join(tmp, "fssm")
+            os.makedirs(fssm_dir)
+            with open(os.path.join(fssm_dir, "c.fssm"), "wb") as f:
+                f.write(tail_blob([(1, 2, 3, 4, 5), (6, 7, 8, 9, 10)], b"x"))
+            p = subprocess.run([sys.executable, "-I", TOOL, fssm_dir, "--bindings"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("bindings header=3 records=2 name_len=1 trailing=", p.stdout)
+            self.assertIn("binding tables 1, records 2, tail name equals file stem 0", p.stdout)
+
+    def test_bindings_in_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fssm_dir = os.path.join(tmp, "fssm")
+            os.makedirs(fssm_dir)
+            with open(os.path.join(fssm_dir, "c.fssm"), "wb") as f:
+                f.write(tail_blob([(1, 2, 3, 4, 5)], b"x"))
+            p = subprocess.run([sys.executable, "-I", TOOL, fssm_dir, "--json", "--bindings"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            doc = json.loads(p.stdout)
+            self.assertEqual(doc["files"][0]["bindings"]["records"], 1)
+            self.assertEqual(doc["files"][0]["bindings"]["name"], "x")
 
 
 if __name__ == "__main__":
