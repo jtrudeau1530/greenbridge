@@ -65,6 +65,12 @@ D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes) {
     return desc;
 }
 
+D3D12_RESOURCE_DESC volume_desc(UINT16 mips) {
+    auto desc = texture_desc(8, 6, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, mips, 16);
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    return desc;
+}
+
 D3D12_TEXTURE_COPY_LOCATION subresource(ID3D12Resource* resource, UINT index) {
     D3D12_TEXTURE_COPY_LOCATION location{};
     location.pResource = resource;
@@ -123,6 +129,7 @@ int compare_footprints(ID3D12Device* ours) {
         UINT subresources;
     };
     const Case cases[] = {
+        {volume_desc(5), 5},
         {buffer_desc(300), 1},
         {texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, 4), 4},
@@ -298,10 +305,8 @@ int main() {
                                 D3D12_RESOURCE_STATE_COPY_SOURCE, untouched)));
         EXPECT(SUCCEEDED(create(upload_heap, buffer_desc(65536), D3D12_RESOURCE_STATE_GENERIC_READ, upload)));
         EXPECT(SUCCEEDED(create(readback_heap, buffer_desc(65536), D3D12_RESOURCE_STATE_COPY_DEST, readback)));
-        D3D12_RESOURCE_DESC volume_desc =
-            texture_desc(small_size, small_size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
-        volume_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        EXPECT(create(default_heap, volume_desc, D3D12_RESOURCE_STATE_COMMON, volume) == E_NOTIMPL && !volume.p);
+        EXPECT(SUCCEEDED(create(default_heap, volume_desc(0), D3D12_RESOURCE_STATE_COPY_DEST, volume)));
+        EXPECT(volume->GetDesc().MipLevels == 5);
         EXPECT(rt_resource->GetDesc().Width == size && rt_resource->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         EXPECT(rt::d3d12::vulkan_image(rt_resource.p) && !rt::d3d12::vulkan_image(upload.p));
 
@@ -497,6 +502,54 @@ int main() {
         else
             std::printf("BC1 round trip: no textureCompressionBC, skipped\n");
         report("buffer copy", 0, down + bytes_down, up + bytes_at, 64);
+
+        // Mip 1 is 4x3x8. Move a two-row box across slices through each of the three copy paths.
+        // The footprint has a third row, so using the box height as the slice stride corrupts every later slice.
+        {
+            Ref<ID3D12Resource> clone, cropped;
+            EXPECT(SUCCEEDED(create(default_heap, volume_desc(0), D3D12_RESOURCE_STATE_COPY_DEST, clone)));
+            EXPECT(SUCCEEDED(create(default_heap, volume_desc(0), D3D12_RESOURCE_STATE_COPY_DEST, cropped)));
+            cursor = 0;
+            const auto layout = place(device.p, volume.p, 1, cursor);
+            EXPECT(layout.Footprint.Depth == 8 && layout.Footprint.Height == 3 && layout.Footprint.Width == 4);
+            const auto offset = [&](UINT x, UINT y, UINT z) {
+                return layout.Offset + (z * 3 + y) * layout.Footprint.RowPitch + x * 4;
+            };
+            for (UINT z = 0; z < 8; ++z)
+                for (UINT y = 0; y < 3; ++y)
+                    for (UINT x = 0; x < 4; ++x)
+                        std::memcpy(up + offset(x, y, z), pattern(x, z + 8 * y).data(), 4);
+            std::memset(down, 0xcd, 65536);
+            const auto in = footprint(upload.p, layout), out = footprint(readback.p, layout);
+            const auto v = subresource(volume.p, 1), c = subresource(clone.p, 1), target = subresource(cropped.p, 1);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_BOX upload_box{1, 1, 1, 4, 3, 5};
+            list->CopyTextureRegion(&v, 0, 0, 2, &in, &upload_box);
+            auto readable_volume = transition(volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &readable_volume);
+            list->CopyResource(clone.p, volume.p);
+            readable_volume = transition(clone.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &readable_volume);
+            const D3D12_BOX clone_box{0, 0, 2, 3, 2, 6};
+            list->CopyTextureRegion(&target, 1, 1, 3, &c, &clone_box);
+            readable_volume = transition(cropped.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &readable_volume);
+            const D3D12_BOX output_box{1, 1, 3, 4, 3, 7};
+            list->CopyTextureRegion(&out, 0, 0, 1, &target, &output_box);
+            EXPECT(SUCCEEDED(list->Close()));
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            const std::array<std::uint8_t, 4> untouched_bytes{0xcd, 0xcd, 0xcd, 0xcd};
+            for (UINT z = 0; z < 8; ++z)
+                for (UINT y = 0; y < 3; ++y)
+                    for (UINT x = 0; x < 4; ++x) {
+                        const auto want = (x < 3 && y < 2 && z >= 1 && z < 5)
+                            ? pattern(x + 1, z + 8 * (y + 1)) : untouched_bytes;
+                        report("volume texel", (z * 3 + y) * 4 + x, down + offset(x, y, z), want.data(), 4);
+                    }
+        }
+        volume.reset();
 
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);

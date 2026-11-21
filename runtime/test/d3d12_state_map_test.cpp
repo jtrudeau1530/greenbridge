@@ -197,6 +197,26 @@ int main() {
     CHECK(range.baseMipLevel == 2 && range.baseArrayLayer == 3);
     CHECK(!image_range(color, 12, range));  // no plane 1 on a colour image
 
+    // Validate the last byte of the last volume slice before recording an upload.
+    detail::Prepared upload{};
+    upload.binding.image = color.image;
+    upload.binding.format = VK_FORMAT_R8_UNORM;
+    upload.binding.width = 4;
+    upload.binding.height = 3;
+    upload.binding.depth = 2;
+    upload.binding.volume = true;
+    upload.source.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
+    upload.source.size = 5 * 256 + 4;
+    CopyTexture copy{};
+    copy.src = {2, true, 0, 0, 4, 3, 2, 256};
+    CHECK(detail::prepare_texture_copy(copy, upload) == ReplayResult::success);
+    --upload.source.size;
+    CHECK(detail::prepare_texture_copy(copy, upload) == ReplayResult::invalid_copy);
+    ++upload.source.size;
+    copy.z = 1;
+    CHECK(detail::prepare_texture_copy(copy, upload) == ReplayResult::invalid_copy);
+    CHECK(upload.buffer_image_copies.size() == 1);
+
     ResourceBinding depth_stencil = color;
     depth_stencil.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     depth_stencil.mip_levels = 2;

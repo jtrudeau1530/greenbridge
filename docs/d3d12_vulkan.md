@@ -1,7 +1,7 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, committed buffers and 2D textures, copies) runs behind the Xbox-ABI device proxy
+render-target and depth views, committed buffers, 2D textures and 3D texture transfers) runs behind the Xbox-ABI device proxy
 (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is set and the host PC device otherwise.
 Shader views, root signatures, PSOs, draws and the swapchain are not implemented.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
@@ -161,7 +161,7 @@ What is implemented (all of it testable without the game):
   block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not). Each
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
-  2D only: 3D boxes and depth slices are rejected as unsupported.
+  A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -189,11 +189,12 @@ What is implemented (all of it testable without the game):
     yet;
   - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D` and `TEXTURE2DARRAY`;
   - committed buffers (upload and readback heaps mapped persistently and zeroed) and 2D textures in the common
-    render-target, depth and texture formats (typeless families become mutable-format images);
+    render-target, depth and texture formats (typeless families become mutable-format images), plus non-attachment
+    3D textures with mipmapped upload, image copy and readback;
   - `CheckFeatureSupport` for feature levels (up to 12_1) and architecture. Every other query is logged and
     refused until the trace shows what the game asks (question 11);
-  - `GetCopyableFootprints` for buffers and 2D textures, including BC1–7 and the two-plane depth-stencil formats.
-    The test compares every output with the PC runtime's for 13 descriptions; that comparison found that planar
+  - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
+    The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
 
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
@@ -207,8 +208,8 @@ What is implemented (all of it testable without the game):
   the inner device, so `GetDevice` always returns the Xbox-ABI object. All D3D12 queues share one graphics
   `VkQueue` behind a submit lock (question 12).
 
-Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, 3D and array
-copies through footprints with depth, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), MSAA, 1D/3D textures and the swapchain;
+Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, volume attachment
+views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), MSAA, 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
 sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error; the GCL8
