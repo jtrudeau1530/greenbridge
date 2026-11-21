@@ -21,7 +21,7 @@
 #include <vector>
 
 #include "pe_loader.h"
-#include "../shims/process.h"
+#include "../shims/process_shim.h"
 #include "../shims/shims.h"
 
 namespace {
