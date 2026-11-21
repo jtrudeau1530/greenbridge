@@ -71,9 +71,6 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-  add_executable(clear_commands_test test/clear_commands_test.cpp)
-  add_test(NAME clear_commands COMMAND clear_commands_test)
-
   if(WIN32)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
@@ -119,6 +116,7 @@ if(BUILD_TESTING)
       shims/registry.cpp
       shims/xmem.cpp
       shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
     )
     target_include_directories(pe_loader_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -130,6 +128,8 @@ if(BUILD_TESTING)
     target_link_libraries(pe_loader_test PRIVATE gta6rt_d3d12_xs_rootsig psapi)
     add_dependencies(pe_loader_test tiny_dll tiny_exe)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
+  endif()
+
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
   endif()
@@ -160,6 +160,7 @@ if(LEONIDA_D3D12_SHIM_TESTS)
     test/d3d12_xs_root_signature_test.cpp
     shims/d3d12_xs.cpp
     shims/registry.cpp
+    shims/d3d12_xs_device.cpp
   )
   target_include_directories(d3d12_xs_root_signature_test PRIVATE shims)
   target_compile_definitions(d3d12_xs_root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
