@@ -39,7 +39,9 @@ using XboxCreateDeviceFn = HRESULT(WINAPI*)(IUnknown*, const void*, const IID*, 
 using XboxCreateResourceFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
                                               const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
                                               const D3D12_CLEAR_VALUE*, REFIID, void**);
-using XboxCreateComputePsoFn = HRESULT(WINAPI*)(void*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+// Xbox slot 62: (desc, two words, iid, out), as XboxBvhBuilder.dll calls it (zeros for the two words).
+using XboxCreateComputePsoFn = HRESULT(WINAPI*)(void*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
+                                                std::uint64_t, REFIID, void**);
 using GetCpuHandleFn = D3D12_CPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*);
 using GetGpuHandleFn = D3D12_GPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*);
 
@@ -327,7 +329,7 @@ int main() {
         auto create_pso = reinterpret_cast<XboxCreateComputePsoFn>(proxy_vtbl[62]);
         const IID iid_pso = __uuidof(ID3D12PipelineState);
         ComPtr<ID3D12PipelineState> pso;
-        hr = create_pso(device.Get(), &pso_desc, iid_pso, reinterpret_cast<void**>(pso.GetAddressOf()));
+        hr = create_pso(device.Get(), &pso_desc, 0, 0, iid_pso, reinterpret_cast<void**>(pso.GetAddressOf()));
         check(SUCCEEDED(hr) && pso != nullptr, "slot 62 creates a compute PSO via CreateComputePipelineState");
         check(rt::d3d12_xs::device_slot_hits(62) == 1, "slot 62 hit counter is 1");
         check(rt::d3d12_xs::device_slot_first_call_seen(62), "slot 62 first-call flag is set");
