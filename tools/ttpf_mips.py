@@ -554,6 +554,7 @@ def scan_pools(paths, as_json=None):
                  layout_mismatch=0, reader_full=0, reader_partial=0,
                  reader_skip_bcpack=0, whitelist_gated=0, gated_layout_ok=0,
                  gated_full_chain=0, gated_full_mips=0, gated_full_bytes=0,
+                 gated_tail_only=0, gated_by_mode={},
                  compact_partial_rows=0, compact_missing_mips=0,
                  compact_decodable_mips=0, compact_decodable_bytes=0,
                  compact_missing_standalone=0, compact_missing_tail=0,
@@ -609,12 +610,17 @@ def scan_pools(paths, as_json=None):
                 if gated:
                     total["whitelist_gated"] += 1
                     total["gated_layout_ok"] += 1
+                    key = str(d["mode"])
+                    total["gated_by_mode"][key] = total["gated_by_mode"].get(key, 0) + 1
                     if all(avail):
                         total["gated_full_chain"] += 1
                         total["gated_full_mips"] += d["mips"]
                         total["gated_full_bytes"] += sum(
                             mip["blocks_w"] * mip["blocks_h"] * layout["element_bytes"]
                             for mip in layout["mips"])
+                    elif (layout["first_tail"] < d["mips"] and
+                          all(avail[k] for k in range(layout["first_tail"], d["mips"]))):
+                        total["gated_tail_only"] += 1
                     continue
                 is_compact = compact_row(d)
                 limit = min(d["non_tail"], len(avail)) if is_compact else len(avail)

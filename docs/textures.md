@@ -217,6 +217,9 @@ is 87,524 bytes (148 + 87,376).
 
 ### What this unlocks
 
+"Decompressed" is the block-linear BC payload size (`blocks × block bytes`), not the inflated
+chunk size, which includes tile padding.
+
 | | Textures | New mips | Decompressed |
 |---|---:|---:|---:|
 | partial exports that become complete | 195,091 | 1,065,138 | 1.69 GiB |
