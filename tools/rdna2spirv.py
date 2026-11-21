@@ -6083,20 +6083,31 @@ def translate(path):
             cur = index[ins["pc"]]
         blocks[cur].append(ins)
 
-    # Successors ahead of emission, for the lane-mask analysis (the loop below works them out again as it goes,
-    # and the two are compared at the end).
-    succ = []
+    # Successors ahead of emission, for node splitting and lane-mask analysis (the loop below works them out
+    # again as it goes, and the two are compared at the end).
+    raw_edges = []
     for n, blk in enumerate(blocks):
         last = next((i for i in blk if base_op(i["op"]) == "s_endpgm" or base_op(i["op"]) in BRANCHES), None)
         fall = [n + 1] if n + 1 < len(blocks) else []
         if last is None:
-            succ.append(fall)
+            raw_edges.append(fall)
         elif base_op(last["op"]) == "s_endpgm":
-            succ.append([])
+            raw_edges.append([])
         elif base_op(last["op"]) == "s_branch":
-            succ.append([index[target(last)]])
+            raw_edges.append([index[target(last)]])
         else:
-            succ.append(list(dict.fromkeys([index[target(last)]] + fall)))
+            raw_edges.append([index[target(last)]] + fall)
+    split_edges = None
+    if STRUCTURED:
+        res = cfg_structure.split_irreducible(raw_edges)
+        if res is not None and len(res[0]) > len(blocks):
+            split_edges, orig_of = res
+            # Shallow-copy each instruction dict so lane_masks.py's id(ins) keys stay unique across clones.
+            blocks = [[dict(ins) for ins in blocks[o]] for o in orig_of]
+            for n in range(len(blocks) + 1):
+                g.cu(n)
+            raw_edges = split_edges
+    succ = [list(dict.fromkeys(e)) for e in raw_edges]
     g.park_masks((blocks, succ))
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
@@ -6117,7 +6128,8 @@ def translate(path):
                 term = ("br", op, index[target(ins)])
                 break
             g.insn(ins)
-        fall = n + 1 if n + 1 < len(blocks) else None
+        edges = raw_edges[n]
+        fall = (edges[0] if edges else None) if term is None else (edges[1] if len(edges) > 1 else None)
         # Every block leaves the number of the block to run next in %pc (len(blocks) = none: the program is over),
         # and its possible successors in g.succ for cfg_structure.
         if term is None or term[0] == "end":
@@ -6127,7 +6139,8 @@ def translate(path):
                 g.emit("OpStore %done %true")
             g.succ.append([nxt] if nxt is not None else [])
         else:
-            _, op, tgt = term
+            _, op, _ = term
+            tgt = edges[0]
             if op == "s_branch":
                 g.emit(f"OpStore %pc {g.cu(tgt)}")
                 g.succ.append([tgt])

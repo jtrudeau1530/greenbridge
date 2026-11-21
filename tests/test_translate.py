@@ -463,3 +463,91 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
     assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
+# ---- Irreducible CFG node splitting (compute shaders) ----
+
+IRREDUCIBLE_PATTERNS = {
+    # 2-entry SCC with s_branch + s_cbranch_scc0 (all 1-dword insns; offsets are relative dwords from next_pc)
+    "scc0_branch": """\
+s_mov_b32 s1, 0
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc0 3
+s_add_u32 s1, s1, 1
+s_cmp_lt_u32 s1, 4
+s_cbranch_scc0 4
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 8
+s_cbranch_scc0 1
+s_branch -7
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # 2-entry SCC with s_cbranch_scc1
+    "scc1": """\
+s_mov_b32 s1, 0
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 1
+s_cmp_ge_u32 s1, 4
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 8
+s_cbranch_scc1 -6
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # 2-entry SCC with s_cbranch_vccnz
+    "vccnz": """\
+s_mov_b32 s1, 0
+v_cmp_gt_u32_e32 vcc_lo, 4, v0
+s_cbranch_vccnz 3
+s_add_u32 s1, s1, 1
+v_cmp_gt_u32_e32 vcc_lo, 8, v0
+s_cbranch_vccnz 3
+s_add_u32 s1, s1, 2
+v_cmp_lt_u32_e32 vcc_lo, 2, v0
+s_cbranch_vccnz -6
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # Nested irreducible cycle {A, B} inside an outer reducible loop headed by H (pc=2)
+    "nested_in_reducible": """\
+s_mov_b32 s1, 0
+s_mov_b32 s2, 0
+s_add_u32 s2, s2, 1
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc0 3
+s_add_u32 s1, s1, 1
+s_cmp_eq_u32 s1, 3
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 6
+s_cbranch_scc1 -6
+s_cmp_lt_u32 s2, 4
+s_cbranch_scc1 -11
+v_mov_b32 v1, s1
+s_endpgm
+""",
+}
+
+
+@pytest.mark.parametrize("pattern", sorted(IRREDUCIBLE_PATTERNS))
+def test_irreducible_cfg_node_splitting(pattern, make_shader, monkeypatch):
+    """Irreducible CFGs (2-entry SCCs and nested irreducible cycles) structure via node splitting and pass spirv-val."""
+    asm = IRREDUCIBLE_PATTERNS[pattern]
+    shader = make_shader(asm, name=f"cs_irred_{pattern}")
+
+    # Without node splitting, the shader genuinely falls back to the dispatch loop.
+    monkeypatch.setattr(rdna2spirv.cfg_structure, "split_irreducible", lambda succ, **kw: None)
+    spv_fallback = shader.translate()
+    meta_fallback = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv_fallback)
+    assert meta_fallback["control_flow"] == "dispatch loop"
+    assert "OpSwitch" in spv_fallback
+
+    # With node splitting enabled, the shader becomes structured and passes spirv-val.
+    monkeypatch.undo()
+    spv_struct = shader.translate()
+    shader.validate(spv_struct)
+    meta_struct = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv_struct)
+    assert meta_struct["control_flow"] == "structured"
+    assert "OpLoopMerge" in spv_struct
+    assert "OpSwitch" not in spv_struct

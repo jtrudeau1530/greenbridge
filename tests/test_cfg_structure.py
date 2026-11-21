@@ -90,13 +90,38 @@ def blocks_in(tree):
 
 def test_random_graphs():
     rng = random.Random(20261121)
-    structured = refused = loops = 0
+    structured = refused = loops = split_ok = split_cap = 0
     for case in range(20000):
         succ = random_graph(rng)
         tree = S.structure(succ)
         assert (tree is not None) == reducible(succ), f"reducibility disagrees for {succ}"
         if tree is None:
             refused += 1
+            res = S.split_irreducible(succ)
+            if res is not None:
+                new_succ, orig = res
+                assert len(new_succ) <= min(2 * len(succ), len(succ) + 64)
+                stree = S.structure(new_succ)
+                assert stree is not None, f"split_irreducible returned irreducible graph for {succ}"
+                splaced = blocks_in(stree)
+                assert len(splaced) == len(set(splaced)), f"a split block is placed twice: {succ}"
+                for seed in range(6):
+                    want = walk(succ, chooser(succ, seed), 200)
+                    visits = {}
+
+                    def split_choose(b, _orig=orig, _ns=new_succ, _seed=seed, _v=visits):
+                        ob = _orig[b]
+                        k = _v[ob] = _v.get(ob, 0) + 1
+                        opts = _ns[b]
+                        if not opts:
+                            return S.END
+                        return opts[random.Random(f"{_seed}/{ob}/{k}").randrange(len(opts))]
+
+                    got = [orig[b] for b in S.run(stree, split_choose, 200)]
+                    assert got == want, f"split graph {succ} seed {seed}: tree ran {got}, graph runs {want}"
+                split_ok += 1
+            else:
+                split_cap += 1
             continue
         structured += 1
         loops += '"loop"' in repr(tree).replace("'", '"')
@@ -107,7 +132,8 @@ def test_random_graphs():
             got = S.run(tree, chooser(succ, seed), 200)
             assert got == want, f"graph {succ} seed {seed}: tree ran {got}, graph runs {want}"
     assert structured > 5000 and refused > 1000 and loops > 2000, (structured, refused, loops)
-    return structured, refused, loops
+    assert split_ok > 1000 and split_ok + split_cap == refused, (split_ok, split_cap, refused)
+    return structured, refused, loops, split_ok, split_cap
 
 
 def test_shapes():
@@ -118,8 +144,36 @@ def test_shapes():
                                                     ("guard", 1, [("block", 1)]), ("guard", 3, [("block", 3)])]
     assert S.structure([[0, 1], []]) == [("loop", 0, [("block", 0)]), ("guard", 1, [("block", 1)])]
     assert S.structure([[1, 2], [2], [1]]) is None                                           # two-entry loop
+    ns, orig = S.split_irreducible([[1, 2], [2], [1]])
+    assert S.structure(ns) is not None and len(ns) == 4 and orig == [0, 1, 2, 2]
+    # Nested irreducible cycle {2, 3} inside an outer reducible loop headed by 1.
+    nested = [[1], [2, 3], [3, 4], [2, 4], [1, 5], []]
+    assert S.structure(nested) is None
+    ns2, orig2 = S.split_irreducible(nested)
+    assert S.structure(ns2) is not None and len(ns2) == 7
+    # Regression for single-node infinite unrolling: SCC {1, 2, 3} with entries 1 (h) and 2 (e), plus an
+    # internal subcycle 2 <-> 3 that does not pass through 1. Single-node cloning bounces 2' -> 3 -> 3' -> 2 -> ...
+    # until hitting the cap; closed-region cloning duplicates R = {2, 3} once (+2 blocks, 5 -> 7).
+    subcycle = [[1, 2], [3, 4], [3], [1, 2], []]
+    assert S.structure(subcycle) is None
+    ns3, orig3 = S.split_irreducible(subcycle)
+    assert S.structure(ns3) is not None and len(ns3) == 7
+    for seed in range(6):
+        want = walk(subcycle, chooser(subcycle, seed), 200)
+        visits = {}
+
+        def sc_choose(b, _o=orig3, _ns=ns3, _s=seed, _v=visits):
+            ob = _o[b]
+            k = _v[ob] = _v.get(ob, 0) + 1
+            opts = _ns[b]
+            return S.END if not opts else opts[random.Random(f"{_s}/{ob}/{k}").randrange(len(opts))]
+
+        assert [orig3[b] for b in S.run(S.structure(ns3), sc_choose, 200)] == want
+    # Cap enforcement: max_splits=0 must refuse an irreducible graph cleanly.
+    assert S.split_irreducible([[1, 2], [2], [1]], max_splits=0) is None
 
 
 if __name__ == "__main__":
     test_shapes()
-    print("ok: %d graphs structured and run, %d irreducible refused, %d with loops" % test_random_graphs())
+    print("ok: %d graphs structured and run, %d irreducible (%d split-structured, %d capped), %d with loops" %
+          (lambda s, r, l, ok, cap: (s, r, ok, cap, l))(*test_random_graphs()))
