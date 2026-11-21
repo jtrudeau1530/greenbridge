@@ -286,7 +286,16 @@ void test_deserializer() {
     {
         ID3D12RootSignatureDeserializer* direct = nullptr;
         hr = D3D12CreateRootSignatureDeserializer(tampered.data(), tampered.size(), IID_PPV_ARGS(&direct));
-        check(FAILED(hr), "host deserializer rejects the Xbox high byte");
+        if (SUCCEEDED(hr) && direct) {
+            // Some runtimes accept the high byte without clearing it, which is
+            // exactly the bug the shim fixes. Newer runtimes reject it here.
+            check(direct->GetRootSignatureDesc()->Flags ==
+                      static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
+                  "host deserializer, when it accepts, keeps the Xbox high byte");
+            direct->Release();
+        } else {
+            std::printf("host deserializer rejects the Xbox high byte (runtime-dependent)\n");
+        }
     }
 
     using DeserializeFn = HRESULT(WINAPI*)(const void*, SIZE_T, REFIID, void**);
