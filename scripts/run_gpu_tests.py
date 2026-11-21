@@ -26,7 +26,7 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container
 from check import Skip, clip_test
 from compute_fixture import compute_header
-from check import CMPX_CLASS_WORDS, Skip, mesh_v5_test, start_failure
+from check import CMPX_CLASS_WORDS, TEST_PROGRAMS, Skip, mesh_v5_test, not_found_message, pick_build_dir, start_failure
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -425,28 +425,6 @@ def with_draw_shaders(asm_files: list[str]) -> list[str]:
     return build
 
 
-# Multi-config CMake generators (Visual Studio, Xcode, Ninja Multi-Config) put each program in build/<Config>.
-CONFIG_DIRS = ("RelWithDebInfo", "Release", "Debug", "MinSizeRel")
-
-
-def resolve_build_dir(build: str, programs: tuple[str, ...]) -> str:
-    """The folder that holds all of `programs` (file names with their extension).
-
-    Makefile and Ninja builds leave them in `build`. With the Visual Studio generator they land in
-    build/RelWithDebInfo, build/Release and so on. `build` itself wins when it has them all; otherwise the
-    configuration folder that has them all and was built last. If none has them, `build` is returned, so the
-    caller's "not found" message names the folder the user gave."""
-    def complete(d: str) -> bool:
-        return all(os.path.isfile(os.path.join(d, n)) for n in programs)
-
-    if complete(build):
-        return build
-    found = [d for d in (os.path.join(build, c) for c in CONFIG_DIRS) if complete(d)]
-    if not found:
-        return build
-    return max(found, key=lambda d: max(os.path.getmtime(os.path.join(d, n)) for n in programs))
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
@@ -464,14 +442,11 @@ def main() -> int:
         a.work = os.path.abspath(a.work)
 
     ext = ".exe" if os.name == "nt" else ""
-    required = tuple(t + ext for t in ("vk_compute_test", "vk_store_test", "vk_harness"))
-    a.build = resolve_build_dir(a.build, required)
+    required = tuple(t + ext for t in TEST_PROGRAMS)
+    a.build = pick_build_dir(a.build, required)
     missing = [t for t in required if not os.path.isfile(os.path.join(a.build, t))]
     if missing:
-        sys.exit(f"Test programs not found in {a.build}:{', '.join(missing)}\n"
-                 "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
-                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
-                 "Vulkan headers (vulkan-headers on Arch) and configure again.")
+        sys.exit(not_found_message(a.build, missing))
 
     work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
     try:
