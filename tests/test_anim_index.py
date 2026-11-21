@@ -81,6 +81,35 @@ def bink():
     return bytes(data)
 
 
+def _u16s(text):
+    return struct.pack("<H", len(text)) + text
+
+
+def _fd(text):
+    return b"\xfd\xff" + struct.pack("<I", len(text) + 1) + text + b"\x00"
+
+
+def _entry(source, rig, group):
+    return _fd(source) + b"\xff\xff\x06\x00" + bytes(6) + _fd(rig) + b"\xff\xff\x07\x00" + bytes(6) + _fd(group)
+
+
+def rbf0_blob():
+    """Synthetic RBF0 with three rig sets (one empty), three rig entries and three source kinds."""
+    b = bytearray(b"RBF0" + struct.pack("<H", 0xFFFB) + struct.pack("<I", 1) + _u16s(b"rage__crRigSetManager") + b"\x00")
+    b += b"\x03\x60\x03\x00key" + _u16s(b"anim/rigset/synthetic/one")
+    b += b"\x04\x00" + bytes(6) + b"\x02\x00" + bytes(6) + b"\x05\x00" + bytes(6)
+    b += _entry(b"canonical@source", b"anim/rig/canonical/source/synthetic/one", b"pose")
+    b += _entry(b"generated@source", b"anim/rig/generated/source/synthetic/two", b"deformation")
+    b += b"\xff" * 6
+    b += b"\x02\x00\x00\x00\x00\x00\x01\x00\x03\x60" + _u16s(b"anim/rigset/synthetic/empty")
+    b += b"\x04\x00" + bytes(6) + b"\xff" * 4
+    b += b"\x02\x00\x00\x00\x00\x00\x01\x00\x03\x60" + _u16s(b"anim/rigset/synthetic/three")
+    b += b"\x04\x00" + bytes(6) + b"\x02\x00" + bytes(6) + b"\x05\x00" + bytes(6)
+    b += _entry(b"pipelined@source", b"anim/rig/pipelined/source/synthetic/three", b"facial")
+    b += b"\xff" * 6
+    return bytes(b)
+
+
 PAYLOADS = [move(), page(), names(), skeleton(), chunks(), clip(), rbf0(), raw(), text(), bink()]
 EXPECTED = ["move", "page-directory", "name-table", "skeleton-names", "typehash", "clip-stream",
             "rbf0", "raw:11223344", "text", "bink2"]
@@ -118,6 +147,36 @@ class ClassifyTest(unittest.TestCase):
     def test_rbf0(self):
         r = anim_index.classify(rbf0(), 0x700, 30)
         self.assertEqual((r["name"], r["detail"]), ("rage__crRigSetManager", "rig metadata"))
+
+
+class RigParseTest(unittest.TestCase):
+    def test_joaat_known_value(self):
+        self.assertEqual(anim_index.joaat32("adder"), 0xB779A091)
+
+    def test_rbf0_rigsets_and_entries(self):
+        r = anim_index.parse_rbf0(rbf0_blob())
+        self.assertEqual(r["header"]["schema"], "rage__crRigSetManager")
+        self.assertEqual((r["summary"]["rigsets"], r["summary"]["entries"], r["summary"]["distinct_rigs"]),
+                         (3, 3, 3))
+        self.assertEqual(r["summary"]["empty_rigsets"], 1)
+        self.assertEqual(r["summary"]["sources"]["canonical@source"]["entries"], 1)
+        self.assertEqual(r["summary"]["sources"]["generated@source"]["distinct_rigs"], 1)
+        self.assertEqual(r["summary"]["sources"]["pipelined@source"]["entries"], 1)
+        self.assertEqual(r["summary"]["groups"], {"pose": 1, "deformation": 1, "facial": 1})
+        self.assertEqual(r["rigsets"][0]["entries"][0]["source_offset"],
+                         rbf0_blob().find(b"canonical@source") - 6)
+        self.assertEqual(r["rigsets"][0]["distinct_rigs"], 2)
+
+    def test_rbf0_rejects_non_rbf0(self):
+        with self.assertRaises(ValueError):
+            anim_index.parse_rbf0(b"not an RBF0 blob")
+
+    def test_skel_names_and_hashes(self):
+        name = b"SKEL_Synthetic"
+        data = name + b"\x00" + struct.pack("<I", anim_index.joaat32(name.decode())) + b"\x00SKEL_Second\x00"
+        r = anim_index.parse_skel_names(data, 0x123)
+        self.assertEqual((r["offset"], r["occurrences"], r["distinct"], r["hashes_present"]),
+                         (0x123, 2, 2, 1))
 
 
 class ArchiveTest(unittest.TestCase):
@@ -200,6 +259,53 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
         self.assertEqual([r["signature"] for r in rows], ["move", "page-directory", "name-table"])
         self.assertEqual(summary["mode"], "directory")
+
+
+class RigArchiveTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.rpf = os.path.join(self.root, "rigs.rpf")
+        blob = rbf0_blob()
+        cut = blob.find(b"\xff" * 6) + 6
+        self.parts = [blob[:cut], blob[cut:]]
+        self.skel = b"SKEL_Synthetic\x00SKEL_Second\x00"
+        self.skel += bytes(64 - len(self.skel))
+        self.front = b"\x0f\x00\xe0\x00\x0c\x00\x16\x00SKEL_Front\x00"
+        self.front += struct.pack("<I", anim_index.joaat32("SKEL_Front")) + bytes(64)
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        body = bytearray()
+        for payload in self.parts + [self.skel, self.front]:
+            body += zlib.compress(payload)
+            body += bytes((-len(body)) % 16)
+        with open(self.rpf, "wb") as f:
+            f.write(header + body)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_collect_and_parse_continuation(self):
+        rows, _ = anim_index.scan_rpf(self.rpf)
+        blob = anim_index.collect_rbf0(self.rpf, rows)
+        self.assertIsNotNone(blob)
+        r = anim_index.parse_rbf0(blob)
+        self.assertEqual(r["summary"]["rigsets"], 3)
+        self.assertEqual(r["summary"]["entries"], 3)
+
+    def test_cli_rigs(self):
+        out = os.path.join(self.root, "index.json")
+        rigs = os.path.join(self.root, "rigs.json")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", rigs, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(rigs, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["rbf0"]["summary"]["rigsets"], 3)
+        self.assertEqual(doc["skeletons"][0]["distinct"], 2)
+        self.assertEqual(doc["skeletons"][0]["kind"], "plain-bone-table")
+        self.assertEqual(doc["skeletons"][1]["hashes_present"], 1)
 
 
 if __name__ == "__main__":
