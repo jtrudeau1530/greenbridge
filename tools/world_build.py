@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import threading
@@ -461,8 +462,12 @@ def _write_json_atomic(path: str, data: dict) -> None:
         raise
 
 
+# Cell coordinates are written as decimal integers, without leading zeros.
+_CHUNK_FILE_RE = re.compile(r"c_(?:0|-?[1-9][0-9]*)_(?:0|-?[1-9][0-9]*)\.glb(?:\.tmp)?")
+
+
 def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
-    """Remove obsolete *.glb and *.glb.tmp files left over from earlier builds."""
+    """Remove stale chunk files and partial writes left by earlier builds."""
     try:
         entries = os.listdir(chunks_dir)
     except OSError:
@@ -470,7 +475,7 @@ def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
     for name in entries:
         if name in keep_filenames:
             continue
-        if not (name.endswith(".glb") or name.endswith(".glb.tmp")):
+        if not _CHUNK_FILE_RE.fullmatch(name):
             continue
         full = os.path.join(chunks_dir, name)
         if os.path.isfile(full):
@@ -492,7 +497,13 @@ def build_world(
     limit: int | None = None,
     jobs: int = 1,
 ) -> dict:
-    """Build world.json and chunk .glb files from rpf9dump asset exports."""
+    """Build world.json and chunk .glb files from rpf9dump asset exports.
+
+    Unless limit=0 explicitly requests an empty world, raise ValueError before changing
+    the output if no readable model manifests or no usable selected models are found.
+    Individual unusable models are still skipped when other selected models can load.
+    This input check does not provide rollback for failures during output writing.
+    """
     if chunk_size <= 0 or not math.isfinite(chunk_size):
         raise ValueError(f"chunk_size must be positive, got {chunk_size!r}")
     if up_axis not in ("z", "y"):
@@ -510,6 +521,8 @@ def build_world(
     dds_mod = _get_dds_png() if textures else None
 
     manifests = discover_model_manifests(assets_dir)
+    if not manifests and limit != 0:
+        raise ValueError(f"No readable model manifests found in {assets_dir}; output left unchanged")
     entries: list[tuple[str, dict]] = []
     for mpath in manifests:
         data = _load_json_dict(mpath)
@@ -576,6 +589,12 @@ def build_world(
             "bounds": bounds,
             "mat_to_dds": mat_to_dds,
         })
+
+    if not loaded_models and limit != 0:
+        raise ValueError(
+            f"No usable models in {assets_dir} ({len(entries)} selected manifest items); "
+            "check model File fields and OBJ geometry; output left unchanged"
+        )
 
     if grid_layout:
         _apply_grid_layout(loaded_models, glb_mod)
@@ -789,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
         type=_non_negative_int,
         default=None,
         metavar="N",
-        help="Process at most N manifest items.",
+        help="Process at most N manifest items; 0 explicitly writes an empty world and removes old chunks.",
     )
     ap.add_argument(
         "--jobs",

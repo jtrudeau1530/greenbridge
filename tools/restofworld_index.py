@@ -191,6 +191,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     rows = []
     zero = unread = skipped = 0
     t0 = time.time()
+    if os.path.getsize(path) == 0:
+        raise ValueError("empty file")
     with open(path, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         size = len(m)
@@ -336,10 +338,13 @@ def main():
                     help="skip a stream that inflates above this many bytes (default: 512 MiB)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
-    if os.path.isdir(args.source):
-        rows, summary = scan_dir(args.source)
-    else:
-        rows, summary = scan_rpf(args.source, args.start, args.limit, args.max_inflate)
+    try:
+        if os.path.isdir(args.source):
+            rows, summary = scan_dir(args.source)
+        else:
+            rows, summary = scan_rpf(args.source, args.start, args.limit, args.max_inflate)
+    except ValueError as e:
+        sys.exit(f"{args.source}: {e}")
     write_output(args.out, rows, summary)
     if not args.quiet:
         print(json.dumps({k: summary[k] for k in

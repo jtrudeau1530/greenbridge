@@ -413,8 +413,8 @@ JSON carries one object per resource: `offset`, `size`, `chunks`, `layout`, `roo
 `descriptors`, `counts` and `tree`. Every node has a `kind` and a byte `offset`. Elements carry `descriptor`,
 `attrs_declared`, `attrs_actual`, `children`, `content_count`, `attributes`, ordered `content` and `end`; values
 carry `descriptor`, `type`, `payload_offset`, `size` and `value`; text nodes carry `length`, `nul_terminated`,
-`text` and `utf8_valid`. The full-corpus JSON is about 534 MB because every node keeps its offset; `--root`,
-`--offset` and `--limit` select samples. The JSON summary adds the aggregate tree shape: `nodes`,
+`text` and `utf8_valid`. The full-corpus JSON is about 0.6 GB because every node keeps its offset and child counts;
+`--root`, `--offset` and `--limit` select samples. The JSON summary adds the aggregate tree shape: `nodes`,
 `elements_by_depth`, `children_histogram`, `content_length_histogram`, `attribute_count_histogram`,
 `leaf_elements`, `empty_elements`, `text_only_elements`, `parent_child_edges`, `max_children` and `mean_children`.
 

@@ -308,6 +308,14 @@ class ToolchainDetectionTest(PreflightTestBase):
 
 
 class PreflightPrerequisiteTest(PreflightTestBase):
+    def setUp(self):
+        super().setUp()
+        # preflight runs `dotnet --list-sdks` (#223). Follow the test's faked shutil.which instead: the SDK counts as
+        # installed exactly when the test says dotnet is on PATH, so no real dotnet is needed and none is consulted.
+        patcher = mock.patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_preflight_success_all_tools_present_and_space_sufficient(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             with mock.patch("sys.version_info", (3, 11, 0)), \
@@ -316,7 +324,9 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("os.path.isfile", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
-                make_game.preflight(["shaders", "assets", "runtime"], tmp_work, wav=True)
+                # runtime is refused before any check off Windows (tests/test_make_game_platform.py)
+                stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
+                make_game.preflight(stages, tmp_work, wav=True)
 
     def test_preflight_aggregates_multiple_missing_tools_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as tmp_work:
@@ -332,7 +342,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
                 self.assertIn("spirv-as:", err)
                 self.assertIn("spirv-val:", err)
-                self.assertIn(".NET 8 SDK:", err)
+                self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
 
     def test_preflight_python_version_check(self):

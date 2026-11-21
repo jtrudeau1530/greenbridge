@@ -455,6 +455,121 @@ void test_rejections(const fs::path& dll, const fs::path& temp_dir) {
     check(good.base != nullptr && loader.modules().size() == 1, "a valid image still loads after the rejected ones");
 }
 
+// The image's .pdata as the file declares it.
+const IMAGE_DATA_DIRECTORY& exception_directory(const rt::Module& m) {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + dos->e_lfanew);
+    return nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+}
+
+// Every non-empty entry of a registered table, looked up by the system at its first byte, must come back as itself
+// with this module's base. Returns the number of entries that don't.
+uint32_t unwind_lookup_mismatches(const rt::Module& m) {
+    const auto* table = static_cast<const RUNTIME_FUNCTION*>(m.function_table);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < m.function_count; ++i) {
+        if (table[i].BeginAddress == table[i].EndAddress) continue;
+        DWORD64 image_base = 0;
+        const auto* found =
+            RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(m.base) + table[i].BeginAddress, &image_base, nullptr);
+        if (found != &table[i] || image_base != reinterpret_cast<DWORD64>(m.base)) ++bad;
+    }
+    return bad;
+}
+
+// Calls the fixture's fault probe with a null pointer: -1 means the image handled it, -2 that the fault escaped to
+// here. Without registration the dispatcher can't unwind the image's frame, so the fault escapes or the process dies
+// on a corrupt unwind, which ctest reports as a failure too. Kept apart because __try can't share a function with
+// objects that have destructors.
+int call_faulting(int(__cdecl* fault)(const volatile int*)) {
+    __try {
+        return fault(nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -2;
+    }
+}
+
+void test_unwind(const fs::path& dll) {
+    std::printf("\n-- unwind registration: %s --\n", dll.string().c_str());
+    rt::Loader loader(dll.parent_path());
+    rt::Module& m = loader.load(dll);
+
+    const auto& dir = exception_directory(m);
+    check(dir.Size != 0, "the fixture DLL has an exception directory");
+    check(m.function_table == m.base + dir.VirtualAddress && m.function_count == dir.Size / sizeof(RUNTIME_FUNCTION),
+          "load registers the whole exception directory");
+    check(m.function_count != 0 && unwind_lookup_mismatches(m) == 0,
+          "RtlLookupFunctionEntry finds every entry in the mapped image");
+    std::printf("     %u unwind entries\n", m.function_count);
+
+    const auto it = m.exports.find("tiny_fault_caught");
+    check(it != m.exports.end(), "exports contain tiny_fault_caught");
+    if (it == m.exports.end()) return;
+    using FaultFn = int(__cdecl*)(const volatile int*);
+    const auto fault = reinterpret_cast<FaultFn>(it->second);
+    const volatile int value = 42;
+    check(fault(&value) == 42, "tiny_fault_caught reads through a valid pointer");
+    check(call_faulting(fault) == -1,
+          "an access violation inside the mapped image is caught by the image's own handler");
+}
+
+// True when the code at rva (or, through up to 4 `jmp rel32` thunks, the code they lead to) has an unwind entry.
+// A jump thunk touches no stack, so it legitimately has none: libHttpClient.GDK.dll's entry point is one.
+bool unwind_covers(const rt::Module& m, uint32_t rva) {
+    for (int hops = 0; hops <= 4; ++hops) {
+        DWORD64 image_base = 0;
+        if (RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(m.base) + rva, &image_base, nullptr)) return true;
+        if (rva > m.size - 5 || m.base[rva] != 0xE9) return false;
+        int32_t rel = 0;
+        std::memcpy(&rel, m.base + rva + 1, sizeof(rel));
+        const int64_t target = static_cast<int64_t>(rva) + 5 + rel;
+        if (target < 0 || target >= m.size) return false;
+        rva = static_cast<uint32_t>(target);
+    }
+    return false;
+}
+
+// Optional: the unwind tables of whichever package DLLs are in LEONIDA_GAME_DIR. Unlike test_optional_package it
+// does not need all 16, so a folder with only some of them is still checked. Nothing in the images is executed.
+void test_optional_package_unwind() {
+    std::printf("\n-- optional package unwind tables --\n");
+    char* env = nullptr;
+    size_t env_size = 0;
+    if (_dupenv_s(&env, &env_size, "LEONIDA_GAME_DIR") != 0 || !env) {
+        std::printf("SKIP (no package): LEONIDA_GAME_DIR is not set\n");
+        return;
+    }
+    const fs::path game_dir = env;
+    std::free(env);
+    if (!fs::is_directory(game_dir)) {
+        std::printf("SKIP: LEONIDA_GAME_DIR is not a directory\n");
+        return;
+    }
+    int found = 0;
+    for (const auto& entry : fs::directory_iterator(game_dir)) {
+        if (!entry.is_regular_file() || rt::lower(entry.path().extension().string()) != ".dll") continue;
+        ++found;
+        const std::string name = entry.path().filename().string();
+        const std::string label = name + ": its whole exception directory is registered and every entry resolves";
+        try {
+            rt::Loader loader(game_dir);
+            rt::Module& m = loader.load(entry.path());
+            const auto& dir = exception_directory(m);
+            const uint32_t bad = unwind_lookup_mismatches(m);
+            const bool entry_covered = m.entry_rva == 0 || unwind_covers(m, m.entry_rva);
+            std::printf("     %-36s unwind=%u mismatches=%u entry covered=%s\n", name.c_str(), m.function_count, bad,
+                        entry_covered ? "yes" : "no");
+            check(m.function_count == dir.Size / sizeof(RUNTIME_FUNCTION) && m.function_count != 0 && bad == 0 &&
+                      entry_covered,
+                  label.c_str());
+        } catch (const std::exception& e) {
+            std::printf("     %-36s load failed: %s\n", name.c_str(), e.what());
+            check(false, label.c_str());
+        }
+    }
+    if (!found) std::printf("SKIP: no DLL in LEONIDA_GAME_DIR\n");
+}
+
 // Optional integration check over the 16 DLLs the retail package ships. It reads only the file headers, section
 // table and import directory: Loader never calls DllMain or an imported function. The package is not part of the
 // repository; when LEONIDA_GAME_DIR is unset the test skips cleanly. When it is set, an incomplete directory is an
@@ -573,7 +688,9 @@ int main(int argc, char** argv) {
         test_recursive_exe(exe, dll);
         test_forced_relocation(dll);
         test_rejections(dll, temp.path);
+        test_unwind(dll);
         test_optional_package();
+        test_optional_package_unwind();
     } catch (const std::exception& e) {
         ++g_checks;
         ++g_failures;

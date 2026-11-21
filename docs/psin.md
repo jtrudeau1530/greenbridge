@@ -71,6 +71,9 @@ then the page fields used by the generic RPF pager. `CHKS` carries the file size
 python -I tools/psin_index.py <PSIN file or carve directory> [--json] [--limit N]
 ```
 
+`--limit N` stops after N PSIN containers and must be at least 1 (0 or a negative value is refused with exit
+code 2). Leave it out to index every container.
+
 - `parse(blob)` returns the magic, version, table size, the ordered section list
   (`tag`, `offset`, `size`, `payload`) and a `complete` flag with the first structural error. When the
   `LRSC` payload starts with `0DRP`, the `0DRP` version is reported; `CHKS` contributes the file size

@@ -16,8 +16,8 @@ Usage:
 
     --out     JSON path (default: <input name>.navmesh-index.json in the current directory)
     --csv     optional CSV path
-    --start   first byte to scan (default: the archive's data start, u32 at offset 4)
-    --limit   stop after this many bytes (default: to the end)
+    --start   first byte to scan, 0 or more (default: the archive's data start, u32 at offset 4)
+    --limit   stop after this many bytes, at least 1 (default: to the end)
     --pattern glob for directory input (default: *.bin, the carve file names)
 """
 import argparse
@@ -197,13 +197,35 @@ def write_outputs(rows, summary, out_path, csv_path):
     return written
 
 
+def byte_count(text):
+    """--limit: 0 or less used to scan nothing (negative) or everything (0 is falsy) without a word."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def offset(text):
+    """--start: a negative offset would slice the archive from its end."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="RPF9 archive, or a directory of carved .bin files")
     ap.add_argument("--out", help="JSON output (default: <input name>.navmesh-index.json)")
     ap.add_argument("--csv", help="optional CSV output")
-    ap.add_argument("--start", type=int, help="first byte to scan in an archive")
-    ap.add_argument("--limit", type=int, help="maximum bytes to scan in an archive")
+    ap.add_argument("--start", type=offset, help="first byte to scan in an archive")
+    ap.add_argument("--limit", type=byte_count, help="maximum bytes to scan in an archive")
     ap.add_argument("--pattern", default="*.bin", help="directory input glob (default: *.bin)")
     a = ap.parse_args()
     below_normal()

@@ -95,5 +95,78 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("0 invalid words", body)
 
 
+class DisasmInputTest(unittest.TestCase):
+    """Short blobs, bad --jobs/--limit and an empty folder end with a reason, not a traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.src = os.path.join(self.dir, "fssm")
+        os.makedirs(self.src)
+        mc = os.path.join(self.dir, "fake_mc.py")
+        with open(mc, "w", encoding="utf-8") as f:
+            f.write("import sys\n"
+                    "probe = sys.stdin.read().strip() == %r\n"
+                    "print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]' if probe else %r)\n" % (PROBE, ASM))
+        self.mc = f'"{sys.executable}" "{mc}"'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_tool(self, *args: str) -> subprocess.CompletedProcess:
+        env = dict(os.environ, LLVM_MC=self.mc)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, env=env)
+
+    def write(self, name: str, data: bytes) -> None:
+        with open(os.path.join(self.src, name), "wb") as f:
+            f.write(data)
+
+    def test_code_range_scans_a_blob_shorter_than_the_header(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        try:
+            import shader_disasm
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(shader_disasm.code_range(b"FSSM" + CODE), (None, 12, "scan"))
+        self.assertEqual(shader_disasm.code_range(b"FSSM"), (None, None, "scan"))
+        self.assertEqual(shader_disasm.code_range(b""), (None, None, "scan"))
+
+    def test_a_short_blob_does_not_stop_the_others(self):
+        self.write("a_good.fssm", fssm())
+        self.write("b_short.fssm", b"FSSM" + CODE)   # 12 bytes: no room for the code offset at 0xC0
+        self.write("c_good.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(self.src, "--out", out, "--jobs", "1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(sorted(os.listdir(out)), ["a_good.s", "c_good.s"])
+        self.assertIn("'clean': 2", p.stdout)
+        self.assertIn("'scan failed': 1", p.stdout)
+
+    def test_jobs_and_limit_must_be_at_least_one(self):
+        self.write("one.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        for flag, value in (("--jobs", "0"), ("--jobs", "-2"), ("--limit", "0"), ("--limit", "-1")):
+            with self.subTest(flag=flag, value=value):
+                p = self.run_tool(self.src, "--out", out, flag, value)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("must be at least 1", p.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_folder_without_fssm_files_is_an_error(self):
+        for args in ((self.src,), (self.src, "--out", os.path.join(self.dir, "out"))):
+            with self.subTest(args=args):
+                p = self.run_tool(*args)
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertIn("no .fssm files", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_a_missing_source_is_an_error(self):
+        p = self.run_tool(os.path.join(self.dir, "nope"), "--out", os.path.join(self.dir, "out"))
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("is not a file or folder", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

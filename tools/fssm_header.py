@@ -27,11 +27,18 @@ table (55,791 records, 11,199 of them 16-bit).  The table count equals the numbe
 `v_interp attr` numbers in 11,316/12,101 shaders (93.5%); 300 more declare exactly one unread input,
 475 declare two or more, and the 10 shaders whose table starts with a non-6 record are the only ones
 that undercount.  A 200-PS spot check agreed on 187/200.  Flag bit 4 matched the 16-bit interpolant
-opcodes in 12,067/12,101 (99.7%).  This is available for a translator integration; nothing in
-`rdna2spirv.py` uses it yet.
+opcodes in 12,067/12,101 (99.7%).  `rdna2spirv.py` consumes it in the PS input path (pixel_interpolants:
+every table position declared as a fragment input, 16-bit-flagged positions
+rounded f32->f16->f32 on 32-bit reads).
+
+The post-`code_end` tail carries a binding table.  After 16 bytes of `0xBF9F0000` filler and an
+8-byte header, 20-byte records run until a `0xFFFFFFFF` sentinel; then `u32 0`, `u16 0`, `u16`
+name length and the name.  `binding_table()` returns those records.  On the local 26,503-blob
+corpus every blob parses (5,640,704 records), and the tail name is a substring of the container
+name in all 26,503 cases, exactly equal in 691.
 
 Usage:
-    python -I fssm_header.py <fssm dir or file> [--json] [--limit N]
+    python -I fssm_header.py <fssm dir or file> [--json] [--limit N] [--bindings]
 
 Prints one line per blob and a corpus tally:
     N files, directory_ok X, PS with table Y, entries Z
@@ -50,10 +57,24 @@ FLAG_FP16 = 0x10
 DIRECTORY_OFFSET = 0x120
 DIRECTORY_SIZE = 0x12C
 DIRECTORY_NEXT = 0x130
+CODE_OFFSET = 0xC0
+CODE_SIZE = 0xC8
+CODE_END = 0xE8
+CODE_END_UNSET = 0xDEADBEEFDEADBEEF
+TAIL_FILLER = 0xBF9F0000
+TAIL_PAD = 16
+TAIL_HEADER = 8
+BINDING_SIZE = 20
+BINDING_SENTINEL = 0xFFFFFFFF
+MAX_BINDINGS = 100_000
 
 
 def _u32(blob: bytes, offset: int):
     return struct.unpack_from("<I", blob, offset)[0]
+
+
+def _u64(blob: bytes, offset: int):
+    return struct.unpack_from("<Q", blob, offset)[0]
 
 
 def pixel_inputs(blob):
@@ -94,6 +115,60 @@ def directory_ok(blob):
     return _u32(blob, DIRECTORY_OFFSET) + _u32(blob, DIRECTORY_SIZE) == _u32(blob, DIRECTORY_NEXT)
 
 
+def binding_table(blob):
+    """Return the post-code binding table, or None when the tail does not match the layout.
+
+    The table starts at `code_end`, or at `code_off + code_size` when `code_end` is the
+    0xDEADBEEFDEADBEEF sentinel:
+
+        +0x00  4 x 0xBF9F0000 (s_code_end filler)
+        +0x10  u32 header (4, 3, or 0 on the corpus), u32 zero
+        +0x18  20-byte records until a u32 0xFFFFFFFF
+        at the sentinel:
+        +0x04  u32 0
+        +0x08  u16 0, u16 name length
+        +0x0C  name bytes
+
+    Keys: code_end, header, records (5-word tuples), name, trailing.  `trailing` counts the
+    bytes after the name, which are not parsed here.  None means the tail is shorter than the
+    layout, lacks the filler or sentinel, or has a malformed length or prefix.
+    """
+    if len(blob) < CODE_END + 8:
+        return None
+    code_end = _u64(blob, CODE_END)
+    if code_end == CODE_END_UNSET:
+        code_end = _u64(blob, CODE_OFFSET) + _u64(blob, CODE_SIZE)
+    start = code_end + TAIL_PAD
+    if code_end > len(blob) or start + TAIL_HEADER > len(blob):
+        return None
+    if blob[code_end:start] != struct.pack("<I", TAIL_FILLER) * 4:
+        return None
+    header = _u32(blob, start)
+    offset = start + TAIL_HEADER
+    records = []
+    while offset + BINDING_SIZE <= len(blob) and _u32(blob, offset) != BINDING_SENTINEL:
+        if len(records) >= MAX_BINDINGS:
+            return None
+        records.append(struct.unpack_from("<5I", blob, offset))
+        offset += BINDING_SIZE
+    if offset + 12 > len(blob) or _u32(blob, offset) != BINDING_SENTINEL:
+        return None
+    zero, pad, length = struct.unpack_from("<IHH", blob, offset + 4)
+    if zero != 0 or pad != 0 or not 0 < length <= 512 or offset + 12 + length > len(blob):
+        return None
+    raw_name = blob[offset + 12:offset + 12 + length]
+    if not all(0x20 <= byte < 0x7F for byte in raw_name):
+        return None
+    name = raw_name.decode("latin-1")
+    return {
+        "code_end": code_end,
+        "header": header,
+        "records": records,
+        "name": name,
+        "trailing": len(blob) - (offset + 12 + length),
+    }
+
+
 def stage_index(path):
     """Map shader stems to stages from the carve index, or {} when it is not next to the corpus.
 
@@ -118,13 +193,13 @@ def files_of(path):
     return [os.path.join(path, name) for name in sorted(os.listdir(path)) if name.endswith(".fssm")]
 
 
-def summarize(path, stages):
+def summarize(path, stages, bindings=False):
     """Decode one blob and return the row used by the text and JSON output."""
     with open(path, "rb") as f:
         blob = f.read()
     stem = os.path.splitext(os.path.basename(path))[0]
     count, fp16 = interpolants(blob)
-    return {
+    row = {
         "name": os.path.basename(path),
         "stage": stages.get(stem),
         "directory_ok": directory_ok(blob),
@@ -132,6 +207,15 @@ def summarize(path, stages):
         "fp16_mask": fp16,
         "inputs": pixel_inputs(blob),
     }
+    if bindings:
+        table = binding_table(blob)
+        row["bindings"] = None if table is None else {
+            "header": table["header"],
+            "records": len(table["records"]),
+            "name": table["name"],
+            "trailing": table["trailing"],
+        }
+    return row
 
 
 def tally(rows, stages_known):
@@ -160,13 +244,14 @@ def main(argv=None):
     ap.add_argument("path", help="an .fssm file or a directory of them")
     ap.add_argument("--json", action="store_true", help="print one JSON document instead of lines")
     ap.add_argument("--limit", type=int, help="stop after this many blobs")
+    ap.add_argument("--bindings", action="store_true", help="also parse the post-code binding table")
     args = ap.parse_args(argv)
 
     paths = files_of(args.path)
     if args.limit is not None:
         paths = paths[:args.limit]
     stages = stage_index(args.path)
-    rows = [summarize(path, stages) for path in paths]
+    rows = [summarize(path, stages, args.bindings) for path in paths]
     summary = tally(rows, bool(stages))
 
     if args.json:
@@ -178,6 +263,13 @@ def main(argv=None):
         stage = row["stage"] or "?"
         print(f"{row['name']}: stage={stage} directory_ok={row['directory_ok']} "
               f"entries={row['entries']} fp16=0x{row['fp16_mask']:x}")
+        if args.bindings:
+            table = row["bindings"]
+            if table is None:
+                print("  bindings unparsed")
+            else:
+                print(f"  bindings header={table['header']} records={table['records']} "
+                      f"name_len={len(table['name'])} trailing={table['trailing']}")
     total = summary
     print(f"{total['files']} files, directory_ok {total['directory_ok']}, "
           f"PS with table {total['ps_with_table']}, entries {total['entries']}")
@@ -185,6 +277,12 @@ def main(argv=None):
     print(label + ": " + ", ".join(f"{k}:{v}" for k, v in total["entry_counts"].items()))
     if total["stage_source"] == "table-only":
         print("(no index.json found: counted every blob with a non-empty table as a PS)")
+    if args.bindings:
+        parsed = [row for row in rows if row["bindings"]]
+        records = sum(row["bindings"]["records"] for row in parsed)
+        exact = sum(1 for row in parsed
+                    if os.path.splitext(row["name"])[0].casefold() == row["bindings"]["name"].casefold())
+        print(f"binding tables {len(parsed)}, records {records}, tail name equals file stem {exact}")
     return 0
 
 

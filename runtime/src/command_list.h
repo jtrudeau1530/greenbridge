@@ -2,7 +2,8 @@
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
-// render-target and depth-stencil clears (whole views or rectangles), and copies. It has no Windows or Vulkan dependency.
+// render-target and depth-stencil clears (whole views or rectangles), copies and resolves. It has no Windows or
+// Vulkan dependency.
 
 #include <array>
 #include <cstdint>
@@ -268,6 +269,15 @@ struct CopyResource {
     ResourceId src;
 };
 
+// ResolveSubresource: a multisampled subresource into a single-sampled one of the same size. The call's format is
+// not kept: the resolve uses the textures' own format, which D3D12 requires to be compatible.
+struct ResolveSubresource {
+    ResourceId dst;
+    std::uint32_t dst_subresource;
+    ResourceId src;
+    std::uint32_t src_subresource;
+};
+
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
 inline constexpr std::uint32_t texture_data_pitch_alignment = 256;
 inline constexpr std::uint32_t texture_data_placement_alignment = 512;
@@ -288,7 +298,7 @@ struct ClearDepthStencil {
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource>;
+                             CopyResource, ResolveSubresource>;
 
 class CommandList {
 public:
@@ -348,6 +358,12 @@ public:
     bool copy_resource(const CopyResource& copy) {
         if (!copy.dst || !copy.src || copy.dst == copy.src) return false;
         return append(copy);
+    }
+
+    // A resource has one sample count, so it cannot be resolved into itself.
+    bool resolve_subresource(const ResolveSubresource& resolve) {
+        if (!resolve.dst || !resolve.src || resolve.dst == resolve.src) return false;
+        return append(resolve);
     }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
