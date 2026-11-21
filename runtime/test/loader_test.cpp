@@ -4,6 +4,7 @@
 // What it pins down: a valid image maps exactly as its headers say, and a truncated or corrupt one is rejected with
 // a message instead of being followed out of bounds. The truncation case covers every length of a valid image.
 #include <windows.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -499,12 +500,21 @@ void test_initialise() {
             failed("initialise calls DllMain for a DLL", "the entry point never wrote its sentinel");
         else
             pass("initialise calls DllMain for a DLL");
-        uint32_t slot = *reinterpret_cast<const uint32_t*>(m.base + 0x10A0);
-        void* block = slot == TLS_OUT_OF_INDEXES ? nullptr : TlsGetValue(slot);
-        if (!block || std::memcmp(block, "TLS!", 4) != 0)
-            failed("the TLS template is copied into the allocated slot", "the slot doesn't hold the template");
+        // __declspec(thread) reads TEB->ThreadLocalStoragePointer[_tls_index] at gs:[58h], which is a different index
+        // space from the TlsAlloc slots. The loader writes the OS-assigned module index (reserved through
+        // gta6rt_tls_host.dll) into AddressOfIndex and puts the template copy in that TEB slot, so this reads exactly
+        // what mapped __declspec(thread) code would.
+        const uint32_t index = *reinterpret_cast<const uint32_t*>(m.base + 0x10A0);
+        auto** module_slots = reinterpret_cast<void**>(__readgsqword(0x58));
+        void* block = index == TLS_OUT_OF_INDEXES || index >= 64 || !module_slots ? nullptr : module_slots[index];
+        if (index != m.tls_index)
+            failed("the module TLS index is written to AddressOfIndex", "the image and the Module disagree");
         else
-            pass("the TLS template is copied into the allocated slot");
+            pass("the module TLS index is written to AddressOfIndex");
+        if (!block || std::memcmp(block, "TLS!", 4) != 0)
+            failed("the TLS template is copied into the module TLS slot", "the TEB slot doesn't hold the template");
+        else
+            pass("the TLS template is copied into the module TLS slot");
     } catch (const std::exception& e) {
         failed("initialise runs a TLS callback and DllMain", e.what());
     }
