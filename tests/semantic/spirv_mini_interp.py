@@ -135,6 +135,7 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     var_class = {}              # variable id -> storage class
     var_box = {}                # variable id -> [value]
     pointers = {}               # id -> (container list, index) / ("pc", offset) / ("psb", address)
+    id_type = {}                # constant / result id -> its type id (the width of a signed comparison)
     pc_type = {}                # id -> pointee type id of a PushConstant pointer
     in_body = False
     body = []
@@ -205,6 +206,7 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 constants[res] = values[res] = f32(float(a[1]))
             elif k[0] == "int":
                 constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
+                id_type[res] = a[0]
             else:
                 raise UnsupportedConstruct(f"OpConstant of type {k[0]}")
         elif op == "OpConstantTrue":
@@ -251,6 +253,13 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
         v &= (1 << bits) - 1
         return v - (1 << bits) if v >> (bits - 1) else v
 
+    def sval(x):
+        """An integer operand as signed, at the width of its type (a scalar int; 32 if the type is unknown)."""
+        t = types.t.get(id_type.get(x))
+        if t is not None and t[0] != "int":
+            raise UnsupportedConstruct(f"signed comparison of a {t[0]}")
+        return signed(val(x), t[1] if t else 32)
+
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
     pc = 0
     killed = False
@@ -258,6 +267,8 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     while pc < len(body):
         res, op, a, line = body[pc]
         pc += 1
+        if res and a:
+            id_type[res] = a[0]
         if op == "OpLabel":
             prev_label, cur_label = cur_label, res
             continue
@@ -405,6 +416,14 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
         elif op == "OpUConvert":
             values[res] = val(a[1]) & wmask(a[0])
+        elif op == "OpBitReverse":
+            bits = types.bits(a[0])
+            values[res] = int(f"{val(a[1]) & wmask(a[0]):0{bits}b}"[::-1], 2)
+        elif op in ("OpConvertUToF", "OpConvertSToF"):
+            x = val(a[1])
+            if not isinstance(x, int):
+                raise UnsupportedConstruct(f"{op} on non-integer")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x & MASK))
         elif op == "OpBitCount":
             values[res] = (val(a[1]) & wmask(a[0])).bit_count()
         elif op == "OpISubBorrow":
@@ -417,14 +436,23 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 x, y = _s32(x), _s32(y)
             p = (x * y) & 0xFFFFFFFFFFFFFFFF
             values[res] = (p & MASK, p >> 32)
+        elif op == "OpIAddCarry":
+            x, y = val(a[1]) & MASK, val(a[2]) & MASK
+            values[res] = ((x + y) & MASK, (x + y) >> 32)
         elif op == "OpIEqual":
             values[res] = val(a[1]) == val(a[2])
         elif op == "OpINotEqual":
             values[res] = val(a[1]) != val(a[2])
-        elif op == "OpSLessThan":
-            values[res] = _s32(val(a[1])) < _s32(val(a[2]))
+        elif op in ("OpSLessThan", "OpSLessThanEqual", "OpSGreaterThan", "OpSGreaterThanEqual"):
+            x, y = sval(a[1]), sval(a[2])
+            values[res] = {"OpSLessThan": x < y, "OpSLessThanEqual": x <= y,
+                           "OpSGreaterThan": x > y, "OpSGreaterThanEqual": x >= y}[op]
         elif op == "OpULessThan":
             values[res] = val(a[1]) < val(a[2])
+        elif op == "OpULessThanEqual":
+            values[res] = val(a[1]) <= val(a[2])
+        elif op == "OpUGreaterThan":
+            values[res] = val(a[1]) > val(a[2])
         elif op == "OpUGreaterThanEqual":
             values[res] = val(a[1]) >= val(a[2])
         elif op == "OpLogicalAnd":
@@ -446,6 +474,20 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
+        elif op in ("OpConvertUToF", "OpConvertSToF"):
+            x = val(a[1])
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
+                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
+        elif op in ("OpConvertFToU", "OpConvertFToS"):
+            x, bits = val(a[1]), types.bits(a[0])
+            if not isinstance(x, float) or not math.isfinite(x):
+                raise UnsupportedConstruct(f"{op} of a non-finite value (undefined in SPIR-V)")
+            n = math.trunc(x)
+            lo, hi = (0, 1 << bits) if op == "OpConvertFToU" else (-(1 << (bits - 1)), 1 << (bits - 1))
+            if not lo <= n < hi:
+                raise UnsupportedConstruct(f"{op} out of range (undefined in SPIR-V)")
+            values[res] = n & wmask(a[0])
         elif op in ("OpFOrdEqual", "OpFOrdLessThan", "OpFOrdGreaterThan", "OpFOrdGreaterThanEqual",
                     "OpFOrdLessThanEqual", "OpFUnordNotEqual"):
             x, y = val(a[1]), val(a[2])
@@ -494,6 +536,21 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
                 values[res] = f32(abs(args[0]))
+            elif name == "SAbs":
+                # Two's complement: the most negative value is its own absolute value (as on the hardware).
+                values[res] = abs(_s32(args[0])) & MASK
+            elif name in ("FMax", "FClamp"):
+                if any(math.isnan(v) for v in args) or (name == "FClamp" and args[1] > args[2]):
+                    raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
+                v = max(args[0], args[1])
+                values[res] = f32(v if name == "FMax" else min(v, args[2]))
+            elif name == "RoundEven":
+                x = args[0]
+                values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
+            elif name in ("FMin", "FMax"):
+                if any(math.isnan(x) for x in args):
+                    raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
+                values[res] = f32(min(args) if name == "FMin" else max(args))
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":

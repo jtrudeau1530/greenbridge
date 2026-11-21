@@ -34,6 +34,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
+WINDOWS_ONLY = ("runtime",)
 # Archives scanned for models and texture dictionaries, small to large.
 MODEL_ARCHIVES = [
     "common.rpf", "textures.rpf", "data.rpf",
@@ -201,6 +202,11 @@ MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
 def preflight(stages: list, work: str, wav: bool = False) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
+    if os.name != "nt":
+        asked = [s for s in stages if s in WINDOWS_ONLY]
+        if asked:
+            fail(f"The {', '.join(asked)} stage builds on Windows only for now. Leave it out of --stages; "
+                 "without --stages it is left out on this system.")
     missing = []
     if wav and "assets" in stages and not shutil.which("ffmpeg"):
         missing.append("ffmpeg (needed for --wav): https://ffmpeg.org/download.html, then reopen the terminal")
@@ -218,8 +224,9 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
             if not shutil.which(t):
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
     if "assets" in stages:
-        if not shutil.which("dotnet"):
-            missing.append(".NET 8 SDK: https://dotnet.microsoft.com/download/dotnet/8.0")
+        if not dotnet_sdk_ok():
+            missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
+                           "https://dotnet.microsoft.com/download/dotnet/8.0")
         ensure_submodule()
     if "runtime" in stages and os.name == "nt":
         vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
@@ -234,6 +241,18 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
     if free_gb < need_gb:
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work.")
+
+
+def dotnet_sdk_ok() -> bool:
+    """True if a .NET SDK 8 or newer is installed. `dotnet` is also on PATH with only a runtime, and then
+    `dotnet build` fails with "No .NET SDKs were found"."""
+    if not shutil.which("dotnet"):
+        return False
+    try:
+        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", r.stdout, re.M))
 
 
 def ensure_submodule() -> None:
@@ -275,7 +294,7 @@ def check(game: str, full: bool) -> dict:
 
 
 # ---------------------------------------------------------------- shaders
-def shaders(game: str, work: str, jobs: int, emulate: bool = False) -> None:
+def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False) -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -324,7 +343,12 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False) -> None:
                 had = f.read().strip()
         except OSError:
             had = "off"
-        if had != want:
+        if had == "on" and want == "off" and keep_emulated:
+            # auto answers differently from run to run (a GPU asleep or hidden, vulkaninfo missing); emulated
+            # shaders are exact on every GPU, so they are kept rather than translating the whole corpus again.
+            log("shaders: the shaders were translated with wave64 emulation and are kept (exact on every GPU); "
+                "--wave64-emulate off translates them natively")
+        elif had != want:
             log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
                 "translating again")
             drop(translated)
@@ -332,9 +356,12 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False) -> None:
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
-        translate(disasm, spirv, jobs, emulate=emulate)
+        # The mode goes down before the translation starts, while there is no index.json: a stop at any point then
+        # leaves either no index (translated again) or an index with the right mode, never one with a guessed mode.
+        os.makedirs(spirv, exist_ok=True)
         with open(mode_file, "w", encoding="utf-8") as f:
             f.write(want + "\n")
+        translate(disasm, spirv, jobs, emulate=emulate)
     log("shaders: done")
 
 
@@ -348,8 +375,20 @@ WAVE64_MODES = ("auto", "on", "off")
 
 def smallest_max_subgroup(vulkaninfo_text: str):
     """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
-    sizes = [int(n) for n in re.findall(r'maxSubgroupSize"?\s*[=:]\s*(\d+)', vulkaninfo_text)]
-    return min(sizes) if sizes else None
+    size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
+    starts = [m.start() for m in re.finditer(r'deviceName"?\s*[=:]', vulkaninfo_text)]
+    if not starts:
+        sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
+        return min(sizes) if sizes else None
+    # One section per device (a 1.3 device can print the size twice, in two property structs): one value each,
+    # and a device that prints none makes the answer unknown rather than being left out of the smallest.
+    per_device = []
+    for a, b in zip(starts, starts[1:] + [len(vulkaninfo_text)]):
+        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[a:b])]
+        if not sizes:
+            return None
+        per_device.append(min(sizes))
+    return min(per_device)
 
 
 def wave64_emulate(mode: str) -> bool:
@@ -375,8 +414,25 @@ def wave64_emulate(mode: str) -> bool:
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
         return True
     on = size < 64
+    if not on and runtime_gpu_native64() is False:
+        log(f"shaders: smallest maximum subgroup size is {size}, but the GPU the runtime would use can't be made to "
+            "run compute and mesh shaders 64-wide (subgroupSizeControl and the stage bits): wave64 emulation on")
+        return True
     log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
     return on
+
+
+def runtime_gpu_native64():
+    """True or False as tools/vk_subgroup_info.py answers for the GPU the runtime would use (the same test as
+    vk_pipeline_check's can_require_sg: subgroupSizeControl, and compute and mesh in requiredSubgroupSizeStages),
+    or None when it can't tell. It only ever turns emulation on: vulkaninfo's maxSubgroupSize alone doesn't say
+    that a 64-wide subgroup can be requested."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        return bool(json.loads(r.stdout.strip().splitlines()[-1])["native64"])
+    except (OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError):
+        return None
 
 
 def drop(*paths: str) -> None:
@@ -538,11 +594,26 @@ def positive_int(text: str) -> int:
     return value
 
 
+def pipeline_check_exe():
+    """vk_pipeline_check where the build puts it: runtime/build on Windows (scripts/build_runtime.ps1), the CMake
+    build folders of the README and CONTRIBUTING.md elsewhere."""
+    build = os.path.join(ROOT, "runtime", "build")
+    if os.name == "nt":
+        found = [os.path.join(build, "vk_pipeline_check.exe")]
+    else:
+        found = [os.path.join(build, "linux", "vk_pipeline_check"), os.path.join(build, "vk_pipeline_check")]
+    return next((p for p in found if os.path.isfile(p)), None)
+
+
 def pipelines(work: str, out: str) -> None:
-    exe = os.path.join(ROOT, "runtime", "build", "vk_pipeline_check.exe")
+    exe = pipeline_check_exe()
     spirv = os.path.join(work, "shaders", "spirv")
-    if not os.path.isfile(exe):
+    if not exe and os.name == "nt":
         fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
+    if not exe:
+        fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
+             "loader installed, run: cmake -S runtime -B runtime/build/linux && "
+             "cmake --build runtime/build/linux --parallel")
     if not os.path.isfile(os.path.join(spirv, "index.json")):
         fail("No translated shaders yet: run the shaders stage first.")
     log("pipelines: creating every shader module and compute pipeline on this GPU")
@@ -581,10 +652,13 @@ def main() -> int:
         return 0
     out = os.path.abspath(a.out or default_out())
     work = os.path.abspath(a.work or os.path.join(out, "work"))
+    # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.
+    real_game = os.path.normcase(os.path.realpath(game))
     for p in (out, work):
         try:
             # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
-            inside = os.path.commonpath([os.path.normcase(p), os.path.normcase(game)]) == os.path.normcase(game)
+            real_destination = os.path.normcase(os.path.realpath(p))
+            inside = os.path.commonpath([real_destination, real_game]) == real_game
         except ValueError:          # different drives
             inside = False
         if inside:
@@ -593,11 +667,15 @@ def main() -> int:
     for s in stages:
         if s not in STAGES:
             fail(f"unknown stage '{s}'")
+    if os.name != "nt" and a.stages == ap.get_default("stages"):
+        stages = [s for s in stages if s not in WINDOWS_ONLY]
+        log(f"{', '.join(WINDOWS_ONLY)}: left out, it builds on Windows only for now")
     preflight(stages, work, a.wav)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
-        shaders(game, work, a.jobs, emulate=wave64_emulate(a.wave64_emulate))
+        shaders(game, work, a.jobs, emulate=wave64_emulate(a.wave64_emulate),
+                keep_emulated=a.wave64_emulate == "auto")
     if "assets" in stages:
         assets(game, work, a.wav, a.jobs)
     if "runtime" in stages:

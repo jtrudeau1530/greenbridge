@@ -323,6 +323,8 @@ def _gap(gap):
 def scan_rpf(path, start=None, limit=None, progress=None):
     """Walk an RPF9 data area. Returns (records, summary). No tables of contents are read or decrypted."""
     rows = []
+    if os.path.getsize(path) == 0:
+        raise ValueError("empty file")
     with open(path, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         size = len(m)
@@ -454,13 +456,16 @@ def main():
     ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
-    if os.path.isdir(a.source):
-        rows, summary = scan_dir(a.source)
-    else:
-        def progress(n, pos, end):
-            if not a.quiet:
-                print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
-        rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
+    try:
+        if os.path.isdir(a.source):
+            rows, summary = scan_dir(a.source)
+        else:
+            def progress(n, pos, end):
+                if not a.quiet:
+                    print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
+            rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
+    except ValueError as e:
+        sys.exit(f"{a.source}: {e}")
     write_output(a.out, rows, summary)
     if a.rigs:
         if os.path.isdir(a.source):
