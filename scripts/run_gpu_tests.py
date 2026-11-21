@@ -691,6 +691,7 @@ def run_suite(a, work: str) -> int:
                 "ps_ops8": (0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F),
                 "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
                 "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
+                "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])

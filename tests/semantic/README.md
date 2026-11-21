@@ -13,7 +13,8 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_value_semantics.py` does the same for the recent value-level fixes: scalar b16 shifts, packed b16 shifts
   with `op_sel`, `v_add_nc_u16`, `v_sin_f16`/`v_cos_f16`, `s_buffer_load_dwordx2` into VCC and flat
   `v_interp_mov` input next to an interpolated one. `ps_ops5`, `ps_ops6`, `ps_vcc_x2` and `ps_flat` give 16 more
-  asserted values; `cs_bounds` runs as compute and asserts the four dwords in its buffer after in-bounds
+  asserted values, and `ps_fma_literal` 4 more: which operand the literal K multiplies in
+  `v_fmamk/fmaak/madmk/madak_f32`. `cs_bounds` runs as compute and asserts the four dwords in its buffer after in-bounds
   load/store and out-of-bounds load/store attempts (the V# has num_records 16). `ps_ops4` and `ps_legacy_mul`
   are also asserted there, duplicating the matching `test_ps_semantics.py` cases. As above, constants are
   written by hand and recomputed by plain-Python references checked against each other. `cs_fmt_1010102` runs
