@@ -317,6 +317,22 @@ if(BUILD_TESTING)
       target_link_options(fsr_dispatch_test PRIVATE /OPT:NOREF)
       target_link_libraries(fsr_dispatch_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY} psapi)
       add_test(NAME fsr_dispatch COMMAND fsr_dispatch_test)
+
+      # Optional: skips unless LEONIDA_GAME_DIR is set. Constructs the package's XboxBvhBuilder on the device proxy.
+      add_executable(bvh_builder_test
+        test/bvh_builder_test.cpp
+        src/pe_loader.cpp
+        shims/registry.cpp
+        shims/xmem.cpp
+        shims/d3d12_xs.cpp
+        shims/d3d12_xs_device.cpp
+      )
+      target_compile_definitions(bvh_builder_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+      target_compile_options(bvh_builder_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      target_link_options(bvh_builder_test PRIVATE /OPT:NOREF)
+      target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY} psapi)
+      add_dependencies(bvh_builder_test gta6rt_tls_host)
+      add_test(NAME bvh_builder COMMAND bvh_builder_test)
     endif()
 
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE_AUDIO are set.
