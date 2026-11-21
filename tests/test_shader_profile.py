@@ -270,10 +270,10 @@ class TestCommandLineEndToEnd(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_profile(self):
+    def run_profile(self, extra=()):
         out_json = os.path.join(self.tmp.name, "custom_profile.json")
         cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "shader_profile.py"), self.disasm_dir, "--out", out_json]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd + list(extra), capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"CLI failed: {res.stderr}")
         with open(out_json, encoding="utf-8") as f:
             return res.stdout, json.load(f, parse_constant=self.fail)
@@ -345,10 +345,7 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertIn("ps registers: VGPR max 2", stdout)
         self.assertNotIn("per_shader", data)
 
-        res = subprocess.run(cmd + ["--per-shader"], capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, f"CLI failed: {res.stderr}")
-        with open(out_json, encoding="utf-8") as f:
-            data = json.load(f)
+        _, data = self.run_profile(["--per-shader"])
         self.assertEqual(data["per_shader"], [
             {"name": "ps_001", "stage": "ps", "instructions": 4, "vgpr_count": 2, "sgpr_count": 4},
             {"name": "vs_002", "stage": "vs", "instructions": 3, "vgpr_count": 4, "sgpr_count": 0},
