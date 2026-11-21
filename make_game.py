@@ -427,6 +427,17 @@ def runtime(game: str, out: str, v: dict) -> None:
         log(f"runtime: done. Start {os.path.join(out, 'gta6rt.exe')}")
 
 
+def positive_int(text: str) -> int:
+    """--jobs: 0 or less would start no translation shard and merge an empty index as if the step had finished."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def pipelines(work: str, out: str) -> None:
     exe = os.path.join(ROOT, "runtime", "build", "vk_pipeline_check.exe")
     spirv = os.path.join(work, "shaders", "spirv")
@@ -450,7 +461,7 @@ def main() -> int:
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     a = ap.parse_args()
     below_normal()
@@ -468,7 +479,8 @@ def main() -> int:
     work = os.path.abspath(a.work or os.path.join(out, "work"))
     for p in (out, work):
         try:
-            inside = os.path.commonpath([p, game]) == game
+            # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
+            inside = os.path.commonpath([os.path.normcase(p), os.path.normcase(game)]) == os.path.normcase(game)
         except ValueError:          # different drives
             inside = False
         if inside:
