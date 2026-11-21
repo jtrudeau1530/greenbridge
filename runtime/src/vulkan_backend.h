@@ -31,7 +31,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdClearAttachments) X(vkDeviceWaitIdle) X(vkCreateImage) X(vkDestroyImage)                         \
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
-    X(vkUnmapMemory)
+    X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -48,7 +48,8 @@ struct VulkanDeviceFunctions {
                vkCmdClearDepthStencilImage && vkCmdClearAttachments && vkDeviceWaitIdle && vkCreateImage &&
                vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
-               vkFreeMemory && vkMapMemory && vkUnmapMemory;
+               vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
+               vkCmdCopyImageToBuffer && vkCmdCopyImage;
     }
 };
 
@@ -65,6 +66,10 @@ public:
         replay_.begin_rendering = vk.vkCmdBeginRendering;
         replay_.end_rendering = vk.vkCmdEndRendering;
         replay_.clear_attachments = vk.vkCmdClearAttachments;
+        replay_.copy_buffer = vk.vkCmdCopyBuffer;
+        replay_.copy_buffer_to_image = vk.vkCmdCopyBufferToImage;
+        replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
+        replay_.copy_image = vk.vkCmdCopyImage;
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
@@ -250,6 +255,13 @@ public:
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         context_.vk.vkBeginCommandBuffer(command_buffer, &begin);
         for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
+        // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
+        // readback buffers are read through Map once the application has waited.
+        VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                         0, 1, &host, 0, nullptr, 0, nullptr);
         context_.vk.vkEndCommandBuffer(command_buffer);
         return submit(command_buffer, VK_NULL_HANDLE, 0) ? ReplayResult::success : ReplayResult::unsupported;
     }

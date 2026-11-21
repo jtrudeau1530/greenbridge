@@ -67,6 +67,27 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8_UNORM: return {VK_FORMAT_R8_UNORM, color};
     case DXGI_FORMAT_R32_FLOAT: return {VK_FORMAT_R32_SFLOAT, color};
     case DXGI_FORMAT_R32_UINT: return {VK_FORMAT_R32_UINT, color};
+    case DXGI_FORMAT_BC1_TYPELESS: return {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, color, true};
+    case DXGI_FORMAT_BC1_UNORM: return {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, color};
+    case DXGI_FORMAT_BC1_UNORM_SRGB: return {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, color};
+    case DXGI_FORMAT_BC2_TYPELESS: return {VK_FORMAT_BC2_UNORM_BLOCK, color, true};
+    case DXGI_FORMAT_BC2_UNORM: return {VK_FORMAT_BC2_UNORM_BLOCK, color};
+    case DXGI_FORMAT_BC2_UNORM_SRGB: return {VK_FORMAT_BC2_SRGB_BLOCK, color};
+    case DXGI_FORMAT_BC3_TYPELESS: return {VK_FORMAT_BC3_UNORM_BLOCK, color, true};
+    case DXGI_FORMAT_BC3_UNORM: return {VK_FORMAT_BC3_UNORM_BLOCK, color};
+    case DXGI_FORMAT_BC3_UNORM_SRGB: return {VK_FORMAT_BC3_SRGB_BLOCK, color};
+    case DXGI_FORMAT_BC4_TYPELESS: return {VK_FORMAT_BC4_UNORM_BLOCK, color, true};
+    case DXGI_FORMAT_BC4_UNORM: return {VK_FORMAT_BC4_UNORM_BLOCK, color};
+    case DXGI_FORMAT_BC4_SNORM: return {VK_FORMAT_BC4_SNORM_BLOCK, color};
+    case DXGI_FORMAT_BC5_TYPELESS: return {VK_FORMAT_BC5_UNORM_BLOCK, color, true};
+    case DXGI_FORMAT_BC5_UNORM: return {VK_FORMAT_BC5_UNORM_BLOCK, color};
+    case DXGI_FORMAT_BC5_SNORM: return {VK_FORMAT_BC5_SNORM_BLOCK, color};
+    case DXGI_FORMAT_BC6H_TYPELESS: return {VK_FORMAT_BC6H_UFLOAT_BLOCK, color, true};
+    case DXGI_FORMAT_BC6H_UF16: return {VK_FORMAT_BC6H_UFLOAT_BLOCK, color};
+    case DXGI_FORMAT_BC6H_SF16: return {VK_FORMAT_BC6H_SFLOAT_BLOCK, color};
+    case DXGI_FORMAT_BC7_TYPELESS: return {VK_FORMAT_BC7_UNORM_BLOCK, color, true};
+    case DXGI_FORMAT_BC7_UNORM: return {VK_FORMAT_BC7_UNORM_BLOCK, color};
+    case DXGI_FORMAT_BC7_UNORM_SRGB: return {VK_FORMAT_BC7_SRGB_BLOCK, color};
     case DXGI_FORMAT_D32_FLOAT: return {VK_FORMAT_D32_SFLOAT, d};
     case DXGI_FORMAT_D16_UNORM: return {VK_FORMAT_D16_UNORM, d};
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return {VK_FORMAT_D32_SFLOAT_S8_UINT, ds};
@@ -186,7 +207,10 @@ public:
         } else {
             log_once("default-heap buffers are not zero-filled yet; dimension", int(desc_.Dimension));
         }
-        device_.context->add_resource(id(), leonida::ResourceBinding{});  // a buffer: no image
+        leonida::ResourceBinding binding{};  // a buffer: no image
+        binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        device_.context->add_resource(id(), binding);
         return S_OK;
     }
 
@@ -457,6 +481,71 @@ public:
         return hand_out(resource, riid, out);
     }
 
+    // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
+    // depth-stencil), subresources placed at D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, block-compressed sizes rounded up to whole blocks, depth-stencil
+    // formats as two planes. d3d12_vulkan_device_test compares every output with the PC runtime's.
+    void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC* desc, UINT first, UINT count, UINT64 base,
+                                                 D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows,
+                                                 UINT64* row_sizes, UINT64* total) override {
+        const auto fail = [&] {
+            for (UINT i = 0; i < count; ++i) {
+                if (layouts) std::memset(&layouts[i], 0xff, sizeof(layouts[i]));
+                if (rows) rows[i] = ~0u;
+                if (row_sizes) row_sizes[i] = ~0ull;
+            }
+            if (total) *total = ~0ull;
+        };
+        if (!desc) return fail();
+        const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (first != 0 || count != 1) return fail();
+            if (layouts) layouts[0] = {base, {DXGI_FORMAT_UNKNOWN, UINT(desc->Width), 1, 1,
+                                              UINT(align(desc->Width, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT))}};
+            if (rows) rows[0] = 1;
+            if (row_sizes) row_sizes[0] = desc->Width;
+            if (total) *total = desc->Width;
+            return;
+        }
+        if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            log_once("GetCopyableFootprints dimension not supported:", desc->Dimension);
+            return fail();
+        }
+        const Format format = vulkan_format(desc->Format, true);  // typeless depth families are planar either way
+        UINT mips = desc->MipLevels;
+        if (!mips)
+            for (UINT64 size = std::max<UINT64>(desc->Width, desc->Height); size; size >>= 1) ++mips;
+        const UINT planes = (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? 2 : 1;
+        const UINT per_plane = mips * desc->DepthOrArraySize;
+        if (!format.format || UINT64(first) + count > UINT64(per_plane) * planes) return fail();
+
+        UINT64 offset = base, end = base;
+        for (UINT i = 0; i < count; ++i) {
+            const UINT index = first + i, plane = index / per_plane, mip = index % mips;
+            const VkImageAspectFlags aspect =
+                planes == 2 ? (plane ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : format.aspects;
+            const leonida::BlockFormat block = leonida::block_format(format.format, aspect);
+            if (!block.bytes) return fail();
+            const UINT width = std::max<UINT>(1, UINT(desc->Width >> mip)), height = std::max<UINT>(1, desc->Height >> mip);
+            const UINT blocks_wide = (width + block.block - 1) / block.block;
+            const UINT blocks_high = (height + block.block - 1) / block.block;
+            const UINT64 row_size = UINT64(blocks_wide) * block.bytes;
+            // Measured against the PC runtime (d3d12_vulkan_device_test): planar depth-stencil rows are padded to
+            // 512 bytes, every other format's to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256).
+            const UINT pitch = UINT(align(row_size, planes == 2 ? 2 * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+                                                                : D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+            offset = align(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            DXGI_FORMAT footprint_format = desc->Format;
+            if (planes == 2) footprint_format = plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
+            if (layouts)
+                layouts[i] = {offset, {footprint_format, blocks_wide * block.block, blocks_high * block.block, 1, pitch}};
+            if (rows) rows[i] = blocks_high;
+            if (row_sizes) row_sizes[i] = row_size;
+            end = offset + UINT64(blocks_high - 1) * pitch + row_size;
+            offset += UINT64(blocks_high) * pitch;
+        }
+        if (total) *total = end - base;
+    }
+
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
         log_once("CheckFeatureSupport feature", feature);
         if (!data) return E_INVALIDARG;
@@ -578,6 +667,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.instance = owned.instance;
     info.separate_depth_stencil_layouts = true;
     VkPhysicalDeviceProperties chosen{};
+    bool chosen_bc = false;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -586,6 +676,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
         vkGetPhysicalDeviceFeatures2(candidate, &features);
+        const bool bc = features.features.textureCompressionBC;
         if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore ||
             !f12.separateDepthStencilLayouts)
             continue;
@@ -599,6 +690,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 info.physical = candidate;
                 info.queue_family = i;
                 chosen = props;
+                chosen_bc = bc;
             }
             break;
         }
@@ -618,9 +710,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     queue_info.queueFamilyIndex = info.queue_family;
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
+    VkPhysicalDeviceFeatures enable{};
+    enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
+    if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+    device_info.pEnabledFeatures = &enable;
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;

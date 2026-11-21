@@ -32,6 +32,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::unresolved_resource: return "unknown resource";
     case leonida::ReplayResult::invalid_subresource: return "invalid subresource";
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
+    case leonida::ReplayResult::invalid_copy: return "invalid copy";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -138,6 +139,23 @@ public:
         }
     }
 
+    void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
+                                            UINT64 src_offset, UINT64 bytes) override {
+        check(list_.copy_buffer({resource_id(dst), dst_offset, resource_id(src), src_offset, bytes}));
+    }
+
+    void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
+                                             const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) override {
+        if (!dst || !src) return check(false);
+        leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
+        if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
+        check(list_.copy_texture(copy));
+    }
+
+    void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
+        check(list_.copy_resource({resource_id(dst), resource_id(src)}));
+    }
+
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,
                                                  const D3D12_RECT* rects) override {
         if (!view.ptr || !color) return check(false);
@@ -159,6 +177,15 @@ private:
     template<class E>
     static std::uint32_t u(E value) {
         return static_cast<std::uint32_t>(value);
+    }
+
+    static leonida::CopyLocation location(const D3D12_TEXTURE_COPY_LOCATION& l) {
+        if (l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            const auto& f = l.PlacedFootprint;
+            return {resource_id(l.pResource), true, 0, f.Offset, f.Footprint.Width, f.Footprint.Height,
+                    f.Footprint.Depth, f.Footprint.RowPitch};
+        }
+        return {resource_id(l.pResource), false, l.SubresourceIndex, 0, 0, 0, 0, 0};
     }
 
     static std::vector<leonida::Rect> to_rects(UINT count, const D3D12_RECT* rects) {

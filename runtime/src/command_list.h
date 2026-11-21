@@ -2,7 +2,7 @@
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
-// render-target and depth-stencil clears (whole views or rectangles). It has no Windows or Vulkan dependency.
+// render-target and depth-stencil clears (whole views or rectangles), and copies. It has no Windows or Vulkan dependency.
 
 #include <array>
 #include <cstdint>
@@ -219,6 +219,59 @@ struct TextureBarrier {
 };
 
 // rects empty: the whole view.
+// CopyBufferRegion.
+struct CopyBuffer {
+    ResourceId dst;
+    std::uint64_t dst_offset;
+    ResourceId src;
+    std::uint64_t src_offset;
+    std::uint64_t size;
+};
+
+// D3D12_TEXTURE_COPY_LOCATION: a texture subresource, or a placed footprint in a buffer. The footprint's format is
+// not kept: the copy uses the texture's own format for the plane, which D3D12 requires to be compatible.
+struct CopyLocation {
+    ResourceId resource;
+    bool footprint;
+    std::uint32_t subresource;  // texture
+    std::uint64_t offset;       // footprint: byte offset in the buffer
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t depth;
+    std::uint32_t row_pitch;
+};
+
+// D3D12_BOX: right, bottom and back are exclusive.
+struct CopyBox {
+    std::uint32_t left;
+    std::uint32_t top;
+    std::uint32_t front;
+    std::uint32_t right;
+    std::uint32_t bottom;
+    std::uint32_t back;
+};
+
+// CopyTextureRegion. Without a box, the whole source subresource or footprint is copied.
+struct CopyTexture {
+    CopyLocation dst;
+    std::uint32_t x;
+    std::uint32_t y;
+    std::uint32_t z;
+    CopyLocation src;
+    bool has_box;
+    CopyBox box;
+};
+
+// CopyResource: every subresource, or the whole buffer.
+struct CopyResource {
+    ResourceId dst;
+    ResourceId src;
+};
+
+// D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
+inline constexpr std::uint32_t texture_data_pitch_alignment = 256;
+inline constexpr std::uint32_t texture_data_placement_alignment = 512;
+
 struct ClearRenderTarget {
     TargetView target;
     ClearColor color;
@@ -234,7 +287,8 @@ struct ClearDepthStencil {
 };
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
-                             TextureBarrier, ClearRenderTarget, ClearDepthStencil>;
+                             TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
+                             CopyResource>;
 
 class CommandList {
 public:
@@ -276,6 +330,26 @@ public:
         return append(barrier);
     }
 
+    // Copies. The rules D3D12 states for the call itself are checked here; ranges against the resources are
+    // checked at replay, when the resources are known.
+    bool copy_buffer(const CopyBuffer& copy) {
+        if (!copy.dst || !copy.src || !copy.size) return false;
+        return append(copy);
+    }
+
+    bool copy_texture(const CopyTexture& copy) {
+        if (!valid(copy.dst) || !valid(copy.src) || (copy.dst.footprint && copy.src.footprint)) return false;
+        if (copy.has_box && (copy.box.right <= copy.box.left || copy.box.bottom <= copy.box.top ||
+                             copy.box.back <= copy.box.front))
+            return false;
+        return append(copy);
+    }
+
+    bool copy_resource(const CopyResource& copy) {
+        if (!copy.dst || !copy.src || copy.dst == copy.src) return false;
+        return append(copy);
+    }
+
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
     bool clear_render_target(const TargetView& target, const ClearColor& color, std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
@@ -310,6 +384,15 @@ public:
 
 private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
+
+    // A placed footprint needs aligned offsets and pitches and a non-empty size.
+    static bool valid(const CopyLocation& location) {
+        if (!location.resource) return false;
+        if (!location.footprint) return true;
+        return location.width && location.height && location.depth && location.row_pitch &&
+               location.offset % texture_data_placement_alignment == 0 &&
+               location.row_pitch % texture_data_pitch_alignment == 0;
+    }
 
     // A split begin and end cannot be the same barrier.
     static bool valid_sync(std::uint32_t before, std::uint32_t after) {

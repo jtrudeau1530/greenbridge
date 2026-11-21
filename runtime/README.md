@@ -74,7 +74,8 @@ Current limits, by design:
   the measured-slot Xbox-ABI proxy: the host PC `ID3D12Device` by default, or the Vulkan-backed device
   (`shims/d3d12_vulkan_device.cpp`) when `LEONIDA_D3D12=vulkan` is set and the runtime was built with the
   Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
-  depth views and committed resources; see `docs/d3d12_vulkan.md` section 3.2 for what is missing.
+  depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
+  section 3.2 for what is missing.
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
