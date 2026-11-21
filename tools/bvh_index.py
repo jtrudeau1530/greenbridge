@@ -167,10 +167,19 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
     rows = []
     t0 = time.time()
     with open(path, "rb") as fh:
+        if os.fstat(fh.fileno()).st_size == 0:   # mmap refuses an empty file; it holds no streams
+            if start:
+                raise ValueError("start offset is outside the archive")
+            return rows, [summarize(rows, path, 0, 0, 0, time.time() - t0)]
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         try:
             size = len(m)
-            pos = start if start is not None else struct.unpack_from("<I", m, 4)[0]
+            if start is not None:
+                pos = start
+            else:   # too short for the header word: nothing to scan
+                pos = struct.unpack_from("<I", m, 4)[0] if size >= 8 else size
+            if not 0 <= pos <= size:
+                raise ValueError("start offset is outside the archive")
             end = min(size, pos + limit) if limit else size
             span = end - pos
             last, zero, unread = pos, 0, 0
@@ -229,7 +238,11 @@ def scan_dir(path):
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
-            r, s = scan_rpf(p)
+            try:
+                r, s = scan_rpf(p)
+            except (OSError, ValueError) as e:   # one unreadable archive should not lose the others
+                print(f"{p}: skipped ({e})", file=sys.stderr)
+                continue
             rows += r
             summaries.append(s)
         return rows, summaries
@@ -276,20 +289,47 @@ def write_outputs(rows, summaries, out, csv_path):
                 w.writerow(r)
 
 
+def byte_count(text):
+    """--limit: 0 or less used to scan nothing (negative) or everything (0 is falsy) without a word."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def offset(text):
+    """--start: a negative offset would slice the archive from its end."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
     ap.add_argument("--out", help="write JSON (summary + per-stream rows)")
     ap.add_argument("--csv", help="write CSV (offset, size, signature, readable fields)")
-    ap.add_argument("--start", type=int, help="data-area start (default: u32 at file offset 4)")
-    ap.add_argument("--limit", type=int, help="stop after this many bytes of the data area")
-    ap.add_argument("--max-inflate", type=int, default=1 << 28, help="keep at most this many bytes of one stream")
+    ap.add_argument("--start", type=offset, help="data-area start (default: u32 at file offset 4)")
+    ap.add_argument("--limit", type=byte_count, help="stop after this many bytes of the data area")
+    ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
+                    help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
     below_normal()
     if os.path.isdir(a.target):
         rows, summaries = scan_dir(a.target)
     else:
-        rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)
+        try:
+            rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)
+        except (OSError, ValueError) as e:
+            print(f"{a.target}: {e}", file=sys.stderr)
+            return 2
     for s in summaries:
         print(json.dumps(s, indent=1))
     write_outputs(rows, summaries, a.out, a.csv)

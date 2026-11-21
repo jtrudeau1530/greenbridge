@@ -160,6 +160,8 @@ python -I tools/navmesh_index.py <carve-dir> --pattern *.bin --out carved-index.
 python -I tests/test_navmesh_index.py
 ```
 
+`--start` must be 0 or more and `--limit` at least 1; anything else is refused with exit code 2 before the scan.
+
 Validation on the first 64 MiB of the real archive: 1,378 streams, 1,132 directory pages, all version 122,
 1,077 keys present, about 2 s. A full run produced 9,603 rows (745,601,504 stored / 2,764,382,624 inflated) in
 132 s, matching the independent census. The synthetic test builds its own RPF9 header and pages; it needs no

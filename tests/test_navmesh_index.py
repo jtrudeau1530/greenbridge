@@ -118,6 +118,16 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not an RPF7/8/9 archive", r.stderr)
 
+    def test_limit_below_one_is_refused(self):
+        path = os.path.join(self.root, "nav.rpf")
+        make_rpf(path)
+        for extra in (("--limit", "0"), ("--limit", "-100"), ("--start", "-1")):
+            out = os.path.join(self.root, "x.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--out", out, *extra],
+                               cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertFalse(os.path.exists(out))
+
 
 if __name__ == "__main__":
     unittest.main()
