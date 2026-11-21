@@ -148,7 +148,9 @@ read and the licence limits on it.
 
 The biggest open pieces:
 
-- **Compute, mesh and geometry shaders**: their per-stage system-value register layout.
+- **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
+  [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
+  unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
 - **Xbox D3D12 → Vulkan**: the `d3d12_xs` command list and descriptor heap model.
 - **Model layouts** the decoder rejects today.
 
