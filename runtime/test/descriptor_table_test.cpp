@@ -219,6 +219,56 @@ int test_clear_resets_table() {
     return 0;
 }
 
+int test_erase_and_cluster_compact() {
+    DescriptorTable table(16);
+
+    const std::uint32_t k1[8] = {1, 10, 100, 1000, 2, 20, 200, 2000};
+    const std::uint32_t k2[8] = {3, 30, 300, 3000, 4, 40, 400, 4000};
+    const std::uint32_t k3[8] = {5, 50, 500, 5000, 6, 60, 600, 6000};
+
+    // Erasing a non-existent key returns false
+    EXPECT(!table.erase(k1));
+
+    EXPECT(table.insert(k1, 101));
+    EXPECT(table.insert(k2, 102));
+    EXPECT(table.insert(k3, 103));
+    EXPECT(table.size() == 3);
+
+    // Erase middle element
+    EXPECT(table.erase(k2));
+    EXPECT(table.size() == 2);
+    EXPECT(!table.contains(k2));
+    EXPECT(table.lookup(k2) == 0);
+    EXPECT(table.contains(k1));
+    EXPECT(table.lookup(k1) == 101);
+    EXPECT(table.contains(k3));
+    EXPECT(table.lookup(k3) == 103);
+
+    // Double erase returns false
+    EXPECT(!table.erase(k2));
+
+    // Erase remaining entries
+    EXPECT(table.erase(k1));
+    EXPECT(table.size() == 1);
+    EXPECT(!table.contains(k1));
+    EXPECT(table.lookup(k1) == 0);
+    EXPECT(table.contains(k3));
+    EXPECT(table.lookup(k3) == 103);
+
+    EXPECT(table.erase(k3));
+    EXPECT(table.size() == 0);
+    EXPECT(!table.contains(k3));
+    EXPECT(table.lookup(k3) == 0);
+
+    // Re-inserting into erased slots
+    EXPECT(table.insert(k1, 201));
+    EXPECT(table.size() == 1);
+    EXPECT(table.contains(k1));
+    EXPECT(table.lookup(k1) == 201);
+
+    return 0;
+}
+
 int main() {
     EXPECT(test_fnv1a_hash_matches_contract() == 0);
     EXPECT(test_ssharp_key_padding() == 0);
@@ -228,6 +278,7 @@ int main() {
     EXPECT(test_gpu_buffer_serialization() == 0);
     EXPECT(test_multithreaded_insert_and_lookup() == 0);
     EXPECT(test_clear_resets_table() == 0);
+    EXPECT(test_erase_and_cluster_compact() == 0);
 
     std::printf("descriptor_table_test: all tests passed (0 failures)\n");
     return 0;

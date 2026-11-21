@@ -4,6 +4,7 @@
 
 Every byte here is built by the test. No game file, game asset path or game name is used.
 """
+import csv
 import json
 import os
 import struct
@@ -16,6 +17,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import rbf0_tree  # noqa: E402
+import rbf0_index  # noqa: E402
 
 WIDE = b"RBF0" + rbf0_tree.PROLOGUE
 CLOSE = b"\xff\xff"
@@ -94,18 +96,21 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(root["offset"], 8)
         self.assertEqual(root["header_offset"], 20)
         self.assertEqual(root["end"], len(blob))
+        self.assertEqual((root["children"], root["content_count"], root["attrs_actual"]), (2, 2, 0))
         item = root["content"][0]
         self.assertEqual(item["name"], "Item")
         self.assertEqual(item["offset"], 26)
         self.assertEqual(item["header_offset"], 34)
         self.assertEqual(item["depth"], 2)
         self.assertEqual(item["attrs_declared"], 2)
+        self.assertEqual((item["children"], item["content_count"], item["attrs_actual"]), (1, 2, 2))
         self.assertEqual([a["name"] for a in item["attributes"]], ["count", "label"])
         self.assertEqual([a["value"] for a in item["attributes"]], [7, "alpha"])
         self.assertEqual([n["kind"] for n in item["content"]], ["element", "value"])
         child = item["content"][0]
         self.assertEqual(child["name"], "Child")
         self.assertEqual(child["depth"], 3)
+        self.assertEqual((child["children"], child["content_count"], child["attrs_actual"]), (0, 1, 0))
         self.assertEqual(child["content"][0]["kind"], "text")
         self.assertEqual(child["content"][0]["depth"], 4)
         self.assertEqual(child["content"][0]["text"], "body")
@@ -113,9 +118,48 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(item["content"][1]["name"], "ratio")
         self.assertEqual(item["content"][1]["value"], 0.5)
         self.assertTrue(item["value_after_child"])
+        empty = root["content"][1]
+        self.assertEqual(empty["name"], "Empty")
+        self.assertEqual((empty["children"], empty["content_count"], empty["attrs_actual"]), (0, 0, 0))
+        self.assertEqual(empty["content"], [])
+        self.assertEqual(empty["end"], len(blob) - 2)
         self.assertEqual(doc["attribute_mismatches"], 0)
         self.assertEqual(doc["attribute_order_violations"], 0)
         self.assertEqual(doc["max_depth"], 3)  # elements only; the text child is at element depth 4
+
+    def test_siblings_and_empty_element(self):
+        doc = rbf0_tree.parse_resource(wide_blob())
+        root = doc["tree"]
+        siblings = [c for c in root["content"] if c["kind"] == "element"]
+        self.assertEqual([c["name"] for c in siblings], ["Item", "Empty"])
+        self.assertEqual([c["offset"] for c in siblings],
+                         sorted(c["offset"] for c in siblings))
+        self.assertEqual(root["children"], 2)
+        self.assertEqual(siblings[1]["children"], 0)
+        self.assertEqual(siblings[1]["content"], [])
+        self.assertIsNotNone(siblings[1]["end"])
+
+    def test_index_output_stays_flat(self):
+        parsed = rbf0_index.parse_rbf0(wide_blob())
+        self.assertEqual(parsed["status"], "ok")
+        self.assertNotIn("tree", parsed)
+
+    def test_malformed_close_matches_index_parser(self):
+        cases = [
+            ("bad close", WIDE + _open(0, b"TestRoot") + b"\xff\x00", "bad", "close tag is not FF FF"),
+            ("close without open", WIDE + b"\xff\xff", "bad", "close without an open element"),
+            ("bad text tag", WIDE + _open(0, b"TestRoot") + b"\xfd\x00" + struct.pack("<I", 1) + b"\x00",
+             "bad", "text tag is not FD FF"),
+            ("truncated", WIDE + _open(0, b"TestRoot"), "truncated", "unclosed element(s)"),
+        ]
+        for label, blob, status, needle in cases:
+            with self.subTest(label):
+                tree_doc = rbf0_tree.parse_resource(blob)
+                index_doc = rbf0_index.parse_rbf0(blob)
+                self.assertEqual(tree_doc["status"], status)
+                self.assertEqual(index_doc["status"], status)
+                self.assertIn(needle, tree_doc["error"])
+                self.assertIn(needle, index_doc["error"])
 
     def test_descriptor_table(self):
         doc = rbf0_tree.parse_resource(wide_blob())
@@ -208,6 +252,27 @@ class ParseTest(unittest.TestCase):
         self.assertIn("word is not zero", doc["error"])
         self.assertIsNone(doc["tree"])
 
+    def test_string_keeps_a_trailing_nul(self):
+        b = WIDE + _open(0, b"TestRoot") + _value(1, 0x60, struct.pack("<H", 2) + b"a\x00", b"label") + CLOSE
+        doc = rbf0_tree.parse_resource(b)
+        value = doc["tree"]["content"][0]
+        self.assertEqual(value["value"], "a\x00")
+        self.assertTrue(value["nul_terminated"])
+        self.assertEqual(value["byte_length"], 2)
+
+    def test_non_finite_float_is_json_safe(self):
+        b = WIDE + _open(0, b"TestRoot") + _value(1, 0x40, struct.pack("<d", float("nan")), b"ratio") + CLOSE
+        doc = rbf0_tree.parse_resource(b)
+        value = doc["tree"]["content"][0]
+        self.assertIsNone(value["value"])
+        self.assertEqual(value["float_special"], "nan")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "tree.json")
+            rbf0_tree.write_json(path, [doc], {"resources": 1})
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+        self.assertIsNone(loaded["resources"][0]["tree"]["content"][0]["value"])
+
     def test_not_rbf0(self):
         with self.assertRaises(rbf0_tree.TreeError):
             rbf0_tree.parse_resource(b"PSIN" + bytes(16))
@@ -253,6 +318,13 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(docs[0]["root_name"], "TestRoot")
         self.assertEqual(summary["ok"], 1)
 
+    def test_source_without_rbf0(self):
+        path = os.path.join(self.root, "not-rbf0.bin")
+        with open(path, "wb") as f:
+            f.write(b"PSIN" + bytes(16))
+        with self.assertRaises(SystemExit):
+            rbf0_tree.decode_source(path)
+
 
 class OutputTest(unittest.TestCase):
     def setUp(self):
@@ -294,6 +366,8 @@ class OutputTest(unittest.TestCase):
         texts = root.findall(".//text")
         self.assertEqual(texts[0].text, "a < b & c")
         self.assertEqual(texts[1].text, "a\ufffdb")  # XML 1.0 control bytes are replaced, not emitted
+        rbf0_tree.write_xml(xml_dir, doc["resources"])  # a rerun overwrites, it does not add -0000 duplicates
+        self.assertEqual(len(os.listdir(xml_dir)), 1)
 
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
@@ -315,6 +389,46 @@ class OutputTest(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["summary"]["bad"], 1)
+
+    def test_summary_tree_shape(self):
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        _, summary = rbf0_tree.decode_source(self.root)
+        self.assertEqual(summary["nodes"], 8)
+        self.assertEqual(summary["elements_by_depth"], {"1": 1, "2": 2, "3": 1})
+        self.assertEqual(summary["children_histogram"], {"0": 2, "1": 1, "2": 1})
+        self.assertEqual(summary["content_length_histogram"], {"0": 1, "1": 1, "2": 2})
+        self.assertEqual(summary["attribute_count_histogram"], {"0": 3, "2": 1})
+        self.assertEqual(summary["leaf_elements"], 2)
+        self.assertEqual(summary["empty_elements"], 1)
+        self.assertEqual(summary["text_only_elements"], 1)
+        self.assertEqual(summary["parent_child_edges"], 3)
+        self.assertEqual(summary["max_children"], 2)
+        self.assertEqual(summary["mean_children"], 0.75)
+
+    def test_csv_node_table(self):
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        out = os.path.join(self.root, "tree.json")
+        csv_path = os.path.join(self.root, "nodes.csv")
+        self.assertEqual(rbf0_tree.main([self.root, out, "--csv", csv_path, "--quiet"]), 0)
+        with open(csv_path, encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 8)
+        root = rows[0]
+        self.assertEqual((root["kind"], root["name"], root["parent"], root["children"],
+                          root["content_count"]), ("element", "TestRoot", "", "2", "2"))
+        item = next(r for r in rows if r["name"] == "Item")
+        self.assertEqual((item["slot"], item["sibling"], item["child_index"]), ("content", "0", "0"))
+        self.assertEqual(item["parent"], "0x8")
+        self.assertEqual((item["attrs"], item["children"]), ("2", "1"))
+        count = next(r for r in rows if r["slot"] == "attribute" and r["name"] == "count")
+        self.assertEqual(count["parent"], item["offset"])
+        self.assertEqual((count["type"], count["value"]), ("int", "7"))
+        text = next(r for r in rows if r["kind"] == "text")
+        self.assertEqual((text["value"], text["nul"], text["utf8"]), ("body", "1", "1"))
+        empty = next(r for r in rows if r["name"] == "Empty")
+        self.assertEqual((empty["children"], empty["content_count"]), ("0", "0"))
 
 
 if __name__ == "__main__":

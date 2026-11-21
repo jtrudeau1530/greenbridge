@@ -400,6 +400,13 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
         elif op == "OpISubBorrow":
             x, y = val(a[1]) & MASK, val(a[2]) & MASK
             values[res] = ((x - y) & MASK, 1 if x < y else 0)
+        elif op in ("OpUMulExtended", "OpSMulExtended"):
+            # Result struct {low, high} of the full 64-bit product (SPIR-V spec, 32-bit scalars only).
+            x, y = val(a[1]) & MASK, val(a[2]) & MASK
+            if op == "OpSMulExtended":
+                x, y = _s32(x), _s32(y)
+            p = (x * y) & 0xFFFFFFFFFFFFFFFF
+            values[res] = (p & MASK, p >> 32)
         elif op == "OpIEqual":
             values[res] = val(a[1]) == val(a[2])
         elif op == "OpINotEqual":
@@ -408,6 +415,8 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = _s32(val(a[1])) < _s32(val(a[2]))
         elif op == "OpULessThan":
             values[res] = val(a[1]) < val(a[2])
+        elif op == "OpUGreaterThanEqual":
+            values[res] = val(a[1]) >= val(a[2])
         elif op == "OpLogicalAnd":
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, bool) and isinstance(y, bool)):
@@ -477,8 +486,27 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 values[res] = f32(abs(args[0]))
             elif name == "UMin":
                 values[res] = min(args)
+            elif name == "UMax":
+                values[res] = max(args)
             elif name == "SMax":
                 values[res] = max(args, key=_s32)
+            elif name == "SMin":
+                values[res] = min(args, key=_s32)
+            elif name in ("UClamp", "SClamp"):
+                # min(max(x, minVal), maxVal) (GLSL.std.450; undefined if minVal > maxVal, which raises here).
+                key = _s32 if name == "SClamp" else (lambda v: v)
+                x, lo, hi = args
+                if key(lo) > key(hi):
+                    raise UnsupportedConstruct(f"{name} with minVal > maxVal (undefined)")
+                values[res] = min(max(x, lo, key=key), hi, key=key)
+            elif name == "FindILsb":
+                # Bit number of the least significant 1 bit, -1 if the value is 0 (GLSL.std.450).
+                x = args[0] & MASK
+                values[res] = (x & -x).bit_length() - 1 & MASK if x else MASK
+            elif name == "FindUMsb":
+                # Bit number of the most significant 1 bit, -1 if the value is 0 (GLSL.std.450).
+                x = args[0] & MASK
+                values[res] = x.bit_length() - 1 if x else MASK
             elif name == "FindSMsb":
                 x = _s32(args[0])
                 if x in (0, -1):

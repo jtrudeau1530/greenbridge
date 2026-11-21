@@ -1583,6 +1583,51 @@ class ViewerServeTest(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
+    def test_host_allowed_accepts_loopback_names_only(self):
+        for host in ("127.0.0.1", "127.0.0.1:8765", "localhost", "LOCALHOST:8765", "localhost.:8765",
+                     "[::1]", "[::1]:8765", None):
+            with self.subTest(host=host):
+                self.assertTrue(viewer_serve.host_allowed(host))
+        for host in ("evil.example", "evil.example:8765", "127.0.0.1.evil.example", "localhost.evil.example:8765",
+                     "192.168.1.5:8765", "0.0.0.0:8765", "[::2]:8765", ""):
+            with self.subTest(host=host):
+                self.assertFalse(viewer_serve.host_allowed(host))
+
+    def test_handler_refuses_a_foreign_host_header(self):
+        # DNS rebinding: a web page points its own domain at 127.0.0.1, so the request arrives here with that domain.
+        with tempfile.TemporaryDirectory() as tmp:
+            world_dir = os.path.join(tmp, "world")
+            os.makedirs(world_dir)
+            with open(os.path.join(world_dir, "world.json"), "w", encoding="utf-8") as f:
+                f.write('{"spawn": "WORLD_PAYLOAD"}')
+
+            class QuietHandler(viewer_serve.Handler):
+                def log_message(self, format, *args):
+                    pass
+
+            QuietHandler.world = os.path.abspath(world_dir)
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(QuietHandler, directory=VIEWER))
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                for host, status in ((f"rebind.example:{port}", 403), ("evil.example", 403),
+                                     (f"localhost:{port}", 200), (f"127.0.0.1:{port}", 200)):
+                    for path in ("/world/world.json", "/index.html"):
+                        with self.subTest(host=host, path=path):
+                            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                            try:
+                                conn.request("GET", path, headers={"Host": host})
+                                r = conn.getresponse()
+                                body = r.read()
+                            finally:
+                                conn.close()
+                            self.assertEqual(r.status, status)
+                            if status == 403:
+                                self.assertNotIn(b"WORLD_PAYLOAD", body)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
