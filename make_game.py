@@ -328,6 +328,20 @@ def assets(game: str, work: str) -> None:
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
         py("awc_opus.py", os.path.join(out, "audio", "awc"), os.path.join(out, "audio", "ogg"))
+    xma_dir = os.path.join(out, "audio", "xma")
+    if not os.path.isdir(xma_dir):
+        log("assets: XMA2 streams")
+        run([exe, "xma", os.path.join(game, "audio.rpf"), out])
+        ff = shutil.which("ffmpeg")
+        if ff:
+            log("assets: XMA2 -> PCM WAV (ffmpeg)")
+            for root, _, files in os.walk(xma_dir):
+                for f in files:
+                    if f.endswith(".xma.wav"):
+                        src = os.path.join(root, f)
+                        subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", src[:-8] + ".wav"])
+        else:
+            log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
     log("assets: done")
 
 

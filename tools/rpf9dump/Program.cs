@@ -52,6 +52,27 @@ else if (mode == "audio")
         return new { e.Path, e.Offset, e.Size, Streams = info?.Streams.Select(s => new { s.Index, Id = s.Id.ToString("X8"), s.Codec, s.Channels, s.SampleRate, s.DurationSeconds, s.IsStreamed }) }; }).ToList();
     File.WriteAllText(Path.Combine(outDir, "audio_manifest.json"), JsonSerializer.Serialize(new { src, Count = banks.Count, Banks = rows }, json));
 }
+else if (mode == "xma")
+{
+    // XMA2 streams (AWC codec 5) as RIFF XMA2 .wav files that ffmpeg decodes (AwcRecovery.WriteXmaWave).
+    var doc = ArchiveReader.Open(src);
+    var banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
+    string sub = Path.Combine(outDir, "xma"); Directory.CreateDirectory(sub);
+    foreach (var e in banks)
+    {
+        var info = AwcInfo.Inspect(src, e.Offset, e.Size);
+        if (info == null) continue;
+        foreach (var st in info.Streams.Where(x => x.Codec == 5))
+        {
+            string dir = Path.Combine(sub, Util.Safe(Path.GetFileNameWithoutExtension(e.Name)));
+            Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, $"{st.Id:X8}.xma.wav");
+            if (File.Exists(path)) { ok++; continue; }
+            try { AwcRecovery.WriteXmaWave(src, e.Offset, e.Size, st.Index, path); ok++; }
+            catch (Exception ex) { fail++; if (fail <= 5) Console.WriteLine($"  fail {e.Name}#{st.Index}: {ex.GetType().Name} {ex.Message}"); }
+        }
+    }
+}
 else if (mode is "models" or "textures")
 {
     byte[] header; using (var f = File.OpenRead(src)) { header = new byte[64]; f.ReadExactly(header); }
