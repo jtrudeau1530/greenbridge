@@ -26,6 +26,11 @@ jobs:
           if [ -n "$bad" ]; then echo "Game or binary files tracked:"; echo "$bad"; exit 1; fi
   translator-tests:
     runs-on: ubuntu-24.04
+  semantic-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,3 +43,5 @@ jobs:
           pip install pytest
       - name: Translator tests
         run: python -m pytest tests -q
+      - name: Translator semantic tests
+        run: python -m unittest discover -s tests/semantic -v

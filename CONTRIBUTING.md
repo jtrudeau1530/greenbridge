@@ -17,3 +17,5 @@ Thanks for helping. A few rules keep the project safe to host:
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
 - Say what you tested and on which GPU in the pull request.
+- Run the translator tests with `python -m unittest discover -s tests/semantic -v` (see `tests/semantic/README.md`). A new
+  translator rule should come with a small hand-written `.asm` fixture and its expected output words.
