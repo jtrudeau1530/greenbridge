@@ -9,6 +9,8 @@ Standard library only: the headers, the section table, the import, delay-import,
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
 by the same standard-library-only CI job as the other tools.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import math
