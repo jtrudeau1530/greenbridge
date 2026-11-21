@@ -72,6 +72,9 @@ def parse(blob):
     if first < HEADER or first > len(blob):
         record["error"] = f"first section offset {first} is outside the file"
         return record
+    if len(blob) - first < SECTION_HEADER:
+        record["error"] = f"missing or truncated first section header at {first}"
+        return record
     offset = first
     while offset + SECTION_HEADER <= len(blob):
         tag = blob[offset:offset + 4]
