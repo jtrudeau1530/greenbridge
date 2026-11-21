@@ -119,6 +119,19 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f2p5\n"), 2)
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f70000\n"), 70000)
 
+    def test_wide_integer_conversion_is_rejected(self):
+        # A 64-bit operand must not be silently truncated to 32 bits before the conversion.
+        text = HEADER.replace("%c0 = OpConstant %uint 0",
+                              "%ulong = OpTypeInt 64 0\n"
+                              "%c64_big = OpConstant %ulong 4294967296\n"
+                              "%c0 = OpConstant %uint 0")
+        for op in ("OpConvertUToF", "OpConvertSToF"):
+            with self.subTest(op=op):
+                body = text + (f"%x = {op} %float %c64_big\n"
+                               "%res = OpBitcast %uint %x\nOpStore %out %res\n" + FOOTER)
+                with self.assertRaises(si.UnsupportedConstruct):
+                    si.run_fragment(body)
+
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
         self.assertEqual(run_word("%x = OpExtInst %float %glsl RoundEven %f2p5\n%res = OpBitcast %uint %x\n"),
