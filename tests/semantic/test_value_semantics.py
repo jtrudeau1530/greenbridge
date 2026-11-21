@@ -45,6 +45,8 @@ EXPECTED_OPS5 = [0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00]
 EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
 EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
 EXPECTED_OPS8 = [0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F]
+# s_ff0_i32_b32 of 3, 0x8c7dfb89 and -1, s_ff1_i32_b32 of 0x100 (FUZZ-4): lowest zero / set bit, -1 if none.
+EXPECTED_SALU_FF = [2, 1, 0xFFFFFFFF, 8]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
 EXPECTED_BOUNDS = {0x00: 0x12345678, 0x04: 0x12345678, 0x08: 0x00000000, 0x0C: 0xEEEEEEEE}
@@ -286,6 +288,10 @@ class TranslatorValueSemantics(unittest.TestCase):
         # High halves of unsigned and signed products, popcount with an accumulator, lowest/highest set bit,
         # v_ffbh_u32(0) = -1 feeding a wrapping v_add3_u32, and v_xad_u32.
         self.check("ps_ops8", EXPECTED_OPS8)
+
+    def test_s_ff_on_a_constant_is_a_value(self):
+        # A 32-bit constant source is a value, not a lane mask: before the fix every s_ff0 here gave -1.
+        self.check("ps_salu_ff", EXPECTED_SALU_FF)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.

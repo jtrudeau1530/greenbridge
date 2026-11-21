@@ -121,6 +121,17 @@ python -I tools/cpu_ref.py <listing.s> --json
 python -I tests/test_cpu_ref.py
 ```
 
+The scalar ALU has its own differential fuzzer (FUZZ-4), `tools/salu_diff.py`: a separate reference for 87
+SOP1/SOP2/SOPC/SOPK opcodes with SCC kept explicit, seeded programs, the translated SPIR-V run in
+`tests/semantic/spirv_mini_interp.py`, and failing programs shrunk to the instructions that matter.
+64-bit mask ops are left out by default (the translator models them as wave masks); its docstring lists
+the known divergences.
+
+```
+python -I tools/salu_diff.py --programs 2000 --seed 1
+python -I tests/test_salu_diff.py
+```
+
 Two assembler facts matter when writing edge cases:
 
 - An integer token in a float-operand position uses AMD's inline-constant encoding for values 0..64

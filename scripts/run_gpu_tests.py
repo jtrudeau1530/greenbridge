@@ -658,6 +658,7 @@ def run_suite(a, work: str) -> int:
                 "ps_ops2": (0xABCD4400, 0x46001234, 0xFFFFFFFA, 7),
                 "ps_ops3": (0xFFFFFFFA, 0x44660066, 0x44AABBCC, 16),
                 "ps_ops4": (0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00),
+                "ps_salu_ff": (2, 1, 0xFFFFFFFF, 8),
                 "ps_scc": (1, 1, 3, 0x80000000),
                 "ps_sdwa": (0x000000F1, 0xFFFEFFF2, 0x3C003344, 0xFFF70000),
                 "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
