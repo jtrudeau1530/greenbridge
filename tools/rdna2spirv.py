@@ -2274,7 +2274,11 @@ class Gen:
                 self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {z} {src}")
                 self.uses_subgroup = True
             else:
-                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {dat} {ln2}")
+                # Wave32: a source lane that is off in EXEC reads as 0 here too (RDNA ISA 10.4.4). Until
+                # 2026-11-21 the raw value was shuffled. GPU-checked with cs_bpermute32.
+                z = self.tmp()
+                self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {z} {ln2}")
                 self.uses_subgroup = True
             self.dst(d, r)
         elif op.startswith("ds_") and self.stage == "gs":

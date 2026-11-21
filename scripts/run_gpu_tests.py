@@ -473,7 +473,8 @@ def run_suite(a, work: str) -> int:
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
-                      "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load"):
+                      "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
+                      "cs_bpermute32"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -497,6 +498,7 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
                 "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
                 "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
+                "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],     # wave32: runs anywhere
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store and cs_smem_soffset_imm is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip, as
@@ -505,7 +507,7 @@ def run_suite(a, work: str) -> int:
             # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
             emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
             partial = name == "cs_w64x_partial"
-            wave64 = name not in ("cs_store", "cs_smem_soffset_imm") and not emulated and not partial
+            wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_bpermute32") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)

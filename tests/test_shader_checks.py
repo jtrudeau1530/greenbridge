@@ -16,11 +16,12 @@ WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS + check.W64X_DUMPS + check.W64X_
                 if n not in (*check.WAVE32_DUMPS, "cs_wave64_ballot")}
 # A group smaller than a wave can't ask for full subgroups: it asks for subgroup size 64 and reads the device's range.
 PARTIAL = {n for n, _ in check.W64X_PARTIAL}
+W32 = dict(check.W32_DUMPS)
 
 
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, and ms_w64x_ballot (skipped here: build.py does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
+# tests, the wave32 dumps, pixel tests, and ms_w64x_ballot (skipped here: build.py does not build mesh shaders)
+TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + len(W32) + 2
          + len(check.PIXEL_TESTS) + 1)
 
 
@@ -28,6 +29,9 @@ class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False):
         def harness(_tool, shader, *args):
             name = Path(shader).stem
+            if name in W32:                    # wave32: no 64-wide subgroup asked for, runs on any device
+                self.assertNotIn("--require-wave64", args)
+                return 0, "out[0..7] = " + " ".join(map(str, W32[name])) + "\n"
             if name in PARTIAL:
                 self.assertNotIn("--require-wave64", args)
                 words = (WAVE64_DUMPS[name] + [0] * 8)[:8]

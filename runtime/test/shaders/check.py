@@ -47,6 +47,8 @@ W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_lds_war", [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031]),
               ("cs_w64x_sbarrier", [605, 605, 686, 686, 3032, 3013, 3032, 3031]),         # 128-thread group
               ("cs_w64x_load_ballot_load", [43, 74, 75, 42, 42, 18, 41, 32])]
+# Wave32 programs on a 32-lane group: run on any device, with or without wave64 emulation.
+W32_DUMPS = [("cs_bpermute32", [0, 50, 162, 99, 36, 218, 183, 15])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820])]
 PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
@@ -236,6 +238,8 @@ def main():
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
+    for name, want in W32_DUMPS:
+        results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     for name, want in W64X_PARTIAL:
         results.append((name, partial_wave_test(tools, spirv, name, want)))
     results.append(("ms_w64x_ballot", mesh_w64x_test(tools, spirv, "ms_w64x_ballot")))
