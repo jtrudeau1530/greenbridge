@@ -24,6 +24,7 @@ Stages, in order (each skips work that is already done, so a stopped build conti
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -216,8 +217,9 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
             if not shutil.which(t):
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
     if "assets" in stages:
-        if not shutil.which("dotnet"):
-            missing.append(".NET 8 SDK: https://dotnet.microsoft.com/download/dotnet/8.0")
+        if not dotnet_sdk_ok():
+            missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
+                           "https://dotnet.microsoft.com/download/dotnet/8.0")
         ensure_submodule()
     if "runtime" in stages and os.name == "nt":
         vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
@@ -232,6 +234,18 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
     if free_gb < need_gb:
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work.")
+
+
+def dotnet_sdk_ok() -> bool:
+    """True if a .NET SDK 8 or newer is installed. `dotnet` is also on PATH with only a runtime, and then
+    `dotnet build` fails with "No .NET SDKs were found"."""
+    if not shutil.which("dotnet"):
+        return False
+    try:
+        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", r.stdout, re.M))
 
 
 def ensure_submodule() -> None:
