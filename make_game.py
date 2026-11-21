@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -101,23 +102,47 @@ def versions() -> list:
 PROBES = ("MicrosoftGame.Config", "Catalog000.bin", "appdata0.rpf")
 
 
+def probe_mismatches(game: str, version: dict) -> list[str]:
+    """Describe which probe files prevent a version match, using only filesystem metadata."""
+    files = version["files"]
+    probes = [name for name in PROBES if name in files]
+    if not probes:
+        return ["No version probe files are listed in the manifest."]
+
+    mismatches = []
+    for name in probes:
+        expected_size = files[name]["size"]
+        try:
+            info = os.stat(os.path.join(game, name))
+        except (FileNotFoundError, NotADirectoryError):
+            mismatches.append(f"Missing {name}.")
+            continue
+        except OSError as error:
+            mismatches.append(f"Cannot read file metadata for {name} ({error.strerror}).")
+            continue
+
+        if not stat.S_ISREG(info.st_mode):
+            mismatches.append(f"{name} is not a regular file.")
+        elif info.st_size != expected_size:
+            mismatches.append(f"Wrong size for {name} ({info.st_size} bytes, expected {expected_size}).")
+    return mismatches
+
+
 def match_version(game: str):
     """The supported version this folder is, or None. Only names and sizes are read."""
-    for v in versions():
-        probes = [p for p in PROBES if p in v["files"]]
-        if probes and all(os.path.isfile(os.path.join(game, p)) and
-                          os.path.getsize(os.path.join(game, p)) == v["files"][p]["size"] for p in probes):
-            return v
-    return None
+    return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
 def load_version(game: str) -> dict:
-    v = match_version(game)
-    if v is None:
-        fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
-             "MicrosoftGame.Config and the .rpf archives. Supported: "
-             + ", ".join(f"{x['title']} {x['version']}" for x in versions()))
-    return v
+    reports = []
+    for version in versions():
+        mismatches = probe_mismatches(game, version)
+        if not mismatches:
+            return version
+        reports.append(f"  {version['title']} {version['version']}\n    " + "\n    ".join(mismatches))
+    fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
+         "MicrosoftGame.Config and the .rpf archives.\nSupported:\n"
+         + "\n".join(reports or ["  No version manifests found."]))
 
 
 def find_dumps() -> list:

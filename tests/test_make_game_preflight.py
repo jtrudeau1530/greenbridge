@@ -136,12 +136,36 @@ class VersionParsingAndMatchingTest(PreflightTestBase):
                                     match="This doesn't look like a supported version of the game")
             self.assertIn("Supported:", err)
             self.assertIn("1.0.2.1", err)
+            for name in make_game.PROBES:
+                self.assertIn(f"Missing {name}.", err)
 
 
 class GameCheckTest(PreflightTestBase):
     def test_check_nonexistent_directory_fails(self):
         self.assert_fails(make_game.check, "nonexistent_dir_0xdeadbeef", full=False,
                           match="Game folder not found: nonexistent_dir_0xdeadbeef")
+
+    def test_check_option_reports_each_version_probe_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "MicrosoftGame.Config"), "wb") as config:
+                config.write(b"test")
+            os.mkdir(os.path.join(tmp, "Catalog000.bin"))
+            manifests = [
+                {"title": "Synthetic", "version": version, "files": {
+                    "MicrosoftGame.Config": {"size": size},
+                    "Catalog000.bin": {"size": 8},
+                    "appdata0.rpf": {"size": 16},
+                }}
+                for version, size in [("1.0", 6), ("2.0", 10)]
+            ]
+            with mock.patch.object(make_game, "versions", return_value=manifests), \
+                 mock.patch.object(sys, "argv", ["make_game.py", "--check", "--game", tmp]):
+                err = self.assert_fails(make_game.main)
+
+        self.assertIn("Synthetic 1.0\n    Wrong size for MicrosoftGame.Config (4 bytes, expected 6).", err)
+        self.assertIn("Synthetic 2.0\n    Wrong size for MicrosoftGame.Config (4 bytes, expected 10).", err)
+        self.assertEqual(err.count("Catalog000.bin is not a regular file."), 2)
+        self.assertEqual(err.count("Missing appdata0.rpf."), 2)
 
     def test_check_synthetic_game_all_files_present_with_exe(self):
         with tempfile.TemporaryDirectory() as tmp:
