@@ -8,6 +8,12 @@ AWC layout (little-endian "ADAT"), as read by rpf9-explorer's OpusPreview.cpp: a
 2048-byte blocks of [u16 length][packet] ..., a zero length pads the rest of the block. Codec 0 = PCM16 (written as
 .wav). Streamed music (tag 0x48, multi-channel interleaved blocks) is not handled here yet.
 
+Streamed music (tag 0x48 descriptor: u32 blocks, u32 chunk size, u32 channels, then 16 bytes per channel: id,
+samples, rate at +10, codec at +12) is split into one mono Ogg Opus per channel: each chunk starts with a
+24-byte record per channel (subblock count at +4, repeated-prefix samples to skip at +8), the channel data are
+its run of 2048-byte subblocks after the 2048-aligned header, and the first `skip` samples of a chunk repeat the
+previous chunk's tail and are dropped (whole packets).
+
 Output: <out>/<bank>/<stream id>.ogg (or .wav), plus a summary line per bank.
 """
 import argparse
@@ -107,11 +113,11 @@ def parse_awc(d: bytes):
         p += (n + 1) * 4
     info = p
     p += n * 4
-    streams = []
+    streams, music = [], []
     for i in range(n):
         v = struct.unpack_from("<I", d, info + 4 * i)[0]
         sid, ntags = v & 0x1FFFFFFF, v >> 29
-        data = fmt = None
+        data = fmt = mus = None
         for _ in range(ntags):
             t = struct.unpack_from("<Q", d, p)[0]
             p += 8
@@ -120,13 +126,51 @@ def parse_awc(d: bytes):
                 data = (at, size)
             elif typ == 0x76:
                 fmt = (at, size)
+            elif typ == 0x48:
+                mus = (at, size)
+        if mus and data:
+            music.append((mus, data))
         if data and fmt and fmt[1] >= 32:
             samples, = struct.unpack_from("<I", d, fmt[0])
             rate, = struct.unpack_from("<H", d, fmt[0] + 8)
             codec, channels = d[fmt[0] + 28], d[fmt[0] + 29]
             streams.append({"id": sid, "samples": samples, "rate": rate, "codec": codec, "channels": channels,
                             "data": data})
+    parse_awc.music = music
     return streams
+
+
+def music_channels(d: bytes, mus, data):
+    """[(channel id, samples, rate, codec, [packets])] for one streamed-music descriptor."""
+    (m_at, m_size), (d_at, d_size) = mus, data
+    blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
+    if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
+        return []
+    info = []
+    for c in range(channels):
+        base = m_at + 12 + 16 * c
+        cid = struct.unpack_from("<I", d, base)[0] & 0x1FFFFFFF
+        samples, = struct.unpack_from("<I", d, base + 4)
+        rate, = struct.unpack_from("<H", d, base + 10)
+        info.append([cid, samples, rate, d[base + 12], []])
+    for b in range(blocks):
+        at = d_at + b * chunk
+        recs = [struct.unpack_from("<III", d, at + 24 * c + 4)[:2] for c in range(channels)]   # (count, skip)
+        total = sum(r[0] for r in recs)
+        header = (channels * 24 + total * 4 + 2047) & ~2047
+        before = 0
+        for c, (count, skip) in enumerate(recs):
+            start = at + header + before * 2048
+            before += count
+            if info[c][3] != 0x0B or count == 0:
+                continue
+            for pk in opus_packets(d, start, count * 2048):
+                n = opus_samples(pk)
+                if skip >= n and skip > 0:
+                    skip -= n
+                    continue
+                info[c][4].append(pk)
+    return [tuple(x) for x in info]
 
 
 def opus_packets(d: bytes, at: int, size: int):
@@ -148,8 +192,15 @@ def export_bank(path: str, out_dir: str):
     name = os.path.splitext(os.path.basename(path))[0]
     od = os.path.join(out_dir, name)
     os.makedirs(od, exist_ok=True)
-    counts = {"opus": 0, "pcm": 0, "other": 0}
-    for s in parse_awc(d):
+    counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
+    streams = parse_awc(d)
+    for mus, data in parse_awc.music:
+        for cid, samples, rate, codec, pk in music_channels(d, mus, data):
+            if pk:
+                n48 = samples * 48000 // rate if rate else 0
+                write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, 1, cid, n48)
+                counts["music"] += 1
+    for s in streams:
         at, size = s["data"]
         if s["codec"] == 0x0B and size % 2048 == 0 and s["channels"] in (1, 2):
             pk = opus_packets(d, at, size)
@@ -180,7 +231,7 @@ def main() -> int:
     else:
         banks = [a.src]
     banks = banks[: a.limit] if a.limit else banks
-    tot = {"opus": 0, "pcm": 0, "other": 0}
+    tot = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     for i, b in enumerate(banks):
         try:
             c = export_bank(b, a.out)
@@ -191,7 +242,8 @@ def main() -> int:
             tot[k] += c[k]
         if (i + 1) % 200 == 0:
             print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
-    print(f"{len(banks)} banks: {tot['opus']} Ogg Opus, {tot['pcm']} WAV, {tot['other']} not handled (music/XMA/other)")
+    print(f"{len(banks)} banks: {tot['opus']} Ogg Opus, {tot['music']} music channels (Ogg Opus), {tot['pcm']} WAV, "
+          f"{tot['other']} not handled (XMA/other)")
     return 0
 
 
