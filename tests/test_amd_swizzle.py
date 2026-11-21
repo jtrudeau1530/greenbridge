@@ -14,7 +14,9 @@ try:
 except ModuleNotFoundError as e:
     if e.name != "numpy":
         raise
-    raise unittest.SkipTest("amd_swizzle needs numpy")
+    _skip_numpy = True
+else:
+    _skip_numpy = False
 
 
 def table(name, rows):
@@ -55,6 +57,9 @@ def test_rejects_code():
 
 
 if __name__ == "__main__":
+    if _skip_numpy:
+        print("skipped: amd_swizzle needs numpy")
+        raise SystemExit(0)
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()
