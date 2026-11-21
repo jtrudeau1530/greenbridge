@@ -1,7 +1,7 @@
 // Headless Vulkan harness: draws one triangle (3 vertices, no vertex buffers) with a given VS + FS into a
 // W x H RGBA32F image and writes the raw floats to a file. Used to check translated shaders on the real GPU.
 //
-//   vk_harness <vs.spv> <fs.spv> <out.raw> [width height]
+//   vk_harness <vs.spv> <fs.spv> <out.raw> [width height [clip-test-s0 clip-test-s1]]
 //
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
@@ -129,6 +129,10 @@ int main(int argc, char** argv) {
     // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders.
     const char* gs_path = std::getenv("VKH_GS");
     VkPhysicalDeviceFeatures feats{};
+    if (argc == 8 && !f2q.features.shaderClipDistance) {
+        std::fprintf(stderr, "unsupported: shaderClipDistance\n");
+        return 77;
+    }
     feats.geometryShader = gs_path ? VK_TRUE : VK_FALSE;
     feats.shaderClipDistance = f2q.features.shaderClipDistance;
     feats.shaderCullDistance = f2q.features.shaderCullDistance;
@@ -263,6 +267,10 @@ int main(int argc, char** argv) {
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     uint32_t zeros[36] = {};
+    if (argc == 8) {
+        const float shifts[] = {float(std::atof(argv[6])), float(std::atof(argv[7]))};
+        std::memcpy(zeros, shifts, sizeof(shifts));
+    }
     reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"))(
         cmd, pl, pcs, 0, sizeof(zeros), zeros);
     if (mesh)

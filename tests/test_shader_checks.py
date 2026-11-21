@@ -21,7 +21,7 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
 # tests, pixel tests, and ms_w64x_ballot (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + 1)
+         + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + 1)
 
 
 class Wave64Checks(unittest.TestCase):
@@ -71,6 +71,7 @@ class Wave64Checks(unittest.TestCase):
                 (spirv / "cs_wave64_ballot.spv").touch()
             output = io.StringIO()
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
+                  patch.object(check, "clip_test", return_value=""),
                   patch.object(check, "pixel_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   contextlib.redirect_stdout(output)):
                 status = check.main()

@@ -15,6 +15,10 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
+sys.path.insert(0, SHADER_DIR)
+from build import CLIP_CASES, clip_container
+from check import Skip, clip_test
+
 TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
 
 
@@ -91,6 +95,8 @@ def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
         if m:
             cmd.append(f"-mattr={m.group(1)}")
             break
+    if name in CLIP_CASES:
+        cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[name]}")
     cmd.append("-show-encoding")
     p = subprocess.run(
         cmd,
@@ -388,14 +394,19 @@ def run_suite(a, work: str) -> int:
     for d in (fssm_dir, disasm_dir, spirv_dir, raw_dir):
         os.makedirs(d, exist_ok=True)
 
-    asm_files = sorted(f for f in os.listdir(SHADER_DIR) if f.endswith(".asm"))
+    asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
     if a.filter:
         asm_files = [f for f in asm_files if a.filter in f]
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
-    for fname in asm_files:
+    sources = list(asm_files)
+    if any(os.path.splitext(f)[0] in CLIP_CASES for f in sources) and "ps_ops.asm" not in sources:
+        sources.append("ps_ops.asm")  # fragment partner for clipped rasterization
+    for fname in sources:
         name = os.path.splitext(fname)[0]
-        if name == "gs_tri":
+        if name in CLIP_CASES and name != "vs_clip_undeclared":
+            dxbc = clip_container()
+        elif name == "gs_tri":
             dxbc = make_dxbc([
                 (b"ISG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
                 (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
@@ -415,6 +426,8 @@ def run_suite(a, work: str) -> int:
         if name.startswith("cs_"):
             with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
                 f.write(make_cs_fssm(0x8088, *asm_group(os.path.join(SHADER_DIR, fname))))
+        if name in CLIP_CASES:
+            fname = "vs_clip.asm"
         assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), os.path.join(disasm_dir, f"{name}.s"), name)
 
     # 2. Translate all .s -> .spv
@@ -459,7 +472,10 @@ def run_suite(a, work: str) -> int:
         cs_env = dict(os.environ, VKC_SUBGROUP_SIZE=str(sg)) if sg else None
         gfx_env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
 
-        if name == "cs_lds":
+        if name in CLIP_CASES:
+            detail = clip_test(a.build, spirv_dir, name)
+            results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
+        elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name == "cs_exec64":
