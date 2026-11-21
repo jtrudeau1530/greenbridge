@@ -89,9 +89,12 @@ when the Vulkan SDK is found:
 
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
-- `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` — creates a shader module and, for compute
-  shaders, a pipeline for every entry in the translator's `index.json`; reports `MODULE FAIL` /
-  `PIPELINE FAIL` per shader and a summary.
+- `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--max-bytes N]` -
+  creates a shader module and, for compute shaders, a pipeline for every entry in the translator's
+  `index.json`; reports `MODULE FAIL` / `PIPELINE FAIL` per shader and a summary. `--max-bytes`
+  names and skips modules larger than the limit, which is how the corpus run works around the
+  driver's compile time on multi-megabyte ray-tracing shaders. The measured partial pass is in
+  [docs/pipeline_check.md](../docs/pipeline_check.md).
 
 The PE-loader and Bink-decode tests that need the retail package are optional: when
 `LEONIDA_GAME_DIR` (and, for Bink, `LEONIDA_MOVIE`) is unset they print `SKIP` and exit 0. They read
