@@ -5242,14 +5242,17 @@ def assemble(gen):
             (["%ms_clip = OpVariable %_ptr_Fn_ms_clip Function %null_ms_clip"] if gen.uses_clip else []) + \
             (["%ms_cull_dist = OpVariable %_ptr_Fn_ms_cull_d Function %null_ms_cull_d"] if gen.uses_cull else []) + \
             [f"%ms_param{n} = OpVariable %_ptr_Function_v4_ms Function %null_v4_ms" for n in sorted(gen.ms_params)]
-        # v5 = workgroup index (linear), s3 = merged-wave info with the wave id in [27:24].
+        # v5 = first launch vertex ID of the lane = linear group index * NumThreads + local index (the game's mesh
+        # entry does v5 >> 7 on lane 0 to get the group index; NumThreads is 128 in this corpus).
+        # s3 = merged-wave info with the wave id in [27:24].
         fn += ["%wgi = OpLoad %v3uint %wg_id", "%nwg = OpLoad %v3uint %num_wg", "%lidx = OpLoad %uint %local_index",
                "%wgx = OpCompositeExtract %uint %wgi 0", "%wgy = OpCompositeExtract %uint %wgi 1",
                "%wgz = OpCompositeExtract %uint %wgi 2", "%nwx = OpCompositeExtract %uint %nwg 0",
                "%nwy = OpCompositeExtract %uint %nwg 1", "%nxy = OpIMul %uint %nwx %nwy",
                "%wz = OpIMul %uint %wgz %nxy", "%wy = OpIMul %uint %wgy %nwx", "%wyz = OpIAdd %uint %wy %wz",
                "%wlin = OpIAdd %uint %wgx %wyz",
-               f"%v5p = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(5)}", "OpStore %v5p %wlin",
+               f"%wbase = OpIMul %uint %wlin {gen.cu(gen.ms['threads'])}", "%v5v = OpIAdd %uint %wbase %lidx",
+               f"%v5p = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(5)}", "OpStore %v5p %v5v",
                f"%wave = OpShiftRightLogical %uint %lidx {gen.cu(6)}",
                f"%mwi = OpShiftLeftLogical %uint %wave {gen.cu(24)}",
                f"%s3p = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(3)}", "OpStore %s3p %mwi"]
@@ -5773,8 +5776,8 @@ def translate(path):
             g.cu(i)
     if stage == "ms":
         # Mesh shaders run as NGG wave64 programs. PSV0 (DXBC) gives NumThreads, MaxOutputVertices/Primitives and
-        # the output topology. System inputs (Mesa radv_shader_args.c, mesh as NGG on GFX10.3): v5 = workgroup
-        # index ("vertex_id" slot); the merged-wave-info SGPR (s3 here) holds the wave id in [27:24]; user data
+        # the output topology. System inputs (Mesa radv_shader_args.c, mesh as NGG on GFX10.3): v5 = first launch
+        # vertex ID of the lane, groupIndex * NumThreads + lane ("vertex_id" slot); the merged-wave-info SGPR (s3 here) holds the wave id in [27:24]; user data
         # follows in s16.. (from push constants, like every stage).
         psv = mesh_psv(path, info["name"])
         if psv is None:
