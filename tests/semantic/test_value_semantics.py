@@ -16,6 +16,15 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_sin_f16/v_cos_f16   input is a number of turns: sin/cos(S * 2*pi), rounded to binary16; high half kept.
   s_buffer_load_dwordx2 with destination vcc: dword 0 -> vcc_lo, dword 1 -> vcc_hi.
   v_interp_mov_f32      reads the flat (provoking-vertex) input attribute; the translator must declare it Flat.
+  v_perm_b32            byte i = BYTE_PERMUTE({S0, S1}, S2 byte i) over 8 bytes, S1 = bytes 0-3: selector 0-7 picks
+                          that byte; 8/9/10/11 give 0xff if bit 7 of byte 1/3/5/7 is set, else 0; 12 gives 0;
+                          13 and above give 0xff.
+  v_alignbit_b32        D = ({S0, S1} >> (S2 & 31)) & 0xffffffff.
+  v_med3_i32/u32        the middle of three values, compared signed or unsigned.
+  v_mul_hi_u32/i32      bits 63:32 of the unsigned or signed 64-bit product.
+  v_bcnt_u32_b32        D = popcount(S0) + S1.
+  v_ffbl_b32/ffbh_u32   index of the lowest set bit / count of leading zeros; 0xffffffff when S0 = 0.
+  v_xad_u32/add3_u32    D = (S0 ^ S1) + S2 / D = S0 + S1 + S2, both mod 2^32.
 
 The appended cases for ps_ops5/ps_ops6 also pin the op_sel source-half selection for packed shifts, which the
 GPU-checked ps_ops4 does not exercise. cs_bounds (compute) pins the buffer num_records bounds checks: an
@@ -32,6 +41,8 @@ EXPECTED_LEGACY_MUL = [0x00000000, 0x00000000, 0x00000000, 0x40C00000]
 EXPECTED_OPS4 = [0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00]
 EXPECTED_OPS5 = [0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00]
 EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
+EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
+EXPECTED_OPS8 = [0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
 EXPECTED_BOUNDS = {0x00: 0x12345678, 0x04: 0x12345678, 0x08: 0x00000000, 0x0C: 0xEEEEEEEE}
@@ -103,6 +114,49 @@ def reference_ops6():
             _pk_shift("ashr", 0, 0x8000FFF0)]
 
 
+def _perm(s0, s1, sel):
+    data = list(s1.to_bytes(4, "little")) + list(s0.to_bytes(4, "little"))
+    out = 0
+    for i in range(4):
+        k = (sel >> (8 * i)) & 0xFF
+        if k >= 13:
+            b = 0xFF
+        elif k == 12:
+            b = 0
+        elif k >= 8:
+            b = 0xFF if data[2 * (k - 8) + 1] & 0x80 else 0
+        else:
+            b = data[k]
+        out |= b << (8 * i)
+    return out
+
+
+def _s(v):
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
+def reference_ops7():
+    m = 0xFFFFFFFF
+    med_i = sorted([_s(0xFFFFFFFB), 7, 3])[1] & m
+    med_u = sorted([0xFFFFFFFB, 7, 3])[1]
+    return [_perm(0x80112233, 0x4455E677, 0x0C0D0700),
+            _perm(0x80112233, 0x4455E677, 0x0B0A0908),          # sign of bytes 1, 3, 5, 7: E6, 44, 22, 80
+            (((0x12345678 << 32) | 0x9ABCDEF0) >> (36 & 31)) & m,
+            ((med_u << 16) + med_i) & m]
+
+
+def reference_ops8():
+    m = 0xFFFFFFFF
+    bcnt = bin(0xF0F00001).count("1") + 5
+    ffbl = (0x00010000 & -0x00010000).bit_length() - 1
+    ffbh = 32 - 0x00010000.bit_length()
+    xad = ((0xF0F0F0F0 ^ m) + 1) & m
+    return [(0x80000001 * 0xFFFFFFFF) >> 32,
+            ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m,
+            ((ffbh << 16) + (ffbl << 8) + bcnt) & m,
+            (xad + 16 + m) & m]                                  # v_ffbh_u32(0) = 0xffffffff
+
+
 def reference_vcc_x2():
     return [0x11223344, 0x55667788, 0, 0]
 
@@ -154,6 +208,8 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_ops4(), EXPECTED_OPS4)
         self.assertEqual(reference_ops5(), EXPECTED_OPS5)
         self.assertEqual(reference_ops6(), EXPECTED_OPS6)
+        self.assertEqual(reference_ops7(), EXPECTED_OPS7)
+        self.assertEqual(reference_ops8(), EXPECTED_OPS8)
         self.assertEqual(reference_vcc_x2(), EXPECTED_VCC_X2)
         self.assertEqual(reference_flat(), EXPECTED_FLAT)
         self.assertEqual(reference_bounds(), EXPECTED_BOUNDS)
@@ -184,6 +240,16 @@ class TranslatorValueSemantics(unittest.TestCase):
     def test_packed_b16_shifts_with_op_sel(self):
         # Packed ashrrev (both halves negative) and lshl/lshr selecting source halves through op_sel/op_sel_hi.
         self.check("ps_ops6", EXPECTED_OPS6)
+
+    def test_perm_alignbit_and_med3(self):
+        # v_perm_b32 with plain byte picks, the 0x00/0xff constants and the sign selectors 8-11; v_alignbit_b32
+        # with a shift of 36 (taken mod 32); v_med3_i32 and v_med3_u32 on the same operands (-5, 7, 3).
+        self.check("ps_ops7", EXPECTED_OPS7)
+
+    def test_mul_hi_bit_counts_xad_add3(self):
+        # High halves of unsigned and signed products, popcount with an accumulator, lowest/highest set bit,
+        # v_ffbh_u32(0) = -1 feeding a wrapping v_add3_u32, and v_xad_u32.
+        self.check("ps_ops8", EXPECTED_OPS8)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
