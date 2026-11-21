@@ -56,6 +56,8 @@ bool prefer_host_copy(const std::string& dll) {
 
 Loader::~Loader() {
     for (auto* m : order_) {
+        // Before the image is freed: a stale table would let a later stack walk read unmapped memory.
+        if (m->function_table) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(m->function_table));
         if (m->tls_block) VirtualFree(m->tls_block, 0, MEM_RELEASE);
         if (m->has_tls_slot) TlsFree(m->tls_slot);
         if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
@@ -69,8 +71,47 @@ Module& Loader::load(const std::filesystem::path& image) {
     Module& m = map_image(image);
     bind_imports(m);  // loads every bundled module m imports first, so they land in init_order_ before m
     protect_sections(m);
+    register_unwind(m);
     init_order_.push_back(&m);
     return m;
+}
+
+// x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing
+// through) a mapped image can't be dispatched past that frame, and the process dies. Images the system loader maps
+// are found through its own module list; ours are VirtualAlloc'd, so they are registered as dynamic function tables.
+//
+// The table is checked before it is handed over, because RtlLookupFunctionEntry trusts it: it binary-searches the
+// entries by BeginAddress and follows UnwindData without bounds checks. Measured over 3,780 x64 images in
+// System32 (5,023,071 entries) and the package's FidelityFX DLLs: every table is sorted and non-overlapping and in
+// bounds, and one shipped image (symcryptk.dll) has a zero-length entry (BeginAddress == EndAddress), so that is
+// allowed. No entry in that set uses the indirect form (UnwindData bit 0).
+void Loader::register_unwind(Module& m) {
+    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXCEPTION) return;
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    // Like the system loader, a trailing partial entry is ignored.
+    const uint32_t count = dir.Size / sizeof(RUNTIME_FUNCTION);
+    if (!count) return;
+    require_range(m.name, dir.VirtualAddress, static_cast<uint64_t>(count) * sizeof(RUNTIME_FUNCTION), m.size,
+                  "the exception directory");
+    auto* table = at<RUNTIME_FUNCTION>(m.base, dir.VirtualAddress);
+    auto reject = [&](uint32_t i, const char* why) {
+        throw std::runtime_error(m.name + ": unwind entry " + std::to_string(i) + " " + why);
+    };
+    uint32_t previous_end = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const RUNTIME_FUNCTION& f = table[i];
+        if (f.EndAddress < f.BeginAddress || f.EndAddress > m.size) reject(i, "covers code outside the image");
+        if (f.BeginAddress < previous_end) reject(i, "is out of order or overlaps the one before it");
+        // UNWIND_INFO starts with a 4-byte header; its codes and handler data are the unwinder's to read.
+        const uint32_t info = f.UnwindData & ~1u;
+        if (info > m.size || m.size - info < 4) reject(i, "has unwind data outside the image");
+        previous_end = f.EndAddress;
+    }
+    if (!RtlAddFunctionTable(table, count, reinterpret_cast<DWORD64>(m.base)))
+        throw std::runtime_error(m.name + ": RtlAddFunctionTable failed");
+    m.function_table = table;
+    m.function_count = count;
 }
 
 void Loader::initialise() {

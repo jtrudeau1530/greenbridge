@@ -1,5 +1,5 @@
 // Native PE mapper for Xbox Series (x86-64) images.
-// Maps an image, applies relocations and binds every import through the shim registry.
+// Maps an image, applies relocations, binds every import through the shim registry and registers its unwind table.
 // Mapping never runs code from the image. Loader::initialise() is the one call that does: it sets up the
 // module's TLS (slot, template and callbacks) and calls a DLL's entry point as DllMain.
 #pragma once
@@ -34,6 +34,12 @@ struct Module {
     unsigned tls_slot = 0;
     bool has_tls_slot = false;
     bool initialised = false;
+
+    // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception
+    // dispatch and stack walks can unwind through its frames. Removed when the loader is destroyed.
+    void* function_table = nullptr;
+    uint32_t function_count = 0;
+
     std::vector<ImportRecord> imports;
     std::map<std::string, void*> exports;           // by name, plus "#ordinal"
     std::map<std::string, std::string> forwarders;  // same keys, holding "module.symbol" for re-exports
@@ -66,6 +72,7 @@ private:
     void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
+    void register_unwind(Module& m);
 
     std::filesystem::path game_dir_;
     std::map<std::string, Module*> by_name_;  // lower-case file name
