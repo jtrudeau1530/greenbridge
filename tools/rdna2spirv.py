@@ -2517,7 +2517,9 @@ class Gen:
             self.uses_subgroup = True
             v, ln = self.src_u(a[1]), self.src_u(a[2])
             m, r = self.tmp(), self.tmp()
-            self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63)}")
+            # RDNA2: wave64 uses S1[5:0] (mod 64); wave32 uses S1[4:0] (mod 32). Masking wave32 with 63 left
+            # lane selects 32..63 pointing past a 32-wide subgroup (SHADER-52 / FUZZ-7).
+            self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
             self.g_shuffle(r, v, m)
             self.dst(a[0], r)
         elif op == "v_writelane_b32":
@@ -2533,7 +2535,7 @@ class Gen:
                 self.emit(f"{me} = OpCopyObject %uint {self.wave_lane()}")
             else:
                 self.emit(f"{me} = OpLoad %uint %sg_lane")
-            self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63)}")
+            self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
             self.emit(f"{eq} = OpIEqual %bool {me} {m}")
             p = self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a[0]['r'])}")
