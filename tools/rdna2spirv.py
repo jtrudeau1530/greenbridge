@@ -5040,9 +5040,26 @@ def main():
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--shard", help="i/n: translate every n-th shader starting at i (run n processes in parallel, "
+                                    "then merge the index.part*.json files with --merge)")
+    ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
     a = ap.parse_args()
+    if a.merge:
+        import glob as _gl, json as _js
+        merged = {}
+        for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
+            merged.update(_js.load(open(part, encoding="utf-8")))
+        with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8") as f:
+            _js.dump(merged, f, indent=0, sort_keys=True)
+        print(f"merged {len(merged)} entries")
+        return 0
     files = [a.src] if a.src.endswith(".s") else sorted(os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".s"))
     files = files[: a.limit] if a.limit else files
+    shard = None
+    if a.shard:
+        si, sn = (int(x) for x in a.shard.split("/"))
+        files = files[si::sn]
+        shard = si
     os.makedirs(a.out, exist_ok=True)
     why, ok, valid = Counter(), 0, 0
     meta = {}
@@ -5074,9 +5091,9 @@ def main():
         else:
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
     import json as _js
-    idx_path = os.path.join(a.out, "index.json")
+    idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}
-    if os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
+    if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
         old = _js.load(open(idx_path, encoding="utf-8"))      # partial runs merge into an existing index
     old.update(meta)
     with open(idx_path, "w", encoding="utf-8") as f:
