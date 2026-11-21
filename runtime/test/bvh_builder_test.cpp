@@ -7,6 +7,7 @@
 //   LEONIDA_GAME_DIR=<package root>   (contains XboxBvhBuilder.dll)
 //   LEONIDA_BVH_FLAG=1                (optional: pass true as the constructor's bool argument)
 //   LEONIDA_BVH_WARP=1                (optional: use the WARP adapter)
+//   LEONIDA_BVH_DEVICE=vulkan         (optional: the Vulkan-backed ID3D12Device from #119 instead of a PC device)
 //
 // Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 0. Nothing from the DLL is written to disk.
 //
@@ -30,6 +31,9 @@
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "../shims/d3d12_com.h"
+#endif
 
 namespace {
 
@@ -369,16 +373,31 @@ int main() {
         if (init) return 1;
         std::printf("TLS: %s slot %u\n", bvh.has_tls_slot ? "loader" : "no", bvh.tls_slot);
 
-        const bool debug_layer = enable_debug_layer();
-        note(std::string("D3D12 debug layer ") + (debug_layer ? "enabled" : "not available (Graphics Tools not installed)"));
-        ID3D12Device* pc = create_pc_device(env("LEONIDA_BVH_WARP") == "1");
-        check(pc != nullptr, "PC D3D12 device created");
+        ID3D12Device* pc = nullptr;
+        const bool on_vulkan = env("LEONIDA_BVH_DEVICE") == "vulkan";
+        if (on_vulkan) {
+#ifdef LEONIDA_VULKAN_DEVICE
+            // The Vulkan-backed ID3D12Device (#119) instead of the host's D3D12 device, behind the same proxy.
+            const HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device), reinterpret_cast<void**>(&pc));
+            check(SUCCEEDED(vhr) && pc, "Vulkan-backed D3D12 device created (" + hex(static_cast<uint32_t>(vhr)) + ")");
+#else
+            check(false, "LEONIDA_BVH_DEVICE=vulkan needs a build with the Vulkan SDK (gta6rt_d3d12_com)");
+#endif
+        } else {
+            const bool debug_layer = enable_debug_layer();
+            note(std::string("D3D12 debug layer ") + (debug_layer ? "enabled" : "not available (Graphics Tools not installed)"));
+            pc = create_pc_device(env("LEONIDA_BVH_WARP") == "1");
+            check(pc != nullptr, "PC D3D12 device created");
+        }
         if (!pc) return 1;
         pc->AddRef();  // kept for the debug messages; the proxy takes its own reference
         void* proxy = nullptr;
         const HRESULT hr = rt::d3d12_xs::create_device_proxy(pc, __uuidof(ID3D12Device11), &proxy);
         check(SUCCEEDED(hr) && proxy, "Xbox-ABI device proxy created as ID3D12Device11 (" + hex(static_cast<uint32_t>(hr)) + ")");
         if (!proxy) return 1;
+#ifdef LEONIDA_VULKAN_DEVICE
+        if (on_vulkan) rt::d3d12::set_device_outer(pc, static_cast<IUnknown*>(proxy));
+#endif
         rt::d3d12_xs::reset_device_proxy_stats();
         if (env("LEONIDA_BVH_RECORD62") == "1")
             check(hook_slot62(proxy, rt::d3d12_xs::device_proxy_slot_count(proxy)), "slot 62 recorder installed");
