@@ -64,9 +64,9 @@ Two observations matter for a decoder:
 
 - Every `0DRP` stream is in the first 1/8 of the data area (about 551 MB of span). The remaining 7/8 contains no
   `0DRP` header at +16.
-- The 78,688 zero-prefixed streams are not opaque blobs. In a 200-stream sample, 78% start with eight zero bytes
-  and a 64-bit pointer into the `0x50000000` range; the rest are mostly zero or other tables. Some pages carry a
-  name table and high-entropy blocks later in the same stream.
+- The 78,688 zero-prefixed streams are not opaque blobs. In a 200-stream sample, 78% have a 64-bit pointer into
+  the `0x50000000` range at +8; the rest are mostly zero or other tables. Some pages carry a name table and
+  high-entropy blocks later in the same stream.
 
 ## Container signatures actually observed
 
@@ -113,12 +113,11 @@ hold 711,536 inflated bytes and 2,298 distinct paths:
 | `.anim` | 274 |
 | `.motion` | 12 |
 
-Paths are padded to 16-byte boundaries. The records include a 32-bit name hash and a second 32-bit value. The
-name hash is **joaat32 of the path stem**: strip `pack:/`, strip the final extension, lowercase. In one
-161-name table all 161 hashes matched exactly; across the 273 tables, 3,229 of 3,637 name occurrences (88.8%)
-and 248 of 273 tables matched every name. The remaining 11.2% are not explained (duplicate names, missing
-records or a different record layout). `0x98e1750c` recurs as the second value, but its meaning is not
-established. A separate scan of the first 4 KiB of the 130,449 `rpf9_carve` streams found 7,661 distinct
+Paths are padded to 16-byte boundaries. The records include a 32-bit name hash; a second 32-bit value recurs as
+`0x98e1750c` in some tables, but its meaning is not established. The name hash is **joaat32 of the path stem**:
+strip `pack:/`, strip the final extension, lowercase. In one 161-name table all 161 hashes matched exactly;
+across the 273 tables, 3,229 of 3,637 name occurrences (88.8%) and 248 of 273 tables matched every name. The
+remaining 11.2% are not explained (duplicate names, missing records or a different record layout). A separate scan of the first 4 KiB of the 130,449 `rpf9_carve` streams found 7,661 distinct
 `pack:/...` paths and 31,020
 occurrences; 5,880 of those streams contain at least one path, bone name or animation word in that prefix. The
 union of the two name sources is 8,020 distinct paths. Names also appear embedded at non-zero offsets in
@@ -133,8 +132,8 @@ Two forms were seen in carved samples:
 - a plain NUL-terminated bone list (896-byte stream), and
 - a front-coded table (2,064 bytes) whose entries are length-prefixed name fragments plus parent indices.
 
-The `SKEL_<region>_<part>` naming shape matches the bone names used by the model side, but the animation pages
-carry no model name next to them.
+The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. The model manifest available here does
+not expose bone names, so that match is not measured; the animation pages carry no model name next to the bones.
 
 ### Type-hash containers
 
@@ -173,7 +172,8 @@ The last 21 streams are one logical `RBF0` blob split into 64 KiB blocks (20 × 
 52 42 46 30 fb ff 01 00 00 00 15 00  "rage__crRigSetManager"
 ```
 
-They hold 58,391 stored / 1,348,436 inflated bytes and 20,224 printable runs (4,819 distinct). The readable
+They hold 58,391 stored / 1,348,436 inflated bytes and 20,224 printable runs of at least 6 bytes (4,819
+distinct). The readable
 content is a rig-set manager, not clip keyframes:
 
 | Lowercase token | Occurrences | Distinct |
@@ -237,7 +237,7 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
   pairs), `ped_` 1,308, `blend` 40; `facial`, `ycd` and `skeleton` 0. The tags include `<AnimData>`,
   `<ClipSet>`, `<ClipSelectionRule>` and `<Bones>`, and a path to `platform:/anim/animscenes/gesture/gesture.rpf`.
   These are configuration references, not clip payloads.
-- A 64 MiB sample of `data.rpf` (6,359 streams, 3 XML-ish) contains no animation catalog. Its strict keyword
+- A 64 MiB sample of `data.rpf` (6,359 streams, 3 XML-ish) yielded no animation catalog. Its strict keyword
   hits are dialogue or model/decal names; the five `ycd#` hits are part of a model hash table, not a container
   header.
 
