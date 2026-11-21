@@ -551,12 +551,13 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgload":
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == "ps_texture_sample":
-            # #167's bindless texture test: vk_texture_test finds vs_ids.spv and this shader in its working directory.
+        elif name in ("ps_texture_sample", "ps_cube_sample"):
+            # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
+            mode = ["cube"] if name == "ps_cube_sample" else []
             try:
-                p = subprocess.run([tool, raw], capture_output=True, text=True, cwd=spirv_dir)
+                p = subprocess.run([tool, *mode, raw], capture_output=True, text=True, cwd=spirv_dir)
                 rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
             except FileNotFoundError:
                 rc, msg = 1, f"missing {tool}"
