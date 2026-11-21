@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from compute_fixture import compute_header
-from check import Skip, mesh_v5_test
+from check import Skip, mesh_v5_test, start_failure
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -216,7 +216,10 @@ def unsupported_skip(msg: str) -> str:
 
 
 def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
-    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    except OSError as e:   # e.g. Smart App Control blocked a fresh build: fail this test, keep running the others
+        return 1, start_failure(cmd[0], e)
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
 
 
@@ -560,6 +563,8 @@ def run_suite(a, work: str) -> int:
                 rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
             except FileNotFoundError:
                 rc, msg = 1, f"missing {tool}"
+            except OSError as e:
+                rc, msg = 1, start_failure(tool, e)
             results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
