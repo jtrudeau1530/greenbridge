@@ -123,3 +123,19 @@ def test_mesh_without_psv0_is_rejected(make_shader):
         shader = make_shader(f.read(), "ms_tri")                   # empty DXBC
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
+
+
+def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
+    """Wave64 s_bfm_b64 must reconstruct the 64-bit wave mask, and 32-bit half compare must guard its half."""
+    bfm = make_shader("s_mov_b64 exec, -1\ns_bfm_b64 s[6:7], 16, 8\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n",
+                      name="cs_bfm64_ci")
+    asm_bfm = bfm.translate()
+    bfm.validate(asm_bfm)
+    assert "OpGroupNonUniformBitwiseOr" in asm_bfm
+
+    hcmp = make_shader("s_mov_b32 exec_lo, 0\ns_mov_b32 exec_hi, 0xffff\ns_mov_b64 s[6:7], exec\n"
+                       "s_cmp_eq_u32 s6, 0\ns_endpgm\n", name="cs_halfcmp_ci")
+    asm_hcmp = hcmp.translate()
+    hcmp.validate(asm_hcmp)
+    assert "OpGroupNonUniformAll" in asm_hcmp
+    assert asm_hcmp.count("OpULessThan %bool") >= 2  # exec_lo write + half-mask guard before All

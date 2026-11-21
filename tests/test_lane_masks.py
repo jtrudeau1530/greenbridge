@@ -30,7 +30,7 @@ def ins(op, *args):
 
 
 def masks_at_last(blocks, succ, block=-1):
-    return L.analyse(blocks, succ)[0][id(blocks[block][-1])]
+    return set(L.analyse(blocks, succ)[0][id(blocks[block][-1])])
 
 
 def test_straight_line():
@@ -108,7 +108,7 @@ def test_masks_through_a_vgpr():
            ins("v_readfirstlane_b32", s(3), v(51))]
     blocks = [masks + via + [use]]
     got, writes = L.analyse(blocks, [[]])
-    assert got[id(use)] == {3, 47, ("v", 51)}
+    assert set(got[id(use)]) == {3, 47, ("v", 51)}
     assert writes == {id(via[0]), id(via[1])}
     # Mixed with data, or with the VGPR written by anything else in between, it is data.
     data = ins("s_buffer_load_dword", s(47), s(0, 4), imm(0))
@@ -116,7 +116,23 @@ def test_masks_through_a_vgpr():
     assert masks_at_last([masks + [via[0], ins("v_add_nc_u32_e32", v(51), v(51), v(2)), via[2], use]], [[]]) == {47}
     # A constant alone does not make a VGPR a mask (v_mov_b32 v, 0 is everywhere).
     blocks = [[ins("v_mov_b32_e32", v(51), imm(0)), ins("v_readfirstlane_b32", s(3), v(51)), use]]
-    assert L.analyse(blocks, [[]]) == ({id(i): frozenset() for i in blocks[0]}, set())
+    assert L.analyse(blocks, [[]]) == ({id(i): {} for i in blocks[0]}, set())
+
+
+
+
+def test_bfm64_and_half_kinds():
+    # s_bfm_b64 produces a 64-bit lane mask (low half in s6, high half in s7).
+    use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
+    got = L.analyse([[ins("s_bfm_b64", s(6, 2), imm(16), imm(8)), use]], [[]])[0][id(use)]
+    assert got == {6: L.MASK_LO, 7: L.MASK_HI}
+    # exec_lo / exec_hi preserve half identity on 32-bit copies.
+    got2 = L.analyse([[ins("s_mov_b32", s(6), sp("exec_lo")), ins("s_mov_b32", s(7), sp("exec_hi")), use]], [[]])[0][id(use)]
+    assert got2 == {6: L.MASK_LO, 7: L.MASK_HI}
+    # Merging low half and high half yields generic MASK (unknown half -> keep both halves).
+    got3 = L.analyse([[ins("s_nop")], [ins("s_mov_b32", s(6), sp("exec_lo"))],
+                      [ins("s_mov_b32", s(6), sp("exec_hi"))], [use]], [[1, 2], [3], [3], []])[0][id(use)]
+    assert got3 == {6: L.MASK}
 
 
 if __name__ == "__main__":
@@ -124,4 +140,5 @@ if __name__ == "__main__":
     test_joins()
     test_parked_masks()
     test_masks_through_a_vgpr()
+    test_bfm64_and_half_kinds()
     print("ok")
