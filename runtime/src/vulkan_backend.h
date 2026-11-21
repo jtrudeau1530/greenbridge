@@ -32,7 +32,7 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage)
+    X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -50,7 +50,8 @@ struct VulkanDeviceFunctions {
                vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
                vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
-               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage;
+               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage && vkCmdFillBuffer &&
+               vkCmdUpdateBuffer;
     }
 };
 
@@ -72,6 +73,8 @@ public:
         replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
         replay_.copy_image = vk.vkCmdCopyImage;
         replay_.resolve_image = vk.vkCmdResolveImage;
+        replay_.fill_buffer = vk.vkCmdFillBuffer;
+        replay_.update_buffer = vk.vkCmdUpdateBuffer;
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };

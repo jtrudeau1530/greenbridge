@@ -18,14 +18,18 @@
 // - a queue with graphics support (the stage masks use ALL_GRAPHICS);
 // - images cleared without rectangles have TRANSFER_DST usage; images cleared with rectangles have attachment usage
 //   and image_view must return views for them (dynamicRendering, Vulkan 1.3);
-// - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3).
+// - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3);
+// - unordered-access clears need fill_buffer, update_buffer and copy_buffer for buffers; texture views cleared with
+//   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment).
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
+#include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <type_traits>
@@ -53,6 +57,7 @@ struct ResourceBinding {
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
+    bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
 };
 
 struct VulkanAccess {
@@ -468,6 +473,8 @@ struct ReplayFunctions {
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
+    PFN_vkCmdFillBuffer fill_buffer = nullptr;                  // unordered-access buffer clears, with copy_buffer
+    PFN_vkCmdUpdateBuffer update_buffer = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -497,6 +504,9 @@ struct Prepared {
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
+    uav_clear::Element element;                      // unordered-access clears: one element of the view's format
+    VkClearColorValue clear_color{};                 // ... the value that writes it into the image
+    std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
 };
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
@@ -602,6 +612,87 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
 
 inline bool within(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
     return offset <= total && size <= total - offset;
+}
+
+// The bytes of a buffer UAV clear, and whether the transfer commands can write them. Elements of up to 4 bytes
+// repeat in every aligned word, so vkCmdFillBuffer writes the aligned middle and copies from it the unaligned ends
+// (vkCmdCopyBuffer has no alignment rule); that needs one whole word in the middle. Wider elements are written
+// with vkCmdUpdateBuffer and doubled with copies, which needs a word-aligned range.
+inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, Prepared& p) {
+    const UavView& view = clear.view;
+    if (!p.binding.buffer || p.binding.image) return ReplayResult::invalid_clear;
+    if (view.offset >= p.binding.size) return ReplayResult::invalid_subresource;
+    // A V# may reach past the end of the buffer (the hardware bounds-checks it); the clear stops at the end.
+    const std::uint64_t size = std::min(view.size, p.binding.size - view.offset);
+    if (view.format) {
+        if (!uav_clear::encode(VkFormat(view.format), clear.is_float, clear.values, p.element))
+            return ReplayResult::unsupported;
+        if (view.element_size != p.element.size) return ReplayResult::invalid_clear;
+    } else {
+        p.element = uav_clear::raw_element(clear.values);
+    }
+    const std::uint32_t e = p.element.size;
+    const auto add = [&](std::uint64_t offset, std::uint64_t bytes) {
+        if (!bytes) return ReplayResult::success;
+        if (offset % std::min(e, 4u)) return ReplayResult::invalid_clear;
+        if (e <= 4) {
+            const std::uint64_t a0 = (offset + 3) / 4 * 4, a1 = (offset + bytes) / 4 * 4;
+            if ((a0 != offset || a1 != offset + bytes) && a1 < a0 + 4) return ReplayResult::unsupported;
+        } else if (bytes % 4) {
+            return ReplayResult::unsupported;
+        }
+        p.fills.push_back({offset, bytes});
+        return ReplayResult::success;
+    };
+    if (clear.rects.empty()) return add(view.offset, size);
+    const std::uint64_t elements = size / view.element_size;
+    for (const Rect& r : clear.rects) {
+        if (r.top > 0 || r.bottom <= 0) continue;  // a buffer has one row
+        const std::uint64_t left = std::uint64_t(std::max<std::int64_t>(r.left, 0));
+        const std::uint64_t right = std::min<std::uint64_t>(std::uint64_t(std::max<std::int64_t>(r.right, 0)), elements);
+        if (right <= left) continue;
+        if (const auto result = add(view.offset + left * view.element_size, (right - left) * view.element_size);
+            result != ReplayResult::success)
+            return result;
+    }
+    if (p.fills.empty()) p.skip = true;
+    return ReplayResult::success;
+}
+
+// Writes one prepared range; the caller has made the buffer writable by transfers.
+inline void emit_buffer_fill(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkBuffer buffer,
+                             const uav_clear::Element& element, VkDeviceSize offset, VkDeviceSize size) {
+    const auto transfer_barrier = [&] {
+        memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    };
+    if (element.size <= 4) {
+        std::uint32_t word = 0;
+        for (unsigned i = 0; i < 4; ++i) word |= std::uint32_t(element.bytes[i % element.size]) << (8 * i);
+        const VkDeviceSize a0 = (offset + 3) / 4 * 4, a1 = (offset + size) / 4 * 4;
+        if (a1 > a0) vk.fill_buffer(command_buffer, buffer, a0, a1 - a0, word);
+        VkBufferCopy ends[2]{};
+        std::uint32_t count = 0;
+        if (a0 > offset) ends[count++] = {offset + 4, offset, a0 - offset};
+        if (a1 < offset + size) ends[count++] = {a1 - 4, a1, offset + size - a1};
+        if (count) {
+            transfer_barrier();
+            vk.copy_buffer(command_buffer, buffer, buffer, count, ends);
+        }
+        return;
+    }
+    constexpr VkDeviceSize update_limit = 65536;  // vkCmdUpdateBuffer's, a multiple of every element size
+    const VkDeviceSize first = std::min(size, update_limit);
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(first));
+    for (std::size_t i = 0; i < data.size(); ++i) data[i] = element.bytes[i % element.size];
+    vk.update_buffer(command_buffer, buffer, offset, first, data.data());
+    for (VkDeviceSize filled = first; filled < size;) {
+        const VkDeviceSize step = std::min(filled, size - filled);
+        transfer_barrier();
+        const VkBufferCopy copy{offset, offset + filled, step};
+        vk.copy_buffer(command_buffer, buffer, buffer, 1, &copy);
+        filled += step;
+    }
 }
 
 // The one plane of one subresource a texture copy location names.
@@ -878,6 +969,27 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_subresource;
             if (const auto r = rect_view(depth_clear->rects, depth_clear->target, p.binding.aspects); r != ReplayResult::success)
                 return r;
+        } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
+            const UavView& view = uav->view;
+            if (!bind(view.resource)) return ReplayResult::unresolved_resource;
+            if (view.buffer) {
+                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
+                if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) return r;
+                continue;
+            }
+            if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
+            const TargetView target{view.resource, view.mip, view.first_layer, view.layer_count};
+            if (!detail::view_range(p.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
+                return ReplayResult::invalid_subresource;
+            // The view's format turns the values into bytes; the image's own format clears them in.
+            const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
+            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element) ||
+                !uav_clear::decode(p.binding.format, p.element, p.clear_color))
+                return ReplayResult::unsupported;
+            if (!uav->rects.empty() && (!p.binding.color_attachment || p.binding.volume))
+                return ReplayResult::unsupported;
+            if (const auto r = rect_view(uav->rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
+                return r;
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
@@ -925,6 +1037,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 using T = std::decay_t<decltype(c)>;
                 if constexpr (std::is_same_v<T, ClearRenderTarget> || std::is_same_v<T, ClearDepthStencil>)
                     return c.target.resource;
+                else if constexpr (std::is_same_v<T, ClearUnorderedAccess>)
+                    return c.view.resource;
                 else if constexpr (requires { c.resource; })
                     return c.resource;
                 else
@@ -1073,6 +1187,58 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.begin_rendering(command_buffer, &rendering);
                 VkClearAttachment attachment_clear{p.range.aspectMask, 0, {}};
                 attachment_clear.clearValue.depthStencil = value;
+                vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
+                vk.end_rendering(command_buffer);
+            });
+        } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
+            if (p.skip) continue;
+            // The UAV state, widened to transfers: a later barrier from SYNC_CLEAR_UNORDERED_ACCESS_VIEW names the
+            // clear stage, which is a transfer stage in the legacy masks.
+            VulkanAccess state = vulkan_access(d3d12_state::unordered_access, false);
+            state.access |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            state.stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+            if (uav->view.buffer) {
+                constexpr VkAccessFlags transfer = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                detail::memory_barrier(vk, command_buffer, state.access, state.stages, transfer,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+                for (std::size_t f = 0; f < p.fills.size(); ++f) {
+                    if (f)  // rectangles may overlap
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT, transfer, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    detail::emit_buffer_fill(vk, command_buffer, p.binding.buffer, p.element, p.fills[f][0],
+                                             p.fills[f][1]);
+                }
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       state.access, state.stages);
+                continue;
+            }
+            // Cleared in place in GENERAL, the UAV layout, which transfer clears and attachments both accept.
+            const VkImageLayout layout = image_layout(p.binding, state.layout);
+            auto pieces = detail::current(tracker, id, p.range, layout);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
+            if (p.rects.empty()) {
+                detail::round_trip(vk, command_buffer, p.binding.image, pieces, layout, state,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
+                    vk.clear_color_image(command_buffer, p.binding.image, layout, &p.clear_color, 1, &p.range);
+                });
+                continue;
+            }
+            detail::round_trip(vk, command_buffer, p.binding.image, pieces, layout, state,
+                               VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, [&] {
+                VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                info.imageView = p.view;
+                info.imageLayout = layout;
+                info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                rendering.renderArea = {{0, 0}, detail::mip_extent(p.binding, uav->view.mip)};
+                rendering.layerCount = uav->view.layer_count;
+                rendering.colorAttachmentCount = 1;
+                rendering.pColorAttachments = &info;
+                vk.begin_rendering(command_buffer, &rendering);
+                VkClearAttachment attachment_clear{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+                attachment_clear.clearValue.color = p.clear_color;
                 vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
                 vk.end_rendering(command_buffer);
             });

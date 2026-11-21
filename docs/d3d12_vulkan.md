@@ -150,7 +150,8 @@ What is implemented (all of it testable without the game):
 - **IR** (`runtime/src/command_list.h`): legacy barriers (transition, UAV, aliasing; split barriers record their end
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
   replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles,
-  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, and `ResolveSubresource`.
+  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, `ResolveSubresource`, and
+  `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat` (whole view or rectangles).
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
@@ -166,6 +167,33 @@ What is implemented (all of it testable without the game):
   subresource into a single-sampled one of the same size and format. Depth-stencil resolves, and resolves between
   two formats of one typeless family, are refused as unsupported. A multisampled texture copies only to one with
   the same sample count and has no footprint.
+- **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read
+  while recording as the GFX10 descriptor a shader would load (section 3.4), so the clear works with any
+  view-creation code that writes them and with descriptors the game builds itself; the GPU handle is not needed.
+  A T# gives the view's format (FORMAT plus DST_SEL, which tells BGRA from RGBA), mip and layers; a 3D view clears
+  every slice of its mip. A V# gives a byte range: its address minus the resource's `GetGPUVirtualAddress`, and
+  NUM_RECORDS bytes (stride 0, no format: raw), records (a stride: structured) or elements (a format: typed). A view
+  that reaches past the end of the buffer stops there, as the hardware's bounds check would.
+  - Values follow D3D's rules (`runtime/src/uav_clear.h`): Uint copies the low bits of each value into its channel
+    with no conversion, whatever the format's type; Float converts (UNORM/SNORM clamp and round to nearest, NaN is
+    0; 16-bit and the packed 11/10-bit floats round to nearest even). A raw or structured view takes value 0 for
+    every 32-bit word (Float: its bits). D3D11 calls Float on an integer view invalid and D3D12 does not say; here
+    the value is converted (toward zero, clamped, NaN 0) so the result is defined. These are checked against
+    hand-computed elements in `d3d12_uav_clear_test`.
+  - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
+    and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
+    elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an
+    element range `[left, right)` on row 0. A view with unaligned ends and less than one whole aligned word between
+    them (a few bytes of an 8- or 16-bit format) is refused as `unsupported`.
+  - Textures: the values become one element of the view's format, and that element is cleared into the image as
+    the value that decodes it in the image's own format, so a typeless texture viewed as UINT gets exactly the bits
+    asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)
+    and NaN payloads. A whole view is `vkCmdClearColorImage`; rectangles are `vkCmdClearAttachments` in a
+    dynamic-rendering scope, so a texture created with `ALLOW_UNORDERED_ACCESS` also gets `COLOR_ATTACHMENT` usage
+    when its format supports it. Both run in place in `GENERAL`, the UAV layout. Rectangle clears of volumes, or of
+    formats without attachment support, are refused as `unsupported`.
+  - The clear is fenced as the UAV state widened to transfers, so a following UAV barrier, transition, or enhanced
+    barrier from `SYNC_CLEAR_UNORDERED_ACCESS_VIEW` sees it.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -239,7 +267,8 @@ Two pieces of milestone M2 that the device does not use yet, built and tested on
     a table that has grown gets a new buffer behind binding 2: `flush_needs_idle()` says when a flush would do
     either, so the owner can wait until no command buffer that uses the set is still running.
 
-Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, volume attachment
+Known gaps: shader-resource, UAV and constant-buffer views (UAV clears read the descriptor bytes, so they do not
+wait on view creation), samplers, root signatures, PSOs, draws, volume attachment
 views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves and
 `ResolveSubresourceRegion`, 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
@@ -642,7 +671,9 @@ The trace will enumerate them.
   Partial resolve regions need a shader or a region copy.
 - Clears: a full-subresource clear maps to `vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` (UAV buffers to
   `vkCmdFillBuffer`); a rect clear uses `vkCmdClearAttachments` inside the rendering scope. UAV image clears use
-  `vkCmdClearColorImage` in `GENERAL`; non-32-bit buffer patterns need a compute clear.
+  `vkCmdClearColorImage` in `GENERAL`, and rectangles `vkCmdClearAttachments`. Buffer patterns of other sizes
+  need no compute clear: 8/16-bit elements are a 32-bit fill with copied ends, 64/128-bit ones an update doubled by
+  copies (section 3.2, UAV clears).
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
   raw DCC metadata.

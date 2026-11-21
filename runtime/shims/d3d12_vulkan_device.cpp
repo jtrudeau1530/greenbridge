@@ -119,6 +119,12 @@ struct DeviceState {
         return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
     }
 
+    bool color_attachment_usable(VkFormat format) const {
+        VkFormatProperties properties{};
+        format_properties(info.physical, format, &properties);
+        return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    }
+
     // Whether the GPU has this format and usage in this sample count: not every format has every count.
     bool samples_usable(const VkImageCreateInfo& image) const {
         VkImageFormatProperties properties{};
@@ -250,7 +256,12 @@ public:
         if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
             info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+            info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            // ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
+            if (!volume && samples == 1 && device_.color_attachment_usable(format.format))
+                info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        }
         if (!(desc_.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
         if (samples > 1 && !device_.samples_usable(info)) {
             log_once("sample count not supported by the GPU for this format:", int(samples));
@@ -274,6 +285,7 @@ public:
         binding.depth = depth;
         binding.volume = volume;
         binding.samples = samples;
+        binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
         // Never used yet: the first command that touches a part zero-fills it and moves it to the layout of the
