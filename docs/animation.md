@@ -120,9 +120,10 @@ and 248 of 273 tables matched every name. The remaining 11.2% are not explained 
 records or a different record layout). `0x98e1750c` recurs as the second value, but its meaning is not
 established. A separate scan of the first 4 KiB of the 130,449 `rpf9_carve` streams found 7,661 distinct
 `pack:/...` paths and 31,020
-occurrences; 5,880 of those streams contain at least one path, bone name or animation word in that prefix. Names
-also appear embedded at non-zero offsets in zero-prefixed pages (for example at +0x497e0 and +0x4aa8 in one
-327,680-byte page), not only in the 273 start-of-stream tables.
+occurrences; 5,880 of those streams contain at least one path, bone name or animation word in that prefix. The
+union of the two name sources is 8,020 distinct paths. Names also appear embedded at non-zero offsets in
+zero-prefixed pages (for example at +0x497e0 and +0x4aa8 in one 327,680-byte page), not only in the 273
+start-of-stream tables.
 
 ### Skeleton and bone names
 
@@ -137,7 +138,7 @@ carry no model name next to them.
 
 ### Type-hash containers
 
-1,355 streams share this 16-byte header shape:
+1,371 streams share this 16-byte header shape:
 
 ```
 +0x00  u32 type id
@@ -147,7 +148,7 @@ carry no model name next to them.
 ```
 
 The most frequent type ids are `0x88560988` (721 streams), `0x51e5606c` (220), `0x51404a31` (133),
-`0x8db79d92` (119) and `0x98a13c55` (7). Their payload is chunk-like, entropy 2.57–4.24 bits/byte. `PSIN` is a
+`0x8db79d92` (119) and `0x98a13c55` (7). Their payload is chunk-like, entropy 2.57–4.26 bits/byte. `PSIN` is a
 separate 18-stream group (`PSIN` at offset 0, 0.21 MB stored / 0.65 MB inflated); `docs/design.md` already
 describes `PSIN` as PSO metadata, and these bytes do not show that it is animation data.
 
@@ -208,7 +209,7 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
 
 ## Readable, compressed and still opaque
 
-- **Readable:** all 273 name tables (2,298 paths), 31 distinct `SKEL_*` tokens, the `0DRP` version/page count, 1,355
+- **Readable:** all 273 name tables (2,298 paths), 31 distinct `SKEL_*` tokens, the `0DRP` version/page count, 1,371
   type-hash headers, 1,781 clip-stream headers, and the 4,819 distinct strings in the `RBF0` rig metadata. Some
   `MoVE` and zero-prefixed pages expose counts and float arrays directly.
 - **Outer compression:** the only compression this work inverts is the RPF9 zlib framing. Inflating the 130,470
@@ -267,8 +268,8 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
 
 1. **Parse the `RBF0` rig-set manager first.** It is 1.35 MB, has an explicit schema name
    (`rage__crRigSetManager`) and 4,819 readable rig/rig-set paths. Extract the rig-set → rig entries and the
-   channel names (`deformation`, `facial`, `pose.*`). That is the missing skeleton/rig table; without it, clips
-   have no bone order.
+   channel names (`deformation`, `facial`, `pose.*`). That is the missing rig-set mapping; combined with the
+   `SKEL_*` bone tables it gives bone order. Without a rig entry, a clip has no skeleton binding.
 2. **Group streams into resources.** The TOC is encrypted, so use the `0DRP` page header: count at +0x20,
    pointers at +0x08 and +0x28..+0x40, four u16 values at +0x48. The sampled layout places page headers among
    zero-prefixed pages; a logical resource can span several streams. Do not assume one stream is one file.
