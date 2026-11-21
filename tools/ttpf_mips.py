@@ -654,7 +654,8 @@ def scan_pools(paths, as_json=None, include_tuples=False):
                             1 for k in range(d["non_tail"], layout["first_tail"]) if avail[k])
         finally:
             pool.close()
-    total["gated_accounted"] = total["gated_layout_ok"] + total["gated_no_layout"]
+    total["gated_accounted"] = (total["gated_layout_ok"] + total["gated_no_layout"] +
+                                total["gated_span_mismatch"] + total["gated_unreadable_range"])
     total["gated_tuple_distinct"] = len(gated_tuples)
     # Projected split once the reader uses the computed layout: existing full
     # exports plus compact partials that complete plus gated records that
