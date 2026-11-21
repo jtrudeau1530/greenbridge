@@ -28,6 +28,7 @@ static PFN_vkGetInstanceProcAddr gipa;
 
 static std::vector<uint32_t> read_spv(const char* p) {
     std::ifstream f(p, std::ios::binary);
+    if (!f.good()) return {};
     std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
     std::vector<uint32_t> w(b.size() / 4);
     std::memcpy(w.data(), b.data(), w.size() * 4);
@@ -37,12 +38,42 @@ static std::vector<uint32_t> read_spv(const char* p) {
 #include "../src/descriptor_table.h"
 
 int main(int argc, char** argv) {
-    if (argc < 9) { std::fprintf(stderr, "usage: vk_texture_test vs fs out ptr_sgpr s0 s1 s2 s3\n"); return 2; }
     const uint32_t W = 64, H = 64, TW = 8;
-    int ptr_sgpr = atoi(argv[4]);
-    uint32_t ssharp[8] = {(uint32_t)strtoul(argv[5], 0, 16), (uint32_t)strtoul(argv[6], 0, 16),
-                          (uint32_t)strtoul(argv[7], 0, 16), (uint32_t)strtoul(argv[8], 0, 16),
-                          0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+    std::string vs_path, fs_path, out_path;
+    int ptr_sgpr = 0;
+    uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
+                          0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    if (argc >= 9) {
+        vs_path = argv[1];
+        fs_path = argv[2];
+        out_path = argv[3];
+        ptr_sgpr = std::atoi(argv[4]);
+        for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
+    } else if (argc <= 2) {
+        // Autonomous mode using synthetic hand-written shaders (no game files required)
+        auto find_spv = [](const char* name) -> std::string {
+            const char* candidates[] = {
+                "runtime/build/shaders/spirv/",
+                "runtime/test/shaders/spirv/",
+                "build/shaders/spirv/",
+                "shaders/spirv/",
+                ""
+            };
+            for (const char* prefix : candidates) {
+                std::string p = std::string(prefix) + name;
+                std::ifstream f(p, std::ios::binary);
+                if (f.good()) return p;
+            }
+            return std::string("runtime/build/shaders/spirv/") + name;
+        };
+        vs_path = find_spv("vs_ids.spv");
+        fs_path = find_spv("ps_texture_sample.spv");
+        out_path = (argc == 2) ? argv[1] : "runtime/build/vk_texture_test_out.raw";
+        ptr_sgpr = 0;
+    } else {
+        std::fprintf(stderr, "usage: vk_texture_test [vs fs out ptr_sgpr s0 s1 s2 s3]\n");
+        return 2;
+    }
     uint32_t tsharp[8] = {0x11111111, 0x22222222, 0x33333333, 0x44444444,
                           0x55555555, 0x66666666, 0x77777777, 0x88888888};   // any 8 dwords; only the key matters
     const uint32_t tsharp_va = 256;
@@ -210,10 +241,14 @@ int main(int argc, char** argv) {
     // Pipeline.
     auto module = [&](const char* p, VkShaderModule* m) {
         auto code = read_spv(p);
+        if (code.empty()) {
+            std::fprintf(stderr, "failed to read shader module: %s\n", p);
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; smi.codeSize = code.size() * 4; smi.pCode = code.data();
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
-    VkShaderModule vs, fs; CHECK(module(argv[1], &vs)); CHECK(module(argv[2], &fs));
+    VkShaderModule vs, fs; CHECK(module(vs_path.c_str(), &vs)); CHECK(module(fs_path.c_str(), &fs));
     VkPipelineShaderStageCreateInfo st[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
@@ -272,7 +307,23 @@ int main(int argc, char** argv) {
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(q));
-    std::ofstream(argv[3], std::ios::binary).write(static_cast<const char*>(rbp), std::streamsize(W) * H * 16);
-    std::fprintf(stderr, "ok -> %s (heap base 0x%llx)\n", argv[3], (unsigned long long)heap_base);
+    std::ofstream(out_path, std::ios::binary).write(static_cast<const char*>(rbp), std::streamsize(W) * H * 16);
+    std::fprintf(stderr, "ok -> %s (heap base 0x%llx)\n", out_path.c_str(), (unsigned long long)heap_base);
+    if (argc <= 2) {
+        const float* pixels = static_cast<const float*>(rbp);
+        // Sample center pixel (32, 32)
+        int idx = (32 * W + 32) * 4;
+        float r = pixels[idx + 0];
+        float g = pixels[idx + 1];
+        float b = pixels[idx + 2];
+        float a = pixels[idx + 3];
+        if (std::abs(b - (128.0f / 255.0f)) > 0.05f || std::abs(a - 1.0f) > 0.05f) {
+            std::fprintf(stderr, "vk_texture_test: pixel check FAILED at (32,32): rgba=(%f, %f, %f, %f), expected gradient sample (~0.5, ~0.5, 0.5, 1.0)\n",
+                         r, g, b, a);
+            return 1;
+        }
+        std::printf("vk_texture_test: PASSED (verified center pixel rgba=(%.3f, %.3f, %.3f, %.3f) from gradient texture via descriptor table)\n",
+                    r, g, b, a);
+    }
     return 0;
 }
