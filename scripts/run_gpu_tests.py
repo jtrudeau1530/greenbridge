@@ -454,6 +454,7 @@ def run_suite(a, work: str) -> int:
     vk_compute = os.path.join(a.build, "vk_compute_test" + ext)
     vk_store = os.path.join(a.build, "vk_store_test" + ext)
     vk_harness = os.path.join(a.build, "vk_harness" + ext)
+    vk_bindless = os.path.join(a.build, "vk_bindless_test" + ext)
 
     results: list[tuple[str, bool, str]] = []
     for fname in asm_files:
@@ -492,14 +493,18 @@ def run_suite(a, work: str) -> int:
                             " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
-            rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", "--require-wave64"], env=cs_env)
-            if rc == 77:
+            # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
+            emulated = os.environ.get("LEONIDA_W64_EMULATE") == "1"
+            args = [] if emulated else ["--require-wave64"]
+            rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", *args], env=cs_env)
+            if not emulated and rc == 77:
                 results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
-            elif rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
+            elif not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
                 results.append((name, False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"))
             else:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
+                      "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load"):
@@ -513,6 +518,7 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_half_cmp": [1, 0, 1, 1],
                 "cs_wm_bfm64": [16, 8, 8, 40],
                 "cs_wm_scc_rfl": [55, 48],
+                "cs_w64_mask_detect": [48],
                 # cross-half tests (derivations in each .asm); need exact wave64 or its emulation
                 "cs_w64x_readlane": [121, 121, 16, 97, 16, 100, 100, 121],
                 "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 4660, 99],
@@ -569,6 +575,16 @@ def run_suite(a, work: str) -> int:
             except FileNotFoundError:
                 rc, msg = 1, f"missing {tool}"
             results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
+        elif name == "ps_tex":
+            # A texture through the descriptor hash table and the bindless set. vk_bindless_test compares the
+            # pixels itself, and exits 77 where the device lacks a feature the set or the shader needs.
+            rc, msg = run_cmd([vk_bindless, vs_tri, spv])
+            lines = msg.splitlines()
+            if rc == 77:
+                reason = next((ln for ln in lines if ln.startswith("unsupported:")), "unsupported device")
+                results.append((name, None, f"SKIP ({reason})"))
+            else:
+                results.append((name, rc == 0, lines[-1] if lines else ""))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
