@@ -400,6 +400,9 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
         elif op == "OpISubBorrow":
             x, y = val(a[1]) & MASK, val(a[2]) & MASK
             values[res] = ((x - y) & MASK, 1 if x < y else 0)
+        elif op == "OpIAddCarry":
+            x, y = val(a[1]) & MASK, val(a[2]) & MASK
+            values[res] = ((x + y) & MASK, (x + y) >> 32)
         elif op == "OpIEqual":
             values[res] = val(a[1]) == val(a[2])
         elif op == "OpINotEqual":
