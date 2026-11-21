@@ -128,6 +128,21 @@ class CpuRefTest(unittest.TestCase):
         self.assertEqual(self.vgpr(r, 6), 0x000044DD)    # bytes 0, 4; sign 0; zero
         self.assertEqual(self.vgpr(r, 7), 0xFFFFDDDD)    # byte 0, sign of src1 half, 0xff
 
+    def test_perm_sign_bit_selectors(self):
+        r = self.execute("""
+            v_mov_b32 v0, 0x80000000
+            v_mov_b32 v1, 0x80000000
+            v_mov_b32 v2, 0x0b0a0908
+            v_perm_b32 v3, v0, v1, v2
+            v_mov_b32 v0, 0x00008000
+            v_mov_b32 v1, 0x00008000
+            v_perm_b32 v4, v0, v1, v2
+            s_endpgm
+        """)
+        # Selectors 8/9 read bit 7 of src1 bytes 1/3 (bits 15/31), 10/11 the same of src0.
+        self.assertEqual(self.vgpr(r, 3), 0xFF00FF00)
+        self.assertEqual(self.vgpr(r, 4), 0x00FF00FF)
+
     def test_mul_hi_and_mad(self):
         r = self.execute("""
             v_mul_hi_u32 v0, 0xffffffff, 0xffffffff
