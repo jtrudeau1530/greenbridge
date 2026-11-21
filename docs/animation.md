@@ -113,9 +113,13 @@ hold 711,536 inflated bytes and 2,298 distinct paths:
 | `.anim` | 274 |
 | `.motion` | 12 |
 
-Paths are padded to 16-byte boundaries. After the strings come 16-byte records containing a 32-bit hash and a
-second 32-bit value; `0x98e1750c` recurs in the sampled pages, but its meaning is not established. A separate
-scan of the first 4 KiB of the 130,449 `rpf9_carve` streams found 7,661 distinct `pack:/...` paths and 31,020
+Paths are padded to 16-byte boundaries. The records include a 32-bit name hash and a second 32-bit value. The
+name hash is **joaat32 of the path stem**: strip `pack:/`, strip the final extension, lowercase. In one
+161-name table all 161 hashes matched exactly; across the 273 tables, 3,229 of 3,637 name occurrences (88.8%)
+and 248 of 273 tables matched every name. The remaining 11.2% are not explained (duplicate names, missing
+records or a different record layout). `0x98e1750c` recurs as the second value, but its meaning is not
+established. A separate scan of the first 4 KiB of the 130,449 `rpf9_carve` streams found 7,661 distinct
+`pack:/...` paths and 31,020
 occurrences; 5,880 of those streams contain at least one path, bone name or animation word in that prefix. Names
 also appear embedded at non-zero offsets in zero-prefixed pages (for example at +0x497e0 and +0x4aa8 in one
 327,680-byte page), not only in the 273 start-of-stream tables.
@@ -268,9 +272,10 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
 2. **Group streams into resources.** The TOC is encrypted, so use the `0DRP` page header: count at +0x20,
    pointers at +0x08 and +0x28..+0x40, four u16 values at +0x48. The sampled layout places page headers among
    zero-prefixed pages; a logical resource can span several streams. Do not assume one stream is one file.
-3. **Parse the name/hash tables.** Names are NUL-terminated and 16-byte aligned; records are 16 bytes. The hash
-   algorithm is not identified (joaat32 of the sampled paths did not match the observed values), so do not
-   synthesise hashes. The recurring `0x98e1750c` needs a meaning before it can be used as a type or source id.
+3. **Parse the name/hash tables.** Names are NUL-terminated and 16-byte aligned; the name hash is joaat32 of
+   the stem (path without `pack:/` and without the final extension). The record stride varies (16 or 32 bytes in
+   sampled tables), so do not assume one layout. The recurring `0x98e1750c` needs a meaning before it can be
+   used as a type or source id.
 4. **Join rigs to clips, then decode a known clip.** Pick one `.clip` name table entry, follow its pointer into
    the page, and use the rig entry for its bone order. The 24-byte header and the packed bitstream are the
    blocking unknowns. `MoVE` (version 19, size hint at +0x14) is a second, separate format; map its fields only
