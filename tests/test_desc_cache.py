@@ -9,7 +9,9 @@ encodings of the right length so that branch targets work out) and count the cal
 """
 import gc
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import warnings
@@ -104,6 +106,45 @@ def test_lookups_around_image_load_constructs():
     # before it (the id dominates), and the construct itself added no lookup.
     assert calls(LOAD, SAMPLE, LOAD, SAMPLE) == 2
 
+
+
+def test_no_caching_inside_construct():
+    # A lookup emitted inside an instruction's own selection construct must not be cached: its SSA id does not
+    # dominate code after the merge label, so reusing it there is invalid SPIR-V.
+    g = rdna2spirv.Gen("ps")
+    t_desc = {"k": "sgpr", "r": 8, "n": 8}
+    then_lbl, merge_lbl = "%t_then", "%t_merge"
+
+    assert g.desc_cache_ok()
+    g.emit(f"OpSelectionMerge {merge_lbl} None")
+    g.emit(f"OpBranchConditional %true {then_lbl} {merge_lbl}")
+    g.emit(f"{then_lbl} = OpLabel")
+    assert not g.desc_cache_ok()
+    idx_inner = g.desc_lookup_sgpr(t_desc, 8)
+    assert g.desc_cache == {}, "lookup inside selection construct must not populate desc_cache"
+    g.emit(f"OpBranch {merge_lbl}")
+    g.emit(f"{merge_lbl} = OpLabel")
+
+    # Back at top level of the block: a fresh lookup must be emitted, cached, and reused by a third lookup.
+    assert g.desc_cache_ok()
+    idx_outer = g.desc_lookup_sgpr(t_desc, 8)
+    assert idx_outer != idx_inner, "top-level lookup reused non-dominating id from inside construct"
+    assert g.desc_cache == {(8, 8): idx_outer}
+    assert g.desc_lookup_sgpr(t_desc, 8) == idx_outer
+    g.store_reg("sgpr", 20, idx_outer)  # use the post-merge id so dominance is checked by spirv-val
+
+    asm = rdna2spirv.assemble(g)
+    assert asm.count(CALL) == 2, asm.count(CALL)
+    if shutil.which("spirv-as") and shutil.which("spirv-val"):
+        with tempfile.TemporaryDirectory() as tmp:
+            sa = os.path.join(tmp, "dom.spvasm")
+            sv = os.path.join(tmp, "dom.spv")
+            with open(sa, "w", encoding="utf-8") as f:
+                f.write(asm)
+            r1 = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", sa, "-o", sv], capture_output=True, text=True)
+            assert r1.returncode == 0, f"spirv-as failed:\n{r1.stderr}"
+            r2 = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", sv], capture_output=True, text=True)
+            assert r2.returncode == 0, f"spirv-val failed:\n{r2.stderr}"
 
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
