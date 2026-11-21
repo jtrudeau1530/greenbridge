@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from shader_ir import parse_file  # noqa: E402
 import cfg_structure  # noqa: E402
 import lane_masks  # noqa: E402
+import shader_meta as _shader_meta  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
 
@@ -129,6 +130,7 @@ class Gen:
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
+        self.build_meta = {}          # runtime build metadata from tools/shader_meta.py
 
     def tmp(self):
         self.n += 1
@@ -5311,10 +5313,14 @@ def translate(path):
             for c in range(4):
                 g.cu(4 + 4 * reg + c)
         insns = [i for i in insns if base_op(i["op"]) != "s_swappc_b64"]
+    user_limit = g.cs["user"] if g.cs else USER_SGPRS
+    sys_sgprs = (3,) if stage in ("ms", "gs") else ()
     insns = fold_far_branches(insns)
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if not branchy:
         g.park_masks(([insns], [[]]))
+        g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
+                                            user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
         for ins in insns:
             if base_op(ins["op"]) == "s_endpgm":
                 break
@@ -5369,6 +5375,8 @@ def translate(path):
         else:
             succ.append(list(dict.fromkeys([index[target(last)]] + fall)))
     g.park_masks((blocks, succ))
+    g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
+                                        user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
     for n, blk in enumerate(blocks):
         g.body = []
@@ -5484,6 +5492,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
          "wave64_emulated": bool(g.wave64 and g.stage in ("vs", "ps", "gs"))}
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
+    if g.uses_codebase:
+        m["uses_code_base"] = True
     if g.cs:
         m["local_size"] = list(g.cs["size"])
         m["user_sgprs"] = g.cs["user"]
@@ -5521,6 +5531,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["outputs"] = outs
     if g.inputs:
         m["inputs"] = sorted(g.inputs.values())
+    if g.build_meta:
+        m.update(g.build_meta)
     return m
 
 
