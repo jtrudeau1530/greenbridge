@@ -99,7 +99,13 @@ then 16 bytes per channel:
 At the `0x55` data offset, each chunk starts with a 24-byte record per channel. The record's `+4` word is the
 channel's subblock count and `+8` is a repeated-prefix sample count to skip. The channel data are its run of
 2048-byte subblocks after the 2048-aligned header. The skipped samples repeat the previous chunk's tail, so the
-exporter drops whole packets until the count is consumed. Each Opus channel becomes one mono Ogg Opus file.
+exporter drops whole packets until the count is consumed. Each descriptor channel becomes one Ogg Opus file.
+
+The descriptor's `channels` field is the number of channel groups, not necessarily the packet channel count.
+An Opus packet's TOC stereo bit (`packet[0] & 0x04`) gives the real count, and the descriptor's `samples` field
+counts interleaved samples across those packet channels. The exporter therefore writes a stereo Ogg with
+`OpusHead channels=2` and `samples / 2` as the end granule when the packets are stereo; mono groups keep their
+count unchanged. Reading `samples` as a frame count produces a file that reports twice its real duration.
 
 ## What the exporters write
 
@@ -170,6 +176,8 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 - 300 random Opus streams decode with ffmpeg with no errors; their lengths match the declared sample counts.
 - All 1,818 XMA2 streams decode after `rpf9dump xma`.
 - A 4-channel streamed-music bank gives four 42.0 s mono channels with real levels and no decoder errors.
+- A 1-channel streamed-music descriptor can carry stereo Opus packets; it exports as one stereo Ogg with the
+  interleaved sample count halved, and a 3-channel descriptor with stereo packets exports three stereo Oggs.
 - All exported WAVs decode. Codec 2 values are stored as-is, so a float WAV can exceed ±1.
 
 The tools export the streams and channels as stored. They do not reconstruct runtime mixing, looping, ducking or

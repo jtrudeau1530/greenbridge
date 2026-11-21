@@ -1,0 +1,82 @@
+# Builds a native Windows llvm-mc.exe with the AMDGPU target, for the shader disassembler, without WSL.
+# The official Windows LLVM build ships no llvm-mc.exe and no AMDGPU target. This fetches only the LLVM sources the
+# tool needs (sparse, shallow), builds llvm-mc alone with AMDGPU as the only target, keeps llvm-mc.exe (static CRT,
+# so it runs without the VC++ redistributable) and deletes the rest. Needs git, Python 3 and Visual Studio with the
+# C++ x64 tools; uses VS's CMake + Ninja, or the ones on PATH. About 2 GB of temporary space, 20-40 minutes.
+#
+#   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1 -Dest D:\tools\llvm-mc -NoEnv
+param(
+    [string]$Version = "21.1.8",
+    [string]$Dest = (Join-Path $env:LOCALAPPDATA "Leonida\llvm-mc"),
+    [string]$Temp = (Join-Path $env:TEMP "leonida-llvm-mc"),
+    [switch]$NoEnv,   # don't set LLVM_MC for the current user
+    [switch]$Keep     # keep the sources and build folder (faster rebuilds)
+)
+$ErrorActionPreference = "Stop"
+
+foreach ($t in "git", "python") {
+    if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t wasn't found on PATH." }
+}
+$installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+$vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
+$vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
+
+$cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
+$cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
+$ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
+if (-not ((Test-Path $cmake) -and (Test-Path $ninja))) {
+    $cmake = (Get-Command cmake -ErrorAction SilentlyContinue).Source
+    $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+    if (-not ($cmake -and $ninja)) { throw "CMake and Ninja weren't found (install VS's 'C++ CMake tools' or put them on PATH)." }
+}
+
+$src = Join-Path $Temp "src"
+$out = Join-Path $Temp "build"
+if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
+    if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+    New-Item -ItemType Directory -Force $Temp | Out-Null
+    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse https://github.com/llvm/llvm-project $src
+    if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
+    & git -C $src sparse-checkout set llvm cmake third-party
+    if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
+}
+
+# DIA SDK off: its headers need ATL, which the C++ build tools don't always include, and llvm-mc doesn't use it.
+$body = @"
+"$cmake" -S "$src\llvm" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=Release ^
+  -DLLVM_TARGETS_TO_BUILD=AMDGPU -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLLVM_ENABLE_DIA_SDK=OFF ^
+  -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF ^
+  -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF || exit /b 1
+"$cmake" --build "$out" --target llvm-mc -j $jobs || exit /b 1
+"@
+New-Item -ItemType Directory -Force $out | Out-Null
+# A .cmd file avoids cmd.exe's quote stripping on paths with spaces.
+$bat = Join-Path $Temp "_build.cmd"
+"@echo off`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body" | Set-Content -Encoding ascii $bat
+
+$p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
+$null = $p.Handle  # keeps the exit code readable after WaitForExit
+try { $p.PriorityClass = "BelowNormal" } catch {}
+$p.WaitForExit()
+if ($p.ExitCode -ne 0) { throw "build failed ($($p.ExitCode)); the build folder is kept in $out" }
+
+# Same check shader_disasm.py makes before a run: one s_endpgm on the console's GPU.
+$exe = Join-Path $out "bin\llvm-mc.exe"
+# Through a file: a PowerShell pipe can prepend a BOM, which llvm-mc rejects as an invalid token.
+$probeFile = Join-Path $Temp "probe.txt"
+[IO.File]::WriteAllText($probeFile, "0x00 0x00 0x81 0xbf`n")
+$probe = & $exe --disassemble -triple=amdgcn -mcpu=gfx1013 $probeFile
+if ($LASTEXITCODE -ne 0 -or -not ($probe -match "s_endpgm")) { throw "the built llvm-mc didn't disassemble an s_endpgm" }
+
+New-Item -ItemType Directory -Force $Dest | Out-Null
+$final = Join-Path $Dest "llvm-mc.exe"
+Copy-Item -Force $exe $final
+if (-not $Keep) { Remove-Item -Recurse -Force $Temp }
+if (-not $NoEnv) {
+    [Environment]::SetEnvironmentVariable("LLVM_MC", $final, "User")
+    Write-Host "LLVM_MC set for this user (open a new terminal to pick it up)."
+}
+Write-Host "built $final"

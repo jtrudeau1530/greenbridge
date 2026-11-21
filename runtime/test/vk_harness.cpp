@@ -90,7 +90,9 @@ int main(int argc, char** argv) {
     void* chain = nullptr;
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+#if defined(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) && defined(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR)
     VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+#endif
     if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
         enable.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         bary.fragmentShaderBarycentric = VK_TRUE; bary.pNext = chain; chain = &bary;
@@ -107,10 +109,13 @@ int main(int argc, char** argv) {
         enable.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         meshf.meshShader = VK_TRUE; meshf.pNext = chain; chain = &meshf;
     }
+#if defined(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) && defined(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR)
+    // Older Vulkan headers (as on some CI images) do not declare maintenance8; omit the optional feature.
     if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
         enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
     }
+#endif
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;

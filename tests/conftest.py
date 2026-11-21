@@ -17,13 +17,46 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import mc_command  # noqa: E402
 import rdna2spirv  # noqa: E402
+
+
+def _repair_stdin_handle():
+    """Windows, under pytest's fd capture: give the children the tests start a stdin that is open.
+
+    The capture replaces fd 0 with os.dup2(), which closes the handle fd 0 had, while the process's
+    STD_INPUT_HANDLE keeps that handle's number. subprocess starts from GetStdHandle(), not from fd 0, so a child
+    started without stdin=/input= fails with "[WinError 6] The handle is invalid" or, when the number has been
+    reused meanwhile, gets whatever file now has it. Which one depends on what ran before, so the failures move
+    from run to run. With -s or --capture=sys, and without pytest, the two handles agree and nothing is done.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    import msvcrt
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.GetStdHandle.restype = ctypes.c_void_p
+    kernel32.GetStdHandle.argtypes = [ctypes.c_uint32]
+    kernel32.SetStdHandle.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    std_input = 0xFFFFFFF6                              # STD_INPUT_HANDLE, (DWORD)-10
+    handle = kernel32.GetStdHandle(std_input)
+    try:
+        fd0 = msvcrt.get_osfhandle(0)
+    except OSError:
+        fd0 = None
+    if not handle or handle == fd0:                     # no stdin at all (subprocess copes), or not redirected
+        return
+    # A NUL of our own, never closed: fd 0's handle would go stale again the next time the capture swaps fd 0.
+    kernel32.SetStdHandle(std_input, msvcrt.get_osfhandle(os.open(os.devnull, os.O_RDONLY)))
+
+
+_repair_stdin_handle()      # before the llvm-mc probe below, which is the first child
 
 
 def _has_amdgpu(mc):
     """True if this llvm-mc was built with the AMDGPU target (the official Windows release archives are not)."""
     try:
-        r = subprocess.run([mc, "--version"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(mc + ["--version"], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return "amdgcn" in r.stdout
@@ -33,12 +66,14 @@ def _find_llvm_mc():
     candidates = []
     env = os.environ.get("LLVM_MC")
     if env:
-        candidates.append(shutil.which(env))      # None when the path doesn't exist
-    candidates.append(shutil.which("llvm-mc"))
+        candidates.append(mc_command.split_command(env))
+    found = shutil.which("llvm-mc")
+    if found:
+        candidates.append([found])
     # Debian/Ubuntu install it versioned, out of PATH.
-    candidates += sorted(glob.glob("/usr/lib/llvm-*/bin/llvm-mc"), reverse=True)
+    candidates += [[p] for p in sorted(glob.glob("/usr/lib/llvm-*/bin/llvm-mc"), reverse=True)]
     # Default location of the official Windows installer, which doesn't add LLVM to PATH unless asked to.
-    candidates += glob.glob(r"C:\Program Files\LLVM\bin\llvm-mc.exe")
+    candidates += [[p] for p in glob.glob(r"C:\Program Files\LLVM\bin\llvm-mc.exe")]
     for c in candidates:
         if c and _has_amdgpu(c):
             return c
@@ -126,7 +161,7 @@ class Shader:
             rsrc2, (lx, ly, lz) = cs_header
             (workdir / "fssm").mkdir(exist_ok=True)
             (workdir / "fssm" / f"{name}.fssm").write_bytes(bytes(0x138) + struct.pack("<4I", rsrc2, lx, ly, lz))
-        cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        cmd = LLVM_MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         for ln in asm.splitlines():
             s = ln.strip()
             if not s:

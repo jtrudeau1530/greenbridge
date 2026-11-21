@@ -3413,7 +3413,14 @@ class Gen:
         """s_load_dwordxN sD, s[p:p+1], off   -> N dwords at (64-bit pointer + off)
         s_buffer_load_dwordxN sD, s[v:v+3], off -> N dwords at (V# base address + off)
         Both become PhysicalStorageBuffer loads (Vulkan buffer device address). V# base = dword0 | (dword1 & 0xFFFF) << 32
-        (AMD RDNA ISA, buffer resource descriptor)."""
+        (AMD RDNA ISA, buffer resource descriptor).
+        off is an immediate or a scalar register. An SMEM load can carry both, which llvm-mc prints as
+        "sOFF offset:IMM" (the immediate arrives in mods); the address is then base + sOFF + IMM. Measured on an
+        RX 6800 (gfx1030) for s_buffer_load_dword/x2/x4/x8: soffset 8 + imm 4 reads +12. s_load_dword* shares the
+        encoding and gets the same rule (not measured). The immediate is zero-extended from 32 bits exactly as the
+        immediate-only form is.
+        Not modelled: for s_buffer_load* the hardware was measured to truncate base, sOFF and IMM each to a multiple
+        of 4 and to return 0 past num_records (docs/design.md, Scalar/buffer memory)."""
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         d, base = a[0], a[1]
         # A single dword may also land in vcc_lo / m0 / vcc_hi (seen: s_buffer_load_dword vcc_lo, ...).
@@ -3432,6 +3439,15 @@ class Gen:
             if base.get("n") != 2:
                 raise Unsupported("s_load without 64-bit pointer")
         off = a[2] if len(a) > 2 else {"k": "imm", "v": 0}
+        inst = [m.split(":", 1)[1] for m in mods if m.startswith("offset:")]
+        if len(a) > 3 or len(inst) > 1 or (inst and off["k"] == "imm"):
+            raise Unsupported(f"{op} offset form")      # not something llvm-mc prints: don't guess an address
+        imm = None
+        if inst:
+            try:
+                imm = int(inst[0], 0)
+            except ValueError:
+                raise Unsupported(f"{op} offset:{inst[0]}") from None
         offv = self.src_u(off)
         l64, h64, sh, addr, o64, full = (self.tmp() for _ in range(6))
         self.emit(f"{l64} = OpUConvert %ulong {lo}")
@@ -3440,6 +3456,11 @@ class Gen:
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{o64} = OpUConvert %ulong {offv}")
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
+        if imm is not None:                             # register offset and immediate: both are added
+            i64, both = self.tmp(), self.tmp()
+            self.emit(f"{i64} = OpUConvert %ulong {self.cu(imm)}")
+            self.emit(f"{both} = OpIAdd %ulong {full} {i64}")
+            full = both
         ptr = self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
         self.uses_psb = True
@@ -5648,7 +5669,7 @@ def pos_export_layout(osg1, insns):
       - clip distances precede cull distances, packed contiguously into 4-component pos exports (<= 8 total).
     Contrasted with DXBC OSG1 (D3D_NAME: 2=SV_ClipDistance, 3=SV_CullDistance,
     4=SV_RenderTargetArrayIndex, 5=SV_ViewportArrayIndex, 23=SV_ShadingRate).
-    When OSG1 is absent, infer contiguous ClipDistance slots from non-off pos1..pos2 exports.
+    When OSG1 is absent (or declares no clip/cull/misc outputs), pos1..pos3 exports are ignored.
     """
     misc_svs = {sv for _, _, sv, _, _ in osg1 if sv in (4, 5, 23)}
     has_misc = bool(misc_svs)
@@ -5667,21 +5688,6 @@ def pos_export_layout(osg1, insns):
             if (mask >> c) & 1:
                 slots.append(("cull", cull_n))
                 cull_n += 1
-    if not osg1:
-        used = set()
-        for ins in insns:
-            if base_op(ins["op"]) != "exp":
-                continue
-            a = ins["args"]
-            tgt = a[0]["t"] if a and a[0]["k"] in ("target", "special") else ""
-            if tgt in ("pos1", "pos2"):
-                p = int(tgt[3:])
-                for c, x in enumerate(a[1:5]):
-                    if not (x["k"] == "special" and x["t"] == "off"):
-                        used.add((p - 1) * 4 + c)
-        if used:
-            clip_n = min(max(used) + 1, 8)
-            slots = [("clip", i) for i in range(clip_n)]
     base_pos = 2 if has_misc else 1
     pos_map = {}
     for k, target in enumerate(slots[:8]):

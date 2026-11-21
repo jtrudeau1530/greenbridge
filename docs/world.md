@@ -238,21 +238,19 @@ pattern in the 0–2 GiB family is a hash-table slot, not a matrix row.
 
 ### How many are there?
 
-The measured 9,918 files and 680,228 entities are a **lower bound**, not a whole-archive total. The sample is
-29 GiB of the 57 GiB map band (50.9%) and 39.23 GiB of the archive (55.3%, including the carver-indexed 0–2 GiB
-window).
+A full sharded census of the `levels.rpf` data area now gives a measured total: **23,535 map resources /
+1,670,442 placement entities**. Every map row is exact against its declared entity size and every expected
+shard completed. The earlier bounded passes measured 9,918 files and 680,228 entities in 55.3% of the archive;
+that was a lower bound, and the full pass settles the extrapolation. See
+[world_census.md](world_census.md) for the shard layout, the exactness condition and the 98.32% stream
+coverage.
 
-A single multiplier is weak because density is not uniform: sampled 1-GiB blocks range from 96 to 2,174 map
-files and from 4,754 to 145,118 entities. Treating the 29 sampled 1-GiB units as exchangeable gives a
-uniform-block estimate of **~26,600 map files / ~1.77 million entities**. A 20,000-resample block bootstrap
-gives an approximate 95% interval of 16.0k–39.6k map files and 1.03M–2.64M entities. The selection was
-purposive, not random, so those bounds are approximate; they are not a census.
-
-SixNG's published full-archive measurement, 30,785 map files / 2,249,490 entities
-(https://github.com/holdmysocks/SixNG), lies inside that interval. It is external evidence, not a measurement
-made here. The observed 9,918 files are 32.2% of that count and 680,228 entities are 30.2%, even though 50.9% of
-the map band was scanned. That gap is consistent with the unsampled parts being denser, with map files whose
-entity blocks live in graphics pages, or with both; only a full band scan can settle it.
+The full count is lower than SixNG's published 30,785 map files / 2,249,490 entities
+(https://github.com/holdmysocks/SixNG). The difference is not yet explained. The census counts only
+validated `0x7a` resources whose schema includes `CMapData` and whose entity table is self-consistent;
+SixNG may count archive entries, nested maps, or map resources that this scanner rejects. Treat the
+23,535 / 1,670,442 figure as the measured count for this package and this validation rule, not as a
+claim about a different enumeration method.
 
 ## What is readable, what is hash-only
 
@@ -303,6 +301,11 @@ Hash-only or opaque:
 `offset, size, signature, version, kind, structs, blocks, entities, extents, position bounds, LOD counts`.
 It implements the header/schema validation above and the continuation join. It does not decrypt anything,
 does not extract models/textures, and keeps the output aggregate (one row per resource, no entity dump).
+
+`tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
+`0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
+with 98.32% stream coverage; the exactness condition and byte accounting are in
+[world_census.md](world_census.md).
 
 ```powershell
 python -I tools\world_index.py <levels.rpf> --start 21474836480 --limit 1073741824 `

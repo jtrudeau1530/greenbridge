@@ -15,6 +15,7 @@ payload, carved stream, path list or string dump is committed here.
 | Is there a name or hash table? | **No.** Schema names are inline UTF-8 with a u16 length. There is no hash table and no readable hash string. The 64-bit integers are mostly small codes; none is identified as a name hash. |
 | What do the streams carry? | UI framework and UI data schemas, movie-subtitle containers, and three tuning/config schemas. No animation, mesh or audio payload. |
 | Is it the same format as the `anim.rpf` rig blob? | **Yes, same container and grammar.** That blob is one `rage__crRigSetManager` resource; its 9 descriptors and 28,962 elements parse with the same rules. |
+| Can it be decoded to a tree? | **Yes.** `tools/rbf0_tree.py` decodes all 1,263 resources to element/value/text trees. Unknown descriptors and record types fail closed. |
 | Compression inside `RBF0`? | **None observed.** The only compression is the outer RPF9 zlib framing. |
 
 ## 1. Method and coverage
@@ -229,6 +230,12 @@ The rig blob's nine descriptors are `rage__crRigSetManager`, `RigSet`, `Item`, `
 strings. The element words are again `0, 0, attrs` (27,836 with 0, 1,126 with 1) and there are no attribute
 mismatches.
 
+The grammar-driven tree decoder in section 9 reproduces those counts and resolves the nesting. The root contains
+one `RigSet`, whose 1,126 `Item` elements each carry one `key` string attribute and one `Entries` element. Under
+`Entries`, the 6,677 entry `Item` elements contain a `Dictionary` text, a `Rig` text, a `Group` text and a
+`Priority` integer after the three child elements. Maximum element depth is 6. The decoder does not resolve the
+rig-to-skeleton link.
+
 So the container, prologue, record grammar and element header are shared. The difference is the root schema:
 `anim.rpf` carries a rig-set manager, while `data.rpf` carries UI and config schemas. No `data.rpf` resource has
 the rig-set root, an `anim/` string or a `SKEL_` string. The `data.rpf` RBF0s are not animation data.
@@ -263,7 +270,163 @@ the rig-set root, an `anim/` string or a `SKEL_` string. The `data.rpf` RBF0s ar
 7. **Keep the compression boundary explicit.** The RBF0 bytes are uncompressed after the outer RPF9 zlib inflate.
    There is no byte-blob value type and the parse consumes every byte, so there is no place for a nested frame.
 
-## 9. Reproduction
+The chunk join, descriptor/type pairing, width selection, attribute count and tree build are implemented in
+`tools/rbf0_tree.py`; section 9 records what that decoder measured and what it still cannot name.
+
+## 9. Tree decoder
+
+`tools/rbf0_tree.py` turns the record stream into a tree. It reads a carve directory or one complete resource,
+joins the 64 KiB continuations, and writes one JSON file with one object per resource, plus optional per-resource
+generic XML files. It is stdlib-only and uses no schema file.
+
+The full `data.rpf` carve decodes **1,263 of 1,263 resources with status `ok`**, and the totals are identical to the
+index counts in section 3: 475,461 elements, 254,935 text records, 85,924 string values, 160,490 value records,
+44,887 descriptors (698 distinct names) and maximum element depth 36. No unknown record type occurs in the corpus.
+
+### 9.1 Grammar used by the decoder
+
+| Bytes | Meaning |
+|---|---|
+| `RBF0` + `FB FF 01 00` | magic and the wide (64-bit integer/float) prologue; without the prologue values are 32-bit |
+| `idx type` | one record; `idx < descriptor_count` reuses a descriptor, `idx == descriptor_count` adds one |
+| `u16 len` + UTF-8 | descriptor name, present only when the record adds a descriptor |
+| `0x00` | element open; three u16 words follow, words 0 and 1 are zero and word 2 is the attribute count |
+| `0x10` | unsigned integer, 8 bytes wide or 4 bytes narrow |
+| `0x20` / `0x30` | true / false, no payload |
+| `0x40` | float, 8 bytes wide or 4 bytes narrow |
+| `0x50` | three floats, 3 x width (not present in this corpus) |
+| `0x60` | string; u16 length followed by that many UTF-8 bytes |
+| `FD FF` | text for the open element; u32 length followed by that many bytes (NUL-terminated in this corpus) |
+| `FF FF` | close the open element |
+
+A descriptor is a name index, not a type declaration. The decoder records the type that introduced the descriptor
+and all later types used with the same index.
+
+In every one of the 1,263 resources, the declared attributes are the first value records of their element: no child
+element or text record precedes them (0 violations). Values after the attribute prefix are content in stream order,
+and a value can follow a child element. A text record attaches to the open element.
+
+### 9.2 Measured tree facts
+
+| Measure | Value |
+|---|---:|
+| Resources decoded | 1,263 / 1,263 `ok` |
+| Elements | 475,461 |
+| Elements with 0 / 1 / 2 declared attributes | 389,525 / 84,541 / 1,395 |
+| Attribute values | 87,331: 85,924 string, 1,111 integer, 296 float |
+| Two-attribute type pairs | float/float 128, string/int 1,111, string/float 40, string/string 116 |
+| Non-attribute values | 73,159: 38,008 float, 28,289 integer, 6,862 boolean |
+| Non-attribute values after a child element | 22,977 |
+| Text records | 254,935, all NUL-terminated |
+| Text-only elements | 254,935; one text record, first content, no child or value |
+| String values | 85,924; all are attributes and none is NUL-terminated |
+| Text / string length | 2-1,006 / 1-126 bytes (the text length includes its trailing NUL) |
+| Descriptor instances reused with more than one type | 564 |
+| Root with an attribute | 1: `rage__SafeframeConfig` |
+| Descriptor names not usable as XML element names | 1: `xmlns:xi` |
+| Unknown record types | 0 |
+
+The single root attribute is `xmlns:xi` on the narrow `rage__SafeframeConfig` resource at archive offset
+`0x1c33e000` (18,317 inflated bytes). The same name is declared as descriptor 1 at offset `0x23` and is used 14 times
+in that resource. It is also the only descriptor name that cannot be used as an XML element name (the `xmlns`
+prefix is reserved), which is why the XML writer uses fixed tags and puts the exact name in a `name` attribute.
+
+Of the 26 text payloads that are not valid UTF-8, all are text records; no string value or descriptor name failed
+a strict UTF-8 decode. The decoder replaces invalid bytes with U+FFFD and sets `utf8_valid: false`; the original
+encoding is not established.
+
+### 9.3 Sample trees
+
+The three samples below are the smallest resources of their root schema that decode completely. Offsets are
+relative to the start of the joined resource.
+
+| Root schema | Archive offset | Inflated | Layout | Descriptors | Elements | Texts | Strings | Depth |
+|---|---|---:|---|---:|---:|---:|---:|---:|
+| `CMovieSubtitleContainer` | `0x9ed7280` | 490 | wide-64 | 13 | 11 | 3 | 3 | 4 |
+| `rage__fwuiPrefab` | `0x11dd8950` | 195 | wide-64 | 5 | 4 | 2 | 1 | 3 |
+| `UIScreen` | `0x12059180` | 385 | wide-64 | 9 | 9 | 6 | 0 | 3 |
+
+`CMovieSubtitleContainer` descriptor table:
+
+| ID | Name | First type | Uses |
+|---:|---|---|---:|
+| 0 | `CMovieSubtitleContainer` | open | 1 |
+| 1 | `TextBlockName` | open | 1 |
+| 2 | `pCutsceneEventArgsList` | open | 1 |
+| 3 | `Item` | open | 3 |
+| 4 | `type` | string | 3 |
+| 5 | `cName` | open | 2 |
+| 6 | `m_cOptionalActor` | open | 2 |
+| 7 | `fSubtitleDuration` | float | 2 |
+| 8 | `pCutsceneEventList` | open | 1 |
+| 9 | `fTime` | float | 1 |
+| 10 | `iEventId` | int | 1 |
+| 11 | `iEventArgsIndex` | int | 1 |
+| 12 | `iObjectId` | int | 1 |
+
+The tree shows the attribute/content split directly:
+
+```
+0x0008  element 0  CMovieSubtitleContainer  attrs=0  end 0x01ea
+0x0029    element 1  TextBlockName
+0x0040      text     length 8
+0x0050    element 2  pCutsceneEventArgsList
+0x0070      element 3  Item  attrs=1
+0x007e        value 4  type (string, attribute)
+0x009e        element 5  cName
+0x00ad          text   length 12
+0x00c1        element 6  m_cOptionalActor
+0x00dd        value 7  fSubtitleDuration (float, content after the child)
+0x0154    element 8  pCutsceneEventList
+0x0170      element 3  Item  attrs=1
+0x018f        value 9  fTime (float)
+0x01a0        value 10 iEventId (int)
+0x01b4        value 11 iEventArgsIndex (int)
+0x01cf        value 12 iObjectId (int)
+0x01e8  close root; end 0x01ea
+```
+
+The 195-byte `rage__fwuiPrefab` uses descriptor IDs 0-4: root, `Id`, `PrefabObject`, `type` (string) and `Style`.
+Its root is at 0x08; `Id` at 0x22 with a 42-byte text at 0x2e; `PrefabObject` at 0x60 with one attribute `type`
+at 0x76; `Style` at 0x8f with a 25-byte text at 0x9e; root close at 0xc1, end 0xc3.
+
+The 385-byte `UIScreen` uses descriptor IDs 0-8: `UIScreen`, `LayoutParams`, `widthContentMode`,
+`heightContentMode`, `horizontalAlignment`, `verticalAlignment`, `Name`, `Screen` and `ID`. It has nine elements
+and six text leaves; `LayoutParams` contains four text-valued children and the root contains `Name`, `Screen` and
+`ID` siblings. No attribute is present.
+
+### 9.4 Output and failure behavior
+
+JSON carries one object per resource: `offset`, `size`, `chunks`, `layout`, `root_name`, `status`, `error`,
+`descriptors`, `counts` and `tree`. Every node has a `kind` and a byte `offset`. Elements carry `descriptor`,
+`attrs_declared`, `attributes`, ordered `content` and `end`; values carry `descriptor`, `type`, `payload_offset`,
+`size` and `value`; text nodes carry `length`, `nul_terminated`, `text` and `utf8_valid`.
+
+XML is a rendering, not a round-trip. Fixed tags avoid descriptor names that are not legal XML names:
+`<node name="...">`, `<attr>`, `<value>` and `<text>`. A string containing XML markup is escaped by the writer.
+
+The decoder fails closed. An index beyond the current descriptor table, an unknown record type, a non-zero element
+header word, a close or text with no open element, and a truncated payload stop that resource with `status` `bad`
+or `truncated`; the partial tree is kept and no value is invented. `status` `trailing` means the root closed before
+the last byte. The corpus has 0 bad, 0 truncated and 0 trailing resources.
+
+### 9.5 Remaining unknowns
+
+- There is no schema: descriptor names are fields, but value meaning, enum spelling and units are not stored.
+- The prologue's meaning is still not established; the decoder uses it only to select 4- or 8-byte values.
+- Element header words 0 and 1 are zero in all 475,461 elements. Their intended meaning is unknown; the decoder
+  rejects a non-zero value instead of guessing.
+- The attribute rule is measured, not proven universal: every corpus attribute leads its element and every text
+  element is a text-only leaf. The decoder marks `attribute_order_violation`, `multiple_text` and
+  `text_after_child` if a future resource departs from it; the corpus has none of these.
+- The 26 invalid UTF-8 text payloads have no established encoding. The XML writer replaces bad bytes, so it is
+  lossy for those records.
+- `xmlns:xi` is a literal field name. Its namespace meaning is not decoded.
+- `0x50` (three floats) is accepted by the grammar but never occurs in this corpus.
+- No external schema or XSD validates the tree; XML output is a structural rendering only.
+- A resource does not store its archive path. The source label is the carve offset or file name, not a game path.
+
+## 10. Reproduction
 
 ```powershell
 # Index the archive: CSV or JSON, root/counts/strings; no payload is written
@@ -273,16 +436,23 @@ python -I tools/rbf0_index.py <package>\data.rpf <work>\rbf0.csv --quiet
 # Index a directory of already-carved streams (offsets from leading hex file names)
 python -I tools/rbf0_index.py <work>\data-carve <work>\rbf0.json
 
-# Unit test: synthetic headers only
+# Decode trees from the same carve; JSON plus optional per-resource XML
+python -I tools/rbf0_tree.py <work>\data-carve <work>\rbf0-tree.json
+python -I tools/rbf0_tree.py <work>\data-carve <work>\rbf0-tree.json --xml <work>\rbf0-xml
+python -I tools/rbf0_tree.py <work>\data-carve <work>\subtitle.json --root CMovieSubtitleContainer --limit 1
+
+# Unit tests: synthetic headers and trees only
 python -I tests/test_rbf0_index.py
+python -I tests/test_rbf0_tree.py
 ```
 
 The JSON summary carries the corpus totals used above (`streams`, `compressed_bytes`, `inflated_bytes`,
 `rbf0.resources`, `rbf0.multi_chunk`, `rbf0.by_root`, `rbf0.size_buckets`, record counts, string categories and
 keyword occurrences), so the numbers can be re-measured without committing an index. `--all-strings` writes the
-full readable string list to JSON; that file is game data and must stay out of git.
+full readable string list to JSON; that file is game data and must stay out of git. The tree output and XML files
+contain names and payloads and are game data too.
 
-## 10. No-sharing rule
+## 11. No-sharing rule
 
 Game files, carved streams, inflated RBF0 blobs, readable string lists, parsed trees and reports that quote them
 stay on the machine that owns the package. Do not commit them, attach them to an issue or pull request, or paste

@@ -43,5 +43,38 @@ class CarveTrailingStreamTest(unittest.TestCase):
             self.assertEqual(doc["files"][1]["off"], 0x40 + len(a))
 
 
+def carve(test, data):
+    """Run rpf9_carve.py on `data`; return its index.json after checking it exited cleanly."""
+    with tempfile.TemporaryDirectory() as tmp:
+        arc = os.path.join(tmp, "x.rpf")
+        out = os.path.join(tmp, "out")
+        with open(arc, "wb") as f:
+            f.write(data)
+        p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only"], capture_output=True, text=True)
+        test.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+
+class CarveEdgeTest(unittest.TestCase):
+    def test_bink_signature_cut_off_by_end_of_file(self):
+        # A truncated copy can end inside what looks like a Bink 2 header: its fields lie past the end of the file.
+        a = zlib.compress(b"A" * 1000)
+        data = bytearray(0x40) + a + b"KB2a" + bytes(8)
+        data[0:4] = b"RPF9"
+        struct.pack_into("<I", data, 4, 0x40)
+        doc = carve(self, bytes(data))
+        self.assertEqual(doc["summary"]["files"], 1, doc["summary"])
+        self.assertEqual(doc["summary"]["unread_bytes"], 12)
+
+    def test_empty_data_area(self):
+        data = bytearray(0x40)
+        data[0:4] = b"RPF9"
+        struct.pack_into("<I", data, 4, 0x40)        # data starts at the end of the file
+        doc = carve(self, bytes(data))
+        self.assertEqual(doc["summary"]["files"], 0)
+        self.assertEqual(doc["summary"]["span"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

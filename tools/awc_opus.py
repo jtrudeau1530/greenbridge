@@ -6,13 +6,15 @@ AWC layout (little-endian "ADAT"), as read by rpf9-explorer's OpusPreview.cpp: a
 (id[28:0] | tag count[31:29]), then 8-byte tags (type[63:56], size[55:28], offset[27:0]). Tag 0x55 = data,
 0x76 = format (u32 samples, u16 rate at +8, codec at +28, channels at +29). Codec 0x0B = Opus at 48 kHz: data is
 2048-byte blocks of [u16 length][packet] ..., a zero length pads the rest of the block. Codec 0 = PCM16 (written as
-.wav). Codec 2 = 32-bit float PCM (float .wav). Streamed music (tag 0x48, multi-channel interleaved blocks) is not handled here yet.
+.wav). Codec 2 = 32-bit float PCM (float .wav).
 
 Streamed music (tag 0x48 descriptor: u32 blocks, u32 chunk size, u32 channels, then 16 bytes per channel: id,
-samples, rate at +10, codec at +12) is split into one mono Ogg Opus per channel: each chunk starts with a
+samples, rate at +10, codec at +12) is split into one Ogg Opus per descriptor channel: each chunk starts with a
 24-byte record per channel (subblock count at +4, repeated-prefix samples to skip at +8), the channel data are
 its run of 2048-byte subblocks after the 2048-aligned header, and the first `skip` samples of a chunk repeat the
-previous chunk's tail and are dropped (whole packets).
+previous chunk's tail and are dropped (whole packets). The descriptor's `channels` is the number of channel
+groups, not necessarily the packet channel count: an Opus packet's TOC stereo bit gives the real channel count,
+and the descriptor's `samples` counts interleaved samples across those packet channels.
 
 Output: <out>/<bank>/<stream id>.ogg (or .wav), plus a summary line per bank.
 
@@ -156,7 +158,11 @@ def parse_awc(d: bytes):
 
 
 def music_channels(d: bytes, mus, data, collect_packets: bool = True):
-    """[(channel id, samples, rate, codec, [packets])] for one streamed-music descriptor.
+    """[(channel id, samples, rate, codec, [packets], packet channels)] for one streamed-music descriptor.
+
+    `samples` is the per-channel frame count. The descriptor stores the interleaved sample count, so it is
+    divided by the packet channel count when the Opus packets are stereo. `packet channels` is read from the
+    Opus TOC stereo bit (bit 2) and defaults to 1 when no packet is present.
 
     collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py)."""
     (m_at, m_size), (d_at, d_size) = mus, data
@@ -169,7 +175,7 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         cid = struct.unpack_from("<I", d, base)[0] & 0x1FFFFFFF
         samples, = struct.unpack_from("<I", d, base + 4)
         rate, = struct.unpack_from("<H", d, base + 10)
-        info.append([cid, samples, rate, d[base + 12], []])
+        info.append([cid, samples, rate, d[base + 12], [], 0])
     for b in range(blocks):
         at = d_at + b * chunk
         recs = [struct.unpack_from("<III", d, at + 24 * c + 4)[:2] for c in range(channels)]   # (count, skip)
@@ -179,14 +185,22 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         for c, (count, skip) in enumerate(recs):
             start = at + header + before * 2048
             before += count
-            if info[c][3] != 0x0B or count == 0 or not collect_packets:
+            if info[c][3] != 0x0B or count == 0:
                 continue
-            for pk in opus_packets(d, start, count * 2048):
+            packets = opus_packets(d, start, count * 2048)
+            if packets and info[c][5] == 0:
+                info[c][5] = 2 if any(p[0] & 0x04 for p in packets) else 1
+            if not collect_packets:
+                continue
+            for pk in packets:
                 n = opus_samples(pk)
                 if skip >= n and skip > 0:
                     skip -= n
                     continue
                 info[c][4].append(pk)
+    for x in info:
+        if x[3] == 0x0B and x[5] > 1:
+            x[1] //= x[5]
     return [tuple(x) for x in info]
 
 
@@ -213,10 +227,10 @@ def export_bank(path: str, out_dir: str):
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     streams, music = parse_awc(d)
     for mus, data in music:
-        for cid, samples, rate, codec, pk in music_channels(d, mus, data):
+        for cid, samples, rate, codec, pk, packet_channels in music_channels(d, mus, data):
             if pk:
                 n48 = samples * 48000 // rate if rate else 0
-                write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, 1, cid, n48)
+                write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48)
                 counts["music"] += 1
     for s in streams:
         at, size = s["data"]
