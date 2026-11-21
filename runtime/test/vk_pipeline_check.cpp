@@ -302,14 +302,25 @@ std::string upper_stage(const std::string& st) {
     return u;
 }
 
+VkShaderStageFlagBits stage_bit(const std::string& st) {
+    if (st == "cs") return VK_SHADER_STAGE_COMPUTE_BIT;
+    if (st == "ps") return VK_SHADER_STAGE_FRAGMENT_BIT;
+    if (st == "vs") return VK_SHADER_STAGE_VERTEX_BIT;
+    if (st == "ms") return VK_SHADER_STAGE_MESH_BIT_EXT;
+    if (st == "gs") return VK_SHADER_STAGE_GEOMETRY_BIT;
+    return VkShaderStageFlagBits(0);
+}
+
 struct StageStats {
     uint32_t pipes_ok = 0;
     uint32_t pipes_bad = 0;
     uint32_t pipes_skipped = 0;
     uint32_t w32_ok = 0;
     uint32_t w32_bad = 0;
+    uint32_t w32_unforced = 0;
     uint32_t w64_ok = 0;
     uint32_t w64_bad = 0;
+    uint32_t w64_unforced = 0;
     double seconds = 0.0;
     double max_sec = 0.0;
     std::string max_name;
@@ -458,6 +469,31 @@ int main(int argc, char** argv) {
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     VkDevice dev;
     if (VkResult r = vkCreateDevice(pd, &dci, nullptr, &dev)) { std::fprintf(stderr, "vkCreateDevice %d\n", r); return 1; }
+    auto can_require_sg = [&](uint32_t sg, VkShaderStageFlagBits bit) -> bool {
+        return f13.subgroupSizeControl &&
+               sg >= sgProps.minSubgroupSize &&
+               sg <= sgProps.maxSubgroupSize &&
+               (sgProps.requiredSubgroupSizeStages & bit);
+    };
+    {
+        std::map<uint32_t, std::set<std::string>> unforced_by_sg;
+        for (const auto& [_, meta] : work) {
+            const VkShaderStageFlagBits bit = stage_bit(meta->stage);
+            if (bit && meta->subgroup_size > 0 && !can_require_sg(meta->subgroup_size, bit)) {
+                unforced_by_sg[meta->subgroup_size].insert(meta->stage);
+            }
+        }
+        for (const auto& [sg, stages] : unforced_by_sg) {
+            std::string list;
+            for (const auto& st : stages) {
+                if (!list.empty()) list += "/";
+                list += st;
+            }
+            std::fprintf(stderr,
+                "note: %u-wide subgroups not supported for %s; those pipelines are compiled without a required subgroup size\n",
+                sg, list.c_str());
+        }
+    }
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
     LOADD(vkCreateShaderModule); LOADD(vkDestroyShaderModule); LOADD(vkCreateDescriptorSetLayout);
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateGraphicsPipelines);
@@ -580,13 +616,17 @@ int main(int argc, char** argv) {
         std::printf("SKIPPED %s (%s)\n", name.c_str(), reason.c_str());
     };
 
-    auto record_pipe = [&](const std::string& name, const std::string& stage, uint32_t sg, VkResult r, double sec) {
+    auto record_pipe = [&](const std::string& name, const std::string& stage, uint32_t sg, bool sg_forced,
+                           VkResult r, double sec) {
         std::lock_guard<std::mutex> g(mu);
         inflight.erase(std::this_thread::get_id());
         auto& st = stats[stage];
         st.seconds += sec;
         if (sec > st.max_sec) { st.max_sec = sec; st.max_name = name; }
         if (sec > slow) std::printf("SLOW %s %s (w%u, %.1fs)\n", upper_stage(stage).c_str(), name.c_str(), sg, sec);
+        if (sg > 0 && !sg_forced) {
+            if (sg == 64) st.w64_unforced++; else st.w32_unforced++;
+        }
         if (r) {
             st.pipes_bad++;
             if (sg == 64) st.w64_bad++; else st.w32_bad++;
@@ -597,13 +637,6 @@ int main(int argc, char** argv) {
         }
         uint32_t n_done = ++total_pipes_done;
         if (n_done % 250 == 0) std::fprintf(stderr, "  pipelines %u (%.0fs elapsed)\n", n_done, elapsed());
-    };
-
-    auto can_require_sg = [&](uint32_t sg, VkShaderStageFlagBits bit) -> bool {
-        return f13.subgroupSizeControl &&
-               sg >= sgProps.minSubgroupSize &&
-               sg <= sgProps.maxSubgroupSize &&
-               (sgProps.requiredSubgroupSizeStages & bit);
     };
 
     auto worker = [&] {
@@ -636,7 +669,8 @@ int main(int argc, char** argv) {
                     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
                     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
                     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
-                    if (can_require_sg(meta.subgroup_size, VK_SHADER_STAGE_COMPUTE_BIT)) cpi.stage.pNext = &reqSg;
+                    const bool sg_forced = can_require_sg(meta.subgroup_size, VK_SHADER_STAGE_COMPUTE_BIT);
+                    if (sg_forced) cpi.stage.pNext = &reqSg;
                     cpi.layout = pl;
                     const auto t0 = std::chrono::steady_clock::now();
                     { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
@@ -644,7 +678,7 @@ int main(int argc, char** argv) {
                     VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
                     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                    record_pipe(name, stage, meta.subgroup_size, r, sec);
+                    record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
                 }
             } else if (mod_ok && is_graphics_stage(stage)) {
                 const std::string miss = check_missing_feature(meta);
@@ -656,10 +690,14 @@ int main(int argc, char** argv) {
                         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
                     reqSg.requiredSubgroupSize = meta.subgroup_size;
 
+                    bool sg_forced = false;
                     auto make_stage = [&](VkShaderStageFlagBits bit, VkShaderModule mod, bool real) {
                         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
                         si.stage = bit; si.module = mod; si.pName = "main";
-                        if (real && can_require_sg(meta.subgroup_size, bit)) si.pNext = &reqSg;
+                        if (real && can_require_sg(meta.subgroup_size, bit)) {
+                            si.pNext = &reqSg;
+                            sg_forced = true;
+                        }
                         return si;
                     };
 
@@ -802,7 +840,7 @@ int main(int argc, char** argv) {
                         VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &p);
                         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                         if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                        record_pipe(name, stage, meta.subgroup_size, r, sec);
+                        record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
                     }
                 }
             } else if (mod_ok) {
@@ -866,8 +904,13 @@ int main(int argc, char** argv) {
                     std::printf("  %s skipped (%s): %u\n", st.c_str(), reason.c_str(), cnt);
             }
             if (compiled > 0) {
-                std::printf("  %s wave32: %u ok, %u failed; wave64: %u ok, %u failed\n",
-                            st.c_str(), s.w32_ok, s.w32_bad, s.w64_ok, s.w64_bad);
+                auto fmt_unforced = [](uint32_t cnt) -> std::string {
+                    return cnt ? (" (" + std::to_string(cnt) + " without required subgroup size)") : "";
+                };
+                std::printf("  %s wave32: %u ok, %u failed%s; wave64: %u ok, %u failed%s\n",
+                            st.c_str(),
+                            s.w32_ok, s.w32_bad, fmt_unforced(s.w32_unforced).c_str(),
+                            s.w64_ok, s.w64_bad, fmt_unforced(s.w64_unforced).c_str());
                 std::printf("  %s compile time: %.2fs total, %.3fs mean, slowest %s (%.2fs)\n",
                             st.c_str(), s.seconds, s.seconds / compiled, s.max_name.c_str(), s.max_sec);
             }
