@@ -83,9 +83,18 @@ def main() -> int:
         rows.append({"name": stem, "size": len(fssm), "magic": fssm[:4].decode("latin-1"),
                      "version": struct.unpack_from("<H", fssm, 4)[0], "endpgm": ends,
                      "tags": sorted(hex(t) for t in ents)})
-    with open(os.path.join(src, "fssm_index.json"), "w", encoding="utf-8") as f:
-        json.dump(rows, f)
     print(f"{len(rows)} FSSM blobs, problems: {dict(problems)}")
+    if not rows:
+        # No index: make_game.py takes fssm_index.json as proof this step finished, and an empty one is not.
+        print(f"ERROR: no shader in {src} unpacked. Check that it holds the carved .dxbc files of a supported "
+              "game version.", file=sys.stderr)
+        return 1
+    tmp = os.path.join(src, "fssm_index.json.tmp")   # written last and renamed in, so a stopped run leaves none
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rows, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, os.path.join(src, "fssm_index.json"))
     print("magic:", dict(Counter(r["magic"] for r in rows)))
     print("s_endpgm per blob:", dict(Counter(len(r["endpgm"]) for r in rows)))
     sizes = sorted(r["size"] for r in rows)

@@ -21,6 +21,7 @@ import zlib
 
 ENTRY = re.compile(rb"([\x21-\x7e]{3,200})\x00(.)(....)(....)\3(....)", re.DOTALL)
 STAGES = {0: "ps", 1: "vs", 2: "gs", 3: "hs", 4: "ds", 5: "cs", 6: "lib", 13: "ms", 14: "as"}
+RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
 def parts(dxbc: bytes) -> dict:
@@ -40,10 +41,29 @@ def shader_model(dxbc: bytes, p: dict):
     return STAGES.get(kind, str(kind)), f"{ver >> 4}.{ver & 0xF}"
 
 
+def file_name(name: str, seen: dict, used: set) -> str:
+    """A file name for `name` that no earlier shader has, as Windows compares them: without case, and with the
+    device names (CON, NUL, COM1...) that open a device instead of a file. Same name twice means distinct
+    variants; the second gets ~1, the third ~2."""
+    base = re.sub(r'[<>:"/\\|?*]', "_", name)
+    if base.split(".")[0].upper() in RESERVED:
+        base = "_" + base
+    key = base.lower()
+    n = seen.get(key, 0)
+    while True:
+        fname = base + (f"~{n}" if n else "") + ".dxbc"
+        if fname.lower() not in used:
+            break
+        n += 1
+    seen[key] = n + 1
+    used.add(fname.lower())
+    return fname
+
+
 def main() -> int:
     src, out = sys.argv[1], sys.argv[2]
     os.makedirs(out, exist_ok=True)
-    index, seen, bad = [], {}, 0
+    index, seen, used, bad = [], {}, set(), 0
     with open(src, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         for mt in ENTRY.finditer(m):
@@ -63,16 +83,18 @@ def main() -> int:
                 continue
             p = parts(data)
             stage, sm = shader_model(data, p)
-            # Same name twice means distinct variants; keep both.
-            n = seen.get(name, 0)
-            seen[name] = n + 1
-            fname = re.sub(r'[<>:"/\\|?*]', "_", name) + (f"~{n}" if n else "") + ".dxbc"
+            fname = file_name(name, seen, used)
             with open(os.path.join(out, fname), "wb") as f:
                 f.write(data)
             index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],
                           "stage": stage, "sm": sm, "size": size, "parts": {k: v[1] for k, v in p.items()}})
-    with open(os.path.join(out, "index.json"), "w", encoding="utf-8") as f:
+    # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
+    tmp = os.path.join(out, "index.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, os.path.join(out, "index.json"))
     from collections import Counter
     print(f"{len(index)} shaders carved, {bad} candidates rejected")
     print("stages:", dict(Counter(e["stage"] for e in index)))
