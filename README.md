@@ -129,7 +129,8 @@ Pass the directory containing `index.json` and the translated SPIR-V files to `v
 | Research tools | PE/RTTI inspection, raw carving, texture tiling probes, GPU test harnesses | `tools/`, `runtime/test/` |
 
 The translator's runtime contract (user SGPRs, push constants, memory model, bindless images, vertex fetch,
-system values) and all the format notes are in [docs/design.md](docs/design.md). The Xbox D3D12 plan is in
+system values) and all the format notes are in [docs/design.md](docs/design.md); the format, asset, runtime
+and validation notes are indexed in [docs/README.md](docs/README.md). The Xbox D3D12 plan is in
 [docs/d3d12_vulkan.md](docs/d3d12_vulkan.md). Audio bank formats and the export tools are in
 [docs/audio.md](docs/audio.md); [docs/related_projects.md](docs/related_projects.md) records the prior art we may
 read and the licence limits on it.
