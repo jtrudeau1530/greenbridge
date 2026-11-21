@@ -96,6 +96,7 @@ class Gen:
         self.ms_params = set()     # MS: param export indices used
         self.ms_alloc = False      # MS: s_sendmsg GS_ALLOC_REQ seen
         self.gs = None             # GS: {"in": [(reg, sv)], "out": [(reg, sv)], "nreg": n, "maxv": n}
+        self.wave64 = False        # compiled for 64-lane waves (64-bit EXEC writes, exec_hi, v_mbcnt_hi, ...)
         self.uses_storage3d = False
         self.uses_heap = False
         self.uses_codebase = False
@@ -1206,6 +1207,56 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
+    def wave_lane(self):
+        """This invocation's hardware lane within its wave. Compute and mesh shaders: LocalInvocationIndex mod the
+        wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane, which is
+        the hardware lane when the runtime runs them with subgroup size == wave size."""
+        lane = self.tmp()
+        if self.stage == "ms":
+            li = self.tmp()
+            self.emit(f"{li} = OpLoad %uint %local_index")
+            self.emit(f"{lane} = OpBitwiseAnd %uint {li} {self.cu(63 if self.wave64 else 31)}")
+        elif self.stage == "cs":
+            lid, x, y, z, lx, lxy, t1, t2, li = (self.tmp() for _ in range(9))
+            sx, sy, _ = self.cs["size"]
+            self.emit(f"{lid} = OpLoad %v3uint %local_id")
+            self.emit(f"{x} = OpCompositeExtract %uint {lid} 0")
+            self.emit(f"{y} = OpCompositeExtract %uint {lid} 1")
+            self.emit(f"{z} = OpCompositeExtract %uint {lid} 2")
+            self.emit(f"{t1} = OpIMul %uint {y} {self.cu(sx)}")
+            self.emit(f"{t2} = OpIMul %uint {z} {self.cu(sx * sy)}")
+            self.emit(f"{lx} = OpIAdd %uint {x} {t1}")
+            self.emit(f"{li} = OpIAdd %uint {lx} {t2}")
+            self.emit(f"{lane} = OpBitwiseAnd %uint {li} {self.cu(63 if self.wave64 else 31)}")
+        else:
+            self.uses_subgroup = True
+            self.emit(f"{lane} = OpLoad %uint %sg_lane")
+        return lane
+
+    def exec_half_write(self, half, val, const=None):
+        """Write one 32-bit half of EXEC. In the per-lane model a lane is active iff its bit is set. A constant
+        sets each lane from its own bit; a register value (mask representation: all-ones / zero per lane) sets
+        the lanes of that half from their own copy. Lanes of the other half are unchanged."""
+        lane = self.wave_lane()
+        rel, inh, bit, on, cur, new = (self.tmp() for _ in range(6))
+        if half == 0:
+            self.emit(f"{inh} = OpULessThan %bool {lane} {self.cu(32)}")
+            self.emit(f"{rel} = OpCopyObject %uint {lane}")
+        else:
+            self.emit(f"{inh} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+            self.emit(f"{rel} = OpISub %uint {lane} {self.cu(32)}")
+        if const is not None:
+            r31 = self.tmp()
+            self.emit(f"{r31} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
+            self.emit(f"{bit} = OpBitFieldUExtract %uint {self.cu(const & 0xFFFFFFFF)} {r31} {self.cu(1)}")
+            self.emit(f"{on} = OpINotEqual %bool {bit} {self.cu(0)}")
+        else:
+            self.emit(f"{on} = OpINotEqual %bool {val} {self.cu(0)}")
+        self.emit(f"{cur} = OpLoad %bool %active")
+        self.emit(f"{new} = OpSelect %bool {inh} {on} {cur}")
+        self.emit(f"OpStore %active {new}")
+        self.uses_active = True
+
     def set_scc(self, b):
         """SCC = bool id (1/0)."""
         r = self.tmp()
@@ -1353,7 +1404,15 @@ class Gen:
             # MODE register (rounding/denormals). SPIR-V float controls aren't modelled yet: Vulkan defaults are
             # used, which can differ in denormal handling. Recorded here so the gap is visible.
             return
-        if op == "v_mov_b32" or op == "s_mov_b32":
+        if op == "s_mov_b32" and a[0]["k"] == "special" and a[0]["t"] in ("exec_lo", "exec_hi") and \
+                (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm")):
+            src = a[1]
+            const = (src["v"] & 0xFFFFFFFF) if src["k"] == "imm" else None
+            if src["k"] == "fimm":
+                const = struct.unpack("<I", struct.pack("<f", src["v"]))[0]
+            self.exec_half_write(0 if a[0]["t"] == "exec_lo" else 1, None if const is not None else self.src_u(src),
+                                 const)
+        elif op == "v_mov_b32" or op == "s_mov_b32":
             self.dst(a[0], self.src_u(a[1]))
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
@@ -1543,12 +1602,8 @@ class Gen:
             self.uses_subgroup = True
             mask, acc = self.src_u(a[1]), self.src_u(a[2])
             lane, rel, below, inrange, one, m1, cnt, r = (self.tmp() for _ in range(8))
-            if self.stage == "ms":
-                li = self.tmp()
-                self.emit(f"{li} = OpLoad %uint %local_index")
-                self.emit(f"{lane} = OpBitwiseAnd %uint {li} {self.cu(63)}")
-            else:
-                self.emit(f"{lane} = OpLoad %uint %sg_lane")
+            wl = self.wave_lane()
+            self.emit(f"{lane} = OpCopyObject %uint {wl}")
             if op.endswith("lo_u32_b32"):
                 self.emit(f"{rel} = OpCopyObject %uint {lane}")
             else:
@@ -4162,6 +4217,9 @@ def stage_of(name, path):
     return _STAGES.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
 
 
+WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
+
+
 def fold_far_branches(insns):
     """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] is a far
     branch (s_branch only reaches +-32K dwords): the target is the address after s_getpc plus K. Fold the four
@@ -4365,6 +4423,11 @@ def translate(path):
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
     g = Gen(stage)
+    g.wave64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
+                   (base_op(i["op"]).endswith("_b64") and any(x.get("t") == "exec" for x in i["args"]))
+                   for i in insns)
+    if stage == "ms":
+        g.wave64 = True            # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
     if stage == "gs":
         ins_sig = [(reg, sv) for reg, mask, sv, ctype in input_signature(path, info["name"])]
         outs = output_signature(path, info["name"])
@@ -4498,6 +4561,7 @@ def translate(path):
             if base_op(ins["op"]) == "s_endpgm":
                 break
             g.insn(ins)
+        translate.last_gen = g
         return assemble(g)
 
     # ---- basic blocks ----
@@ -4559,6 +4623,7 @@ def translate(path):
                 g.emit(f"OpStore %pc {r}")
         g.blocks.append([l.strip() for l in g.body])
     g.body = []
+    translate.last_gen = g
     return assemble(g)
 
 
@@ -4595,6 +4660,51 @@ def branch_condition(g, op):
     return b
 
 
+def shader_meta(g, asm):
+    """What a runtime needs to create the pipeline for this module without inspecting it: stage, wave size,
+    Vulkan features/extensions it requires, descriptor bindings (set 0), push-constant size, workgroup size,
+    LDS bytes, mesh/geometry limits, and the input/output locations."""
+    caps = sorted(set(re.findall(r"OpCapability (\w+)", asm)))
+    exts = sorted(set(re.findall(r'OpExtension "([^"]+)"', asm)))
+    binds = sorted({int(b) for b in re.findall(r"OpDecorate %\w+ Binding (\d+)", asm)})
+    feats = {"FragmentBarycentricKHR": "fragmentShaderBarycentric",
+             "FragmentShaderPixelInterlockEXT": "fragmentShaderPixelInterlock",
+             "MeshShadingEXT": "meshShader", "Geometry": "geometryShader", "Float64": "shaderFloat64",
+             "Int64": "shaderInt64", "StorageImageWriteWithoutFormat": "shaderStorageImageWriteWithoutFormat",
+             "PhysicalStorageBufferAddresses": "bufferDeviceAddress",
+             "RuntimeDescriptorArray": "runtimeDescriptorArray", "ImageGatherExtended": "shaderImageGatherExtended",
+             "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core"}
+    m = {"stage": g.stage, "wave64": bool(g.wave64), "capabilities": caps, "extensions": exts,
+         "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),
+         "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 16,
+         "subgroup_size": 64 if g.wave64 else 32}
+    if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
+        m["needs_maintenance8"] = True
+    if g.cs:
+        m["local_size"] = list(g.cs["size"])
+        m["user_sgprs"] = g.cs["user"]
+    if g.ms:
+        m["local_size"] = list(g.ms["size"])
+        m["max_vertices"], m["max_primitives"] = g.ms["maxv"], g.ms["maxp"]
+        m["params"] = sorted(g.ms_params)
+    if g.gs:
+        m["max_vertices"] = g.gs["maxv"]
+        m["gs_inputs"] = [r for r, _ in g.gs["in"]]
+        m["gs_outputs"] = [r for r, _ in g.gs["out"]]
+    if g.uses_lds:
+        m["lds_bytes"] = 4 * g.lds_dwords
+    if g.vertex_inputs:
+        m["vertex_inputs"] = [{"location": r, "type": {1: "uint", 2: "sint"}.get(t, "float")} for r, t in g.vertex_inputs]
+    if g.frag_inputs:
+        m["ps_system_inputs"] = sorted({str(c) for c in g.frag_inputs.values()})
+    outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if t != "pos0")
+    if outs:
+        m["outputs"] = outs
+    if g.inputs:
+        m["inputs"] = sorted(g.inputs.values())
+    return m
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -4605,6 +4715,7 @@ def main():
     files = files[: a.limit] if a.limit else files
     os.makedirs(a.out, exist_ok=True)
     why, ok, valid = Counter(), 0, 0
+    meta = {}
     for p in files:
         name = os.path.splitext(os.path.basename(p))[0]
         try:
@@ -4626,8 +4737,20 @@ def main():
                                capture_output=True, text=True)  # Offset on non-gather: VK_KHR_maintenance8
         if r.returncode == 0:
             valid += 1
+            try:
+                meta[name] = shader_meta(translate.last_gen, asm)
+            except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
+                meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
+    import json as _js
+    idx_path = os.path.join(a.out, "index.json")
+    old = {}
+    if os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
+        old = _js.load(open(idx_path, encoding="utf-8"))      # partial runs merge into an existing index
+    old.update(meta)
+    with open(idx_path, "w", encoding="utf-8") as f:
+        _js.dump(old, f, indent=0, sort_keys=True)
     print(f"{len(files)} shaders: {ok} translated, {valid} pass spirv-val")
     for k, v in why.most_common(25):
         print(f"  {v:6}  {k}")

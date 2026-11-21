@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
     VkDeviceMemory mem; CHECK(vkAllocateMemory(dev, &mai, nullptr, &mem));
     CHECK(vkBindBufferMemory(dev, buf, mem, 0));
     void* map; CHECK(vkMapMemory(dev, mem, 0, bytes, 0, &map));
-    std::memset(map, 0xEE, size_t(bytes));
+    std::memset(map, !std::strcmp(argv[3], "exec64") ? 0 : 0xEE, size_t(bytes));
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = buf;
     const uint64_t heap = vkGetBufferDeviceAddress(dev, &bai);
@@ -146,6 +146,13 @@ int main(int argc, char** argv) {
         for (uint32_t g = 0; g < groups; g++)
             for (uint32_t t = 0; t < 64; t++) {
                 uint32_t want = g * 64 + (63 - t), got = out[g * 64 + t];
+                if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
+            }
+    }
+    if (!std::strcmp(argv[3], "exec64")) {    // runtime/test/shaders/cs_exec64.asm
+        for (uint32_t g = 0; g < groups; g++)
+            for (uint32_t t = 0; t < 64; t++) {
+                uint32_t want = (t >= 16 && t < 48) ? 7u : 0u, got = out[g * 64 + t];
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
     }
