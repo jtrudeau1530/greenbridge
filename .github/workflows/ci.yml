@@ -78,11 +78,11 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - name: Install llvm-mc and spirv-tools
+      - name: Install LLVM, SPIR-V tools and Python test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm-18 spirv-tools
-          pip install pytest
+          python -m pip install pytest numpy Pillow
       - name: Translator tests
         run: python -m pytest tests -q --ignore=tests/semantic
   semantic-tests:
