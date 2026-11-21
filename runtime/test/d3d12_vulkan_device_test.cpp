@@ -1,7 +1,7 @@
 // The Vulkan-backed ID3D12Device behind the Xbox-ABI device proxy, end to end, on a GPU. Everything goes through
 // the proxy the way the game will call it: device methods (forwarded slots), descriptor heaps from slot 14 with
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
-// resources, views, command lists, a queue and a fence. Results are read back through D3D12 itself
+// resources, views, command lists, a queue, a fence and query heaps. Results are read back through D3D12 itself
 // (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo and
 // GetResourceTiling are compared with the host PC runtime's, and so are copies (d3d12_copy_compare.h).
 // WriteToSubresource/ReadFromSubresource run on devices of their own, once per copy path. No shaders or game data.
@@ -1561,6 +1561,8 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.texture_compression_bc = d.bc;
+        info.occlusion_query_precise = d.occlusion_query_precise;
+        info.pipeline_statistics_query = d.pipeline_statistics_query;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -2631,6 +2633,123 @@ int main() {
             report("reserved buffer", 0, down + tiled_bytes_down, up + tiled_bytes_up, 256);
         }
 
+        // Queries (docs/d3d12_vulkan.md section 4.6). The layer has no draws yet, so occlusion and pipeline
+        // statistics count nothing and read zero; what is checked is that every query is reset and run, that
+        // results land as UINT64s at the offsets asked for (over a 0xcd fill), that timestamps advance at the
+        // reported frequency, that a query keeps its result across executions, that one never ended reads zero
+        // instead of stalling the GPU, and that the D3D12 rules for the calls are kept.
+        {
+            UINT64 frequency = 0;
+            EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency >= 1'000'000);
+            EXPECT(queue->GetTimestampFrequency(nullptr) == E_INVALIDARG);
+            Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, refused;
+            D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));
+            EXPECT(device->CreateQueryHeap(&query_desc, __uuidof(ID3D12QueryHeap), nullptr) == S_FALSE);
+            {
+                Ref<ID3D12Device> parent;
+                EXPECT(SUCCEEDED(occlusion->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
+            }
+            query_desc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 3, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
+            query_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0};
+            EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
+            query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 1, 0};  // no stream output path yet
+            EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+            query_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 2, 0};
+            if (d.pipeline_statistics_query)
+                EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&statistics.p))));
+            else
+                std::printf("pipeline statistics: no pipelineStatisticsQuery, skipped\n");
+
+            // Readback layout: timestamps at 0, occlusion at 64, statistics at 256, the second run's at 1024.
+            constexpr UINT64 ts_at = 0, occlusion_at = 64, statistics_at = 256, again_at = 1024;
+            const auto u64 = [&](UINT64 offset) {
+                UINT64 value;
+                std::memcpy(&value, down + offset, sizeof(value));
+                return value;
+            };
+            std::memset(down, 0xcd, 65536);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            if (statistics.p) list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            // A rectangle clear runs in a render pass inside a query; clears count no samples.
+            device->CreateRenderTargetView(rt_resource.p, &rtv_desc, rtv1);  // the resolve test reused it
+            list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            barrier = transition(rt_resource.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &barrier);
+            list->ClearRenderTargetView(rtv1, red, 1, &square);
+            list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+            list->CopyBufferRegion(readback.p, 8192, upload.p, 0, 32768);
+            list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+            if (statistics.p) list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, readback.p, ts_at);  // 2: never
+            list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.p, occlusion_at);
+            list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1, readback.p, occlusion_at + 8);
+            list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 2, 2, readback.p, occlusion_at + 16);
+            if (statistics.p)
+                list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 2, readback.p,
+                                       statistics_at);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)) && SUCCEEDED(fence->SetEventOnCompletion(10, nullptr)));
+
+            const UINT64 t0 = u64(ts_at), t1 = u64(ts_at + 8);
+            EXPECT(t0 != 0 && t0 != 0xcdcdcdcdcdcdcdcdull && t1 >= t0);
+            EXPECT(double(t1 - t0) / double(frequency) < 10.0);  // the copy took less than ten seconds
+            EXPECT(u64(ts_at + 16) == 0);                        // never written
+            for (UINT i = 0; i < 4; ++i) EXPECT(u64(occlusion_at + 8 * i) == 0);
+            for (UINT i = 0; statistics.p && i < 22; ++i) EXPECT(u64(statistics_at + 8 * i) == 0);
+            EXPECT(u64(statistics.p ? statistics_at + 176 : statistics_at) == 0xcdcdcdcdcdcdcdcdull);  // not past it
+
+            // A second execution reuses timestamp 0 (reset before it is written again) and resolves timestamp 1,
+            // which keeps the result of the first execution.
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->EndQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback.p, again_at);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 11)) && SUCCEEDED(fence->SetEventOnCompletion(11, nullptr)));
+            EXPECT(u64(again_at) >= t1 && u64(again_at + 8) == t1);
+
+            // Lists that break the rules. Close reports what it can see; the rest is refused at execution, and
+            // nothing is submitted.
+            const auto refuse = [&](HRESULT close, leonida::ReplayResult result, auto&& record) {
+                if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return false;
+                record();
+                if (list->Close() != close) return false;
+                queue->ExecuteCommandLists(1, lists);
+                return rt::d3d12::last_execute_result(queue.p) == result;
+            };
+            using R = leonida::ReplayResult;
+            EXPECT(refuse(E_INVALIDARG, R::invalid_query,  // begun and never ended
+                          [&] { list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0); }));
+            EXPECT(refuse(E_INVALIDARG, R::success,  // timestamps have no Begin; the call is dropped
+                          [&] { list->BeginQuery(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
+            EXPECT(refuse(E_INVALIDARG, R::success,  // offset not a multiple of 8
+                          [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, readback.p, 4); }));
+            EXPECT(refuse(S_OK, R::invalid_query,  // past the end of the heap
+                          [&] { list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 3, 2, readback.p, 0); }));
+            EXPECT(refuse(S_OK, R::invalid_query,  // a type the heap does not hold
+                          [&] { list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_TIMESTAMP, 0); }));
+            EXPECT(refuse(S_OK, R::invalid_query,  // into a texture
+                          [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, rt_resource.p, 0); }));
+            EXPECT(refuse(S_OK, R::invalid_query,  // past the end of the buffer
+                          [&] { list->ResolveQueryData(timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback.p, 65528); }));
+            EXPECT(refuse(S_OK, R::unsupported, [&] {  // valid D3D12, but Vulkan runs one occlusion query at a time
+                list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+                list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+                list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+                list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            }));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            EXPECT(SUCCEEDED(list->Close()));
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
@@ -2678,6 +2797,11 @@ int main() {
         EXPECT(SUCCEEDED(standalone->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 5)));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(5, nullptr)) && fence->GetCompletedValue() == 5);
+        UINT64 frequency = 0;
+        Ref<ID3D12QueryHeap> timestamps;
+        const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 1, 0};
+        EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency);
+        EXPECT(SUCCEEDED(standalone->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
     }
 
     if (d.validation_errors()) {
@@ -2685,6 +2809,7 @@ int main() {
         return 1;
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
-                "BC copies, a resolve, reserved resources, and GetCopyableFootprints and GetResourceTiling all matched\n");
+                "BC copies, a resolve, reserved resources, queries, and GetCopyableFootprints and GetResourceTiling all "
+                "matched\n");
     return 0;
 }

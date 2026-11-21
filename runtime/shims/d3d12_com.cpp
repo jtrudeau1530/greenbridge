@@ -47,6 +47,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_subresource: return "invalid subresource";
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
+    case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -90,9 +91,11 @@ public:
     }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
 
-    // E_INVALIDARG when a call during recording was invalid, as D3D12's Close reports it.
+    // E_INVALIDARG when a call during recording was invalid, or a query was begun and not ended, as D3D12's Close
+    // reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
+        if (list_.queries_open()) invalid_ = true;
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
     }
@@ -305,6 +308,21 @@ public:
                                {std::bit_cast<std::uint32_t>(values[0]), std::bit_cast<std::uint32_t>(values[1]),
                                 std::bit_cast<std::uint32_t>(values[2]), std::bit_cast<std::uint32_t>(values[3])},
                                count, rects);
+    }
+
+    // Queries (docs/d3d12_vulkan.md section 4.6). Heap types, index ranges and the destination buffer are checked
+    // at ExecuteCommandLists, when the heap and the buffer are known.
+    void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
+        check(list_.begin_query({query_heap_id(heap), u(type), index}));
+    }
+
+    void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
+        check(list_.end_query({query_heap_id(heap), u(type), index}));
+    }
+
+    void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT first, UINT count,
+                                            ID3D12Resource* dst, UINT64 offset) override {
+        check(list_.resolve_queries({query_heap_id(heap), u(type), first, count, resource_id(dst), offset}));
     }
 
     // GCL8. Vulkan can set the two faces independently with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT /
@@ -525,7 +543,7 @@ public:
 
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
                  const D3D12_COMMAND_QUEUE_DESC& desc)
-        : desc_(desc), queue_(context, queue, family) {}
+        : desc_(desc), context_(context), queue_(context, queue, family) {}
 
     bool ok() const { return queue_.ok(); }
     leonida::ReplayResult last_result() const { return last_result_; }
@@ -592,10 +610,22 @@ public:
         return d3d12_trace::result(method, S_OK);
     }
 
+    // Ticks per second of the timestamps EndQuery writes: one tick is timestampPeriod nanoseconds. Every D3D12
+    // queue of the device shares one VkQueue, so they share one frequency. E_FAIL when that queue has no
+    // timestamps (timestampValidBits 0), as D3D12 reports for a queue that does not support them.
+    HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* frequency) override {
+        if (!frequency) return E_INVALIDARG;
+        const double period = context_.timestamp_period();
+        if (!(period > 0)) return E_FAIL;
+        *frequency = static_cast<UINT64>(1e9 / period + 0.5);
+        return S_OK;
+    }
+
     static CommandQueue* from(IUnknown* object) { return Child::from<CommandQueue>(object); }
 
 private:
     D3D12_COMMAND_QUEUE_DESC desc_;
+    leonida::VulkanContext& context_;
     std::mutex mutex_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;

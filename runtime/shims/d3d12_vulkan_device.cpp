@@ -1,9 +1,9 @@
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
 // committed buffers and textures (2D, multisampled 2D, 3D) and their 1/2/3 variants, allocation info, CPU
-// texture copies (WriteToSubresource/ReadFromSubresource), a few feature queries. Everything else is a generated
-// stub that reports itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what
-// is still open.
+// texture copies (WriteToSubresource/ReadFromSubresource), query heaps, a few feature queries. Everything else is a
+// generated stub that reports itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and
+// what is still open.
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
@@ -1075,6 +1075,81 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc) {
     return out;
 }
 
+// A query heap: one VkQueryPool, registered with the context so that lists can resolve it by ID
+// (docs/d3d12_vulkan.md section 4.6). Occlusion heaps hold both OCCLUSION and BINARY_OCCLUSION queries; timestamp
+// and copy-queue timestamp heaps are timestamp pools; pipeline-statistics heaps count all eleven Vulkan
+// statistics, whose result order is the field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS.
+class QueryHeap final
+    : public Child<QueryHeap, ID3D12QueryHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12QueryHeap> {
+public:
+    // {6e2b9a41-d83c-4f17-b5e9-0a7c3d1f8b62}
+    static constexpr GUID kTag{0x6e2b9a41, 0xd83c, 0x4f17, {0xb5, 0xe9, 0x0a, 0x7c, 0x3d, 0x1f, 0x8b, 0x62}};
+
+    explicit QueryHeap(DeviceState& device) : device_(device) {}
+
+    ~QueryHeap() override {
+        if (!pool_) return;
+        device_.context->remove_query_pool(id());
+        device_.context->vk.vkDestroyQueryPool(device_.info.device, pool_, nullptr);
+    }
+
+    leonida::QueryHeapId id() const { return query_heap_id(this); }
+
+    HRESULT create(const D3D12_QUERY_HEAP_DESC& desc) {
+        namespace h = leonida::d3d12_query_heap;
+        auto& vk = device_.context->vk;
+        if (!vk.vkCreateQueryPool || !vk.vkDestroyQueryPool) return E_NOTIMPL;
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryCount = desc.Count;
+        switch (desc.Type) {
+        case h::occlusion: info.queryType = VK_QUERY_TYPE_OCCLUSION; break;
+        case h::timestamp:
+        case h::copy_queue_timestamp:
+            if (!(device_.context->timestamp_period() > 0)) {
+                log_once("timestamp query heap: the queue writes no timestamps; type", desc.Type);
+                return E_NOTIMPL;
+            }
+            info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            break;
+        case h::pipeline_statistics:
+            if (!device_.info.pipeline_statistics_query) {
+                log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
+                return E_NOTIMPL;
+            }
+            info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+            info.pipelineStatistics = kPipelineStatistics;
+            break;
+        default:
+            // Stream output, video decode and mesh-shader statistics (PIPELINE_STATISTICS1) have no path yet.
+            log_once("query heap type not supported:", desc.Type);
+            return E_NOTIMPL;
+        }
+        if (vk.vkCreateQueryPool(device_.info.device, &info, nullptr, &pool_) != VK_SUCCESS) {
+            pool_ = VK_NULL_HANDLE;
+            return E_OUTOFMEMORY;
+        }
+        leonida::QueryPool pool{};
+        pool.pool = pool_;
+        pool.heap_type = desc.Type;
+        pool.count = desc.Count;
+        pool.precise = device_.info.occlusion_query_precise;
+        pool.ended.assign(desc.Count, false);
+        device_.context->add_query_pool(id(), pool);
+        return S_OK;
+    }
+
+private:
+    // VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT through COMPUTE_SHADER_INVOCATIONS_BIT (0x1-0x400):
+    // IAVertices, IAPrimitives, VSInvocations, GSInvocations, GSPrimitives, CInvocations, CPrimitives,
+    // PSInvocations, HSInvocations (patches), DSInvocations, CSInvocations.
+    static constexpr VkQueryPipelineStatisticFlags kPipelineStatistics = 0x7ff;
+    static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 11 * sizeof(UINT64));
+
+    DeviceState& device_;
+    VkQueryPool pool_ = VK_NULL_HANDLE;
+};
+
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
@@ -1101,7 +1176,13 @@ public:
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceImageFormatProperties"));
         const auto memory_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties"));
-        if (!get_device || !state_.format_properties || !state_.image_format_properties || !memory_properties) return;
+        const auto device_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
+        const auto queue_families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+        if (!get_device || !state_.format_properties || !state_.image_format_properties || !memory_properties ||
+            !device_properties || !queue_families)
+            return;
         memory_properties(info.physical, &state_.memory);
         for (const char* name : {"vkGetDeviceImageMemoryRequirements", "vkGetDeviceImageMemoryRequirementsKHR"})
             if (!state_.image_requirements)
@@ -1132,6 +1213,15 @@ public:
         if (info.host_image_copy) load_host_image_copy(get_device);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
+        // Timestamps: what the one VkQueue every D3D12 queue submits to can write.
+        VkPhysicalDeviceProperties properties{};
+        device_properties(info.physical, &properties);
+        std::uint32_t family_count = 0;
+        queue_families(info.physical, &family_count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(family_count);
+        queue_families(info.physical, &family_count, families.data());
+        if (info.queue_family < family_count && families[info.queue_family].timestampValidBits)
+            state_.context->set_timestamp_period(properties.limits.timestampPeriod);
     }
 
     // Set 0 of every translated shader that declares bindings: images, samplers and the descriptor hash table
@@ -1299,6 +1389,22 @@ public:
         auto* heap = new DescriptorHeap(*desc);
         heap->attach_device(identity());
         return d3d12_trace::result(method, hand_out(heap, riid, out));
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (!desc || !desc->Count) return E_INVALIDARG;
+        auto* heap = new QueryHeap(state_);
+        heap->attach_device(identity());
+        if (const HRESULT hr = heap->create(*desc); FAILED(hr)) {
+            heap->Release();
+            return hr;
+        }
+        if (!out) {  // a capability check: D3D12 allows a null output
+            heap->Release();
+            return S_FALSE;
+        }
+        return hand_out(heap, riid, out);
     }
 
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
@@ -2703,6 +2809,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
     enable.samplerAnisotropy = info.sampler_anisotropy;
+    enable.occlusionQueryPrecise = chosen_features.occlusionQueryPrecise;  // exact D3D12 occlusion counts
+    enable.pipelineStatisticsQuery = chosen_features.pipelineStatisticsQuery;
+    info.occlusion_query_precise = chosen_features.occlusionQueryPrecise == VK_TRUE;
+    info.pipeline_statistics_query = chosen_features.pipelineStatisticsQuery == VK_TRUE;
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
     const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
