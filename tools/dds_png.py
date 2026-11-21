@@ -19,6 +19,7 @@ import zlib
 DDS_MAGIC = b"DDS "
 DDS_HEADER_SIZE = 128
 DDS_DX10_HEADER_SIZE = 148
+DDSD_PITCH = 0x8
 
 DDPF_ALPHAPIXELS = 0x1
 DDPF_FOURCC = 0x4
@@ -169,18 +170,26 @@ def parse_dds_header(data: bytes) -> dict:
 
 
 def _decode_uncompressed_32(
-    payload: bytes | bytearray | memoryview,
+    payload: memoryview,
     width: int,
     height: int,
     fmt: str,
     masks: tuple[int, int, int, int] | None,
+    pitch: int,
 ) -> bytes:
     pixel_count = width * height
-    expected = pixel_count * 4
+    row_bytes = width * 4
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
     if len(payload) < expected:
         raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
 
-    src = bytes(payload[:expected])
+    if pitch == row_bytes:
+        src = bytes(payload[:expected])
+    else:
+        src = b"".join(payload[start : start + row_bytes] for start in range(0, height * pitch, pitch))
 
     if masks is None or masks in _CANONICAL_MASKS:
         if fmt == "RGBA8":
@@ -205,6 +214,7 @@ def _decode_uncompressed_32(
     b_shift, b_max = _validate_mask(masks[2])
     a_shift, a_max = _validate_mask(masks[3])
 
+    out = bytearray(len(src))
     # Fast path when all non-zero masks are byte-aligned 8-bit lanes.
     if (
         (r_max in (0, 255) and (r_shift & 7) == 0)
@@ -212,7 +222,6 @@ def _decode_uncompressed_32(
         and (b_max in (0, 255) and (b_shift & 7) == 0)
         and (a_max in (0, 255) and (a_shift & 7) == 0)
     ):
-        out = bytearray(expected)
         if r_max:
             out[0::4] = src[r_shift >> 3 :: 4]
         if g_max:
@@ -226,7 +235,6 @@ def _decode_uncompressed_32(
         return bytes(out)
 
     # General bitmask fallback (e.g. R10G10B10A2).
-    out = bytearray(expected)
     r_half = r_max >> 1
     g_half = g_max >> 1
     b_half = b_max >> 1
@@ -689,7 +697,9 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     offset = int(info["data_offset"])  # type: ignore[arg-type]
 
     if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
-        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks)
+        flags = struct.unpack_from("<I", data, 8)[0]
+        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
+        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
     elif fmt == "BC1":
         rgba = _decode_bc1(data, offset, width, height)
     elif fmt == "BC2":
