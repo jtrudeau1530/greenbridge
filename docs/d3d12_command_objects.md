@@ -64,8 +64,7 @@ A PE import scan (normal and delay-load) of all 16 DLLs gives the complete stati
 No shipped module imports `d3d12.dll`, `dxgi.dll` or `xgameruntime.dll`. No shipped module
 imports a queue, list, fence, allocator or `PresentX` free function. The only two `d3d12_xs`
 imports are the root-signature calls already recorded in
-[d3d12_vulkan.md §2](d3d12_vulkan.md) and
-[`docs/related_projects.md` §americas-recomp](related_projects.md). This is consistent with the
+[d3d12_vulkan.md §7](d3d12_vulkan.md) and Appendix A.2/A.3. This is consistent with the
 prior-art statement that the bundled middleware surface is tiny and the command-object surface
 belongs to the executable.
 
@@ -503,7 +502,7 @@ the SDK; the console GUIDs are attributed to SCARAB in
   16-byte little-endian value. Absence is evidence about static constants, not about runtime
   `QueryInterface` calls.
 - Builder call sites: Capstone 5.0.7 x86-64 disassembly of the 12 exported functions and the
-  functions they call directly; RVAs are file-relative virtual addresses from the PE. The
+  functions they call directly; RVAs are PE relative virtual addresses. The
   `0xd0` call is in the batched entry (`0x216a0`, site `0x2171e`); the `0x490` call is in the
   per-descriptor function reached from it (`0x1d7c0`, site `0x1da02`).
 - Public slots: parse the `MIDL_INTERFACE`/`virtual` declarations in `d3d12.h`; the counts in
