@@ -30,6 +30,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   undefined in SPIR-V (`UndefinedResult`); a "lane mod 32" model of issue #94 gives the words a 32-wide GPU
   shows (all 24 matched on an RTX 4070 SUPER, driver 610.88, without `--wave64-emulate`). Two SPIR-V sabotages (readlane lane & 31, bpermute without its half base) must change the
   64-wide result.
+- `test_wave64_subgroup_ops.py` runs eight more wave64 GPU tests the same way (`cs_w64x_ballot`,
+  `_readfirstlane`, `_load_ballot_load`, `_partial`, `cs_wave64_ballot`, `cs_wm_bfm64`, `cs_wm_half_cmp`,
+  `cs_wavemask`): on one 64-wide subgroup every word equals the GPU check; on two 32-wide subgroups the
+  words pinned there are the ones an RTX 4070 SUPER (driver 610.88) wrote without `--wave64-emulate`. The
+  cs_w64x tests with branches need llvm-mc encodings and are not covered.
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,
@@ -38,7 +43,8 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
 
-Limits: single lane (or lanes in lockstep that meet only at `OpGroupNonUniformShuffle` and `OpGroupNonUniformBallot`), forward-only structured control flow (the fragment-exit discard test and the compute
+Limits: single lane (or lanes in lockstep, one instruction per lane per round, that exchange values only through
+`OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), forward-only structured control flow (the fragment-exit discard test and the compute
 dynamic-bounds merge; no backward branches, loops, calls or switches), no texture access. PushConstant words,
 Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
 undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
