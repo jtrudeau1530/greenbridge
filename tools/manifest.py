@@ -1,9 +1,10 @@
 """SHA-256 manifest of a game folder, so later copies (and the exe, when it arrives) can be checked.
 
 Usage:
-    python -I manifest.py create <game_dir> [--out FILE]
-    python -I manifest.py verify <game_dir> [--manifest FILE]
+    python -I manifest.py create <game_dir> [--out FILE] [--jobs N]
+    python -I manifest.py verify <game_dir> [--manifest FILE] [--jobs N]
 
+Files are hashed with up to --jobs threads (default: half the CPU count; 1 = serial).
 On Windows it lowers its own priority to BelowNormal so the PC stays usable.
 """
 import argparse
@@ -12,9 +13,24 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CHUNK = 8 * 1024 * 1024
 DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
+
+
+def default_jobs() -> int:
+    return max(1, (os.cpu_count() or 2) // 2)
+
+
+def positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
 
 
 def below_normal() -> None:
@@ -39,16 +55,38 @@ def walk(game_dir: str):
             yield os.path.relpath(p, game_dir).replace("\\", "/"), p
 
 
-def create(game_dir: str, out: str) -> int:
+def create(game_dir: str, out: str, jobs: int = 1) -> int:
+    files = sorted(walk(game_dir))
+    total = sum(os.path.getsize(p) for _, p in files)
     entries = {}
-    total = sum(os.path.getsize(p) for _, p in walk(game_dir))
-    done, t0 = 0, time.time()
-    for rel, p in walk(game_dir):
-        size = os.path.getsize(p)
-        entries[rel] = {"size": size, "sha256": sha256(p)}
+    done = count = 0
+    t0 = time.time()
+
+    def finish(rel: str, size: int, digest: str) -> None:
+        nonlocal done, count
+        entries[rel] = {"size": size, "sha256": digest}
         done += size
+        count += 1
         rate = done / max(time.time() - t0, 1e-6) / 2**20
-        print(f"[{done / total:6.1%}] {rate:7.0f} MiB/s  {rel}", flush=True)
+        pct = done / total if total else 1.0
+        # One line per completed file, printed only from the main thread. Completion order is not
+        # stable with threads, so this reports counts and bytes rather than coupling output to a path.
+        print(f"[{pct:6.1%}] {count}/{len(files)} files {rate:7.0f} MiB/s", flush=True)
+
+    def work(rel: str, path: str) -> tuple[str, int, str]:
+        return rel, os.path.getsize(path), sha256(path)
+
+    if jobs == 1:
+        for rel, p in files:
+            finish(*work(rel, p))
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(work, rel, p) for rel, p in files]
+            for future in as_completed(futures):
+                finish(*future.result())
+
+    # Re-insert in walk order so the JSON is independent of which worker finished first.
+    entries = {rel: entries[rel] for rel, _ in files}
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         json.dump({"created": time.strftime("%Y-%m-%d %H:%M:%S"), "files": entries}, f, indent=1)
@@ -56,36 +94,64 @@ def create(game_dir: str, out: str) -> int:
     return 0
 
 
-def verify(game_dir: str, manifest: str) -> int:
+def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     with open(manifest, encoding="utf-8") as f:
         want = json.load(f)["files"]
     have = dict(walk(game_dir))
-    bad = 0
+    problems = {}
+    pending = []
     for rel, info in want.items():
         p = have.get(rel)
         if p is None:
-            print(f"MISSING   {rel}")
-            bad += 1
+            problems[rel] = "MISSING"
         elif os.path.getsize(p) != info["size"]:
-            print(f"SIZE      {rel}")
-            bad += 1
-        elif sha256(p) != info["sha256"]:
-            print(f"CHANGED   {rel}")
+            problems[rel] = "SIZE"
+        else:
+            pending.append((rel, p, info["sha256"]))
+
+    if jobs == 1:
+        for rel, p, digest in pending:
+            if sha256(p) != digest:
+                problems[rel] = "CHANGED"
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = {pool.submit(sha256, p): (rel, digest) for rel, p, digest in pending}
+            for future in as_completed(futures):
+                rel, digest = futures[future]
+                if future.result() != digest:
+                    problems[rel] = "CHANGED"
+
+    # Print in manifest order, not completion order, so the report is identical for any --jobs.
+    bad = 0
+    for rel in want:
+        kind = problems.get(rel)
+        if kind:
+            print(f"{kind:<10}{rel}")
             bad += 1
     for rel in sorted(set(have) - set(want)):
-        print(f"NEW       {rel}")
+        print(f"{'NEW':<10}{rel}")
     print("OK" if not bad else f"{bad} problem(s)")
     return 1 if bad else 0
+
+
+def add_jobs(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--jobs", type=positive_int, default=default_jobs(), metavar="N",
+        help="hash up to N files concurrently with threads; 1 hashes serially "
+             "(default: half the CPU count = %(default)s)")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("create"); c.add_argument("game_dir"); c.add_argument("--out", default=DEFAULT)
+    add_jobs(c)
     v = sub.add_parser("verify"); v.add_argument("game_dir"); v.add_argument("--manifest", default=DEFAULT)
+    add_jobs(v)
     a = ap.parse_args()
     below_normal()
-    return create(a.game_dir, a.out) if a.cmd == "create" else verify(a.game_dir, a.manifest)
+    return (create(a.game_dir, a.out, a.jobs) if a.cmd == "create"
+            else verify(a.game_dir, a.manifest, a.jobs))
 
 
 if __name__ == "__main__":
