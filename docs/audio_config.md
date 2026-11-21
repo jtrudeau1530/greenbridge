@@ -35,7 +35,9 @@ the duration:
 
 `hash B` is Jenkins one-at-a-time over the lowercased name, with runs of spaces and punctuation
 collapsed to `_`. The AWC stream id is `hash B & 0x1FFFFFFF`. The duration is the real song/ad
-length; the AWC manifest reports twice that value because of a stereo-sample counting artifact.
+length. `awc_manifest.py` now reports the per-channel duration: for a 1-channel streamed descriptor it
+divides the interleaved sample count by the Opus packet channel count (2 when the TOC stereo bit is
+set), so it matches the config instead of reporting twice.
 
 The records are not necessarily contiguous: they are 46 bytes apart inside a run, but omitted
 records leave gaps. The tool finds records by the marker and the duration range, not by a fixed

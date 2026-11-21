@@ -216,15 +216,16 @@ public:
         return (properties.optimalTilingFeatures & needed) == needed;
     }
 
+    // depth > 1: a 3D image. samples > 1: a multisampled one.
     VkImage image(VkFormat format, std::uint32_t width, std::uint32_t height, std::uint32_t layers,
-                  VkImageUsageFlags usage) {
+                  VkImageUsageFlags usage, std::uint32_t depth = 1, std::uint32_t samples = 1) {
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        info.imageType = VK_IMAGE_TYPE_2D;
+        info.imageType = depth > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
         info.format = format;
-        info.extent = {width, height, 1};
+        info.extent = {width, height, depth};
         info.mipLevels = 1;
         info.arrayLayers = layers;
-        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.samples = VkSampleCountFlagBits(samples);
         info.usage = usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         VkImage image = VK_NULL_HANDLE;
         if (fn<PFN_vkCreateImage>("vkCreateImage")(device, &info, nullptr, &image) != VK_SUCCESS) return VK_NULL_HANDLE;

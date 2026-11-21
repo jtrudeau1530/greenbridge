@@ -2,6 +2,7 @@
 
 Sources: printable runs in carved blobs (selected archives fully; PSO/RBF blobs everywhere), shader names, and
 any extra text/binary files given (e.g. the exe once it arrives: run with --extra path\\to\\exe).
+When multiple names share a hash, the dictionary keeps the lexicographically first spelling.
 
 Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
@@ -74,7 +75,7 @@ def main():
         elif os.path.isfile(x):
             harvest(open(x, "rb").read(), strings, a.min)
     d = {}
-    for s in strings:
+    for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(d, f)

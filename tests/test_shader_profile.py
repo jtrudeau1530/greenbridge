@@ -270,6 +270,27 @@ class TestCommandLineEndToEnd(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def run_profile(self, extra=()):
+        out_json = os.path.join(self.tmp.name, "custom_profile.json")
+        cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "shader_profile.py"), self.disasm_dir, "--out", out_json]
+        res = subprocess.run(cmd + list(extra), capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"CLI failed: {res.stderr}")
+        with open(out_json, encoding="utf-8") as f:
+            return res.stdout, json.load(f, parse_constant=self.fail)
+
+    def test_cli_alu_without_memory_writes_null(self):
+        with open(os.path.join(self.disasm_dir, "ps_001.s"), "w", encoding="utf-8") as f:
+            f.write("\tv_mov_b32 v0, 1.0\n\ts_endpgm\n")
+        _, data = self.run_profile()
+        self.assertEqual(data["categories"]["alu"], 1)
+        self.assertEqual(data["categories"]["memory"], 0)
+        self.assertIsNone(data["ratios"]["alu_to_memory"])
+
+    def test_cli_empty_corpus(self):
+        _, data = self.run_profile()
+        self.assertEqual(data["shaders"], 0)
+        self.assertEqual(data["ratios"]["alu_to_memory"], 0.0)
+
     def test_cli_execution_and_json_output(self):
         s1 = (
             "; ps_001 code 0x0..0x20\n"
@@ -291,18 +312,11 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         with open(os.path.join(self.disasm_dir, "vs_002.s"), "w", encoding="utf-8") as f:
             f.write(s2)
 
-        out_json = os.path.join(self.tmp.name, "custom_profile.json")
-        cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "shader_profile.py"), self.disasm_dir, "--out", out_json]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0, f"CLI failed: {res.stderr}")
-        self.assertIn("2 shaders", res.stdout)
-        self.assertIn("ALU:", res.stdout)
-        self.assertIn("Memory:", res.stdout)
-        self.assertIn("Branch:", res.stdout)
-
-        self.assertTrue(os.path.isfile(out_json))
-        with open(out_json, encoding="utf-8") as f:
-            data = json.load(f)
+        stdout, data = self.run_profile()
+        self.assertIn("2 shaders", stdout)
+        self.assertIn("ALU:", stdout)
+        self.assertIn("Memory:", stdout)
+        self.assertIn("Branch:", stdout)
 
         self.assertEqual(data["shaders"], 2)
         self.assertIn("families", data)
@@ -320,6 +334,29 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         ratios = data["ratios"]
         self.assertGreater(ratios["alu_ratio"], 0.0)
         self.assertGreater(ratios["memory_ratio"], 0.0)
+        self.assertEqual(ratios["alu_to_memory"], 2.0)
+
+        # Register pressure per stage: ps_001 uses v0-v1 and s0-s3, vs_002 uses v0-v3 and no SGPR.
+        regs = data["registers"]
+        self.assertEqual(regs["ps"], {"shaders": 1, "vgpr_max": 2, "vgpr_mean": 2.0, "sgpr_max": 4,
+                                      "sgpr_mean": 4.0, "vgpr_hist": {"32": 1}})
+        self.assertEqual(regs["vs"]["vgpr_max"], 4)
+        self.assertEqual(regs["vs"]["sgpr_max"], 0)
+        self.assertIn("ps registers: VGPR max 2", stdout)
+        self.assertNotIn("per_shader", data)
+
+        _, data = self.run_profile(["--per-shader"])
+        self.assertEqual(data["per_shader"], [
+            {"name": "ps_001", "stage": "ps", "instructions": 4, "vgpr_count": 2, "sgpr_count": 4},
+            {"name": "vs_002", "stage": "vs", "instructions": 3, "vgpr_count": 4, "sgpr_count": 0},
+        ])
+
+    def test_register_summary_histogram(self):
+        summary = P.register_summary({"cs": [(10, 4), (40, 8), (100, 20), (300, 2)]})
+        self.assertEqual(summary["cs"]["vgpr_hist"], {"32": 1, "64": 1, "128": 1, ">256": 1})
+        self.assertEqual(summary["cs"]["vgpr_max"], 300)
+        self.assertEqual(summary["cs"]["sgpr_mean"], 8.5)
+        self.assertEqual(P.register_summary({}), {})
 
 
 if __name__ == "__main__":

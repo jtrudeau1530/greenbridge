@@ -127,45 +127,55 @@ def vulkan_matrix():
         return m
     with tempfile.TemporaryDirectory() as d:
         r = run(["vulkaninfo", "-j"], cwd=d)
-        if r is None:
+        if r is None or r.returncode != 0:
             return m
         files = glob.glob(os.path.join(d, "VP_VULKANINFO_*.json"))
         if not files:
             return m
         try:
-            doc = json.load(open(files[0], encoding="utf-8"))
+            with open(files[0], encoding="utf-8") as f:
+                doc = json.load(f)
         except (OSError, ValueError):
             return m
-    try:
-        dev = doc["capabilities"]["device"]
-        props = dev.get("properties", {})
-        feats = dev.get("features", {})
-        exts = dev.get("extensions", {})
-        v11 = props.get("VkPhysicalDeviceVulkan11Properties", {})
-        v13p = props.get("VkPhysicalDeviceVulkan13Properties", {})
-        v13f = feats.get("VkPhysicalDeviceVulkan13Features", {})
-        v11f = feats.get("VkPhysicalDeviceVulkan11Features", {})
-        pdev = props.get("VkPhysicalDeviceProperties", {})
-        m["device"] = {"name": pdev.get("deviceName"),
-                       "driver": pdev.get("driverVersion"),
-                       "api": pdev.get("apiVersion")}
-        m["subgroup"] = {"size": v11.get("subgroupSize"),
-                         "stages": v11.get("subgroupSupportedStages"),
-                         "min": v13p.get("minSubgroupSize"),
-                         "max": v13p.get("maxSubgroupSize")}
-        m["subgroup_size_control"] = {
+    caps = doc.get("capabilities") if isinstance(doc, dict) else None
+    dev = caps.get("device") if isinstance(caps, dict) else None
+    if not isinstance(dev, dict):
+        return m
+    props = dev.get("properties")
+    feats = dev.get("features")
+    exts = dev.get("extensions")
+    if not all(isinstance(x, dict) for x in (props, feats, exts)):
+        return m
+    pdev = props.get("VkPhysicalDeviceProperties")
+    v11 = props.get("VkPhysicalDeviceVulkan11Properties", {})
+    v13p = props.get("VkPhysicalDeviceVulkan13Properties", {})
+    v13f = feats.get("VkPhysicalDeviceVulkan13Features", {})
+    v11f = feats.get("VkPhysicalDeviceVulkan11Features", {})
+    if not all(isinstance(x, dict) for x in (pdev, v11, v13p, v13f, v11f)):
+        return m
+    name = pdev.get("deviceName")
+    if not isinstance(name, str) or not name:
+        return m
+    m.update({
+        "vulkaninfo": "ok",
+        "device": {"name": name,
+                   "driver": pdev.get("driverVersion"),
+                   "api": pdev.get("apiVersion")},
+        "subgroup": {"size": v11.get("subgroupSize"),
+                     "stages": v11.get("subgroupSupportedStages"),
+                     "min": v13p.get("minSubgroupSize"),
+                     "max": v13p.get("maxSubgroupSize")},
+        "subgroup_size_control": {
             "subgroupSizeControl": v13f.get("subgroupSizeControl"),
             "computeFullSubgroups": v13f.get("computeFullSubgroups"),
             "requiredSubgroupSizeStages": v13p.get("requiredSubgroupSizeStages"),
-        }
-        m["mesh"] = "VK_EXT_mesh_shader" in exts
-        m["barycentric"] = "VK_KHR_fragment_shader_barycentric" in exts
-        m["maintenance8"] = "VK_KHR_maintenance8" in exts
-        m["descriptor_heap"] = "VK_EXT_descriptor_heap" in exts
-        m["storageInputOutput16"] = v11f.get("storageInputOutput16")
-    except (KeyError, IndexError, TypeError, AttributeError):
-        pass
-    m["vulkaninfo"] = "ok"
+        },
+        "mesh": "VK_EXT_mesh_shader" in exts,
+        "barycentric": "VK_KHR_fragment_shader_barycentric" in exts,
+        "maintenance8": "VK_KHR_maintenance8" in exts,
+        "descriptor_heap": "VK_EXT_descriptor_heap" in exts,
+        "storageInputOutput16": v11f.get("storageInputOutput16"),
+    })
     return m
 
 
