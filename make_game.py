@@ -275,7 +275,7 @@ def check(game: str, full: bool) -> dict:
 
 
 # ---------------------------------------------------------------- shaders
-def shaders(game: str, work: str, jobs: int, emulate: bool = False) -> None:
+def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False) -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -324,7 +324,12 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False) -> None:
                 had = f.read().strip()
         except OSError:
             had = "off"
-        if had != want:
+        if had == "on" and want == "off" and keep_emulated:
+            # auto answers differently from run to run (a GPU asleep or hidden, vulkaninfo missing); emulated
+            # shaders are exact on every GPU, so they are kept rather than translating the whole corpus again.
+            log("shaders: the shaders were translated with wave64 emulation and are kept (exact on every GPU); "
+                "--wave64-emulate off translates them natively")
+        elif had != want:
             log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
                 "translating again")
             drop(translated)
@@ -332,9 +337,12 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False) -> None:
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
-        translate(disasm, spirv, jobs, emulate=emulate)
+        # The mode goes down before the translation starts, while there is no index.json: a stop at any point then
+        # leaves either no index (translated again) or an index with the right mode, never one with a guessed mode.
+        os.makedirs(spirv, exist_ok=True)
         with open(mode_file, "w", encoding="utf-8") as f:
             f.write(want + "\n")
+        translate(disasm, spirv, jobs, emulate=emulate)
     log("shaders: done")
 
 
@@ -349,6 +357,9 @@ WAVE64_MODES = ("auto", "on", "off")
 def smallest_max_subgroup(vulkaninfo_text: str):
     """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
     sizes = [int(n) for n in re.findall(r'maxSubgroupSize"?\s*[=:]\s*(\d+)', vulkaninfo_text)]
+    devices = len(re.findall(r'deviceName"?\s*[=:]', vulkaninfo_text))
+    if devices > len(sizes):
+        return None     # a device that prints no subgroup size must not be left out of the smallest
     return min(sizes) if sizes else None
 
 
@@ -375,8 +386,25 @@ def wave64_emulate(mode: str) -> bool:
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
         return True
     on = size < 64
+    if not on and runtime_gpu_native64() is False:
+        log(f"shaders: smallest maximum subgroup size is {size}, but the GPU the runtime would use can't be made to "
+            "run compute and mesh shaders 64-wide (subgroupSizeControl and the stage bits): wave64 emulation on")
+        return True
     log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
     return on
+
+
+def runtime_gpu_native64():
+    """True or False as tools/vk_subgroup_info.py answers for the GPU the runtime would use (the same test as
+    vk_pipeline_check's can_require_sg: subgroupSizeControl, and compute and mesh in requiredSubgroupSizeStages),
+    or None when it can't tell. It only ever turns emulation on: vulkaninfo's maxSubgroupSize alone doesn't say
+    that a 64-wide subgroup can be requested."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        return bool(json.loads(r.stdout.strip().splitlines()[-1])["native64"])
+    except (OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError):
+        return None
 
 
 def drop(*paths: str) -> None:
@@ -597,7 +625,8 @@ def main() -> int:
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
-        shaders(game, work, a.jobs, emulate=wave64_emulate(a.wave64_emulate))
+        shaders(game, work, a.jobs, emulate=wave64_emulate(a.wave64_emulate),
+                keep_emulated=a.wave64_emulate == "auto")
     if "assets" in stages:
         assets(game, work, a.wav, a.jobs)
     if "runtime" in stages:

@@ -86,6 +86,99 @@ class Wave64EmulateTest(unittest.TestCase):
         self.assertTrue(self.decide("auto", stdout="ERROR: no Vulkan device\n")[0])
 
 
+REAL_FORMAT_BLOCK = """VkPhysicalDeviceProperties:
+	deviceName        = {name}
+VkPhysicalDeviceVulkan13Properties:
+-----------------------------------
+	minSubgroupSize                                                               = 32
+	maxSubgroupSize                                                               = {size}
+	maxComputeWorkgroupSubgroups                                                  = 4294967295
+	requiredSubgroupSizeStages: count = {n}
+{stages}
+	maxInlineUniformBlockSize                                                     = 65536
+"""
+
+
+def real_format(*devices):
+    """vulkaninfo's text as a real run prints it (excerpt): per device its name and the 1.3 properties block with
+    the required-stage list. devices: (name, maxSubgroupSize, [stage names])."""
+    return "\n".join(REAL_FORMAT_BLOCK.format(name=n, size=s, n=len(st), stages="\n".join("\t\t" + x for x in st))
+                     for n, s, st in devices)
+
+
+ALL = ["SHADER_STAGE_FRAGMENT_BIT", "SHADER_STAGE_COMPUTE_BIT", "SHADER_STAGE_TASK_BIT_EXT",
+       "SHADER_STAGE_MESH_BIT_EXT"]
+
+
+class DetectionGapsTest(unittest.TestCase):
+    """Where auto's detection is less strict than vk_pipeline_check's can_require_sg, native shaders would run
+    inexact without any error."""
+
+    def test_a_device_that_prints_no_subgroup_block_is_not_ignored(self):
+        text = real_format(("Big GPU", 64, ALL)) + "VkPhysicalDeviceProperties:\n\tdeviceName        = Old GPU\n"
+        self.assertIsNone(make_game.smallest_max_subgroup(text))      # one device says nothing: unknown, so on
+
+    def test_real_format_still_reads(self):
+        self.assertEqual(make_game.smallest_max_subgroup(real_format(("A", 64, ALL))), 64)
+        self.assertEqual(make_game.smallest_max_subgroup(real_format(("A", 64, ALL), ("B", 32, ALL))), 32)
+
+    def decide(self, vulkaninfo, tool):
+        def fake_run(args, **kw):
+            if os.path.basename(str(args[-1])) == "vk_subgroup_info.py":
+                return subprocess.CompletedProcess(args, 0 if "native64" in tool else 1, stdout=tool, stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=vulkaninfo, stderr="")
+        with mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            return make_game.wave64_emulate("auto")
+
+    def test_64_wide_but_without_the_mesh_stage_bit_turns_emulation_on(self):
+        no_mesh = [s for s in ALL if "MESH" not in s]
+        tool = '{"native64": false, "mesh_in_required_stages": false, "compute_in_required_stages": true}'
+        self.assertTrue(self.decide(real_format(("A", 64, no_mesh)), tool))
+
+    def test_64_wide_without_the_subgroup_size_control_feature_turns_emulation_on(self):
+        self.assertTrue(self.decide(real_format(("A", 64, ALL)), '{"native64": false, "subgroup_size_control": false}'))
+
+    def test_64_wide_and_confirmed_by_the_runtime_check_leaves_it_off(self):
+        self.assertFalse(self.decide(real_format(("A", 64, ALL)), '{"native64": true}'))
+
+    def test_an_unreadable_runtime_check_does_not_change_the_vulkaninfo_answer(self):
+        self.assertFalse(self.decide(real_format(("A", 64, ALL)), '{"error": "no Vulkan loader found"}'))
+        self.assertFalse(self.decide(real_format(("A", 64, ALL)), "not json"))
+        self.assertTrue(self.decide(real_format(("A", 32, ALL)), '{"native64": true}'))     # vulkaninfo wins: on
+
+
+class SubgroupInfoToolTest(unittest.TestCase):
+    def test_sizes_and_offsets_match_the_vulkan_headers_on_x64(self):
+        # Literal values from vulkan_core.h (sizeof/offsetof on x86-64), not derived from the tool's own constants
+        import ctypes
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import vk_subgroup_info as v
+        self.assertEqual(v.PROPS_SIZE, 824)
+        self.assertEqual((v.PROPS_API_VERSION, v.PROPS_DEVICE_TYPE, v.PROPS_DEVICE_NAME), (0, 16, 20))
+        self.assertEqual((v.FEATURES2_SIZE, v.F12_SIZE, v.F13_SIZE), (240, 208, 80))
+        self.assertEqual((v.F12_SEPARATE_DEPTH_STENCIL_LAYOUTS, v.F12_TIMELINE_SEMAPHORE), (156, 164))
+        self.assertEqual((v.F13_SUBGROUP_SIZE_CONTROL, v.F13_SYNCHRONIZATION2, v.F13_DYNAMIC_RENDERING), (44, 52, 64))
+        self.assertEqual(v.QUEUE_FAMILY_SIZE, 24)
+        self.assertEqual((ctypes.sizeof(v.SubgroupSizeControl), ctypes.sizeof(v.AppInfo),
+                          ctypes.sizeof(v.InstanceInfo)), (32, 48, 64))
+        self.assertEqual((v.VK_SHADER_STAGE_COMPUTE_BIT, v.VK_SHADER_STAGE_MESH_BIT_EXT), (0x20, 0x80))
+
+    def test_script_runs_isolated_and_prints_one_json_line(self):
+        import json
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import vk_subgroup_info as v
+        try:
+            v.load_vulkan()
+        except RuntimeError:
+            self.skipTest("no Vulkan loader on this machine")
+        r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        info = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(r.returncode, 1 if "error" in info else 0)
+
+
 class TranslateFlagTest(unittest.TestCase):
     """translate() passes --wave64-emulate to every shard, and only when asked."""
 
