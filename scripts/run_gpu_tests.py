@@ -450,6 +450,7 @@ def run_suite(a, work: str) -> int:
     vk_compute = os.path.join(a.build, "vk_compute_test" + ext)
     vk_store = os.path.join(a.build, "vk_store_test" + ext)
     vk_harness = os.path.join(a.build, "vk_harness" + ext)
+    vk_bindless = os.path.join(a.build, "vk_bindless_test" + ext)
 
     results: list[tuple[str, bool, str]] = []
     for fname in asm_files:
@@ -561,6 +562,16 @@ def run_suite(a, work: str) -> int:
             except FileNotFoundError:
                 rc, msg = 1, f"missing {tool}"
             results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
+        elif name == "ps_tex":
+            # A texture through the descriptor hash table and the bindless set. vk_bindless_test compares the
+            # pixels itself, and exits 77 where the device lacks a feature the set or the shader needs.
+            rc, msg = run_cmd([vk_bindless, vs_tri, spv])
+            lines = msg.splitlines()
+            if rc == 77:
+                reason = next((ln for ln in lines if ln.startswith("unsupported:")), "unsupported device")
+                results.append((name, None, f"SKIP ({reason})"))
+            else:
+                results.append((name, rc == 0, lines[-1] if lines else ""))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids

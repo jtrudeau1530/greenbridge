@@ -2,14 +2,15 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test and vk_harness (runtime/build by default). Each line is one
-shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes 0-31, since a GPU
-with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
+The test programs are vk_compute_test, vk_store_test, vk_harness and vk_bindless_test (runtime/build by default).
+Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
+0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
 to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
 fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
+ps_tex is skipped when the device lacks a feature the bindless set or the shader needs.
 """
 import collections
 import json
@@ -206,6 +207,20 @@ def subgroup_size(spirv, name):
         return None
 
 
+def bindless_test(tools, spirv):
+    """ps_tex: a texture found through the descriptor hash table and the bindless set (vk_bindless_test)."""
+    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_tex")]
+    for path in shaders:
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    code, out = run(os.path.join(tools, "vk_bindless_test" + EXE), *shaders)
+    if code == UNSUPPORTED:
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    m = re.search(r"(\d+) draws read back, (\d+) bad pixels", out)
+    return "" if code == 0 and m and m.group(2) == "0" else failure(code, out, 3)
+
+
 def pixels(tools, spirv, name, fmt):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
@@ -299,6 +314,7 @@ def main():
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
+    results.append(("ps_tex", bindless_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"

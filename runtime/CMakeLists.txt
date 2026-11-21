@@ -252,7 +252,8 @@ endif()
 # GPU test and pipeline tools load Vulkan at run time.
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
-  foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test)
+  foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
+          vk_bindless_test)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
