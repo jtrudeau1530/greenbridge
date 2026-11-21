@@ -6,10 +6,12 @@ Xbox Series 1.0.2.1 package. No game data is in this file; counts, aggregate bou
 
 ## How much was read
 
-`levels.rpf` is 76,155,065,056 bytes (70.92 GiB), so it was sampled in four windows rather than scanned whole.
-`packs.rpf`, `data.rpf` and `common.rpf` are small enough to index completely. All indexes were made with the
-corrected RPF9 carver from PR #90 (`--index-only`), which advances by the actual stream length. Every stream is
-zlib; "unread" is non-zero bytes between streams that did not inflate, not a second storage format.
+`levels.rpf` is 76,155,065,056 bytes (70.92 GiB), so it was sampled in bounded windows rather than scanned
+whole. `packs.rpf`, `data.rpf` and `common.rpf` are small enough to index completely. All indexes were made
+with the corrected RPF9 carver from PR #90 (`--index-only`), which advances by the actual stream length. Every
+stream is zlib; "unread" is non-zero bytes between streams that did not inflate, not a second storage format.
+
+### First pass (four windows)
 
 | Area | Bytes covered | Streams | Stored | Inflated | Zero | Unread | Coverage |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -21,9 +23,49 @@ zlib; "unread" is non-zero bytes between streams that did not inflate, not a sec
 | `data.rpf` (whole archive) | 481,544,304 | 28,509 | 0.394 GiB | 1.307 GiB | 7.88% | 4.21% | 87.9% |
 | `common.rpf` (whole archive) | 6,642,192 | 954 | 0.005 GiB | 0.047 GiB | 5.85% | 8.64% | 85.5% |
 
-The four `levels.rpf` windows cover 5,153,960,755 bytes, 6.77% of the archive. The sampled stream split is
-~2.36 GiB in 20–21 GiB, 1.77 GiB in 40–41 GiB and 1.92 GiB in 70–70.8 GiB; the first two GiB are anomalous (see
-the metadata family below). Positions and counts are therefore sample measurements, not whole-map totals.
+### Second pass (bounded map-band scan)
+
+The second pass used `tools/world_index.py` on the gaps and on every 2 GiB around the two known map areas. The
+requested 72–76 GiB window does not exist: the file ends at 70.92 GiB. The tail window is 70.8–70.92 GiB
+(134,143,917 bytes). Coverage is scanned compressed bytes / window span; streams and `0x7a` resources are from
+the same tool.
+
+| Window (GiB) | Streams | Coverage | 0x7a resources | Map files | Entities |
+|---|---:|---:|---:|---:|---:|
+| 4–5 | 22,991 | 97.5% | 648 | 0 | 0 |
+| 6–7 | 23,433 | 97.0% | 914 | 0 | 0 |
+| 7–8 | 12,897 | 98.9% | 1,892 | 498 | 36,480 |
+| 8–9 | 17,619 | 97.8% | 4,430 | 1,398 | 88,228 |
+| 9–10 | 18,886 | 97.9% | 4,107 | 1,068 | 75,344 |
+| 10–11 | 10,239 | 99.0% | 1,042 | 164 | 18,306 |
+| 16–18 | 35,216 | 97.9% | 9,449 | 2,174 | 145,118 |
+| 22–23 | 16,824 | 98.2% | 3,522 | 821 | 50,438 |
+| 26–27 | 17,974 | 98.0% | 4,737 | 992 | 68,492 |
+| 30–31 | 16,946 | 98.2% | 2,959 | 152 | 10,533 |
+| 34–35 | 13,082 | 98.6% | 2,361 | 98 | 4,754 |
+| 38–40 | 28,331 | 98.5% | 4,591 | 209 | 13,476 |
+| 42–43 | 10,725 | 98.7% | 2,874 | 111 | 9,566 |
+| 46–47 | 9,085 | 99.4% | 2,906 | 105 | 7,999 |
+| 50–51 | 13,634 | 98.6% | 1,737 | 121 | 6,086 |
+| 52–54 | 29,483 | 98.5% | 5,062 | 214 | 11,942 |
+| 54–56 | 28,185 | 98.5% | 4,715 | 226 | 10,658 |
+| 56–58 | 33,248 | 98.3% | 7,346 | 276 | 16,731 |
+| 58–60 | 30,811 | 98.5% | 5,136 | 215 | 9,842 |
+| 60–62 | 30,411 | 98.5% | 5,041 | 178 | 9,766 |
+| 62–64 | 39,004 | 98.1% | 2,372 | 104 | 4,006 |
+| 64–66 | 59,986 | 97.3% | 127 | 0 | 0 |
+| 66–68 | 48,706 | 97.5% | 8,203 | 0 | 0 |
+| 68–70 | 50,412 | 97.6% | 137 | 0 | 0 |
+| 70.8–70.92 | 2,353 | 97.7% | 0 | 0 | 0 |
+| **new windows** | **620,481** | **98.2%** | **86,308** | **9,124** | **597,765** |
+
+The second pass scanned 37,026,725,270 bytes (34.48 GiB) in 35.125 GiB of windows. Adding the three first-pass
+`world_index` windows gives 39,984,950,733 bytes (37.24 GiB, 52.5% of the archive); adding the carver-indexed
+0–2 GiB window gives 42,126,097,955 bytes (39.23 GiB, 55.3%). This is still a sample, not a census.
+
+The first four `levels.rpf` windows cover 5,153,960,755 bytes, 6.77% of the archive. The sampled stream split
+is ~2.36 GiB in 20–21 GiB, 1.77 GiB in 40–41 GiB and 1.92 GiB in 70–70.8 GiB; the first two GiB are anomalous
+(see the metadata family below). Positions and counts are sample measurements, not whole-map totals.
 
 ## Composition
 
@@ -52,9 +94,30 @@ table stays encrypted.
 The 20–21 GiB map count needs a correction: a first system page of exactly 65,536 bytes is often followed by a
 small continuation stream (usually 1–2 KiB) that the next stream scan alone would miss. `tools/world_index.py`
 joins that continuation when the schema still has unresolved pointers. The join turns 630 first-page maps into
-698 complete map files and 55,564 entities into 75,551. The other sampled windows do not change. This is a
+698 complete map files and 55,564 entities into 75,551. The other first-pass windows did not change. This is a
 format rule, not a heuristic: the continuation is reached by system pointers in the first page, and the joined
 schema then validates.
+
+### Where the maps are
+
+Map placement is not clustered in a few page ranges. It occupies one continuous band, bounded at the tested
+window granularity:
+
+- 0–2, 4–5 and 6–7 GiB: **0 maps**; 2–4 and 5–6 GiB were not sampled;
+- 7–8 GiB: the band starts, 498 maps; the first map resource is at `0x1e0bed010` (7.51 GiB);
+- 8–64 GiB: every sampled window has maps; density ranges from 96 to 1,398 maps per GiB (96 to 2,174 per
+  sampled window);
+- 62–64 GiB: the last sampled map is at `0xfb883d010` (62.88 GiB);
+- 64–70.92 GiB: sampled 64–66, 66–68, 68–70, 70–70.8 and 70.8–70.92 GiB, **0 maps**.
+
+That is a 57 GiB map band. The first pass's 794 files were not a 20/40 GiB cluster: 20–21 and 40–41 GiB are
+inside the band, while its 0–2 and 70–70.8 GiB windows are outside it. The revised answer is that maps are spread
+through roughly 80% of `levels.rpf`, with local density varying by more than 14×.
+
+Within a window the maps are also packed in runs, not spread evenly. Median spacing between consecutive map
+resource offsets is 8–24 KiB; runs are separated by hundreds of MiB (largest gaps 0.4–1.0 GiB). For example,
+8–9 GiB has 1,398 maps over an 842 MiB span and 16–18 GiB has 2,174 over 1,331 MiB, while 58–60 GiB has 215
+maps spread over 1,356 MiB in 30 runs.
 
 ## Signatures and strings
 
@@ -65,7 +128,7 @@ model/material names (`.#dr`, `.#ft`) and, in `data.rpf`, UI/dialogue text; `ipl
 `zone` hits were substrings of those names or of unrelated text, not chunk tags. No repeated 4×4 or 3×4 matrix
 table was found.
 
-Byte offsets used: the four archive windows in the table above. The first map resource in the 20–21 GiB window
+Byte offsets used: the bounded windows in the two tables above. The first map resource in the 20–21 GiB window
 is at 21,588,586,512 (`0x506c7b010`); the first in the 40–41 GiB window is at 42,953,629,712
 (`0xa003c6010`). The `0DRP` signature is at +0x10 of a map/meta stream; in a `PSIN` resource the same tag is in
 the footer.
@@ -152,13 +215,15 @@ table, not fixed offsets.
 
 ### Measured placement summary
 
-| Area | Map files | Entities | Unique archetypes | Entity position bbox (x, y, z) |
-|---|---:|---:|---:|---|
-| 0–2 GiB | 0 | 0 | 0 | — |
-| 20–21 GiB | 698 | 75,551 | 8,758 | (-9866.3, 993.5, -146.2) … (-717.2, 5285.8, 123.7) |
-| 40–41 GiB | 96 | 6,912 | 2,898 | (-4094.2, 4004.7, -3.6) … (-1.9, 6140.3, 81.3) |
-| 70–70.8 GiB | 0 | 0 | 0 | — |
-| **sampled** | **794** | **82,463** | — | — |
+| Scope | Map files | Entities |
+|---|---:|---:|
+| 0–2 GiB (first pass) | 0 | 0 |
+| 20–21 GiB (first pass) | 698 | 75,551 |
+| 40–41 GiB (first pass) | 96 | 6,912 |
+| 70–70.8 GiB (first pass) | 0 | 0 |
+| **first-pass subtotal** | **794** | **82,463** |
+| **second-pass new windows** | **9,124** | **597,765** |
+| **measured total** | **9,918** | **680,228** |
 
 The 20–21 GiB LOD split: HD 53,551; LOD 2,119; SLOD1 230; SLOD2 40; SLOD3 11; SLOD4 10; ORPHAN_HD 19,590.
 `lodDist` is -1 for 74,375 entities (98.4%, meaning archetype default); the rest are 10–1200 m.
@@ -171,11 +236,23 @@ cell/zone metadata a streamer needs. **No global cell table, zone table or 4×4/
 the sampled streams. Placement is per-entity position + quaternion + scale, not a matrix; the repeated 16-byte
 pattern in the 0–2 GiB family is a hash-table slot, not a matrix row.
 
-For context, SixNG's published full-archive measurement is 30,785 map files and 2,249,490 entities in
-`levels.rpf` (https://github.com/holdmysocks/SixNG). The sample here is 2.6% of those files and 3.7% of those
-entities; per-file density is higher in the sampled city/foothill windows (104 vs 73 entities), which is
-expected for a non-uniform map. (The 20–21 GiB window alone averages 108 entities per map.) That full number
-is external evidence, not a measurement made here.
+### How many are there?
+
+The measured 9,918 files and 680,228 entities are a **lower bound**, not a whole-archive total. The sample is
+29 GiB of the 57 GiB map band (50.9%) and 39.23 GiB of the archive (55.3%, including the carver-indexed 0–2 GiB
+window).
+
+A single multiplier is weak because density is not uniform: sampled 1-GiB blocks range from 96 to 2,174 map
+files and from 4,754 to 145,118 entities. Treating the 29 sampled 1-GiB units as exchangeable gives a
+uniform-block estimate of **~26,600 map files / ~1.77 million entities**. A 20,000-resample block bootstrap
+gives an approximate 95% interval of 16.0k–39.6k map files and 1.03M–2.64M entities. The selection was
+purposive, not random, so those bounds are approximate; they are not a census.
+
+SixNG's published full-archive measurement, 30,785 map files / 2,249,490 entities
+(https://github.com/holdmysocks/SixNG), lies inside that interval. It is external evidence, not a measurement
+made here. The observed 9,918 files are 32.2% of that count and 680,228 entities are 30.2%, even though 50.9% of
+the map band was scanned. That gap is consistent with the unsampled parts being denser, with map files whose
+entity blocks live in graphics pages, or with both; only a full band scan can settle it.
 
 ## What is readable, what is hash-only
 
