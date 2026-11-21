@@ -10,15 +10,13 @@ executes the SPIR-V in tests/semantic/spirv_mini_interp.py, and compares the res
 plain-Python IEEE-754 binary32 / RDNA2 ISA reference oracle (stdlib only, no game data).
 
 Observed translator / interpreter findings (kept out of failing assertions and documented here):
-  1. v_min3_f32 / v_max3_f32 with NaN operands: tools/rdna2spirv.py emits GLSL.std.450 FMin / FMax (rather than
-     NMin / NMax). GLSL.std.450 leaves FMin / FMax (and FClamp) undefined when any operand is NaN (whereas RDNA2
-     DX10 mode returns the non-NaN numeric operand). tests/semantic/spirv_mini_interp.py explicitly rejects NaN inputs
-     to FMin / FMax / FClamp with UnsupportedConstruct, so NaN inputs are excluded from v_min3_f32 / v_max3_f32
-     (and clamp-on-NaN) value assertions; NaN semantics are tested on v_mad_f32, v_fmac_f32, and v_mad_legacy_f32.
-  2. v_min3_f32 / v_max3_f32 signed-zero ties: GLSL.std.450 FMin / FMax permits either +0.0 or -0.0 when both inputs
-     are zero; spirv_mini_interp.py evaluates Python min / max, returning the first zero in operand order.
-     Unambiguous zero triples (same-sign zeros or a strictly smaller/larger third operand) assert exact bit
-     patterns; mixed (+0.0, -0.0) tie cases verify zero magnitude and match the chained FMin / FMax tie order.
+  1. v_min3_f32 / v_max3_f32 with NaN operands: tools/rdna2spirv.py emits GLSL.std.450 NMin / NMax, which give the
+     other operand for a NaN, as RDNA2 hardware does. Those rows are asserted in tests/semantic/
+     test_float_nan_fract.py; NaN inputs stay out of the value assertions here (clamp-on-NaN is still FClamp, which
+     spirv_mini_interp.py rejects). NaN semantics are tested on v_mad_f32, v_fmac_f32, and v_mad_legacy_f32.
+  2. v_min3_f32 / v_max3_f32 signed-zero ties: RDNA2 hardware orders -0.0 below +0.0 (measured on an AMD Radeon
+     RX 6800: min(+0, -0) = -0 and max(+0, -0) = +0 in either operand order), and spirv_mini_interp.py's NMin / NMax
+     do the same, so every zero triple asserts exact bit patterns.
   3. Fma double-rounding in spirv_mini_interp.py: spirv_mini_interp.py implements GLSL.std.450 Fma as Python
      binary64 `f32(x * y + z)`. Binary32 products require at most 48 <= 53 significand bits and never overflow
      binary64, so intermediate rounding differences vs unfused v_mad_f32 are modeled accurately except for extreme
@@ -172,33 +170,26 @@ def _zero_sign_bit(bits: int) -> int:
     return 1 if (bits & MASK32) == NEG_ZERO else 0
 
 
+def _zero_ordered(v: float):
+    """Sort key with -0.0 below +0.0, the order RDNA2 v_min/v_max use (measured on an AMD Radeon RX 6800:
+    min(+0, -0) = -0 and max(+0, -0) = +0 in either operand order; docs/design.md, float min/max/med3)."""
+    return (v, math.copysign(1.0, v))
+
+
 def ref_min3_f32(xb: int, yb: int, zb: int) -> int:
-    """Reference for chained GLSL FMin(FMin(x, y), z) matching rdna2spirv lowering on non-NaN f32s."""
+    """Reference for v_min3_f32 = min(min(x, y), z) on non-NaN f32s, with -0.0 < +0.0."""
     x, y, z = bits_to_f32(xb), bits_to_f32(yb), bits_to_f32(zb)
     if math.isnan(x) or math.isnan(y) or math.isnan(z):
-        raise ValueError("NaN is undefined for GLSL FMin")
-    m = x if x <= y else y
-    # Python min(a, b) returns a when a == b (e.g. -0.0 and +0.0).
-    if x == 0.0 and y == 0.0:
-        m = x
-    r = m if m <= z else z
-    if m == 0.0 and z == 0.0:
-        r = m
-    return f32_to_bits(r)
+        raise ValueError("NaN operands are covered by tests/semantic/test_float_nan_fract.py")
+    return f32_to_bits(min((x, y, z), key=_zero_ordered))
 
 
 def ref_max3_f32(xb: int, yb: int, zb: int) -> int:
-    """Reference for chained GLSL FMax(FMax(x, y), z) matching rdna2spirv lowering on non-NaN f32s."""
+    """Reference for v_max3_f32 = max(max(x, y), z) on non-NaN f32s, with -0.0 < +0.0."""
     x, y, z = bits_to_f32(xb), bits_to_f32(yb), bits_to_f32(zb)
     if math.isnan(x) or math.isnan(y) or math.isnan(z):
-        raise ValueError("NaN is undefined for GLSL FMax")
-    m = x if x >= y else y
-    if x == 0.0 and y == 0.0:
-        m = x
-    r = m if m >= z else z
-    if m == 0.0 and z == 0.0:
-        r = m
-    return f32_to_bits(r)
+        raise ValueError("NaN operands are covered by tests/semantic/test_float_nan_fract.py")
+    return f32_to_bits(max((x, y, z), key=_zero_ordered))
 
 
 def _mul_bits_f32(xb: int, yb: int) -> int:
@@ -522,7 +513,7 @@ class Min3Max3F32Tests(unittest.TestCase):
             with self.subTest(op=op, xs=[hex(w) for w in xs]):
                 self.assertEqual(run_three_input(op, *xs), want)
 
-        # Mixed (+0.0, -0.0) tie cases: magnitude is 0.0 and follows chained FMin / FMax tie order.
+        # Mixed (+0.0, -0.0) cases: -0.0 is the smaller zero, as on hardware.
         for op, ref_fn, third in (("v_min3_f32", ref_min3_f32, ONE), ("v_max3_f32", ref_max3_f32, NEG_ONE)):
             for perm in sorted(set(itertools.permutations((POS_ZERO, NEG_ZERO, third)))):
                 with self.subTest(op=op, perm=[hex(w) for w in perm]):
@@ -840,7 +831,7 @@ class NegativeControlsTests(unittest.TestCase):
     """Sabotage translated SPIR-V output and confirm value assertions catch each mutation."""
 
     def test_sabotaged_spirv_is_detected(self):
-        # 1. v_min3_f32 mutated to FMax
+        # 1. v_min3_f32 mutated to NMax
         spv_min3 = translate_ps([
             f"v_mov_b32 v1, {ONE:#x}",
             f"v_mov_b32 v2, {TWO:#x}",
@@ -848,9 +839,9 @@ class NegativeControlsTests(unittest.TestCase):
             "v_min3_f32 v0, v1, v2, v3",
         ])
         self.assertEqual(si.run_fragment(spv_min3)["%out_mrt0"][0], ONE)
-        self.assertNotEqual(si.run_fragment(spv_min3.replace("glsl FMin", "glsl FMax"))["%out_mrt0"][0], ONE)
+        self.assertNotEqual(si.run_fragment(spv_min3.replace("glsl NMin", "glsl NMax"))["%out_mrt0"][0], ONE)
 
-        # 2. v_max3_f32 mutated to FMin
+        # 2. v_max3_f32 mutated to NMin
         spv_max3 = translate_ps([
             f"v_mov_b32 v1, {ONE:#x}",
             f"v_mov_b32 v2, {TWO:#x}",
@@ -858,7 +849,7 @@ class NegativeControlsTests(unittest.TestCase):
             "v_max3_f32 v0, v1, v2, v3",
         ])
         self.assertEqual(si.run_fragment(spv_max3)["%out_mrt0"][0], THREE)
-        self.assertNotEqual(si.run_fragment(spv_max3.replace("glsl FMax", "glsl FMin"))["%out_mrt0"][0], THREE)
+        self.assertNotEqual(si.run_fragment(spv_max3.replace("glsl NMax", "glsl NMin"))["%out_mrt0"][0], THREE)
 
         # 3. v_mad_f32 OpFAdd mutated to OpFSub
         spv_mad = translate_ps([

@@ -165,10 +165,18 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_f16_const": (0xaaaa3d00, 0x38005555, 0xaaaa3800, 0x3f000000),
               "ps_f16_const2": (0x42003d00, 0x3d004200, 0xaaaabc00, 3),
               "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200),
-              "ps_sff_imm": (2, 1, 20, 16)}
+              "ps_sff_imm": (2, 1, 20, 16),
+              "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
+              "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
-PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
+PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
+             # float NaN / fract rows measured on RDNA2 hardware (see the .asm headers)
+             "ps_fnan_med3": {"VKH_SGPRS": "0x1000,0,32,0",
+                              "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"
+                                          "0x100c=0x7fc10001,0x1010=0x40600000,0x1014=0xc0200000"},
+             "ps_fnan_fract": {"VKH_SGPRS": "0x1000,0,16,0",
+                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"}}
 # ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
 # texture); the expected channels are derived in the .asm header.
 GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)
