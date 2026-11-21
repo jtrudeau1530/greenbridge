@@ -50,6 +50,10 @@ struct ResourceBinding {
     bool presentable = false;          // a swapchain image: common/present maps to PRESENT_SRC_KHR
     bool simultaneous_access = false;  // D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS: always GENERAL
     bool not_zeroed = false;           // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: first use skips the zero fill
+    // A descriptor in the bindless set 0 has one layout, but D3D12 lets a texture be sampled both in a
+    // shader-resource state and while promoted from common (GENERAL). With this set, the shader-resource states
+    // use GENERAL too, so the descriptor's layout is right in both.
+    bool sampled_in_general = false;
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
     VkDeviceSize size = 0;             // its size in bytes
     std::uint32_t depth = 1;
@@ -336,10 +340,13 @@ inline VkImageLayout vulkan_layout(std::uint32_t layout, bool presentable) {
     }
 }
 
-// The layout an image actually uses: simultaneous-access images live in GENERAL.
+// The layout an image actually uses: simultaneous-access images live in GENERAL, and so do images in a
+// shader-resource state when set 0 names them (sampled_in_general).
 inline VkImageLayout image_layout(const ResourceBinding& resource, VkImageLayout layout) {
     if (resource.simultaneous_access && layout != VK_IMAGE_LAYOUT_UNDEFINED &&
         layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+        return VK_IMAGE_LAYOUT_GENERAL;
+    if (resource.sampled_in_general && layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
         return VK_IMAGE_LAYOUT_GENERAL;
     return layout;
 }

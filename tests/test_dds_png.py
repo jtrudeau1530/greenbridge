@@ -30,13 +30,16 @@ DDPF_RGB = 0x40
 
 
 def dds_buffer(width, height, payload=b"", *, flags=0, fourcc=b"\x00\x00\x00\x00",
-               bit_count=0, masks=(0, 0, 0, 0), mips=0, dxgi=None):
+               bit_count=0, masks=(0, 0, 0, 0), mips=0, dxgi=None, pitch=None):
     """A 128-byte DDS header, a DX10 header when dxgi is set, then the payload."""
     header = bytearray(128)
     header[0:4] = b"DDS "
     struct.pack_into("<I", header, 4, 124)
     struct.pack_into("<I", header, 12, height)
     struct.pack_into("<I", header, 16, width)
+    if pitch is not None:
+        struct.pack_into("<I", header, 8, 0x8)  # DDSD_PITCH
+        struct.pack_into("<I", header, 20, pitch)
     struct.pack_into("<I", header, 28, mips)
     struct.pack_into("<I", header, 76, 32)
     struct.pack_into("<I", header, 80, flags)
@@ -217,6 +220,53 @@ class HeaderTests(unittest.TestCase):
 
 
 class UncompressedTests(unittest.TestCase):
+    def test_padded_rows_are_removed_before_channel_conversion(self):
+        first_row = bytes((1, 2, 3, 4))
+        second_row = bytes((5, 6, 7, 8))
+        payload = first_row + b"\x99" * 4 + second_row
+        legacy = dict(flags=DDPF_RGB | DDPF_ALPHAPIXELS, bit_count=32,
+                      masks=(0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000))
+        dx10 = dict(flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=87)
+        for header, expected in ((legacy, [(1, 2, 3, 4), (5, 6, 7, 8)]),
+                                 (dx10, [(3, 2, 1, 4), (7, 6, 5, 8)])):
+            with self.subTest(header=header):
+                width, height, rgba = dds.decode_dds(dds_buffer(1, 2, payload, pitch=8, **header))
+                self.assertEqual((width, height), (1, 2))
+                self.assertEqual(pixels(rgba), expected)
+
+    def test_pitch_with_custom_byte_masks(self):
+        payload = bytes((1, 2, 3, 4)) + b"\xcc" * 4 + bytes((5, 6, 7, 8))
+        data = dds_buffer(
+            1, 2, payload, flags=DDPF_RGB | DDPF_ALPHAPIXELS, bit_count=32, pitch=8,
+            masks=(0x0000FF00, 0x00FF0000, 0xFF000000, 0x000000FF),
+        )
+        self.assertEqual(dds.decode_dds(data), (1, 2, bytes((2, 3, 4, 1, 6, 7, 8, 5))))
+
+    def test_pitch_with_r10g10b10a2_masks(self):
+        first = (1023 << 20) | (512 << 10) | 255 | (3 << 30)
+        second = (512 << 10) | 1023 | (1 << 30)
+        payload = struct.pack("<I", first) + b"\xcc" * 4 + struct.pack("<I", second)
+        data = dds_buffer(
+            1, 2, payload, flags=DDPF_RGB | DDPF_ALPHAPIXELS, bit_count=32, pitch=8,
+            masks=(0x3FF00000, 0x000FFC00, 0x000003FF, 0xC0000000),
+        )
+        self.assertEqual(dds.decode_dds(data), (1, 2, bytes((255, 128, 64, 255, 0, 128, 255, 85))))
+
+    def test_pitch_errors_are_reported(self):
+        header = dict(flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=28)
+        with self.assertRaisesRegex(dds.DdsError, "pitch"):
+            dds.decode_dds(dds_buffer(1, 2, b"\x00" * 8, pitch=2, **header))
+        with self.assertRaisesRegex(dds.DdsError, "Truncated"):
+            dds.decode_dds(dds_buffer(1, 2, b"\x00" * 11, pitch=8, **header))
+
+    def test_zero_and_unflagged_pitch_use_tightly_packed_rows(self):
+        payload = bytes(range(8))
+        header = dict(flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=28)
+        self.assertEqual(dds.decode_dds(dds_buffer(1, 2, payload, pitch=0, **header)), (1, 2, payload))
+        unflagged = bytearray(dds_buffer(1, 2, payload, **header))
+        struct.pack_into("<I", unflagged, 20, 8)
+        self.assertEqual(dds.decode_dds(unflagged), (1, 2, payload))
+
     def test_rgba8_is_copied(self):
         payload = bytes((1, 2, 3, 4, 5, 6, 7, 8))
         _, _, rgba = dds.decode_dds(dds_buffer(

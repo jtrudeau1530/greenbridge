@@ -291,6 +291,15 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertEqual(data["shaders"], 0)
         self.assertEqual(data["ratios"]["alu_to_memory"], 0.0)
 
+    def test_cli_counts_only_instructions(self):
+        with open(os.path.join(self.disasm_dir, "ps_001.s"), "w", encoding="utf-8") as f:
+            f.write("\t.text\n\t.long 0\n\t; comment with v7\n\t\t\n\tv_mov_b32 v0, 1\n\ts_endpgm\n")
+        _, data = self.run_profile(["--per-shader"])
+        self.assertEqual(data["categories"]["total"], 2)
+        self.assertEqual({row["m"] for row in data["by_mnemonic"]}, {"v_mov_b32", "s_endpgm"})
+        self.assertEqual(data["per_shader"][0]["instructions"], 2)
+        self.assertEqual(data["per_shader"][0]["vgpr_count"], 1)
+
     def test_cli_execution_and_json_output(self):
         s1 = (
             "; ps_001 code 0x0..0x20\n"

@@ -38,6 +38,15 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // Enabled: runtimeDescriptorArray, the dynamic indexing of sampled- and storage-image arrays, and update after
+    // bind for sampled images, storage images and storage buffers. The device then keeps the bindless set 0 of
+    // the translated shaders (docs section 3.4), and texture views and samplers are put in it as they are
+    // created. bindless_partially_bound: descriptorBindingPartiallyBound is enabled as well.
+    bool bindless = false;
+    bool bindless_partially_bound = false;
+    // samplerAnisotropy and samplerMirrorClampToEdge enabled; without them such samplers are approximated.
+    bool sampler_anisotropy = false;
+    bool sampler_mirror_clamp_to_edge = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -64,6 +73,12 @@ std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 // True when `device`'s Vulkan physical device has maxPushConstantsSize < 144 bytes, requiring
 // the uniform-buffer fallback for the 16-byte tail (heap/code base).
 bool device_push_constants_need_fallback(ID3D12Device* device);
+
+// The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
+// pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
+// brought up to date at every ExecuteCommandLists.
+VkDescriptorSet bindless_set(ID3D12Device* device);
+VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);

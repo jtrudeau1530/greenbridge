@@ -18,6 +18,7 @@ its output (make_game.py does both, the second only with --wav).
 """
 import argparse
 import concurrent.futures
+from functools import cache
 import os
 import shutil
 import struct
@@ -114,27 +115,42 @@ def collect(src: str):
     return files, not_opus
 
 
-def output_names(items):
+def output_names(items, out=None):
     """Give every input its own output stem, and count how many had to keep their extension.
 
     x.ogg and x.opus (or x.OPUS, which is the same name on Windows) both became x.wav: two jobs then decoded into
     the same x.wav.part.wav at once and one result was lost, and with --jobs 1 the second silently replaced the
     first. Inputs that share a stem now keep their extension (x.ogg.wav, x.opus.wav); a name that still clashes
-    gets ~2, ~3. Names that are unique stay as they were, so existing WAVs are still found and skipped."""
+    gets ~2, ~3. With out supplied, resolve directory links on the destination before checking names. Keep the
+    original relative paths in the result so existing WAVs are still found and skipped."""
+    @cache
+    def output_directory(relative):
+        return os.path.normcase(os.path.realpath(os.path.join(out, relative)))
+
+    def destination(stem):
+        if out is None:
+            return os.path.normcase(stem)
+        directory, name = os.path.split(stem)
+        return output_directory(directory), os.path.normcase(name)
+
     count = {}
     for _, rel in items:
-        key = os.path.normcase(rel)
+        key = destination(rel)
         count[key] = count.get(key, 0) + 1
+    if len(count) == len(items):
+        return list(items), 0
     named, used, renamed = [], set(), 0
     for path, rel in items:
         name = rel
-        if count[os.path.normcase(rel)] > 1:
+        if count[destination(rel)] > 1:
             name = rel + os.path.splitext(path)[1]
             renamed += 1
         base, n = name, 2
-        while os.path.normcase(name) in used:
+        key = destination(name)
+        while key in used:
             name, n = f"{base}~{n}", n + 1
-        used.add(os.path.normcase(name))
+            key = destination(name)
+        used.add(key)
         named.append((path, name))
     return named, renamed
 
@@ -198,7 +214,7 @@ def main() -> int:
     if not ffmpeg:
         return 2
 
-    items, renamed = output_names(items)
+    items, renamed = output_names(items, out)
     if renamed:
         print(f"{renamed} file(s) share a name with another input (e.g. x.ogg and x.opus) and keep their extension "
               f"in the WAV name (x.ogg.wav)")

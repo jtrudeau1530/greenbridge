@@ -656,6 +656,10 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, help="stop after this many selected resources")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        ap.error("--limit must be at least 1")
+    if args.offset is not None and args.offset < 0:
+        ap.error("--offset must be non-negative")
 
     def progress(n, total):
         if not args.quiet and (n % 100 == 0 or n == total):

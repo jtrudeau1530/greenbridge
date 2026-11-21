@@ -38,6 +38,8 @@ public:
     std::uint32_t family = 0;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
+    bool bindless = false;         // the features the bindless set 0 needs are enabled
+    bool partially_bound = false;  // and its slots can stay empty
 
     Device() = default;
     Device(const Device&) = delete;
@@ -182,6 +184,20 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        // What the bindless set 0 of the translated shaders needs, where the device has it: runtime arrays of
+        // images indexed dynamically, updated while the set is bound; and, to leave slots empty, partially bound
+        // bindings.
+        bindless = features12.runtimeDescriptorArray && features.features.shaderSampledImageArrayDynamicIndexing &&
+                   features.features.shaderStorageImageArrayDynamicIndexing &&
+                   features12.descriptorBindingSampledImageUpdateAfterBind &&
+                   features12.descriptorBindingStorageImageUpdateAfterBind &&
+                   features12.descriptorBindingStorageBufferUpdateAfterBind;
+        partially_bound = bindless && features12.descriptorBindingPartiallyBound;
+        enable12.runtimeDescriptorArray = bindless;
+        enable12.descriptorBindingSampledImageUpdateAfterBind = bindless;
+        enable12.descriptorBindingStorageImageUpdateAfterBind = bindless;
+        enable12.descriptorBindingStorageBufferUpdateAfterBind = bindless;
+        enable12.descriptorBindingPartiallyBound = partially_bound;
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -191,6 +207,8 @@ public:
         VkPhysicalDeviceFeatures enable{};
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         bc = features.features.textureCompressionBC == VK_TRUE;
+        enable.shaderSampledImageArrayDynamicIndexing = bindless;
+        enable.shaderStorageImageArrayDynamicIndexing = bindless;
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;

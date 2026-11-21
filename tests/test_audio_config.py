@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "audio_config.py")
@@ -88,6 +89,17 @@ class TestScan(unittest.TestCase):
                 f.write(record[22:])
             self.assertEqual(len(A.collect(tmp)), 0)
             self.assertEqual(len(A.collect(tmp, join=True)), 1)
+
+    def test_non_joined_scan_processes_each_blob_before_reading_the_next(self):
+        def parts(_src):
+            yield "first.bin", make_record(0x1000, 100_000)
+            self.assertEqual(scan.call_count, 1)
+            yield "second.bin", make_record(0x1001, 200_000)
+
+        with patch.object(A, "files_in", parts), patch.object(A, "scan", wraps=A.scan) as scan:
+            rows = A.collect("unused")
+        self.assertEqual([(row["file"], row["id"]) for row in rows],
+                         [("first.bin", 0x1000), ("second.bin", 0x1001)])
 
 
 class TestCli(unittest.TestCase):

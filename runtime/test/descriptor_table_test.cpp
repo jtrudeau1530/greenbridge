@@ -106,6 +106,20 @@ int test_load_factor_and_growth() {
     return 0;
 }
 
+int test_insert_reports_mapping_changes() {
+    DescriptorTable table;
+    const DescriptorKey key{1, 2, 3, 4, 5, 6, 7, 8};
+    using Result = DescriptorTable::InsertResult;
+
+    EXPECT(table.insert_or_update(key.data(), 0) == Result::added);
+    EXPECT(table.insert_or_update(key.data(), 0) == Result::unchanged);
+    EXPECT(table.insert_or_update(key.data(), 17) == Result::replaced);
+    EXPECT(table.insert_or_update(key.data(), 17) == Result::unchanged);
+    EXPECT(table.lookup(key) == 17);
+    EXPECT(table.size() == 1);
+    return 0;
+}
+
 int test_probe_collision_resolution() {
     DescriptorTable table(64);
 
@@ -273,6 +287,7 @@ int main() {
     EXPECT(test_fnv1a_hash_matches_contract() == 0);
     EXPECT(test_ssharp_key_padding() == 0);
     EXPECT(test_basic_insertion_and_lookup() == 0);
+    EXPECT(test_insert_reports_mapping_changes() == 0);
     EXPECT(test_load_factor_and_growth() == 0);
     EXPECT(test_probe_collision_resolution() == 0);
     EXPECT(test_gpu_buffer_serialization() == 0);
