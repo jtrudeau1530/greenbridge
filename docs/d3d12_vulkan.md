@@ -744,7 +744,16 @@ The trace will enumerate them.
   within the family; unsupported casts are logged and fall back to the resource format. Depth/stencil, BCn and
   packed formats map directly; any format the device rejects is a hard error with the DXGI value.
 - `Map`/`Unmap`: upload/readback buffers map their host-visible memory; default-heap resources return
-  `E_INVALIDARG` as D3D12 does. `WriteToSubresource`/`ReadFromSubresource` use a staging copy at the next submit.
+  `E_INVALIDARG` as D3D12 does. A texture in a CPU-visible custom heap maps only with a null pointer (its layout is
+  the driver's), as on D3D12.
+- `WriteToSubresource`/`ReadFromSubresource` (implemented in `d3d12_vulkan_device.cpp`) complete before they
+  return, as D3D12 requires; a read cannot wait for a later submit. Textures in CPU-visible custom heaps are
+  created with `VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT` when the device has `VK_EXT_host_image_copy`, moved to
+  `GENERAL` and zero-filled on the host at creation, and copied with `vkCopyMemoryToImageEXT`/
+  `vkCopyImageToMemoryEXT` while they stay in `GENERAL` (D3D12's `COMMON`). Every other case (no extension, a
+  texture a barrier has moved, a default-heap texture, which D3D12 does not allow but the layer copies and logs) is
+  a `CopyTextureRegion` from or to a host-visible staging buffer, replayed on the device's queue and waited for, so
+  the layout tracker and a first use's zero fill behave exactly as for the application's own copies.
 - Resource flags map to Vulkan usage: `ALLOW_RENDER_TARGET` → `COLOR_ATTACHMENT`, `ALLOW_DEPTH_STENCIL` →
   `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
   sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;
