@@ -411,9 +411,9 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = int(f"{val(a[1]) & wmask(a[0]):0{bits}b}"[::-1], 2)
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
-            if not isinstance(x, int):
-                raise UnsupportedConstruct(f"{op} on non-integer")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x & MASK))
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
+                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op == "OpBitCount":
             values[res] = (val(a[1]) & wmask(a[0])).bit_count()
         elif op == "OpISubBorrow":
@@ -464,11 +464,6 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
-        elif op in ("OpConvertUToF", "OpConvertSToF"):
-            x = val(a[1])
-            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
-                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op in ("OpConvertFToU", "OpConvertFToS"):
             x, bits = val(a[1]), types.bits(a[0])
             if not isinstance(x, float) or not math.isfinite(x):
@@ -537,10 +532,10 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             elif name == "RoundEven":
                 x = args[0]
                 values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
-            elif name in ("FMin", "FMax"):
+            elif name == "FMin":
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
-                values[res] = f32(min(args) if name == "FMin" else max(args))
+                values[res] = f32(min(args))
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":
