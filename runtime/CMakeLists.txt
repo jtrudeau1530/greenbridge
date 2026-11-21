@@ -59,6 +59,7 @@ if(WIN32)
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
+    shims/process.cpp
   )
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
@@ -210,6 +211,24 @@ if(BUILD_TESTING)
     target_link_options(pe_loader_test PRIVATE /OPT:NOREF)
     target_link_libraries(pe_loader_test PRIVATE gta6rt_d3d12_xs_rootsig psapi)
     add_dependencies(pe_loader_test tiny_dll tiny_exe)
+
+    # `gta6rt --run` rehearsal: a stand-in game EXE (CRT startup, statics, heap, files, threads) that imports
+    # xgameruntime.dll from a link-time stub; under --run the shim registry answers those imports instead.
+    add_library(xgameruntime_stub SHARED test/fixtures/xgameruntime_stub.cpp)
+    target_compile_definitions(xgameruntime_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    set_target_properties(xgameruntime_stub PROPERTIES
+      OUTPUT_NAME xgameruntime
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
+    add_executable(tiny_game test/fixtures/tiny_game.cpp)
+    target_link_libraries(tiny_game PRIVATE xgameruntime_stub)
+    target_compile_definitions(tiny_game PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)  # plain fopen, as games use
+    target_compile_options(tiny_game PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    set_target_properties(tiny_game PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
   endif()
 
@@ -257,6 +276,12 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
+  endif()
+  if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    # The stand-in game passes only with its own arguments; with others it exits 1, which --run passes through.
+    add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
+    add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
+    set_tests_properties(run_tiny_game_exit_code PROPERTIES WILL_FAIL TRUE)
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
