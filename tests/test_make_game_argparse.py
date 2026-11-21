@@ -107,6 +107,16 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertIn("invalid int value", mock_err.getvalue())
 
+    def test_zero_or_negative_jobs_rejected_by_argparse(self):
+        # 0 would start no translation shard and merge an empty index; a negative count, the same.
+        for jobs in ("0", "-2"):
+            with patch.object(sys, "argv", ["make_game.py", "--jobs", jobs]):
+                with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                    with self.assertRaises(SystemExit) as ctx:
+                        make_game.main()
+                    self.assertEqual(ctx.exception.code, 2, jobs)
+                    self.assertIn("must be at least 1", mock_err.getvalue())
+
     def test_unrecognized_argument_rejected(self):
         with patch.object(sys, "argv", ["make_game.py", "--unrecognized-option"]):
             with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
@@ -490,6 +500,22 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
             game = os.path.join(tmp, "game")
             out = os.path.join(tmp, "out")
             work = os.path.join(game, "work")
+            os.makedirs(game)
+            with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work]):
+                with patch("make_game.below_normal"):
+                    with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
+                        with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                            with self.assertRaises(SystemExit) as ctx:
+                                make_game.main()
+                            self.assertEqual(ctx.exception.code, 1)
+                            self.assertIn("--out and --work must be outside the game folder", mock_err.getvalue())
+
+    @unittest.skipUnless(os.name == "nt", "paths compare without case only on Windows")
+    def test_out_inside_game_folder_in_other_case_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "Game")
+            out = os.path.join(tmp, "GAME", "out")      # the same folder on Windows
+            work = os.path.join(tmp, "work")
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work]):
                 with patch("make_game.below_normal"):
