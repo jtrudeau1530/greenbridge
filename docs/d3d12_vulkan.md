@@ -456,6 +456,17 @@ Reconciliation: `tools/root_sig_contract.py` checks a candidate root signature a
 the build on the first contradiction. Until the console mapping in §3.5 is confirmed by a PSO, this check — not
 a rendered frame — is the acceptance gate for the mapping above.
 
+Blob format: `rt::rootsig::parse_rts0` reads the `RTS0` chunk of a serialized root signature, versions 1.0, 1.1
+and 1.2. `root_signature_oracle_test` checks it on Windows against blobs the PC `d3d12.dll` serializes. These
+layouts are measured, not assumed:
+- a descriptor table's payload is `{num_ranges, ranges_offset}`, with the ranges at that offset;
+- ranges are 20 bytes, or 24 with the 1.1/1.2 flags dword;
+- root descriptors carry a flags dword from 1.1 on;
+- static samplers are 13 dwords (`D3D12_STATIC_SAMPLER_DESC` order). In 1.2 they are 14: `D3D12_STATIC_SAMPLER_DESC1`
+  appends `Flags`, i.e. UINT border colours and non-normalized coordinates.
+
+Static samplers take no user-data dwords, so 1.2 changes nothing in `pack`.
+
 **Root-signature flag quirk.** Prior art measured Xbox root-signature descriptors carrying flags `0x03000000`; the
 PC serializer rejects them with `E_INVALIDARG` because its flags live in the low 16 bits. Clear the high byte on a
 private copy before calling the host serializer/deserializer; never modify the game's descriptor. The meaning of the
