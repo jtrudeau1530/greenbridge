@@ -7,7 +7,8 @@ Design rules (see tests/semantic/README.md):
   * Strict: any opcode, extended instruction, type or storage class not listed below raises
     UnsupportedConstruct. Nothing is skipped or approximated silently, so a translator change that starts
     emitting something new makes the test error out instead of passing.
-  * One invocation (one lane). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
+  * One invocation (one lane), or with run_workgroup several in lockstep, which meet only at
+    OpGroupNonUniformShuffle (the one subgroup operation modelled). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
     branches the translator emits: OpBranch / OpBranchConditional to a later label plus OpPhi at the merge block.
     Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores use a flat
@@ -38,6 +39,26 @@ _IGNORED = frozenset({
 })
 
 _LINE = re.compile(r"^(?:(%\S+)\s*=\s*)?(Op\w+)\s*(.*)$")
+
+
+class _Undef:
+    """An undefined value (SPIR-V: a shift by at least the bit width). Pure arithmetic on it gives another
+    undefined value; any other use (a store, a branch or select condition, a subgroup operation, an output)
+    raises, so a result that does not depend on it, such as the unselected side of OpSelect, is still exact."""
+
+    def __repr__(self):
+        return "<undefined>"
+
+
+UNDEF = _Undef()
+
+# Operations whose result is undefined when an operand is (they have no side effect and no control).
+_PURE = frozenset({
+    "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
+    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUConvert", "OpBitCount", "OpIEqual",
+    "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThanEqual", "OpCopyObject", "OpBitcast",
+    "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
+})
 
 
 def f32(x):
@@ -124,7 +145,79 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     PhysicalStorageBuffer loads and stores.
 
     Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns.
+    A module with a subgroup operation is rejected here; see run_workgroup.
     """
+    gen = _invocation(text, inputs, push_constants, memory)
+    try:
+        req = next(gen)
+    except StopIteration as done:
+        return done.value
+    gen.close()
+    raise UnsupportedConstruct(f"{req[0]} in a single invocation (use run_workgroup)")
+
+
+class UndefinedResult(Exception):
+    """A subgroup operation whose result SPIR-V leaves undefined (for example a shuffle from a lane that is not in
+    the subgroup). Raised instead of inventing a value."""
+
+
+def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
+                  out_of_range="raise"):
+    """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
+
+    Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
+    invocation order). `inputs_for(i)` gives invocation i's Input values (see run_fragment); push constants and
+    the physical-address memory are shared. Every invocation must reach every subgroup operation, in the same
+    order (the translator emits them in uniform control flow and models EXEC with a variable, so a lane that is
+    off in EXEC still executes them).
+
+    OpGroupNonUniformShuffle (Subgroup scope) returns the value of lane Id of the caller's own subgroup. An Id at
+    or past `subgroup_size` is undefined in SPIR-V: `out_of_range="raise"` raises UndefinedResult;
+    `out_of_range="wrap"` takes lane Id mod subgroup_size instead, a model of one observed driver behaviour
+    and not of the specification (Leonida issue #94: on a 32-wide NVIDIA subgroup lane 40 read lane 8).
+    """
+    if out_of_range not in ("raise", "wrap"):
+        raise ValueError(f"out_of_range: {out_of_range!r}")
+    if invocations % subgroup_size:
+        raise UnsupportedConstruct("a partial subgroup")
+    memory = {} if memory is None else memory
+    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory)
+            for i in range(invocations)]
+    pending = [None] * invocations
+    live = set()
+    for i, g in enumerate(gens):
+        try:
+            pending[i] = next(g)
+            live.add(i)
+        except StopIteration:
+            pass
+    while live:
+        if len(live) != invocations or len({pending[i][1] for i in live}) != 1:
+            raise UnsupportedConstruct("subgroup operation not reached by every invocation at the same point")
+        results = []
+        for i in range(invocations):
+            kind, _, _value, ident = pending[i]
+            if kind != "OpGroupNonUniformShuffle":
+                raise UnsupportedConstruct(kind)
+            if not 0 <= ident < subgroup_size:
+                if out_of_range == "raise":
+                    raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a {subgroup_size}-wide "
+                                          f"subgroup")
+                ident %= subgroup_size
+            src = (i // subgroup_size) * subgroup_size + ident
+            results.append(pending[src][2])
+        for i in range(invocations):
+            try:
+                pending[i] = gens[i].send(results[i])
+            except StopIteration:
+                live.discard(i)
+                pending[i] = None
+    return memory
+
+
+def _invocation(text, inputs, push_constants, memory):
+    """One invocation as a generator. It yields (opcode, instruction index, value, id) at each subgroup operation
+    and expects that operation's result back; it returns run_fragment's result."""
     inputs = inputs or {}
     push_constants = list(push_constants or [])
     memory = {} if memory is None else memory
@@ -297,6 +390,12 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 raise UnsupportedConstruct("OpPhi with an unknown predecessor")
             values[res] = val(incoming[0])
             continue
+        if op in _PURE and any(values.get(x) is UNDEF for x in a[1:]):
+            values[res] = UNDEF
+            continue
+        used = a[1:2] if op == "OpSelect" else a      # OpSelect may pass the chosen undefined value on
+        if any(values.get(x) is UNDEF for x in used):
+            raise UnsupportedConstruct(f"{op} uses an undefined value: {line}")
         if op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
             if cls != "Function":
@@ -386,17 +485,20 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
         elif op == "OpShiftLeftLogical":
             bits = types.bits(a[0])
             if val(a[2]) >= bits:
-                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+                values[res] = UNDEF             # undefined in SPIR-V; raises only if it is used
+                continue
             values[res] = (val(a[1]) << val(a[2])) & wmask(a[0])
         elif op == "OpShiftRightLogical":
             bits = types.bits(a[0])
             if val(a[2]) >= bits:
-                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+                values[res] = UNDEF             # undefined in SPIR-V; raises only if it is used
+                continue
             values[res] = (val(a[1]) & wmask(a[0])) >> val(a[2])
         elif op == "OpShiftRightArithmetic":
             bits = types.bits(a[0])
             if val(a[2]) >= bits:
-                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+                values[res] = UNDEF             # undefined in SPIR-V; raises only if it is used
+                continue
             values[res] = (signed(val(a[1]), bits) >> val(a[2])) & wmask(a[0])
         elif op == "OpIAdd":
             values[res] = (val(a[1]) + val(a[2])) & wmask(a[0])
@@ -445,6 +547,11 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = val(a[1]) > val(a[2])
         elif op == "OpUGreaterThanEqual":
             values[res] = val(a[1]) >= val(a[2])
+        elif op == "OpGroupNonUniformShuffle":
+            # OpGroupNonUniformShuffle <result type> <scope> <value> <id>; the scope must be Subgroup (3).
+            if types.t[a[0]][0] != "int" or val(a[1]) != 3:
+                raise UnsupportedConstruct("OpGroupNonUniformShuffle other than a Subgroup-scope integer")
+            values[res] = yield (op, pc - 1, val(a[2]), val(a[3]))
         elif op == "OpLogicalAnd":
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, bool) and isinstance(y, bool)):
