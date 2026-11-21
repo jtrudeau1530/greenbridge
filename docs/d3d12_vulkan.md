@@ -1302,11 +1302,11 @@ The file is an XVD container, not a PE; PE-oriented import tools do not apply.
 Reproduce: `rea.inspect_native_exports` and `rea.inspect_pe_imports` on the DLL, then a byte scan for the
 little-endian GUIDs from `d3d12.h`.
 
-Constructed by `runtime/test/bvh_builder_test.cpp` (1.0.2.1, `rt::Loader` with #93, `DllMain`, then
-`XboxBvhBuilder(ID3D12Device11*, bool)` on a PC device behind the Xbox-ABI proxy). Measured:
+Constructed by `runtime/test/bvh_builder_test.cpp` (1.0.2.1: `rt::Loader`, `Loader::initialise()` for TLS and
+`DllMain`, `.pdata` registered by the test while the loader doesn't, then `XboxBvhBuilder(ID3D12Device11*, bool)`
+on a PC device behind the Xbox-ABI proxy). Measured:
 
-- 0 unimplemented imports; `D3D12SerializeVersionedRootSignature`, `XMemVirtualQuery` and (from #93)
-  `_CxxThrowException` bind to shims. The constructor writes 24 bytes of the object (`sizeof(XboxBvhBuilder)` >= 24;
+- 0 unimplemented imports; `D3D12SerializeVersionedRootSignature` and `XMemVirtualQuery` bind to shims. The constructor writes 24 bytes of the object (`sizeof(XboxBvhBuilder)` >= 24;
   the rest of its state is elsewhere). It prints nothing through `OutputDebugString` and never calls
   `TerminateProcess`. On failure it throws the failing `HRESULT` as a C++ `long`.
 - **Device slot 62 is called as `(desc, 0, 0, &IID_ID3D12PipelineState, out)`**, with a plain
@@ -1329,10 +1329,11 @@ Constructed by `runtime/test/bvh_builder_test.cpp` (1.0.2.1, `rt::Loader` with #
   `IID_ID3D12RootSignatureDeserializer` (0x047320), `IID_ID3D12PipelineState` (0x047330),
   `IID_ID3D12Heap` (0x047340), `IID_ID3D12RootSignature` (0x047350), `IID_ID3D12DescriptorHeap` (0x0472e0) and
   `IID_ID3D12CommandSignature` (0x047300). Again, presence ≠ use.
-- Run through the public FidelityFX API by `runtime/test/fsr_dispatch_test.cpp` (1.0.2.1, `rt::Loader` with static
-  TLS and unwind from #93, then `DllMain`; PC D3D12 device on an RTX 4090 behind the Xbox-ABI proxy). Measured:
+- Run through the public FidelityFX API by `runtime/test/fsr_dispatch_test.cpp` (1.0.2.1: `rt::Loader` and
+  `Loader::initialise()`, with #93's static TLS, which the DLL's thread-safe statics need, and `.pdata` registered by
+  the test while the loader doesn't; PC D3D12 device on an RTX 4090 behind the Xbox-ABI proxy). Measured:
   - It maps with 0 unimplemented imports: `D3D12CreateRootSignatureDeserializer` and `XMemAlloc` /
-    `XMemFree` / `XMemGetWorkingSetStatistics` bind to the shims, 81 imports to host DLLs. Its TLS template is
+    `XMemFree` / `XMemGetWorkingSetStatistics` bind to the shims, 82 imports to host DLLs. Its TLS template is
     8 bytes with no callbacks. `DllMain(DLL_PROCESS_ATTACH)` returns TRUE.
   - `ffxConfigure(GLOBALDEBUG)` and the CPU-only upscale queries accept the **PC struct type ids**: the
     Performance ratio is 2.0 and 3840x2160 Quality renders at 2560x1440. `GET_VERSIONS` for the upscaler lists one

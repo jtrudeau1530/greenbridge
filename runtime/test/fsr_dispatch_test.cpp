@@ -155,8 +155,8 @@ bool patch(void** slot, void* fn, void** old) {
 }
 
 // main's loader (#95) maps, sets up TLS and runs DllMain, but doesn't register the image's x64 unwind tables yet
-// (#93 adds that). Both DLLs throw and catch C++ exceptions inside, which ends the process without them. Register
-// .pdata here only when the loader hasn't, so the test keeps working once #93 is in.
+// (#176 adds that). Both DLLs throw and catch C++ exceptions inside, which ends the process without them. Register
+// .pdata here only when the loader hasn't, so the test keeps working once the loader does.
 bool ensure_unwind_registered(rt::Module& m) {
     DWORD64 base = 0;
     if (RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(m.base + m.entry_rva), &base, nullptr)) return true;
