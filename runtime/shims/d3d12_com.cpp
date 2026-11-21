@@ -109,7 +109,10 @@ public:
         invalid_ = false;
         front_stencil_ref_ = back_stencil_ref_ = 0;  // Reset returns every list state to its default
         stencil_ref_set_ = false;
-        if (state) stub("ID3D12GraphicsCommandList::Reset(initial pipeline state)");
+        compute_ = {};
+        graphics_ = {};
+        compute_pipeline_ = compute_pipeline_id(state);
+        if (state && !compute_pipeline_) stub("ID3D12GraphicsCommandList::Reset(graphics pipeline state)");
         return d3d12_trace::result(method, S_OK);
     }
 
@@ -128,6 +131,73 @@ public:
             back_stencil_ref_ = bundle->back_stencil_ref_;
             stencil_ref_set_ = true;
         }
+    }
+
+    // Root signatures, pipeline state and root arguments. The arguments are packed into the 32 user-data dwords
+    // the translated shaders read (root_signature.h; docs section 3.5); a draw or dispatch records a copy.
+    void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature* signature) override {
+        bind_root(compute_, signature);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* signature) override {
+        bind_root(graphics_, signature);
+    }
+
+    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
+        compute_pipeline_ = compute_pipeline_id(state);
+        if (state && !compute_pipeline_) stub("ID3D12GraphicsCommandList::SetPipelineState(graphics)");
+    }
+
+    // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {}
+
+    void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) override {
+        constants(compute_, index, 1, &value, offset);
+    }
+    void STDMETHODCALLTYPE SetComputeRoot32BitConstants(UINT index, UINT count, const void* data, UINT offset) override {
+        constants(compute_, index, count, data, offset);
+    }
+    void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
+        address(compute_, index, table.ptr, rt::rootsig::ParamType::Table);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRoot32BitConstant(UINT index, UINT value, UINT offset) override {
+        constants(graphics_, index, 1, &value, offset);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRoot32BitConstants(UINT index, UINT count, const void* data, UINT offset) override {
+        constants(graphics_, index, count, data, offset);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
+        address(graphics_, index, table.ptr, rt::rootsig::ParamType::Table);
+    }
+
+    void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
+        if (!compute_pipeline_ || !compute_.layout) return check(false);
+        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+    }
+
+    // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
+    void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
+        front_stencil_ref_ = back_stencil_ref_ = 0;
+        compute_ = {};
+        graphics_ = {};
+        compute_pipeline_ = compute_pipeline_id(state);
     }
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
@@ -438,12 +508,60 @@ private:
         return true;
     }
 
+    struct RootState {
+        const RootArgumentLayout* layout = nullptr;
+        std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+    };
+
+    // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here.
+    void bind_root(RootState& state, ID3D12RootSignature* signature) {
+        state.layout = root_signature_layout(signature);
+        state.data = {};
+        if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
+    }
+
+    // The parameter, if it exists and has the expected type; null after recording an invalid call.
+    const RootArgumentLayout::Parameter* parameter(RootState& state, UINT index, rt::rootsig::ParamType type) {
+        if (!state.layout || index >= state.layout->parameters.size() ||
+            state.layout->parameters[index].type != type) {
+            check(false);
+            return nullptr;
+        }
+        return &state.layout->parameters[index];
+    }
+
+    // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
+    void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
+        if (dword < rt::rootsig::kMaxUserSgprs)
+            state.data[dword] = value;
+        else
+            stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+    }
+
+    void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
+        const RootArgumentLayout::Parameter* p = parameter(state, index, rt::rootsig::ParamType::Constants);
+        if (!p) return;
+        if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
+        const auto* values = static_cast<const std::uint32_t*>(data);
+        for (UINT i = 0; i < count; ++i) write(state, p->user_offset + offset + i, values[i]);
+    }
+
+    void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
+        const RootArgumentLayout::Parameter* p = parameter(state, index, type);
+        if (!p) return;
+        write(state, p->user_offset, std::uint32_t(va));
+        write(state, p->user_offset + 1, std::uint32_t(va >> 32));
+    }
+
     D3D12_COMMAND_LIST_TYPE type_;
     leonida::CommandList list_;
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     bool stencil_ref_set_ = false;
+    RootState compute_;
+    RootState graphics_;
+    std::uintptr_t compute_pipeline_ = 0;
 };
 
 class Fence final

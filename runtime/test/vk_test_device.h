@@ -220,7 +220,7 @@ public:
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
         if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
-            !features12.separateDepthStencilLayouts) {
+            !features12.separateDepthStencilLayouts || !features12.bufferDeviceAddress) {
             std::fprintf(stderr, "the device lacks dynamicRendering, synchronization2, timelineSemaphore or "
                                  "separateDepthStencilLayouts\n");
             return DeviceStatus::unavailable;
@@ -267,6 +267,7 @@ public:
         enable12.descriptorBindingStorageImageUpdateAfterBind = bindless;
         enable12.descriptorBindingStorageBufferUpdateAfterBind = bindless;
         enable12.descriptorBindingPartiallyBound = partially_bound;
+        enable12.bufferDeviceAddress = VK_TRUE;
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
