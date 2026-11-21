@@ -428,7 +428,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_grad_a16": "vs_ids.asm",
-              "ps_texture_sample_d16": "vs_ids.asm",
+              "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm",
               "vs_clip": "ps_ops.asm"}
 
 
@@ -744,14 +744,14 @@ def run_suite(a, work: str) -> int:
         elif name == "ps_texture_grad_a16":
             problem = texture_gradient_a16_test(a.build, spirv_dir)
             results.append((name, not problem, problem or "4096 RGBA pixels matched"))
-        elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16"):
+        elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16", "ps_sample_c_lz"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
                 cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
             else:
-                mode = ["cube"] if name == "ps_cube_sample" else []
+                mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"]}.get(name, [])
                 cmd = [tool, *mode, raw]
             try:
                 p = subprocess.run(cmd, capture_output=True, text=True, cwd=spirv_dir)
