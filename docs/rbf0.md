@@ -392,8 +392,8 @@ at 0x76; `Style` at 0x8f with a 25-byte text at 0x9e; root close at 0xc1, end 0x
 
 The 385-byte `UIScreen` uses descriptor IDs 0-8: `UIScreen`, `LayoutParams`, `widthContentMode`,
 `heightContentMode`, `horizontalAlignment`, `verticalAlignment`, `Name`, `Screen` and `ID`. It has nine elements
-and six text leaves; `LayoutParams` contains four text-valued children and the root contains `Name`, `Screen` and
-`ID` siblings. No attribute is present.
+and six text leaves. `LayoutParams` contains four text-valued children; the root also contains `Name` and `Screen`,
+and `Screen` contains `ID`. No attribute is present.
 
 ### 9.4 Output and failure behavior
 
