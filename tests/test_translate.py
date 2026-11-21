@@ -126,6 +126,21 @@ def test_mesh_without_psv0_is_rejected(make_shader):
         shader.translate()
 
 
+def test_mesh_cull_primitive_is_block_bool(make_shader):
+    """CullPrimitiveEXT must be a Block bool member (VUID-07036); array-of-bool trips SPIRV-Tools ≤2025.1."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_v5_workgroup.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_v5_workgroup", dxbc=SAMPLE_DXBC["ms_v5_workgroup"])
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpDecorate %ms_cull_blk Block" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT" in spvasm
+    assert "%ms_cull_blk = OpTypeStruct %bool" in spvasm
+    assert re.search(r"%ms_arr_cull = OpTypeArray %ms_cull_blk %c\w+", spvasm)
+    assert "OpDecorate %ms_cull BuiltIn CullPrimitiveEXT" not in spvasm
+    assert re.search(r"OpAccessChain %_ptr_Out_bool_ms %ms_cull %\w+ %c0", spvasm)
+
+
 # ---- pos1..pos3: ClipDistance / CullDistance / misc exports (VS & MS) ----
 
 def _vgpr_to_index_map(spvasm, array_var, ptr_type):

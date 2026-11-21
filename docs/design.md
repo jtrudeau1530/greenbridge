@@ -75,8 +75,10 @@ Run `python -I scripts/run_gpu_tests.py --filter ms_v5_workgroup` to check the m
 shader exports its incoming `v5` from lanes 0, 1 and 31 in the RGB channels of a full-screen triangle. One `vkCmdDrawMeshTasksEXT(2, 3, 4)`
 produces 24 triangles. A stencil countdown lets pixel *i* record only triangle *i* in Vulkan rasterization order.
 The CPU compares each pixel with `x + 2*y + 6*z`. This checks the translator's register mapping on the host GPU.
-SPIRV-Tools 2026.1 validates this fixture. Version 2025.1 reports a known error on `CullPrimitiveEXT`.
-[Vulkan mesh rasterization order](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_mesh_shader.html) · [Validator fix](https://github.com/KhronosGroup/SPIRV-Tools/pull/6155).
+`CullPrimitiveEXT` is emitted as a `Block` struct with a bool member (VUID-07036 also allows an array of
+bool). The Block form keeps SPIRV-Tools 2025.1 happy; array-of-bool was falsely rejected there (#5980) until
+[PR #6155](https://github.com/KhronosGroup/SPIRV-Tools/pull/6155).
+[Vulkan mesh rasterization order](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_mesh_shader.html).
 
 ## Build the runtime
 
