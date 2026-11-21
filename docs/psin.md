@@ -72,7 +72,9 @@ python -I tools/psin_index.py <PSIN file or carve directory> [--json] [--limit N
 ```
 
 - `parse(blob)` returns the magic, version, table size, the ordered section list
-  (`tag`, `offset`, `size`, `payload`) and a `complete` flag with the first structural error.
+  (`tag`, `offset`, `size`, `payload`) and a `complete` flag with the first structural error. When the
+  `LRSC` payload starts with `0DRP`, the `0DRP` version is reported; `CHKS` contributes the file size
+  and a 32-bit checksum. Text output and the summary include those fields.
 - `collect(src)` scans a single file or every `.bin` in a carve directory; non-PSIN files are
   skipped.
 - Text output prints one line per container and a tag summary; `--json` writes `{files, summary}`.
