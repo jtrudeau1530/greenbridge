@@ -31,6 +31,20 @@ def _symbols():
     return env
 
 
+def _term(text, env):
+    """Value of one pattern cell: symbols and integers joined by ^, the only syntax addrlib's tables use."""
+    value = 0
+    for part in text.split("^"):
+        part = part.strip()
+        if part in env:
+            value ^= env[part]
+        elif re.fullmatch(r"\d+", part):
+            value ^= int(part)
+        else:
+            raise ValueError(f"unexpected swizzle pattern term: {text!r}")
+    return value
+
+
 def load(path=HEADER):
     text = open(path, encoding="utf-8", errors="replace").read()
     env = _symbols()
@@ -38,7 +52,7 @@ def load(path=HEADER):
     for name in ("NIBBLE01", "NIBBLE2", "NIBBLE3", "NIBBLE4"):
         m = re.search(r"GFX10_SW_PATTERN_" + name + r"\[\]\[\d+\]\s*=\s*\{(.*?)\n\};", text, re.S)
         rows = re.findall(r"\{([^{}]*)\}", m.group(1))
-        nibbles[name] = [[eval(t.strip() or "0", {}, env) for t in r.split(",") if t.strip()] for r in rows]  # noqa: S307
+        nibbles[name] = [[_term(t, env) for t in r.split(",") if t.strip()] for r in rows]
     tables = {}
     for m in re.finditer(r"const ADDR_SW_PATINFO (GFX10_SW_\w+_PATINFO)\[\]\s*=\s*\{(.*?)\n\};", text, re.S):
         entries = []
