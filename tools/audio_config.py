@@ -200,6 +200,8 @@ def main():
 
     names = load_names(a.names) if a.names else None
     records = collect(a.src, a.min_ms, a.max_ms, names, a.join)
+    if not records:
+        sys.exit(f"{a.src}: no audio-config records found")
     summary = summarize(records)
 
     if a.json:
