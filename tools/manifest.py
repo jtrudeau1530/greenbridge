@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -95,20 +96,13 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
 
     # Re-insert in walk order so the JSON is independent of which worker finished first.
     entries = {rel: entries[rel] for rel, _ in files}
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    # Written beside the target and swapped in, so an interrupted run keeps the old manifest instead of leaving a
-    # truncated one for verify to trip over.
-    tmp = out + ".partial"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
+    out_dir = os.path.dirname(os.path.abspath(out))
+    os.makedirs(out_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out_dir) as staging:
+        staged = os.path.join(staging, "manifest.json")
+        with open(staged, "w", encoding="utf-8") as f:
             json.dump({"created": time.strftime("%Y-%m-%d %H:%M:%S"), "files": entries}, f, indent=1)
-        os.replace(tmp, out)
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
+        os.replace(staged, out)
     print(f"{len(entries)} files, {total / 2**30:.1f} GiB -> {out}")
     return 0
 

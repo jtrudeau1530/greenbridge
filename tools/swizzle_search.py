@@ -103,6 +103,9 @@ def main():
     for s, w, seq in res[:8]:
         print(f"score {s:7.2f}  width {w:5}  bits(low->high) {seq}")
     if a.out:
+        if not res:
+            print("ERROR: no layout fits the input, tile size and requested widths", file=sys.stderr)
+            return 1
         render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
         print("preview ->", a.out)
 

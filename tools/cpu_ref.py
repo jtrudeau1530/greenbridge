@@ -657,7 +657,9 @@ class Machine:
                     elif sb < 12:
                         k = sb & 3
                         src = lo if k < 2 else hi
-                        val = 0xFF if (src >> (15 + 8 * (k & 1))) & 1 else 0
+                        # Selector 8/9 pick bit 7 of bytes 1/3 of src1 (bits 15/31);
+                        # 10/11 the same bytes of src0 (bits 47/63, i.e. 15/31 again).
+                        val = 0xFF if (src >> (15 + 16 * (k & 1))) & 1 else 0
                     else:
                         val = 0 if sb == 12 else 0xFF
                     r |= val << (8 * i)

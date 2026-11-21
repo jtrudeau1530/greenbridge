@@ -159,6 +159,40 @@ test('leaving pauses retries; returning preserves the exhausted budget', async (
     assert.equal(f.requests.length, 3);
 });
 
+test('a full load queue skips looking up unloaded chunk bounds until a slot opens', async () => {
+    const f = fixture(8);
+    f.frame();
+    assert.equal(f.state.inflight, 4);
+    const next = f.context.world.chunks[4];
+    const bounds = next.bounds;
+    let reads = 0;
+    Object.defineProperty(next, 'bounds', { get() { reads++; return bounds; } });
+
+    f.frame();
+    assert.equal(reads, 0);
+    assert.equal(f.requests.length, 4);
+
+    await f.succeed(0, f.object());
+    f.frame();
+    assert.equal(reads, 1);
+    assert.equal(f.requests[4].url, '4.glb');
+});
+
+test('candidate distances are computed once and nearest chunks load first', () => {
+    const f = fixture(7);
+    const distances = [100, 5, 20, 20, 10, 1400, 4];
+    const reads = Array(distances.length).fill(0);
+    f.context.world.chunks.forEach((chunk, i) => {
+        const x = distances[i];
+        const bounds = [x, 0, 0, x + 1, 1, 1];
+        Object.defineProperty(chunk, 'bounds', { get() { reads[i]++; return bounds; } });
+    });
+
+    f.frame();
+    assert.deepEqual(f.requests.map(r => r.url), ['6.glb', '1.glb', '4.glb', '2.glb']);
+    assert.deepEqual(reads, Array(distances.length).fill(1));
+});
+
 test('pending requests are not duplicated and retries obey the inflight limit', async () => {
     const f = fixture(6);
     f.frame();

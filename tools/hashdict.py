@@ -46,13 +46,18 @@ def main():
     ap.add_argument("--archives", default="common,data,script,pack_story000_story000_script,textures")
     ap.add_argument("--extra", nargs="*", default=[])
     ap.add_argument("--min", type=int, default=3)
-    ap.add_argument("--lookup", nargs="+")
+    ap.add_argument("--lookup", nargs="+", metavar="VALUE", help="dictionary path followed by one or more hashes")
     a = ap.parse_args()
     if a.lookup:
-        d = json.load(open(a.lookup[0], encoding="utf-8"))
+        if len(a.lookup) < 2:
+            ap.error("--lookup requires a dictionary and at least one hash")
+        with open(a.lookup[0], encoding="utf-8") as f:
+            d = json.load(f)
         for h in a.lookup[1:]:
             print(h, d.get(f"{int(h, 16):08x}", "?"))
         return 0
+    if a.carve is None:
+        ap.error("a carve directory is required to build a dictionary")
     strings = set()
     full = set(a.archives.split(","))
     for arch in sorted(os.listdir(a.carve)):

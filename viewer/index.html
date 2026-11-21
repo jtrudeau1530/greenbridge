@@ -266,12 +266,18 @@ function stream(now = performance.now()) {
     // A canceled retry does not erase the previous failures or spend another attempt.
     if (c.previous) live.set(id, c.previous);
   }
-  const want = world.chunks.filter(c => {
-    if (dist(c, p) >= LOAD_R) return false;
-    const entry = live.get(c.id);
-    return !entry || (!entry.obj && !entry.loading && entry.attempts < MAX_LOAD_ATTEMPTS && now >= entry.retryAt);
-  }).sort((a, b) => dist(a, p) - dist(b, p));
-  for (const def of want) {
+  // Always evict stale chunks, but only look for new work when a slot is free.
+  if (inflight >= MAX_INFLIGHT) return;
+
+  const want = [];
+  for (const def of world.chunks) {
+    const entry = live.get(def.id);
+    if (entry && (entry.obj || entry.loading || entry.attempts >= MAX_LOAD_ATTEMPTS || now < entry.retryAt)) continue;
+    const distance = dist(def, p);
+    if (distance < LOAD_R) want.push({ def, distance });
+  }
+  want.sort((a, b) => a.distance - b.distance);
+  for (const { def } of want) {
     if (inflight >= MAX_INFLIGHT) break;
     const previous = live.get(def.id);
     const entry = { def, obj: null, loading: true, attempts: (previous?.attempts || 0) + 1, retryAt: 0, previous };
