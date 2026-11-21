@@ -218,7 +218,8 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                                             self.assertEqual(ret, 0)
 
         expected_calls = [
-            call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY),
+            call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
+                         emulate=unittest.mock.ANY),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
             call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
             call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir)),
@@ -291,10 +292,12 @@ class JobsHandlingTest(unittest.TestCase):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
                             with patch("make_game.log"):
-                                with patch("make_game.shaders") as mock_shaders:
+                                with patch("make_game.shaders") as mock_shaders, \
+                                        patch("make_game.wave64_emulate", return_value=True):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
-                                    mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6)
+                                    mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
+                                                                         emulate=True)
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
