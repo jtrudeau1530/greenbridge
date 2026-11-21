@@ -21,6 +21,22 @@ target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
 target_link_options(gta6rt PRIVATE /OPT:NOREF)
 target_link_libraries(gta6rt PRIVATE psapi)
 
+option(LEONIDA_D3D12_SHIM_TESTS "Build the standalone D3D12 root-signature shim test" OFF)
+if(LEONIDA_D3D12_SHIM_TESTS)
+  enable_testing()
+  add_executable(d3d12_xs_root_signature_test
+    test/d3d12_xs_root_signature_test.cpp
+    shims/d3d12_xs.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(d3d12_xs_root_signature_test PRIVATE shims)
+  target_compile_definitions(d3d12_xs_root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(d3d12_xs_root_signature_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+  target_link_options(d3d12_xs_root_signature_test PRIVATE /OPT:NOREF)
+  target_link_libraries(d3d12_xs_root_signature_test PRIVATE d3d12 dxgi)
+  add_test(NAME d3d12_xs_root_signature COMMAND d3d12_xs_root_signature_test)
+endif()
+
 # GPU test and pipeline tools (need the Vulkan SDK headers; they load vulkan-1.dll at run time).
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)

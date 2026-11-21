@@ -1,11 +1,11 @@
-// d3d12_xs.dll: the Xbox Series build of D3D12. Only the free functions the bundled DLLs import are here.
-//
-// ASSUMPTION (verify against the exe's call sites): root-signature descriptions and blobs have the same layout as
-// desktop D3D12, so these forward to the PC d3d12.dll. Device/command-list interfaces are a separate, much larger
-// job (Xbox-only methods, placement and ESRAM-era extensions) and aren't shimmed here.
+// Xbox Series root-signature imports forwarded to the Windows D3D12 exports.
+// The SDK types describe the Windows side. Xbox ABI and binary compatibility,
+// including the layout of guest descriptions and serialized blobs, remain unverified.
 #include <windows.h>
+#include <d3d12.h>
 
 #include <cstdio>
+#include <type_traits>
 
 #include "shims.h"
 
@@ -18,22 +18,26 @@ FARPROC host(const char* name) {
     return p;
 }
 
-using SerializeFn = HRESULT(WINAPI*)(const void*, void**, void**);
-using DeserializerFn = HRESULT(WINAPI*)(const void*, SIZE_T, const GUID*, void**);
+using SerializeFn = decltype(&::D3D12SerializeVersionedRootSignature);
+using DeserializerFn = decltype(&::D3D12CreateRootSignatureDeserializer);
 
-HRESULT WINAPI D3D12SerializeVersionedRootSignature(const void* desc, void** blob, void** error) {
+HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc,
+                                        ID3DBlob** blob, ID3DBlob** error) {
     static auto fn = reinterpret_cast<SerializeFn>(host("D3D12SerializeVersionedRootSignature"));
     return fn ? fn(desc, blob, error) : E_NOTIMPL;
 }
 
-HRESULT WINAPI D3D12CreateRootSignatureDeserializer(const void* data, SIZE_T size, const GUID* iid, void** out) {
+HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
     static auto fn = reinterpret_cast<DeserializerFn>(host("D3D12CreateRootSignatureDeserializer"));
     return fn ? fn(data, size, iid, out) : E_NOTIMPL;
 }
 
+static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
+static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
+
 }  // namespace
 
 SHIM_TABLE(d3d12_xs,
-    {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&D3D12SerializeVersionedRootSignature)},
-    {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer", reinterpret_cast<void*>(&D3D12CreateRootSignatureDeserializer)},
+    {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&serialize_root_signature)},
+    {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer", reinterpret_cast<void*>(&create_root_signature_deserializer)},
 );
