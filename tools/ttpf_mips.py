@@ -6,20 +6,23 @@ first. `TtpfReader` only trusts a hand-validated tuple table and stops at the
 descriptor's `nonTail` field, which is not the layout boundary. The layout rule lives
 in `tex_headers.py` (`compact_surface_layout` and the helpers around it); this tool
 supplies the RDS5 reader, decoders and commands. It computes the layout from the
-descriptor, validates it against the native allocation span, then decodes the mips
-that are zlib/raw (no BCPack backend is used or guessed).
+descriptor, validates it against the native allocation span, then decodes zlib/raw
+mips and supported BCPack codecs (BC1, BC3, BC4 and BC5 via `bcpack.py`, strict
+confirmed-history mode by default; pass `--allow-provisional` to opt into unconfirmed
+built-in history entries).
 
 Read-only: no texture bytes are printed or committed. `scan` emits aggregate
-counters only. `layout` prints descriptor fields and offsets. `check` prints the
-BC block-average error against a 2x2 downsample of the parent mip; it decodes
-BC1, BC3, BC4_UNORM and BC5_UNORM (BC2, the SNORM BC4/5 variants, BC6H and BC7
-are sized but not decoded, and uncompressed tiling is not validated). `export`
-writes a full BC chain only when every source mip is zlib/raw.
+counters only (both the zlib/raw baseline and the BCPack-enabled projection).
+`layout` prints descriptor fields and offsets. `check` prints the BC block-average
+error against a 2x2 downsample of the parent mip; it decodes BC1, BC3, BC4_UNORM
+and BC5_UNORM (BC2, the SNORM BC4/5 variants, BC6H and BC7 are sized but not
+decoded, and uncompressed tiling is not validated). `export` writes a full BC chain
+when every source mip uses a supported codec.
 
     python -I tools/ttpf_mips.py scan <game root or pool paths...> [--json out] [--tuples]
     python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
-    python -I tools/ttpf_mips.py check <pool.ttpf> <index>
-    python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--mips N] [--force]
+    python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional]
+    python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--mips N] [--force] [--allow-provisional]
 
 Standard library only. The RDS5/ETPF checks mirror rpf9-explorer's `TtpfReader`
 (MIT); the tile patterns and tail formula are the AMD Gfx10 4 KiB/64 KiB layouts
@@ -35,6 +38,7 @@ import sys
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bcpack  # noqa: E402
 from tex_headers import (  # noqa: E402
     compact_surface_layout, gfx10_tile_bytes, gfx10_tile_mode,
     parse_etpf_texture_record,
@@ -242,10 +246,10 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
             elif fmt in (77, 78):
                 blk = decode_bc1_block(data, at + 8)
             elif fmt in (80,):
-                blk = decode_bc4_block(data, (by * blocks_w + bx) * 8, False)
+                blk = decode_bc4_block(data, (by * blocks_w + bx) * 8)
             elif fmt in (83,):
-                a = decode_bc4_block(data, at, False)
-                b = decode_bc4_block(data, at + 8, False)
+                a = decode_bc4_block(data, at)
+                b = decode_bc4_block(data, at + 8)
                 blk = [(p[0], q[0], 0.0) for p, q in zip(a, b)]
             else:
                 return None
@@ -393,22 +397,31 @@ class Pool:
     def codecs(self, start, size):
         return {c[4] for c in self.chunks_for(start, size)}
 
-    def readable(self, start, size):
-        return self.codecs(start, size) <= {0, 8}
+    def readable(self, start, size, *, allow_bcpack=False):
+        allowed = ({0, 8} | bcpack.SUPPORTED_REBUILD_CODECS) if allow_bcpack else {0, 8}
+        return self.codecs(start, size) <= allowed
 
-    def read_range(self, start, size, cache=None):
+    def read_range(self, start, size, cache=None, *, bcpack_mode="strict"):
+        if bcpack_mode not in ("strict", "provisional", "off"):
+            raise ValueError(f"invalid bcpack_mode: {bcpack_mode!r}")
         cache = {} if cache is None else cache
         out = bytearray(size)
         for virt, csize, src, packed, codec, pad in self.chunks_for(start, size):
-            key = (src, packed, codec)
+            key = (src, packed, codec, bcpack_mode if codec not in (0, 8) else "raw")
             if key not in cache:
                 raw = self.data[src:src + packed]
                 if codec == 0:
                     cache[key] = bytes(raw)
                 elif codec == 8:
                     cache[key] = zlib.decompress(raw)
+                elif bcpack_mode != "off" and codec in bcpack.SUPPORTED_REBUILD_CODECS:
+                    cache[key] = bcpack.decode(
+                        raw, codec, csize, allow_provisional=(bcpack_mode == "provisional")
+                    )
                 else:
-                    raise BcpackRequired("range touches a BCPack chunk")
+                    raise BcpackRequired(
+                        f"range touches a BCPack chunk (codec {codec})"
+                    )
                 if len(cache[key]) != csize:
                     raise ValueError("decoded chunk length disagrees with its range")
             lo, hi = max(start, virt), min(start + size, virt + csize)
@@ -445,7 +458,7 @@ def validated_aux(desc):
               ELEMENT_BYTES.get(desc["format"]) == a["bytes_b"])))
 
 
-def analyze(pool, index):
+def analyze(pool, index, *, allow_bcpack=True):
     """Descriptor + layout + per-mip codec availability for one texture."""
     d = pool.descriptor(index)
     out = dict(descriptor=d, tile_mode=tile_mode(d["mode"]), tile=tile_bytes(d["mode"]))
@@ -469,13 +482,19 @@ def analyze(pool, index):
         out["blocked"] = "layout does not match the allocation span"
         return out
     avail = []
+    mip_codecs = []
     for mip in layout["mips"]:
         try:
-            avail.append(pool.readable(d["base"] + mip["offset"], mip["region"]))
+            codecs = sorted(pool.codecs(d["base"] + mip["offset"], mip["region"]))
+            mip_codecs.append(codecs)
+            avail.append(pool.readable(d["base"] + mip["offset"], mip["region"],
+                                       allow_bcpack=allow_bcpack))
         except ValueError:
             avail = []
+            mip_codecs = []
             break
     out["available"] = avail
+    out["mip_codecs"] = mip_codecs
     if avail:
         limit = d["non_tail"] if compact_row(d) else d["mips"]
         limit = max(0, min(limit, len(avail)))
@@ -518,8 +537,10 @@ def scan_pools(paths, as_json=None, include_tuples=False):
                  compact_rows_measured=0, compact_non_tail_before_tail=0,
                  compact_standalone_beyond_limit=0,
                  compact_standalone_decodable_beyond_limit=0,
-                 compact_full_rows=0, tile_modes={})
+                 compact_full_rows=0, after_bcpack_full=0,
+                 after_bcpack_partial=0, tile_modes={})
     gated_tuples = {}
+    bcpack_allowed = {0, 8} | bcpack.SUPPORTED_REBUILD_CODECS
     for path in paths:
         pool = Pool(path)
         try:
@@ -564,18 +585,36 @@ def scan_pools(paths, as_json=None, include_tuples=False):
                         total["gated_span_mismatch"] += 1
                     continue
                 avail = []
+                avail_bc = []
                 for mip in layout["mips"]:
                     try:
-                        avail.append(pool.readable(d["base"] + mip["offset"], mip["region"]))
+                        cs = pool.codecs(d["base"] + mip["offset"], mip["region"])
                     except ValueError:
                         avail = []
+                        avail_bc = []
                         break
+                    avail.append(cs <= {0, 8})
+                    avail_bc.append(cs <= bcpack_allowed)
                 if not avail:
                     total["layout_mismatch"] += 1
                     if gated:
                         total["whitelist_gated"] += 1
                         total["gated_unreadable_range"] += 1
                     continue
+                if all(avail_bc):
+                    total["after_bcpack_full"] += 1
+                else:
+                    ft = layout["first_tail"]
+                    usable_tail_bc = (ft < d["mips"] and all(avail_bc[ft:]))
+                    lim_bc = (d["mips"] if (not compact_row(d) or usable_tail_bc)
+                              else min(ft, len(avail_bc)))
+                    bm_bc = next((k for k in range(lim_bc) if avail_bc[k]), None)
+                    exp_bc = 0
+                    if bm_bc is not None:
+                        while bm_bc + exp_bc < lim_bc and avail_bc[bm_bc + exp_bc]:
+                            exp_bc += 1
+                    if exp_bc:
+                        total["after_bcpack_partial"] += 1
                 if gated:
                     total["whitelist_gated"] += 1
                     total["gated_layout_ok"] += 1
@@ -665,6 +704,9 @@ def scan_pools(paths, as_json=None, include_tuples=False):
     total["after_partial"] = (total["reader_partial"] - total["compact_full_rows"] +
                               total["gated_partial"])
     total["after_skip"] = total["entries"] - total["after_full"] - total["after_partial"]
+    total["after_bcpack_skip"] = (total["entries"] - total["after_bcpack_full"] -
+                                  total["after_bcpack_partial"])
+    total["bcpack_unlocked_full"] = total["after_bcpack_full"] - total["after_full"]
     if include_tuples:
         total["gated_tuples"] = [
             {"tuple": list(key), "count": count}
@@ -689,9 +731,11 @@ def describe(pool, index):
         out["allocation_span"] = a.get("allocation_span")
         out["span_matches"] = a.get("span_matches")
         out["first_tail_mip"] = a["layout"]["first_tail"]
+        mip_codecs = a.get("mip_codecs") or []
         out["mips_detail"] = [
             dict(index=m["index"], blocks=[m["blocks_w"], m["blocks_h"]], offset=m["offset"],
-                 region=m["region"], tail=m["in_tail"], tile_origin=[m["tile_x"], m["tile_y"]])
+                 region=m["region"], tail=m["in_tail"], tile_origin=[m["tile_x"], m["tile_y"]],
+                 **({"codecs": mip_codecs[m["index"]]} if m["index"] < len(mip_codecs) else {}))
             for m in a["layout"]["mips"]]
     if "available" in a:
         out["available"] = a["available"]
@@ -703,7 +747,7 @@ def describe(pool, index):
     return out
 
 
-def check(pool, index):
+def check(pool, index, *, allow_provisional=False):
     a = analyze(pool, index)
     if "layout" not in a:
         print(json.dumps(dict(index=index, blocked=a.get("blocked")), indent=1))
@@ -711,10 +755,17 @@ def check(pool, index):
     layout = a["layout"]
     d = a["descriptor"]
     cache = {}
+    bcpack_mode = "provisional" if allow_provisional else "strict"
     try:
-        tiled = pool.read_range(d["base"], layout["size"], cache)
-    except BcpackRequired:
-        print(json.dumps(dict(index=index, blocked="BCPack in allocation"), indent=1))
+        tiled = pool.read_range(d["base"], layout["size"], cache, bcpack_mode=bcpack_mode)
+    except BcpackRequired as exc:
+        print(json.dumps(dict(index=index, blocked=str(exc)), indent=1))
+        return 2
+    except bcpack.BcpackProvisionalError as exc:
+        print(json.dumps(dict(
+            index=index,
+            blocked=f"provisional BCPack history required ({exc}); pass --allow-provisional",
+        ), indent=1))
         return 2
     decoded, means = [], []
     for mip in layout["mips"]:
@@ -770,7 +821,7 @@ def dds_bytes(width, height, fmt, mips, linear, payload):
     return bytes(hdr) + struct.pack("<IIIII", fmt, 3, 0, 1, 0) + payload
 
 
-def export(pool, index, out_path, mips=None, force=False):
+def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=False):
     a = analyze(pool, index)
     if "layout" not in a or "available" not in a:
         print(f"texture {index}: {a.get('blocked', 'layout unavailable')}", file=sys.stderr)
@@ -781,8 +832,8 @@ def export(pool, index, out_path, mips=None, force=False):
               "validate uncompressed tiling, so it will not write a DDS", file=sys.stderr)
         return 2
     if not a["full_chain"]:
-        print(f"texture {index}: not every source mip is zlib/raw; refusing to mix BCPack",
-              file=sys.stderr)
+        print(f"texture {index}: not every source mip uses a supported codec "
+              "(zlib/raw/BCPack BC1/BC3/BC4/BC5)", file=sys.stderr)
         return 2
     count = d["mips"] if mips is None else mips
     if count < 1 or count > d["mips"]:
@@ -790,10 +841,20 @@ def export(pool, index, out_path, mips=None, force=False):
         return 2
     layout = a["layout"]
     cache = {}
+    bcpack_mode = "provisional" if allow_provisional else "strict"
     payload = bytearray()
-    for mip in layout["mips"][:count]:
-        tiled = pool.read_range(d["base"] + mip["offset"], mip["region"], cache)
-        payload += detile(layout, mip, tiled)
+    try:
+        for mip in layout["mips"][:count]:
+            tiled = pool.read_range(d["base"] + mip["offset"], mip["region"], cache,
+                                    bcpack_mode=bcpack_mode)
+            payload += detile(layout, mip, tiled)
+    except BcpackRequired as exc:
+        print(f"texture {index}: {exc}", file=sys.stderr)
+        return 2
+    except bcpack.BcpackProvisionalError as exc:
+        print(f"texture {index}: provisional BCPack history required ({exc}); "
+              "pass --allow-provisional", file=sys.stderr)
+        return 2
     if 148 + len(payload) > MAX_OUTPUT:
         print("DDS exceeds the 256 MiB output limit", file=sys.stderr)
         return 2
@@ -824,12 +885,16 @@ def main(argv=None):
     pc = sub.add_parser("check", help="decode a chain and report downsample error")
     pc.add_argument("pool")
     pc.add_argument("index", type=int)
-    pe = sub.add_parser("export", help="write the full zlib/raw chain as DDS")
+    pc.add_argument("--allow-provisional", action="store_true",
+                    help="allow unconfirmed built-in BCPack history entries")
+    pe = sub.add_parser("export", help="write the full chain as DDS")
     pe.add_argument("pool")
     pe.add_argument("index", type=int)
     pe.add_argument("out")
     pe.add_argument("--mips", type=int)
     pe.add_argument("--force", action="store_true")
+    pe.add_argument("--allow-provisional", action="store_true",
+                    help="allow unconfirmed built-in BCPack history entries")
     a = ap.parse_args(argv)
     if a.cmd == "scan":
         pools = []
@@ -843,8 +908,9 @@ def main(argv=None):
             print(json.dumps(describe(pool, a.index), indent=1))
             return 0
         if a.cmd == "check":
-            return check(pool, a.index)
-        return export(pool, a.index, a.out, a.mips, a.force)
+            return check(pool, a.index, allow_provisional=a.allow_provisional)
+        return export(pool, a.index, a.out, a.mips, a.force,
+                      allow_provisional=a.allow_provisional)
     finally:
         pool.close()
 
