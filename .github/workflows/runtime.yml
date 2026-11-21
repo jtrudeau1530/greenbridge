@@ -1,0 +1,28 @@
+# Builds the loader (runtime/) with MSVC on every push and pull request, as scripts/build_runtime.ps1 does, so a
+# change that breaks the C++ build shows up in CI. Without the Vulkan SDK the GPU test tools are skipped.
+name: Runtime
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+      - name: Configure
+        run: cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build runtime/build
