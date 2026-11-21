@@ -1,8 +1,10 @@
 // gta6rt: native runtime for the Xbox Series build.
 //
 //   gta6rt --dry-run <image> [--game-dir DIR]
-//       Maps the image and its bundled modules, applies relocations, binds every import and prints a report.
-//       No code from the image runs.
+//       Maps the image and its bundled modules, applies relocations, binds every import, installs static TLS for
+//       this thread and prints a report. No code from the mapped images
+//       runs. TLS needs the runtime's own gta6rt_tls_host.dll, which reserves the module TLS index; system DLLs are
+//       loaded to resolve host imports, as before.
 //
 //   gta6rt --init <image> [--game-dir DIR]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
@@ -66,9 +68,9 @@ int wmain(int argc, wchar_t** argv) {
 
     try {
         rt::Loader loader(game_dir);
-        rt::Module& main_module = loader.load(image);
+        rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         if (init || run) {
-            loader.initialise();
+            loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
             std::printf("%zu module(s) initialised\n", loader.modules().size());
         }
         int unimplemented = 0;
