@@ -2275,7 +2275,7 @@ class Gen:
                 x = f64(a[1])
                 r = self.tmp()
                 self.emit(f"{r} = OpFConvert %float {x}")
-                self.dst(a[0], self.tou(r))
+                self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64":
