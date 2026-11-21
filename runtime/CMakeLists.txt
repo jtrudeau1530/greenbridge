@@ -313,7 +313,12 @@ if(Vulkan_FOUND)
       target_compile_definitions(d3d12_state_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME d3d12_state_map COMMAND d3d12_state_map_test)
+    # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
+    add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
+    target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
+    add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
 else()
-  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check and d3d12_state_map_test are not built")
+  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
+                 "gfx10_descriptors_test are not built")
 endif()
