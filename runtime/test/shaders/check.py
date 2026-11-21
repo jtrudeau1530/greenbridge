@@ -19,6 +19,7 @@ from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
+UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
@@ -133,8 +134,9 @@ def main():
                                            expected_words=want)))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
-        if code == 77:   # vk_store_test: the device lacks format-less storage image access
-            results.append((name, Skip("SKIP (no format-less storage image read/write on this device)")))
+        if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
+            m = re.search(r"unsupported: .*", out)
+            results.append((name, Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")))
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))

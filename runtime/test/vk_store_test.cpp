@@ -80,10 +80,9 @@ int main(int argc, char** argv) {
     // report that and exit 77 (unsupported, as vk_compute_test does) instead of failing vkCreateDevice.
     VkPhysicalDeviceFeatures have{};
     vkGetPhysicalDeviceFeatures(pd, &have);
-    if (!have.shaderStorageImageWriteWithoutFormat || !have.shaderStorageImageReadWithoutFormat || !have.shaderInt64) {
-        std::fprintf(stderr, "unsupported: shaderStorageImageWriteWithoutFormat=%u shaderStorageImageReadWithoutFormat=%u "
-                     "shaderInt64=%u\n", have.shaderStorageImageWriteWithoutFormat,
-                     have.shaderStorageImageReadWithoutFormat, have.shaderInt64);
+    if (!have.shaderStorageImageWriteWithoutFormat || !have.shaderInt64) {   // every mode; reads: load mode, below
+        std::printf("unsupported: shaderStorageImageWriteWithoutFormat=%u shaderInt64=%u\n",
+                    have.shaderStorageImageWriteWithoutFormat, have.shaderInt64);
         return 77;
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -92,9 +91,16 @@ int main(int argc, char** argv) {
     f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-    f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     // "load" mode (cs_imgload.asm): the sint image receives the uint texel read back with image_load.
     const bool load_mode = argc > 2 && !std::strcmp(argv[2], "load");
+    if (load_mode) {
+        // Only image_load needs it, and some GPUs (Intel Gen9) lack it: report that instead of a failed vkCreateDevice.
+        if (!have.shaderStorageImageReadWithoutFormat) {
+            std::printf("unsupported: shaderStorageImageReadWithoutFormat\n");
+            return 77;
+        }
+        f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
+    }
     f2.features.shaderInt64 = VK_TRUE;
     f2.pNext = &f12;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
