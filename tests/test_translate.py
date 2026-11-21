@@ -9,7 +9,7 @@ import os
 import pytest
 
 import rdna2spirv
-from conftest import ROOT, requires_tools
+from conftest import EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, make_dxbc, mesh_psv0_chunk, requires_tools, signature_chunk
 
 pytestmark = requires_tools
 
@@ -50,12 +50,12 @@ def program(body):
 def test_gpu_samples_translate_and_validate(path, make_shader):
     """The hand-written GPU-harness samples must translate to SPIR-V that passes spirv-val."""
     stem = os.path.splitext(os.path.basename(path))[0]
-    if stem.startswith(("gs_", "ms_")):
-        pytest.skip("needs a DXBC with ISG1/OSG1 (gs) or PSV0 (ms) chunks; the synthetic empty DXBC has none")
-    name = stem if stem.startswith(("vs_", "ps_", "cs_")) else "ps_" + stem     # the prefix selects the stage
+    name = stem if stem.startswith(("vs_", "ps_", "cs_", "gs_", "ms_")) else "ps_" + stem   # the prefix selects the stage
+    if name.startswith(("gs_", "ms_")) and stem not in SAMPLE_DXBC:
+        pytest.skip(f"no synthetic DXBC (ISG1/OSG1 for gs, PSV0 for ms) defined for {stem} in conftest.SAMPLE_DXBC")
     with open(path, encoding="utf-8") as f:
-        shader = make_shader(f.read(), name)
-    shader.validate(shader.translate())
+        shader = make_shader(f.read(), name, dxbc=SAMPLE_DXBC.get(stem, EMPTY_DXBC))
+    shader.validate(shader.translate(), KNOWN_VAL_ISSUES.get(stem))
 
 
 @pytest.mark.parametrize("case", sorted(SUPPORTED))
@@ -97,5 +97,29 @@ def test_compute_thread_group_size_sgpr_is_rejected(make_shader):
 @pytest.mark.parametrize("group", [(0, 1, 1), (2048, 1, 1)], ids=["empty", "over-1024"])
 def test_compute_bad_group_size_is_rejected(make_shader, group):
     shader = make_shader("s_endpgm\n", name="cs_test", cs_header=(0x8088, group))
+    with pytest.raises(rdna2spirv.Unsupported):
+        shader.translate()
+
+
+def test_geometry_without_signatures_is_rejected(make_shader):
+    """A gs needs ISG1/OSG1 to know which registers LDS holds and which outputs to write."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "gs_tri.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "gs_tri")                   # empty DXBC
+    with pytest.raises(rdna2spirv.Unsupported):
+        shader.translate()
+
+
+@pytest.mark.parametrize("kw", [dict(topology=1), dict(threads=(2048, 1, 1)), dict(max_vertices=0)],
+                         ids=["not-triangles", "over-1024-threads", "no-vertices"])
+def test_mesh_bad_psv0_is_rejected(make_shader, kw):
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_tri.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_tri", dxbc=make_dxbc([mesh_psv0_chunk(**kw)]))
+    with pytest.raises(rdna2spirv.Unsupported):
+        shader.translate()
+
+
+def test_mesh_without_psv0_is_rejected(make_shader):
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_tri.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_tri")                   # empty DXBC
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()

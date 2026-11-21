@@ -57,6 +57,52 @@ requires_tools = pytest.mark.skipif(
 # 32-byte DXBC header: magic, digest, version, size, chunk count = 0. Gives an empty input signature.
 EMPTY_DXBC = b"DXBC" + bytes(16) + struct.pack("<III", 1, 32, 0)
 
+
+
+def make_dxbc(chunks):
+    """DXBC container holding ``chunks`` = [(fourcc, payload bytes)]. The digest is left zeroed (never read)."""
+    head = 32 + 4 * len(chunks)
+    offsets, body = [], b""
+    for fourcc, payload in chunks:
+        offsets.append(head + len(body))
+        body += fourcc + struct.pack("<I", len(payload)) + payload
+    return (b"DXBC" + bytes(16) + struct.pack("<III", 1, head + len(body), len(chunks))
+            + b"".join(struct.pack("<I", o) for o in offsets) + body)
+
+
+def signature_chunk(fourcc, elements):
+    """ISG1/OSG1 chunk. elements = [(register, system value, mask)]: system value 1 is SV_Position, 0 is a plain
+    varying. Semantic names are left out (offset 0): the translator only reads register, system value, component
+    type and the two masks."""
+    out = struct.pack("<II", len(elements), 8)
+    for reg, sysv, mask in elements:
+        # stream, name offset, semantic index, system value, component type (3 = float), register, masks, padding
+        out += struct.pack("<6I", 0, 0, 0, sysv, 3, reg) + bytes([mask, mask, 0, 0]) + struct.pack("<I", 0)
+    return fourcc, out
+
+
+def mesh_psv0_chunk(threads=(128, 1, 1), max_vertices=64, max_primitives=64, topology=2, group_shared=0):
+    """PSV0 chunk of a mesh shader: only the runtime-info fields rdna2spirv.mesh_psv() reads (stage 13 = mesh,
+    MSInfo vertex/primitive limits, output topology 2 = triangles, NumThreads X/Y/Z)."""
+    r = bytearray(48)
+    struct.pack_into("<I", r, 0, group_shared)
+    struct.pack_into("<HH", r, 12, max_vertices, max_primitives)
+    r[24] = 13
+    r[27] = topology
+    struct.pack_into("<III", r, 36, *threads)
+    return b"PSV0", struct.pack("<I", len(r)) + bytes(r)
+
+
+# DXBC the hand-written gs_tri / ms_tri samples in runtime/test/shaders need (their header comments say which).
+GS_TRI_DXBC = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF)]),      # SV_Position reg 0, TEXCOORD0 reg 1
+                         signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)])])
+MS_TRI_DXBC = make_dxbc([mesh_psv0_chunk()])                                          # 128 threads, 64/64, triangles
+SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC}
+
+# spirv-val errors on valid-looking output, by sample. ms_tri: SPIRV-Tools 2025.1 (Ubuntu 24.04) rejects the
+# CullPrimitiveEXT output although it is declared as the spec asks (PerPrimitiveEXT array of bool, MeshEXT model).
+KNOWN_VAL_ISSUES = {"ms_tri": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036"}
+
 # Compute shaders take their system registers from the FSSM header (rdna2spirv.translate reads it from
 # <disasm dir>/../fssm/<name>.fssm): word 0x138 is COMPUTE_PGM_RSRC2, words 0x13C/0x140/0x144 the thread-group size.
 # 0x8088 = 4 user SGPRs, TGID_X, 512 B of LDS; group 64x1x1 (the header the cs_* samples in runtime/test/shaders use).
@@ -64,11 +110,11 @@ DEFAULT_CS_HEADER = (0x8088, (64, 1, 1))
 
 
 class Shader:
-    def __init__(self, workdir, name, asm, cs_header=DEFAULT_CS_HEADER):
+    def __init__(self, workdir, name, asm, cs_header=DEFAULT_CS_HEADER, dxbc=EMPTY_DXBC):
         self.name = name
         disasm = workdir / "disasm"
         disasm.mkdir(exist_ok=True)
-        (workdir / f"{name}.dxbc").write_bytes(EMPTY_DXBC)
+        (workdir / f"{name}.dxbc").write_bytes(dxbc)
         if name.startswith("cs_"):
             rsrc2, (lx, ly, lz) = cs_header
             (workdir / "fssm").mkdir(exist_ok=True)
@@ -83,7 +129,10 @@ class Shader:
     def translate(self):
         return rdna2spirv.translate(str(self.path))
 
-    def validate(self, spvasm):
+    def validate(self, spvasm, known_val_issue=None):
+        """Assemble and run spirv-val. known_val_issue: a substring of a spirv-val error that is a validator problem,
+        not a translator one; the test is then reported as xfail with that text, so it turns into a plain pass once
+        a newer spirv-tools no longer reports it. (spirv-val stops at its first error: later ones stay hidden.)"""
         sa = self.workdir / f"{self.name}.spvasm"
         sv = self.workdir / f"{self.name}.spv"
         sa.write_text(spvasm)
@@ -91,13 +140,16 @@ class Shader:
                            capture_output=True, text=True)
         assert r.returncode == 0, "spirv-as: " + r.stderr
         r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(sv)], capture_output=True, text=True)
+        if r.returncode != 0 and known_val_issue and known_val_issue in r.stderr:
+            pytest.xfail("known spirv-val issue (" + known_val_issue + "): " + r.stderr.strip().splitlines()[0])
         assert r.returncode == 0, "spirv-val: " + r.stderr
 
 
 @pytest.fixture
 def make_shader(tmp_path):
     """make_shader(asm, name="ps_test") -> Shader. The name's prefix ("ps_", "vs_", "cs_") selects the stage.
-    For cs_ shaders, cs_header=(RSRC2, (x, y, z)) sets the synthetic FSSM header."""
+    For cs_ shaders, cs_header=(RSRC2, (x, y, z)) sets the synthetic FSSM header; dxbc=<bytes> replaces the
+    empty DXBC container (see make_dxbc)."""
     def make(asm, name="ps_test", **kw):
         return Shader(tmp_path, name, asm, **kw)
     return make
