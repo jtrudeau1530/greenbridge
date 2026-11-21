@@ -133,6 +133,8 @@ if(BUILD_TESTING)
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
   endif()
+  add_executable(command_list_test test/command_list_test.cpp)
+  add_test(NAME command_list COMMAND command_list_test)
 endif()
 
 if(WIN32)
@@ -156,13 +158,48 @@ endif()
 # GPU test and pipeline tools load Vulkan at run time.
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
-  foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_clear_replay_test)
+  foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
+  # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(WIN32 AND Python3_FOUND)
+    set(LEONIDA_STUBS ${CMAKE_CURRENT_BINARY_DIR}/generated/d3d12_stubs.h)
+    add_custom_command(
+      OUTPUT ${LEONIDA_STUBS}
+      COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
+              ID3D12GraphicsCommandList7 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
+      COMMENT "Generating D3D12 COM stubs"
+      VERBATIM)
+    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp ${LEONIDA_STUBS})
+    target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers)
+    target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8)
+
+    add_executable(d3d12_com_test test/d3d12_com_test.cpp)
+    target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_com_test PRIVATE /W4 /permissive- /utf-8)
+  else()
+    message(STATUS "Python 3 or Windows missing: the D3D12 COM objects and d3d12_com_test are not built")
+  endif()
+
+  # Needs only the Vulkan headers, not a GPU.
+  if(BUILD_TESTING)
+    add_executable(d3d12_state_map_test test/d3d12_state_map_test.cpp)
+    target_link_libraries(d3d12_state_map_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(d3d12_state_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME d3d12_state_map COMMAND d3d12_state_map_test)
+  endif()
 else()
-  message(STATUS "Vulkan SDK not found: GPU test tools and vk_pipeline_check are not built")
+  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check and d3d12_state_map_test are not built")
 endif()
