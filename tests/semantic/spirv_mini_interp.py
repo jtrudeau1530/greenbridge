@@ -368,16 +368,6 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 values[res] = v & wmask(a[0])
             else:
                 raise UnsupportedConstruct("OpBitcast between these types")
-        elif op in ("OpConvertFToS", "OpConvertFToU"):
-            source = val(a[1])
-            if not math.isfinite(source):
-                raise UnsupportedConstruct(f"{op} with a non-finite operand")
-            value = math.trunc(source)
-            bits = types.bits(a[0])
-            lo, hi = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if op == "OpConvertFToS" else (0, wmask(a[0]))
-            if not lo <= value <= hi:
-                raise UnsupportedConstruct(f"{op} result out of range (undefined in SPIR-V)")
-            values[res] = value & wmask(a[0])
         elif op == "OpCompositeExtract":
             v = val(a[1])
             for i in a[2:]:
