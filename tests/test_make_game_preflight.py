@@ -334,7 +334,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
                 self.assertIn("spirv-as:", err)
                 self.assertIn("spirv-val:", err)
-                self.assertIn(".NET 8 SDK:", err)
+                self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
 
     def test_preflight_python_version_check(self):
