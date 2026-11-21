@@ -12,6 +12,7 @@ to check a translator that emulates wave64 on them. ms_w64x_ballot is a mesh sha
 scripts/run_gpu_tests.py makes it (and fs_passthru.spv); here it runs when both .spv files are in <out dir>/spirv.
 """
 import collections
+import json
 import math
 import os
 import re
@@ -54,9 +55,9 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
 
 
-def run(*cmd):
+def run(*cmd, env=None):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     except FileNotFoundError:
         tools = os.path.abspath(os.path.dirname(cmd[0]))
         missing = [t + EXE for t in ("vk_compute_test", "vk_store_test", "vk_harness")
@@ -152,11 +153,24 @@ def mesh_w64x_test(tools, spirv, name):
     return "" if not wrong else f"{wrong} of {len(px)} pixels differ (blue {px[0][2]:.3g} at pixel 0, want 0.5)"
 
 
+def subgroup_size(spirv, name):
+    """The wave size the translator recorded for a shader (index.json), or None."""
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            return json.load(f).get(name, {}).get("subgroup_size")
+    except (OSError, ValueError):
+        return None
+
+
 def pixels(tools, spirv, name, fmt):
+    # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
+    # (RADV's default on RDNA1) reads lanes it was never written for.
+    sg = subgroup_size(spirv, name)
+    env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, _ = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
-                      os.path.join(spirv, name + ".spv"), raw)
+                      os.path.join(spirv, name + ".spv"), raw, env=env)
         if code or not raw.is_file():
             return None
         data = raw.read_bytes()
