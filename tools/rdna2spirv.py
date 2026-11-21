@@ -3676,14 +3676,26 @@ class Gen:
             return a["r"]
         raise Unsupported("image address operand")
 
+    def cube_coords(self, f):
+        """(s, t, face) of a cube sample -> the 6-layer 2D-array view. The hardware takes s and t in [1, 2]
+        (sc / |cubema| + 1.5) and the third coordinate as 8 * slice + face."""
+        s, t, q, fl, d, layer = (self.tmp() for _ in range(6))
+        self.emit(f"{s} = OpFSub %float {f[0]} %f1")
+        self.emit(f"{t} = OpFSub %float {f[1]} %f1")
+        self.emit(f"{q} = OpFMul %float {f[2]} {self.fconst(0.125)}")
+        self.emit(f"{fl} = OpExtInst %float %glsl Floor {q}")
+        self.emit(f"{d} = OpFMul %float {fl} {self.fconst(2.0)}")
+        self.emit(f"{layer} = OpFSub %float {f[2]} {d}")
+        return [s, t, layer] + f[3:]
+
     def image_op(self, op, a, mods):
         a16 = "a16" in mods
         d16 = "d16" in mods
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
         kinds = {"dim:SQ_RSRC_IMG_2D": ("img2d", "%images", "simg2d", 2, "_ptr_UC_img"),
                  "dim:SQ_RSRC_IMG_2D_ARRAY": ("img2da", "%images_arr", "simg2da", 3, "_ptr_UC_imga"),
-                 # Cube: the shader already did face selection (v_cube*), so (s, t, face) samples a 6-layer
-                 # 2D array view of the cube. The runtime binds cube textures as 2D-array views.
+                 # Cube: the shader already did face selection (v_cube*), and cube_coords maps (s, t, face) onto a
+                 # 6-layer 2D array view of the cube. The runtime binds cube textures as 2D-array views.
                  "dim:SQ_RSRC_IMG_CUBE": ("img2da", "%images_arr", "simg2da", 3, "_ptr_UC_imga"),
                  "dim:SQ_RSRC_IMG_1D": ("img1d", "%images_1d", "simg1d", 1, "_ptr_UC_img1"),
                  "dim:SQ_RSRC_IMG_3D": ("img3d", "%images_3d", "simg3d", -3, "_ptr_UC_img3")}
@@ -3823,6 +3835,8 @@ class Gen:
                 # Gather the 2x2 footprint of one channel (dmask picks it) at mip 0 -> 4 results.
                 if bin(dmask).count("1") != 1 or ncoord not in (2, 3) or is3d or len(f) < ncoord:
                     raise Unsupported("image_gather4_lz form")
+                if dim == "dim:SQ_RSRC_IMG_CUBE":
+                    f = self.cube_coords(f)
                 uv, res = self.tmp(), self.tmp()
                 if ncoord == 3:          # 2D array (or cube as a 6-layer array): layer is the 3rd coordinate
                     self.emit(f"{uv} = OpCompositeConstruct %v3float {f[0]} {f[1]} {f[2]}")
@@ -3896,6 +3910,8 @@ class Gen:
                     grads, f = (gx, gy), f[4:]
             if len(f) < ncoord:
                 raise Unsupported(op + " coords")
+            if dim == "dim:SQ_RSRC_IMG_CUBE":
+                f = self.cube_coords(f)
             if ncoord == 1:
                 uv = f[0]
             elif ncoord == 3:
