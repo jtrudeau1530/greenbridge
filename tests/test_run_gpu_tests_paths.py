@@ -108,6 +108,51 @@ class BuildConfigurations(unittest.TestCase):
             self.assertIsNone(run_gpu_tests.find_test_programs(tmp, ".exe"))
 
 
+    def test_relwithdebinfo_is_preferred_over_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            for config_name in run_gpu_tests.BUILD_CONFIGS:
+                config = build / config_name
+                config.mkdir()
+                for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                    (config / (tool + ".exe")).touch()
+            self.assertEqual(run_gpu_tests.find_test_programs(str(build), ".exe"),
+                             str(build / "RelWithDebInfo"))
+
+    def test_extensionless_executables_are_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                (Path(tmp) / tool).touch()
+            self.assertEqual(run_gpu_tests.find_test_programs(tmp, ""), tmp)
+
+    def test_programs_are_not_combined_across_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            (build / "RelWithDebInfo").mkdir()
+            (build / "Release").mkdir()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS[:2]:
+                (build / "RelWithDebInfo" / (tool + ".exe")).touch()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS[2:]:
+                (build / "Release" / (tool + ".exe")).touch()
+            self.assertIsNone(run_gpu_tests.find_test_programs(str(build), ".exe"))
+
+    def test_missing_program_error_lists_per_directory_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / "build output"
+            rel = build / "RelWithDebInfo"
+            rel.mkdir(parents=True)
+            (rel / "vk_compute_test.exe").touch()
+            (rel / "vk_store_test.exe").touch()
+            with (patch.object(sys, "argv", ["run_gpu_tests.py", "--build", str(build)]),
+                  self.assertRaises(SystemExit) as caught):
+                run_gpu_tests.main()
+            message = str(caught.exception)
+            self.assertIn(str(build), message)
+            self.assertIn(str(rel), message)
+            self.assertIn("vk_harness.exe", message)
+            self.assertIn("--config RelWithDebInfo", message)
+            self.assertIn("--target vk_compute_test vk_store_test vk_harness", message)
+
     def test_main_passes_visual_studio_config_directory_to_suite(self):
         ext = ".exe" if os.name == "nt" else ""
         for config_name in run_gpu_tests.BUILD_CONFIGS:
