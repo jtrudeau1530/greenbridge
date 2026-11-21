@@ -79,6 +79,8 @@ def unpack(dxbc: bytes, payload: str = "last"):
     data = zlib.decompress(blob[24:])
     if len(data) != unpacked:
         raise ValueError(f"size mismatch {len(data)} != {unpacked}")
+    if len(data) < 6:
+        raise ValueError("truncated FSSM magic or version")
     return data, ents
 
 

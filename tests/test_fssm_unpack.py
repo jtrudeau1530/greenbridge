@@ -359,6 +359,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         dxbc_no_xbch = make_dxbc([(b"DXIL", make_xdat({0x07: b"dxil-hdr"}))])
         dxbc_mismatch = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1, unpacked_override=9999)}))])
         dxbc_bad_zlib = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1, corrupt_zlib=True)}))])
+        dxbc_short_fssm = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(b"FSSM")}))])
 
         with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
             f.write(dxbc_1)
@@ -370,6 +371,8 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write(dxbc_mismatch)
         with open(os.path.join(self.src, "bad_zlib.dxbc"), "wb") as f:
             f.write(dxbc_bad_zlib)
+        with open(os.path.join(self.src, "short_fssm.dxbc"), "wb") as f:
+            f.write(dxbc_short_fssm)
         with open(os.path.join(self.src, "ignored.txt"), "w") as f:
             f.write("not a dxbc container")
 
