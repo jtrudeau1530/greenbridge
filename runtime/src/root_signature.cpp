@@ -1,6 +1,8 @@
 // Portable root-signature packer, see root_signature.h.
 #include "root_signature.h"
 
+#include <cstring>
+
 namespace rt::rootsig {
 
 PackResult pack(const RootSignature& sig) {
@@ -54,7 +56,7 @@ void put_u32(std::vector<uint8_t>& out, uint32_t v) {
 void put_f32(std::vector<uint8_t>& out, float v) {
     uint32_t bits = 0;
     static_assert(sizeof(bits) == sizeof(v));
-    __builtin_memcpy(&bits, &v, sizeof(bits));
+    std::memcpy(&bits, &v, sizeof(bits));
     put_u32(out, bits);
 }
 
@@ -75,7 +77,7 @@ public:
     [[nodiscard]] bool f32(float& v) {
         uint32_t bits = 0;
         if (!u32(bits)) return false;
-        __builtin_memcpy(&v, &bits, sizeof(v));
+        std::memcpy(&v, &bits, sizeof(v));
         return true;
     }
 
