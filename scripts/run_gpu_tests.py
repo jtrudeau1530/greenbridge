@@ -352,6 +352,20 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
     return ok, detail
 
 
+# Shaders a selected test draws with, built even when the filter leaves them out (#192): ps_flat and
+# ps_texture_sample (vk_texture_test) are drawn with vs_ids.
+DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm"}
+
+
+def with_draw_shaders(asm_files: list[str]) -> list[str]:
+    build = list(asm_files)
+    for f in asm_files:
+        extra = DRAWN_WITH.get(os.path.splitext(f)[0])
+        if extra and extra not in build:
+            build.append(extra)
+    return build
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
@@ -360,12 +374,17 @@ def main() -> int:
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")
     a = ap.parse_args()
+    # Some test programs run with their working directory in <work>/spirv (vk_texture_test), so a relative path
+    # given here would point somewhere else for them.
+    a.build = os.path.abspath(a.build)
+    if a.work:
+        a.work = os.path.abspath(a.work)
 
     ext = ".exe" if os.name == "nt" else ""
     missing = [t + ext for t in ("vk_compute_test", "vk_store_test", "vk_harness")
                if not os.path.isfile(os.path.join(a.build, t + ext))]
     if missing:
-        sys.exit(f"Test programs not found in {os.path.abspath(a.build)}: {', '.join(missing)}\n"
+        sys.exit(f"Test programs not found in {a.build}:{', '.join(missing)}\n"
                  "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
                  "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
                  "Vulkan headers (vulkan-headers on Arch) and configure again.")
@@ -389,10 +408,7 @@ def run_suite(a, work: str) -> int:
     asm_files = sorted(f for f in os.listdir(SHADER_DIR) if f.endswith(".asm"))
     if a.filter:
         asm_files = [f for f in asm_files if a.filter in f]
-    # Shaders a selected test draws with are built even when the filter leaves them out (#192): ps_flat uses vs_ids.
-    build_files = list(asm_files)
-    if any(f.startswith("ps_flat") for f in asm_files) and "vs_ids.asm" not in build_files:
-        build_files.append("vs_ids.asm")
+    build_files = with_draw_shaders(asm_files)
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
     for fname in build_files:
