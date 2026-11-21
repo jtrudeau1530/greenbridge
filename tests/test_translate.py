@@ -404,3 +404,35 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
     assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
+
+
+MASK_REUSE_HEAD = "; mattr: +wavefrontsize64,-wavefrontsize32\nv_mbcnt_lo_u32_b32 v1, -1, 0\nv_mbcnt_hi_u32_b32 v1, -1, v1\n"
+
+
+def emulated_exchanges(make_shader, monkeypatch, body, name="cs_reuse"):
+    """Translate `body` (wave64 compute) with --wave64-emulate; return (SPIR-V, number of mask-word ORs). Every
+    whole-mask exchange ORs two words (lanes 0-31 and 32-63), so the count is two per exchange."""
+    shader = make_shader(MASK_REUSE_HEAD + body + "s_endpgm\n", name)
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    asm = shader.translate()
+    shader.validate(asm)
+    return asm, asm.count("OpAtomicOr")
+
+
+def test_wave64_emulate_reuses_a_mask_exchange(make_shader, monkeypatch):
+    """The same register value (or EXEC) read as a whole mask twice in a block is exchanged once; a rewrite of the
+    register or of EXEC gets a new exchange."""
+    cmp = "v_cmp_eq_u32_e64 s[4:5], 5, v1\n"
+    _, same = emulated_exchanges(make_shader, monkeypatch, cmp + "s_bcnt1_i32_b64 s6, s[4:5]\ns_bcnt1_i32_b64 s7, s[4:5]\n")
+    _, rewritten = emulated_exchanges(
+        make_shader, monkeypatch, cmp + "s_bcnt1_i32_b64 s6, s[4:5]\nv_cmp_gt_u32_e64 s[4:5], 40, v1\ns_bcnt1_i32_b64 s7, s[4:5]\n")
+    _, same_exec = emulated_exchanges(make_shader, monkeypatch, "s_bcnt1_i32_b64 s6, exec\ns_bcnt1_i32_b64 s7, exec\n")
+    _, new_exec = emulated_exchanges(
+        make_shader, monkeypatch, "s_bcnt1_i32_b64 s6, exec\nv_cmpx_gt_u32_e32 10, v1\ns_bcnt1_i32_b64 s7, exec\n")
+    _, pair = emulated_exchanges(  # s4 and s5 hold the same value: one exchange serves v_mbcnt_lo(s4) and _hi(s5)
+        make_shader, monkeypatch, cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_mbcnt_hi_u32_b32 v3, s5, v3\n")
+    _, half = emulated_exchanges(  # s5 rewritten, s4 kept: two exchanges
+        make_shader, monkeypatch,
+        cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_cmp_gt_u32_e64 s[6:7], 40, v1\ns_and_b32 s5, s5, s7\n"
+        "v_mbcnt_hi_u32_b32 v3, s5, v3\n")
+    assert (same, rewritten, same_exec, new_exec, pair, half) == (2, 4, 2, 4, 2, 4)

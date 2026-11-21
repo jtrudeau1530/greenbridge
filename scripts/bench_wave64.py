@@ -7,7 +7,7 @@ Three configurations: AMD with its native 64-wide subgroup (no flag), AMD with -
 vk_compute_test with VKC_BENCH=`reps` timed dispatches of `groups` workgroups; the table gives the median over all
 dispatches, the spread of the per-process medians (other programs share the GPU, so look at it), the number of
 translated segments (static: blocks + continuation segments; every continuation segment is one more workgroup barrier
-on the path through it) and whether the output bytes are the same in every configuration (they must be).
+on the path through it) and whether the output bytes of the emulated runs equal the native AMD run, which is the reference (they must).
 """
 import argparse
 import json
@@ -57,8 +57,9 @@ def run(tools, spv, groups, reps, driver, emulate):
     m = re.search(r"bench ms: median=([\d.]+) min=([\d.]+) max=([\d.]+)", out)
     h = re.search(r"bench out fnv1a: (\w+)", out)
     dev = re.search(r"device: (.*) \(subgroup", out)
-    if r.returncode or not m or "0 mismatches" not in out:
-        return None, out.strip().splitlines()[-1:] or ["no output"], None
+    if r.returncode or not m or not h or "0 mismatches" not in out:
+        why = f"exit {r.returncode}" if r.returncode else "no 'bench ms' / 'bench out fnv1a' line (rebuild vk_compute_test)"
+        return None, why + ": " + (out.strip().splitlines()[-1:] or ["no output"])[0], None
     return (float(m.group(1)), float(m.group(2))), h.group(1), dev.group(1) if dev else "?"
 
 
@@ -77,7 +78,7 @@ def main():
         print(f"{a.shader}: {a.groups} workgroups of the shader's group size, {a.procs} x {a.reps} timed dispatches")
         if seg:
             print(f"emulated: {seg[0]} segments, {seg[1]} of them continuation segments (one extra round each)")
-        hashes, rows = set(), []
+        hashes, rows = {}, []
         for name, driver, emulate in CONFIGS:
             med, mins, dev = [], [], None
             for _ in range(a.procs):
@@ -88,13 +89,20 @@ def main():
                     break
                 med.append(t[0])
                 mins.append(t[1])
-                hashes.add(h)
+                hashes.setdefault(name, set()).add(h)
             if med:
                 rows.append((name, dev, statistics.median(med), min(mins), min(med), max(med)))
         for name, dev, m, lo, a_, b_ in rows:
             print(f"{name:26} {dev:34} median {m:8.3f} ms   best {lo:8.3f}   process medians {a_:.3f}..{b_:.3f}")
-        print("output identical in every configuration" if len(hashes) == 1 else f"OUTPUT DIFFERS: {sorted(hashes)}")
-        return 0 if len(hashes) <= 1 else 1
+        ref_name = CONFIGS[0][0]
+        ref = hashes.get(ref_name)
+        if not ref or len(ref) != 1:
+            print(f"no reference output from {ref_name}: cannot compare")
+            return 1
+        bad = [n for n, _, _ in CONFIGS[1:] if n in hashes and hashes[n] != ref]
+        print(f"reference output hash: {next(iter(ref))} ({ref_name})")
+        print("emulated output equals the reference" if not bad else f"OUTPUT DIFFERS from the reference: {', '.join(bad)}")
+        return 1 if bad or len(hashes) < len(CONFIGS) else 0
 
 
 if __name__ == "__main__":

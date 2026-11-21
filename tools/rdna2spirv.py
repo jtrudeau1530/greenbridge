@@ -6042,6 +6042,7 @@ def translate(path):
                 g.emit(f"OpStore %pc {g.cu(tgt)}")
                 g.succ.append([tgt])
             else:
+                marks0, body0 = len(g.x_marks), len(g.body)
                 cond = branch_condition(g, op)
                 alt = g.cu(fall) if fall is not None else g.cu(len(blocks))   # past the end = default -> done
                 r = g.tmp()
@@ -6049,7 +6050,12 @@ def translate(path):
                 g.emit(f"OpStore %pc {r}")
                 if g.emulate and op in ("s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz"):
                     # This segment only reads the vote and sets %pc, and the code before the vote ran in an earlier
-                    # round: the successor can start in this one (x_scheduler).
+                    # round: the successor can start in this one (x_scheduler). That only holds when the vote's own
+                    # x_split started this segment: then it holds the vote read and the %pc select and nothing else.
+                    # A vote that reused an earlier exchange (no split) would put the end of the block in the
+                    # successor's round, with no barrier between their memory accesses.
+                    if len(g.x_marks) != marks0 + 1 or g.x_marks[-1][0] < body0:
+                        raise Unsupported("wave64 emulation: a voted branch must start its own segment")
                     g.emit("OpStore %x_chain %true")
                 g.succ.append(list(dict.fromkeys([tgt] + ([fall] if fall is not None else []))))
         lines = [l.strip() for l in g.body]
