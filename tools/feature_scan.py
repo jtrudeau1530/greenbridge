@@ -61,10 +61,17 @@ def parts(d: bytes) -> dict:
 
 
 def streams(sig: bytes) -> set:
-    """Stream index of every element of an ISG1/OSG1 signature (32-byte elements, stream first)."""
+    """Stream index of every element of an ISG1/OSG1 signature (32-byte elements, stream first).
+
+    A part shorter than its declared element table, or with its first element inside the 8-byte
+    count/offset header, carries no usable stream information: report no streams rather than let
+    struct.error abort the whole count-only scan. Well-formed signatures are read as before.
+    """
     if len(sig) < 8:
         return set()
     count, first = struct.unpack_from("<II", sig, 0)
+    if first < 8 or first + 32 * count > len(sig):
+        return set()
     return {struct.unpack_from("<I", sig, first + 32 * i)[0] for i in range(count)}
 
 
