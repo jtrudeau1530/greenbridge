@@ -2,6 +2,8 @@
 
     python -I tests/test_amd_swizzle.py
 """
+import pytest
+
 import os
 import sys
 import tempfile
@@ -13,8 +15,7 @@ try:
 except ModuleNotFoundError as e:
     if e.name != "numpy":
         raise
-    print("skipped: amd_swizzle needs numpy")
-    sys.exit(0)
+    pytest.skip("amd_swizzle needs numpy", allow_module_level=True)
 
 
 def table(name, rows):
