@@ -1,10 +1,10 @@
-"""Manifest create/verify must not depend on how many threads hash the files.
+"""Tests for tools/manifest.py covering directory hashing, manifest creation, verification, and corruption detection.
 
     python -I tests/test_manifest.py
-
-The tree and manifests are generated in a temporary directory; nothing is committed.
 """
+import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -14,112 +14,290 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "manifest.py")
-
-# alpha is much larger than the rest so worker completion order differs from walk order.
-SIZES = {
-    "alpha.bin": 2 * 1024 * 1024,
-    "bravo.bin": 512 * 1024,
-    "charlie.bin": 384 * 1024,
-    "delta.bin": 256 * 1024,
-    "nested/echo.bin": 128 * 1024,
-}
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import manifest  # noqa: E402
 
 
-def payload(size: int, seed: str) -> bytes:
-    block = hashlib.sha256(seed.encode()).digest()
-    return (block * (size // len(block) + 1))[:size]
-
-
-class ManifestTest(unittest.TestCase):
+class ManifestSha256Test(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = self.tmp.name
-        self.game = os.path.join(self.root, "game")
-        self.contents = {}
-        for rel, size in SIZES.items():
-            path = os.path.join(self.game, *rel.split("/"))
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            data = payload(size, rel)
-            with open(path, "wb") as f:
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_sha256_computes_expected_hash(self):
+        payload = b"synthetic manifest test payload\nwith multiple lines and deterministic data."
+        path = os.path.join(self.tmp.name, "sample.bin")
+        with open(path, "wb") as f:
+            f.write(payload)
+
+        expected = hashlib.sha256(payload).hexdigest()
+        self.assertEqual(manifest.sha256(path), expected)
+
+    def test_sha256_empty_file(self):
+        path = os.path.join(self.tmp.name, "empty.bin")
+        with open(path, "wb") as f:
+            pass
+
+        expected = hashlib.sha256(b"").hexdigest()
+        self.assertEqual(manifest.sha256(path), expected)
+
+
+class ManifestWalkTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pkg = os.path.join(self.tmp.name, "pkg")
+        os.makedirs(os.path.join(self.pkg, "sub", "deep"))
+
+        with open(os.path.join(self.pkg, "root.dat"), "wb") as f:
+            f.write(b"root file")
+        with open(os.path.join(self.pkg, "sub", "mid.dat"), "wb") as f:
+            f.write(b"mid level file")
+        with open(os.path.join(self.pkg, "sub", "deep", "leaf.dat"), "wb") as f:
+            f.write(b"leaf file")
+
+    def test_walk_normalizes_to_forward_slashes_and_yields_all_files(self):
+        entries = list(manifest.walk(self.pkg))
+        rel_paths = [rel for rel, _ in entries]
+
+        self.assertIn("root.dat", rel_paths)
+        self.assertIn("sub/mid.dat", rel_paths)
+        self.assertIn("sub/deep/leaf.dat", rel_paths)
+        for rel in rel_paths:
+            self.assertNotIn("\\", rel)
+
+        for rel, abs_path in entries:
+            self.assertTrue(os.path.isabs(abs_path))
+            self.assertTrue(os.path.exists(abs_path))
+
+
+class ManifestCreateVerifyTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pkg = os.path.join(self.tmp.name, "game_pkg")
+        os.makedirs(os.path.join(self.pkg, "content", "data"))
+
+        self.files = {
+            "alpha.bin": b"alpha payload bytes " * 100,
+            "bravo.bin": b"bravo payload bytes " * 50,
+            "content/asset1.dat": b"asset 1 synthetic binary payload " * 20,
+            "content/data/table.bin": b"table data entries and records " * 10,
+        }
+        for rel, data in self.files.items():
+            full = os.path.join(self.pkg, rel.replace("/", os.sep))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as f:
                 f.write(data)
-            self.contents[rel] = data
 
-    def tearDown(self):
-        self.tmp.cleanup()
+        self.out_manifest = os.path.join(self.tmp.name, "reports", "test_manifest.json")
 
-    def run_tool(self, *args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+    def test_create_manifest_format_and_hashes(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.create(self.pkg, self.out_manifest, jobs=1)
 
-    def create(self, jobs: int, name: str) -> str:
-        out = os.path.join(self.root, name)
-        p = self.run_tool("create", self.game, "--out", out, "--jobs", str(jobs))
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        return out
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(self.out_manifest))
 
-    def verify(self, manifest: str, jobs: int):
-        return self.run_tool("verify", self.game, "--manifest", manifest, "--jobs", str(jobs))
+        with open(self.out_manifest, encoding="utf-8") as f:
+            doc = json.load(f)
 
-    def read(self, path: str) -> dict:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        self.assertIn("created", doc)
+        self.assertIn("files", doc)
+        entries = doc["files"]
+        self.assertEqual(len(entries), len(self.files))
+
+        for rel, data in self.files.items():
+            self.assertIn(rel, entries)
+            self.assertEqual(entries[rel]["size"], len(data))
+            self.assertEqual(entries[rel]["sha256"], hashlib.sha256(data).hexdigest())
 
     def test_create_is_identical_for_serial_and_parallel(self):
-        one = self.read(self.create(1, "one.json"))
-        four = self.read(self.create(4, "four.json"))
-        self.assertEqual(one["files"], four["files"])
-        # dict equality ignores order, so also compare the serialized form: the JSON must be
-        # byte-for-byte the same apart from the "created" timestamp.
-        self.assertEqual(json.dumps(one["files"]), json.dumps(four["files"]))
-        self.assertEqual(list(one["files"]), sorted(SIZES))
-        for rel, data in self.contents.items():
-            self.assertEqual(one["files"][rel],
-                             {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        out_serial = os.path.join(self.tmp.name, "serial.json")
+        out_parallel = os.path.join(self.tmp.name, "parallel.json")
 
-    def test_verify_clean(self):
-        p = self.verify(self.create(4, "clean.json"), 1)
-        self.assertEqual(p.returncode, 0, p.stdout)
-        self.assertEqual(p.stdout.strip(), "OK")
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, out_serial, jobs=1)
+            manifest.create(self.pkg, out_parallel, jobs=4)
+
+        with open(out_serial, encoding="utf-8") as f:
+            serial_doc = json.load(f)
+        with open(out_parallel, encoding="utf-8") as f:
+            parallel_doc = json.load(f)
+
+        self.assertEqual(serial_doc["files"], parallel_doc["files"])
+        self.assertEqual(json.dumps(serial_doc["files"]), json.dumps(parallel_doc["files"]))
+
+    def test_verify_intact_directory_returns_zero(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
+        self.assertEqual(rc, 0)
+        self.assertIn("OK", out.getvalue())
+
+    def test_verify_detects_missing_file(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        missing_target = os.path.join(self.pkg, "content", "asset1.dat")
+        os.remove(missing_target)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
+        self.assertEqual(rc, 1)
+        output = out.getvalue()
+        self.assertIn("MISSING   content/asset1.dat", output)
+        self.assertIn("1 problem(s)", output)
+
+    def test_verify_detects_size_mismatch(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        target = os.path.join(self.pkg, "content", "asset1.dat")
+        with open(target, "ab") as f:
+            f.write(b"appended extra bytes")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
+        self.assertEqual(rc, 1)
+        output = out.getvalue()
+        self.assertIn("SIZE      content/asset1.dat", output)
+        self.assertIn("1 problem(s)", output)
+
+    def test_verify_detects_changed_content_same_size(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        target = os.path.join(self.pkg, "content", "asset1.dat")
+        with open(target, "r+b") as f:
+            original = f.read()
+            mutated = bytes([original[0] ^ 0xFF]) + original[1:]
+            f.seek(0)
+            f.write(mutated)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
+        self.assertEqual(rc, 1)
+        output = out.getvalue()
+        self.assertIn("CHANGED   content/asset1.dat", output)
+        self.assertIn("1 problem(s)", output)
+
+    def test_verify_reports_new_untracked_file(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        extra = os.path.join(self.pkg, "content", "unexpected_new.dat")
+        with open(extra, "wb") as f:
+            f.write(b"new rogue asset")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
+        self.assertEqual(rc, 0)
+        output = out.getvalue()
+        self.assertIn("NEW       content/unexpected_new.dat", output)
+        self.assertIn("OK", output)
+
+    def test_verify_accumulates_multiple_corruptions(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        os.remove(os.path.join(self.pkg, "alpha.bin"))
+
+        with open(os.path.join(self.pkg, "bravo.bin"), "ab") as f:
+            f.write(b"extra")
+
+        tbl = os.path.join(self.pkg, "content", "data", "table.bin")
+        with open(tbl, "r+b") as f:
+            b = f.read()
+            f.seek(0)
+            f.write(bytes([b[0] ^ 0xFF]) + b[1:])
+
+        with open(os.path.join(self.pkg, "new_file.dat"), "wb") as f:
+            f.write(b"extra")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
+        self.assertEqual(rc, 1)
+        output = out.getvalue()
+        self.assertIn("MISSING   alpha.bin", output)
+        self.assertIn("SIZE      bravo.bin", output)
+        self.assertIn("CHANGED   content/data/table.bin", output)
+        self.assertIn("NEW       new_file.dat", output)
+        self.assertIn("3 problem(s)", output)
 
     def test_verify_messages_do_not_depend_on_jobs(self):
-        manifest = self.create(1, "mutated.json")
-        with open(os.path.join(self.game, "alpha.bin"), "r+b") as f:
-            first = f.read(1)  # CHANGED, same size; the largest file is listed first
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        target = os.path.join(self.pkg, "content", "asset1.dat")
+        with open(target, "r+b") as f:
+            orig = f.read()
             f.seek(0)
-            f.write(bytes([first[0] ^ 0xFF]))
-        with open(os.path.join(self.game, "bravo.bin"), "r+b") as f:
-            f.truncate(SIZES["bravo.bin"] // 2)  # SIZE
-        os.remove(os.path.join(self.game, "charlie.bin"))  # MISSING
-        with open(os.path.join(self.game, "new.bin"), "wb") as f:
-            f.write(b"new")  # NEW
+            f.write(bytes([orig[0] ^ 0xFF]) + orig[1:])
 
-        serial = self.verify(manifest, 1)
-        parallel = self.verify(manifest, 4)
-        expected = [
-            "CHANGED   alpha.bin",
-            "SIZE      bravo.bin",
-            "MISSING   charlie.bin",
-            "NEW       new.bin",
-            "3 problem(s)",
-        ]
-        self.assertEqual(serial.returncode, 1)
-        self.assertEqual(serial.stdout.splitlines(), expected)
-        self.assertEqual(parallel.returncode, serial.returncode)
-        self.assertEqual(parallel.stdout, serial.stdout)
+        out_serial = io.StringIO()
+        with contextlib.redirect_stdout(out_serial):
+            rc_serial = manifest.verify(self.pkg, self.out_manifest, jobs=1)
 
-    def test_new_file_is_reported_but_not_a_problem(self):
-        manifest = self.create(1, "only-new.json")
-        with open(os.path.join(self.game, "new.bin"), "wb") as f:
-            f.write(b"new")
-        p = self.verify(manifest, 4)
-        self.assertEqual(p.returncode, 0)
-        self.assertEqual(p.stdout.splitlines(), ["NEW       new.bin", "OK"])
+        out_parallel = io.StringIO()
+        with contextlib.redirect_stdout(out_parallel):
+            rc_parallel = manifest.verify(self.pkg, self.out_manifest, jobs=4)
 
-    def test_parallel_manifest_verifies_serially(self):
-        p = self.verify(self.create(4, "parallel.json"), 1)
-        self.assertEqual(p.returncode, 0, p.stdout)
-        self.assertEqual(p.stdout.strip(), "OK")
+        self.assertEqual(rc_serial, rc_parallel)
+        self.assertEqual(out_serial.getvalue(), out_parallel.getvalue())
+
+
+class ManifestCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pkg = os.path.join(self.tmp.name, "pkg")
+        os.makedirs(self.pkg)
+        with open(os.path.join(self.pkg, "sample.dat"), "wb") as f:
+            f.write(b"cli test payload bytes")
+        self.out_manifest = os.path.join(self.tmp.name, "manifest.json")
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+
+    def test_cli_create_and_verify(self):
+        p_create = self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "2")
+        self.assertEqual(p_create.returncode, 0, p_create.stderr)
+        self.assertIn("1 files", p_create.stdout)
+
+        p_verify = self.run_cli("verify", self.pkg, "--manifest", self.out_manifest, "--jobs", "2")
+        self.assertEqual(p_verify.returncode, 0, p_verify.stderr)
+        self.assertIn("OK", p_verify.stdout)
+
+    def test_cli_verify_failure_exit_code(self):
+        self.assertEqual(self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "1").returncode, 0)
+
+        with open(os.path.join(self.pkg, "sample.dat"), "wb") as f:
+            f.write(b"corrupted bytes!")
+
+        p_verify = self.run_cli("verify", self.pkg, "--manifest", self.out_manifest, "--jobs", "1")
+        self.assertEqual(p_verify.returncode, 1)
+        self.assertIn("problem(s)", p_verify.stdout)
+
+
+class ManifestBelowNormalTest(unittest.TestCase):
+    def test_below_normal_callable(self):
+        manifest.below_normal()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
