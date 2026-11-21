@@ -195,15 +195,44 @@ function dist(c, p) {
 }
 function drop(id) {
   const c = live.get(id); if (!c) return;
+  live.delete(id);
+  c.controller?.abort();
   if (c.obj) {
     scene.remove(c.obj);
     disposeObject(c.obj);
   }
-  live.delete(id);
+}
+async function loadChunk(entry) {
+  const { def, controller } = entry;
+  inflight++;
+  try {
+    const response = await fetch(def.url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`Chunk request failed: ${response.status}`);
+    const bytes = await response.arrayBuffer();
+    if (controller.signal.aborted) return;
+    const g = await loader.parseAsync(bytes, THREE.LoaderUtils.extractUrlBase(def.url));
+    // GLTFLoader cannot cancel a parse already underway. Dispose its late result.
+    if (live.get(def.id) !== entry) { disposeObject(g.scene); return; }
+    entry.obj = g.scene; scene.add(g.scene); applyClay(g.scene); applyWire(g.scene);
+  } catch {
+    if (live.get(def.id) !== entry) return;
+    failed++;
+    entry.retryAt = performance.now() + RETRY_DELAY_MS * 2 ** (entry.attempts - 1);
+  } finally {
+    entry.loading = false;
+    entry.controller = null;
+    entry.previous = null;
+    inflight--;
+  }
 }
 function stream(now = performance.now()) {
   const p = camera.position;
-  for (const [id, c] of live) if (c.obj && dist(c.def, p) > UNLOAD_R) drop(id);
+  for (const [id, c] of live) {
+    if ((!c.obj && !c.loading) || dist(c.def, p) <= UNLOAD_R) continue;
+    drop(id);
+    // A canceled retry does not erase the previous failures or spend another attempt.
+    if (c.previous) live.set(id, c.previous);
+  }
   const want = world.chunks.filter(c => {
     if (dist(c, p) >= LOAD_R) return false;
     const entry = live.get(c.id);
@@ -212,20 +241,11 @@ function stream(now = performance.now()) {
   for (const def of want) {
     if (inflight >= MAX_INFLIGHT) break;
     const previous = live.get(def.id);
-    const entry = { def, obj: null, loading: true, attempts: (previous?.attempts || 0) + 1, retryAt: 0 };
+    const entry = { def, obj: null, loading: true, attempts: (previous?.attempts || 0) + 1, retryAt: 0, previous };
     live.set(def.id, entry);
     if (def.test) { entry.loading = false; entry.obj = buildTestChunk(def.test); scene.add(entry.obj); applyClay(entry.obj); applyWire(entry.obj); continue; }
-    inflight++;
-    loader.load(def.url, g => {
-      inflight--;
-      if (live.get(def.id) !== entry) { disposeObject(g.scene); return; }
-      entry.loading = false; entry.obj = g.scene; scene.add(g.scene); applyClay(g.scene); applyWire(g.scene);
-    }, undefined, () => {
-      inflight--; failed++;
-      if (live.get(def.id) !== entry) return;
-      entry.loading = false;
-      entry.retryAt = performance.now() + RETRY_DELAY_MS * 2 ** (entry.attempts - 1);
-    });
+    entry.controller = new AbortController();
+    void loadChunk(entry);
   }
 }
 
