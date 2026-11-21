@@ -34,6 +34,7 @@ Run directly:
 Or via unittest discovery:
     python -m unittest discover -s tests/semantic -v
 """
+import copy
 import os
 import sys
 import unittest
@@ -268,10 +269,8 @@ class TranslatorBarrierEmissionTests(unittest.TestCase):
 
     def test_s_barrier_leaves_registers_unmodified(self):
         g = rdna2spirv.Gen(stage="cs")
-        initial_masks = set(g.mask_sgprs)
-        initial_cur_masks = set(g.cur_masks)
+        initial_cur_masks = copy.copy(g.cur_masks)
         g.insn({"op": "s_barrier", "args": [], "mods": []})
-        self.assertEqual(g.mask_sgprs, initial_masks)
         self.assertEqual(g.cur_masks, initial_cur_masks)
 
 

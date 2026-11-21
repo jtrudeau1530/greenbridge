@@ -7,8 +7,10 @@ Windows without llvm-mc.
 """
 import hashlib
 import os
+import sys
 
-import rdna2spirv
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+import rdna2spirv  # noqa: E402
 from rdna2spirv import Gen, Unsupported, shader_meta
 
 
