@@ -22,6 +22,81 @@ import sys
 
 
 
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
+PE32PLUS_MAGIC = 0x020B
+MAX_PE_IMAGE_SIZE = 0x80000000  # 2 GiB (PE32+ spec maximum)
+
+
+def load_pe64_image(data: bytes) -> tuple[int, bytes, list[dict]]:
+    """Parse a 64-bit PE32+ image using only the Python standard library.
+
+    Returns (image_base, memory_mapped_image, sections) where each section dict contains
+    'name', 'virtual_address', 'virtual_size', 'raw_ptr', 'raw_size', and 'characteristics'.
+    """
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise ValueError("not a PE image: missing MZ header")
+    (e_lfanew,) = struct.unpack_from("<I", data, 0x3C)
+    if e_lfanew + 24 > len(data) or data[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
+        raise ValueError("not a PE image: missing PE signature")
+
+    _machine, num_sections, _ts, _sym, _nsym, opt_size, _chars = struct.unpack_from(
+        "<HHIIIHH", data, e_lfanew + 4
+    )
+    opt_off = e_lfanew + 24
+    if opt_size < 64 or opt_off + opt_size > len(data):
+        raise ValueError("truncated PE optional header")
+    (magic,) = struct.unpack_from("<H", data, opt_off)
+    if magic != PE32PLUS_MAGIC:
+        raise ValueError(f"unsupported PE optional header magic 0x{magic:04X} (expected PE32+ 0x020B)")
+
+    (image_base,) = struct.unpack_from("<Q", data, opt_off + 24)
+    size_of_image, size_of_headers = struct.unpack_from("<II", data, opt_off + 56)
+
+    sec_table_off = opt_off + opt_size
+    if sec_table_off + num_sections * 40 > len(data):
+        raise ValueError("truncated PE section table")
+
+    sections: list[dict] = []
+    mapped_size = size_of_image
+    for i in range(num_sections):
+        sec_off = sec_table_off + i * 40
+        raw_name, vsize, vaddr, rsize, rptr, _rel, _ln, _nrel, _nln, chars = struct.unpack_from(
+            "<8sIIIIIIHHI", data, sec_off
+        )
+        span = vsize if vsize > 0 else rsize
+        end = vaddr + max(vsize, rsize)
+        if end > mapped_size:
+            mapped_size = end
+        sections.append({
+            "name": raw_name.split(b"\x00", 1)[0].decode("latin-1"),
+            "virtual_address": vaddr,
+            "virtual_size": span,
+            "raw_ptr": rptr,
+            "raw_size": rsize,
+            "characteristics": chars,
+        })
+
+    if mapped_size <= 0 or mapped_size > MAX_PE_IMAGE_SIZE:
+        raise ValueError(f"invalid PE mapped image size: {mapped_size}")
+
+    img = bytearray(mapped_size)
+    hdr_copy = min(size_of_headers, len(data), mapped_size)
+    if hdr_copy > 0:
+        img[0:hdr_copy] = data[0:hdr_copy]
+
+    for sec in sections:
+        rptr = sec["raw_ptr"]
+        rsize = sec["raw_size"]
+        vaddr = sec["virtual_address"]
+        if rsize <= 0 or rptr >= len(data) or vaddr >= mapped_size:
+            continue
+        copy_len = min(rsize, len(data) - rptr, mapped_size - vaddr)
+        if copy_len > 0:
+            img[vaddr : vaddr + copy_len] = data[rptr : rptr + copy_len]
+
+    return image_base, bytes(img), sections
+
+
 def simple_name(mangled: str) -> str:
     """'.?AVFoo@bar@@' -> 'bar::Foo' (enough to read; full demangling isn't needed here)."""
     m = re.match(r"\.\?A[VUW](.*)@@$", mangled)
@@ -31,17 +106,14 @@ def simple_name(mangled: str) -> str:
     return "::".join(reversed(parts))
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("image")
-    ap.add_argument("--out")
-    a = ap.parse_args()
-    import pefile  # only the CLI needs it; the helpers import without it
-    pe = pefile.PE(a.image, fast_load=True)
-    base = pe.OPTIONAL_HEADER.ImageBase
-    img = pe.get_memory_mapped_image()
-    exec_ranges = [(s.VirtualAddress, s.VirtualAddress + s.Misc_VirtualSize) for s in pe.sections
-                   if s.Characteristics & 0x20000000]
+def scan_pe64_rtti(data: bytes) -> dict:
+    """Recover x64 MSVC TypeDescriptors, class hierarchies, and vtables from raw PE32+ bytes."""
+    base, img, sections = load_pe64_image(data)
+    exec_ranges = [
+        (s["virtual_address"], min(s["virtual_address"] + s["virtual_size"], len(img)))
+        for s in sections
+        if s["characteristics"] & IMAGE_SCN_MEM_EXECUTE
+    ]
 
     def is_exec(rva):
         return any(lo <= rva < hi for lo, hi in exec_ranges)
@@ -49,7 +121,7 @@ def main():
     def u32(rva):
         return struct.unpack_from("<I", img, rva)[0]
 
-    # 1. Type descriptors: '.?AV' / '.?AU' strings, 16 bytes after the descriptor start.
+    # 1. Type descriptors: '.?AV' / '.?AU' / '.?AW' strings, 16 bytes after the descriptor start.
     tds = {}
     for m in re.finditer(rb"\.\?A[VUW][\x21-\x7e]{1,2000}?@@\x00", img):
         rva = m.start() - 16
@@ -89,10 +161,11 @@ def main():
     # 4. Vtables: a qword equal to (image base + COL rva), followed by code pointers.
     vtables = []
     col_vas = {base + rva: rva for rva in cols}
-    for sec in pe.sections:
-        if sec.Characteristics & 0x20000000:
+    for sec in sections:
+        if sec["characteristics"] & IMAGE_SCN_MEM_EXECUTE:
             continue
-        lo, hi = sec.VirtualAddress, sec.VirtualAddress + sec.Misc_VirtualSize
+        lo = sec["virtual_address"]
+        hi = min(lo + sec["virtual_size"], len(img))
         for p in range(lo - lo % 8, hi - 8, 8):
             q = struct.unpack_from("<Q", img, p)[0]
             if q in col_vas:
@@ -106,14 +179,35 @@ def main():
                 col = cols[col_vas[q]]
                 vtables.append({"rva": vt, "class": classes.get(col["td"], {}).get("name", "?"),
                                 "offset_in_object": col["offset"], "slots": n})
-    out = {"image": a.image, "type_descriptors": len(tds), "classes": sorted(classes.values(), key=lambda c: c["name"]),
-           "vtables": sorted(vtables, key=lambda v: v["rva"])}
+
+    return {
+        "type_descriptors": len(tds),
+        "classes": sorted(classes.values(), key=lambda c: c["name"]),
+        "vtables": sorted(vtables, key=lambda v: v["rva"]),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("image")
+    ap.add_argument("--out")
+    a = ap.parse_args()
+    try:
+        with open(a.image, "rb") as f:
+            data = f.read()
+        scanned = scan_pe64_rtti(data)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    out = {"image": a.image, **scanned}
     path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1)
-    print(f"{a.image}: {len(tds)} type descriptors, {len(classes)} classes with RTTI, {len(vtables)} vtables -> {path}")
+    print(f"{a.image}: {out['type_descriptors']} type descriptors, {len(out['classes'])} classes with RTTI, {len(out['vtables'])} vtables -> {path}")
     for c in out["classes"][:5]:
         print("  ", c["name"], "<-", ", ".join(c["bases"][:4]))
+    return 0
 
 
 if __name__ == "__main__":
