@@ -3774,9 +3774,11 @@ class Gen:
         self.emit(f"{img} = OpLoad %{itype} {ip}")
         coords = [self.load_reg("vgpr", r) for r in addr]
         if a16:
-            # 16-bit addresses: each register packs two f16 coordinates (low half first).
-            unpacked = []
-            for c in coords:
+            # Non-G16 image_sample_d keeps its gradients in full VGPRs. Only the coordinates
+            # that follow them are packed as f16 pairs (low half first).
+            gradient_words = 2 * min(ncoord, 2) if op == "image_sample_d" else 0
+            unpacked = coords[:gradient_words]
+            for c in coords[gradient_words:]:
                 v2 = self.tmp()
                 self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {c}")
                 for k in (0, 1):
