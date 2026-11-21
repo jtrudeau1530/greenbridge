@@ -46,6 +46,21 @@ class TestParse(unittest.TestCase):
                          ["LSCH", "LENM", "LGID", "LRSC", "CHKS"])
         self.assertEqual(got["sections"][2]["size"], 8)
         self.assertEqual(got["sections"][0]["payload"], 3)
+        self.assertEqual(got["rsc_version"], 122)
+        self.assertEqual(got["checksum_size"], 0)
+        self.assertEqual(got["checksum"], "00000000")
+
+    def test_rsc_and_checksum_fields(self):
+        blob = make_psin([
+            ("LRSC", b"0DRP\x7a\x00\x00\x00"),
+            ("CHKS", struct.pack(">I", 5392) + b"\x99\xfe\x66\x9f"),
+        ])
+        got = P.parse(blob)
+        self.assertTrue(got["complete"])
+        self.assertEqual(got["rsc_version"], 122)
+        self.assertEqual(got["sections"][0]["rsc_magic"], "0DRP")
+        self.assertEqual(got["checksum_size"], 5392)
+        self.assertEqual(got["checksum"], "99fe669f")
 
     def test_not_psin(self):
         self.assertIsNone(P.parse(b"NOPE" + b"\x00" * 20))
