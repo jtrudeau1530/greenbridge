@@ -1925,7 +1925,10 @@ class Gen:
                     hi = nhi
             c1, c2, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{c1} = OpBitCount %uint {lo}")
-            if op.endswith("b64"):
+            if op.endswith("b64") or "bcnt1" in op:
+                # s_bcnt1_i32_b32 counts the high word too: for a lane mask of a wave32 shader running in a 64-lane
+                # subgroup (graphics stages can't request 32) the other lanes' bits are there; otherwise hi is 0.
+                # s_bcnt0_i32_b32 counts zeros of the low word only (~0 in the high word would add 32).
                 self.emit(f"{c2} = OpBitCount %uint {hi}")
                 self.emit(f"{r} = OpIAdd %uint {c1} {c2}")
             else:
