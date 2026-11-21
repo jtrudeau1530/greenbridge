@@ -571,7 +571,8 @@ def run_suite(a, work: str) -> int:
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
-                      "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load"):
+                      "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
+                      "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -589,6 +590,9 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_readfirstlane": [140, 140, 163, 132, 100, 105, 133, 48],
                 "cs_w64x_bpermute": [36, 316, 253, 218, 435, 225, 0, 442],
                 "cs_w64x_branch": [0, 0, 0, 0, 5, 5, 9, 9],
+                "cs_w64x_mask_reuse": [8, 40, 8, 40, 2, 20, 10, 64],
+                "cs_w64x_mask_reuse2": [10, 20, 8, 8, 5, 2, 132, 131],
+                "cs_w64x_chain_barrier": [564, 563, 500, 627],
                 "cs_w64x_ballot": [2053, 2061, 2069, 2077, 2085, 2093, 2101, 2109],
                 "cs_w64x_wg128_branches": [121, 121, 343, 343, 14, 31, 19812, 22728],
                 "cs_w64x_lds_raw": [132, 137, 100, 108, 131, 101, 149, 118],
