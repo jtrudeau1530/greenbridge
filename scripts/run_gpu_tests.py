@@ -377,9 +377,13 @@ def run_suite(a, work: str) -> int:
     asm_files = sorted(f for f in os.listdir(SHADER_DIR) if f.endswith(".asm"))
     if a.filter:
         asm_files = [f for f in asm_files if a.filter in f]
+    # Shaders a selected test draws with are built even when the filter leaves them out (#192): ps_flat uses vs_ids.
+    build_files = list(asm_files)
+    if any(f.startswith("ps_flat") for f in asm_files) and "vs_ids.asm" not in build_files:
+        build_files.append("vs_ids.asm")
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
-    for fname in asm_files:
+    for fname in build_files:
         name = os.path.splitext(fname)[0]
         if name == "gs_tri":
             dxbc = make_dxbc([
