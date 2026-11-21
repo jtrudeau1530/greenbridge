@@ -105,7 +105,8 @@ int main(int argc, char** argv) {
     const bool mesh = std::getenv("VKH_MESH") != nullptr;
     VkPhysicalDeviceMeshShaderFeaturesEXT meshf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     if (mesh) {
-        if (!has(VK_EXT_MESH_SHADER_EXTENSION_NAME)) { std::fprintf(stderr, "no VK_EXT_mesh_shader\n"); return 1; }
+        // 77: the device cannot run this test (as vk_compute_test and vk_store_test), so the runners report SKIP.
+        if (!has(VK_EXT_MESH_SHADER_EXTENSION_NAME)) { std::fprintf(stderr, "unsupported: no VK_EXT_mesh_shader\n"); return 77; }
         enable.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         meshf.meshShader = VK_TRUE; meshf.pNext = chain; chain = &meshf;
     }
@@ -133,6 +134,10 @@ int main(int argc, char** argv) {
     dci.pNext = chain;
     // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders.
     const char* gs_path = std::getenv("VKH_GS");
+    if (gs_path && !f2q.features.geometryShader) {   // MoltenVK: Metal has no geometry stage
+        std::fprintf(stderr, "unsupported: no geometryShader\n");
+        return 77;
+    }
     VkPhysicalDeviceFeatures feats{};
     feats.geometryShader = gs_path ? VK_TRUE : VK_FALSE;
     feats.shaderClipDistance = f2q.features.shaderClipDistance;

@@ -146,6 +146,9 @@ def mesh_w64x_test(tools, spirv, name):
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         r = subprocess.run([os.path.join(tools, "vk_harness" + EXE), shader, fs, raw], capture_output=True, text=True, env=env)
+        if r.returncode == UNSUPPORTED:   # vk_harness: the device has no VK_EXT_mesh_shader
+            m = re.search(r"unsupported: .*", r.stderr)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
         if r.returncode or not raw.is_file():
             return failure(r.returncode, r.stdout + r.stderr, 2)
         data = raw.read_bytes()
