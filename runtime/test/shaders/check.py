@@ -22,6 +22,9 @@ EXE = ".exe" if os.name == "nt" else ""
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_wavemask", "1", "wavemask"),
            ("cs_bvh", "1", "bvh")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
+CS_DUMPS = [("cs_store", CS_STORE), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
+            ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
+            ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48])]
 PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops": (0x48804300, 5, 7, 0xfffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xfffffffa, 7),
               "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
@@ -96,10 +99,11 @@ def main():
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"), groups, expect)
         m = re.search(r"(\d+) mismatches", out)
         results.append((name, "" if code == 0 and m and m.group(1) == "0" else failure(code, out, 2)))
-    code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, "cs_store.spv"), "1", "dump")
-    m = re.search(r"out\[0\.\.7\] = (.*)", out)
-    got = [int(x) for x in m.group(1).split()[:6]] if m else None
-    results.append(("cs_store", "" if code == 0 and got == CS_STORE else failure(code, out, 2)))
+    for name, want in CS_DUMPS:
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"), "1", "dump")
+        m = re.search(r"out\[0\.\.7\] = (.*)", out)
+        got = [int(x) for x in m.group(1).split()[:len(want)]] if m else None
+        results.append((name, "" if code == 0 and got == want else failure(code, out, 2)))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         bad = re.findall(r"(\d+) bad", out)

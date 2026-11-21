@@ -6,6 +6,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -65,8 +66,20 @@ def make_cs_fssm(rsrc2: int = 0x8088, lx: int = 64, ly: int = 1, lz: int = 1) ->
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     raw = open(asm_path, encoding="utf-8").read()
+    cmd = [llvm_mc, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith(";"):
+            break
+        m = re.match(r";\s*mattr:\s*(\S+)", s)
+        if m:
+            cmd.append(f"-mattr={m.group(1)}")
+            break
+    cmd.append("-show-encoding")
     p = subprocess.run(
-        [llvm_mc, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"],
+        cmd,
         input=raw,
         capture_output=True,
         text=True,
@@ -368,14 +381,23 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == "cs_store":
+        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl"):
+            cs_dump_wants = {
+                "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
+                "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
+                "cs_wm_half_ops": [32, 16, 16, 0, 16],
+                "cs_wm_half_cmp": [1, 0, 1, 1],
+                "cs_wm_bfm64": [16, 8, 8, 40],
+                "cs_wm_scc_rfl": [55, 48],
+            }
+            want = cs_dump_wants[name]
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
-            want = [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800]
             dump_line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
             if rc == 0 and dump_line:
-                vals = [int(x) for x in dump_line.split("=")[1].split()[:6]]
+                vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
                 ok = vals == want
-                results.append((name, ok, " ".join(hex(x) for x in vals)))
+                fmt = hex if name == "cs_store" else str
+                results.append((name, ok, " ".join(fmt(x) for x in vals)))
             else:
                 results.append((name, False, msg))
         elif name == "cs_imgstore":

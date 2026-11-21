@@ -100,10 +100,9 @@ class Gen:
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
         self.uses_ballot = False       # wave mask ballot (OpGroupNonUniformBallot)
-        self.mask_sgprs = set()        # SGPRs currently holding a per-lane wave mask
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
-        self.cur_masks = frozenset()
+        self.cur_masks = {}
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
         self.write_all_lanes = False
         self.parked = {}               # (vgpr, lane) a mask is parked in -> the spare SGPR slot that keeps it per lane
@@ -155,7 +154,6 @@ class Gen:
 
     def store_reg(self, kind, r, val):
         if kind == "sgpr":
-            self.mask_sgprs.discard(r)
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
@@ -177,9 +175,10 @@ class Gen:
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %m0")
         elif k == "special" and a["t"] == "vcc_hi":
-            # wave32: vcc_hi is an ordinary SGPR (the lane mask lives in vcc_lo).
+            # wave64: vcc_hi is the upper half of VCC when VCC holds a lane mask (each lane's bit lives in %vcc).
+            # wave32 (or plain data): vcc_hi is an ordinary SGPR.
             v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint %vcc_hi")
+            self.emit(f"{v} = OpLoad %uint {'%vcc' if (self.wave64 and 'vcc' in self.cur_masks) else '%vcc_hi'}")
         elif k == "special" and a["t"] == "scc":
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %scc")
@@ -358,9 +357,6 @@ class Gen:
             raise Unsupported("s_mov_b64 source")
         self.store_reg("sgpr", d["r"], lo)
         self.store_reg("sgpr", d["r"] + 1, hi)
-        if (s["k"] == "special" and s["t"] in ("exec", "exec_lo", "vcc", "vcc_lo")) or \
-                (s["k"] == "sgpr" and s["r"] in self.mask_sgprs):
-            self.mask_sgprs.update((d["r"], d["r"] + 1))
 
     def compare(self, op, a, scalar, exec_only=False):
         """v_cmp_* / s_cmp_*: lane result into VCC/SGPR mask (vector), SCC (scalar), or EXEC (v_cmpx)."""
@@ -413,9 +409,10 @@ class Gen:
             raise Unsupported(op)
         b, r = self.tmp(), self.tmp()
         self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
-        masks = any(self.holds_lane_mask(s) for s in srcs)
-        if scalar and masks and ty in ("u32", "i32") and cond in ("eq", "ne", "lg"):
-            b = self.wave_equal(b, cond == "eq")
+        mask_halves = [self.mask_half(s) for s in srcs if self.holds_lane_mask(s)]
+        if scalar and mask_halves and ty in ("u32", "i32") and cond in ("eq", "ne", "lg"):
+            half = mask_halves[0] if (self.wave64 and len(set(mask_halves)) == 1) else None
+            b = self.wave_equal(b, cond == "eq", half=half)
         # Lane masks are all-ones/zero per invocation (one lane), SCC is 1/0. A VOPC result bit is 0 for lanes
         # that are off in EXEC (as on hardware), so wave-wide reductions of the mask (s_cbranch_vccz) are exact.
         bm = b
@@ -1343,11 +1340,39 @@ class Gen:
         slots = lane_masks.parked(blocks[0], self.lane_masks)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
 
-    def wave_equal(self, mine, equal):
+    def mask_half(self, a):
+        """For a 32-bit lane-mask operand in wave64, return 'lo' (lanes 0-31), 'hi' (lanes 32-63), or None."""
+        if a["k"] == "special":
+            t = a.get("t", "")
+            if t in ("exec_lo", "vcc_lo"):
+                return "lo"
+            if t in ("exec_hi", "vcc_hi"):
+                return "hi"
+            return None
+        if a["k"] == "sgpr" and a.get("n", 1) == 1:
+            k = self.cur_masks.get(a["r"])
+            if k == lane_masks.MASK_LO:
+                return "lo"
+            if k == lane_masks.MASK_HI:
+                return "hi"
+        return None
+
+    def wave_equal(self, mine, equal, half=None):
         """s_cmp_eq / s_cmp_lg of a lane mask (with 0, or with another mask): the masks are equal when every lane's
         bit is, so the lanes vote. `mine` is this lane's result for the comparison asked (equal, or not equal).
-        Taken per lane, `s_cmp_lg_u32 mask, 0; s_cbranch_scc0` would send the lanes of one wave different ways."""
+        When `half` is 'lo' or 'hi' (32-bit compare on one half of a wave64 mask), restrict the vote to that half."""
         self.uses_vote = True
+        if half is not None:
+            lane = self.wave_lane()
+            in_h = self.tmp()
+            op = "OpULessThan" if half == "lo" else "OpUGreaterThanEqual"
+            self.emit(f"{in_h} = {op} %bool {lane} {self.cu(32)}")
+            eff = self.tmp()
+            if equal:
+                self.emit(f"{eff} = OpSelect %bool {in_h} {mine} %true")
+            else:
+                self.emit(f"{eff} = OpLogicalAnd %bool {in_h} {mine}")
+            mine = eff
         r = self.tmp()
         self.emit(f"{r} = OpGroupNonUniform{'All' if equal else 'Any'} %bool {self.cu(3)} {mine}")
         return r
@@ -1357,7 +1382,8 @@ class Gen:
         written as a mask on every path. An SGPR pair filled from a buffer (a light mask, say) is data."""
         if a["k"] == "special":
             t = a.get("t", "")
-            return t.startswith("exec") or (t in ("vcc", "vcc_lo") and "vcc" in self.cur_masks)
+            return t.startswith("exec") or (t in ("vcc", "vcc_lo") and "vcc" in self.cur_masks) or \
+                (t == "vcc_hi" and self.wave64 and "vcc" in self.cur_masks)
         return a["k"] == "sgpr" and all(a["r"] + i in self.cur_masks for i in range(a.get("n", 1)))
 
     def wave_mask(self, a):
@@ -1384,7 +1410,7 @@ class Gen:
         """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane."""
         if a["k"] == "sgpr":
             return self.load_reg("sgpr", a["r"])
-        if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo"):
+        if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
             return v
@@ -1399,36 +1425,12 @@ class Gen:
             self.set_exec(v)
         elif d["k"] == "sgpr":
             self.store_reg("sgpr", d["r"], v)
-            self.mask_sgprs.add(d["r"])
             if d.get("n") == 2:
                 self.store_reg("sgpr", d["r"] + 1, v)
-                self.mask_sgprs.add(d["r"] + 1)
         elif d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {v}")
         else:
             raise Unsupported("mask destination")
-
-    def ballot_pair(self, arg, is64):
-        """Return (lo, hi) 32-bit mask words. If arg holds a per-lane wave mask, reconstruct the wave-wide
-        64-bit bitmask via OpGroupNonUniformBallot."""
-        is_mask = (arg["k"] == "special" and arg["t"] in ("exec", "exec_lo", "vcc", "vcc_lo")) or \
-                  (arg["k"] == "sgpr" and arg["r"] in self.mask_sgprs)
-        if is_mask:
-            self.uses_ballot = True
-            self.uses_subgroup = True
-            pred = self.tmp_bool_nz(self.mask_src(arg))
-            bal, lo = self.tmp(), self.tmp()
-            self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 {pred}")
-            self.emit(f"{lo} = OpCompositeExtract %uint {bal} 0")
-            if is64:
-                hi = self.tmp()
-                self.emit(f"{hi} = OpCompositeExtract %uint {bal} 1")
-            else:
-                hi = self.cu(0)
-            return lo, hi
-        if is64 and arg["k"] == "sgpr" and arg.get("n") == 2:
-            return self.load_reg("sgpr", arg["r"]), self.load_reg("sgpr", arg["r"] + 1)
-        return self.src_u(arg), self.cu(0)
 
     def clamp_mods(self, v, mods):
         # Output modifier (mul:2 / mul:4 / div:2) is applied before clamp, as on hardware.
@@ -1458,7 +1460,7 @@ class Gen:
         under sext()) before the op and its neg/abs, and a VGPR result is placed at dst_sel with dst_unused
         deciding the other bits (PAD = zero, SEXT = sign-extend, PRESERVE = keep the old bits). VOPC has no
         dst_sel; v_cmpx (GFX10) has no written destination operand."""
-        self.cur_masks = self.lane_masks.get(id(ins), frozenset())
+        self.cur_masks = self.lane_masks.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
         if not ins["op"].endswith("_sdwa"):
             return self._insn(ins)
@@ -1821,9 +1823,11 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("s_bcnt1_i32_b64", "s_bcnt1_i32_b32"):
             if self.holds_lane_mask(a[1]):
-                # How many lanes of the wave are set. Both halves for the 32-bit form as well: a wave32 shader
-                # run in a 64-lane subgroup has lanes there too, and the subgroup is what stands in for the wave.
                 lo, hi = self.wave_mask(a[1])
+                if op.endswith("b32") and self.wave64:
+                    half = self.mask_half(a[1])
+                    if half is not None:
+                        lo, hi = (hi if half == "hi" else lo), self.cu(0)
             elif op.endswith("b64") and a[1]["k"] == "sgpr" and a[1].get("n") == 2:
                 lo, hi = self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1)
             else:
@@ -1845,6 +1849,10 @@ class Gen:
             # Lowest set bit of a 64-bit mask, -1 if none. For a lane mask that is the wave's first set lane.
             if self.holds_lane_mask(a[1]):
                 lo, hi = self.wave_mask(a[1])
+                if op.endswith("b32") and self.wave64:
+                    half = self.mask_half(a[1])
+                    if half is not None:
+                        lo, hi = (hi if half == "hi" else lo), self.cu(0)
             elif a[1]["k"] != "sgpr" or a[1].get("n") != 2:
                 lo, hi = self.mask_src(a[1]), self.cu(0)
             else:
@@ -1913,9 +1921,8 @@ class Gen:
             # D = ((1 << size) - 1) << offset as a lane mask: in the per-lane model this lane's bit is
             # offset <= lane < offset + size (size/offset taken mod 64).
             size, off = self.src_u(a[1]), self.src_u(a[2])
-            self.uses_subgroup = True
-            lane, sz, of, end, ge, lt, on, m = (self.tmp() for _ in range(8))
-            self.emit(f"{lane} = OpLoad %uint %sg_lane")
+            lane = self.wave_lane()
+            sz, of, end, ge, lt, on, m = (self.tmp() for _ in range(7))
             self.emit(f"{sz} = OpBitwiseAnd %uint {size} {self.cu(63)}")
             self.emit(f"{of} = OpBitwiseAnd %uint {off} {self.cu(63)}")
             self.emit(f"{end} = OpIAdd %uint {of} {sz}")
@@ -5381,7 +5388,6 @@ def translate(path):
     for n, blk in enumerate(blocks):
         g.body = []
         g.block_label = f"%blk{n}"
-        g.mask_sgprs.clear()
         g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
         term = None
         for ins in blk:

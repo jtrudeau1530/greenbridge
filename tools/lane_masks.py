@@ -8,9 +8,9 @@ The same instructions also run on plain 64-bit data, such as a light mask read f
 instruction says which of the two it has, so this module works it out from what wrote the register.
 
     masks, writes = analyse(blocks, succ)   # blocks: lists of instructions; succ: successor block numbers per block
-    masks[id(ins)]                      # registers holding a lane mask on every path to ins: SGPR numbers, "vcc",
-                                        # ("lane", vgpr, lane): a mask parked in one lane of a VGPR,
-                                        # ("v", vgpr): a mask on its way through a VGPR
+    masks[id(ins)]                      # dict mapping each register holding a lane mask on every path to ins
+                                        # (SGPR number, "vcc", ("lane", vgpr, lane) parked in a VGPR lane, or
+                                        # ("v", vgpr) passing through a VGPR) to its kind (MASK, MASK_LO, MASK_HI)
     id(ins) in writes                   # ins writes a mask to a VGPR
 
 A register counts as a mask only if every path to the instruction wrote a mask to it. Anything else is treated
@@ -26,7 +26,10 @@ whole mask and the first lane's copy is read. Here each lane computes its own bi
 copy, and it has to compute it whether or not it is active.
 """
 
-MASK = "mask"
+MASK = "mask"           # full lane mask (64-bit pair, vcc, or wave32 single register)
+MASK_LO = "mask_lo"     # low 32-bit half of a 64-bit lane mask (lanes 0-31)
+MASK_HI = "mask_hi"     # high 32-bit half of a 64-bit lane mask (lanes 32-63)
+MASK_KINDS = (MASK, MASK_LO, MASK_HI)
 EITHER = "either"       # a constant 0 or -1: no lanes or all lanes, and the same bits when read as data
 # Absent from the state: data.
 
@@ -47,12 +50,28 @@ def base_op(op):
 def kind(state, a):
     if a["k"] == "special":
         t = a.get("t", "")
-        if t.startswith("exec"):
+        if t == "exec_lo":
+            return MASK_LO
+        if t == "exec_hi":
+            return MASK_HI
+        if t == "exec":
             return MASK
-        return state.get("vcc") if t in ("vcc", "vcc_lo") else None
+        if t == "vcc":
+            return state.get("vcc")
+        if t in ("vcc_lo", "vcc_hi"):
+            vk = state.get("vcc")
+            if vk in MASK_KINDS:
+                return MASK_LO if t == "vcc_lo" else MASK_HI
+            return vk if t == "vcc_lo" else None
+        return None
     if a["k"] == "sgpr":
-        kinds = {state.get(a["r"] + i) for i in range(a.get("n", 1))}
-        return kinds.pop() if len(kinds) == 1 else None
+        n = a.get("n", 1)
+        ks = [state.get(a["r"] + i) for i in range(n)]
+        if None in ks:
+            return None
+        if n == 2 and any(k in MASK_KINDS for k in ks):
+            return MASK
+        return ks[0] if len(set(ks)) == 1 else None
     if a["k"] == "vgpr" and a.get("n", 1) == 1:
         return state.get(("v", a["r"]))
     if a["k"] == "imm" and a["v"] in (0, -1):
@@ -62,9 +81,18 @@ def kind(state, a):
 
 def put(state, a, k):
     if a["k"] == "sgpr":
-        regs = [a["r"] + i for i in range(a.get("n", 1))]
+        n = a.get("n", 1)
+        if k == MASK and n == 2:
+            state[a["r"]] = MASK_LO
+            state[a["r"] + 1] = MASK_HI
+            return
+        regs = [a["r"] + i for i in range(n)]
     elif a["k"] == "special" and a.get("t") in ("vcc", "vcc_lo"):
         regs = ["vcc"]
+    elif a["k"] == "special" and a.get("t") == "vcc_hi":
+        # A separate write to vcc_hi lands in %vcc_hi, so vcc no longer holds one lane mask.
+        state.pop("vcc", None)
+        return
     else:
         return
     for r in regs:
@@ -82,7 +110,7 @@ def lane_slot(vgpr, lane):
 
 
 def step(state, ins):
-    """Update `state` (register -> MASK | EITHER) for one instruction. True if it writes a mask to a VGPR."""
+    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return
@@ -99,6 +127,10 @@ def step(state, ins):
     if op == "v_readlane_b32" and len(a) == 3:                                  # sD = vS[lane]
         put(state, a[0], state.get(lane_slot(a[1], a[2])))
         return
+    if op.startswith("v_cmp"):
+        # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
+        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK)
+        return
     if a[0]["k"] == "vgpr":                             # any other write to a VGPR ends what was parked in it
         # A mask only when every source is one (or a constant 0 / -1) on every path: no EITHER for VGPRs, whose
         # plain writes skip inactive lanes. The sources are looked at first: the destination can be one of them.
@@ -106,16 +138,21 @@ def step(state, ins):
         written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
         for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
             del state[key]
-        if None not in kinds and MASK in kinds:
-            state[("v", a[0]["r"])] = MASK
+        if None not in kinds and any(k in MASK_KINDS for k in kinds):
+            ms = {k for k in kinds if k in MASK_KINDS}
+            state[("v", a[0]["r"])] = ms.pop() if len(ms) == 1 else MASK
             return True
-    if op.startswith("v_cmp") or "_saveexec_b" in op or "_wrexec_b" in op:
+    if "_saveexec_b" in op or "_wrexec_b" in op or op == "s_bfm_b64":
         put(state, a[0], MASK)
     elif op.startswith(COPIES) and len(a) > 1:
         put(state, a[0], kind(state, a[1]))
     elif op.startswith(BITWISE):
         kinds = [kind(state, x) for x in a[1:]]
-        put(state, a[0], None if None in kinds else MASK if MASK in kinds else EITHER)
+        if None in kinds:
+            put(state, a[0], None)
+        else:
+            ms = {k for k in kinds if k in MASK_KINDS}
+            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else EITHER)
     else:
         put(state, a[0], None)
         if op.startswith("v_") and "_co_" in op and len(a) > 1:
@@ -149,8 +186,17 @@ def analyse(blocks, succ):
             if entry[s] is None:
                 merged = dict(state)
             else:                                       # a mask on both paths, or a mask on one and 0 / -1 on the other
-                merged = {r: MASK if MASK in (entry[s][r], state[r]) else EITHER
-                          for r in entry[s].keys() & state.keys()}
+                merged = {}
+                for r in entry[s].keys() & state.keys():
+                    a_k, b_k = entry[s][r], state[r]
+                    if a_k == b_k:
+                        merged[r] = a_k
+                    elif a_k == EITHER:
+                        merged[r] = b_k
+                    elif b_k == EITHER:
+                        merged[r] = a_k
+                    else:
+                        merged[r] = MASK
             if merged != entry[s]:
                 entry[s] = merged
                 work.append(s)
@@ -158,7 +204,7 @@ def analyse(blocks, succ):
     for n, blk in enumerate(blocks):
         state = dict(entry[n] or {})
         for ins in blk:
-            out[id(ins)] = frozenset(r for r, k in state.items() if k == MASK)
+            out[id(ins)] = {r: k for r, k in state.items() if k in MASK_KINDS}
             if step(state, ins):
                 writes.add(id(ins))
     return out, writes

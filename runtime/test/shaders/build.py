@@ -13,6 +13,7 @@ The comment at the top of each .asm says which test program to run on the result
 """
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -25,13 +26,31 @@ LLVM_MC = os.environ.get("LLVM_MC", "llvm-mc")
 RSRC2, GROUP = 0x8088, (64, 1, 1)
 
 
+def asm_mattr(path):
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith(";"):
+            break
+        m = re.match(r";\s*mattr:\s*(\S+)", s)
+        if m:
+            return m.group(1)
+    return None
+
+
 def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
     fssm.mkdir()
     for n in names:
-        r = subprocess.run([LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding",
-                            os.path.join(HERE, n + ".asm")], capture_output=True, text=True)
+        asm_path = os.path.join(HERE, n + ".asm")
+        mattr = asm_mattr(asm_path)
+        cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        if mattr:
+            cmd.append(f"-mattr={mattr}")
+        cmd += ["-show-encoding", asm_path]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
