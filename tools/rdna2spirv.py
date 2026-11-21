@@ -5540,6 +5540,8 @@ def main():
     ap.add_argument("--limit", type=int)
     ap.add_argument("--shard", help="i/n: translate every n-th shader starting at i (run n processes in parallel, "
                                     "then merge the index.part*.json files with --merge)")
+    ap.add_argument("--no-asm", action="store_true",
+                    help="delete each .spvasm once its .spv is written (the text is ~2.7x the binary: 35 GB for the corpus)")
     ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
     ap.add_argument("--fssm-dir", default=None,
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
@@ -5594,6 +5596,8 @@ def main():
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
+        if a.no_asm and os.path.exists(sa):
+            os.remove(sa)
     import json as _js
     idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}

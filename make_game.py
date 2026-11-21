@@ -311,7 +311,8 @@ def translate(disasm: str, spirv: str, jobs: int) -> None:
             os.remove(os.path.join(spirv, f))
     tool = os.path.join(TOOLS, "rdna2spirv.py")
     log(f"  rdna2spirv.py {disasm} --out {spirv} --shard 0..{jobs - 1}/{jobs}")
-    procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}"])
+    # --no-asm: keep only the .spv modules; the .spvasm text would add ~35 GB for the corpus
+    procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm"])
              for i in range(jobs)]
     bad = [f"shard {i} exited with {r}" for i, r in enumerate(p.wait() for p in procs) if r != 0]
     if bad:
