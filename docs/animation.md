@@ -166,7 +166,8 @@ is not established; no name is stored in the stream.
 
 ### Tail `RBF0` rig metadata
 
-The last 21 streams are one logical `RBF0` blob split into 64 KiB blocks (20 × 65,536 plus 37,716 bytes):
+The last 21 streams appear to be one logical `RBF0` blob split into 64 KiB blocks (20 × 65,536 plus 37,716
+bytes); the first block ends mid-path (`...anim/rig`) and the next starts `/canonical/...`:
 
 ```
 52 42 46 30 fb ff 01 00 00 00 15 00  "rage__crRigSetManager"
