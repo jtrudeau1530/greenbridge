@@ -5,8 +5,8 @@ Usage:
 
 Writes <out>/<file>.json and <out>/<file>.md, where <file> is the image's full file name (game.exe.json,
 game.dll.md), so an exe and a dll with the same stem get separate reports. Images with the same file name from
-different directories get a numbered suffix (x.exe-2.json), and the name used is printed to stderr. The same path
-given twice is inspected once. Reads the file only; never runs it.
+different directories get a numbered suffix (x.exe-2.json), and the name used is printed to stderr. The same file
+given twice with the same import search folder is inspected once. Reads the file only; never runs it.
 
 Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
@@ -378,16 +378,17 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     rc = 0
-    seen_paths: set[str] = set()
+    seen_paths: set[tuple[str, str]] = set()
     used_names: set[str] = set()
     for img in a.image:
-        key = os.path.normcase(os.path.realpath(img))
+        search_dir = a.game_dir or os.path.dirname(os.path.abspath(img))
+        key = (os.path.normcase(os.path.realpath(img)), os.path.normcase(os.path.abspath(search_dir)))
         if key in seen_paths:
             print(f"{img}: given more than once; inspected once", file=sys.stderr)
             continue
         seen_paths.add(key)
         try:
-            r = inspect(img, a.game_dir or os.path.dirname(os.path.abspath(img)))
+            r = inspect(img, search_dir)
         except (PeFormatError, OSError) as e:
             print(f"{img}: not a PE image ({e})", file=sys.stderr)
             rc = 1

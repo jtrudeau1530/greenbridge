@@ -12,6 +12,7 @@ import json
 import os
 import struct
 import sys
+import shutil
 import tempfile
 import unittest
 
@@ -323,6 +324,42 @@ class PeInspectTest(unittest.TestCase):
         self.assertNotEqual(r1["machine"], r2["machine"])
         self.assertIn("report written as x.exe-2.json", err)
         self.assertIn("given more than once", err)
+
+    def check_same_image_under_another_folder(self, tag: str, link) -> None:
+        a, b = os.path.join(self.dir, tag + "_a"), os.path.join(self.dir, tag + "_b")
+        os.makedirs(a)
+        os.makedirs(b)
+        first, second = os.path.join(a, "x.exe"), os.path.join(b, "x.exe")
+        with open(first, "wb") as f:
+            f.write(build_image())
+        link(first, second)
+        open(os.path.join(b, "xmem.dll"), "wb").close()
+        out = os.path.join(self.dir, "reports_" + tag)
+        self.run_cli([first, second], out)
+        self.assertEqual(sorted(os.listdir(out)), ["x.exe-2.json", "x.exe-2.md", "x.exe.json", "x.exe.md"])
+
+        def resolves(report: dict) -> dict:
+            return {(i["dll"], i["kind"]): i["where"] for i in report["imports"]}
+
+        for name, img in (("x.exe", first), ("x.exe-2", second)):
+            single = os.path.join(self.dir, "reports_" + tag + "_single_" + name)
+            self.run_cli([img], single)
+            combined, _ = self.read_report(out, name)
+            alone, _ = self.read_report(single, "x.exe")
+            self.assertEqual(resolves(combined), resolves(alone))
+        self.assertEqual(resolves(self.read_report(out, "x.exe")[0])[("xmem.dll", "normal")], "shim")
+        self.assertEqual(resolves(self.read_report(out, "x.exe-2")[0])[("xmem.dll", "normal")], "bundled")
+
+    def test_cli_symlinked_image_under_another_folder_gets_its_own_report(self):
+        def link(src, dst):
+            try:
+                os.symlink(src, dst)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"os.symlink unavailable: {e}")
+        self.check_same_image_under_another_folder("symlink", link)
+
+    def test_cli_copied_image_under_another_folder_gets_its_own_report(self):
+        self.check_same_image_under_another_folder("copy", shutil.copyfile)
 
     def test_cli_reports_a_non_pe_file(self):
         bad = os.path.join(self.dir, "not_pe_cli.bin")
