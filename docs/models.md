@@ -7,6 +7,22 @@ The short version: the exporter does not reject any vertex or index layout in th
 It drops valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
 `48557ea`.
 
+## Upstream status
+
+[Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
+fix is already under review in
+[rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1), so this page records the
+measured gap and independent evidence, not a competing patch. PR #1 reports 190,792 of 190,792
+recognized candidates decoded across the ten archives configured in Leonida, including 169
+candidates rejected by the previous scan (also verified after archive readback).
+
+That count and the counts below are different scopes. Issue #29 is a full ten-archive run against
+its own recognized-candidate set and covers primary-LOD geometry. The counts below are independent
+`rpf9dump` runs at submodule `48557ea`: `data.rpf` plus a 0-8 GiB sample of `levels.rpf`, over the
+page-scan candidate set, and the exporter writes every recovered drawable/LOD variant. The 963 and
+2,564 hidden rejects are therefore not a contradiction of 190,792; they measure the pre-fix gap in
+these scopes. Reconcile them after PR #1 merges and the pin is bumped.
+
 ## How the exporter works
 
 ```
@@ -80,9 +96,12 @@ actually validated. Bytes after those ends are legal: system blocks can carry in
 a graphics zlib block can carry trailing data. Decoding the full spans and then requiring every
 trailing byte to be zero rejects valid resources.
 
-## Proposed upstream patch
+## Measured diagnosis and the upstream fix
 
-Against `breadbbbb/rpf9-explorer` at `48557ea`. Not applied to this checkout.
+This is our measured diagnosis, not a competing patch. The two hunks below record the minimum our
+runs isolated; PR #1 implements this area more broadly, including cluster marker and palette
+handling, packed-position bounds, and mixed raw/zlib block handling, and its exact code may differ.
+The hunks are against `breadbbbb/rpf9-explorer` at `48557ea` and are not applied to this checkout.
 
 ```diff
 --- a/Core/Rpf9ModelRecovery.cs
@@ -147,7 +166,9 @@ The tested set contains 198,286 geometry records. No unhandled layout tag appear
 
 ## What to do next
 
-1. Land the two hunks in `breadbbbb/rpf9-explorer`.
-2. Bump `third_party/rpf9-explorer` in this repository to the patched commit.
-3. Re-run `tools/rpf9dump models` on `data.rpf` and the `levels.rpf` samples and update the counts
-   above. The full `levels.rpf` has not been measured.
+1. Merge [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1).
+2. Bump `third_party/rpf9-explorer` in this repository to the merged commit.
+3. Re-run `tools/rpf9dump models` on `data.rpf` and `levels.rpf`. The full `levels.rpf` has not been
+   measured.
+4. Reconcile the new counts with issue #29's 190,792 total, then update this page and the README
+   model status.
