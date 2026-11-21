@@ -351,6 +351,11 @@ python -I tools/page_index.py <carve-dir> pages.json
 python -I tests/test_page_index.py
 ```
 
+`--start` must be 0 or more and `--limit` at least 1; both take decimal or `0x` hex. A value outside that, an output
+that does not end in `.json` or `.csv`, or a `--start` past the end of the archive stops the tool with a one-line
+error and exit code 2, before anything is scanned or written. An empty archive, or one shorter than its 8-byte
+header, gives an index with no pages.
+
 JSON has a `summary` and one object per page: offset, stored/inflated size, version, `page_count` (`u32@0x20`),
 the four counts, table offsets, `q38_records`, raw `q28_records`, continuation streams, `span`,
 `payload_at_0x60` and `complete`. CSV is one row per `q38` record:
