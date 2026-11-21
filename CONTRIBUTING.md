@@ -16,6 +16,10 @@ Thanks for helping. A few rules keep the project safe to host:
 - `tools/rpf9dump` needs the submodule: `git submodule update --init`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
+- `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all).
+- GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` there turns them into
+  SPIR-V (it needs `llvm-mc`, so WSL or a Linux container), and `check.py` runs them on your GPU and compares
+  the results. A new test gets its expected values in the comment at its top and a check in `check.py`.
 - Say what you tested and on which GPU in the pull request.
 - Run the translator tests with `python -m unittest discover -s tests/semantic -v` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.

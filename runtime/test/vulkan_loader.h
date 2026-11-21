@@ -1,5 +1,9 @@
+// Loads the Vulkan loader at run time: vulkan-1.dll on Windows, libvulkan.so.1 elsewhere. No import library.
 #pragma once
 
+#ifndef VK_NO_PROTOTYPES
+#define VK_NO_PROTOTYPES
+#endif
 #include <vulkan/vulkan.h>
 
 #include <cstdio>

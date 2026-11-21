@@ -6,6 +6,7 @@
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
 //   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3>   (S# words as hex)
+//   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 
@@ -63,7 +64,7 @@ int main(int argc, char** argv) {
     const uint32_t tsharp_va = 256;
 
     gipa = load_vulkan();
-    if (!gipa) return 1;
+    if (!gipa) { std::fprintf(stderr, "the Vulkan loader was not found\n"); return 1; }
     VkInstance inst = VK_NULL_HANDLE;
 #define LI(n) auto n = reinterpret_cast<PFN_##n>(gipa(inst, #n))
     LI(vkCreateInstance);
@@ -121,8 +122,13 @@ int main(int argc, char** argv) {
     };
     // Heap (the Xbox GPU VA window) with the T# at tsharp_va.
     VkBuffer heap; VkDeviceMemory heapm; void* heapp;
-    CHECK(make_buffer(65536, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
-    std::memset(heapp, 0, 65536);
+    // 64 KiB of zeros unless VKT_HEAP_MB says otherwise. Buffer loads are not bounds-checked against the V#, so a
+    // shader that indexes with anything but the zeros it finds here reads past the end: a bigger heap keeps such
+    // reads inside defined memory.
+    const char* heap_mb = std::getenv("VKT_HEAP_MB");
+    const VkDeviceSize heap_bytes = heap_mb && std::atoi(heap_mb) > 0 ? VkDeviceSize(std::atoi(heap_mb)) << 20 : 65536;
+    CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
+    std::memset(heapp, 0, size_t(heap_bytes));
     std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);

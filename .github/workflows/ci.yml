@@ -17,6 +17,13 @@ jobs:
         run: python -m compileall -q make_game.py tools
       - name: make_game.py help
         run: python -I make_game.py --help
+      - name: Tests (standard library only, no game data)
+        shell: bash
+        run: for t in tests/test_*.py; do echo "== $t"; python -I "$t" || exit 1; done
+      - name: Build the runtime (the GPU tools are skipped without the Vulkan SDK)
+        run: |
+          cmake -S runtime -B runtime/build
+          cmake --build runtime/build --config RelWithDebInfo
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
       - name: No game data tracked
