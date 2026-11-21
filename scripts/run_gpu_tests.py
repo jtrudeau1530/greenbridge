@@ -23,7 +23,7 @@ TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
-from build import CLIP_CASES, clip_container
+from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test
 from compute_fixture import compute_header
 from check import CMPX_CLASS_WORDS, Skip, mesh_v5_test, start_failure
@@ -403,13 +403,13 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
-              **dict.fromkeys(CLIP_CASES, "ps_ops.asm")}
+              "vs_clip": "ps_ops.asm"}
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
     build = list(asm_files)
     for f in asm_files:
-        extra = DRAWN_WITH.get(os.path.splitext(f)[0])
+        extra = DRAWN_WITH.get(shader_source(os.path.splitext(f)[0]))
         if extra and extra not in build:
             build.append(extra)
     return build
@@ -511,8 +511,7 @@ def run_suite(a, work: str) -> int:
         if name.startswith("cs_"):
             with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
                 f.write(compute_header(os.path.join(SHADER_DIR, fname)))
-        if name in CLIP_CASES:
-            fname = "vs_clip.asm"
+        fname = shader_source(name) + ".asm"
         assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), os.path.join(disasm_dir, f"{name}.s"), name)
         # A failed translation must not run an old binary left in a reused --work directory.
         Path(spirv_dir, f"{name}.spv").unlink(missing_ok=True)
