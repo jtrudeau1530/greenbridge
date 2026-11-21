@@ -238,9 +238,11 @@ def ensure_submodule() -> None:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if os.path.isdir(core) and os.listdir(core):
         return
-    if shutil.which("git") and os.path.isdir(os.path.join(ROOT, ".git")):
+    git = shutil.which("git")
+    if git and subprocess.run([git, "-C", ROOT, "rev-parse", "--resolve-git-dir", ".git"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         log("fetching third_party/rpf9-explorer")
-        r = subprocess.run(["git", "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+        r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
         if r.returncode == 0 and os.path.isdir(core):
             return
     fail("third_party/rpf9-explorer is missing. Download the project with: "
