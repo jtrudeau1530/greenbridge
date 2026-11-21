@@ -216,8 +216,10 @@ public:
 
     HRESULT create_texture(const Format& format) {
         auto& vk = device_.context->vk;
+        const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         if (desc_.MipLevels == 0) {
-            UINT64 size = std::max<UINT64>(desc_.Width, desc_.Height);
+            UINT64 size = std::max<UINT64>({desc_.Width, desc_.Height, depth});
             UINT16 mips = 1;
             while (size > 1) {
                 size >>= 1;
@@ -227,11 +229,11 @@ public:
         }
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-        info.imageType = VK_IMAGE_TYPE_2D;
+        info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
         info.format = format.format;
-        info.extent = {std::uint32_t(desc_.Width), desc_.Height, 1};
+        info.extent = {std::uint32_t(desc_.Width), desc_.Height, depth};
         info.mipLevels = desc_.MipLevels;
-        info.arrayLayers = desc_.DepthOrArraySize;
+        info.arrayLayers = volume ? 1 : desc_.DepthOrArraySize;
         info.samples = VK_SAMPLE_COUNT_1_BIT;
         info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -253,7 +255,9 @@ public:
         binding.width = std::uint32_t(desc_.Width);
         binding.height = desc_.Height;
         binding.mip_levels = desc_.MipLevels;
-        binding.array_layers = desc_.DepthOrArraySize;
+        binding.array_layers = info.arrayLayers;
+        binding.depth = depth;
+        binding.volume = volume;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
         // Never used yet: the first command that touches a part zero-fills it and moves it to the layout of the
@@ -451,8 +455,12 @@ public:
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             hr = resource->create_buffer();
-        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                   desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
             log_once("committed resource dimension not supported:", desc->Dimension);
+        } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                   (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
+            log_once("volume attachment views not supported, flags:", int(desc->Flags));
         } else if (desc->SampleDesc.Count > 1) {
             log_once("multisampled committed resource not supported, samples:", int(desc->SampleDesc.Count));
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
@@ -506,16 +514,18 @@ public:
             if (total) *total = desc->Width;
             return;
         }
-        if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        const bool volume = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if (!volume && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             log_once("GetCopyableFootprints dimension not supported:", desc->Dimension);
             return fail();
         }
         const Format format = vulkan_format(desc->Format, true);  // typeless depth families are planar either way
         UINT mips = desc->MipLevels;
+        const UINT depth = volume ? desc->DepthOrArraySize : 1;
         if (!mips)
-            for (UINT64 size = std::max<UINT64>(desc->Width, desc->Height); size; size >>= 1) ++mips;
+            for (UINT64 size = std::max<UINT64>({desc->Width, desc->Height, depth}); size; size >>= 1) ++mips;
         const UINT planes = (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? 2 : 1;
-        const UINT per_plane = mips * desc->DepthOrArraySize;
+        const UINT per_plane = mips * (volume ? 1 : desc->DepthOrArraySize);
         if (!format.format || UINT64(first) + count > UINT64(per_plane) * planes) return fail();
 
         UINT64 offset = base, end = base;
@@ -536,12 +546,14 @@ public:
             offset = align(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
             DXGI_FORMAT footprint_format = desc->Format;
             if (planes == 2) footprint_format = plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
+            const UINT slices = std::max(1u, depth >> mip);
             if (layouts)
-                layouts[i] = {offset, {footprint_format, blocks_wide * block.block, blocks_high * block.block, 1, pitch}};
+                layouts[i] = {offset, {footprint_format, blocks_wide * block.block, blocks_high * block.block, slices, pitch}};
             if (rows) rows[i] = blocks_high;
             if (row_sizes) row_sizes[i] = row_size;
-            end = offset + UINT64(blocks_high - 1) * pitch + row_size;
-            offset += UINT64(blocks_high) * pitch;
+            const UINT64 total_rows = UINT64(blocks_high) * slices;
+            end = offset + (total_rows - 1) * pitch + row_size;
+            offset += total_rows * pitch;
         }
         if (total) *total = end - base;
     }
