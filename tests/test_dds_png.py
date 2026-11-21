@@ -234,6 +234,24 @@ class UncompressedTests(unittest.TestCase):
                 self.assertEqual((width, height), (1, 2))
                 self.assertEqual(pixels(rgba), expected)
 
+    def test_pitch_with_custom_byte_masks(self):
+        payload = bytes((1, 2, 3, 4)) + b"\xcc" * 4 + bytes((5, 6, 7, 8))
+        data = dds_buffer(
+            1, 2, payload, flags=DDPF_RGB | DDPF_ALPHAPIXELS, bit_count=32, pitch=8,
+            masks=(0x0000FF00, 0x00FF0000, 0xFF000000, 0x000000FF),
+        )
+        self.assertEqual(dds.decode_dds(data), (1, 2, bytes((2, 3, 4, 1, 6, 7, 8, 5))))
+
+    def test_pitch_with_r10g10b10a2_masks(self):
+        first = (1023 << 20) | (512 << 10) | 255 | (3 << 30)
+        second = (512 << 10) | 1023 | (1 << 30)
+        payload = struct.pack("<I", first) + b"\xcc" * 4 + struct.pack("<I", second)
+        data = dds_buffer(
+            1, 2, payload, flags=DDPF_RGB | DDPF_ALPHAPIXELS, bit_count=32, pitch=8,
+            masks=(0x3FF00000, 0x000FFC00, 0x000003FF, 0xC0000000),
+        )
+        self.assertEqual(dds.decode_dds(data), (1, 2, bytes((255, 128, 64, 255, 0, 128, 255, 85))))
+
     def test_pitch_errors_are_reported(self):
         header = dict(flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=28)
         with self.assertRaisesRegex(dds.DdsError, "pitch"):
