@@ -8,23 +8,72 @@ scanning back from the first s_endpgm to the start that decodes with no invalid 
 Usage:
     python -I shader_disasm.py <fssm dir or file> [--out DIR] [--mcpu gfx1013] [--limit N]
 Writes <out>/<name>.s and prints a summary (decoded cleanly / with invalid words / failed).
+Set LLVM_MC to llvm-mc's path, or to a whole command such as
+'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH.
 """
 import argparse
 import os
+import shlex
 import struct
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-LLVM_MC = os.environ.get("LLVM_MC", "llvm-mc")
+TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
+PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
+FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
+
+
+def split_command(raw: str) -> list:
+    """Split LLVM_MC without eating the backslashes of a Windows path (POSIX shlex would)."""
+    if os.name != "nt":
+        return shlex.split(raw)
+    parts = shlex.split(raw, posix=False)
+    return [p[1:-1] if len(p) > 1 and p[0] == p[-1] == '"' else p for p in parts]
+
+
+def mc_command() -> list:
+    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'."""
+    raw = os.environ.get("LLVM_MC", "llvm-mc").strip()
+    if os.path.isfile(raw):
+        return [raw]                    # a plain path, spaces and all
+    return split_command(raw) or ["llvm-mc"]
+
+
+MC = mc_command()
+
+
+def fail(msg: str) -> "None":
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def probe(mcpu: str) -> None:
+    """Disassemble one s_endpgm first, so a missing tool or AMDGPU target fails now and not per shader."""
+    try:
+        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}"],
+                           input=PROBE, capture_output=True, text=True,
+                           creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+    except OSError as e:
+        fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it, e.g.\n"
+             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+    if p.returncode != 0 or "s_endpgm" not in p.stdout:
+        why = (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[0]
+        fail(f"'{' '.join(MC)}' did not disassemble an s_endpgm: {why}\n"
+             f"The disassembler needs LLVM 21+ with the AMDGPU target. The official Windows LLVM build has no\n"
+             f"AMDGPU target; run it from WSL instead (docs/design.md, 'Disassembling shaders'), e.g.\n"
+             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
 def disasm(code: bytes, mcpu: str):
     text = " ".join(f"0x{b:02x}" for b in code)
-    p = subprocess.run([LLVM_MC, "--disassemble", "-triple=amdgcn--amdpal", f"-mcpu={mcpu}", "-show-encoding"],
-                       input=text, capture_output=True, text=True,
-                       creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+    try:
+        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
+                           input=text, capture_output=True, text=True,
+                           creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+    except OSError as e:
+        return "", 0, str(e)
     bad = p.stderr.count("invalid instruction encoding")
     return p.stdout, bad, p.stderr
 
@@ -61,6 +110,10 @@ def one(path, out, mcpu):
             return "scan failed"
         start = best
     asm, bad, err = disasm(b[start:end], mcpu)
+    if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
+        reason = (err.strip().splitlines() or ["no output"])[0]
+        FAILED.append((path, reason))
+        return "failed"
     name = os.path.splitext(os.path.basename(path))[0]
     with open(os.path.join(out, name + ".s"), "w", encoding="utf-8") as f:
         f.write(f"; {name}  code 0x{start:x}..0x{end:x} ({how}), {mcpu}, {bad} invalid words\n")
@@ -83,10 +136,18 @@ def main():
     files = files[: a.limit] if a.limit else files
     out = a.out or os.path.join(os.path.dirname(files[0]), "..", "disasm")
     os.makedirs(out, exist_ok=True)
+    if files:
+        probe(a.mcpu)
     from collections import Counter
     with ThreadPoolExecutor(a.jobs) as ex:
         res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))
     print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
+    if FAILED:
+        path, reason = FAILED[0]
+        print(f"ERROR: {len(FAILED)} shader(s) produced no disassembly, first {os.path.basename(path)}: {reason}",
+              file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

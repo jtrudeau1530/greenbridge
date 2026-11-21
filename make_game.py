@@ -70,11 +70,19 @@ def py(tool: str, *args) -> None:
     run([sys.executable, "-I", os.path.join(TOOLS, tool), *args])
 
 
+def tool_available(cmd: str) -> bool:
+    """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-21/bin/llvm-mc'."""
+    cmd = cmd.strip().strip('"')
+    if os.path.isfile(cmd):
+        return True
+    head = cmd.split()[0].strip('"') if cmd.split() else ""
+    return bool(head and (shutil.which(head) or os.path.isfile(head)))
+
+
 def need(exe: str, hint: str) -> str:
-    path = shutil.which(exe)
-    if not path:
+    if not tool_available(exe):
         fail(f"'{exe}' was not found on PATH. {hint}")
-    return path
+    return exe
 
 
 # ---------------------------------------------------------------- check
@@ -197,8 +205,11 @@ def preflight(stages: list, work: str) -> None:
         missing.append("Python 3.11 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
         llvm = os.environ.get("LLVM_MC", "llvm-mc")
-        if not (shutil.which(llvm) or os.path.isfile(llvm)):
-            missing.append("llvm-mc (LLVM 21+): https://github.com/llvm/llvm-project/releases, or set LLVM_MC")
+        if not tool_available(llvm):
+            missing.append(
+                "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
+                "target: install llvm-21 in WSL and set LLVM_MC to the whole command, e.g. "
+                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)")
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")

@@ -221,8 +221,17 @@ other blockers are mesh shaders (9,282, which need a mesh-stage entry model), th
 
 ## Disassembling shaders
 
-The AMDGPU disassembler needs LLVM 21+ (`llvm-mc`; e.g. the `llvm-21` package in WSL, `/usr/lib/llvm-21/bin/llvm-mc`). The
-official Windows LLVM build has no AMDGPU target. Run it inside WSL:
+The AMDGPU disassembler needs LLVM 21+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-21` package
+installs it at `/usr/lib/llvm-21/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
+`llvm-mc.exe`, so on Windows run it from WSL and give `LLVM_MC` the whole command:
+
+```
+set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
+python -I make_game.py --game "D:\path\to\your\package" --stages shaders
+```
+
+`shader_disasm.py` disassembles one `s_endpgm` before starting, so a missing tool or AMDGPU target stops the run
+with that reason instead of writing empty `.s` files. To disassemble by hand inside WSL:
 
 ```
 LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
