@@ -10,6 +10,13 @@ Thanks for helping. A few rules keep the project safe to host:
 - Short excerpts needed to explain a format (a few header bytes, one instruction sequence) are fine in docs and
   comments.
 
+## Before you start
+
+Claim the work in [#156](https://github.com/ItsNotRexed/Leonida/issues/156) first: check its tables and the open
+pull requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID
+in your pull request. When two pull requests overlap anyway, the one that lands first is merged and the other is
+asked to rebase or close. GPU test results go in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
+
 ## Working on the code
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise.
