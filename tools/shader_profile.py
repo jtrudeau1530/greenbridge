@@ -1,11 +1,12 @@
 """Profile the disassembled shader corpus: which RDNA instructions the translator must support.
 
 Usage:
-    python -I shader_profile.py <disasm dir> [--out profile.json]
+    python -I shader_profile.py <disasm dir> [--out profile.json] [--per-shader]
 
 Counts each mnemonic (number of shaders using it and total occurrences), groups them by encoding family,
 classifies instructions (ALU vs memory vs branch), computes operation ratios, tracks register footprints,
-and lists the dwords LLVM couldn't decode (likely Xbox-specific instructions) with how many shaders contain them.
+summarises register pressure per stage (VGPR/SGPR counts from `profile_shader`; `--per-shader` also lists
+every shader), and lists the dwords LLVM couldn't decode (likely Xbox-specific instructions) with how many shaders contain them.
 """
 import argparse
 import json
@@ -187,14 +188,40 @@ def profile_shader(text: str) -> dict:
     }
 
 
+def register_summary(reg_stage) -> dict:
+    """Per-stage VGPR/SGPR pressure from (vgpr_count, sgpr_count) pairs: max, mean and a VGPR histogram.
+
+    The histogram buckets are upper bounds on the VGPR count (wave32 RDNA2 allocates in blocks of 8 and caps a
+    wave at 256), so the counts show how many shaders fit each occupancy step."""
+    out = {}
+    for stage in sorted(reg_stage):
+        pairs = reg_stage[stage]
+        if not pairs:
+            continue
+        v = [p[0] for p in pairs]
+        s = [p[1] for p in pairs]
+        hist = Counter()
+        for c in v:
+            hist[next(b for b in (32, 64, 128, 256) if c <= b) if c <= 256 else ">256"] += 1
+        out[stage] = {"shaders": len(pairs),
+                      "vgpr_max": max(v), "vgpr_mean": round(sum(v) / len(v), 2),
+                      "sgpr_max": max(s), "sgpr_mean": round(sum(s) / len(s), 2),
+                      "vgpr_hist": {str(k): hist[k] for k in (32, 64, 128, 256, ">256") if hist[k]}}
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--out")
+    ap.add_argument("--per-shader", action="store_true",
+                    help="also list each shader's instruction count and VGPR/SGPR footprint")
     a = ap.parse_args()
     occ, users = Counter(), Counter()
     invalid_users = Counter()
     per_stage = defaultdict(Counter)
+    reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
+    shaders = []
     n = 0
     for name in os.listdir(a.src):
         if not name.endswith(".s"):
@@ -204,6 +231,12 @@ def main():
         seen = set()
         with open(os.path.join(a.src, name), encoding="utf-8", errors="replace") as f:
             text = f.read()
+        prof = profile_shader(text)
+        regs = prof["registers"]
+        reg_stage[stage].append((regs["vgpr_count"], regs["sgpr_count"]))
+        if a.per_shader:
+            shaders.append({"name": name[:-2], "stage": stage, "instructions": prof["total_instructions"],
+                            "vgpr_count": regs["vgpr_count"], "sgpr_count": regs["sgpr_count"]})
         for line in text.splitlines():
             if not line.startswith("\t"):
                 continue
@@ -225,7 +258,10 @@ def main():
            "families": {k: {"mnemonics": v[0], "occurrences": v[1]} for k, v in sorted(fam.items())},
            "categories": cats,
            "ratios": ratios,
-           "by_mnemonic": [{"m": m, "shaders": users[m], "count": occ[m]} for m, _ in users.most_common()]}
+           "by_mnemonic": [{"m": m, "shaders": users[m], "count": occ[m]} for m, _ in users.most_common()],
+           "registers": register_summary(reg_stage)}
+    if a.per_shader:
+        out["per_shader"] = sorted(shaders, key=lambda e: e["name"])
     path = a.out or os.path.join(a.src, "..", "profile.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1)
@@ -239,6 +275,9 @@ def main():
         if total > 0 and cum / total >= 0.99:
             print(f"  {i} mnemonics cover 99% of all instructions")
             break
+    for st, r in out["registers"].items():
+        print(f"  {st:2} registers: VGPR max {r['vgpr_max']} mean {r['vgpr_mean']}, "
+              f"SGPR max {r['sgpr_max']} mean {r['sgpr_mean']} ({r['shaders']} shaders)")
     print("  most widespread:", ", ".join(f"{m} ({users[m]})" for m, _ in users.most_common(12)))
 
 

@@ -321,6 +321,31 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertGreater(ratios["alu_ratio"], 0.0)
         self.assertGreater(ratios["memory_ratio"], 0.0)
 
+        # Register pressure per stage: ps_001 uses v0-v1 and s0-s3, vs_002 uses v0-v3 and no SGPR.
+        regs = data["registers"]
+        self.assertEqual(regs["ps"], {"shaders": 1, "vgpr_max": 2, "vgpr_mean": 2.0, "sgpr_max": 4,
+                                      "sgpr_mean": 4.0, "vgpr_hist": {"32": 1}})
+        self.assertEqual(regs["vs"]["vgpr_max"], 4)
+        self.assertEqual(regs["vs"]["sgpr_max"], 0)
+        self.assertIn("ps registers: VGPR max 2", res.stdout)
+        self.assertNotIn("per_shader", data)
+
+        res = subprocess.run(cmd + ["--per-shader"], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"CLI failed: {res.stderr}")
+        with open(out_json, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["per_shader"], [
+            {"name": "ps_001", "stage": "ps", "instructions": 4, "vgpr_count": 2, "sgpr_count": 4},
+            {"name": "vs_002", "stage": "vs", "instructions": 3, "vgpr_count": 4, "sgpr_count": 0},
+        ])
+
+    def test_register_summary_histogram(self):
+        summary = P.register_summary({"cs": [(10, 4), (40, 8), (100, 20), (300, 2)]})
+        self.assertEqual(summary["cs"]["vgpr_hist"], {"32": 1, "64": 1, "128": 1, ">256": 1})
+        self.assertEqual(summary["cs"]["vgpr_max"], 300)
+        self.assertEqual(summary["cs"]["sgpr_mean"], 8.5)
+        self.assertEqual(P.register_summary({}), {})
+
 
 if __name__ == "__main__":
     unittest.main()
