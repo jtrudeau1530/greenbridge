@@ -374,7 +374,8 @@ This is the least verifiable part of the layer. D3D12 gives the application a ro
 turns it into the user SGPRs (`s0..s31`) that the shader reads. The translator already copies those 32 dwords from
 push constants into `s0..s31`. The layer must produce them.
 
-The default mapping (**Assumption**) follows root parameter order:
+The default mapping (implemented by `rt::rootsig::pack` in `runtime/src/root_signature.{h,cpp}`) follows root
+parameter order:
 
 | Root parameter | User-data dwords |
 |---|---|
@@ -385,6 +386,15 @@ The default mapping (**Assumption**) follows root parameter order:
 
 Before the draw/dispatch, the layer copies the current root arguments into a 32-dword block in that order and
 uploads it as push constants. Missing parameters are zero.
+
+Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
+refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
+`__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
+
+Reconciliation: `tools/root_sig_contract.py` checks a candidate root signature against every shader's
+`user_sgpr_reads` from `spirv/index.json` (const32 vs constant dwords, 64-bit VAs vs view/table pairs) and fails
+the build on the first contradiction. Until the console mapping in §3.5 is confirmed by a PSO, this check — not
+a rendered frame — is the acceptance gate for the mapping above.
 
 **Root-signature flag quirk.** Prior art measured Xbox root-signature descriptors carrying flags `0x03000000`; the
 PC serializer rejects them with `E_INVALIDARG` because its flags live in the low 16 bits. Clear the high byte on a

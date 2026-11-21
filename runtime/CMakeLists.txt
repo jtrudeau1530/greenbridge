@@ -17,6 +17,24 @@ if(WIN32)
   target_compile_definitions(gta6rt_d3d12_xs_rootsig PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(gta6rt_d3d12_xs_rootsig PRIVATE /W4 /permissive- /utf-8)
 
+  # Portable root-signature model + packer to user SGPRs (no d3d12.h, no windows.h).
+  add_library(gta6rt_root_signature STATIC
+    src/root_signature.cpp
+  )
+  target_include_directories(gta6rt_root_signature PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(gta6rt_root_signature PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gta6rt_root_signature PRIVATE /W4 /permissive- /utf-8)
+
+  # Portable contract test: model, packer, canonical codec and RTS0 hypothesis.
+  # Needs neither d3d12.lib nor the game; runs on Windows CI like the rest here.
+  add_executable(root_signature_test
+    test/root_signature_test.cpp
+  )
+  target_link_libraries(root_signature_test PRIVATE gta6rt_root_signature)
+  target_compile_definitions(root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(root_signature_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(root_signature_test PRIVATE /OPT:NOREF)
+
   add_executable(gta6rt
     src/main.cpp
     src/pe_loader.cpp
@@ -56,6 +74,17 @@ if(WIN32)
     target_compile_definitions(root_sig_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(root_sig_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(root_sig_test PRIVATE /OPT:NOREF)
+
+    # RTS0 parser oracle: synthetic descriptors only, serialized by the real PC
+    # d3d12.dll and parsed back by rt::rootsig::parse_rts0. A layout mismatch
+    # fails here with the blob bytes, never silently in a draw.
+    add_executable(root_signature_oracle_test
+      test/root_signature_oracle_test.cpp
+    )
+    target_link_libraries(root_signature_oracle_test PRIVATE gta6rt_root_signature ${D3D12_LIBRARY})
+    target_compile_definitions(root_signature_oracle_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(root_signature_oracle_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(root_signature_oracle_test PRIVATE /OPT:NOREF)
 
     # Xbox-ABI device proxy test: WARP PC device, no game executable. Needs DXGI for the WARP adapter.
     if(DXGI_LIBRARY)
@@ -190,6 +219,12 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+  endif()
+  if(WIN32 AND TARGET root_signature_test)
+    add_test(NAME root_signature COMMAND root_signature_test)
+  endif()
+  if(WIN32 AND TARGET root_signature_oracle_test)
+    add_test(NAME root_signature_oracle COMMAND root_signature_oracle_test)
   endif()
 endif()
 
