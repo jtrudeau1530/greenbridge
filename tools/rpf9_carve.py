@@ -37,10 +37,19 @@ def main() -> int:
     ap.add_argument("--index-only", action="store_true")
     a = ap.parse_args()
     below_normal()
+    try:
+        size = os.path.getsize(a.archive)
+    except OSError as e:
+        sys.exit(f"{a.archive}: {e.strerror or e}")
+    if size == 0:
+        sys.exit(f"{a.archive}: empty file")
+    if size < 8:
+        sys.exit(f"{a.archive}: too short for an RPF9 header ({size} bytes)")
+    if a.start is not None and not 0 <= a.start < size:
+        sys.exit(f"{a.archive}: --start {a.start} is outside the file (0..{size - 1})")
     os.makedirs(a.out, exist_ok=True)
     with open(a.archive, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        size = len(m)
         pos = a.start if a.start is not None else struct.unpack_from("<I", m, 4)[0]
         end = min(size, pos + a.limit) if a.limit else size
         rows, last, unread, zero = [], pos, 0, 0
