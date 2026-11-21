@@ -7,6 +7,8 @@
 #include <d3d12.h>
 
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 #include "d3d12_xs_rootsig.h"
 #include "shims.h"
@@ -210,6 +212,74 @@ void test_registered_shim() {
           "registered shim leaves the caller's 1.2 descriptor unchanged");
 }
 
+void test_deserializer() {
+    // A blob whose RTS0 flags carry the Xbox high byte is rejected by the host
+    // deserializer; the shim clears the byte on a copy and succeeds.
+    D3D12_ROOT_SIGNATURE_DESC desc = make_legacy_desc(0);
+    Blobs blobs;
+    HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blobs.blob, &blobs.error);
+    check(SUCCEEDED(hr), "serialize a clean legacy root signature for the deserializer test");
+    if (FAILED(hr) || !blobs.blob) return;
+
+    const uint8_t* bytes = static_cast<const uint8_t*>(blobs.blob->GetBufferPointer());
+    const SIZE_T size = blobs.blob->GetBufferSize();
+
+    std::vector<uint8_t> tampered(bytes, bytes + size);
+    uint32_t chunk_count = 0;
+    std::memcpy(&chunk_count, bytes + 28, sizeof(chunk_count));
+    bool found_rts0 = false;
+    for (uint32_t i = 0; i < chunk_count; ++i) {
+        uint32_t off = 0;
+        std::memcpy(&off, bytes + 32 + i * 4, sizeof(off));
+        if (off > size || size - off < 8 + 24) continue;
+        if (std::memcmp(bytes + off, "RTS0", 4) != 0) continue;
+        uint32_t flags = 0;
+        std::memcpy(&flags, bytes + off + 8 + 20, sizeof(flags));
+        check(flags == 0, "clean RTS0 flags are zero before tampering");
+        std::memcpy(tampered.data() + off + 8 + 20, &kXboxFlags, sizeof(kXboxFlags));
+        found_rts0 = true;
+    }
+    check(found_rts0, "RTS0 chunk found in the serialized blob");
+    if (!found_rts0) return;
+
+    std::vector<uint8_t> cleared;
+    const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(tampered.data(), tampered.size(), cleared);
+    check(rewritten, "blob helper reports a rewrite for the Xbox high byte");
+    if (rewritten) {
+        uint32_t cleared_flags = 0;
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            uint32_t off = 0;
+            std::memcpy(&off, cleared.data() + 32 + i * 4, sizeof(off));
+            if (off > cleared.size() || cleared.size() - off < 8 + 24) continue;
+            if (std::memcmp(cleared.data() + off, "RTS0", 4) == 0) {
+                std::memcpy(&cleared_flags, cleared.data() + off + 8 + 20, sizeof(cleared_flags));
+            }
+        }
+        check(cleared_flags == 0, "blob helper cleared the Xbox high byte");
+    }
+
+    {
+        ID3D12RootSignatureDeserializer* direct = nullptr;
+        hr = D3D12CreateRootSignatureDeserializer(tampered.data(), tampered.size(), IID_PPV_ARGS(&direct));
+        check(FAILED(hr), "host deserializer rejects the Xbox high byte");
+    }
+
+    using DeserializeFn = HRESULT(WINAPI*)(const void*, SIZE_T, REFIID, void**);
+    auto deserialize = reinterpret_cast<DeserializeFn>(
+        rt::shims::find("d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer"));
+    check(deserialize != nullptr, "shim registry exposes d3d12_xs!D3D12CreateRootSignatureDeserializer");
+    if (!deserialize) return;
+
+    ID3D12RootSignatureDeserializer* shim_de = nullptr;
+    hr = deserialize(tampered.data(), tampered.size(), IID_PPV_ARGS(&shim_de));
+    check(SUCCEEDED(hr), "shim deserializer clears the Xbox high byte and succeeds");
+    if (SUCCEEDED(hr) && shim_de) {
+        const D3D12_ROOT_SIGNATURE_DESC* d = shim_de->GetRootSignatureDesc();
+        check(d->Flags == 0, "shim deserializer returns flags with the high byte cleared");
+        shim_de->Release();
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -220,6 +290,7 @@ int main() {
     test_legacy_entry_point();
     test_preserves_low_bits_and_unknown_versions();
     test_registered_shim();
+    test_deserializer();
     std::printf("root_sig_test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
