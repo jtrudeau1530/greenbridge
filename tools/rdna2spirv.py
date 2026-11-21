@@ -112,6 +112,14 @@ class Gen:
         self.ms = None             # MS: {"maxv", "maxp", "threads"} from PSV0
         self.ms_params = set()     # MS: param export indices used
         self.ms_alloc = False      # MS: s_sendmsg GS_ALLOC_REQ seen
+        self.pos_map = {}          # VS/MS: pos index (1..3) -> {comp: ("clip"|"cull", idx)} from OSG1
+        self.pos_misc = set()      # VS: misc system values in pos1 (4=Layer, 5=ViewportIndex) from OSG1
+        self.clip_count = 0        # ClipDistance array length (1..8)
+        self.cull_count = 0        # CullDistance array length (1..8)
+        self.uses_clip = False     # True once a pos1+ export writes a ClipDistance slot
+        self.uses_cull = False     # True once a pos1+ export writes a CullDistance slot
+        self.uses_layer = False    # VS: True once pos1 misc writes BuiltIn Layer
+        self.uses_viewport = False # VS: True once pos1 misc writes BuiltIn ViewportIndex
         self.gs = None             # GS: {"in": [(reg, sv)], "out": [(reg, sv)], "nreg": n, "maxv": n}
         self.wave64 = False        # compiled for 64-lane waves (64-bit EXEC writes, exec_hi, v_mbcnt_hi, ...)
         self.uses_storage3d = False
@@ -4353,7 +4361,38 @@ class Gen:
             self.emit("OpStore %ms_has_prim " + hs)
             return
         if tgt.startswith("pos") and tgt != "pos0":
-            return                      # pos1+ (clip/cull distances, point size): not modelled yet
+            if "compr" in ins["mods"]:
+                raise Unsupported("mesh compressed export")
+            pidx = int(tgt[3:])
+            mapping = self.pos_map.get(pidx)
+            if not mapping:
+                return
+            wrote = False
+            for comp, (kind, idx) in sorted(mapping.items()):
+                if comp >= len(srcs):
+                    continue
+                x = srcs[comp]
+                if x["k"] == "special" and x["t"] == "off":
+                    continue
+                fval = self.src_f(x)
+                if kind == "clip":
+                    self.uses_clip = True
+                    var = "%ms_clip"
+                else:
+                    self.uses_cull = True
+                    var = "%ms_cull_dist"
+                ptr, old, sel = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{ptr} = OpAccessChain %_ptr_Function_float {var} {self.cu(idx)}")
+                self.emit(f"{old} = OpLoad %float {ptr}")
+                self.emit(f"{sel} = OpSelect %float {act} {fval} {old}")
+                self.emit(f"OpStore {ptr} {sel}")
+                wrote = True
+            if wrote:
+                hv, hs = self.tmp(), self.tmp()
+                self.emit(f"{hv} = OpLoad %bool %ms_has_vtx")
+                self.emit(f"{hs} = OpLogicalOr %bool {hv} {act}")
+                self.emit("OpStore %ms_has_vtx " + hs)
+            return
         if not (tgt == "pos0" or tgt.startswith("param")):
             raise Unsupported(f"mesh export {tgt}")
         if "compr" in ins["mods"]:
@@ -4381,6 +4420,56 @@ class Gen:
             return
         if self.stage == "ms":
             return self.ms_export(tgt, ins)
+        if tgt.startswith("pos") and tgt != "pos0" and self.stage == "vs":
+            srcs = a[1:5]
+            if all(x["k"] == "special" and x["t"] == "off" for x in srcs):
+                return
+            pidx = int(tgt[3:])
+            act = self.active_b()
+            if pidx == 1 and self.pos_misc:
+                # GFX9+ misc vector at pos1: z[10:0] = Layer, z[19:16] = ViewportIndex.
+                if len(srcs) >= 3 and not (srcs[2]["k"] == "special" and srcs[2]["t"] == "off"):
+                    z = self.src_u(srcs[2])
+                    if 4 in self.pos_misc:
+                        self.uses_layer = True
+                        lu, li, old, sel = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{lu} = OpBitwiseAnd %uint {z} {self.cu(0x7FF)}")
+                        self.emit(f"{li} = OpBitcast %int {lu}")
+                        self.emit(f"{old} = OpLoad %int %out_layer")
+                        self.emit(f"{sel} = OpSelect %int {act} {li} {old}")
+                        self.emit(f"OpStore %out_layer {sel}")
+                    if 5 in self.pos_misc:
+                        self.uses_viewport = True
+                        vs_, vu, vi, old, sel = self.tmp(), self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{vs_} = OpShiftRightLogical %uint {z} {self.cu(16)}")
+                        self.emit(f"{vu} = OpBitwiseAnd %uint {vs_} {self.cu(0xF)}")
+                        self.emit(f"{vi} = OpBitcast %int {vu}")
+                        self.emit(f"{old} = OpLoad %int %out_viewport")
+                        self.emit(f"{sel} = OpSelect %int {act} {vi} {old}")
+                        self.emit(f"OpStore %out_viewport {sel}")
+                return
+            mapping = self.pos_map.get(pidx)
+            if not mapping:
+                return
+            for comp, (kind, idx) in sorted(mapping.items()):
+                if comp >= len(srcs):
+                    continue
+                x = srcs[comp]
+                if x["k"] == "special" and x["t"] == "off":
+                    continue
+                fval = self.src_f(x)
+                if kind == "clip":
+                    self.uses_clip = True
+                    var = "%out_clip"
+                else:
+                    self.uses_cull = True
+                    var = "%out_cull"
+                ptr, old, sel = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{ptr} = OpAccessChain %_ptr_Output_float {var} {self.cu(idx)}")
+                self.emit(f"{old} = OpLoad %float {ptr}")
+                self.emit(f"{sel} = OpSelect %float {act} {fval} {old}")
+                self.emit(f"OpStore {ptr} {sel}")
+            return
         comps = []
         if "compr" in ins["mods"]:
             # Compressed export: two registers, each holding two f16 values (x,y) and (z,w). LLVM lists each register
@@ -4466,8 +4555,9 @@ def assemble(gen):
     ms = gen.stage == "ms"
     gsx = gen.stage == "gs"
     model = "Vertex" if vs else "GLCompute" if cs else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
+    ms_blk = ms and (gen.uses_clip or gen.uses_cull)
     iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
-        (["%wg_id", "%num_wg", "%local_index", "%ms_counts", "%ms_out_pos", "%ms_prim_idx", "%ms_cull"] +
+        (["%wg_id", "%num_wg", "%local_index", "%ms_counts", ("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)]) if ms else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         ((["%fmt_uint_mask", "%fmt_sint_mask"] +
@@ -4483,6 +4573,15 @@ def assemble(gen):
         iface += ["%sg_lane"]
     if gen.writes_depth:
         iface += ["%out_depth"]
+    if vs:
+        if gen.uses_clip:
+            iface += ["%out_clip"]
+        if gen.uses_cull:
+            iface += ["%out_cull"]
+        if gen.uses_layer:
+            iface += ["%out_layer"]
+        if gen.uses_viewport:
+            iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"]
     bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values())
     if gen.frag_inputs:
@@ -4512,6 +4611,14 @@ def assemble(gen):
         caps.append("Geometry")
     if ms:
         caps.append("MeshShadingEXT")
+    if gen.uses_clip:
+        caps.append("ClipDistance")
+    if gen.uses_cull:
+        caps.append("CullDistance")
+    if gen.uses_layer:
+        caps.append("ShaderLayer")
+    if gen.uses_viewport:
+        caps.append("ShaderViewportIndex")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if bary:
@@ -4552,13 +4659,35 @@ def assemble(gen):
             dec.append("OpDecorate %gs_in_pos BuiltIn Position" if sv == 1 else f"OpDecorate %gs_in{r} Location {r}")
         for r, sv in gen.gs["out"]:
             dec.append("OpDecorate %gs_out_pos BuiltIn Position" if sv == 1 else f"OpDecorate %gs_out{r} Location {r}")
+    ms_clip_member = ms_cull_member = None
     if ms:
         dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %num_wg BuiltIn NumWorkgroups",
-                "OpDecorate %local_index BuiltIn LocalInvocationIndex",
-                "OpDecorate %ms_out_pos BuiltIn Position",
-                "OpDecorate %ms_prim_idx BuiltIn PrimitiveTriangleIndicesEXT",
+                "OpDecorate %local_index BuiltIn LocalInvocationIndex"]
+        if ms_blk:
+            dec += ["OpDecorate %ms_vtx_blk Block", "OpMemberDecorate %ms_vtx_blk 0 BuiltIn Position"]
+            mi = 1
+            if gen.uses_clip:
+                dec.append(f"OpMemberDecorate %ms_vtx_blk {mi} BuiltIn ClipDistance")
+                ms_clip_member = mi
+                mi += 1
+            if gen.uses_cull:
+                dec.append(f"OpMemberDecorate %ms_vtx_blk {mi} BuiltIn CullDistance")
+                ms_cull_member = mi
+                mi += 1
+        else:
+            dec.append("OpDecorate %ms_out_pos BuiltIn Position")
+        dec += ["OpDecorate %ms_prim_idx BuiltIn PrimitiveTriangleIndicesEXT",
                 "OpDecorate %ms_cull BuiltIn CullPrimitiveEXT", "OpDecorate %ms_cull PerPrimitiveEXT"]
         dec += [f"OpDecorate %ms_out_param{n} Location {n}" for n in sorted(gen.ms_params)]
+    if vs:
+        if gen.uses_clip:
+            dec.append("OpDecorate %out_clip BuiltIn ClipDistance")
+        if gen.uses_cull:
+            dec.append("OpDecorate %out_cull BuiltIn CullDistance")
+        if gen.uses_layer:
+            dec.append("OpDecorate %out_layer BuiltIn Layer")
+        if gen.uses_viewport:
+            dec.append("OpDecorate %out_viewport BuiltIn ViewportIndex")
     for name, tgt in gen.outputs.items():
         if name == "%out_pos":
             dec.append("OpDecorate %out_pos BuiltIn Position")
@@ -4643,6 +4772,16 @@ def assemble(gen):
         gen.consts.setdefault(3, "%c3")
     if vs:
         gen.consts.setdefault(3, "%c3")              # the instance index goes to v3
+    if gen.uses_clip:
+        gen.cu(gen.clip_count)
+    if gen.uses_cull:
+        gen.cu(gen.cull_count)
+    if ms_blk:
+        gen.cu(0)
+        if ms_clip_member is not None:
+            gen.cu(ms_clip_member)
+        if ms_cull_member is not None:
+            gen.cu(ms_cull_member)
     gen.consts.setdefault(0, "%c0")
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
@@ -4715,10 +4854,29 @@ def assemble(gen):
                   "%_ptr_Function_v4_ms = OpTypePointer Function %v4float",
                   "%_ptr_Function_bool_ms = OpTypePointer Function %bool",
                   "%null_v4_ms = OpConstantNull %v4float"]
+        if ms_blk:
+            types += ["%_ptr_Function_float = OpTypePointer Function %float"]
+            blk_fields = ["%v4float"]
+            if gen.uses_clip:
+                types += [f"%ms_arr_clip = OpTypeArray %float {gen.cu(gen.clip_count)}",
+                          "%_ptr_Fn_ms_clip = OpTypePointer Function %ms_arr_clip",
+                          "%_ptr_Out_ms_clip = OpTypePointer Output %ms_arr_clip",
+                          "%null_ms_clip = OpConstantNull %ms_arr_clip"]
+                blk_fields.append("%ms_arr_clip")
+            if gen.uses_cull:
+                types += [f"%ms_arr_cull_d = OpTypeArray %float {gen.cu(gen.cull_count)}",
+                          "%_ptr_Fn_ms_cull_d = OpTypePointer Function %ms_arr_cull_d",
+                          "%_ptr_Out_ms_cull_d = OpTypePointer Output %ms_arr_cull_d",
+                          "%null_ms_cull_d = OpConstantNull %ms_arr_cull_d"]
+                blk_fields.append("%ms_arr_cull_d")
+            types += [f"%ms_vtx_blk = OpTypeStruct {' '.join(blk_fields)}",
+                      f"%ms_arr_vtx_blk = OpTypeArray %ms_vtx_blk {maxv}",
+                      "%_ptr_Out_ms_arr_vtx_blk = OpTypePointer Output %ms_arr_vtx_blk"]
         gvars += ["%wg_id = OpVariable %_ptr_Input_v3u Input", "%num_wg = OpVariable %_ptr_Input_v3u Input",
                   "%local_index = OpVariable %_ptr_Input_uint_ms Input",
                   "%ms_counts = OpVariable %_ptr_WG_uint_ms Workgroup",
-                  "%ms_out_pos = OpVariable %_ptr_Out_ms_arr_v4 Output",
+                  ("%ms_out_vtx = OpVariable %_ptr_Out_ms_arr_vtx_blk Output" if ms_blk else
+                   "%ms_out_pos = OpVariable %_ptr_Out_ms_arr_v4 Output"),
                   "%ms_prim_idx = OpVariable %_ptr_Out_ms_arr_idx Output",
                   "%ms_cull = OpVariable %_ptr_Out_ms_arr_cull Output"]
         gvars += [f"%ms_out_param{n} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in sorted(gen.ms_params)]
@@ -4755,6 +4913,23 @@ def assemble(gen):
         types += ["%_ptr_Output_float = OpTypePointer Output %float"]
         dec += ["OpDecorate %out_depth BuiltIn FragDepth"]
         gvars += ["%out_depth = OpVariable %_ptr_Output_float Output"]
+    if vs:
+        if gen.uses_clip or gen.uses_cull:
+            types += ["%_ptr_Output_float = OpTypePointer Output %float"]
+        if gen.uses_clip:
+            types += [f"%arr_clip = OpTypeArray %float {gen.cu(gen.clip_count)}",
+                      "%_ptr_Out_arr_clip = OpTypePointer Output %arr_clip"]
+            gvars += ["%out_clip = OpVariable %_ptr_Out_arr_clip Output"]
+        if gen.uses_cull:
+            types += [f"%arr_cull = OpTypeArray %float {gen.cu(gen.cull_count)}",
+                      "%_ptr_Out_arr_cull = OpTypePointer Output %arr_cull"]
+            gvars += ["%out_cull = OpVariable %_ptr_Out_arr_cull Output"]
+        if gen.uses_layer or gen.uses_viewport:
+            types += ["%_ptr_Output_int = OpTypePointer Output %int"]
+            if gen.uses_layer:
+                gvars += ["%out_layer = OpVariable %_ptr_Output_int Output"]
+            if gen.uses_viewport:
+                gvars += ["%out_viewport = OpVariable %_ptr_Output_int Output"]
     gvars += [f"{n} = OpVariable %_ptr_Input_v4 Input" for n in gen.inputs]
     if sg:
         gvars += ["%sg_lane = OpVariable %_ptr_Input_uint Input"]
@@ -4820,6 +4995,8 @@ def assemble(gen):
                    "%ms_prim = OpVariable %_ptr_Function_uint Function %c0",
                    "%ms_has_vtx = OpVariable %_ptr_Function_bool_ms Function %false",
                    "%ms_has_prim = OpVariable %_ptr_Function_bool_ms Function %false"] + \
+            (["%ms_clip = OpVariable %_ptr_Fn_ms_clip Function %null_ms_clip"] if gen.uses_clip else []) + \
+            (["%ms_cull_dist = OpVariable %_ptr_Fn_ms_cull_d Function %null_ms_cull_d"] if gen.uses_cull else []) + \
             [f"%ms_param{n} = OpVariable %_ptr_Function_v4_ms Function %null_v4_ms" for n in sorted(gen.ms_params)]
         # v5 = workgroup index (linear), s3 = merged-wave info with the wave id in [27:24].
         fn += ["%wgi = OpLoad %v3uint %wg_id", "%nwg = OpLoad %v3uint %num_wg", "%lidx = OpLoad %uint %local_index",
@@ -4954,8 +5131,18 @@ def assemble(gen):
              "%mwv = OpLogicalAnd %bool %mhv %mvi",
              "OpSelectionMerge %ms_vend None", "OpBranchConditional %mwv %ms_vdo %ms_vend",
              "%ms_vdo = OpLabel",
-             "%mpv = OpLoad %v4float %ms_pos", "%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_pos %mli",
+             "%mpv = OpLoad %v4float %ms_pos",
+             ("%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_vtx %mli %c0" if ms_blk else
+              "%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_pos %mli"),
              "OpStore %mpp %mpv"]
+        if gen.uses_clip:
+            L += ["%mcv = OpLoad %ms_arr_clip %ms_clip",
+                  f"%mcvp = OpAccessChain %_ptr_Out_ms_clip %ms_out_vtx %mli {c(ms_clip_member)}",
+                  "OpStore %mcvp %mcv"]
+        if gen.uses_cull:
+            L += ["%mkv = OpLoad %ms_arr_cull_d %ms_cull_dist",
+                  f"%mkvp = OpAccessChain %_ptr_Out_ms_cull_d %ms_out_vtx %mli {c(ms_cull_member)}",
+                  "OpStore %mkvp %mkv"]
         for n in sorted(gen.ms_params):
             L += [f"%mq{n} = OpLoad %v4float %ms_param{n}",
                   f"%mqp{n} = OpAccessChain %_ptr_Out_v4_ms %ms_out_param{n} %mli", f"OpStore %mqp{n} %mq{n}"]
@@ -5173,6 +5360,82 @@ def output_signature(path, name):
     return []
 
 
+def output_signature_full(path, name):
+    """OSG1 elements as (register, semantic_index, system_value, mask, rw_mask)."""
+    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
+    if not os.path.isfile(dxbc):
+        return []
+    d = open(dxbc, "rb").read()
+    for k in range(struct.unpack_from("<I", d, 28)[0]):
+        off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
+        if d[off:off + 4] == b"OSG1":
+            p = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
+            cnt, eo = struct.unpack_from("<II", p, 0)
+            out = []
+            for i in range(cnt):
+                e = p[eo + 32 * i:eo + 32 * i + 32]
+                _, _, sem_idx, sysv, _, reg = struct.unpack_from("<6I", e, 0)
+                out.append((reg, sem_idx, sysv, e[24], e[25]))
+            return out
+    return []
+
+
+def pos_export_layout(osg1, insns):
+    """Map RDNA/GFX10 pos1..pos3 export components to BuiltIn ClipDistance / CullDistance (and misc).
+
+    Hardware ABI (Mesa src/amd/common/nir/ac_nir_prerast_utils.c: ac_nir_export_position;
+    AMD LLPC lgc/lowering/LowerInOut.cpp: LowerInOut::visitReturnInst):
+      - pos0 = SV_Position
+      - if any misc output (PointSize / EdgeFlag / ShadingRate / Layer / ViewportIndex) is active,
+        pos1 holds the misc vector (z[10:0] = Layer, z[19:16] = ViewportIndex on GFX9+) and
+        clip/cull distances start at pos2; otherwise clip/cull distances start at pos1.
+      - clip distances precede cull distances, packed contiguously into 4-component pos exports (<= 8 total).
+    Contrasted with DXBC OSG1 (D3D_NAME: 2=SV_ClipDistance, 3=SV_CullDistance,
+    4=SV_RenderTargetArrayIndex, 5=SV_ViewportArrayIndex, 23=SV_ShadingRate).
+    When OSG1 is absent, infer contiguous ClipDistance slots from non-off pos1..pos2 exports.
+    """
+    misc_svs = {sv for _, _, sv, _, _ in osg1 if sv in (4, 5, 23)}
+    has_misc = bool(misc_svs)
+    clip_elems = sorted((sem, reg, mask) for reg, sem, sv, mask, _ in osg1 if sv == 2)
+    cull_elems = sorted((sem, reg, mask) for reg, sem, sv, mask, _ in osg1 if sv == 3)
+    slots = []
+    clip_n = 0
+    for _, _, mask in clip_elems:
+        for c in range(4):
+            if (mask >> c) & 1:
+                slots.append(("clip", clip_n))
+                clip_n += 1
+    cull_n = 0
+    for _, _, mask in cull_elems:
+        for c in range(4):
+            if (mask >> c) & 1:
+                slots.append(("cull", cull_n))
+                cull_n += 1
+    if not osg1:
+        used = set()
+        for ins in insns:
+            if base_op(ins["op"]) != "exp":
+                continue
+            a = ins["args"]
+            tgt = a[0]["t"] if a and a[0]["k"] in ("target", "special") else ""
+            if tgt in ("pos1", "pos2"):
+                p = int(tgt[3:])
+                for c, x in enumerate(a[1:5]):
+                    if not (x["k"] == "special" and x["t"] == "off"):
+                        used.add((p - 1) * 4 + c)
+        if used:
+            clip_n = min(max(used) + 1, 8)
+            slots = [("clip", i) for i in range(clip_n)]
+    base_pos = 2 if has_misc else 1
+    pos_map = {}
+    for k, target in enumerate(slots[:8]):
+        p = base_pos + k // 4
+        pos_map.setdefault(p, {})[k % 4] = target
+    clip_n = min(clip_n, 8)
+    cull_n = min(cull_n, max(0, 8 - clip_n))
+    return pos_map, misc_svs, clip_n, cull_n
+
+
 def mesh_psv(path, name):
     """PSV0 runtime info of a mesh shader: MSInfo (GroupSharedBytesUsed, GroupSharedViewIDDependentBytes,
     PayloadSizeInBytes, u16 MaxOutputVertices, u16 MaxOutputPrimitives), wave lane counts, then PSVRuntimeInfo1
@@ -5366,6 +5629,9 @@ def translate(path):
         g.frag_inputs = layout
         for r in layout:
             g.cu(r)
+    if stage in ("vs", "ms"):
+        g.pos_map, g.pos_misc, g.clip_count, g.cull_count = pos_export_layout(
+            output_signature_full(path, info["name"]), insns)
     if stage == "vs" and any(base_op(i["op"]) == "s_swappc_b64" for i in insns):
         # The call goes to a driver-generated fetch program (not in the blob). Verified rule over 788 shaders:
         # input-signature register r, component c is fetched into v(4 + 4r + c). Replace the call with Vulkan
@@ -5552,7 +5818,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "StorageImageReadWithoutFormat": "shaderStorageImageReadWithoutFormat",
              "PhysicalStorageBufferAddresses": "bufferDeviceAddress",
              "RuntimeDescriptorArray": "runtimeDescriptorArray", "ImageGatherExtended": "shaderImageGatherExtended",
-             "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core"}
+             "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
+             "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
+             "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex"}
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),
@@ -5599,7 +5867,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["fssm_sha256"] = fssm_hash
     if g.frag_inputs:
         m["ps_system_inputs"] = sorted({str(c) for c in g.frag_inputs.values()})
-    outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if t != "pos0")
+    outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if not t.startswith("pos"))
     if outs:
         m["outputs"] = outs
     if g.writes_depth:
