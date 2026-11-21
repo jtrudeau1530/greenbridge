@@ -42,6 +42,10 @@ def failure(code, output, lines):
     return f"exit {code}: {details or 'no test output'}"
 
 
+class Skip(str):
+    """A result that is neither a pass nor a failure: the device can't run the test."""
+
+
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None):
     """Return an empty string for a pass, None for unsupported wave64, or a failure diagnostic."""
     shader = os.path.join(spirv, name + ".spv")
@@ -129,6 +133,9 @@ def main():
                                            expected_words=want)))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
+        if code == 77:   # vk_store_test: the device lacks format-less storage image access
+            results.append((name, Skip("SKIP (no format-less storage image read/write on this device)")))
+            continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
     for name in PIXEL_TESTS:
@@ -137,8 +144,8 @@ def main():
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"
         print(f"{name:20} {'ok' if not problem else problem}")
-    failed = sum(bool(p) for _, p in results)
-    skipped = sum(p is None for _, p in results)
+    skipped = sum(p is None or isinstance(p, Skip) for _, p in results)
+    failed = sum(bool(p) for _, p in results) - sum(isinstance(p, Skip) for _, p in results)
     print(f"{len(results) - failed - skipped} of {len(results)} pass, {skipped} skipped")
     return 1 if failed else 0
 

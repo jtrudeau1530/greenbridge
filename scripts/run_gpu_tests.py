@@ -236,14 +236,30 @@ def check_bitmask_perm(raw_path: str) -> tuple[bool, str]:
     px = read_raw_u32(raw_path)
     bad = 0
     first = ""
+    judged = 0
     for i, (lane, v1, v2, v3) in enumerate(px):
+        if lane >= 32:      # wave32 test: in a 64-wide subgroup lanes 32-63 hold values it never wrote
+            continue
+        judged += 1
         w1 = lane ^ 9
         w2 = ((lane & 5) | 16) ^ 1
         if v1 != w1 or v2 != w2 or v3 != 0:
             if not bad:
                 first = f"at ({i%64},{i//64}) lane={lane}: got ({v1},{v2},{v3}), want ({w1},{w2},0)"
             bad += 1
-    return (bad == 0), (first if bad else "4096/4096 pixels exact")
+    return (bad == 0 and judged > 0), (first if bad else f"{judged}/{judged} pixels in lanes 0-31 exact")
+
+
+def check_flat(raw_path: str) -> tuple[bool, str]:
+    """ps_flat with vs_ids: the integer IDs come from the first (provoking) vertex, the UVs still interpolate."""
+    data = open(raw_path, "rb").read()
+    px = list(struct.iter_unpack("<2I2f", data))
+    w = int(len(px) ** 0.5)
+    wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
+    err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
+    ok = wrong == 0 and err < 1e-6
+    return ok, (f"{len(px)} pixels: flat IDs exact, uv within {err:.1g}" if ok else
+                f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}")
 
 
 def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
@@ -408,7 +424,8 @@ def run_suite(a, work: str) -> int:
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
-            rc, msg = run_cmd([vk_harness, vs_tri, spv, raw], env=gfx_env)
+            vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
+            rc, msg = run_cmd([vk_harness, vs, spv, raw], env=gfx_env)
             if rc != 0:
                 results.append((name, False, msg))
                 continue
@@ -419,6 +436,7 @@ def run_suite(a, work: str) -> int:
                 "ps_ops4": (0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00),
                 "ps_scc": (1, 1, 3, 0x80000000),
                 "ps_sdwa": (0x000000F1, 0xFFFEFFF2, 0x3C003344, 0xFFF70000),
+                "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
@@ -428,6 +446,8 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_bitmask_perm(raw)
             elif name == "ps_uniform_branch":
                 ok, detail = check_uniform_branch(raw)
+            elif name == "ps_flat":
+                ok, detail = check_flat(raw)
             else:
                 ok, detail = False, "no checker defined"
             results.append((name, ok, detail))
