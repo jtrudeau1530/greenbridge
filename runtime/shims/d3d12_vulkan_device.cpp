@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <iterator>
 #include <map>
@@ -37,7 +38,7 @@ namespace {
 
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
-constexpr UINT kDescriptorSize = 32;
+constexpr UINT kDescriptorSize = descriptor_size;
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 
 // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
@@ -682,6 +683,7 @@ public:
             in_arena_ = true;
             std::memset(device_.arena.mapped + arena_offset_, 0, std::size_t(desc_.Width));
             va_ = arena_offset_;
+            binding.va = va_;
             binding.buffer = device_.arena.buffer;
             binding.buffer_offset = arena_offset_;
             device_.context->add_resource(id(), binding);
@@ -725,6 +727,7 @@ public:
             log_once("default-heap buffers are not zero-filled yet; dimension", int(desc_.Dimension));
         }
         binding.buffer = buffer_;
+        binding.va = va_;
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -1075,6 +1078,125 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
 };
 
+// DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
+bool vertex_format(DXGI_FORMAT format, VkFormat& out, UINT& bytes) {
+    struct Row {
+        DXGI_FORMAT dxgi;
+        VkFormat vk;
+        UINT bytes;
+    };
+    static constexpr Row rows[] = {
+        {DXGI_FORMAT_R32G32B32A32_FLOAT, VK_FORMAT_R32G32B32A32_SFLOAT, 16},
+        {DXGI_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_UINT, 16},
+        {DXGI_FORMAT_R32G32B32A32_SINT, VK_FORMAT_R32G32B32A32_SINT, 16},
+        {DXGI_FORMAT_R32G32B32_FLOAT, VK_FORMAT_R32G32B32_SFLOAT, 12},
+        {DXGI_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32_UINT, 12},
+        {DXGI_FORMAT_R32G32B32_SINT, VK_FORMAT_R32G32B32_SINT, 12},
+        {DXGI_FORMAT_R32G32_FLOAT, VK_FORMAT_R32G32_SFLOAT, 8},
+        {DXGI_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT, 8},
+        {DXGI_FORMAT_R32G32_SINT, VK_FORMAT_R32G32_SINT, 8},
+        {DXGI_FORMAT_R32_FLOAT, VK_FORMAT_R32_SFLOAT, 4},
+        {DXGI_FORMAT_R32_UINT, VK_FORMAT_R32_UINT, 4},
+        {DXGI_FORMAT_R32_SINT, VK_FORMAT_R32_SINT, 4},
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, 8},
+        {DXGI_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_UNORM, 8},
+        {DXGI_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_SNORM, 8},
+        {DXGI_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_UINT, 8},
+        {DXGI_FORMAT_R16G16B16A16_SINT, VK_FORMAT_R16G16B16A16_SINT, 8},
+        {DXGI_FORMAT_R16G16_FLOAT, VK_FORMAT_R16G16_SFLOAT, 4},
+        {DXGI_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_UNORM, 4},
+        {DXGI_FORMAT_R16G16_SNORM, VK_FORMAT_R16G16_SNORM, 4},
+        {DXGI_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_UINT, 4},
+        {DXGI_FORMAT_R16G16_SINT, VK_FORMAT_R16G16_SINT, 4},
+        {DXGI_FORMAT_R16_FLOAT, VK_FORMAT_R16_SFLOAT, 2},
+        {DXGI_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, 2},
+        {DXGI_FORMAT_R16_UINT, VK_FORMAT_R16_UINT, 2},
+        {DXGI_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 4},
+        {DXGI_FORMAT_R8G8B8A8_SNORM, VK_FORMAT_R8G8B8A8_SNORM, 4},
+        {DXGI_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UINT, 4},
+        {DXGI_FORMAT_R8G8B8A8_SINT, VK_FORMAT_R8G8B8A8_SINT, 4},
+        {DXGI_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, 4},
+        {DXGI_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_UNORM, 2},
+        {DXGI_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_UINT, 2},
+        {DXGI_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, 1},
+        {DXGI_FORMAT_R8_UINT, VK_FORMAT_R8_UINT, 1},
+        {DXGI_FORMAT_R10G10B10A2_UNORM, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4},
+        {DXGI_FORMAT_R10G10B10A2_UINT, VK_FORMAT_A2B10G10R10_UINT_PACK32, 4},
+        {DXGI_FORMAT_R11G11B10_FLOAT, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4},
+    };
+    for (const Row& row : rows)
+        if (row.dxgi == format) {
+            out = row.vk;
+            bytes = row.bytes;
+            return true;
+        }
+    return false;
+}
+
+VkBlendFactor blend_factor(D3D12_BLEND blend) {
+    switch (blend) {
+    case D3D12_BLEND_ZERO: return VK_BLEND_FACTOR_ZERO;
+    case D3D12_BLEND_ONE: return VK_BLEND_FACTOR_ONE;
+    case D3D12_BLEND_SRC_COLOR: return VK_BLEND_FACTOR_SRC_COLOR;
+    case D3D12_BLEND_INV_SRC_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case D3D12_BLEND_SRC_ALPHA: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case D3D12_BLEND_INV_SRC_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case D3D12_BLEND_DEST_ALPHA: return VK_BLEND_FACTOR_DST_ALPHA;
+    case D3D12_BLEND_INV_DEST_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case D3D12_BLEND_DEST_COLOR: return VK_BLEND_FACTOR_DST_COLOR;
+    case D3D12_BLEND_INV_DEST_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case D3D12_BLEND_SRC_ALPHA_SAT: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    case D3D12_BLEND_BLEND_FACTOR: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case D3D12_BLEND_INV_BLEND_FACTOR: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case D3D12_BLEND_SRC1_COLOR: return VK_BLEND_FACTOR_SRC1_COLOR;
+    case D3D12_BLEND_INV_SRC1_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+    case D3D12_BLEND_SRC1_ALPHA: return VK_BLEND_FACTOR_SRC1_ALPHA;
+    case D3D12_BLEND_INV_SRC1_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    case D3D12_BLEND_ALPHA_FACTOR: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+    case D3D12_BLEND_INV_ALPHA_FACTOR: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    default: return VK_BLEND_FACTOR_ONE;
+    }
+}
+
+VkBlendOp blend_op(D3D12_BLEND_OP op) {
+    switch (op) {
+    case D3D12_BLEND_OP_SUBTRACT: return VK_BLEND_OP_SUBTRACT;
+    case D3D12_BLEND_OP_REV_SUBTRACT: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    case D3D12_BLEND_OP_MIN: return VK_BLEND_OP_MIN;
+    case D3D12_BLEND_OP_MAX: return VK_BLEND_OP_MAX;
+    default: return VK_BLEND_OP_ADD;
+    }
+}
+
+// D3D12_COMPARISON_FUNC (NEVER = 1 .. ALWAYS = 8) and D3D12_STENCIL_OP (KEEP = 1 .. DECR = 8) list their values
+// in Vulkan's order, starting at 1 instead of 0.
+VkCompareOp compare_op(D3D12_COMPARISON_FUNC func) {
+    const int value = int(func);
+    return value >= 1 && value <= 8 ? VkCompareOp(value - 1) : VK_COMPARE_OP_ALWAYS;
+}
+VkStencilOp stencil_op(D3D12_STENCIL_OP op) {
+    const int value = int(op);
+    return value >= 1 && value <= 8 ? VkStencilOp(value - 1) : VK_STENCIL_OP_KEEP;
+}
+
+VkStencilOpState stencil_face(const D3D12_DEPTH_STENCILOP_DESC& face, UINT8 read_mask, UINT8 write_mask) {
+    VkStencilOpState state{};
+    state.failOp = stencil_op(face.StencilFailOp);
+    state.passOp = stencil_op(face.StencilPassOp);
+    state.depthFailOp = stencil_op(face.StencilDepthFailOp);
+    state.compareOp = compare_op(face.StencilFunc);
+    state.compareMask = read_mask;
+    state.writeMask = write_mask;
+    return state;
+}
+
+bool equal_semantic(const std::string& a, const char* b) {
+    if (!b || a.size() != std::strlen(b)) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    return true;
+}
+
 class RootSignature final
     : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
 public:
@@ -1104,11 +1226,269 @@ public:
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
-        if (code_bytes_) device_.arena_release(pipeline_.code_base, code_bytes_);
+        if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
+        if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
+        for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
+        if (code_bytes_) device_.arena_release(code_base_, code_bytes_);
     }
 
     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
-    bool compute() const { return registered_; }
+    bool compute() const { return registered_ && !is_graphics_; }
+    bool graphics() const { return registered_ && is_graphics_; }
+
+    // A VS (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the VS's
+    // input signature by semantic name and index: location = the element's register, the translator's rule
+    // (docs/design.md, "Vertex fetch"). Hull, domain and geometry stages, more than one sample, and two stages
+    // that both read their code base are refused with a log. Viewport, scissor, topology, vertex strides, stencil
+    // reference and blend factor are dynamic, set from the list's state at each draw.
+    HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        if (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength) return E_INVALIDARG;
+        if (!device_.arena.mapped) {
+            log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
+            return E_NOTIMPL;
+        }
+        if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.GS.BytecodeLength || desc.StreamOutput.NumEntries) {
+            log_once("graphics pipeline stage not supported yet (hull/domain/geometry/stream output):", 0);
+            return E_NOTIMPL;
+        }
+        if (desc.SampleDesc.Count > 1) {
+            log_once("multisampled graphics pipelines not supported yet; samples", int(desc.SampleDesc.Count));
+            return E_NOTIMPL;
+        }
+        const leonida::ShaderLibrary* library = device_.library();
+        if (!library) return E_FAIL;
+
+        struct Stage {
+            const char* name;
+            VkShaderStageFlagBits bit;
+            const D3D12_SHADER_BYTECODE& code;
+            const leonida::ShaderEntry* entry = nullptr;
+            std::vector<std::uint8_t> fssm;
+        };
+        Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
+        std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
+        const Stage* code_stage = nullptr;
+        for (Stage& stage : stages) {
+            if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
+            stage.fssm = leonida::fssm_program(
+                {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
+            if (stage.fssm.empty()) {
+                log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
+                return E_INVALIDARG;
+            }
+            const std::string hash = leonida::sha256_hex(stage.fssm);
+            stage.entry = library->find(stage.name, hash);
+            if (!stage.entry) {
+                std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                return E_INVALIDARG;
+            }
+            if (stage.entry->binding_count) {
+                std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the bindless set is not implemented yet\n",
+                             stage.entry->name.c_str());
+                return E_NOTIMPL;
+            }
+            if (stage.entry->uses_code_base) {
+                if (code_stage) {
+                    log_once("two stages read their code base; one push-constant slot holds one (question 14)", 0);
+                    return E_NOTIMPL;
+                }
+                code_stage = &stage;
+            }
+            const std::vector<std::uint32_t> words = library->spirv(*stage.entry);
+            if (words.empty()) return E_FAIL;
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = words.size() * 4;
+            module_info.pCode = words.data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
+            modules_.push_back(module);
+            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage = stage.bit;
+            info.module = module;
+            info.pName = "main";
+            stage_infos.push_back(info);
+        }
+
+        // Input layout -> vertex input, by semantic.
+        std::vector<VkVertexInputAttributeDescription> attributes;
+        std::vector<VkVertexInputBindingDescription> bindings;
+        UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+        for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+            const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
+            if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
+            VkFormat format;
+            UINT bytes;
+            if (!vertex_format(element.Format, format, bytes)) {
+                log_once("vertex attribute format not supported yet:", element.Format);
+                return E_INVALIDARG;
+            }
+            const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
+                                    ? (slot_end[element.InputSlot] + 3) / 4 * 4
+                                    : element.AlignedByteOffset;
+            slot_end[element.InputSlot] = offset + bytes;
+            const leonida::SignatureElement* input = nullptr;
+            for (const auto& e : stages[0].entry->input_signature)
+                if (e.system_value == 0 && e.semantic_index == element.SemanticIndex &&
+                    equal_semantic(e.semantic, element.SemanticName))
+                    input = &e;
+            if (!input) continue;  // the shader does not read this element
+            attributes.push_back({input->register_index, element.InputSlot, format, offset});
+            const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+            if (instance && element.InstanceDataStepRate > 1)
+                log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
+            if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
+                graphics_.vertex_slots |= 1u << element.InputSlot;
+                bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
+                                    instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
+            }
+        }
+        for (const auto& e : stages[0].entry->input_signature) {
+            if (e.system_value) continue;
+            const bool fed = std::any_of(attributes.begin(), attributes.end(),
+                                         [&](const auto& a) { return a.location == e.register_index; });
+            if (!fed) {  // D3D12 rejects an input layout that leaves a shader input unfed
+                std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
+                             e.semantic.c_str(), e.semantic_index, e.register_index);
+                return E_INVALIDARG;
+            }
+        }
+        VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        vertex_input.vertexBindingDescriptionCount = std::uint32_t(bindings.size());
+        vertex_input.pVertexBindingDescriptions = bindings.data();
+        vertex_input.vertexAttributeDescriptionCount = std::uint32_t(attributes.size());
+        vertex_input.pVertexAttributeDescriptions = attributes.data();
+
+        VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        switch (desc.PrimitiveTopologyType) {
+        case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+        case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+        case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+        default:
+            log_once("primitive topology type not supported:", desc.PrimitiveTopologyType);
+            return E_INVALIDARG;
+        }
+        if (desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED)
+            log_once("index-buffer strip cuts (primitive restart) are not modelled; value", desc.IBStripCutValue);
+
+        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewport.viewportCount = 1;
+        viewport.scissorCount = 1;
+
+        const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.polygonMode = r.FillMode == D3D12_FILL_MODE_WIREFRAME ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+        raster.cullMode = r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
+                          : r.CullMode == D3D12_CULL_MODE_BACK ? VK_CULL_MODE_BACK_BIT
+                                                               : VK_CULL_MODE_NONE;
+        // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
+        raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+        raster.depthBiasEnable = r.DepthBias || r.SlopeScaledDepthBias != 0.0f;
+        raster.depthBiasConstantFactor = float(r.DepthBias);
+        raster.depthBiasClamp = r.DepthBiasClamp;
+        raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
+        raster.lineWidth = 1.0f;
+        if (!r.DepthClipEnable) log_once("DepthClipEnable = FALSE is not modelled (depth clamp); flag", 0);
+
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        const VkSampleMask sample_mask = desc.SampleMask;
+        multisample.pSampleMask = &sample_mask;
+        multisample.alphaToCoverageEnable = desc.BlendState.AlphaToCoverageEnable;
+
+        const D3D12_DEPTH_STENCIL_DESC& ds = desc.DepthStencilState;
+        VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        depth.depthTestEnable = ds.DepthEnable;
+        depth.depthWriteEnable = ds.DepthEnable && ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+        depth.depthCompareOp = compare_op(ds.DepthFunc);
+        depth.stencilTestEnable = ds.StencilEnable;
+        depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
+        depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
+
+        std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
+        for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
+            const D3D12_RENDER_TARGET_BLEND_DESC& b =
+                desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
+            if (b.LogicOpEnable) log_once("logic ops are not modelled; render target", int(i));
+            blends[i].blendEnable = b.BlendEnable;
+            blends[i].srcColorBlendFactor = blend_factor(b.SrcBlend);
+            blends[i].dstColorBlendFactor = blend_factor(b.DestBlend);
+            blends[i].colorBlendOp = blend_op(b.BlendOp);
+            blends[i].srcAlphaBlendFactor = blend_factor(b.SrcBlendAlpha);
+            blends[i].dstAlphaBlendFactor = blend_factor(b.DestBlendAlpha);
+            blends[i].alphaBlendOp = blend_op(b.BlendOpAlpha);
+            blends[i].colorWriteMask = b.RenderTargetWriteMask & 0xf;  // R, G, B, A in both APIs
+        }
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        blend.attachmentCount = std::uint32_t(blends.size());
+        blend.pAttachments = blends.data();
+
+        graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
+        for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
+            if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
+            graphics_.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
+            if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
+                log_once("render-target format not supported yet:", desc.RTVFormats[i]);
+                return E_INVALIDARG;
+            }
+        }
+        if (desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+            Format f = vulkan_format(desc.DSVFormat, true);
+            if (f.format == VK_FORMAT_D24_UNORM_S8_UINT && !device_.depth_usable(f.format))
+                f.format = VK_FORMAT_D32_SFLOAT_S8_UINT;  // as CreateCommittedResource does
+            graphics_.depth_format = f.format;
+            graphics_.depth_aspects = f.aspects;
+        }
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rendering.colorAttachmentCount = std::uint32_t(graphics_.color_formats.size());
+        rendering.pColorAttachmentFormats = graphics_.color_formats.data();
+        if (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) rendering.depthAttachmentFormat = graphics_.depth_format;
+        if (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) rendering.stencilAttachmentFormat = graphics_.depth_format;
+
+        static constexpr VkDynamicState dynamic_states[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states));
+        dynamic.pDynamicStates = dynamic_states;
+
+        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                       sizeof(leonida::ShaderUserData)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push;
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
+
+        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
+        info.stageCount = std::uint32_t(stage_infos.size());
+        info.pStages = stage_infos.data();
+        info.pVertexInputState = &vertex_input;
+        info.pInputAssemblyState = &assembly;
+        info.pViewportState = &viewport;
+        info.pRasterizationState = &raster;
+        info.pMultisampleState = &multisample;
+        info.pDepthStencilState = &depth;
+        info.pColorBlendState = &blend;
+        info.pDynamicState = &dynamic;
+        info.layout = graphics_.layout;
+        if (vk.vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, nullptr, &graphics_.pipeline) != VK_SUCCESS)
+            return E_FAIL;
+
+        if (code_stage) {
+            VkDeviceSize offset = 0;
+            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset)) return E_OUTOFMEMORY;
+            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
+            code_bytes_ = code_stage->fssm.size();
+            code_base_ = offset;
+            graphics_.code_base = offset;
+        }
+        device_.context->add_graphics_pipeline(id(), graphics_);
+        registered_ = true;
+        is_graphics_ = true;
+        return S_OK;
+    }
 
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
@@ -1169,6 +1549,7 @@ public:
         if (!device_.arena_allocate(fssm.size(), 256, offset)) return E_OUTOFMEMORY;
         std::memcpy(device_.arena.mapped + offset, fssm.data(), fssm.size());
         code_bytes_ = fssm.size();
+        code_base_ = offset;
         pipeline_.code_base = offset;
         device_.context->add_pipeline(id(), pipeline_);
         registered_ = true;
@@ -1178,9 +1559,13 @@ public:
 private:
     DeviceState& device_;
     leonida::ComputePipeline pipeline_;
+    leonida::GraphicsPipeline graphics_;
     VkShaderModule module_ = VK_NULL_HANDLE;
+    std::vector<VkShaderModule> modules_;
+    VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
     bool registered_ = false;
+    bool is_graphics_ = false;
 };
 
 // A view of a texture as Create*View describes it, before the resource's own shape is applied.
@@ -1682,8 +2067,16 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommandList(UINT, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
                                                 ID3D12PipelineState* state, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandList";
-        if (state) stub("ID3D12Device::CreateCommandList(initial pipeline state)");
-        return d3d12_trace::result(method, create_command_list(type, allocator, riid, out, identity()));
+        HRESULT hr = create_command_list(type, allocator, riid, out, identity());
+        // The initial pipeline state is set as SetPipelineState would set it.
+        if (SUCCEEDED(hr) && state) {
+            ID3D12GraphicsCommandList* list = nullptr;
+            if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list)))) {
+                list->SetPipelineState(state);
+                list->Release();
+            }
+        }
+        return d3d12_trace::result(method, hr);
     }
 
     // Device4: a list created closed, without an allocator.
@@ -1780,6 +2173,20 @@ public:
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         if (const HRESULT hr = pipeline->create_compute(*desc); FAILED(hr)) {
+            pipeline->Release();
+            return hr;
+        }
+        return hand_out(pipeline, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid,
+                                                          void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        auto* pipeline = new PipelineState(state_);
+        pipeline->attach_device(identity());
+        if (const HRESULT hr = pipeline->create_graphics(*desc); FAILED(hr)) {
             pipeline->Release();
             return hr;
         }
@@ -3043,6 +3450,11 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) 
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->compute() ? p->id() : 0;
+}
+
+std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && p->graphics() ? p->id() : 0;
 }
 
 VkImage vulkan_image(ID3D12Resource* resource) {

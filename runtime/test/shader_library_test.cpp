@@ -155,6 +155,12 @@ int main() {
         index << "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
               << "\", \"bindings\": [2], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": true, \"wave64\": false},\n"
+                 " \"vs_test\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
+                 "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
+                 "\"system_value\": 0, \"component_type\": \"float\"}, "
+                 "{\"semantic\": \"SV_VertexID\", \"semantic_index\": 0, \"register\": 2, \"mask\": 1, \"rw_mask\": 1, "
+                 "\"system_value\": 6, \"component_type\": \"uint\"}]},\n"
+                 " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
                  " \"ps_unhashed\": {\"stage\": \"ps\", \"bindings\": []}}";
         std::ofstream spv(dir / "cs_test.spv", std::ios::binary);
         const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
@@ -162,11 +168,17 @@ int main() {
     }
     ShaderLibrary library;
     std::string error;
-    CHECK(library.load(dir.string(), &error) && library.size() == 1);
+    CHECK(library.load(dir.string(), &error) && library.size() == 3);
+    const ShaderEntry* vs = library.find("vs", hash);
+    CHECK(vs && vs->input_signature.size() == 2 && vs->input_signature[0].semantic == "COLOR");
+    CHECK(vs->input_signature[1].register_index == 2 && vs->input_signature[1].system_value == 6 &&
+          vs->input_signature[1].component_type == "uint");
+    const ShaderEntry* ps = library.find("ps", hash);
+    CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
-    CHECK(!library.find("ps", hash));
+    CHECK(!library.find("ms", hash));  // no mesh shader with this hash
     CHECK(library.spirv(*entry).size() == 5);
     CHECK(!library.load((dir / "missing").string(), &error) && !error.empty());
     std::filesystem::remove_all(dir);

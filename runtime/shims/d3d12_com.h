@@ -156,6 +156,10 @@ struct RootArgumentLayout {
 // compute pipeline state (0: not a compute PSO of a Vulkan device).
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
+std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+
+// The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
+inline constexpr UINT descriptor_size = 32;
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);

@@ -689,8 +689,28 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
+      # Milestone M1: a VS+PS pipeline and indexed draws, shaders written to the same contract.
+      set(LEONIDA_TEST_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw.spv)
+      set(LEONIDA_TEST_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_draw.spv)
+      foreach(pair "vs_draw.vert;${LEONIDA_TEST_VS}" "ps_draw.frag;${LEONIDA_TEST_PS}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the draw test shader ${source}"
+          VERBATIM)
+      endforeach()
+      add_executable(d3d12_draw_test test/d3d12_draw_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_VS}
+                     ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test is not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test and d3d12_draw_test are not built")
     endif()
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).

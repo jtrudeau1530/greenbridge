@@ -492,6 +492,16 @@ inline std::vector<std::uint8_t> fssm_program(std::span<const std::uint8_t> byte
 // ---------------------------------------------------------------------------------------------------------------
 // The translator's spirv/index.json
 
+// One element of a shader's DXBC input signature (ISG1), as tools/shader_meta.py records it. For a vertex shader
+// the register is the Vulkan input location the translator gave it (docs/design.md, "Vertex fetch").
+struct SignatureElement {
+    std::string semantic;
+    std::uint32_t semantic_index = 0;
+    std::uint32_t register_index = 0;
+    std::uint32_t system_value = 0;  // 0: an ordinary input fed by the input layout
+    std::string component_type;      // "float", "uint", "sint"
+};
+
 struct ShaderEntry {
     std::string name;
     std::string stage;  // "vs", "ps", "cs", "ms", "gs"
@@ -501,6 +511,8 @@ struct ShaderEntry {
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     bool uses_code_base = false;
     bool wave64 = false;
+    std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
+    std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
 };
 
 class ShaderLibrary {
@@ -533,6 +545,20 @@ public:
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = std::uint32_t(l->array[i].number);
             if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
             if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
+            if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
+                for (const Json& item : s->array) {
+                    SignatureElement element;
+                    if (const Json* v = item.find("semantic"); v && v->kind == Json::Kind::string) element.semantic = v->string;
+                    if (const Json* v = item.find("semantic_index")) element.semantic_index = std::uint32_t(v->number);
+                    if (const Json* v = item.find("register")) element.register_index = std::uint32_t(v->number);
+                    if (const Json* v = item.find("system_value")) element.system_value = std::uint32_t(v->number);
+                    if (const Json* v = item.find("component_type"); v && v->kind == Json::Kind::string)
+                        element.component_type = v->string;
+                    e.input_signature.push_back(std::move(element));
+                }
+            }
+            if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
+                for (const Json& item : o->array) e.outputs.push_back(std::uint32_t(item.number));
             entries_[{e.stage, e.fssm_sha256}] = std::move(e);
         }
         return true;

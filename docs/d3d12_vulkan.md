@@ -450,12 +450,31 @@ The compute path, end to end:
   and `ClearState`. A wrong parameter type or out-of-range constants makes `Close` return `E_INVALIDARG`.
   `Dispatch` records the block as it is at that moment. Replay binds the pipeline, pushes s0..s31, the heap base
   and the code base, and dispatches.
+- **Graphics pipelines and draws (M1).** `CreateGraphicsPipelineState` (PC slot 10) finds the VS and PS by FSSM hash.
+  - **Vertex input:** each input-layout element is matched to the VS input signature by semantic name and index,
+    and its location is the element's register (the translator's vertex-fetch rule). An input the layout leaves
+    unfed is refused, as D3D12 refuses it.
+  - **Fixed-function state:** rasterizer, blend and depth-stencil state map one to one. Viewport, scissor,
+    topology, vertex strides, stencil references and the blend factor are dynamic.
+  - **Formats:** dynamic rendering takes the RTV and DSV formats.
+  - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
+    that both read their code base (question 14).
+
+  The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
+  D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
+  `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state.
+
+  At replay, vertex and index views resolve to buffers by VA (arena or upload). Attachments move to attachment
+  layouts through the tracker, and the draw runs in a dynamic-rendering scope. The viewport is flipped (negative
+  height), because translated vertex shaders write D3D clip coordinates; front-face winding then matches
+  D3D12's. Only the first viewport and scissor are used, and primitive restart is not modelled yet.
 
 Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
-therefore every translated shader that declares bindings; graphics PSOs, input layouts and draws;
-`requiredSubgroupSize = 64` for wave64 compute; the game's present entry point (DXGI factory/swapchain or
-`PresentX`; the presenter above is what either calls), HDR and fullscreen; buffer and constant-buffer views
-(UAV clears read the descriptor bytes, so they do not wait on view creation), typeless volume RTVs, placed
+therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
+multisampled pipelines, several viewports, primitive restart; `requiredSubgroupSize = 64` for wave64 compute;
+the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what either
+calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do
+not wait on view creation), typeless volume RTVs, placed
 resources, depth-stencil resolves and 1D textures;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); the GCL8
@@ -595,6 +614,16 @@ and any validation error fails them.
   application-written entry points at an upload buffer, then runs two dispatches that change s0 and the UAV in
   between. The results come back through a readback buffer. The shader, `test/glsl/cs_user_data.comp`, is GLSL
   written to the translator's push-constant and address contract, compiled with `glslangValidator`.
+- `d3d12_draw_test`: milestone M1, through the proxy.
+  - **Pipeline:** a VS+PS PSO found by FSSM hash. The input layout is POSITION then COLOR, while the VS has them in
+    the opposite register order, so a match by position would fail.
+  - **Buffers:** the vertex buffer is copied into the arena, and the index buffer is read from an upload heap.
+  - **Draws:** two indexed draws with different root constants and root CBVs, then a back-facing triangle that must
+    be culled.
+  - **Check:** all 4096 pixels of the read-back target are compared. Where the red and green quadrants land also
+    checks the viewport flip and the winding.
+
+  The shaders are GLSL written to the translator's contract (`test/glsl/vs_draw.vert`, `ps_draw.frag`).
 - `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
   the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
   resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches
@@ -1616,7 +1645,7 @@ M0–M2 do not need the executable.
 | # | Scope | What it proves | Done when |
 |---|---|---|---|
 | **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/output, `ALLOW_DISPLAY` back buffers, frame events + `PresentX` (DXGI swapchain only if the game creates one), clear + present | COM interception, the known Xbox device entry point and ABI overrides, presentation (`PresentX` + frame events, or swapchain), frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced. **Synthetic part met** by `d3d12_present_test`: 60 frames through the proxy on Vulkan, validation clean, colour checked on screen. Still open: the game's present front end (frame events + `PresentX`, or a DXGI swapchain) and the per-call trace |
-| **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0 |
+| **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0. **Met with stand-in shaders** by `d3d12_draw_test`: every pixel of two indexed draws and a culled triangle matches, through the proxy, validation clean. With translated game shaders it waits for set 0 in pipelines (M2), since most of them declare bindings |
 | **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries |
 | **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report |
 | **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check |

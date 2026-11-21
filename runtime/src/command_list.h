@@ -353,6 +353,53 @@ struct Dispatch {
     std::uint32_t z;
 };
 
+// D3D12_VIEWPORT.
+struct Viewport {
+    float x;
+    float y;
+    float width;
+    float height;
+    float min_depth;
+    float max_depth;
+};
+
+// D3D12_VERTEX_BUFFER_VIEW / D3D12_INDEX_BUFFER_VIEW: console VAs, resolved to buffers at replay.
+struct VertexBufferView {
+    std::uint64_t va;
+    std::uint32_t size;
+    std::uint32_t stride;
+};
+
+struct IndexBufferView {
+    std::uint64_t va;
+    std::uint32_t size;
+    std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
+};
+
+// DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
+// render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
+// the draw. resource 0 marks an unbound render-target slot or no depth buffer.
+struct Draw {
+    std::uintptr_t pipeline;
+    std::array<std::uint32_t, 32> user_data;
+    std::vector<TargetView> render_targets;
+    TargetView depth;
+    std::vector<VertexBufferView> vertex_buffers;  // by input slot
+    IndexBufferView index;
+    std::uint32_t topology;  // D3D_PRIMITIVE_TOPOLOGY
+    Viewport viewport;       // the first; more viewports are not modelled yet
+    Rect scissor;            // the first; D3D12 always scissors
+    std::array<float, 4> blend_factor;
+    std::uint32_t stencil_front;
+    std::uint32_t stencil_back;
+    bool indexed;
+    std::uint32_t count;  // vertices or indices per instance
+    std::uint32_t instances;
+    std::uint32_t first;  // first vertex or first index
+    std::int32_t base_vertex;
+    std::uint32_t first_instance;
+};
+
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
 inline constexpr std::uint32_t texture_data_pitch_alignment = 256;
 inline constexpr std::uint32_t texture_data_placement_alignment = 512;
@@ -487,7 +534,7 @@ struct ResolveQueries {
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, Dispatch>;
+                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, Dispatch, Draw>;
 
 class CommandList {
 public:
@@ -566,6 +613,13 @@ public:
         if (!dispatch.pipeline) return false;
         if (!dispatch.x || !dispatch.y || !dispatch.z) return !closed_;
         return append(dispatch);
+    }
+
+    // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
+    bool draw(const Draw& draw) {
+        if (!draw.pipeline) return false;
+        if (!draw.count || !draw.instances) return !closed_;
+        return append(draw);
     }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
