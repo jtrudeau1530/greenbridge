@@ -93,7 +93,7 @@ add a source file, add it to `runtime\CMakeLists.txt` and to the file list in `b
 
 | Asset | State | Where |
 |---|---|---|
-| Archive data | Carved without the encrypted tables of contents. Most archives are 93–99% plain zlib (`levels.rpf` 98.3%, 1.1M files). Not zlib: `audio.rpf` (99.9%), about half of `story000.rpf` and `shared_minigame000.rpf`. | `<work>\carve\<archive>\`, `coverage.json` |
+| Archive data | Carved without the encrypted tables of contents. Most archives are 93–99% plain zlib (`levels.rpf` 98.3%, 1.1M files; full census **23,535 placement maps / 1,670,442 entities**). Not zlib: `audio.rpf` (99.9%), about half of `story000.rpf` and `shared_minigame000.rpf`. | `<work>\carve\<archive>\`, `coverage.json`; [world_census.md](world_census.md) |
 | Videos | 797 Bink 2 files (`KB2n`), cut out whole. | `*.bk2` in the carve folders |
 | Shaders | 26,503 carved from `shaders.rpf`, native RDNA2 code unpacked (`FSSM`), disassembled, and translated to SPIR-V; all validate (see *Translator status*). | `<work>\shaders\` (`.dxbc`, `fssm\`, `disasm\`, `spirv\`) |
 | Textures | **Solved.** Headers are in CPU segments: GPU pointer at q[k], u16 width/height/depth and DXGI format at q[k+4], mip count at byte 2 of q[k+5]. Data is AMD `SW_4K_S` tiled, largest mip first. The GPU segment is the blob run after the CPU blob. On 200 samples, 173 decode at least 1.5× smoother detiled than untiled (median 2.56×). Exports the top mip, slice 0, as DDS. **22,342 exported (1.23 GiB)**: every header whose GPU data follows its CPU blob. World and model textures are handled by the TXD and TTPF exporters below. GPU offsets must be 256-byte aligned, which drops the false headers in `navmeshes`/`anim`. | `tools\tex_headers.py`, `tools\tex_export.py`, `<work>\textures\` |
