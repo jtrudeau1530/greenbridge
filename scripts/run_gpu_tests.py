@@ -225,6 +225,17 @@ def w64_emulated() -> bool:
     # subgroup, matching check.py (W64_EMULATED). Accepts "1"/"true"/"yes"/"on" and tolerates
     # the trailing space cmd.exe's `set VAR=1 &` leaves in the value.
     return (os.environ.get("LEONIDA_W64_EMULATE") or "").strip().lower() in ("1", "true", "yes", "on")
+def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) -> tuple[bool | None, str]:
+    """cs_wavemask, as in check.py: (passed, detail), passed None for a skip. The native build needs a 64-wide
+    subgroup and skips where the device has none; with LEONIDA_W64_EMULATE=1 it was translated with
+    --wave64-emulate and runs on any subgroup size, so it asks for none."""
+    cmd = [vk_compute, spv, "1", "wavemask"] + ([] if emulated else ["--require-wave64"])
+    rc, msg = run_cmd(cmd, env=env)
+    if not emulated and rc == 77:
+        return None, "SKIP (no 64-wide compute subgroup on this device)"
+    if not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
+        return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    return rc == 0, msg.splitlines()[-1] if msg else ""
 
 
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
@@ -512,6 +523,8 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"))
             else:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + wavemask_check(vk_compute, spv, cs_env,
+                                                    os.environ.get("LEONIDA_W64_EMULATE") == "1"))
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
