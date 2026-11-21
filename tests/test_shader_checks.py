@@ -33,7 +33,7 @@ TOTAL = (len(check.COMPUTE) + 4 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
+         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures and
          # ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -124,6 +124,8 @@ class Wave64Checks(unittest.TestCase):
             if name in dict(check.BOUNDS):    # the SMEM / raw MUBUF rule tests: their words, then the 0xee fill
                 words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
+            if name == "cs_cvt_pk_u8":
+                return 0, "out[0..7] = " + " ".join(map(str, check.CVT_PK_U8_WORDS)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = " + " ".join(map(str, (check.CS_STORE + [0] * 8)[:8])) + "\n"
             if name == "cs_smem_soffset_imm":
