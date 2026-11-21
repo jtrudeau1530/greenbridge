@@ -5491,6 +5491,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["max_vertices"] = g.gs["maxv"]
         m["gs_inputs"] = [r for r, _ in g.gs["in"]]
         m["gs_outputs"] = [r for r, _ in g.gs["out"]]
+        m["gs_input_locations"] = sorted(r for r, sv in g.gs["in"] if sv != 1)
+        m["gs_output_locations"] = sorted(r for r, sv in g.gs["out"] if sv != 1)
     if g.uses_lds:
         m["lds_bytes"] = 4 * g.lds_dwords
     if g.vertex_inputs:
@@ -5515,6 +5517,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if t != "pos0")
     if outs:
         m["outputs"] = outs
+    if g.writes_depth:
+        m["writes_depth"] = True
     if g.inputs:
         m["inputs"] = sorted(g.inputs.values())
     if g.build_meta:
@@ -5554,6 +5558,8 @@ def main():
         for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
             merged.update(_js.load(open(part, encoding="utf-8")))
         write_index(os.path.join(a.out, "index.json"), merged)
+        import spirv_stubs
+        spirv_stubs.generate_for_index(a.out, merged)
         print(f"merged {len(merged)} entries")
         return 0
     files = [a.src] if a.src.endswith(".s") else sorted(os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".s"))
@@ -5601,6 +5607,9 @@ def main():
         old = _js.load(open(idx_path, encoding="utf-8"))      # partial runs merge into an existing index
     old.update(meta)
     write_index(idx_path, old)
+    if shard is None:
+        import spirv_stubs
+        spirv_stubs.generate_for_index(a.out, old)
     print(f"{len(files)} shaders: {ok} translated, {valid} pass spirv-val")
     for k, v in why.most_common(25):
         print(f"  {v:6}  {k}")
