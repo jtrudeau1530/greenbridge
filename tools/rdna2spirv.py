@@ -2201,6 +2201,9 @@ class Gen:
                     half = self.mask_half(a[1])
                     if half is not None:
                         lo, hi = (hi if half == "hi" else lo), self.cu(0)
+            elif a[1]["k"] == "imm":
+                # An immediate is the scalar value itself, not a lane mask: 5 has its first zero bit at 1.
+                lo, hi = self.src_u(a[1]), self.cu(0)
             elif a[1]["k"] != "sgpr" or a[1].get("n") != 2:
                 lo, hi = self.mask_src(a[1]), self.cu(0)
             else:
