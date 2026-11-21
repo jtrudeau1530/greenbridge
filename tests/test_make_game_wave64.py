@@ -149,6 +149,30 @@ class DetectionGapsTest(unittest.TestCase):
         self.assertTrue(self.decide(real_format(("A", 32, ALL)), '{"native64": true}'))     # vulkaninfo wins: on
 
 
+class KeepEmulatedFlagTest(unittest.TestCase):
+    """Only the default auto may keep emulated shaders; an explicit on or off is taken as given."""
+
+    def kept(self, mode):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "game")
+            os.makedirs(game)
+            argv = ["make_game.py", "--game", game, "--out", os.path.join(tmp, "o"), "--work", os.path.join(tmp, "w"),
+                    "--stages", "shaders", "--wave64-emulate", mode]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
+                    mock.patch.object(make_game, "log", lambda *a: None), \
+                    mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
+                    mock.patch.object(make_game, "preflight"), \
+                    mock.patch.object(make_game, "wave64_emulate", return_value=False), \
+                    mock.patch.object(make_game, "shaders") as sh:
+                make_game.main()
+            return sh.call_args.kwargs["keep_emulated"]
+
+    def test_only_auto_keeps(self):
+        self.assertTrue(self.kept("auto"))
+        self.assertFalse(self.kept("off"))
+        self.assertFalse(self.kept("on"))
+
+
 class SubgroupInfoToolTest(unittest.TestCase):
     def test_sizes_and_offsets_match_the_vulkan_headers_on_x64(self):
         # Literal values from vulkan_core.h (sizeof/offsetof on x86-64), not derived from the tool's own constants

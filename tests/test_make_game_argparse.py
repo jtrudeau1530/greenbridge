@@ -219,7 +219,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
 
         expected_calls = [
             call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
-                         emulate=unittest.mock.ANY),
+                         emulate=unittest.mock.ANY, keep_emulated=True),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
             call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
             call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir)),
@@ -297,7 +297,7 @@ class JobsHandlingTest(unittest.TestCase):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
-                                                                         emulate=True)
+                                                                         emulate=True, keep_emulated=True)
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
