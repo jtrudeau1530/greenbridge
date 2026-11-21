@@ -8,8 +8,8 @@ OpSelect.
 v_perm_b32 D, S0, S1, SEL: result byte i is chosen by byte i of SEL from the 64-bit value {S0, S1} (S1 is bytes 0-3,
 S0 bytes 4-7). Selector 0x0c gives 0x00 and anything above 0x0c gives 0xff. Reference: LLVM
 llvm/lib/Target/AMDGPU/AMDGPUISelLowering.cpp, computeKnownBitsForTargetNode, case AMDGPUISD::PERM. Selectors 8-11
-are not tested: LLVM treats them as unknown bits and the translator returns 0x00 for them (see the comment at
-v_perm_b32 in tools/rdna2spirv.py).
+repeat the sign bit of a 16-bit half of {S0, S1}: bit 15, 31, 47 or 63 (RDNA2 ISA reference, V_PERM_B32; LLVM's
+known-bits code treats them as unknown; #211).
 
 v_alignbit_b32 D, S0, S1, S2: the low 32 bits of ({S0, S1} >> (S2 & 31)), S1 being the low word.
 """
@@ -34,24 +34,24 @@ import spirv_mini_interp as si  # noqa: E402
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
-# Selector byte values with a defined, documented result (8-11 left out, see the module docstring).
-PERM_SELECTORS = tuple(range(8)) + (0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x7F, 0x80, 0xFF)
+# Selector byte values with a defined, documented result.
+PERM_SELECTORS = tuple(range(12)) + (0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x7F, 0x80, 0xFF)
 
 
 def ref_perm(src0: int, src1: int, sel: int) -> int:
-    """v_perm_b32 reference for selector bytes 0-7, 0x0c and above 0x0c."""
+    """v_perm_b32 reference for every selector byte."""
     data = ((src0 & MASK32) << 32) | (src1 & MASK32)
     out = 0
     for i in range(4):
         s = (sel >> (8 * i)) & 0xFF
         if s < 8:
             byte = (data >> (8 * s)) & 0xFF
+        elif s < 0x0C:   # 8-11: sign bit of the 16-bit half s - 8
+            byte = 0xFF if (data >> (16 * (s - 8) + 15)) & 1 else 0x00
         elif s == 0x0C:
             byte = 0x00
-        elif s > 0x0C:
-            byte = 0xFF
         else:
-            raise ValueError(f"selector byte {s:#x} is not covered by this reference")
+            byte = 0xFF
         out |= byte << (8 * i)
     return out
 
@@ -114,8 +114,9 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(ref_perm(0x8899AABB, 0x11223344, 0x00010203), 0x44332211)
         self.assertEqual(ref_perm(0x8899AABB, 0x11223344, 0x07050301), 0x88AA1133)
         self.assertEqual(ref_perm(0x8899AABB, 0x11223344, 0x0C0D0C0D), 0x00FF00FF)
-        with self.assertRaises(ValueError):
-            ref_perm(0, 0, 0x08)
+        # #211's probe values: S0 = 0x8C7A06F5, S1 = 0x13E49B80; selectors 8 and 11 hit set sign bits.
+        self.assertEqual(ref_perm(0x8C7A06F5, 0x13E49B80, 0x0B0A0908), 0xFF0000FF)
+        self.assertEqual(ref_perm(0x00008000, 0x80000000, 0x0B0A0908), 0x00FFFF00)
 
     def test_alignbit_reference(self):
         self.assertEqual(ref_alignbit(0x12345678, 0x9ABCDEF0, 0), 0x9ABCDEF0)

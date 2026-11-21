@@ -3139,7 +3139,8 @@ class Gen:
             self.emit(f"OpStore %scc {z}")
         elif op == "v_perm_b32":
             # Byte permute: result byte i = selector byte i picks from the 8 bytes {src0, src1} (src1 is low).
-            # Selector values 0-7 pick a byte; 12 -> 0x00, >=13 -> 0xFF (sign/other cases not used here are 0).
+            # Selector values 0-7 pick a byte; 8-11 repeat the sign bit of a 16-bit half (bit 15, 31, 47 or 63 of
+            # {src0, src1}, RDNA2 ISA reference, V_PERM_B32); 12 -> 0x00, >=13 -> 0xFF.
             # Both candidate shifts are (k & 3) * 8, so every shift stays below 32 (SPIR-V leaves larger ones
             # undefined, even on the side of the OpSelect that is discarded).
             s0, s1, sel = (self.src_u(t) for t in a[1:4])
@@ -3156,9 +3157,19 @@ class Gen:
                 self.emit(f"{hi_pick} = OpShiftRightLogical %uint {s0} {sh}")
                 self.emit(f"{chosen} = OpSelect %uint {b} {lo_pick} {hi_pick}")
                 self.emit(f"{inrange} = OpULessThan %bool {sb} {self.cu(8)}")
-                ff, big = self.tmp(), self.tmp()
+                # 8-11: k3 = sb & 3 picks the half; its sign bit is bit 15 or 31 of src1 (k3 0, 1) or src0 (2, 3).
+                k2, in_s1, sgn_src, sgn_sh, sgn_bit, sgn, sb_hi, is_sgn, const, ff, big = (self.tmp() for _ in range(11))
+                self.emit(f"{k2} = OpBitwiseAnd %uint {k3} {self.cu(2)}")
+                self.emit(f"{in_s1} = OpIEqual %bool {k2} {self.cu(0)}")
+                self.emit(f"{sgn_src} = OpSelect %uint {in_s1} {s1} {s0}")
+                self.emit(f"{sgn_sh} = OpBitFieldInsert %uint {self.cu(15)} {k3} {self.cu(4)} {self.cu(1)}")
+                self.emit(f"{sgn_bit} = OpBitFieldUExtract %uint {sgn_src} {sgn_sh} {self.cu(1)}")
+                self.emit(f"{sgn} = OpIMul %uint {sgn_bit} {self.cu(0xFF)}")
+                self.emit(f"{sb_hi} = OpBitwiseAnd %uint {sb} {self.cu(0xFC)}")
+                self.emit(f"{is_sgn} = OpIEqual %bool {sb_hi} {self.cu(8)}")
                 self.emit(f"{big} = OpUGreaterThanEqual %bool {sb} {self.cu(13)}")
-                self.emit(f"{ff} = OpSelect %uint {big} {self.cu(0xFF)} {self.cu(0)}")
+                self.emit(f"{const} = OpSelect %uint {big} {self.cu(0xFF)} {self.cu(0)}")
+                self.emit(f"{ff} = OpSelect %uint {is_sgn} {sgn} {const}")
                 self.emit(f"{val} = OpSelect %uint {inrange} {chosen} {ff}")
                 m8 = self.tmp()
                 self.emit(f"{m8} = OpBitwiseAnd %uint {val} {self.cu(0xFF)}")
