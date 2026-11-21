@@ -49,7 +49,7 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
         self.assertIsNone(a.game)
         self.assertIsNone(a.out)
         self.assertIsNone(a.work)
-        self.assertEqual(a.stages, "check,shaders,assets,runtime,pipelines")
+        self.assertIsNone(a.stages)
         self.assertFalse(a.check)
         self.assertFalse(a.full_check)
         self.assertFalse(a.wav)
