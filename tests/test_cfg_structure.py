@@ -5,6 +5,7 @@
 Random graphs, random branch outcomes. For each graph the tree is interpreted and compared with a plain walk of
 the graph that makes the same choices. Irreducible graphs must be refused (None), reducible ones must not be.
 """
+from functools import cache
 import os
 import random
 import sys
@@ -13,15 +14,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import cfg_structure as S  # noqa: E402
 
 
+@cache
+def branch_index(seed, block, visit, count):
+    # The choice depends only on these numbers, so different graphs can reuse it.
+    return random.Random(f"{seed}/{block}/{visit}").randrange(count)
+
+
 def chooser(succ, seed):
     """Branch outcomes that depend only on the block and how often it has run, so two runs that execute the
     same blocks make the same choices."""
     visits = {}
 
     def choose(b):
+        options = succ[b]
+        if len(options) < 2:
+            return options[0] if options else S.END
         k = visits[b] = visits.get(b, 0) + 1
-        options = list(succ[b]) or [S.END]
-        return options[random.Random(f"{seed}/{b}/{k}").randrange(len(options))]
+        return options[branch_index(seed, b, k, len(options))]
     return choose
 
 
