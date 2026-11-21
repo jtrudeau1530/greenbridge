@@ -2265,14 +2265,20 @@ class Gen:
             elif self.wave64:
                 # Same on a 64-wide subgroup: the half's base comes from the subgroup lane (on a 32-wide one it
                 # is 0, as before). Until 2026-11-21 lanes 32-63 read lanes 0-31 there, and inactive sources
-                # kept their value. GPU-checked with cs_w64x_bpermute.
+                # kept their value. GPU-checked with cs_w64x_bpermute. A shuffle from an invocation that isn't
+                # running (the missing lanes of a partial wave) is undefined in SPIR-V, and RADV returns stale
+                # registers; the ballot makes it read 0 like a lane that is off. GPU-checked with cs_w64x_partial.
                 lane, half, src, z = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{lane} = OpLoad %uint %sg_lane")
                 self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
                 self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
-                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {z} {src}")
-                self.uses_subgroup = True
+                bal, ex, sh = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
+                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {src}")
+                self.emit(f"{r} = OpSelect %uint {ex} {sh} {self.cu(0)}")
+                self.uses_subgroup = self.uses_ballot = True
             else:
                 self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {dat} {ln2}")
                 self.uses_subgroup = True
@@ -2479,10 +2485,12 @@ class Gen:
                 self.mask_dst(d, r)
         elif op == "v_alignbit_b32":
             # (({src0, src1} as 64 bits) >> (src2 & 31)) low 32 bits
+            # (32 - m) & 31 keeps the left shift below 32 when m == 0; that result is discarded by the OpSelect.
             hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
-            m, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(7))
+            m, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(8))
             self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
-            self.emit(f"{inv} = OpISub %uint {self.cu(32)} {m}")
+            self.emit(f"{inv0} = OpISub %uint {self.cu(32)} {m}")
+            self.emit(f"{inv} = OpBitwiseAnd %uint {inv0} {self.cu(31)}")
             self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {m}")
             self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {inv}")
             self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
@@ -3137,24 +3145,37 @@ class Gen:
             self.emit(f"OpStore %scc {z}")
         elif op == "v_perm_b32":
             # Byte permute: result byte i = selector byte i picks from the 8 bytes {src0, src1} (src1 is low).
-            # Selector values 0-7 pick a byte; 12 -> 0x00, >=13 -> 0xFF (sign/other cases not used here are 0).
+            # Selector values 0-7 pick a byte; 8-11 repeat the sign bit of a 16-bit half (bit 15, 31, 47 or 63 of
+            # {src0, src1}, RDNA2 ISA reference, V_PERM_B32); 12 -> 0x00, >=13 -> 0xFF.
+            # Both candidate shifts are (k & 3) * 8, so every shift stays below 32 (SPIR-V leaves larger ones
+            # undefined, even on the side of the OpSelect that is discarded).
             s0, s1, sel = (self.src_u(t) for t in a[1:4])
             out = self.cu(0)
             for i in range(4):
-                sb, lo_pick, hi_pick, k, b, lo_sh, hi_sh, chosen, inrange, val, shifted, acc = \
+                sb, lo_pick, hi_pick, k, b, k3, sh, chosen, inrange, val, shifted, acc = \
                     (self.tmp() for _ in range(12))
                 self.emit(f"{sb} = OpBitFieldUExtract %uint {sel} {self.cu(8 * i)} {self.cu(8)}")
                 self.emit(f"{k} = OpBitwiseAnd %uint {sb} {self.cu(7)}")
                 self.emit(f"{b} = OpULessThan %bool {k} {self.cu(4)}")
-                self.emit(f"{lo_sh} = OpIMul %uint {k} {self.cu(8)}")
-                self.emit(f"{lo_pick} = OpShiftRightLogical %uint {s1} {lo_sh}")
-                self.emit(f"{hi_sh} = OpISub %uint {lo_sh} {self.cu(32)}")
-                self.emit(f"{hi_pick} = OpShiftRightLogical %uint {s0} {hi_sh}")
+                self.emit(f"{k3} = OpBitwiseAnd %uint {k} {self.cu(3)}")
+                self.emit(f"{sh} = OpIMul %uint {k3} {self.cu(8)}")
+                self.emit(f"{lo_pick} = OpShiftRightLogical %uint {s1} {sh}")
+                self.emit(f"{hi_pick} = OpShiftRightLogical %uint {s0} {sh}")
                 self.emit(f"{chosen} = OpSelect %uint {b} {lo_pick} {hi_pick}")
                 self.emit(f"{inrange} = OpULessThan %bool {sb} {self.cu(8)}")
-                ff, big = self.tmp(), self.tmp()
+                # 8-11: k3 = sb & 3 picks the half; its sign bit is bit 15 or 31 of src1 (k3 0, 1) or src0 (2, 3).
+                k2, in_s1, sgn_src, sgn_sh, sgn_bit, sgn, sb_hi, is_sgn, const, ff, big = (self.tmp() for _ in range(11))
+                self.emit(f"{k2} = OpBitwiseAnd %uint {k3} {self.cu(2)}")
+                self.emit(f"{in_s1} = OpIEqual %bool {k2} {self.cu(0)}")
+                self.emit(f"{sgn_src} = OpSelect %uint {in_s1} {s1} {s0}")
+                self.emit(f"{sgn_sh} = OpBitFieldInsert %uint {self.cu(15)} {k3} {self.cu(4)} {self.cu(1)}")
+                self.emit(f"{sgn_bit} = OpBitFieldUExtract %uint {sgn_src} {sgn_sh} {self.cu(1)}")
+                self.emit(f"{sgn} = OpIMul %uint {sgn_bit} {self.cu(0xFF)}")
+                self.emit(f"{sb_hi} = OpBitwiseAnd %uint {sb} {self.cu(0xFC)}")
+                self.emit(f"{is_sgn} = OpIEqual %bool {sb_hi} {self.cu(8)}")
                 self.emit(f"{big} = OpUGreaterThanEqual %bool {sb} {self.cu(13)}")
-                self.emit(f"{ff} = OpSelect %uint {big} {self.cu(0xFF)} {self.cu(0)}")
+                self.emit(f"{const} = OpSelect %uint {big} {self.cu(0xFF)} {self.cu(0)}")
+                self.emit(f"{ff} = OpSelect %uint {is_sgn} {sgn} {const}")
                 self.emit(f"{val} = OpSelect %uint {inrange} {chosen} {ff}")
                 m8 = self.tmp()
                 self.emit(f"{m8} = OpBitwiseAnd %uint {val} {self.cu(0xFF)}")
@@ -5263,14 +5284,17 @@ def assemble(gen):
             (["%ms_clip = OpVariable %_ptr_Fn_ms_clip Function %null_ms_clip"] if gen.uses_clip else []) + \
             (["%ms_cull_dist = OpVariable %_ptr_Fn_ms_cull_d Function %null_ms_cull_d"] if gen.uses_cull else []) + \
             [f"%ms_param{n} = OpVariable %_ptr_Function_v4_ms Function %null_v4_ms" for n in sorted(gen.ms_params)]
-        # v5 = workgroup index (linear), s3 = merged-wave info with the wave id in [27:24].
+        # v5 = first launch vertex ID of the lane = linear group index * NumThreads + local index (the game's mesh
+        # entry does v5 >> 7 on lane 0 to get the group index; NumThreads is 128 in this corpus).
+        # s3 = merged-wave info with the wave id in [27:24].
         fn += ["%wgi = OpLoad %v3uint %wg_id", "%nwg = OpLoad %v3uint %num_wg", "%lidx = OpLoad %uint %local_index",
                "%wgx = OpCompositeExtract %uint %wgi 0", "%wgy = OpCompositeExtract %uint %wgi 1",
                "%wgz = OpCompositeExtract %uint %wgi 2", "%nwx = OpCompositeExtract %uint %nwg 0",
                "%nwy = OpCompositeExtract %uint %nwg 1", "%nxy = OpIMul %uint %nwx %nwy",
                "%wz = OpIMul %uint %wgz %nxy", "%wy = OpIMul %uint %wgy %nwx", "%wyz = OpIAdd %uint %wy %wz",
                "%wlin = OpIAdd %uint %wgx %wyz",
-               f"%v5p = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(5)}", "OpStore %v5p %wlin",
+               f"%wbase = OpIMul %uint %wlin {gen.cu(gen.ms['threads'])}", "%v5v = OpIAdd %uint %wbase %lidx",
+               f"%v5p = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(5)}", "OpStore %v5p %v5v",
                f"%wave = OpShiftRightLogical %uint %lidx {gen.cu(6)}",
                f"%mwi = OpShiftLeftLogical %uint %wave {gen.cu(24)}",
                f"%s3p = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(3)}", "OpStore %s3p %mwi"]
@@ -5779,8 +5803,8 @@ def translate(path):
             g.cu(i)
     if stage == "ms":
         # Mesh shaders run as NGG wave64 programs. PSV0 (DXBC) gives NumThreads, MaxOutputVertices/Primitives and
-        # the output topology. System inputs (Mesa radv_shader_args.c, mesh as NGG on GFX10.3): v5 = workgroup
-        # index ("vertex_id" slot); the merged-wave-info SGPR (s3 here) holds the wave id in [27:24]; user data
+        # the output topology. System inputs (Mesa radv_shader_args.c, mesh as NGG on GFX10.3): v5 = first launch
+        # vertex ID of the lane, groupIndex * NumThreads + lane ("vertex_id" slot); the merged-wave-info SGPR (s3 here) holds the wave id in [27:24]; user data
         # follows in s16.. (from push constants, like every stage).
         psv = mesh_psv(path, info["name"])
         if psv is None:
@@ -5790,6 +5814,7 @@ def translate(path):
         if not (1 <= psv["threads"] <= 1024) or not (1 <= psv["maxv"] <= 256) or not (1 <= psv["maxp"] <= 512):
             raise Unsupported("mesh limits")
         g.ms = psv
+        g.cu(psv["threads"])     # the v5 seed (assemble) multiplies by it; constants must exist before assembly
         # LDS: the declared group-shared size, grown to cover every constant offset the code uses.
         need = (psv.get("shared", 0) + 3) // 4
         for ins in insns:

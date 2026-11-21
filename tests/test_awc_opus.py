@@ -319,6 +319,16 @@ class StreamedMusicTest(unittest.TestCase):
                 self.assertEqual(channels, 1)
                 self.assertEqual(pages[-1]["granule"], 960)
 
+    def test_two_stereo_groups_export_two_stereo_oggs(self):
+        counts, od = self.export([0xFC, 0xFC], 1920)
+        self.assertEqual(counts, {"opus": 0, "pcm": 0, "other": 0, "music": 2})
+        for sid in ("00000100", "00000101"):
+            with self.subTest(sid=sid):
+                with open(os.path.join(od, sid + ".ogg"), "rb") as f:
+                    pages = parse_ogg_pages(f.read())
+                self.assertEqual(pages[0]["body"][9], 2)
+                self.assertEqual(pages[-1]["granule"], 960)
+
     def test_music_channels_halves_interleaved_samples(self):
         path = os.path.join(self.tmp.name, "streamed.awc")
         with open(path, "wb") as f:

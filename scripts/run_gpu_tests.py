@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
@@ -25,6 +26,7 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container
 from check import Skip, clip_test
 from compute_fixture import compute_header
+from check import Skip, mesh_v5_test
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -55,9 +57,10 @@ def make_sig_chunk(elements: list[tuple[int, int, int, int, int]]) -> bytes:
     return bytes(out)
 
 
-def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2) -> bytes:
+def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_shared: int = 0) -> bytes:
     """Build PSV0 payload for a mesh shader (stage 13)."""
     r = bytearray(48)
+    struct.pack_into("<I", r, 0, group_shared)
     struct.pack_into("<HH", r, 12, maxv, maxp)
     r[24] = 13  # mesh stage
     r[27] = topology  # 2 = triangles
@@ -206,6 +209,15 @@ def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     data = open(path, "rb").read()
     n = len(data) // 16
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
+
+
+UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders)
+
+
+def unsupported_skip(msg: str) -> str:
+    """The SKIP detail for a harness that exited UNSUPPORTED, quoting its "unsupported: ..." line."""
+    m = re.search(r"unsupported: .*", msg)
+    return f"SKIP ({m.group(0) if m else 'unsupported device'})"
 
 
 def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
@@ -401,6 +413,8 @@ def run_suite(a, work: str) -> int:
             ])
         elif name in ("ms_tri", "ms_w64x_ballot"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
+        elif name == "ms_v5_workgroup":
+            dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
         elif name == "ms_clip":
             dxbc = make_dxbc([
                 (b"PSV0", make_ms_psv0(128, 64, 64, 2)),
@@ -417,6 +431,8 @@ def run_suite(a, work: str) -> int:
         if name in CLIP_CASES:
             fname = "vs_clip.asm"
         assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), os.path.join(disasm_dir, f"{name}.s"), name)
+        # A failed translation must not run an old binary left in a reused --work directory.
+        Path(spirv_dir, f"{name}.spv").unlink(missing_ok=True)
 
     # 2. Translate all .s -> .spv
     cmd = [sys.executable, "-I", TRANSLATOR, disasm_dir, "--out", spirv_dir]
@@ -475,6 +491,15 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == "cs_bounds":
+            # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
+            # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            want = [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
+            dump = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
+            vals = [int(x) for x in dump.partition("=")[2].split()[:len(want)]] if dump else []
+            results.append((name, rc == 0 and vals == want,
+                            " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", "--require-wave64"], env=cs_env)
@@ -540,10 +565,23 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgload":
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == "ps_texture_sample":
+            # #167's bindless texture test: vk_texture_test finds vs_ids.spv and this shader in its working directory.
+            tool = os.path.join(a.build, "vk_texture_test" + ext)
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            try:
+                p = subprocess.run([tool, raw], capture_output=True, text=True, cwd=spirv_dir)
+                rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
+            except FileNotFoundError:
+                rc, msg = 1, f"missing {tool}"
+            results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=gfx_env)
+            if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
+                results.append((name, None, "SKIP (unsupported device)"))
+                continue
             if rc != 0:
                 results.append((name, False, msg))
                 continue
@@ -557,13 +595,19 @@ def run_suite(a, work: str) -> int:
                 "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
                 "ps_ops5": (0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00),   # from the .asm headers
                 "ps_ops6": (0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0),
+                "ps_ops7": (0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003),
+                "ps_ops8": (0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
             elif name == "ps_bary":
                 ok, detail = check_bary(raw)
             elif name == "ps_bitmask_perm":
-                ok, detail = check_bitmask_perm(raw)
+                m = re.search(r"subgroup \d+\.\.(\d+)", msg)
+                if m and int(m.group(1)) < 32:
+                    ok, detail = None, f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)"
+                else:
+                    ok, detail = check_bitmask_perm(raw)
             elif name == "ps_uniform_branch":
                 ok, detail = check_uniform_branch(raw)
             elif name == "ps_flat":
@@ -575,11 +619,21 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_GS=spv)
             rc, msg = run_cmd([vk_harness, vs_tri, fs_loc1, raw], env=env)
-            if rc != 0:
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_grad(raw, 0.0, 0.0)
                 results.append((name, ok, detail))
+        elif name == "ms_v5_workgroup":
+            rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
+            if rc:
+                results.append((name, False, msg))
+                continue
+            problem = mesh_v5_test(a.build, spirv_dir, Path(raw_dir) / f"{name}.raw")
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))
         elif name in ("ms_tri", "ms_w64x_ballot"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_MESH="1")
@@ -588,7 +642,9 @@ def run_suite(a, work: str) -> int:
             # the wave64 compute dumps are.
             no64 = (name == "ms_w64x_ballot" and os.environ.get("LEONIDA_W64_EMULATE") != "1" and
                     not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
-            if rc != 0:
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
                 results.append((name, False, msg))
             elif no64:
                 results.append((name, None, "SKIP (no 64-wide subgroup on this device)"))
@@ -599,7 +655,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_MESH="1")
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
-            if rc != 0:
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)

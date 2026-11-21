@@ -8,8 +8,8 @@ with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
-to check a translator that emulates wave64 on them. ms_w64x_ballot is a mesh shader that build.py does not build:
-scripts/run_gpu_tests.py makes it (and fs_passthru.spv); here it runs when both .spv files are in <out dir>/spirv.
+to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
+fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
 """
 import collections
 import json
@@ -34,6 +34,8 @@ WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48])]
+# num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
+BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
@@ -54,6 +56,8 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
               "ps_ops5": (0x12340010, 0xbeef0800, 0xaaaaffff, 0xdeadbc00),
               "ps_ops6": (0xf800ffff, 0x01000010, 0x00800800, 0x8000fff0),
+              "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
+              "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000)}
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
@@ -82,14 +86,47 @@ class Skip(str):
     """A result that is neither a pass nor a failure: the device can't run the test."""
 
 
+def check_mesh_v5(data):
+    if len(data) != 24 * 16:
+        return f"expected 24 RGBA32F pixels (384 bytes), got {len(data)} bytes"
+    pixels = iter(struct.iter_unpack("<4f", data))
+    errors = []
+    for z in range(4):
+        for y in range(3):
+            for x in range(2):
+                pixel = next(pixels)
+                # v5 = linear group index * NumThreads + lane (#209); the shader records lanes 0, 1 and 31 of 32
+                g = x + 2*y + 6*z
+                want = (32 * g, 32 * g + 1, 32 * g + 31, 1)
+                if pixel != want:
+                    errors.append(f"({x},{y},{z}): got {pixel}, expected {want}")
+    return f"{len(errors)}/24 mismatches; first {errors[0]}" if errors else ""
+
+
+def mesh_v5_test(tools, spirv, raw):
+    shader = Path(spirv) / "ms_v5_workgroup.spv"
+    if not shader.is_file():
+        return Skip("SKIP (build the mesh fixture with scripts/run_gpu_tests.py)")
+    fs = Path(spirv) / "fs_passthru.spv"
+    if not fs.is_file():
+        return "missing fs_passthru.spv"
+    code, out = run(os.path.join(tools, "vk_harness" + EXE), shader, fs, raw, "--mesh-group-readback", "2", "3", "4")
+    if code == UNSUPPORTED:
+        return Skip("SKIP (mesh shading unavailable)")
+    if code or not raw.is_file():
+        return failure(code, out, 3)
+    return check_mesh_v5(raw.read_bytes())
+
+
 def partial_wave_test(tools, spirv, name, expected_words):
     """A group smaller than a wave: run with subgroup size 64 requested (no full subgroups); None if the device
-    has no 64-wide subgroup (unless LEONIDA_W64_EMULATE=1)."""
+    has no 64-wide subgroup. With LEONIDA_W64_EMULATE=1 it asks for 32 instead, the width the emulation is for, so
+    a device that defaults to 64 (AMD) runs the emulated path at 32 too (#166)."""
     shader = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(shader):
         return f"missing {name}.spv"
     old = os.environ.get("VKC_SUBGROUP_SIZE")
-    os.environ["VKC_SUBGROUP_SIZE"] = "64"
+    os.environ["VKC_SUBGROUP_SIZE"] = "32" if W64_EMULATED else "64"
     try:
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump")
     finally:
@@ -147,6 +184,9 @@ def mesh_w64x_test(tools, spirv, name):
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         r = subprocess.run([os.path.join(tools, "vk_harness" + EXE), shader, fs, raw], capture_output=True, text=True, env=env)
+        if r.returncode == UNSUPPORTED:   # vk_harness: the device has no VK_EXT_mesh_shader
+            m = re.search(r"unsupported: .*", r.stderr)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
         if r.returncode or not raw.is_file():
             return failure(r.returncode, r.stdout + r.stderr, 2)
         data = raw.read_bytes()
@@ -176,21 +216,26 @@ def pixels(tools, spirv, name, fmt):
     env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
-        code, _ = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
-                      os.path.join(spirv, name + ".spv"), raw, env=env)
+        code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
+                        os.path.join(spirv, name + ".spv"), raw, env=env)
+        if code == UNSUPPORTED:   # vk_harness: the shader needs a device feature this GPU lacks
+            return Skip(""), out
         if code or not raw.is_file():
-            return None
+            return None, out
         data = raw.read_bytes()
     if len(data) != 64 * 64 * 16:  # default harness viewport, four 32-bit components per pixel
-        return None
-    return list(struct.iter_unpack(fmt, data))
+        return None, out
+    return list(struct.iter_unpack(fmt, data)), out
 
 
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
-    px = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch") else "<4I")
+    px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch") else "<4I")
+    if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
     if not px:
         return "vk_harness failed or returned no pixels"
     n = len(px)
@@ -210,6 +255,9 @@ def pixel_test(tools, spirv, name):
         err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
         return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}"
     if name == "ps_bitmask_perm":
+        m = re.search(r"subgroup \d+\.\.(\d+)", out)
+        if m and int(m.group(1)) < 32:   # the shader writes lanes 0-31; a narrower subgroup has no such lanes
+            return Skip(f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)")
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"
@@ -262,12 +310,16 @@ def main():
         results.append((name, compute_test(tools, spirv, name, "1", "dump",
                                            require_wave64=name not in WAVE32_DUMPS and not W64_EMULATED,
                                            expected_words=want)))
+    for name, want in BOUNDS:
+        results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
     for name, want in W64X_PARTIAL:
         results.append((name, partial_wave_test(tools, spirv, name, want)))
     results.append(("ms_w64x_ballot", mesh_w64x_test(tools, spirv, "ms_w64x_ballot")))
+    with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
+        results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
