@@ -19,13 +19,16 @@ inline unsigned& validation_error_count() {
     return count;
 }
 
+// Only validation-type errors fail a test. General messages come from the loader and the layers around the
+// application: a third-party implicit layer that fails to load (an overlay or capture tool, for example) reports a
+// general error that says nothing about this code, so it is printed but not counted.
 inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                                     VkDebugUtilsMessageTypeFlagsEXT types,
                                                     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
-    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
-        (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
-        ++validation_error_count();
-    std::fprintf(stderr, "validation: %s\n", data && data->pMessage ? data->pMessage : "(no message)");
+    const bool validation = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) ++validation_error_count();
+    std::fprintf(stderr, "%s: %s\n", validation ? "validation" : "vulkan (not counted)",
+                 data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }
 
