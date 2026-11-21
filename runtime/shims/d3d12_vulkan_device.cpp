@@ -309,6 +309,7 @@ public:
 
         leonida::ResourceBinding binding{};
         binding.image = image_;
+        binding.rgba8_typeless = desc_.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
         binding.format = format.format;
         binding.aspects = format.aspects;
         binding.width = std::uint32_t(desc_.Width);
@@ -497,6 +498,37 @@ public:
             } else if (desc) {
                 log_once("render-target view dimension not supported:", desc->ViewDimension);
                 view = {};
+            }
+            const bool typeless_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+            const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
+            if (typeless_rgba8 || typed_rgba8) {
+                const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
+                if (typeless_rgba8) {
+                    // This first typeless RTV slice deliberately covers only a single 2D subresource.
+                    if (!desc || desc->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D ||
+                        rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.MipLevels != 1 ||
+                        rd.DepthOrArraySize != 1 || rd.SampleDesc.Count != 1 || desc->Texture2D.MipSlice ||
+                        desc->Texture2D.PlaneSlice || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+                        view = {};
+                    } else {
+                        switch (requested) {
+                        case DXGI_FORMAT_R8G8B8A8_UNORM: view.format = leonida::ColorViewFormat::rgba8_unorm; break;
+                        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: view.format = leonida::ColorViewFormat::rgba8_srgb; break;
+                        case DXGI_FORMAT_R8G8B8A8_UINT: view.format = leonida::ColorViewFormat::rgba8_uint; break;
+                        default: view = {}; break;
+                        }
+                        if (view.resource) {
+                            const auto format = vulkan_format(requested, false);
+                            VkFormatProperties properties{};
+                            state_.format_properties(state_.info.physical, format.format, &properties);
+                            if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) view = {};
+                        }
+                    }
+                } else if (requested != rd.Format) {
+                    view = {}; // No typed-resource format casting is advertised by this backend.
+                }
+                if (!view.resource) log_once("unsupported RGBA8 RTV format/subresource:", int(requested));
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");

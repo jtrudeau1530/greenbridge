@@ -674,6 +674,18 @@ The trace will enumerate them.
   `d3d12_uint_clear_test` compares full and rectangular D3D12 readbacks with WARP over seven input sets on all
   three formats; `clear_color_test` checks both replay paths without a GPU, including unchanged float values.
   This does not add typed-view reinterpretation of typeless resources or new integer formats.
+- **RGBA8 typeless RTV clears (phase 1):** explicit UNORM, SRGB and UINT RTVs on a
+  `R8G8B8A8_TYPELESS` 2D resource with one mip, one array layer and sample count 1.
+  `TargetView` captures its format by value; copies and layout tracking keep the resource's base format.
+  Reinterpreted full clears use dynamic rendering because `vkCmdClearColorImage` cannot select a view format.
+  Rectangle clears use the same typed attachment view. The view-cache key includes the format, and views
+  request only color-attachment usage so SRGB does not inherit an unrelated storage requirement.
+  Same-format image clears and legacy float-only replay clients retain their existing path.
+  On an RX 5700 XT, 13 synthetic full/rectangle readbacks match Windows WARP (UINT exact, normalized
+  channels within one byte), including descriptor rewrites, format switches and an SRGB RTV on a UAV resource.
+  The same tests fail without this change and when the cache ignores format. CPU replay covers 19 scenarios;
+  12 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
+  typed-resource casts, mips/array expansion, MSAA and 3D typeless RTVs are outside this phase.
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
   raw DCC metadata.

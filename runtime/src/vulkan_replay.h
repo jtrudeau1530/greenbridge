@@ -17,7 +17,8 @@
 // Requirements on the device and images:
 // - a queue with graphics support (the stage masks use ALL_GRAPHICS);
 // - images cleared without rectangles have TRANSFER_DST usage; images cleared with rectangles have attachment usage
-//   and image_view must return views for them (dynamicRendering, Vulkan 1.3);
+//   and image_view must return views for them (dynamicRendering, Vulkan 1.3); reinterpreted whole-view clears
+//   use the same attachment path because vkCmdClearColorImage has no view-format argument;
 // - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3).
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
@@ -54,6 +55,7 @@ struct ResourceBinding {
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
+    bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
 };
 
 struct VulkanAccess {
@@ -574,6 +576,7 @@ struct Prepared {
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
+    VkFormat clear_format = VK_FORMAT_UNDEFINED; // The RTV format, without changing the resource binding.
     std::vector<VkClearRect> rects;   // rectangle clears, clipped to the mip
     bool skip = false;                // every rectangle was empty
     ResourceBinding source;                   // copies: the source resource
@@ -608,6 +611,25 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
         }
     }
     return value;
+}
+
+// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format.
+inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
+    if (target.format == ColorViewFormat::resource)
+        return resource.rgba8_typeless ? VK_FORMAT_UNDEFINED : resource.format;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    switch (target.format) {
+    case ColorViewFormat::rgba8_unorm: format = VK_FORMAT_R8G8B8A8_UNORM; break;
+    case ColorViewFormat::rgba8_srgb: format = VK_FORMAT_R8G8B8A8_SRGB; break;
+    case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+    if (!resource.rgba8_typeless) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
+    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.mip_levels != 1 || resource.array_layers != 1 ||
+        resource.volume || resource.depth != 1 || resource.samples != 1 ||
+        target.mip || target.first_layer || target.layer_count != 1)
+        return VK_FORMAT_UNDEFINED;
+    return format;
 }
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
@@ -960,7 +982,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             VkImageSubresourceRange range = p.range;
             range.aspectMask = view_aspects;
-            p.view = vk.image_view(p.binding, range);
+            ResourceBinding view_binding = p.binding;
+            if (p.clear_format != VK_FORMAT_UNDEFINED) view_binding.format = p.clear_format;
+            p.view = vk.image_view(view_binding, range);
             return p.view ? ReplayResult::success : ReplayResult::unsupported;
         };
 
@@ -986,8 +1010,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
                 return ReplayResult::invalid_subresource;
-            if (const auto r = rect_view(color_clear->rects, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
-                return r;
+            p.clear_format = detail::color_view_format(p.binding, color_clear->target);
+            // Older ownerless replay callers omit the resource format for float-only clears. Preserve
+            // that path; an explicit format or a typeless resource must still resolve a concrete RTV.
+            if (p.clear_format == VK_FORMAT_UNDEFINED &&
+                (p.binding.rgba8_typeless || color_clear->target.format != ColorViewFormat::resource))
+                return ReplayResult::invalid_clear;
+            if (p.clear_format != p.binding.format && color_clear->rects.empty()) {
+                // vkCmdClearColorImage has no view-format parameter. Reinterpreted whole-view clears need
+                // an attachment view too, including sRGB conversion and UINT numeric interpretation.
+                const auto extent = detail::mip_extent(p.binding, color_clear->target.mip);
+                const Rect full{0, 0, std::int32_t(extent.width), std::int32_t(extent.height)};
+                if (const auto r = rect_view(std::span<const Rect>(&full, 1), color_clear->target,
+                                            VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
+            } else if (const auto r = rect_view(color_clear->rects, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
+                       r != ReplayResult::success) return r;
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
@@ -1138,7 +1175,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            const VkClearColorValue color = detail::render_target_clear_color(p.binding.format, color_clear->color);
+            const VkClearColorValue color = detail::render_target_clear_color(p.clear_format, color_clear->color);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {

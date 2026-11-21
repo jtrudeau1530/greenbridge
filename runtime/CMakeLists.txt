@@ -371,6 +371,12 @@ if(Vulkan_FOUND)
     target_compile_definitions(d3d12_uint_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_uint_clear_test PRIVATE /W4 /permissive- /utf-8)
 
+    # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)
+    target_link_libraries(d3d12_typeless_rtv_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_typeless_rtv_test PRIVATE /W4 /permissive- /utf-8)
+
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
@@ -382,6 +388,12 @@ if(Vulkan_FOUND)
 
   # Needs only the Vulkan headers, not a GPU.
   if(BUILD_TESTING)
+    add_executable(typeless_rtv_test test/typeless_rtv_test.cpp)
+    target_link_libraries(typeless_rtv_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME typeless_rtv COMMAND typeless_rtv_test)
     add_executable(clear_color_test test/clear_color_test.cpp)
     target_link_libraries(clear_color_test PRIVATE Vulkan::Headers)
     if(WIN32)

@@ -145,12 +145,16 @@ inline constexpr std::uint32_t clear_depth = 0x1;
 inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
+// Portable color-view interpretation. Other views inherit their resource format as before.
+enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint };
+
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.
 struct TargetView {
     ResourceId resource;
     std::uint32_t mip;
     std::uint32_t first_layer;
     std::uint32_t layer_count;
+    ColorViewFormat format = ColorViewFormat::resource;
 };
 
 // D3D12_RECT: right and bottom are exclusive.
