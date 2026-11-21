@@ -1,5 +1,5 @@
 // Optional Windows test: map the package's amd_fidelityfx_upscaler_xbox.dll (FSR) through rt::Loader, bring it up
-// (TLS and unwind from the loader, then DllMain), and drive it through the public FidelityFX API on a PC D3D12
+// (Loader::initialise: TLS and DllMain), and drive it through the public FidelityFX API on a PC D3D12
 // device wrapped in the Xbox-ABI device proxy. It records what the DLL answers and which device slots it calls.
 //
 //   LEONIDA_GAME_DIR=<package root>   (contains amd_fidelityfx_upscaler_xbox.dll)
@@ -9,7 +9,7 @@
 //
 // Steps, each one only if the previous worked:
 //   1. map: the console imports bind to the shims and nothing is unimplemented
-//   2. DllMain(DLL_PROCESS_ATTACH)
+//   2. Loader::initialise(): TLS and DllMain(DLL_PROCESS_ATTACH)
 //   3. ffxConfigure(global debug) with a message callback, so the DLL's own messages are printed
 //   4. CPU-only queries (upscale ratio, render resolution): do the PC struct type ids work on the Xbox build?
 //   5. ffxQuery(GET_VERSIONS) for the upscaler on the proxied device
@@ -111,17 +111,6 @@ Call guarded_destroy(ffx::PfnDestroyContext fn, ffx::Context* ctx) {
     return c;
 }
 
-BOOL guarded_dll_main(void* entry, HMODULE module, DWORD* code) {
-    using DllMain = BOOL(WINAPI*)(HMODULE, DWORD, LPVOID);
-    BOOL ok = FALSE;
-    __try {
-        ok = reinterpret_cast<DllMain>(entry)(module, DLL_PROCESS_ATTACH, nullptr);
-    } __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
-        ok = FALSE;
-    }
-    return ok;
-}
-
 // Counting wrappers around the xmem shims, patched into this DLL's IAT only, so the test sees how far a call gets.
 using XMemAllocFn = void*(__stdcall*)(size_t, uint64_t);
 using XMemFreeFn = void(__stdcall*)(void*, uint64_t);
@@ -163,6 +152,29 @@ bool patch(void** slot, void* fn, void** old) {
     *slot = fn;
     VirtualProtect(slot, sizeof(void*), prot, &prot);
     return true;
+}
+
+// main's loader (#95) maps, sets up TLS and runs DllMain, but doesn't register the image's x64 unwind tables yet
+// (#93 adds that). Both DLLs throw and catch C++ exceptions inside, which ends the process without them. Register
+// .pdata here only when the loader hasn't, so the test keeps working once #93 is in.
+bool ensure_unwind_registered(rt::Module& m) {
+    DWORD64 base = 0;
+    if (RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(m.base + m.entry_rva), &base, nullptr)) return true;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(m.base + reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    const auto& ex = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    return ex.Size && RtlAddFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(m.base + ex.VirtualAddress),
+                                          ex.Size / sizeof(RUNTIME_FUNCTION), reinterpret_cast<DWORD64>(m.base));
+}
+
+// Loader::initialise() runs the module's TLS setup and DllMain (#95). SEH faults inside the DLL are reported here;
+// C++ exceptions (a DllMain returning FALSE, a corrupt TLS directory) go on to the caller's catch.
+DWORD guarded_initialise(rt::Loader* loader) {
+    DWORD code = 0;
+    __try {
+        loader->initialise();
+    } __except ((code = GetExceptionCode()) == 0xE06D7363 ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return code == 0xE06D7363 ? 0 : code;
 }
 
 std::string describe(const Call& c) {
@@ -218,6 +230,7 @@ void print_slot_hits(const void* proxy) {
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep every line if the DLL takes the process down
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
@@ -235,8 +248,8 @@ int main() {
         // 1. Map.
         rt::Loader loader(game_dir);
         rt::Module& fsr = loader.load(dll);
-        std::printf("mapped %s at %p, size %u, entry +%#x%s, TLS index %u\n", fsr.name.c_str(), fsr.base, fsr.size,
-                    fsr.entry_rva, fsr.relocated ? " (relocated)" : "", fsr.tls_index);
+        std::printf("mapped %s at %p, size %u, entry +%#x%s\n", fsr.name.c_str(), fsr.base, fsr.size,
+                    fsr.entry_rva, fsr.relocated ? " (relocated)" : "");
         int shim = 0, host = 0, unimplemented = 0;
         for (auto& r : fsr.imports) {
             if (r.binding == rt::Binding::Shim) ++shim;
@@ -264,11 +277,23 @@ int main() {
                         reinterpret_cast<void**>(&g_xmem_free)),
               "XMemAlloc/XMemFree IAT slots wrapped with counters");
 
-        // 2. DllMain.
-        DWORD code = 0;
-        const BOOL attached = guarded_dll_main(fsr.base + fsr.entry_rva, reinterpret_cast<HMODULE>(fsr.base), &code);
-        check(attached != FALSE, "DllMain(DLL_PROCESS_ATTACH) returned TRUE" + (code ? " (exception " + hex(code) + ")" : ""));
-        if (!attached) return 1;
+        // 2. TLS and DllMain.
+        check(ensure_unwind_registered(fsr), "x64 unwind tables registered (by the loader or here)");
+        const DWORD init = guarded_initialise(&loader);
+        check(init == 0, "Loader::initialise (TLS, DllMain) succeeds" + (init ? " (exception " + hex(init) + ")" : ""));
+        if (init) return 1;
+        std::printf("TLS: %s slot %u\n", fsr.has_tls_slot ? "loader" : "no", fsr.tls_slot);
+        if (fsr.has_tls_slot) {
+            // __declspec(thread) code reads TEB->ThreadLocalStoragePointer[_tls_index] (gs:[58h]), not TlsGetValue.
+            auto** tls_array = reinterpret_cast<void**>(__readgsqword(0x58));
+            void* seen = tls_array ? tls_array[fsr.tls_slot] : nullptr;
+            note("TLS check: ThreadLocalStoragePointer[" + std::to_string(fsr.tls_slot) + "] = " +
+                 hex(reinterpret_cast<uint64_t>(seen)) + ", loader block = " + hex(reinterpret_cast<uint64_t>(fsr.tls_block)));
+            // A TlsAlloc index names TEB->TlsSlots, a different array: the image would read another module's TLS
+            // block, and its thread-safe statics then fault or not depending on what is there (#93 fixes this).
+            check(seen == fsr.tls_block, "the image's __declspec(thread) block is the one the loader set up");
+            if (seen != fsr.tls_block) return 1;
+        }
 
         // 3. Debug messages.
         ffx::ConfigureDescGlobalDebug debug{};

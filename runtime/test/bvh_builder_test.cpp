@@ -1,5 +1,5 @@
-// Optional Windows test: map the package's XboxBvhBuilder.dll through rt::Loader, bring it up (TLS and unwind from
-// the loader, then DllMain), and construct an XboxBvhBuilder on a PC D3D12 device behind the Xbox-ABI device proxy.
+// Optional Windows test: map the package's XboxBvhBuilder.dll through rt::Loader, bring it up (Loader::initialise:
+// TLS and DllMain), and construct an XboxBvhBuilder on a PC D3D12 device behind the Xbox-ABI device proxy.
 // Needs the proxy's slot-62 shape (desc, w2, w3, riid, out). Results: docs/d3d12_vulkan.md, Appendix A.2.
 // It records what the constructor does: how much of the object it writes, which device slots it calls, what it
 // prints through OutputDebugString, and whether it gives up through TerminateProcess.
@@ -143,7 +143,6 @@ int filter(EXCEPTION_POINTERS* e, Call* c) {
 
 using Ctor = void* (*)(void* self, void* device, bool flag);
 using Dtor = void (*)(void* self);
-using DllMain = BOOL(WINAPI*)(HMODULE, DWORD, LPVOID);
 
 Call guarded_ctor(Ctor fn, void* self, void* device, bool flag) {
     Call c;
@@ -165,14 +164,27 @@ Call guarded_dtor(Dtor fn, void* self) {
     return c;
 }
 
-Call guarded_dll_main(DllMain fn, HMODULE module, BOOL* ok) {
-    Call c;
+// main's loader (#95) maps, sets up TLS and runs DllMain, but doesn't register the image's x64 unwind tables yet
+// (#93 adds that). Both DLLs throw and catch C++ exceptions inside, which ends the process without them. Register
+// .pdata here only when the loader hasn't, so the test keeps working once #93 is in.
+bool ensure_unwind_registered(rt::Module& m) {
+    DWORD64 base = 0;
+    if (RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(m.base + m.entry_rva), &base, nullptr)) return true;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(m.base + reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    const auto& ex = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    return ex.Size && RtlAddFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(m.base + ex.VirtualAddress),
+                                          ex.Size / sizeof(RUNTIME_FUNCTION), reinterpret_cast<DWORD64>(m.base));
+}
+
+// Loader::initialise() runs the module's TLS setup and DllMain (#95). SEH faults inside the DLL are reported here;
+// C++ exceptions (a DllMain returning FALSE, a corrupt TLS directory) go on to the caller's catch.
+DWORD guarded_initialise(rt::Loader* loader) {
+    DWORD code = 0;
     __try {
-        *ok = fn(module, DLL_PROCESS_ATTACH, nullptr);
-    } __except (filter(GetExceptionInformation(), &c)) {
-        c.faulted = true;
+        loader->initialise();
+    } __except ((code = GetExceptionCode()) == 0xE06D7363 ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER) {
     }
-    return c;
+    return code == 0xE06D7363 ? 0 : code;
 }
 
 std::string describe(const Call& c) {
@@ -324,8 +336,8 @@ int main() {
     try {
         rt::Loader loader(game_dir);
         rt::Module& bvh = loader.load(dll);
-        std::printf("mapped %s at %p, size %u, entry +%#x%s, TLS index %u\n", bvh.name.c_str(), bvh.base, bvh.size,
-                    bvh.entry_rva, bvh.relocated ? " (relocated)" : "", bvh.tls_index);
+        std::printf("mapped %s at %p, size %u, entry +%#x%s\n", bvh.name.c_str(), bvh.base, bvh.size,
+                    bvh.entry_rva, bvh.relocated ? " (relocated)" : "");
         int shim = 0, host = 0, unimplemented = 0;
         for (auto& r : bvh.imports) {
             if (r.binding == rt::Binding::Shim) ++shim;
@@ -351,10 +363,11 @@ int main() {
               "OutputDebugStringA/W and TerminateProcess redirected in this DLL's IAT");
         if (g_failures) return 1;
 
-        BOOL attached = FALSE;
-        Call c = guarded_dll_main(reinterpret_cast<DllMain>(bvh.base + bvh.entry_rva), reinterpret_cast<HMODULE>(bvh.base), &attached);
-        check(!c.faulted && attached, "DllMain(DLL_PROCESS_ATTACH) returned TRUE" + (c.faulted ? " (" + describe(c) + ")" : ""));
-        if (!attached) return 1;
+        check(ensure_unwind_registered(bvh), "x64 unwind tables registered (by the loader or here)");
+        const DWORD init = guarded_initialise(&loader);
+        check(init == 0, "Loader::initialise (TLS, DllMain) succeeds" + (init ? " (exception " + hex(init) + ")" : ""));
+        if (init) return 1;
+        std::printf("TLS: %s slot %u\n", bvh.has_tls_slot ? "loader" : "no", bvh.tls_slot);
 
         const bool debug_layer = enable_debug_layer();
         note(std::string("D3D12 debug layer ") + (debug_layer ? "enabled" : "not available (Graphics Tools not installed)"));
@@ -373,7 +386,7 @@ int main() {
         const bool flag = env("LEONIDA_BVH_FLAG") == "1";
         std::vector<uint8_t> object(kObjectBuffer, kSentinel);
         const ULONGLONG t0 = GetTickCount64();
-        c = guarded_ctor(ctor, object.data(), proxy, flag);
+        Call c = guarded_ctor(ctor, object.data(), proxy, flag);
         const ULONGLONG ms = GetTickCount64() - t0;
         size_t last = 0, changed = 0;
         for (size_t i = 0; i < object.size(); ++i)
