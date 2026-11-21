@@ -220,6 +220,19 @@ def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
 
 
+def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) -> tuple[bool | None, str]:
+    """cs_wavemask, as in check.py: (passed, detail), passed None for a skip. The native build needs a 64-wide
+    subgroup and skips where the device has none; with LEONIDA_W64_EMULATE=1 it was translated with
+    --wave64-emulate and runs on any subgroup size, so it asks for none."""
+    cmd = [vk_compute, spv, "1", "wavemask"] + ([] if emulated else ["--require-wave64"])
+    rc, msg = run_cmd(cmd, env=env)
+    if not emulated and rc == 77:
+        return None, "SKIP (no 64-wide compute subgroup on this device)"
+    if not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
+        return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    return rc == 0, msg.splitlines()[-1] if msg else ""
+
+
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
     px = read_raw_u32(raw_path)
     if len(px) != 64 * 64:
@@ -487,14 +500,8 @@ def run_suite(a, work: str) -> int:
             results.append((name, rc == 0 and vals == want,
                             " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_wavemask":
-            # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
-            rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", "--require-wave64"], env=cs_env)
-            if rc == 77:
-                results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
-            elif rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
-                results.append((name, False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"))
-            else:
-                results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + wavemask_check(vk_compute, spv, cs_env,
+                                                    os.environ.get("LEONIDA_W64_EMULATE") == "1"))
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
