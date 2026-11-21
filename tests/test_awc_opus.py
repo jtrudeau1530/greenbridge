@@ -274,7 +274,8 @@ class MalformedBankTest(unittest.TestCase):
             with open(path, "wb") as f:
                 f.write(b"XATD" + b"\x00" * 60)
             out = io.StringIO()
-            argv = ["awc_opus.py", path, os.path.join(tmp, "out")]
+            # --jobs 1: the module is loaded under a private name, which worker processes cannot import
+            argv = ["awc_opus.py", path, os.path.join(tmp, "out"), "--jobs", "1"]
             with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
                 self.assertEqual(awc.main(), 0)
             self.assertIn("skip bad.awc", out.getvalue())
