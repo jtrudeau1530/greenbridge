@@ -34,7 +34,16 @@ PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_
 
 
 def run(*cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        tools = os.path.abspath(os.path.dirname(cmd[0]))
+        missing = [t + EXE for t in ("vk_compute_test", "vk_store_test", "vk_harness")
+                   if not os.path.isfile(os.path.join(tools, t + EXE))]
+        sys.exit(f"Test programs not found in {tools}: {', '.join(missing)}\n"
+                 "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
+                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
+                 "Vulkan headers (vulkan-headers on Arch) and configure again.")
     return r.returncode, r.stdout + r.stderr
 
 
