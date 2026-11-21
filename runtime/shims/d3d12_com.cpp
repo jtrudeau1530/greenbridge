@@ -1,6 +1,7 @@
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
+#include "d3d12_com_object.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -36,92 +37,8 @@ const char* name(leonida::ReplayResult result) {
     return "?";
 }
 
-// IUnknown and ID3D12Object for one implementation class. QueryInterface answers the listed public interfaces
-// and the class's private Derived::kTag (which returns the implementation itself); anything else is logged with
-// its IID and refused, as section 3.1 asks.
-template<class Derived, class Stubs, class... Interfaces>
-class Object : public Stubs {
-public:
-    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
-    ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG left = --refs_;
-        if (!left) delete static_cast<Derived*>(this);
-        return left;
-    }
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
-        *out = nullptr;
-        if (riid == Derived::kTag) {
-            *out = static_cast<Derived*>(this);
-        } else if (riid == __uuidof(IUnknown) || ((riid == __uuidof(Interfaces)) || ...)) {
-            *out = static_cast<Stubs*>(this);  // one inheritance chain: every interface shares this pointer
-        } else {
-            std::fprintf(stderr,
-                         "[rt] d3d12: QueryInterface: unknown IID {%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
-                         static_cast<unsigned long>(riid.Data1), riid.Data2, riid.Data3, riid.Data4[0], riid.Data4[1],
-                         riid.Data4[2], riid.Data4[3], riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7]);
-            return E_NOINTERFACE;
-        }
-        AddRef();
-        return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
-        if (!size) return E_INVALIDARG;
-        std::lock_guard lock(data_mutex_);
-        for (const auto& [key, bytes] : data_) {
-            if (key != guid) continue;
-            if (data) {
-                if (*size < bytes.size()) return DXGI_ERROR_MORE_DATA;
-                std::memcpy(data, bytes.data(), bytes.size());
-            }
-            *size = static_cast<UINT>(bytes.size());
-            return S_OK;
-        }
-        *size = 0;
-        return DXGI_ERROR_NOT_FOUND;
-    }
-
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
-        std::lock_guard lock(data_mutex_);
-        std::erase_if(data_, [&](const auto& entry) { return entry.first == guid; });
-        if (data && size) {
-            const auto* bytes = static_cast<const std::uint8_t*>(data);
-            data_.emplace_back(guid, std::vector<std::uint8_t>(bytes, bytes + size));
-        }
-        return S_OK;
-    }
-
-    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return S_OK; }
-
-protected:
-    template<class T>
-    static T* from(IUnknown* object) {
-        if (!object) return nullptr;
-        void* implementation = nullptr;
-        if (FAILED(object->QueryInterface(T::kTag, &implementation))) return nullptr;
-        static_cast<T*>(implementation)->Release();  // the caller holds its own reference
-        return static_cast<T*>(implementation);
-    }
-
-    virtual ~Object() = default;
-
-private:
-    std::atomic<ULONG> refs_{1};
-    std::mutex data_mutex_;
-    std::vector<std::pair<GUID, std::vector<std::uint8_t>>> data_;
-};
-
-template<class T>
-HRESULT hand_out(T* object, REFIID riid, void** out) {
-    const HRESULT hr = object->QueryInterface(riid, out);
-    object->Release();
-    return hr;
-}
-
 class CommandAllocator final
-    : public Object<CommandAllocator, ID3D12CommandAllocatorStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+    : public Child<CommandAllocator, ID3D12CommandAllocatorStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                     ID3D12CommandAllocator> {
 public:
     // {7d0e6b51-34a2-4f0c-9a61-0c5b2e8f4a10}
@@ -137,7 +54,7 @@ private:
 };
 
 class GraphicsCommandList final
-    : public Object<GraphicsCommandList, ID3D12GraphicsCommandList7Stubs, ID3D12Object, ID3D12DeviceChild,
+    : public Child<GraphicsCommandList, ID3D12GraphicsCommandList7Stubs, ID3D12Object, ID3D12DeviceChild,
                     ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList1,
                     ID3D12GraphicsCommandList2, ID3D12GraphicsCommandList3, ID3D12GraphicsCommandList4,
                     ID3D12GraphicsCommandList5, ID3D12GraphicsCommandList6, ID3D12GraphicsCommandList7> {
@@ -236,7 +153,7 @@ public:
                                         stencil, to_rects(count, rects)));
     }
 
-    static GraphicsCommandList* from(IUnknown* object) { return Object::from<GraphicsCommandList>(object); }
+    static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
     template<class E>
@@ -261,7 +178,7 @@ private:
 };
 
 class Fence final
-    : public Object<Fence, ID3D12Fence1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Fence,
+    : public Child<Fence, ID3D12Fence1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Fence,
                     ID3D12Fence1> {
 public:
     // {b4c39e02-6f71-4d8a-b25e-3e9d0f6c1a88}
@@ -316,7 +233,7 @@ public:
         return S_OK;
     }
 
-    static Fence* from(IUnknown* object) { return Object::from<Fence>(object); }
+    static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
 private:
     void wait_loop() {
@@ -349,7 +266,7 @@ private:
 };
 
 class CommandQueue final
-    : public Object<CommandQueue, ID3D12CommandQueueStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+    : public Child<CommandQueue, ID3D12CommandQueueStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                     ID3D12CommandQueue> {
 public:
     // {e1a85d76-0b3f-4c29-a7d4-58f2c6e0b913}
@@ -398,7 +315,7 @@ public:
         return S_OK;
     }
 
-    static CommandQueue* from(IUnknown* object) { return Object::from<CommandQueue>(object); }
+    static CommandQueue* from(IUnknown* object) { return Child::from<CommandQueue>(object); }
 
 private:
     D3D12_COMMAND_QUEUE_DESC desc_;
@@ -410,7 +327,7 @@ private:
 }  // namespace
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
-                             const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out) {
+                             const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
     auto* object = new CommandQueue(context, queue, queue_family, desc);
@@ -418,26 +335,31 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
         object->Release();
         return E_FAIL;
     }
+    object->attach_device(device);
     return hand_out(object, riid, out);
 }
 
-HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) {
+HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    return hand_out(new CommandAllocator(type), riid, out);
+    auto* object = new CommandAllocator(type);
+    object->attach_device(device);
+    return hand_out(object, riid, out);
 }
 
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
-                            void** out) {
+                            void** out, IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!allocator) return E_INVALIDARG;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT) stub("create_command_list(non-direct type)");
-    return hand_out(new GraphicsCommandList(type), riid, out);  // created open, as D3D12 does
+    auto* object = new GraphicsCommandList(type);  // created open, as D3D12 does
+    object->attach_device(device);
+    return hand_out(object, riid, out);
 }
 
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
-                     void** out) {
+                     void** out, IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
     auto* object = new Fence(context, initial_value, flags);
@@ -445,6 +367,7 @@ HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D1
         object->Release();
         return E_FAIL;
     }
+    object->attach_device(device);
     return hand_out(object, riid, out);
 }
 

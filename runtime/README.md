@@ -70,8 +70,11 @@ Current limits, by design:
   address.
 - `d3d12_xs.dll` — `D3D12SerializeVersionedRootSignature` and
   `D3D12CreateRootSignatureDeserializer`, with the console root-signature high byte (`0x03000000`)
-  cleared on a copy before forwarding to the PC `d3d12.dll`. `D3D12XboxCreateDevice` currently creates
-  and returns a PC `ID3D12Device`; the measured-slot Xbox-ABI device proxy is under review.
+  cleared on a copy before forwarding to the PC `d3d12.dll`. `D3D12XboxCreateDevice` wraps a device in
+  the measured-slot Xbox-ABI proxy: the host PC `ID3D12Device` by default, or the Vulkan-backed device
+  (`shims/d3d12_vulkan_device.cpp`) when `LEONIDA_D3D12=vulkan` is set and the runtime was built with the
+  Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
+  depth views and committed resources; see `docs/d3d12_vulkan.md` section 3.2 for what is missing.
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
@@ -89,6 +92,9 @@ when the Vulkan SDK is found:
 
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
+- `vk_command_replay_test`, `d3d12_com_test`, `d3d12_vulkan_device_test` — the D3D12 command path on
+  Vulkan: replay, the COM command objects, and the Vulkan device behind the Xbox-ABI proxy. Set
+  `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
 - `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` — creates a shader module and, for compute
   shaders, a pipeline for every entry in the translator's `index.json`; reports `MODULE FAIL` /
   `PIPELINE FAIL` per shader and a summary.

@@ -46,6 +46,7 @@ struct ResourceBinding {
     std::uint32_t array_layers = 1;
     bool presentable = false;          // a swapchain image: common/present maps to PRESENT_SRC_KHR
     bool simultaneous_access = false;  // D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS: always GENERAL
+    bool not_zeroed = false;           // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: first use skips the zero fill
 };
 
 struct VulkanAccess {
@@ -489,6 +490,37 @@ inline std::vector<LayoutPiece> current(const LayoutTracker* tracker, ResourceId
     return out;
 }
 
+// Images registered with the tracker in UNDEFINED have never been used. D3D12 committed resources start zeroed,
+// so each such piece is cleared to zero (colour 0, depth 0, stencil 0) and moved to `layout`, the layout the
+// operation about to run expects, before that operation; with not_zeroed it is only moved. The tracker records it.
+inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
+                       ResourceId id, std::vector<LayoutPiece>& pieces, VkImageLayout layout, LayoutTracker* tracker) {
+    constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    for (auto& piece : pieces) {
+        if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
+        if (resource.not_zeroed) {
+            image_barrier(vk, command_buffer, resource.image, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        } else {
+            const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            image_barrier(vk, command_buffer, resource.image, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT);
+            if (piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+                const VkClearColorValue zero{};
+                vk.clear_color_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
+            } else {
+                const VkClearDepthStencilValue zero{};
+                vk.clear_depth_stencil_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
+            }
+            image_barrier(vk, command_buffer, resource.image, piece.range, dst, layout, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        }
+        piece.layout = layout;
+        if (tracker) tracker->set(id, piece.range, layout);
+    }
+}
+
 // Moves every piece to `target` (src: the D3D12 state the operation requires), runs `body`, and moves the pieces
 // back to where they were. Pieces already in `target` need no transition.
 template<typename Body>
@@ -627,7 +659,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VkImageLayout new_layout = image_layout(p.binding, to.layout);
-            for (const auto& piece : detail::current(tracker, id, range, image_layout(p.binding, from.layout)))
+            auto pieces = detail::current(tracker, id, range, image_layout(p.binding, from.layout));
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, from.layout), tracker);
+            for (const auto& piece : pieces)
                 detail::image_barrier(vk, command_buffer, p.binding.image, piece.range, piece.layout, new_layout,
                                       from.access, from.stages, to.access, to.stages);
             if (tracker) tracker->set(id, range, new_layout);
@@ -665,9 +699,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             std::vector<LayoutPiece> pieces;
             if (discard)
                 pieces = {{range, VK_IMAGE_LAYOUT_UNDEFINED}};
-            else
-                pieces = detail::current(tracker, id, range,
-                                         image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable)));
+            else {
+                const VkImageLayout before =
+                    image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
+                pieces = detail::current(tracker, id, range, before);
+                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
+            }
             std::vector<VkImageMemoryBarrier2> barriers;
             for (const auto& piece : pieces) {
                 VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -691,7 +728,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
-            const auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
+            auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
             VkClearColorValue color{};
             std::copy(color_clear->color.begin(), color_clear->color.end(), color.float32);
             if (p.rects.empty()) {
@@ -726,7 +764,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // With separate layouts only the cleared planes move; otherwise both do.
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
-            const auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
+            auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
             const VkClearDepthStencilValue value{depth_clear->depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),

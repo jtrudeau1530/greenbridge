@@ -190,10 +190,11 @@ if(Vulkan_FOUND)
       OUTPUT ${LEONIDA_STUBS}
       COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
               ID3D12GraphicsCommandList7 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
+              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
-    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp ${LEONIDA_STUBS})
+    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp ${LEONIDA_STUBS})
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -203,6 +204,18 @@ if(Vulkan_FOUND)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_com_test PRIVATE /W4 /permissive- /utf-8)
+
+    # The Vulkan device behind the Xbox-ABI proxy, end to end.
+    add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp shims/d3d12_xs_device.cpp)
+    target_link_libraries(d3d12_vulkan_device_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
+
+    # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
+    if(TARGET gta6rt)
+      target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
+    endif()
   else()
     message(STATUS "Python 3 or Windows missing: the D3D12 COM objects and d3d12_com_test are not built")
   endif()

@@ -28,7 +28,10 @@ struct VulkanDeviceFunctions {
     X(vkDestroySemaphore) X(vkGetSemaphoreCounterValue) X(vkWaitSemaphores) X(vkSignalSemaphore)               \
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2)                \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdBeginRendering) X(vkCmdEndRendering)         \
-    X(vkCmdClearAttachments)
+    X(vkCmdClearAttachments) X(vkDeviceWaitIdle) X(vkCreateImage) X(vkDestroyImage)                         \
+    X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
+    X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
+    X(vkUnmapMemory)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -42,7 +45,10 @@ struct VulkanDeviceFunctions {
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&
                vkCreateImageView && vkDestroyImageView && vkCmdPipelineBarrier && vkCmdClearColorImage &&
-               vkCmdClearDepthStencilImage && vkCmdClearAttachments;
+               vkCmdClearDepthStencilImage && vkCmdClearAttachments && vkDeviceWaitIdle && vkCreateImage &&
+               vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
+               vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
+               vkFreeMemory && vkMapMemory && vkUnmapMemory;
     }
 };
 
@@ -111,6 +117,9 @@ public:
 
     VulkanDeviceFunctions vk;
 
+    // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
+    std::mutex& submit_mutex() { return submit_mutex_; }
+
 private:
     friend class VulkanQueue;
 
@@ -138,6 +147,7 @@ private:
     VkDevice device_;
     bool loaded_ = false;
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
+    std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
@@ -211,7 +221,10 @@ public:
 
     ~VulkanQueue() {
         auto& vk = context_.vk;
-        if (queue_) vk.vkQueueWaitIdle(queue_);
+        if (queue_) {
+            std::lock_guard lock(context_.submit_mutex());
+            vk.vkQueueWaitIdle(queue_);
+        }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
     }
@@ -251,7 +264,10 @@ public:
         wait_values_.push_back(value);
     }
 
-    bool idle() { return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS; }
+    bool idle() {
+        std::lock_guard lock(context_.submit_mutex());
+        return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+    }
 
 private:
     VkCommandBuffer acquire() {
@@ -296,7 +312,11 @@ private:
         submit.pCommandBuffers = &command_buffer;
         submit.signalSemaphoreCount = std::uint32_t(signals.size());
         submit.pSignalSemaphores = signals.data();
-        const bool ok = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS;
+        bool ok;
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            ok = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS;
+        }
         waits_.clear();
         wait_values_.clear();
         for (auto& slot : buffers_)
