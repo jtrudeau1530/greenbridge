@@ -18,6 +18,7 @@ Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
 Writes <name>.spvasm and <name>.spv for each translated shader and prints coverage + validation results.
 """
 import argparse
+import hashlib
 import os
 import re
 import struct
@@ -118,6 +119,9 @@ class Gen:
         self.uses_codebase = False
         self.uses_long = False
         self.vertex_inputs = []    # (D3D input register, component type 1=uint 2=sint 3=float) for fetch-calling VS
+        self.vertex_signature = []   # full ISG1: (register, mask, system value, component type) for PSO lookup
+        self.dynamic_format = False  # True when a buffer_load used a runtime V# FORMAT (unknown codes -> 0 at runtime)
+        self.fixed_format_codes = set()  # static tbuffer/fixed format codes seen (validated against FORMATS)
         self.frag_inputs = {}      # PS: VGPR -> gl_FragCoord component, from the verified system-VGPR layout
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
@@ -541,7 +545,10 @@ class Gen:
     def encode_format(self, fcomps, icomps, code):
         """Encode one element of format `code` -> list of uint ids (whole dwords; elements under 4 bytes return one
         value in the low bits). fcomps are f32 bit patterns (float/normalized kinds), icomps integers (u32/uint)."""
-        size, kind, widths = self.FORMATS[code]
+        try:
+            size, kind, widths = self.FORMATS[code]
+        except KeyError:
+            raise Unsupported(f"format {code} (not in FORMATS)")
         if kind == "f32":
             return list(fcomps[:len(widths)])
         if kind == "u32":
@@ -580,7 +587,10 @@ class Gen:
 
     def decode_format(self, words, code):
         """Decode one element of format `code` from raw dwords -> 4 uint ids holding f32 bits (or uint for *_UINT/uint)."""
-        size, kind, widths = self.FORMATS[code]
+        try:
+            size, kind, widths = self.FORMATS[code]
+        except KeyError:
+            raise Unsupported(f"format {code} (not in FORMATS)")
         if kind in ("f32", "u32"):
             vals = list(words[:len(widths)])
             if kind == "u32":
@@ -701,6 +711,10 @@ class Gen:
         """buffer_load_format_[x|xy|xyz|xyzw]: element at V#.base + offsets, decoded per the V# FORMAT field
         (word3 bits 12-18), then swizzled by DST_SEL_X/Y/Z/W (word3 bits 0-11: 0=0, 1=1, 4..7 = X..W).
         Formats outside FORMATS decode to 0. num_records bounds checking isn't modelled."""
+        if fixed_fmt is not None:
+            self.fixed_format_codes.add(fixed_fmt)
+        else:
+            self.dynamic_format = True
         if any(m in mods for m in ("lds", "tfe", "d16")):
             raise Unsupported(op + " form")
         d16 = "_d16_" in op
@@ -5247,6 +5261,8 @@ def translate(path):
         if not reads <= predicted:
             raise Unsupported("fetch mapping")
         g.vertex_inputs = [(reg, ctype) for reg, _, _, ctype in sig]
+        g.vertex_signature = [{"register": reg, "mask": mask, "system_value": sv, "component_type": ctype}
+                              for reg, mask, sv, ctype in sig]
         for reg, _ in g.vertex_inputs:          # register the VGPR index constants before assembly
             for c in range(4):
                 g.cu(4 + 4 * reg + c)
@@ -5385,10 +5401,23 @@ def branch_condition(g, op):
     return b
 
 
-def shader_meta(g, asm):
+def _sha256_file(path):
+    """Hex SHA-256 of a file, or None when the path is missing (fssm sidecars are optional)."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def shader_meta(g, asm, src_path=None, fssm_path=None):
     """What a runtime needs to create the pipeline for this module without inspecting it: stage, wave size,
     Vulkan features/extensions it requires, descriptor bindings (set 0), push-constant size, workgroup size,
-    LDS bytes, mesh/geometry limits, and the input/output locations."""
+    LDS bytes, mesh/geometry limits, the input/output locations, plus identity metadata (src/fssm hashes and
+    the full ISG1 vertex-input signature) for PSO lookup and corpus auditing."""
     caps = sorted(set(re.findall(r"OpCapability (\w+)", asm)))
     exts = sorted(set(re.findall(r'OpExtension "([^"]+)"', asm)))
     binds = sorted({int(b) for b in re.findall(r"OpDecorate %\w+ Binding (\d+)", asm)})
@@ -5404,7 +5433,10 @@ def shader_meta(g, asm):
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),
          "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 16,
-         "subgroup_size": 64 if g.wave64 else 32}
+         "subgroup_size": 64 if g.wave64 else 32,
+         # 64-wide subgroups can only be requested for compute/mesh on RADV and NVIDIA; VS/PS/GS wave64
+         # shaders must be treated as emulated (per-32-lane halves) until cross-half ops go through LDS.
+         "wave64_emulated": bool(g.wave64 and g.stage in ("vs", "ps", "gs"))}
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
     if g.cs:
@@ -5422,6 +5454,21 @@ def shader_meta(g, asm):
         m["lds_bytes"] = 4 * g.lds_dwords
     if g.vertex_inputs:
         m["vertex_inputs"] = [{"location": r, "type": {1: "uint", 2: "sint"}.get(t, "float")} for r, t in g.vertex_inputs]
+    if getattr(g, "vertex_signature", None):
+        m["vertex_input_signature"] = list(g.vertex_signature)
+    if getattr(g, "dynamic_format", False):
+        # A runtime V# FORMAT means codes outside FORMATS decode to 0; flag for atlas coverage.
+        m["dynamic_format"] = True
+    if getattr(g, "fixed_format_codes", None):
+        m["fixed_format_codes"] = sorted(g.fixed_format_codes)
+    if src_path:
+        src_hash = _sha256_file(src_path)
+        if src_hash:
+            m["src_sha256"] = src_hash
+    if fssm_path:
+        fssm_hash = _sha256_file(fssm_path)
+        if fssm_hash:
+            m["fssm_sha256"] = fssm_hash
     if g.frag_inputs:
         m["ps_system_inputs"] = sorted({str(c) for c in g.frag_inputs.values()})
     outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if t != "pos0")
@@ -5451,6 +5498,8 @@ def main():
     ap.add_argument("--shard", help="i/n: translate every n-th shader starting at i (run n processes in parallel, "
                                     "then merge the index.part*.json files with --merge)")
     ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
+    ap.add_argument("--fssm-dir", default=None,
+                    help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
     ap.add_argument("--dispatch-loop", action="store_true",
                     help="emit control flow the old way, as one loop around a switch (to compare with the default)")
     a = ap.parse_args()
@@ -5496,7 +5545,8 @@ def main():
         if r.returncode == 0:
             valid += 1
             try:
-                meta[name] = shader_meta(translate.last_gen, asm)
+                fssm_sidecar = os.path.join(a.fssm_dir, name + ".fssm") if a.fssm_dir else None
+                meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:

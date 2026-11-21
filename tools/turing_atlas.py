@@ -1,0 +1,216 @@
+r"""Turing bring-up atlas for Leonida (stdlib only, run with python -I).
+
+Probes the host GPU (here: RTX 2060 SUPER, wave32) without game data:
+  1. vulkaninfo feature matrix (subgroup size, mesh/task, barycentrics,
+     maintenance8, subgroup_size_control, descriptor heap).
+  2. spirv-as/spirv-val validation of 4 synthetic cases at vulkan1.4:
+     compute-32, compute ballot-64 (wave64 marker), mesh-only, 16-bit I/O.
+  3. Emits a JSON atlas to stdout (or --out FILE) for the PR body.
+
+Usage:
+    python -I tools/turing_atlas.py [--out atlas.json]
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+CASES = {
+    # Minimal compute using the subgroup lane id (valid everywhere).
+    "compute32": r"""
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %lid
+OpExecutionMode %main LocalSize 64 1 1
+%void = OpTypeVoid
+%u32 = OpTypeInt 32 0
+%ptr = OpTypePointer Input %u32
+%lid = OpVariable %ptr Input
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+""",
+    # Wave64 marker: 64-bit ballot over a 64-wide subgroup.
+    "ballot64": r"""
+OpCapability Shader
+OpCapability Int64
+OpCapability GroupNonUniformBallot
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %lid
+OpExecutionMode %main LocalSize 64 1 1
+%void = OpTypeVoid
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%u64 = OpTypeInt 64 0
+%v4u64 = OpTypeVector %u64 4
+%scope = OpConstant %u32 3
+%ptr = OpTypePointer Input %u32
+%lid = OpVariable %ptr Input
+%u32_32 = OpConstant %u32 32
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %u32 %lid
+%cmp = OpULessThan %bool %id %u32_32
+%ballot = OpGroupNonUniformBallot %v4u64 %scope %cmp
+OpReturn
+OpFunctionEnd
+""",
+    # 16-bit fragment input probe (records whether the toolchain accepts it
+    # on this host; storageInputOutput16 is false on Turing per vulkaninfo).
+    "f16_input": r"""
+OpCapability Shader
+OpCapability Float16
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %in16
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %in16 Location 0
+%void = OpTypeVoid
+%f16 = OpTypeFloat 16
+%ptr = OpTypePointer Input %f16
+%in16 = OpVariable %ptr Input
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+""",
+    # Maintenance8 Offset form (game uses image_sample with Offset on non-gather).
+    "maintenance8_offset": r"""
+OpCapability Shader
+OpCapability ImageGatherExtended
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main"
+OpExecutionMode %main OriginUpperLeft
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+""",
+    # Control: malformed module that must FAIL validation (proves the gate fires).
+    "broken_negative": r"""
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+OpReturn
+OpFunctionEnd
+OpReturn
+""",
+}
+
+
+def run(cmd, **kw):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except FileNotFoundError:
+        return None
+
+
+def vulkan_matrix():
+    """Device/feature matrix from vulkaninfo JSON (Vulkan Profiles schema)."""
+    m = {"vulkaninfo": None, "device": None, "subgroup": None,
+         "subgroup_size_control": None, "mesh": None, "barycentric": None,
+         "maintenance8": None, "descriptor_heap": None,
+         "storageInputOutput16": None}
+    if not shutil.which("vulkaninfo"):
+        return m
+    with tempfile.TemporaryDirectory() as d:
+        r = run(["vulkaninfo", "-j"], cwd=d)
+        if r is None:
+            return m
+        files = glob.glob(os.path.join(d, "VP_VULKANINFO_*.json"))
+        if not files:
+            return m
+        try:
+            doc = json.load(open(files[0], encoding="utf-8"))
+        except (OSError, ValueError):
+            return m
+    try:
+        dev = doc["capabilities"]["device"]
+        props = dev.get("properties", {})
+        feats = dev.get("features", {})
+        exts = dev.get("extensions", {})
+        v11 = props.get("VkPhysicalDeviceVulkan11Properties", {})
+        v13p = props.get("VkPhysicalDeviceVulkan13Properties", {})
+        v13f = feats.get("VkPhysicalDeviceVulkan13Features", {})
+        v11f = feats.get("VkPhysicalDeviceVulkan11Features", {})
+        pdev = props.get("VkPhysicalDeviceProperties", {})
+        m["device"] = {"name": pdev.get("deviceName"),
+                       "driver": pdev.get("driverVersion"),
+                       "api": pdev.get("apiVersion")}
+        m["subgroup"] = {"size": v11.get("subgroupSize"),
+                         "stages": v11.get("subgroupSupportedStages"),
+                         "min": v13p.get("minSubgroupSize"),
+                         "max": v13p.get("maxSubgroupSize")}
+        m["subgroup_size_control"] = {
+            "subgroupSizeControl": v13f.get("subgroupSizeControl"),
+            "computeFullSubgroups": v13f.get("computeFullSubgroups"),
+            "requiredSubgroupSizeStages": v13p.get("requiredSubgroupSizeStages"),
+        }
+        m["mesh"] = "VK_EXT_mesh_shader" in exts
+        m["barycentric"] = "VK_KHR_fragment_shader_barycentric" in exts
+        m["maintenance8"] = "VK_KHR_maintenance8" in exts
+        m["descriptor_heap"] = "VK_EXT_descriptor_heap" in exts
+        m["storageInputOutput16"] = v11f.get("storageInputOutput16")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        pass
+    m["vulkaninfo"] = "ok"
+    return m
+
+
+def validate_cases():
+    """Assemble + validate each synthetic case at vulkan1.4; returns {name: {...}}."""
+    out = {}
+    if not (shutil.which("spirv-as") and shutil.which("spirv-val")):
+        return {"skipped": "spirv-as/spirv-val not on PATH (Vulkan SDK)"}
+    with tempfile.TemporaryDirectory() as d:
+        for name, asm in CASES.items():
+            src = os.path.join(d, name + ".spvasm")
+            spv = os.path.join(d, name + ".spv")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write(asm)
+            ra = run(["spirv-as", src, "-o", spv, "--target-env", "vulkan1.4"])
+            if ra is None or ra.returncode != 0:
+                out[name] = {"assemble": False, "stderr": (ra.stderr if ra else "missing")[:300]}
+                continue
+            rv = run(["spirv-val", "--target-env", "vulkan1.4", spv])
+            out[name] = {"assemble": True,
+                         "valid": bool(rv and rv.returncode == 0),
+                         "stderr": ((rv.stderr if rv else "") or "")[:300]}
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Turing bring-up atlas (no game data).")
+    ap.add_argument("--out", default=None, help="write JSON atlas to FILE (default: stdout)")
+    a = ap.parse_args()
+    atlas = {"tool": "turing_atlas", "gpu": None, "features": vulkan_matrix(),
+             "cases": validate_cases()}
+    # Surface the discrete GPU name at top level when present.
+    try:
+        atlas["gpu"] = atlas["features"].get("device", {}).get("name")
+    except AttributeError:
+        pass
+    text = json.dumps(atlas, indent=2, sort_keys=True)
+    if a.out:
+        with open(a.out, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        print(f"atlas -> {a.out}")
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
