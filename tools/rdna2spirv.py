@@ -2255,10 +2255,12 @@ class Gen:
                 self.mask_dst(d, r)
         elif op == "v_alignbit_b32":
             # (({src0, src1} as 64 bits) >> (src2 & 31)) low 32 bits
+            # (32 - m) & 31 keeps the left shift below 32 when m == 0; that result is discarded by the OpSelect.
             hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
-            m, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(7))
+            m, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(8))
             self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
-            self.emit(f"{inv} = OpISub %uint {self.cu(32)} {m}")
+            self.emit(f"{inv0} = OpISub %uint {self.cu(32)} {m}")
+            self.emit(f"{inv} = OpBitwiseAnd %uint {inv0} {self.cu(31)}")
             self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {m}")
             self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {inv}")
             self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
@@ -2914,18 +2916,20 @@ class Gen:
         elif op == "v_perm_b32":
             # Byte permute: result byte i = selector byte i picks from the 8 bytes {src0, src1} (src1 is low).
             # Selector values 0-7 pick a byte; 12 -> 0x00, >=13 -> 0xFF (sign/other cases not used here are 0).
+            # Both candidate shifts are (k & 3) * 8, so every shift stays below 32 (SPIR-V leaves larger ones
+            # undefined, even on the side of the OpSelect that is discarded).
             s0, s1, sel = (self.src_u(t) for t in a[1:4])
             out = self.cu(0)
             for i in range(4):
-                sb, lo_pick, hi_pick, k, b, lo_sh, hi_sh, chosen, inrange, val, shifted, acc = \
+                sb, lo_pick, hi_pick, k, b, k3, sh, chosen, inrange, val, shifted, acc = \
                     (self.tmp() for _ in range(12))
                 self.emit(f"{sb} = OpBitFieldUExtract %uint {sel} {self.cu(8 * i)} {self.cu(8)}")
                 self.emit(f"{k} = OpBitwiseAnd %uint {sb} {self.cu(7)}")
                 self.emit(f"{b} = OpULessThan %bool {k} {self.cu(4)}")
-                self.emit(f"{lo_sh} = OpIMul %uint {k} {self.cu(8)}")
-                self.emit(f"{lo_pick} = OpShiftRightLogical %uint {s1} {lo_sh}")
-                self.emit(f"{hi_sh} = OpISub %uint {lo_sh} {self.cu(32)}")
-                self.emit(f"{hi_pick} = OpShiftRightLogical %uint {s0} {hi_sh}")
+                self.emit(f"{k3} = OpBitwiseAnd %uint {k} {self.cu(3)}")
+                self.emit(f"{sh} = OpIMul %uint {k3} {self.cu(8)}")
+                self.emit(f"{lo_pick} = OpShiftRightLogical %uint {s1} {sh}")
+                self.emit(f"{hi_pick} = OpShiftRightLogical %uint {s0} {sh}")
                 self.emit(f"{chosen} = OpSelect %uint {b} {lo_pick} {hi_pick}")
                 self.emit(f"{inrange} = OpULessThan %bool {sb} {self.cu(8)}")
                 ff, big = self.tmp(), self.tmp()

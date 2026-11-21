@@ -408,6 +408,8 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = _s32(val(a[1])) < _s32(val(a[2]))
         elif op == "OpULessThan":
             values[res] = val(a[1]) < val(a[2])
+        elif op == "OpUGreaterThanEqual":
+            values[res] = val(a[1]) >= val(a[2])
         elif op == "OpLogicalAnd":
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, bool) and isinstance(y, bool)):
