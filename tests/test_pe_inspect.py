@@ -266,12 +266,63 @@ class PeInspectTest(unittest.TestCase):
         out = os.path.join(self.dir, "reports")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(pe_inspect.main([self.image, "--out", out]), 0)
-        with open(os.path.join(out, "sample.json"), encoding="utf-8") as f:
+        with open(os.path.join(out, "sample.dll.json"), encoding="utf-8") as f:
             written = json.load(f)
         self.assertEqual(written["machine"], "x86-64")
         self.assertEqual(written["imports"][0]["dll"], "kernel32.dll")
-        with open(os.path.join(out, "sample.md"), encoding="utf-8") as f:
+        with open(os.path.join(out, "sample.dll.md"), encoding="utf-8") as f:
             self.assertIn("# sample.dll", f.read())
+
+    def run_cli(self, images: list[str], out: str) -> str:
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([*images, "--out", out]), 0)
+        return err.getvalue()
+
+    def read_report(self, out: str, name: str) -> tuple[dict, str]:
+        with open(os.path.join(out, name + ".json"), encoding="utf-8") as f:
+            data = json.load(f)
+        with open(os.path.join(out, name + ".md"), encoding="utf-8") as f:
+            return data, f.read()
+
+    def test_cli_exe_and_dll_with_the_same_stem_get_separate_reports(self):
+        sub = os.path.join(self.dir, "stem")
+        os.makedirs(sub)
+        exe, dll = os.path.join(sub, "game.exe"), os.path.join(sub, "game.dll")
+        with open(exe, "wb") as f:
+            f.write(build_image(is64=False))
+        with open(dll, "wb") as f:
+            f.write(build_image())
+        out = os.path.join(self.dir, "reports_stem")
+        self.run_cli([exe, dll], out)
+        self.assertEqual(sorted(os.listdir(out)), ["game.dll.json", "game.dll.md", "game.exe.json", "game.exe.md"])
+        exe_r, exe_md = self.read_report(out, "game.exe")
+        dll_r, dll_md = self.read_report(out, "game.dll")
+        self.assertEqual((exe_r["file"], exe_r["machine"]), ("game.exe", self.report32["machine"]))
+        self.assertEqual((dll_r["file"], dll_r["machine"]), ("game.dll", "x86-64"))
+        self.assertNotEqual(exe_r["machine"], dll_r["machine"])
+        self.assertIn("# game.exe", exe_md)
+        self.assertIn("# game.dll", dll_md)
+
+    def test_cli_same_file_name_from_two_directories_gets_a_numbered_suffix(self):
+        a, b = os.path.join(self.dir, "a"), os.path.join(self.dir, "b")
+        os.makedirs(a)
+        os.makedirs(b)
+        first, second = os.path.join(a, "x.exe"), os.path.join(b, "x.exe")
+        with open(first, "wb") as f:
+            f.write(build_image())
+        with open(second, "wb") as f:
+            f.write(build_image(is64=False))
+        out = os.path.join(self.dir, "reports_dup")
+        err = self.run_cli([first, second, first], out)
+        self.assertEqual(sorted(os.listdir(out)), ["x.exe-2.json", "x.exe-2.md", "x.exe.json", "x.exe.md"])
+        r1, _ = self.read_report(out, "x.exe")
+        r2, _ = self.read_report(out, "x.exe-2")
+        self.assertEqual(r1["machine"], "x86-64")
+        self.assertEqual(r2["machine"], self.report32["machine"])
+        self.assertNotEqual(r1["machine"], r2["machine"])
+        self.assertIn("report written as x.exe-2.json", err)
+        self.assertIn("given more than once", err)
 
     def test_cli_reports_a_non_pe_file(self):
         bad = os.path.join(self.dir, "not_pe_cli.bin")
@@ -335,7 +386,7 @@ class TruncatedImageTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             self.assertEqual(pe_inspect.main([cut, good, "--out", out]), 1)
         self.assertIn("cut.dll: not a PE image (truncated optional header)", err.getvalue())
-        self.assertEqual(sorted(os.listdir(out)), ["good.json", "good.md"])
+        self.assertEqual(sorted(os.listdir(out)), ["good.dll.json", "good.dll.md"])
 
     def test_export_counts_past_the_table_cap_do_not_run_away(self):
         full = bytearray(build_image())
