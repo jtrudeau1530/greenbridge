@@ -71,6 +71,11 @@ subgroup for these two checks, and the summary reports them as skipped if the de
 `cs_exec64` still checks per-lane EXEC writes on 32-wide subgroups. With `LEONIDA_W64_EMULATE=1` in the environment of both commands, `build.py` translates with `--wave64-emulate` and `check.py` runs every wave64 check without asking for a 64-wide subgroup, so a 32-wide GPU runs them all (`scripts/run_gpu_tests.py` honours the same variable). Pick one of several GPUs with the Vulkan loader, e.g. `VK_LOADER_DRIVERS_SELECT='*nv*'` or `'*amd*'`. The flat-input fixture checks both integer
 IDs and interpolated UVs. The corpus comparison is a separate test and uses shader files from the local build.
 
+On macOS the test tools default to MoltenVK. To test another Vulkan driver, set
+`LEONIDA_VULKAN_LOADER` to the standard loader dylib and `VK_DRIVER_FILES` to the driver's ICD manifest, for example
+`LEONIDA_VULKAN_LOADER=/path/to/libvulkan.1.dylib VK_DRIVER_FILES=/path/to/lvp_icd.json`.
+These tools do not request portability enumeration, so use the default for MoltenVK.
+
 Run `python -I scripts/run_gpu_tests.py --filter ms_v5_workgroup` to check the mesh workgroup index. The synthetic
 shader exports its incoming `v5` from lanes 0, 1 and 31 in the RGB channels of a full-screen triangle. One `vkCmdDrawMeshTasksEXT(2, 3, 4)`
 produces 24 triangles. A stencil countdown lets pixel *i* record only triangle *i* in Vulkan rasterization order.
