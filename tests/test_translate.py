@@ -88,6 +88,21 @@ def test_compute_translates_and_validates(make_shader):
     shader.validate(shader.translate())
 
 
+def test_cs_store_packed_atomic_pointers(make_shader):
+    """Packed stores need element zero of the physical dword array for Metal atomics."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_store.asm"), encoding="utf-8") as f:
+        spvasm = make_shader(f.read(), "cs_store").translate()
+    defs = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)", spvasm, re.M))
+    atomics = re.findall(r"= (OpAtomicAnd|OpAtomicOr) %uint (%\w+) ", spvasm)
+    assert {op for op, ptr in atomics} == {"OpAtomicAnd", "OpAtomicOr"}
+    for _, ptr in atomics:
+        access = defs[ptr].split()
+        assert access[:2] == ["OpAccessChain", "%_ptr_PSB_uint"]
+        _, _, base, index = access
+        assert defs[base].startswith("OpConvertUToPtr %_ptr_PSB_arr ")
+        assert defs[index] == "OpConstant %uint 0"
+
+
 def test_compute_thread_group_size_sgpr_is_rejected(make_shader):
     """TG_SIZE_EN (RSRC2 bit 10) adds an SGPR the translator doesn't model."""
     shader = make_shader("s_endpgm\n", name="cs_test", cs_header=(0x8088 | 1 << 10, (64, 1, 1)))

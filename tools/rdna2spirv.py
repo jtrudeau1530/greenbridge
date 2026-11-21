@@ -1187,7 +1187,10 @@ class Gen:
                     self.emit(f"{sh8} = OpShiftLeftLogical %uint {sh} {self.cu(3)}")
                     sh24 = self.tmp()
                     self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
-                    self.emit(f"{ap} = OpConvertUToPtr %_ptr_PSB_uint {self.host_addr(al)}")
+                    # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
+                    dword_arr = self.tmp()
+                    self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                    self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
                     self.emit(f"{mk} = OpCopyObject %uint {self.cu((1 << (8 * size)) - 1)}")
                     self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
                     self.emit(f"{inv} = OpNot %uint {mks}")
