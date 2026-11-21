@@ -27,8 +27,9 @@ table (55,791 records, 11,199 of them 16-bit).  The table count equals the numbe
 `v_interp attr` numbers in 11,316/12,101 shaders (93.5%); 300 more declare exactly one unread input,
 475 declare two or more, and the 10 shaders whose table starts with a non-6 record are the only ones
 that undercount.  A 200-PS spot check agreed on 187/200.  Flag bit 4 matched the 16-bit interpolant
-opcodes in 12,067/12,101 (99.7%).  This is available for a translator integration; nothing in
-`rdna2spirv.py` uses it yet.
+opcodes in 12,067/12,101 (99.7%).  `rdna2spirv.py` consumes it in the PS input path (pixel_interpolants:
+every table position declared as a fragment input, 16-bit-flagged positions
+rounded f32->f16->f32 on 32-bit reads).
 
 The post-`code_end` tail carries a binding table.  After 16 bytes of `0xBF9F0000` filler and an
 8-byte header, 20-byte records run until a `0xFFFFFFFF` sentinel; then `u32 0`, `u16 0`, `u16`
