@@ -30,6 +30,7 @@
 #include <functional>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -46,6 +47,9 @@ struct ResourceBinding {
     std::uint32_t array_layers = 1;
     bool presentable = false;          // a swapchain image: common/present maps to PRESENT_SRC_KHR
     bool simultaneous_access = false;  // D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS: always GENERAL
+    bool not_zeroed = false;           // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: first use skips the zero fill
+    VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
+    VkDeviceSize size = 0;             // its size in bytes
 };
 
 struct VulkanAccess {
@@ -250,6 +254,57 @@ inline VkImageLayout image_layout(const ResourceBinding& resource, VkImageLayout
     return layout;
 }
 
+// Bytes per texel, or per 4x4 block for block-compressed formats, of one aspect as copies lay it out in a buffer
+// (D3D12 footprints and Vulkan buffer-image copies agree on these). bytes == 0: not a format copies support yet.
+struct BlockFormat {
+    std::uint32_t bytes = 0;
+    std::uint32_t block = 1;  // texels per block edge
+};
+
+inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
+    if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return {1, 1};
+    switch (format) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R32G32_SFLOAT: return {8, 1};
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:  // depth aspect
+    case VK_FORMAT_D24_UNORM_S8_UINT: return {4, 1};
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_D16_UNORM: return {2, 1};
+    case VK_FORMAT_R8_UNORM: return {1, 1};
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK: return {8, 4};
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK: return {16, 4};
+    default: return {};
+    }
+}
+
 inline bool two_planes(const ResourceBinding& resource) {
     return (resource.aspects & depth_stencil_aspects) == depth_stencil_aspects;
 }
@@ -405,12 +460,24 @@ struct ReplayFunctions {
     PFN_vkCmdBeginRendering begin_rendering = nullptr;      // rectangle clears
     PFN_vkCmdEndRendering end_rendering = nullptr;
     PFN_vkCmdClearAttachments clear_attachments = nullptr;
+    PFN_vkCmdCopyBuffer copy_buffer = nullptr;                  // copies
+    PFN_vkCmdCopyBufferToImage copy_buffer_to_image = nullptr;
+    PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
+    PFN_vkCmdCopyImage copy_image = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
 };
 
-enum class ReplayResult { success, list_open, unresolved_resource, invalid_subresource, invalid_clear, unsupported };
+enum class ReplayResult {
+    success,
+    list_open,
+    unresolved_resource,
+    invalid_subresource,
+    invalid_clear,
+    invalid_copy,
+    unsupported
+};
 
 namespace detail {
 
@@ -420,6 +487,11 @@ struct Prepared {
     VkImageView view = VK_NULL_HANDLE;
     std::vector<VkClearRect> rects;   // rectangle clears, clipped to the mip
     bool skip = false;                // every rectangle was empty
+    ResourceBinding source;                   // copies: the source resource
+    VkImageSubresourceRange source_range{};   // copies: the source subresources (range: the destination's)
+    std::vector<VkBufferCopy> buffer_copies;
+    std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
+    std::vector<VkImageCopy> image_copies;
 };
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
@@ -489,6 +561,163 @@ inline std::vector<LayoutPiece> current(const LayoutTracker* tracker, ResourceId
     return out;
 }
 
+// Images registered with the tracker in UNDEFINED have never been used. D3D12 committed resources start zeroed,
+// so each such piece is cleared to zero (colour 0, depth 0, stencil 0) and moved to `layout`, the layout the
+// operation about to run expects, before that operation; with not_zeroed, or a block-compressed format (which
+// Vulkan cannot clear), it is only moved. The tracker records it.
+inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
+                       ResourceId id, std::vector<LayoutPiece>& pieces, VkImageLayout layout, LayoutTracker* tracker) {
+    constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    for (auto& piece : pieces) {
+        if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
+        // Vulkan cannot clear block-compressed images; those start undefined (applications upload them first).
+        const bool compressed = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1;
+        if (resource.not_zeroed || compressed) {
+            image_barrier(vk, command_buffer, resource.image, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        } else {
+            const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            image_barrier(vk, command_buffer, resource.image, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT);
+            if (piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+                const VkClearColorValue zero{};
+                vk.clear_color_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
+            } else {
+                const VkClearDepthStencilValue zero{};
+                vk.clear_depth_stencil_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
+            }
+            image_barrier(vk, command_buffer, resource.image, piece.range, dst, layout, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        }
+        piece.layout = layout;
+        if (tracker) tracker->set(id, piece.range, layout);
+    }
+}
+
+inline bool within(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
+    return offset <= total && size <= total - offset;
+}
+
+// The one plane of one subresource a texture copy location names.
+inline bool copy_subresource(const ResourceBinding& resource, std::uint32_t subresource, VkImageSubresourceRange& out) {
+    return resource.image && subresource != all_subresources && image_range(resource, subresource, out);
+}
+
+// CopyTextureRegion: texture to texture, footprint to texture (upload) or texture to footprint (readback).
+// 2D only. Block-compressed footprints are padded to whole blocks; the Vulkan extent stops at the mip edge.
+inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
+    if (copy.z != 0 || (copy.has_box && (copy.box.front != 0 || copy.box.back != 1))) return ReplayResult::unsupported;
+    if (!copy.dst.footprint && !copy.src.footprint) {
+        VkImageSubresourceRange dst{}, src{};
+        if (!copy_subresource(p.binding, copy.dst.subresource, dst) ||
+            !copy_subresource(p.source, copy.src.subresource, src))
+            return ReplayResult::invalid_subresource;
+        if (dst.aspectMask != src.aspectMask) return ReplayResult::invalid_copy;
+        const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
+        const CopyBox box = copy.has_box ? copy.box : CopyBox{0, 0, 0, from.width, from.height, 1};
+        if (box.right > from.width || box.bottom > from.height) return ReplayResult::invalid_copy;
+        const std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
+        if (copy.x + w > to.width || copy.y + h > to.height) return ReplayResult::invalid_copy;
+        p.image_copies.push_back({{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1},
+                                  {std::int32_t(box.left), std::int32_t(box.top), 0},
+                                  {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1},
+                                  {std::int32_t(copy.x), std::int32_t(copy.y), 0},
+                                  {w, h, 1}});
+        p.range = dst;
+        p.source_range = src;
+        return ReplayResult::success;
+    }
+
+    const bool upload = copy.src.footprint;
+    const ResourceBinding& image = upload ? p.binding : p.source;
+    const ResourceBinding& buffer = upload ? p.source : p.binding;
+    const CopyLocation& texture = upload ? copy.dst : copy.src;
+    const CopyLocation& placed = upload ? copy.src : copy.dst;
+    if (!buffer.buffer) return ReplayResult::invalid_copy;
+    VkImageSubresourceRange range{};
+    if (!copy_subresource(image, texture.subresource, range)) return ReplayResult::invalid_subresource;
+    const BlockFormat format = block_format(image.format, range.aspectMask);
+    if (!format.bytes || placed.depth != 1 || placed.row_pitch % format.bytes) return ReplayResult::unsupported;
+    const VkExtent2D mip = mip_extent(image, range.baseMipLevel);
+    // The box is in the source's coordinates: the footprint for an upload, the texture for a readback.
+    const CopyBox box = copy.has_box ? copy.box
+                        : upload     ? CopyBox{0, 0, 0, placed.width, placed.height, 1}
+                                     : CopyBox{0, 0, 0, mip.width, mip.height, 1};
+    const std::uint32_t texture_x = upload ? copy.x : box.left, texture_y = upload ? copy.y : box.top;
+    const std::uint32_t placed_x = upload ? box.left : copy.x, placed_y = upload ? box.top : copy.y;
+    std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
+    if (placed_x + w > placed.width || placed_y + h > placed.height) return ReplayResult::invalid_copy;
+    if (texture_x >= mip.width || texture_y >= mip.height) return ReplayResult::invalid_copy;
+    if (format.block > 1) {
+        w = std::min(w, mip.width - texture_x);
+        h = std::min(h, mip.height - texture_y);
+    }
+    if (texture_x + w > mip.width || texture_y + h > mip.height) return ReplayResult::invalid_copy;
+    if ((placed_x | placed_y | texture_x | texture_y) % format.block) return ReplayResult::invalid_copy;
+    const std::uint64_t offset = placed.offset + std::uint64_t(placed_y / format.block) * placed.row_pitch +
+                                 std::uint64_t(placed_x / format.block) * format.bytes;
+    const std::uint32_t alignment = (range.aspectMask & depth_stencil_aspects) ? 4 : format.bytes;
+    if (offset % alignment) return ReplayResult::unsupported;
+    const std::uint64_t rows = (h + format.block - 1) / format.block;
+    const std::uint64_t row_bytes = std::uint64_t((w + format.block - 1) / format.block) * format.bytes;
+    if (!within(offset, (rows - 1) * placed.row_pitch + row_bytes, buffer.size)) return ReplayResult::invalid_copy;
+    VkBufferImageCopy region{};
+    region.bufferOffset = offset;
+    region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
+    region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
+    region.imageOffset = {std::int32_t(texture_x), std::int32_t(texture_y), 0};
+    region.imageExtent = {w, h, 1};
+    p.buffer_image_copies.push_back(region);
+    (upload ? p.range : p.source_range) = range;
+    return ReplayResult::success;
+}
+
+// CopyResource: the whole buffer, or every subresource of two textures of the same shape.
+inline ReplayResult prepare_resource_copy(Prepared& p) {
+    if (p.binding.buffer && p.source.buffer) {
+        if (p.binding.size != p.source.size) return ReplayResult::invalid_copy;
+        p.buffer_copies.push_back({0, 0, p.source.size});
+        return ReplayResult::success;
+    }
+    const ResourceBinding &dst = p.binding, &src = p.source;
+    if (!dst.image || !src.image || dst.width != src.width || dst.height != src.height ||
+        dst.mip_levels != src.mip_levels || dst.array_layers != src.array_layers || dst.aspects != src.aspects ||
+        block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
+        return ReplayResult::invalid_copy;
+    for (const VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
+        if (!(dst.aspects & aspect)) continue;
+        for (std::uint32_t mip = 0; mip < dst.mip_levels; ++mip) {
+            const VkExtent2D extent = mip_extent(dst, mip);
+            p.image_copies.push_back({{aspect, mip, 0, dst.array_layers}, {0, 0, 0}, {aspect, mip, 0, dst.array_layers},
+                                      {0, 0, 0}, {extent.width, extent.height, 1}});
+        }
+    }
+    p.range = {dst.aspects, 0, dst.mip_levels, 0, dst.array_layers};
+    p.source_range = {src.aspects, 0, src.mip_levels, 0, src.array_layers};
+    return ReplayResult::success;
+}
+
+// The layout a copy uses for a range: D3D12 requires copy_dest/copy_source, or common (GENERAL), where an implicit
+// promotion lets the copy run in place. Anything else is moved to `wanted` and tracked.
+inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
+                                 const ResourceBinding& resource, ResourceId id, const VkImageSubresourceRange& range,
+                                 VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker) {
+    const VkImageLayout target = image_layout(resource, wanted);
+    auto pieces = current(tracker, id, range, target);
+    initialize(vk, command_buffer, resource, id, pieces, target, tracker);
+    if (pieces.size() == 1 && (pieces[0].layout == target || pieces[0].layout == VK_IMAGE_LAYOUT_GENERAL))
+        return pieces[0].layout;
+    for (const auto& piece : pieces) {
+        if (piece.layout == target) continue;
+        image_barrier(vk, command_buffer, resource.image, piece.range, piece.layout, target,
+                      VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
+    if (tracker) tracker->set(id, range, target);
+    return target;
+}
+
 // Moves every piece to `target` (src: the D3D12 state the operation requires), runs `body`, and moves the pieces
 // back to where they were. Pieces already in `target` need no transition.
 template<typename Body>
@@ -516,6 +745,14 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkIma
 
 } // namespace detail
 
+// Destination and source of a copy command.
+inline std::pair<ResourceId, ResourceId> copy_ids(const Command& command) {
+    if (const auto* c = std::get_if<CopyBuffer>(&command)) return {c->dst, c->src};
+    if (const auto* c = std::get_if<CopyTexture>(&command)) return {c->dst.resource, c->src.resource};
+    if (const auto* c = std::get_if<CopyResource>(&command)) return {c->dst, c->src};
+    return {0, 0};
+}
+
 // A list checked against the current resources, ready to emit.
 class PreparedList {
 public:
@@ -532,6 +769,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.list = &list;
     out.commands.assign(commands.size(), {});
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
+    const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -591,6 +829,26 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_subresource;
             if (const auto r = rect_view(depth_clear->rects, depth_clear->target, p.binding.aspects); r != ReplayResult::success)
                 return r;
+        } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
+                   std::holds_alternative<CopyResource>(command)) {
+            if (!copies) return ReplayResult::unsupported;
+            const auto [dst_id, src_id] = copy_ids(command);
+            const ResourceBinding* source = resolve(src_id);
+            if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
+            p.source = *source;
+            ReplayResult result = ReplayResult::success;
+            if (const auto* buffer_copy = std::get_if<CopyBuffer>(&command)) {
+                if (!p.binding.buffer || !p.source.buffer ||
+                    !detail::within(buffer_copy->dst_offset, buffer_copy->size, p.binding.size) ||
+                    !detail::within(buffer_copy->src_offset, buffer_copy->size, p.source.size))
+                    return ReplayResult::invalid_copy;
+                p.buffer_copies.push_back({buffer_copy->src_offset, buffer_copy->dst_offset, buffer_copy->size});
+            } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
+                result = detail::prepare_texture_copy(*texture_copy, p);
+            } else {
+                result = detail::prepare_resource_copy(p);
+            }
+            if (result != ReplayResult::success) return result;
         }
     }
     return ReplayResult::success;
@@ -627,7 +885,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VkImageLayout new_layout = image_layout(p.binding, to.layout);
-            for (const auto& piece : detail::current(tracker, id, range, image_layout(p.binding, from.layout)))
+            auto pieces = detail::current(tracker, id, range, image_layout(p.binding, from.layout));
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, from.layout), tracker);
+            for (const auto& piece : pieces)
                 detail::image_barrier(vk, command_buffer, p.binding.image, piece.range, piece.layout, new_layout,
                                       from.access, from.stages, to.access, to.stages);
             if (tracker) tracker->set(id, range, new_layout);
@@ -665,9 +925,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             std::vector<LayoutPiece> pieces;
             if (discard)
                 pieces = {{range, VK_IMAGE_LAYOUT_UNDEFINED}};
-            else
-                pieces = detail::current(tracker, id, range,
-                                         image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable)));
+            else {
+                const VkImageLayout before =
+                    image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
+                pieces = detail::current(tracker, id, range, before);
+                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
+            }
             std::vector<VkImageMemoryBarrier2> barriers;
             for (const auto& piece : pieces) {
                 VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -691,7 +954,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
-            const auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
+            auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
             VkClearColorValue color{};
             std::copy(color_clear->color.begin(), color_clear->color.end(), color.float32);
             if (p.rects.empty()) {
@@ -726,7 +990,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // With separate layouts only the cleared planes move; otherwise both do.
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
-            const auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
+            auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
             const VkClearDepthStencilValue value{depth_clear->depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
@@ -755,6 +1020,34 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
                 vk.end_rendering(command_buffer);
             });
+        } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
+                   std::holds_alternative<CopyResource>(command)) {
+            const auto [dst_id, src_id] = copy_ids(command);
+            if (!p.buffer_copies.empty()) {
+                vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
+                               p.buffer_copies.data());
+            } else if (!p.image_copies.empty()) {
+                const VkImageLayout src_layout = detail::copy_layout(
+                    vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                const VkImageLayout dst_layout = detail::copy_layout(
+                    vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
+                              std::uint32_t(p.image_copies.size()), p.image_copies.data());
+            } else if (p.binding.image) {
+                const VkImageLayout dst_layout = detail::copy_layout(
+                    vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                vk.copy_buffer_to_image(command_buffer, p.source.buffer, p.binding.image, dst_layout,
+                                        std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+            } else {
+                const VkImageLayout src_layout = detail::copy_layout(
+                    vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
+                                        std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+            }
         }
     }
 }

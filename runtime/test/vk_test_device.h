@@ -37,6 +37,7 @@ public:
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t family = 0;
     bool validation = false;
+    bool bc = false;  // textureCompressionBC enabled
 
     Device() = default;
     Device(const Device&) = delete;
@@ -187,9 +188,13 @@ public:
         queue_info.queueFamilyIndex = family;
         queue_info.queueCount = 1;
         queue_info.pQueuePriorities = &priority;
+        VkPhysicalDeviceFeatures enable{};
+        enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
+        bc = features.features.textureCompressionBC == VK_TRUE;
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
+        device_info.pEnabledFeatures = &enable;
         if (instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device) != VK_SUCCESS)
             return false;
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");

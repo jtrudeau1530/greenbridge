@@ -1,9 +1,9 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
-**Status: design, with the command path in place. The command list, queue, allocator and fence exist as COM objects
-over Vulkan (`runtime/shims/d3d12_com.cpp`, section 3.2), but no device hands them out yet:
-`D3D12XboxCreateDevice` still returns the host PC device, and resources, descriptor heaps, PSOs and the swapchain
-are not implemented.** This is the plan for replacing the console's
+**Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
+render-target and depth views, committed buffers and 2D textures, copies) runs behind the Xbox-ABI device proxy
+(section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is set and the host PC device otherwise.
+Shader views, root signatures, PSOs, draws and the swapchain are not implemented.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
 exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
@@ -149,13 +149,19 @@ What is implemented (all of it testable without the game):
 
 - **IR** (`runtime/src/command_list.h`): legacy barriers (transition, UAV, aliasing; split barriers record their end
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
-  replayed as a full barrier), and `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles.
+  replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles, and
+  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`.
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
   `vulkan_sync` / `vulkan_barrier_access` / `vulkan_layout` to `vkCmdPipelineBarrier2`. Whole-view clears are
   transfer clears inside a layout round trip; rectangle clears are `vkCmdClearAttachments` in a dynamic-rendering
-  scope, with rectangles clipped to the mip.
+  scope, with rectangles clipped to the mip. Copies become `vkCmdCopyBuffer`, `vkCmdCopyBufferToImage`,
+  `vkCmdCopyImageToBuffer` and `vkCmdCopyImage`. A placed footprint's row pitch becomes `bufferRowLength`, and
+  block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not). Each
+  range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
+  in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
+  2D only: 3D boxes and depth slices are rejected as unsupported.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -171,11 +177,37 @@ What is implemented (all of it testable without the game):
   implement is a stub generated at build time from the SDK's `d3d12.h` by `tools/gen_d3d12_stubs.py`. The stub
   reports its name once, so the vtables follow the SDK order exactly and nothing derived from the SDK is checked
   in. Unknown IIDs are logged and refused. Resources are identified by their `ID3D12Resource` pointer, and
-  RTV/DSV CPU handles point at a `TargetView`: that is the contract the device and descriptor heaps must meet.
+  RTV/DSV CPU handles point at a `TargetView`.
+- **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
+  proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
+  work unchanged. It creates the objects above, plus:
+  - descriptor heaps whose slots are 32 bytes (`GetDescriptorHandleIncrementSize`; the console's increments are
+    question 4). RTV/DSV slots hold a `TargetView`; shader-visible heaps return a GPU handle, but nothing reads it
+    yet;
+  - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D` and `TEXTURE2DARRAY`;
+  - committed buffers (upload and readback heaps mapped persistently and zeroed) and 2D textures in the common
+    render-target, depth and texture formats (typeless families become mutable-format images);
+  - `CheckFeatureSupport` for feature levels (up to 12_1) and architecture. Every other query is logged and
+    refused until the trace shows what the game asks (question 11);
+  - `GetCopyableFootprints` for buffers and 2D textures, including BC1–7 and the two-plane depth-stencil formats.
+    The test compares every output with the PC runtime's for 13 descriptions; that comparison found that planar
+    depth-stencil rows are padded to 512 bytes, not 256.
 
-Known gaps: the device proxy that creates these objects (blocked on the measured device ABI, section 7);
-resources, descriptor heaps, PSOs, draws and copies; a fence cannot be signalled to a lower value (Vulkan timelines
-only increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
+  BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
+
+  New textures are not touched at creation. They are tracked as `UNDEFINED`, and the first command that uses a
+  part of one zero-fills it (D3D12 committed resources start zeroed; `CREATE_NOT_ZEROED` skips this) and moves it
+  to the layout that command expects, so creation needs no submission. Block-compressed textures are not
+  zero-filled, because Vulkan cannot clear them; they start undefined until the application uploads them. Each
+  submission ends with a barrier to the host, so a readback buffer holds the GPU's writes once the fence wait
+  returns. Children hold a reference to the proxy, not
+  the inner device, so `GetDevice` always returns the Xbox-ABI object. All D3D12 queues share one graphics
+  `VkQueue` behind a submit lock (question 12).
+
+Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, 3D and array
+copies through footprints with depth, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), MSAA, 1D/3D textures and the swapchain;
+default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
+increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
 sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error.
 
 Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <build> --output-on-failure` for the
@@ -191,6 +223,14 @@ and any validation error fails them.
   texture, and enhanced barriers including a discard.
 - `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
   the CPU has not signalled holds the GPU back.
+- `d3d12_vulkan_device_test`: the Vulkan device behind the Xbox-ABI proxy, called the way the game will call it.
+  It creates heaps through slot 14 and reads their start handles in RAX, creates a render target through slot 76
+  with the Xbox layout word, then creates views, records clears and barriers, executes and waits on a fence.
+  Results come back through D3D12 itself (`CopyTextureRegion` into a readback heap, then `Map`): the render
+  target, the depth and stencil planes, and a never-written texture (which must be zero). A second list uploads a
+  pattern and copies it on: whole into a texture created in `COMMON`, a boxed part into a smaller texture, a BC1
+  round trip and a buffer region. `GetCopyableFootprints` is compared with the PC runtime's, and a short run
+  repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.

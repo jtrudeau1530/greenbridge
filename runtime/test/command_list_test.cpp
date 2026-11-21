@@ -104,6 +104,28 @@ int main() {
     CHECK(std::get<BufferBarrier>(list.commands()[2]).resource == 7);
     CHECK(std::get<TextureBarrier>(list.commands()[3]).flags == texture_barrier_discard);
 
+    // Copies: D3D12's own call rules (aligned footprints, a non-empty box, distinct CopyResource operands).
+    CHECK(list.reset());
+    CHECK(list.copy_buffer({1, 0, 2, 16, 64}));
+    CHECK(!list.copy_buffer({1, 0, 2, 16, 0}));
+    CHECK(!list.copy_buffer({0, 0, 2, 16, 64}));
+    const CopyLocation texture{3, false, 0, 0, 0, 0, 0, 0};
+    const CopyLocation placed{4, true, 0, 512, 8, 8, 1, 256};
+    CHECK(list.copy_texture({texture, 0, 0, 0, placed, false, {}}));
+    CHECK(list.copy_texture({placed, 0, 0, 0, texture, true, {2, 2, 0, 6, 6, 1}}));
+    CHECK(!list.copy_texture({placed, 0, 0, 0, placed, false, {}}));                 // footprint to footprint
+    CHECK(!list.copy_texture({texture, 0, 0, 0, {4, true, 0, 100, 8, 8, 1, 256}, false, {}}));  // offset not 512
+    CHECK(!list.copy_texture({texture, 0, 0, 0, {4, true, 0, 512, 8, 8, 1, 100}, false, {}}));  // pitch not 256
+    CHECK(!list.copy_texture({texture, 0, 0, 0, texture, true, {2, 2, 0, 2, 6, 1}}));          // empty box
+    CHECK(list.copy_resource({5, 6}));
+    CHECK(!list.copy_resource({5, 5}));
+    CHECK(list.close());
+    CHECK(list.commands().size() == 4);
+    CHECK(std::get<CopyBuffer>(list.commands()[0]).src_offset == 16);
+    CHECK(std::get<CopyTexture>(list.commands()[1]).src.footprint && !std::get<CopyTexture>(list.commands()[1]).has_box);
+    CHECK(std::get<CopyTexture>(list.commands()[2]).box.right == 6);
+    CHECK(std::get<CopyResource>(list.commands()[3]).src == 6);
+
     CHECK(list.reset());
     CHECK(!list.closed() && list.commands().empty());
     CHECK(!list.reset());

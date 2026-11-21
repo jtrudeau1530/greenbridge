@@ -28,7 +28,10 @@ struct VulkanDeviceFunctions {
     X(vkDestroySemaphore) X(vkGetSemaphoreCounterValue) X(vkWaitSemaphores) X(vkSignalSemaphore)               \
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2)                \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdBeginRendering) X(vkCmdEndRendering)         \
-    X(vkCmdClearAttachments)
+    X(vkCmdClearAttachments) X(vkDeviceWaitIdle) X(vkCreateImage) X(vkDestroyImage)                         \
+    X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
+    X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
+    X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -42,7 +45,11 @@ struct VulkanDeviceFunctions {
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&
                vkCreateImageView && vkDestroyImageView && vkCmdPipelineBarrier && vkCmdClearColorImage &&
-               vkCmdClearDepthStencilImage && vkCmdClearAttachments;
+               vkCmdClearDepthStencilImage && vkCmdClearAttachments && vkDeviceWaitIdle && vkCreateImage &&
+               vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
+               vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
+               vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
+               vkCmdCopyImageToBuffer && vkCmdCopyImage;
     }
 };
 
@@ -59,6 +66,10 @@ public:
         replay_.begin_rendering = vk.vkCmdBeginRendering;
         replay_.end_rendering = vk.vkCmdEndRendering;
         replay_.clear_attachments = vk.vkCmdClearAttachments;
+        replay_.copy_buffer = vk.vkCmdCopyBuffer;
+        replay_.copy_buffer_to_image = vk.vkCmdCopyBufferToImage;
+        replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
+        replay_.copy_image = vk.vkCmdCopyImage;
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
@@ -111,6 +122,9 @@ public:
 
     VulkanDeviceFunctions vk;
 
+    // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
+    std::mutex& submit_mutex() { return submit_mutex_; }
+
 private:
     friend class VulkanQueue;
 
@@ -138,6 +152,7 @@ private:
     VkDevice device_;
     bool loaded_ = false;
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
+    std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
@@ -211,7 +226,10 @@ public:
 
     ~VulkanQueue() {
         auto& vk = context_.vk;
-        if (queue_) vk.vkQueueWaitIdle(queue_);
+        if (queue_) {
+            std::lock_guard lock(context_.submit_mutex());
+            vk.vkQueueWaitIdle(queue_);
+        }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
     }
@@ -237,6 +255,13 @@ public:
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         context_.vk.vkBeginCommandBuffer(command_buffer, &begin);
         for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
+        // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
+        // readback buffers are read through Map once the application has waited.
+        VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                         0, 1, &host, 0, nullptr, 0, nullptr);
         context_.vk.vkEndCommandBuffer(command_buffer);
         return submit(command_buffer, VK_NULL_HANDLE, 0) ? ReplayResult::success : ReplayResult::unsupported;
     }
@@ -251,7 +276,10 @@ public:
         wait_values_.push_back(value);
     }
 
-    bool idle() { return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS; }
+    bool idle() {
+        std::lock_guard lock(context_.submit_mutex());
+        return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+    }
 
 private:
     VkCommandBuffer acquire() {
@@ -296,7 +324,11 @@ private:
         submit.pCommandBuffers = &command_buffer;
         submit.signalSemaphoreCount = std::uint32_t(signals.size());
         submit.pSignalSemaphores = signals.data();
-        const bool ok = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS;
+        bool ok;
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            ok = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS;
+        }
         waits_.clear();
         wait_values_.clear();
         for (auto& slot : buffers_)

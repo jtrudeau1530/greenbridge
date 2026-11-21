@@ -9,8 +9,13 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "d3d12_com.h"
+#endif
 #include "d3d12_xs_device.h"
 #include "d3d12_xs_rootsig.h"
 #include "shims.h"
@@ -98,6 +103,34 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
     }
+
+#ifdef LEONIDA_VULKAN_DEVICE
+    // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
+    // behind the same proxy instead of the host's D3D12 device.
+    char backend[16] = {};
+    size_t backend_length = 0;
+    if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
+        ID3D12Device* vulkan = nullptr;
+        HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device),
+                                                                 reinterpret_cast<void**>(&vulkan));
+        if (FAILED(vhr)) {
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: Vulkan device failed (hr=0x%08lx)\n",
+                         static_cast<unsigned long>(vhr));
+            return vhr;
+        }
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        if (FAILED(vhr)) {
+            vulkan->Release();
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
+                                 "(hr=0x%08lx)\n", static_cast<unsigned long>(vhr));
+            return vhr;
+        }
+        rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
+                     static_cast<void*>(vulkan));
+        return S_OK;
+    }
+#endif
 
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
     if (!create) return E_NOTIMPL;

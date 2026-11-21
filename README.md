@@ -51,7 +51,7 @@ work on booting can start as soon as one is available to a developer.
 | Texture dictionaries and world texture pools (DDS) | ✅ Exported. Some pool entries (BCPack) are skipped |
 | Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
 | PE loader and import shims | ⚠️ Skeleton. Untested against the real executable |
-| Xbox D3D12 → Vulkan | ⚠️ Design and clean-room `xmem`/`d3d12_xs` shims; no device/queue/command-list proxy yet ([plan](docs/d3d12_vulkan.md)) |
+| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, views and committed resources; barriers, clears, uploads and copies (BC included) run on Vulkan, checked on one GPU. No shader views, pipelines, draws or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
 | Booting, story mode, anything playable | ❌ No |
 
 ## How to build

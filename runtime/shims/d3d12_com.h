@@ -16,13 +16,42 @@
 
 namespace rt::d3d12 {
 
+// `device` (optional) is what the object's GetDevice returns; the object holds a reference to it.
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
-                             const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out);
-HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out);
+                             const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
+                             IUnknown* device = nullptr);
+HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
-                            void** out);
+                            void** out, IUnknown* device = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
-                     void** out);
+                     void** out, IUnknown* device = nullptr);
+
+// The Vulkan objects a D3D12 device runs on. Vulkan 1.3 with dynamicRendering, synchronization2, timelineSemaphore
+// and (when separate_depth_stencil_layouts is set) separateDepthStencilLayouts enabled.
+struct VulkanDeviceInfo {
+    PFN_vkGetInstanceProcAddr get_instance_proc = nullptr;
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;  // a graphics queue; every D3D12 queue of the device submits to it
+    std::uint32_t queue_family = 0;
+    bool separate_depth_stencil_layouts = true;
+};
+
+// A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
+// the device and every object it created. Wrap it in rt::d3d12_xs::create_device_proxy for the Xbox ABI.
+HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out);
+
+// The same, on a Vulkan instance and device of its own (destroyed with the D3D12 device). Picks the first discrete
+// GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation.
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
+
+// Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
+// GetDevice must return. No reference is taken: the outer object owns the device.
+void set_device_outer(ID3D12Device* device, IUnknown* outer);
+
+// The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
+VkImage vulkan_image(ID3D12Resource* resource);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
