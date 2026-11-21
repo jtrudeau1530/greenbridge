@@ -390,7 +390,9 @@ python -I tools/anim_index.py <work>\anim-carve <work>\anim-index.json
 ```
 
 `tools/anim_index.py` reports `MoVE`, `0DRP`, `pack:/`, `SKEL_`, `RBF0`, `PSIN`, type-hash and 2/3 clip headers,
-plus `raw:<hex>` for anything it does not recognise. It writes no payloads.
+plus `raw:<hex>` for anything it does not recognise. It writes no payloads. `--start` must be 0 or more and
+`--limit` at least 1 (decimal or `0x` hex); an out-of-range value stops with a one-line error and exit code 2
+before an index is written.
 
 ## No-sharing rule
 

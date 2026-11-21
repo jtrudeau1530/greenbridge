@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -224,6 +225,90 @@ inline VkAccessFlags2 vulkan_barrier_access(std::uint32_t access) {
         out |= bit.flags;
     }
     if (access & ~known) out |= any_memory;  // video and unknown bits
+    return out;
+}
+
+// For one VkAccessFlagBits2 that vulkan_barrier_access produces: the stages Vulkan lets perform it (the "supported
+// access types" table of the synchronization2 chapter, with the meta stages that contain them), and the narrowest
+// stage to add when a barrier's stages have none of those. MEMORY_READ/WRITE are valid in every stage.
+struct AccessStages {
+    VkAccessFlags2 access;
+    VkPipelineStageFlags2 supported;
+    VkPipelineStageFlags2 narrowest;
+};
+
+inline constexpr VkPipelineStageFlags2 shader_stages2 =
+    VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+    VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT | VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
+    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+    VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+inline constexpr AccessStages access_stages[] = {
+    {VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+     VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT},
+    {VK_ACCESS_2_INDEX_READ_BIT,
+     VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT},
+    {VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT,
+     VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT},
+    // Shader accesses: D3D12 does not say which shader stage, so every one that can run (all shading).
+    {VK_ACCESS_2_UNIFORM_READ_BIT, shader_stages2,
+     VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
+    {VK_ACCESS_2_SHADER_READ_BIT, shader_stages2,
+     VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
+    {VK_ACCESS_2_SHADER_WRITE_BIT, shader_stages2,
+     VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
+    {VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
+     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+    {VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+    {VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
+    {VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
+    // Transfers: ALL_GRAPHICS does not contain the transfer stages, and CLEAR only writes.
+    {VK_ACCESS_2_TRANSFER_READ_BIT,
+     VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+         VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT},
+    {VK_ACCESS_2_TRANSFER_WRITE_BIT,
+     VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+         VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT},
+};
+
+// One side of an enhanced barrier: D3D12 sync and access to a Vulkan stage mask and access mask that Vulkan accepts
+// together. D3D12 lets an access be named with a sync scope whose Vulkan stages cannot perform it (SYNC_ALL_SHADING
+// with ACCESS_VERTEX_BUFFER is valid D3D12, but VERTEX_ATTRIBUTE_READ needs VERTEX_ATTRIBUTE_INPUT). The stages are
+// widened by the narrowest stage that can, never the access dropped: the dependency still covers every access the
+// application named, only over a slightly larger scope. With no stages (SYNC_NONE) there is no access either.
+struct BarrierScope {
+    VkPipelineStageFlags2 stages;
+    VkAccessFlags2 access;
+};
+
+inline BarrierScope vulkan_barrier_scope(std::uint32_t sync, std::uint32_t access) {
+    BarrierScope out{vulkan_sync(sync), 0};
+    if (!out.stages) return out;
+    out.access = vulkan_barrier_access(access);
+    for (const AccessStages& entry : access_stages)
+        if ((out.access & entry.access) && !(out.stages & entry.supported)) out.stages |= entry.narrowest;
     return out;
 }
 
@@ -507,6 +592,32 @@ struct Prepared {
     VkDeviceSize write_offset = 0;
 };
 
+// ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
+// the device, Windows D3D12 (WARP and AMD) clamps to the component range and truncates fractions. Vulkan
+// instead interprets the matching union member as an integer already; copying float bits changes the value.
+inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
+    std::uint32_t maximum = 0;
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UINT: maximum = 255; break;
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32B32A32_UINT: maximum = std::numeric_limits<std::uint32_t>::max(); break;
+    default: break;
+    }
+    VkClearColorValue value{};
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        if (!maximum) {
+            value.float32[i] = input[i];
+        } else if (!(input[i] > 0.0f)) {
+            value.uint32[i] = 0; // NaN, negative values and either zero; no out-of-range float-to-int cast.
+        } else if (double(input[i]) >= double(maximum)) {
+            value.uint32[i] = maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
+        } else {
+            value.uint32[i] = static_cast<std::uint32_t>(input[i]);
+        }
+    }
+    return value;
+}
+
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
                        VkImageSubresourceRange& out) {
     if (view.mip >= resource.mip_levels) return false;
@@ -732,9 +843,7 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     return ReplayResult::success;
 }
 
-// ResolveSubresource through vkCmdResolveImage: a multisampled colour subresource into a single-sampled one of
-// the same size and format. Depth-stencil resolves, and resolves between two formats of a typeless family, are
-// not supported yet.
+// Resolve a multisampled colour image into a single-sampled image of the same format.
 inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared& p) {
     VkImageSubresourceRange dst{}, src{};
     if (!copy_subresource(p.binding, resolve.dst_subresource, dst) ||
@@ -742,13 +851,26 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
         return ReplayResult::invalid_subresource;
     if (p.source.samples <= 1 || p.binding.samples != 1 || p.binding.volume) return ReplayResult::invalid_copy;
     const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
-    if (from.width != to.width || from.height != to.height) return ReplayResult::invalid_copy;
+    VkOffset3D src_offset{}, dst_offset{};
+    VkExtent3D extent{from.width, from.height, 1};
+    if (const auto& region = resolve.region) {
+        dst_offset = {std::int32_t(region->dst_x), std::int32_t(region->dst_y), 0};
+        if (const auto& r = region->src_rect) {
+            if (std::uint32_t(r->right) > from.width || std::uint32_t(r->bottom) > from.height)
+                return ReplayResult::invalid_copy;
+            src_offset = {r->left, r->top, 0};
+            extent = {std::uint32_t(r->right - r->left), std::uint32_t(r->bottom - r->top), 1};
+        }
+        if (!within(region->dst_x, extent.width, to.width) || !within(region->dst_y, extent.height, to.height))
+            return ReplayResult::invalid_copy;
+    } else if (from.width != to.width || from.height != to.height) {
+        return ReplayResult::invalid_copy;
+    }
     if (src.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || dst.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
         p.source.format != p.binding.format)
         return ReplayResult::unsupported;
-    p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, {0, 0, 0},
-                 {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, {0, 0, 0},
-                 {from.width, from.height, 1}};
+    p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, src_offset,
+                 {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, dst_offset, extent};
     p.range = dst;
     p.source_range = src;
     return ReplayResult::success;
@@ -1008,11 +1130,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         return {};
                 },
                 command);
+            const BarrierScope src = vulkan_barrier_scope(sync_before, access_before);
+            const BarrierScope dst = vulkan_barrier_scope(sync_after, access_after);
             VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-            barrier.srcStageMask = vulkan_sync(sync_before);
-            barrier.dstStageMask = vulkan_sync(sync_after);
-            barrier.srcAccessMask = barrier.srcStageMask ? vulkan_barrier_access(access_before) : 0;
-            barrier.dstAccessMask = barrier.dstStageMask ? vulkan_barrier_access(access_after) : 0;
+            barrier.srcStageMask = src.stages;
+            barrier.dstStageMask = dst.stages;
+            barrier.srcAccessMask = src.access;
+            barrier.dstAccessMask = dst.access;
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
             dependency.memoryBarrierCount = 1;
             dependency.pMemoryBarriers = &barrier;
@@ -1032,13 +1156,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 pieces = detail::current(tracker, id, range, before);
                 detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
             }
+            const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before);
+            const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after);
             std::vector<VkImageMemoryBarrier2> barriers;
             for (const auto& piece : pieces) {
                 VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-                b.srcStageMask = vulkan_sync(texture->sync_before);
-                b.dstStageMask = vulkan_sync(texture->sync_after);
-                b.srcAccessMask = b.srcStageMask ? vulkan_barrier_access(texture->access_before) : 0;
-                b.dstAccessMask = b.dstStageMask ? vulkan_barrier_access(texture->access_after) : 0;
+                b.srcStageMask = src.stages;
+                b.dstStageMask = dst.stages;
+                b.srcAccessMask = src.access;
+                b.dstAccessMask = dst.access;
                 b.oldLayout = piece.layout;
                 b.newLayout = new_layout;
                 b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1057,8 +1183,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            VkClearColorValue color{};
-            std::copy(color_clear->color.begin(), color_clear->color.end(), color.float32);
+            const VkClearColorValue color = detail::render_target_clear_color(p.binding.format, color_clear->color);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {

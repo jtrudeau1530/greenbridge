@@ -2,7 +2,8 @@
 // Part A uses only Vulkan 1.0 functions and no layout tracker. Part B uses the tracker with separate depth/stencil
 // layouts: rectangle clears, a depth clear while the stencil plane is in another state, a texture used after
 // implicit promotion from common, and enhanced barriers. Part C copies a volume (footprint, box and whole) and
-// resolves a multisampled target.
+// resolves a multisampled target. Part D records every D3D12 sync/access pair as enhanced barriers, which the
+// validation layer must accept. Part E (D3D-26) runs immediate buffer writes, atomic copies and discards.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -460,11 +461,82 @@ int part_c(vktest::Device& d) {
     return 0;
 }
 
-// Part D (D3D-26): WriteBufferImmediate in its three modes, AtomicCopyBufferUINT/UINT64 and DiscardResource.
+// Part D: every D3D12 sync bit against every access bit, as global, buffer and texture barriers. Whatever pair the
+// application names, the Vulkan barrier must be valid, so every access has a stage in its scope that can perform it
+// (vulkan_barrier_scope). Under LEONIDA_VK_VALIDATION=1 a pair that breaks that rule is a validation error. The
+// image is simultaneous-access, so it stays in GENERAL, which every access may use: only the stage/access rule is
+// under test.
+int part_d(vktest::Device& d) {
+    namespace y = d3d12_sync;
+    namespace a = d3d12_access;
+    namespace l = d3d12_layout;
+    const VkImage image = d.image(VK_FORMAT_R8G8B8A8_UNORM, 4, 4, 1,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    EXPECT(image);
+    constexpr ResourceId image_id = 30, buffer_id = 31;
+    ResourceBinding image_binding{};
+    image_binding.image = image;
+    image_binding.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image_binding.width = image_binding.height = 4;
+    image_binding.simultaneous_access = true;
+    const ResourceBinding buffer_binding{};  // a buffer: no image
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        if (id == image_id) return &image_binding;
+        return id == buffer_id ? &buffer_binding : nullptr;
+    };
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    vk.clear_depth_stencil_image = d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
+    vk.pipeline_barrier2 = d.fn<PFN_vkCmdPipelineBarrier2>("vkCmdPipelineBarrier2");
+    vk.separate_depth_stencil_layouts = true;
+    LayoutTracker tracker(true);
+    tracker.track(image_id, image_binding, VK_IMAGE_LAYOUT_GENERAL);
+
+    // Ray-tracing, video and split syncs map to ALL_COMMANDS, which every access accepts; they are kept anyway.
+    const std::uint32_t syncs[] = {y::all, y::draw, y::index_input, y::vertex_shading, y::pixel_shading,
+                                   y::depth_stencil, y::render_target, y::compute_shading, y::raytracing, y::copy,
+                                   y::resolve, y::execute_indirect, y::all_shading, y::non_pixel_shading,
+                                   y::emit_raytracing_acceleration_structure_postbuild_info,
+                                   y::clear_unordered_access_view, y::video_decode,
+                                   y::build_raytracing_acceleration_structure};
+    const std::uint32_t accesses[] = {a::common, a::vertex_buffer, a::constant_buffer, a::index_buffer,
+                                      a::render_target, a::unordered_access, a::depth_stencil_write,
+                                      a::depth_stencil_read, a::shader_resource, a::stream_output,
+                                      a::indirect_argument, a::copy_dest, a::copy_source, a::resolve_dest,
+                                      a::resolve_source, a::raytracing_acceleration_structure_read,
+                                      a::raytracing_acceleration_structure_write, a::shading_rate_source,
+                                      a::video_decode_read, a::no_access};
+    const BarrierSubresourceRange all{all_subresources, 0, 0, 0, 0, 0};
+    CommandList list;
+    unsigned pairs = 0;
+    for (const std::uint32_t sync : syncs) {
+        for (const std::uint32_t access : accesses) {
+            EXPECT(list.barrier(GlobalBarrier{sync, sync, access, access}));
+            EXPECT(list.barrier(BufferBarrier{sync, sync, access, access, buffer_id}));
+            EXPECT(list.barrier(TextureBarrier{sync, sync, access, access, l::common, l::common, image_id, all, 0}));
+            ++pairs;
+        }
+    }
+    EXPECT(list.close());
+    const unsigned errors_before = d.validation_errors();
+    const bool ok = d.run([&](VkCommandBuffer cb) {
+        d.initial_layout(cb, image, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_GENERAL);
+        return replay(list, cb, resolve, vk, &tracker) == ReplayResult::success;
+    });
+    EXPECT(ok);
+    const unsigned errors = d.validation_errors() - errors_before;
+    std::printf("D: %u sync/access pairs as global, buffer and texture barriers%s\n", pairs,
+                d.validation ? (errors ? ": validation errors" : ", no validation errors") : " (validation off)");
+    return 0;
+}
+
+// Part E (D3D-26): WriteBufferImmediate in its three modes, AtomicCopyBufferUINT/UINT64 and DiscardResource.
 // Buffers carry console VAs; one binding is a range inside another buffer, as resources in the GPU address arena
 // are. The writes and copies are ordered so that a missing barrier would let a copy read a stale or a later value.
 // A colour target is cleared, discarded and cleared again; a second one is only discarded in part.
-int part_d(vktest::Device& d) {
+int part_e(vktest::Device& d) {
     constexpr VkDeviceSize bytes = 256, c_offset = 128, c_size = 64;
     constexpr std::uint64_t va_a = 0x10000, va_b = 0x20000, va_c = 0x30000;
     constexpr std::uint32_t size = 8, texels = size * size;
@@ -562,7 +634,7 @@ int part_d(vktest::Device& d) {
             if (!record()) return false;
             bad.close();
             const ReplayResult got = replay(bad, cb, resolve, functions, &tracker);
-            if (got != expected) std::fprintf(stderr, "D rejected list: got %d, want %d\n", int(got), int(expected));
+            if (got != expected) std::fprintf(stderr, "E rejected list: got %d, want %d\n", int(got), int(expected));
             return got == expected;
         };
         const auto write = [&](std::uint64_t va) { return [&bad, va] { return bad.write_immediate({va, 1, 0}); }; };
@@ -605,8 +677,8 @@ int part_d(vktest::Device& d) {
                                                  {c_offset, 0x33333333}, {c_offset + 8, 0x22222222},
                                                  {c_offset + c_size - 4, 0x55555555}};
     for (VkDeviceSize offset = 0; offset < bytes; offset += 4) {
-        for (const auto& [name, base, want] : {std::tuple{"D buffer a", a_mapped, &want_a},
-                                               std::tuple{"D buffer b", b_mapped, &want_b}}) {
+        for (const auto& [name, base, want] : {std::tuple{"E buffer a", a_mapped, &want_a},
+                                               std::tuple{"E buffer b", b_mapped, &want_b}}) {
             const auto it = want->find(offset);
             const std::uint32_t expected = it == want->end() ? untouched : it->second;
             const std::uint32_t got = word(base, offset);
@@ -617,10 +689,10 @@ int part_d(vktest::Device& d) {
     }
     const auto* image_data = static_cast<const std::uint8_t*>(image_mapped);
     for (std::uint32_t i = 0; i < texels; ++i) {
-        expect_rgba("D discarded then cleared", image_data, i, green);
-        expect_rgba("D partly discarded", image_data + texels * 4, i, red);
+        expect_rgba("E discarded then cleared", image_data, i, green);
+        expect_rgba("E partly discarded", image_data + texels * 4, i, red);
     }
-    std::printf("D: immediate writes in three modes, UINT and UINT64 atomic copies, buffer and texture discards\n");
+    std::printf("E: immediate writes in three modes, UINT and UINT64 atomic copies, buffer and texture discards\n");
     return 0;
 }
 
@@ -629,7 +701,7 @@ int part_d(vktest::Device& d) {
 int main() {
     vktest::Device device;
     EXPECT(device.create());
-    if (part_a(device) || part_b(device) || part_c(device) || part_d(device)) return 1;
+    if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device)) return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", device.validation_errors());

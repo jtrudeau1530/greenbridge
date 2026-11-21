@@ -1,7 +1,8 @@
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
-// committed buffers and textures (2D, multisampled 2D, 3D), a few feature queries. Everything else is a generated stub that reports
-// itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what is still open.
+// committed buffers and textures (2D, multisampled 2D, 3D), allocation info, a few feature queries. Everything
+// else is a generated stub that reports itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer
+// means and what is still open.
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
@@ -105,6 +106,33 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     }
 }
 
+// The full mip chain's length for a texture this size.
+UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
+    UINT16 mips = 0;
+    for (UINT64 size = std::max<UINT64>({width, height, depth}); size; size >>= 1) ++mips;
+    return mips;
+}
+
+// The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
+// texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
+VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format) {
+    const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    info.format = format.format;
+    info.extent = {std::uint32_t(desc.Width), desc.Height, volume ? UINT(desc.DepthOrArraySize) : 1u};
+    info.mipLevels = desc.MipLevels;
+    info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
+    info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
+    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    return info;
+}
+
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
     VulkanDeviceInfo info;
@@ -112,6 +140,7 @@ struct DeviceState {
     VkPhysicalDeviceMemoryProperties memory{};
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
+    PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
 
     bool depth_usable(VkFormat format) const {
         VkFormatProperties properties{};
@@ -125,6 +154,42 @@ struct DeviceState {
         return image_format_properties(info.physical, image.format, image.imageType, image.tiling, image.usage,
                                        image.flags, &properties) == VK_SUCCESS &&
                (properties.sampleCounts & image.samples);
+    }
+
+    // The format a texture description is created with, D24S8's fallback included.
+    Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
+        Format format = vulkan_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
+            log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
+            format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        }
+        return format;
+    }
+
+    // The memory an image made from `create` needs, or false if the device can't make that image.
+    bool memory_requirements(const VkImageCreateInfo& create, VkMemoryRequirements& out) const {
+        VkImageFormatProperties limits{};
+        if (!image_format_properties ||
+            image_format_properties(info.physical, create.format, create.imageType, VK_IMAGE_TILING_OPTIMAL,
+                                    create.usage, create.flags, &limits) != VK_SUCCESS ||
+            create.extent.width > limits.maxExtent.width || create.extent.height > limits.maxExtent.height ||
+            create.extent.depth > limits.maxExtent.depth || create.mipLevels > limits.maxMipLevels ||
+            create.arrayLayers > limits.maxArrayLayers || !(limits.sampleCounts & create.samples))
+            return false;
+        if (image_requirements) {
+            VkDeviceImageMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
+            query.pCreateInfo = &create;
+            VkMemoryRequirements2 result{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+            image_requirements(info.device, &query, &result);
+            out = result.memoryRequirements;
+            return true;
+        }
+        auto& vk = context->vk;  // without the query, a throwaway image
+        VkImage image = VK_NULL_HANDLE;
+        if (vk.vkCreateImage(info.device, &create, nullptr, &image) != VK_SUCCESS) return false;
+        vk.vkGetImageMemoryRequirements(info.device, image, &out);
+        vk.vkDestroyImage(info.device, image, nullptr);
+        return true;
     }
 
     // The first memory type with `required`, preferring one that also has `preferred`.
@@ -228,30 +293,9 @@ public:
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
-        if (desc_.MipLevels == 0) {
-            UINT64 size = std::max<UINT64>({desc_.Width, desc_.Height, depth});
-            UINT16 mips = 1;
-            while (size > 1) {
-                size >>= 1;
-                ++mips;
-            }
-            desc_.MipLevels = mips;
-        }
-        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-        info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-        info.format = format.format;
-        info.extent = {std::uint32_t(desc_.Width), desc_.Height, depth};
-        info.mipLevels = desc_.MipLevels;
-        info.arrayLayers = volume ? 1 : desc_.DepthOrArraySize;
-        const std::uint32_t samples = std::max<UINT>(1, desc_.SampleDesc.Count);
-        info.samples = VkSampleCountFlagBits(samples);
-        info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-            info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        if (!(desc_.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
+        const VkImageCreateInfo info = texture_create_info(desc_, format);
+        const std::uint32_t samples = info.samples;
         if (samples > 1 && !device_.samples_usable(info)) {
             log_once("sample count not supported by the GPU for this format:", int(samples));
             return E_INVALIDARG;
@@ -343,6 +387,10 @@ public:
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties"));
         if (!get_device || !state_.format_properties || !state_.image_format_properties || !memory_properties) return;
         memory_properties(info.physical, &state_.memory);
+        for (const char* name : {"vkGetDeviceImageMemoryRequirements", "vkGetDeviceImageMemoryRequirementsKHR"})
+            if (!state_.image_requirements)
+                state_.image_requirements =
+                    reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirements>(get_device(info.device, name));
 
         if (state_.info.max_push_constants_size == 0 && info.physical && info.get_instance_proc) {
             const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
@@ -537,11 +585,7 @@ public:
                                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))) {
             hr = E_INVALIDARG;  // D3D12: a multisampled texture is a single-mip 2D render target or depth-stencil
         } else {
-            Format format = vulkan_format(desc->Format, desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-            if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !state_.depth_usable(format.format)) {
-                log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc->Format);
-                format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-            }
+            const Format format = state_.texture_format(*desc);
             if (format.format == VK_FORMAT_UNDEFINED) {
                 log_once("texture format not supported yet:", desc->Format);
                 hr = E_INVALIDARG;
@@ -627,6 +671,33 @@ public:
             offset += total_rows * pitch;
         }
         if (total) *total = end - base;
+    }
+
+    // How much heap memory resources need and how to align them, for applications that suballocate heaps (section
+    // 4.1). Buffers follow D3D12's fixed rule. A texture's size is what the Vulkan image it becomes needs, rounded up
+    // to D3D12's alignment for it; the alignment itself is D3D12's, since placed textures bind their own memory
+    // (section 4.2). Several resources are laid out one after another, each at its own alignment. An invalid
+    // description gives SizeInBytes = UINT64_MAX, as on D3D12. d3d12_vulkan_device_test compares with the PC runtime.
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(
+        UINT, UINT count, const D3D12_RESOURCE_DESC* descs) override {
+        return place(count, descs, [&](UINT i) { return descs[i]; }, nullptr);
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo1(
+        UINT, UINT count, const D3D12_RESOURCE_DESC* descs, D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        return place(count, descs, [&](UINT i) { return descs[i]; }, each);
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo2(
+        UINT, UINT count, const D3D12_RESOURCE_DESC1* descs, D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        return place(count, descs, [&](UINT i) {
+            const D3D12_RESOURCE_DESC1& d = descs[i];
+            if (d.SamplerFeedbackMipRegion.Width || d.SamplerFeedbackMipRegion.Height ||
+                d.SamplerFeedbackMipRegion.Depth) {
+                log_once("GetResourceAllocationInfo2 sampler feedback not supported, format", d.Format);
+                return D3D12_RESOURCE_DESC{};  // an unknown dimension: invalid
+            }
+            return D3D12_RESOURCE_DESC{d.Dimension, d.Alignment, d.Width, d.Height, d.DepthOrArraySize,
+                                       d.MipLevels, d.Format, d.SampleDesc, d.Layout, d.Flags};
+        }, each);
     }
 
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
@@ -755,6 +826,97 @@ public:
 private:
     IUnknown* identity() { return outer_ ? outer_ : static_cast<ID3D12Device*>(this); }
 
+    static constexpr D3D12_RESOURCE_ALLOCATION_INFO kInvalidAllocation{UINT64_MAX,
+                                                                       D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+    static UINT64 align_up(UINT64 value, UINT64 to) { return (value + to - 1) / to * to; }
+
+    // Lays `count` resources out one after another; `each` (optional) gets every resource's offset, size and alignment.
+    template<class Desc, class Get>
+    D3D12_RESOURCE_ALLOCATION_INFO place(UINT count, const Desc* descs, Get get,
+                                         D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+        D3D12_RESOURCE_ALLOCATION_INFO total{0, 0};
+        bool failed = count && !descs;
+        for (UINT i = 0; i < count; ++i) {
+            const D3D12_RESOURCE_ALLOCATION_INFO one = failed ? kInvalidAllocation : allocation(get(i));
+            failed = failed || one.SizeInBytes == UINT64_MAX;
+            if (failed) {
+                if (each) each[i] = {UINT64_MAX, one.Alignment, UINT64_MAX};
+                continue;
+            }
+            const UINT64 offset = align_up(total.SizeInBytes, one.Alignment);
+            if (each) each[i] = {offset, one.Alignment, one.SizeInBytes};
+            total = {offset + one.SizeInBytes, std::max(total.Alignment, one.Alignment)};
+        }
+        return failed ? kInvalidAllocation : total;
+    }
+
+    // One resource's size and alignment, or kInvalidAllocation for a description D3D12 (or this device) rejects.
+    D3D12_RESOURCE_ALLOCATION_INFO allocation(const D3D12_RESOURCE_DESC& desc) const {
+        constexpr UINT64 align_4k = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT,
+                         align_64k = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                         align_msaa_64k = D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
+                         align_msaa_4m = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+        constexpr D3D12_RESOURCE_FLAGS attachment =
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (!desc.Width || desc.Width > UINT64_MAX - align_64k || desc.Height != 1 || desc.DepthOrArraySize != 1 ||
+                desc.MipLevels != 1 || desc.Format != DXGI_FORMAT_UNKNOWN || desc.SampleDesc.Count != 1 ||
+                desc.SampleDesc.Quality != 0 || desc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR ||
+                (desc.Alignment && desc.Alignment != align_64k) || (desc.Flags & attachment))
+                return kInvalidAllocation;
+            return {align_up(desc.Width, align_64k), align_64k};
+        }
+        const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_UNKNOWN)
+                log_once("GetResourceAllocationInfo dimension not supported:", desc.Dimension);
+            return kInvalidAllocation;
+        }
+        const UINT samples = desc.SampleDesc.Count, depth = volume ? desc.DepthOrArraySize : 1;
+        const UINT64 max_extent =
+            volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+        const UINT max_layers =
+            volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
+        if (!desc.Width || !desc.Height || !desc.DepthOrArraySize || desc.Width > max_extent ||
+            desc.Height > max_extent || desc.DepthOrArraySize > max_layers || !samples || samples > 16 ||
+            (samples & (samples - 1)) || desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+            return kInvalidAllocation;
+        const UINT16 full = full_mips(desc.Width, desc.Height, depth);
+        D3D12_RESOURCE_DESC resolved = desc;
+        if (!resolved.MipLevels) resolved.MipLevels = full;
+        if (resolved.MipLevels > full) return kInvalidAllocation;
+        if (samples > 1 &&
+            (volume || resolved.MipLevels != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+            return kInvalidAllocation;
+        if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
+            log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
+
+        const Format format = state_.texture_format(desc);
+        if (!format.format) {
+            log_once("GetResourceAllocationInfo format not supported yet:", desc.Format);
+            return kInvalidAllocation;
+        }
+        VkMemoryRequirements need{};
+        if (!state_.memory_requirements(texture_create_info(resolved, format), need)) return kInvalidAllocation;
+
+        // D3D12's alignment: 64 KiB, or 4 MiB with MSAA, unless the description asks for a small one (4 KiB, 64 KiB
+        // with MSAA). 4 KiB needs the resource to fit in 64 KiB and not be a render target or depth buffer; if it
+        // doesn't qualify, the PC runtime calls the description invalid rather than answering with 64 KiB. The MSAA
+        // 64 KiB alignment has no size limit there. Both measured in d3d12_vulkan_device_test.
+        UINT64 alignment = 0;
+        if (samples > 1) {
+            if (desc.Alignment && desc.Alignment != align_msaa_64k && desc.Alignment != align_msaa_4m)
+                return kInvalidAllocation;
+            alignment = desc.Alignment ? desc.Alignment : align_msaa_4m;
+        } else {
+            if (desc.Alignment && desc.Alignment != align_4k && desc.Alignment != align_64k) return kInvalidAllocation;
+            if (desc.Alignment == align_4k && ((desc.Flags & attachment) || need.size > align_64k))
+                return kInvalidAllocation;
+            alignment = desc.Alignment ? desc.Alignment : align_64k;
+        }
+        return {align_up(need.size, alignment), alignment};
+    }
+
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -780,6 +942,21 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
 VkImage vulkan_image(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->image() : VK_NULL_HANDLE;
+}
+
+bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (!dst || !src) return false;
+    const Format requested = vulkan_format(format, false);
+    if (requested.typeless || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return false;
+    if (format == DXGI_FORMAT_R32G32B32A32_UINT || format == DXGI_FORMAT_R8G8B8A8_UINT ||
+        format == DXGI_FORMAT_R32_UINT)
+        return false;
+    const auto matches = [&](ID3D12Resource* resource) {
+        const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        return vulkan_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL).format ==
+               requested.format;
+    };
+    return matches(dst) && matches(src);
 }
 
 std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
