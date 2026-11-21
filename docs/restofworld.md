@@ -1,0 +1,354 @@
+# Rest-of-world and script archives
+
+This page measures the six rest-of-world/script archives in the Xbox 1.0.2.1 package:
+`core_restofworld.rpf`, `story000_restofworld.rpf`, `story000_script.rpf`,
+`core_restofworld001.rpf`, `appdata0.rpf` and `core_licenses_data.rpf`. The two story archives also
+appear in the story report; this page re-measures them with the same corrected carver and adds the
+1.21 GiB `core_restofworld`, the three small archives, and the cross-checks. It is a container survey,
+not a resource decoder. The RPF9 tables of contents are still encrypted, so every count comes from the
+data area or from a fixed header, never from a path or file name.
+
+All six archives were scanned end to end with the corrected carver from PR #90 (`--index-only`, which
+advances by the actual stream length). The largest is 1.21 GiB, so no archive needed a bounded window.
+Everything below is aggregate; no game payload, asset name or path is stored in this repository.
+
+## Archives and full index
+
+Sizes are exact bytes from the package. `data offset` is the little-endian u32 at file offset 4. The
+readable fraction is the carver's `stored / span`; Bink 2 streams count as readable.
+
+| Archive | File size | Data offset | Streams | Stored | Inflated | Zero padding | Unread | Readable | Elapsed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `core_restofworld.rpf` | 1,295,760,752 (1.21 GiB) | 0xAA0 | 2,381 | 1,293,131,069 | 1,355,861,220 | 2,410,297 | 216,666 | 99.8% | 1.9 s |
+| `story000_restofworld.rpf` | 198,354,992 (189.17 MiB) | 0xA40 | 631 | 188,163,116 | 255,343,231 | 862,330 | 9,326,922 | 94.9% | 1.3 s |
+| `story000_script.rpf` | 78,023,728 (74.41 MiB) | 0x2B0 | 2,632 | 20,408,094 | 74,729,504 | 4,585,959 | 53,028,987 | 26.2% | 3.9 s |
+| `core_restofworld001.rpf` | 791,984 | 0x3B0 | 33 | 734,650 | 1,575,059 | 47,232 | 9,158 | 92.9% | 0.1 s |
+| `appdata0.rpf` | 8,880 | 0x360 | 0 | 0 | 0 | 0 | 8,016 | 0.0% | 0.1 s |
+| `core_licenses_data.rpf` | 13,536 | 0x330 | 3 | 1,074 | 2,004 | 19 | 11,627 | 8.4% | 0.1 s |
+
+The six archives total 1,572,953,872 bytes. The three larger scans are all full-file; the three small
+archives are also full, including the 8,016-byte data area of `appdata0`. "Unread" is the non-zero gaps
+between streams that did not inflate, not empty space.
+
+## What each archive is
+
+| Archive | Byte-dominant payload | Models | Maps | Scripts |
+|---|---|---|---:|---:|---:|
+| `core_restofworld` | Bink 2 video, 95.8% of the data span; 958 graphics pages and 924 model-name system pages | 37 decoded in the existing manifest; 433 unique name strings measured here | 0 | 0 |
+| `story000_restofworld` | Bink 2 video 60.6% of the data span, then system pages and 101 `0DRP` metadata resources | 1 page with 3 `.#dr` strings; no decoded model | 0 | 0 |
+| `story000_script` | `PSIN` metadata, 79.2% of inflated bytes | 0 | 0 | 0 validated container |
+| `core_restofworld001` | 23 zero-prefix system pages plus 4 XML content manifests | 0 | 0 | 0 |
+| `core_licenses_data` | 3 XML content manifests | 0 | 0 | 0 |
+| `appdata0` | no readable stream; 100% unread | 0 | 0 | 0 |
+
+"Models" and "maps" are counts of validated resources, not guesses from a magic. The 37
+`core_restofworld` models are the existing model-manifest count in `docs/design.md`; the 924 name-bearing
+pages are a larger upper bound on the page population, not 924 decoded models.
+
+## Payload composition
+
+### `core_restofworld.rpf`
+
+| Class | Streams | Stored | Inflated | Share of inflated |
+|---|---:|---:|---:|---:|
+| Bink 2 (`KB2n`) | 11 | 1,241,514,796 | 1,241,514,796 | 91.6% |
+| `42 40 00 00` resource pages | 958 | 37,556,463 | 77,862,128 | 5.7% |
+| zero-prefix system pages | 1,230 | 12,920,541 | 34,278,992 | 2.5% |
+| other raw/page starts | 162 | 1,045,600 | 1,960,826 | 0.1% |
+| `PSIN` | 6 | 50,402 | 142,056 | <0.1% |
+| `0DRP` metadata | 1 | 35,489 | 65,536 | <0.1% |
+| `RBF0` | 3 | 3,380 | 23,364 | <0.1% |
+| XML | 10 | 4,398 | 13,522 | <0.1% |
+
+- **Video.** The 11 `KB2n` streams are all 1920x1080, with 450 to 9,776 frames; together they are
+  1,241,514,796 bytes, or 95.8% of the archive's data span. They are the largest payload by far.
+  No Bink 2 stream from this archive is byte-identical to one in `story000_restofworld` (0 common
+  SHA-256 over the 11 + 7 stored bodies).
+- **Models and pages.** 924 zero-prefix system pages carry 936 model-name strings (883 `.#dr`, 53
+  `.#ft`; 433 unique strings), which is the same name-bearing system-page pattern used by the model
+  exporter. There are no `.#dd`, `.#td` or `.#txd` strings. The separate `42 40 00 00` graphics-page
+  family has 958 streams, 256 bytes to 9.4 MiB each, 37.6 MB stored / 77.9 MB inflated. The existing
+  model manifest reports 37 decoded `core_restofworld` models; the 924 name pages are not all complete
+  resources, so this page does not raise that count.
+- **Metadata.** One standalone `0DRP` resource at offset 53,899,280 has version 122 and 16 at +0x20.
+  `world_index.py` classifies it as `meta`, not a map: 1 resource, 0 maps, 0 entities. Six `PSIN` streams
+  follow: five complete six-section chains and one partial `LSCH`+`LENM` stream. Their `LRSC` payload
+  is 80 bytes of `0DRP` + 122, with page counts 7, 5, 7, 2 and 2. The `u32` at `PSIN+8` is 257 on four
+  of the six; it is not called a version because it varies and the story report already found it
+  unstable.
+- **Schemas and text.** The three `RBF0` records name `CMovieSubtitleContainer` (2) and
+  `VfxTextureAtlasMetadataInfoMgr` (1). The 10 XML streams have the roots
+  `CDataFileMgr__ContentChangeSetDef` (8), `CDataFileMgr__ContentDef` (1) and `SSetupData` (1). They are
+  content definitions, not UI layout.
+- **Containers.** The file has 11 `9FPR` headers that pass the measured check: the outer archive plus
+  10 embedded header candidates; one sits at the data start (2,720), eight are 4 KiB-aligned, and one
+  is at 54,154,944. There is no `RSC8` or `RSC7` header anywhere in it. The 216,666 unread bytes include
+  the non-zero gaps around those headers.
+
+### `story000_restofworld.rpf`
+
+| Class | Streams | Stored | Inflated | Share of inflated |
+|---|---:|---:|---:|---:|
+| Bink 2 (`KB2n`) | 7 | 120,187,756 | 120,187,756 | 47.1% |
+| zero-prefix system pages | 400 | 57,694,475 | 92,678,320 | 36.3% |
+| `0DRP` metadata | 101 | 8,152,633 | 38,632,912 | 15.1% |
+| other raw/page starts | 99 | 1,903,036 | 3,436,561 | 1.3% |
+| clip streams | 3 | 94,250 | 137,024 | 0.1% |
+| `PSIN` | 3 | 40,679 | 104,080 | <0.1% |
+| text | 3 | 28,330 | 60,064 | <0.1% |
+| `42 40 00 00` resource page | 1 | 44,718 | 58,880 | <0.1% |
+| type-hash page | 1 | 11,532 | 31,760 | <0.1% |
+| XML | 13 | 5,707 | 15,874 | <0.1% |
+
+- The seven Bink 2 streams are 120,187,756 bytes, 60.6% of the data span: five 720x1280 and two
+  1920x1080, with 425 to 3,192 frames. This is a vertical-video/extra-content archive as much as a
+  resource archive.
+- The 101 `0DRP` streams are all version 122. Their +0x20 counts range from 1 to 37 and sum to 1,662
+  pages. `world_index.py` classifies all 101 as `meta`, not maps: 101 resources, 0 maps, 0 entities.
+  The 400 zero-prefix system pages account for 92.7 MB inflated. Only one page has model-name strings
+  (3 `.#dr` names), so this is not a model archive.
+- The three `PSIN` streams are 2 complete chains and 1 stream with no parseable chain. Two complete
+  `LRSC` payloads are present. The 13 XML streams are again content definitions (11 change-set, 1
+  content-def, 1 `SSetupData`); the three text streams are 59,848, 146 and 70 bytes; the three clip
+  streams have the measured `u32 2/3 + 01 01 00 00` header.
+- The 19 `9FPR` headers are the outer archive plus 18 nested headers on 4 KiB boundaries. The 9.33 MB
+  unread region holds nine `RSC8` headers (version 8001, flags 1, declared size 4,852-13,764, sum
+  71,380) between offsets 70,697,336 and 70,877,704, but no `RSC7`. In these nine headers the bytes at
+  +0x30 are zero and the first `0x50xxxxxx` pointer is at +0x48; this page does not claim a name field
+  at +0x30.
+
+### `story000_script.rpf`
+
+| Class | Streams | Stored | Inflated | Share of inflated |
+|---|---:|---:|---:|---:|
+| `PSIN` | 2,309 | 14,484,253 | 59,151,216 | 79.2% |
+| other raw/page starts | 258 | 4,704,587 | 11,970,376 | 16.0% |
+| zero-prefix system pages | 65 | 1,219,254 | 3,607,912 | 4.8% |
+
+`PSIN` dominates; no compiled-script container was found. The measured header and chain are:
+
+```
++0   "PSIN"
++4   big-endian first-section offset (points at LSCH)
++8   u32, 261 on 1,771 streams; 77/265/264 on the next 517; 21 other values
++12  u32, the hash-table byte count
+...
+record: 4-byte tag + big-endian u32 total size (includes the 8-byte record header)
+```
+
+| Tag | Sections | Size range | Median |
+|---|---:|---:|---:|
+| `LSCH` | 2,160 | 2,440-7,464 | 4,200 |
+| `LENM` | 2,156 | 376-5,968 | 728 |
+| `LSNS` | 2,118 | 68-17,204 | 1,804 |
+| `LGID` | 2,118 | 8 | 8 |
+| `LRSC` | 2,118 | 88 | 88 |
+| `CHKS` | 2,118 | 20 | 20 |
+
+Of the 2,309 containers, 2,118 have all six sections, 38 have `LSCH`+`LENM`, 4 have `LSCH` only and
+149 have no parseable chain. An all-offset scan finds 2,275 `0DRP` occurrences in the inflated set: the
+2,118 `LRSC` payloads plus 157 in page payloads. The tag/length chain is contiguous and ends at `CHKS`,
+which is the same layout measured for `script.rpf`. The `LSNS` payload is high-entropy (5.228-7.990
+bits/byte, median 7.888) and none of the 2,118 payloads decompresses with zlib. No `SCRP`, `YSC`,
+`RSCC`, `RSC8`, `RBF0`, `FSSM` or Bink magic occurs anywhere in the inflated set. One of the 258 raw
+streams begins with `LSCH` but has no `PSIN` header; it is a fragment, not a container.
+
+The 65 zero-prefix streams are 3.6 MB inflated. The remaining 258 raw streams are 226 distinct
+first-eight-byte classes, 4.7 MB stored / 12.0 MB inflated; no recognised container starts them.
+The archive has 5 `9FPR` headers: the outer archive plus four nested headers at 4,096; 98,304;
+51,539,968 and 77,819,904. The 53,028,987 unread bytes (68.0% of the data span) contain those nested
+archives and their high-entropy payloads. They are not decoded and are not guessed to be bytecode.
+
+### `core_restofworld001.rpf`, `appdata0.rpf` and `core_licenses_data.rpf`
+
+- `core_restofworld001.rpf` has 33 streams: 23 zero-prefix system pages (686,469 stored / 1,507,952
+  inflated), 6 other raw streams (46,599 / 63,872) and 4 XML streams (1,582 / 3,235). The XML roots are
+  2 `CDataFileMgr__ContentChangeSetDef`, 1 `CDataFileMgr__ContentDef` and 1 `SSetupData`. There is one
+  nested `9FPR` at 4,096. There is no `PSIN`, `0DRP`, Bink, model-name string or map. It is a small
+  content-manifest/page supplement.
+- `appdata0.rpf` has the outer `9FPR` header and an 8,016-byte data area with no complete zlib stream,
+  no Bink and no nested `9FPR`. The data area is 2,751 zero bytes and 2,036 printable bytes with an
+  entropy of 6.155 bits/byte; no `<?xml`, `RSC8`, `PSIN`, `0DRP`, `KB2` or other known magic occurs.
+  It is left opaque rather than labelled a save, a table of contents or anything else.
+- `core_licenses_data.rpf` has 3 XML streams, 1,074 stored / 2,004 inflated, with one each of
+  `CDataFileMgr__ContentChangeSetDef`, `CDataFileMgr__ContentDef` and `SSetupData`. One nested `9FPR`
+  sits at 4,096. The other 11,627 bytes (91.4% of the data span) are unread; no other signature is
+  present.
+
+## Signatures actually observed
+
+Only a stream start counts as a container signature. A four-byte magic inside an inflated page or XML
+text is recorded as a substring, not as a container.
+
+| Magic | Offset | Validation used | Measured count |
+|---|---|---|---:|
+| `9FPR` (RPF9) | +0 | data offset u32 at +4, header sizes below EOF | 11 core (10 embedded), 19 story-rest (18), 5 script (4), 2 core001, 2 licenses, 1 appdata |
+| zlib `78 01/5e/9c/da` | +0 | inflates cleanly to the stream end | 2,370 core, 624 story-rest, 2,632 script, 33 core001, 3 licenses |
+| `KB2[a-z]` (Bink 2) | +0 | size u32 +4, width +0x14, height +0x18, valid bounds | 11 core (all `KB2n`), 7 story-rest (all `KB2n`) |
+| `PSIN` | +0 | tag/length chain below EOF, six measured tags | 6 core, 3 story-rest, 2,309 script |
+| `0DRP` | +0x10 or +0 | version 122 at magic+4; count at +0x20 (at +0x10) or +0x0C (at +0) | 1 core, 101 story-rest; plus 5 `LRSC` payloads in core, 2 in story-rest, 2,118 in script |
+| `RBF0` | +0 | printable schema string after the 8-byte header | 3 core |
+| `RSC8` | +0 | version 8001 at +4, flags 1 at +12, declared size below EOF | 0 at stream starts; 9 raw headers in the story-rest unread gap |
+| `RSC7` | +0 | - | 0 everywhere |
+| `42 40 00 00` | +0 | 0x4042 page marker | 958 core, 1 story-rest |
+| zero-prefix page | +0 | first 8 bytes zero | 1,230 core, 400 story-rest, 65 script, 23 core001 |
+| XML | +0 | optional UTF-8 BOM + `<?xml` | 10 core, 13 story-rest, 4 core001, 3 licenses |
+| text | +0 | printable sample, at least 64 bytes | 3 story-rest |
+| type-hash header | +0 | u32 type, u32 8, u32 count, u32 0 | 1 story-rest |
+| clip stream | +0 | u32 2/3 + `01 01 00 00` | 3 story-rest |
+
+Not observed as a container anywhere in the six archives: `RSC7`, `SCRP`, `YSC`, `RSCC`, `AWC`,
+`ADAT`, `FSSM`, `DDS `, `DXT1`, `DXT3`, `DXT5`, `ATI2`, `BC5`, `BC7` and `TXTR`. Naive byte scans do
+produce false positives, which is why the table is restricted to stream starts:
+
+- `ADAT` occurs inside the XML word `METADATA` in two story-rest streams and two core streams.
+- `AWC\x00` occurs inside a printable name table in one story-rest zero-prefix page.
+- `ATI2` occurs once inside a high-entropy story-rest page, but it is not a validated texture header.
+- `KB2` occurs inside two story-rest pages as a four-byte coincidence; only the seven validated
+  `KB2n` streams are Bink.
+
+The `0DRP` version is 122 in every validated header. The `RSC8` version is 8001 in all nine raw
+headers. No format is inferred beyond these bytes.
+
+## Cross-checks
+
+### `story000_script` against `script.rpf` and `story000.rpf`
+
+The fixed walker finds 1,012 `PSIN` streams in `script.rpf`, of which 1,009 are complete six-section
+chains. That matches the 1,012 complete records the `rpf9dump` path reports; the earlier 671-stream
+carve figure is not reproduced by the corrected walk. `story000_script` has 2,309 `PSIN` streams and
+2,118 complete chains. The two sets are not the same records:
+
+| Archive | `PSIN` | Complete | `LSCH` size | `LENM` size | `LSNS` size | `u32@8` | Common inflated SHA-256 |
+|---|---:|---:|---:|---:|---:|---|---:|
+| `story000_script.rpf` | 2,309 | 2,118 | 2,440-7,464 | 376-5,968 | 68-17,204 | 261 (1,771), 77/265/264 (517) | - |
+| `script.rpf` | 1,012 | 1,009 | 472-552 | 128 | 52-19,412 | 22 (1,010) | 0 |
+| `story000.rpf` first 256 MiB | 0 | 0 | - | - | - | - | 0 |
+| `story000.rpf` 14-14.25 GiB | 0 | 0 | - | - | - | - | 0 |
+
+The section shapes differ by an order of magnitude, and no inflated stream is byte-identical. The
+`story000` samples are 33,315 streams / 2,024,500,480 inflated bytes in the first 256 MiB (16,977
+`0DRP` pages) and 2,547 streams / 472,245,792 inflated bytes at 14 GiB (780 `42 40 00 00` pages); neither
+has a `PSIN` stream or a hash in common with `story000_script`. That is sample evidence, not a full
+20 GB proof. It supports the reading that `story000_script` is its own script-metadata corpus, not a
+copy of the base `script.rpf` records; no compiled-script container was found in it. The `LSNS` bodies
+remain opaque.
+
+### `core_restofworld` against `packs.rpf` and `levels.rpf`
+
+A full hash pass over `packs.rpf` found 144,364 streams, 4,583,737,693 stored / 9,735,393,187
+inflated, matching `docs/world.md`. Against all 2,370 zlib streams in `core_restofworld` (2,278 distinct
+hashes; 92 are internal duplicates, including 16 repeated `42 40 00 00` page groups), four hashes are
+common with packs and all four are 240-byte zero-prefix pages; there is no common `42 40 00 00` page
+and no common model system page. The levels samples are three windows: 20-21 GiB (16,683 streams),
+40-41 GiB (14,314) and 70-70.8 GiB (14,445); they share **zero** inflated hashes with core.
+
+| Comparison | Scope | Common inflated streams |
+|---|---|---:|
+| `core` vs `packs` | full packs, 144,364 streams | 4 (all 240-byte zero pages) |
+| `core` vs `levels` 20-21 GiB | 1 GiB window, 16,683 streams | 0 |
+| `core` vs `levels` 40-41 GiB | 1 GiB window, 14,314 streams | 0 |
+| `core` vs `levels` 70-70.8 GiB | 0.8 GiB window, 14,445 streams | 0 |
+
+The model-name check is consistent: `core` has 433 unique base name strings; the packs sample has
+11,991 and the levels sample 4,853, with **zero** exact or case-insensitive base-name intersection.
+The samples are derived name lists, not a table of contents, so this does not prove the full archives
+never share a model. It does show that the measured core pages are private copies, not the same page
+sets as full packs or the three levels windows.
+
+Map placement is absent: all 101 story-rest `0DRP` resources and the one core `0DRP` resource are
+`meta`, with 0 `CMapData`/`CEntityDef` structs and 0 entities. The map-placement records remain in
+`levels.rpf` (`docs/world.md`), not in these archives.
+
+### Cross-archive duplicates
+
+No inflated stream SHA-256 is shared across `core_restofworld`, `story000_restofworld`,
+`story000_script`, `script.rpf`, `core_restofworld001` and `core_licenses_data`. The core and story-rest
+Bink sets also have 0 common stored-body SHA-256. These are distinct corpora, not copies at different
+block boundaries.
+
+## Readable versus opaque
+
+Readable: the RPF9 header and data offset, zlib streams, Bink 2 headers, XML content definitions,
+`PSIN` tag/length chains, `0DRP` version and count fields, `RBF0` schema strings, and model-name
+strings in system pages. `42 40 00 00` page relocation tables are visible but not decoded.
+
+Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` payloads, the bodies of the
+`RSC8` headers, the 958 graphics pages beyond their header, the nested RPF9 payloads, and the whole
+`appdata0` data area. "Unread" in the tables above is not a claim that those bytes are empty: in
+`story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and
+in `story000_script` the 53 MB unread region contains four nested RPF9 headers.
+
+## Likely format family
+
+The bytes support the existing **RPF9/RAGE family**, not a new container:
+
+- RPF9 data areas are zlib streams with embedded RPF9 sub-archives (10 nested in core, 18 in
+  story-rest, 4 in script; most sit on 4 KiB boundaries).
+- Bink 2 video is `KB2n` and is separate from the resource pages; core is video-first, story-rest is
+  video plus metadata/pages.
+- `0DRP` version 122 is the metadata/page-directory family. In a standalone stream it is a `0x7a`
+  metadata resource; in a `PSIN` `LRSC` payload it is an 80-byte page-directory record. Neither form
+  carries map-placement structs here.
+- `PSIN` is a sectioned metadata container, not a compiled-script container. The six tags and the
+  big-endian length chain are measured; `LSNS` semantics are not.
+- `RBF0` records carry schema names (movie subtitles, VFX texture-atlas metadata); XML records carry
+  content definitions.
+- `RSC8` appears only as raw headers in the story-rest unread gap. No `RSC7` was found.
+
+Models are present (37 decoded in core, plus 924 name-bearing pages), but the measured bytes do not
+support a claim that these archives hold map placement, compiled scripts, audio banks or UI layout.
+The only UI-adjacent evidence is content-manifest XML and text; there is no UI container signature.
+
+## What a future decoder needs
+
+1. The RPF9 table-of-contents key/schema for names, paths and exact entry boundaries. This project
+   does not search for or distribute keys.
+2. A recursive RPF9 walker. The flat carve crosses 10/18/4 embedded archives; a decoder needs their
+   spans and TOCs to group pages into resources.
+3. A Bink 2 decoder for the 11 core and 7 story-rest videos (`KB2n`; see `docs/movies.md`).
+4. An `0DRP`/`0x7a` parser that distinguishes a standalone metadata resource from a `PSIN` `LRSC`
+   page-directory record. `docs/world.md` already validates the `0x7a` header and schema tables; this
+   page adds the two placements.
+5. A `PSIN` section walker for `LSCH`, `LENM`, `LSNS`, `LGID`, `LRSC` and `CHKS`. The chain is
+   measured; `LSNS` is high-entropy and not zlib. Do not call it bytecode without evidence.
+6. A model-page joiner. `rpf9dump` already exports 37 core models; the 924 name-bearing system pages
+   are the larger page population, but grouping them into complete resources needs the missing TOC or
+   a page-graph rule.
+7. A page/texture decoder for `42 40 00 00` and zero-prefix pages. No DDS, `TXTR`, DXT or BC magic was
+   found at a stream start, so the texture format is not claimed from these bytes.
+8. An XML content-definition reader. The roots are content change sets, content definitions and
+   `SSetupData`; this is configuration, not UI layout.
+9. A false-positive-aware magic scanner. `ADAT` inside `METADATA`, `AWC` inside names and `ATI2` inside
+   a page are measured examples; only validated stream starts and fixed headers count.
+
+## No-sharing rule
+
+Do not commit archives, carved streams, inflated payloads, asset names, path strings, hashes of assets
+or name dumps. This page and its test contain aggregate counts and synthetic bytes only. Keep carves in
+a local work directory, never in the repository or a PR. `tools/restofworld_index.py` writes offsets,
+sizes, signatures and header fields; it does not write resource payloads or carved bytes.
+
+## Reproduce
+
+```powershell
+python -I tools/rpf9_carve.py <archive.rpf> <work>\carve\<name> --index-only
+python -I tools/restofworld_index.py <archive.rpf> <work>\index.csv
+python -I tools/restofworld_index.py <archive.rpf> <work>\index.json
+python -I tests/test_restofworld_index.py
+```
+
+For the map/meta split, run the `world_index.py` from `docs/world.md` over the same archive; it reports
+`maps`, `meta`, `entities` and the `0x7a` version without decoding geometry. The index tool walks readable
+streams; the nine `RSC8` headers in the story-rest unread gap come from a raw-file scan, not from the
+tool. The cross-check hashes in this report came from a local SHA-256 pass over the inflated streams and
+are not committed. The carver and index tool are stdlib-only and read the archive in place; neither
+decrypts the TOC.
+
+## See also
+
+- [docs/rpf.md](rpf.md) - RPF9 carving and recovery tools.
+- [docs/design.md](design.md) - the model manifest and the archive-stage table.
+- `docs/story.md` - the `story000`/`shared_minigame000` archive family (pending story PR).
+- `docs/world.md` - map placement and the `0x7a` metadata resource (PR #117).
+- `docs/psin.md` - the `PSIN` container measured on `script.rpf` and `data.rpf` (PR #110).
