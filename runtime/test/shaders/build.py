@@ -103,6 +103,9 @@ def main():
                 artifact = built / (n + suffix)
                 artifact.replace(spirv / artifact.name)
         index.replace(published_index)
+        sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
+        import spirv_stubs
+        spirv_stubs.generate_for_index(str(spirv), combined)
     return 0
 
 
