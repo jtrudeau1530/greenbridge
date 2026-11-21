@@ -56,6 +56,8 @@ bool prefer_host_copy(const std::string& dll) {
 
 Loader::~Loader() {
     for (auto* m : order_) {
+        if (m->tls_block) VirtualFree(m->tls_block, 0, MEM_RELEASE);
+        if (m->has_tls_slot) TlsFree(m->tls_slot);
         if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
         delete m;
     }
@@ -68,6 +70,88 @@ Module& Loader::load(const std::filesystem::path& image) {
     bind_imports(m);
     protect_sections(m);
     return m;
+}
+
+void Loader::initialise() {
+    // order_ is dependency order: a module is pushed after the modules it imports.
+    for (auto* m : order_) initialise(*m);
+}
+
+void Loader::initialise(Module& m) {
+    if (m.initialised) return;
+    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    const uint64_t base = reinterpret_cast<uint64_t>(m.base);
+
+    // The TLS directory holds virtual addresses, which relocations have already moved to this mapping.
+    auto rva_of = [&](uint64_t va, const char* what) {
+        if (va < base || va - base >= m.size)
+            throw std::runtime_error(m.name + ": " + what + " is outside the image");
+        return va - base;
+    };
+
+    auto& tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tls_dir.Size) {
+        require_range(m.name, tls_dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64), m.size, "the TLS directory");
+        auto* tls = at<IMAGE_TLS_DIRECTORY64>(m.base, tls_dir.VirtualAddress);
+
+        uint64_t start = 0, template_size = 0;
+        if (tls->StartAddressOfRawData || tls->EndAddressOfRawData) {
+            start = rva_of(tls->StartAddressOfRawData, "the TLS template");
+            uint64_t end = rva_of(tls->EndAddressOfRawData, "the end of the TLS template");
+            if (end < start) throw std::runtime_error(m.name + ": the TLS template ends before it starts");
+            template_size = end - start;
+            require_range(m.name, start, template_size, m.size, "the TLS template");
+        }
+        m.tls_block_size = template_size + tls->SizeOfZeroFill;
+        if (m.tls_block_size > (1u << 20)) throw std::runtime_error(m.name + ": the TLS block is larger than 1 MiB");
+        if (m.tls_block_size) {
+            m.tls_block = VirtualAlloc(nullptr, static_cast<SIZE_T>(m.tls_block_size), MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_READWRITE);
+            if (!m.tls_block) throw std::runtime_error(m.name + ": cannot allocate the TLS block");
+            if (template_size) std::memcpy(m.tls_block, m.base + start, static_cast<size_t>(template_size));
+        }
+
+        if (tls->AddressOfIndex) {
+            uint64_t index_rva = rva_of(tls->AddressOfIndex, "the TLS index");
+            require_range(m.name, index_rva, sizeof(uint32_t), m.size, "the TLS index");
+            DWORD slot = TlsAlloc();
+            if (slot == TLS_OUT_OF_INDEXES) throw std::runtime_error(m.name + ": no TLS slot is free");
+            m.tls_slot = slot;
+            m.has_tls_slot = true;
+            if (m.tls_block) TlsSetValue(slot, m.tls_block);
+            // The index lives in a writable section, but protect_sections already ran, so lift it for the write.
+            auto* index = m.base + index_rva;
+            auto* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(index) & ~uintptr_t(0xFFF));
+            DWORD old = 0, ignored = 0;
+            if (!VirtualProtect(page, 0x1000, PAGE_READWRITE, &old))
+                throw std::runtime_error(m.name + ": the TLS index can't be written");
+            *reinterpret_cast<uint32_t*>(index) = slot;
+            VirtualProtect(page, 0x1000, old, &ignored);
+        }
+
+        if (tls->AddressOfCallBacks) {
+            uint64_t table_rva = rva_of(tls->AddressOfCallBacks, "the TLS callback table");
+            for (uint64_t i = 0;; ++i) {
+                uint64_t entry_rva = table_rva + i * sizeof(uint64_t);
+                require_range(m.name, entry_rva, sizeof(uint64_t), m.size, "a TLS callback table entry");
+                uint64_t fn = *at<uint64_t>(m.base, static_cast<uint32_t>(entry_rva));
+                if (!fn) break;
+                auto callback = reinterpret_cast<void(NTAPI*)(void*, DWORD, void*)>(m.base + rva_of(fn, "a TLS callback"));
+                callback(m.base, DLL_PROCESS_ATTACH, nullptr);
+            }
+        }
+    }
+
+    // Only a DLL gets DllMain. An EXE's entry point has a different signature and is the caller's to run.
+    if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+        if (m.entry_rva >= m.size) throw std::runtime_error(m.name + ": the entry point is outside the image");
+        auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
+        if (!entry(m.base, DLL_PROCESS_ATTACH, nullptr)) {
+            m.initialised = true;  // it ran: a second DLL_PROCESS_ATTACH would be wrong
+            throw std::runtime_error(m.name + ": DllMain returned FALSE");
+        }
+    }
+    m.initialised = true;
 }
 
 Module& Loader::map_image(const std::filesystem::path& path) {
