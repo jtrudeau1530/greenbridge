@@ -337,6 +337,25 @@ Things that can invalidate this simple model, all **Open**:
   high dword to zero, the resource must also be low; that would constrain the arena layout. The disassembly shows
   which addresses are truncated; collect them per shader.
 
+**What the console's own D3D12 libraries show** (names only, read statically from a user's console system-file
+dump; nothing from those files is in this repository):
+
+- Two root-signature ABIs exist. The driver's validation messages name a flag
+  `D3D12XBOX_ROOT_SIGNATURE_FLAG_FORCE_MEMORY_BASED_ABI`, and require it for ray tracing (XDXR) and for pipelines
+  with an amplification shader. So the default is the register-based ABI this section describes, and a root
+  signature can opt into a memory-based one. The shader compiler has the matching switch,
+  `XBOX_FORCE_MEMORY_BASED_ABI`.
+- The ABI is decided when the shader is compiled, not by the driver at bind time. The shader compiler has the
+  intrinsics `__XB_GetShaderUserData` and `__XB_GetRootSignatureSpillPointer`. That answers the "larger than
+  32 dwords" question above: parameters that don't fit in the user SGPRs spill to memory, and the shader reads a
+  spill pointer from its user data. Because the game ships precompiled shaders, each shader's own user-SGPR reads
+  (and any loads through a spill pointer) are the authoritative map; the metadata below is how to recover it.
+- `d3d12_xs.dll` is a thin front end (about 50 KB). It loads the user-mode driver, `xgs12_10.dll`, which implements
+  the device and command lists and exports `UMD*` entry points. `xg_xs.dll` exports the texture layout functions
+  (`XGComputeTexture2DLayout`, `XGComputeOptimalSwizzleMode`, ...), the reference for untiling textures.
+- The driver keeps the standard D3D12 root-signature cost limit: 64 dwords, with descriptor tables costing 1 and
+  root views 2.
+
 **Required build metadata.** To solve the mapping without guessing, `spirv/index.json` should gain, per shader:
 
 - the set of user-SGPR dwords read before first write, and whether each is used as a 32-bit constant or a 64-bit
