@@ -264,7 +264,21 @@ cross-half code on 32-wide subgroups.
 
 The AMDGPU disassembler needs LLVM 21+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-21` package
 installs it at `/usr/lib/llvm-21/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
-`llvm-mc.exe`, so on Windows run it from WSL and give `LLVM_MC` the whole command:
+`llvm-mc.exe`. On Windows, either build a native one or run it from WSL.
+
+Native: `scripts\build_llvm_mc.ps1` fetches the LLVM sources the tool needs (sparse, shallow), builds `llvm-mc` alone
+with `LLVM_TARGETS_TO_BUILD=AMDGPU`, static CRT and the DIA SDK off (its headers need ATL, which the C++ build tools
+don't always include), checks it disassembles an `s_endpgm` for `gfx1013`, keeps only `llvm-mc.exe` (by default in
+`%LOCALAPPDATA%\Leonida\llvm-mc`) and sets `LLVM_MC` for the user. It needs git, Python and Visual Studio with the C++
+x64 tools, about 2 GB of temporary space and 20-40 minutes. `-Dest`, `-NoEnv`, `-Keep` and `-Version` change the
+defaults.
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
+python -I make_game.py --game "D:\path\to\your\package" --stages shaders
+```
+
+WSL: install `llvm-21` and give `LLVM_MC` the whole command:
 
 ```
 set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc

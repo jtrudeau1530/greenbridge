@@ -210,7 +210,8 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
         if not tool_available(llvm):
             missing.append(
                 "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
-                "target: install llvm-21 in WSL and set LLVM_MC to the whole command, e.g. "
+                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
+                "LLVM_MC to the whole command, e.g. "
                 "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)")
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
