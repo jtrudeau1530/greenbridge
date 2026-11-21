@@ -305,6 +305,37 @@ def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
     return (bad == 0), (first if bad else "4096/4096 pixels exact")
 
 
+def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
+    """Check 64x64 output with ClipDistance[0] = NDC x: left half (x < 32) clipped to clear (-1),
+    right half (x >= 32) covered (2048/4096 pixels) with the gradient."""
+    px = read_raw_rgba32f(raw_path)
+    if len(px) != 64 * 64:
+        return False, f"expected 4096 pixels, got {len(px)}"
+    covered = 0
+    bad = 0
+    first = ""
+    for i, (r, g, b, a) in enumerate(px):
+        x, y = i % 64, i // 64
+        is_clear = (r == -1.0 and g == -1.0 and b == -1.0 and a == -1.0)
+        if not is_clear:
+            covered += 1
+        if x < 32:
+            if not is_clear:
+                if not bad:
+                    first = f"unclipped pixel at ({x},{y}): got ({r:.4f},{g:.4f},{b:.4f},{a:.4f})"
+                bad += 1
+        else:
+            wx = (x + 0.5) / 64.0
+            wy = (y + 0.5) / 64.0
+            if is_clear or abs(r - wx) > 1e-3 or abs(g - wy) > 1e-3 or abs(b - want_b) > 1e-3 or abs(a - want_a) > 1e-3:
+                if not bad:
+                    first = f"at ({x},{y}): got ({r:.4f},{g:.4f},{b:.4f},{a:.4f}), want ({wx:.4f},{wy:.4f},{want_b},{want_a})"
+                bad += 1
+    ok = (bad == 0 and covered == 2048)
+    detail = f"{covered}/4096 pixels covered (expected 2048)" if ok else f"covered={covered}/2048; {first}"
+    return ok, detail
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
@@ -343,6 +374,12 @@ def run_suite(a, work: str) -> int:
             ])
         elif name == "ms_tri":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
+        elif name == "ms_clip":
+            dxbc = make_dxbc([
+                (b"PSV0", make_ms_psv0(128, 64, 64, 2)),
+                # OSG1: SV_Position (sysv=1) reg 0 xyzw, SV_ClipDistance (sysv=2) reg 1 x
+                (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (2, 3, 1, 0x1, 0xE)])),
+            ])
         else:
             dxbc = make_dxbc([])
         with open(os.path.join(work, f"{name}.dxbc"), "wb") as f:
@@ -473,6 +510,15 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_grad(raw, 0.5, 1.0)
+                results.append((name, ok, detail))
+        elif name == "ms_clip":
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            env = dict(gfx_env or os.environ, VKH_MESH="1")
+            rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
+            if rc != 0:
+                results.append((name, False, msg))
+            else:
+                ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
 
     print("\n=== GPU TEST RESULTS ===")
