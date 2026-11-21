@@ -62,6 +62,21 @@ def make_xdat(entries, pre_padding=b""):
     return pre_padding + xdat_header + bytes(payloads)
 
 
+def make_xdat_list(entries, pre_padding=b""):
+    """Like make_xdat, but entries is an ordered list so duplicate tags can be represented."""
+    count = len(entries)
+    table_len = 12 + 12 * count
+    dxil_base_offset = len(pre_padding) + table_len
+    table_entries = []
+    payloads = bytearray()
+    for tag, payload in entries:
+        off = dxil_base_offset + len(payloads)
+        table_entries.append(struct.pack("<III", tag, off, len(payload)))
+        payloads.extend(payload)
+    xdat_header = b"XDAT" + struct.pack("<II", count, 8) + b"".join(table_entries)
+    return pre_padding + xdat_header + bytes(payloads)
+
+
 def make_dxbc(chunks, digest=bytes(16), version=1):
     count = len(chunks)
     head_len = 32 + 4 * count
@@ -138,6 +153,43 @@ class TestXdatEntries(unittest.TestCase):
         dxil = make_xdat(entries)
         parsed = fssm_unpack.xdat_entries(dxil)
         self.assertEqual(parsed, entries)
+
+
+class TestDuplicateXdatPayloads(unittest.TestCase):
+    def test_duplicate_tag_keeps_order_and_selects_first_or_last(self):
+        first = make_fssm(version=0x0101, instructions=[(0x100, S_ENDPGM)])
+        last = make_fssm(version=0x0102, instructions=[(0x100, S_ENDPGM)])
+        xdat = make_xdat_list([
+            (0x12, b"\x11" * 16),
+            (0x0D, make_xbch(first)),
+            (0x0D, make_xbch(last)),
+        ])
+        entries = fssm_unpack.xdat_entries_all(xdat)
+        self.assertEqual([tag for tag, _ in entries], [0x12, 0x0D, 0x0D])
+        self.assertEqual(entries[1][1], make_xbch(first))
+        self.assertEqual(entries[2][1], make_xbch(last))
+        self.assertEqual(fssm_unpack.xdat_entries(xdat)[0x0D], make_xbch(last))
+        dxbc = make_dxbc([(b"DXIL", xdat)])
+        data, _ = fssm_unpack.unpack(dxbc)
+        self.assertEqual(data, last)
+        data, _ = fssm_unpack.unpack(dxbc, payload="first")
+        self.assertEqual(data, first)
+        with self.assertRaises(ValueError):
+            fssm_unpack.unpack(dxbc, payload="middle")
+
+    def test_cli_payload_first(self):
+        first = make_fssm(version=0x0101, instructions=[(0x100, S_ENDPGM)])
+        last = make_fssm(version=0x0102, instructions=[(0x100, S_ENDPGM)])
+        xdat = make_xdat_list([(0x0D, make_xbch(first)), (0x0D, make_xbch(last))])
+        dxbc = make_dxbc([(b"DXIL", xdat)])
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "dup.dxbc"), "wb") as f:
+                f.write(dxbc)
+            p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--payload", "first"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(os.path.join(tmp, "fssm", "dup.fssm"), "rb") as f:
+                self.assertEqual(f.read(), first)
 
 
 class TestXbchContainerCarvingAndUnpack(unittest.TestCase):

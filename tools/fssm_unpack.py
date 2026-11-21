@@ -9,14 +9,22 @@ Layout found in GTA VI's Xbox shaders (shader model 6.6 containers):
           tag 0x12  16-byte hash
           tag 0x0d  'XBCH' u32 ?, u32 stored, u32 0, u32 unpacked, u32 0, then zlib -> 'FSSM' blob
           tag 0x07  DxilProgramHeader with 'NOBC' (no LLVM bitcode is shipped)
+
+Some containers carry **two distinct tag-0x0D payloads** (195 of 26,503 measured). Both decompress to
+valid FSSM blobs with the same code offset but different code sizes; the first is 64 or 128 bytes
+longer. `xdat_entries_all` preserves their order, `xdat_entries` keeps the previous last-wins mapping
+for compatibility, and `unpack()` defaults to the last payload (the one the existing corpus used) with
+`payload="first"` available for the XDAT-order/SCARAB choice. The CLI exposes `--payload`.
       PRIV part  = Xbox private metadata
 
 The FSSM blob is the precompiled RDNA2 program plus its metadata. It contains the s_endpgm (0xBF810000) that ends
 the code.
 
 Usage:
-    python -I fssm_unpack.py <carved_shader_dir>     (writes <dir>/fssm/<name>.fssm and fssm_index.json)
+    python -I fssm_unpack.py <carved_shader_dir> [--payload first|last]
+    (writes <dir>/fssm/<name>.fssm and fssm_index.json)
 """
+import argparse
 import json
 import os
 import struct
@@ -33,22 +41,38 @@ def parts(d: bytes) -> dict:
     return out
 
 
-def xdat_entries(dxil: bytes) -> dict:
+def xdat_entries_all(dxil: bytes) -> list:
+    """All XDAT entries in directory order, as (tag, payload) pairs."""
     x = dxil.find(b"XDAT")
     if x < 0:
-        return {}
+        return []
     count, hdr = struct.unpack_from("<II", dxil, x + 4)
-    ents = {}
+    out = []
     for k in range(count):
         tag, off, size = struct.unpack_from("<III", dxil, x + 12 + 12 * k)
-        ents[tag] = dxil[off:off + size]
-    return ents
+        out.append((tag, dxil[off:off + size]))
+    return out
 
 
-def unpack(dxbc: bytes):
+def xdat_entries(dxil: bytes) -> dict:
+    """Last payload per tag, kept for callers that want the old single-value view."""
+    return {tag: payload for tag, payload in xdat_entries_all(dxil)}
+
+
+def unpack(dxbc: bytes, payload: str = "last"):
     p = parts(dxbc)
-    ents = xdat_entries(p.get(b"DXIL", b""))
-    blob = ents.get(0x0D)
+    dxil = p.get(b"DXIL", b"")
+    all_entries = xdat_entries_all(dxil)
+    ents = {tag: value for tag, value in all_entries}
+    blobs = [value for tag, value in all_entries if tag == 0x0D]
+    if not blobs:
+        return None, ents
+    if payload == "first":
+        blob = blobs[0]
+    elif payload == "last":
+        blob = blobs[-1]
+    else:
+        raise ValueError(f"payload must be 'first' or 'last', not {payload!r}")
     if not blob or blob[:4] != b"XBCH":
         return None, ents
     unpacked = struct.unpack_from("<I", blob, 16)[0]
@@ -58,8 +82,13 @@ def unpack(dxbc: bytes):
     return data, ents
 
 
-def main() -> int:
-    src = sys.argv[1]
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Unpack the FSSM program from each carved shader container.")
+    ap.add_argument("src", help="carved shader directory")
+    ap.add_argument("--payload", choices=("first", "last"), default="last",
+                    help="tag-0x0D payload when a container has more than one (default: last)")
+    a = ap.parse_args(argv)
+    src = a.src
     out = os.path.join(src, "fssm")
     os.makedirs(out, exist_ok=True)
     rows, problems = [], Counter()
@@ -69,7 +98,7 @@ def main() -> int:
         with open(os.path.join(src, name), "rb") as f:
             d = f.read()
         try:
-            fssm, ents = unpack(d)
+            fssm, ents = unpack(d, payload=a.payload)
         except Exception as e:  # noqa: BLE001
             problems[type(e).__name__] += 1
             continue
@@ -80,9 +109,10 @@ def main() -> int:
         with open(os.path.join(out, stem + ".fssm"), "wb") as f:
             f.write(fssm)
         ends = [i for i in range(0, len(fssm) - 3, 4) if fssm[i:i + 4] == b"\x00\x00\x81\xbf"]
+        payloads = sum(1 for tag, _ in xdat_entries_all(parts(d).get(b"DXIL", b"")) if tag == 0x0D)
         rows.append({"name": stem, "size": len(fssm), "magic": fssm[:4].decode("latin-1"),
                      "version": struct.unpack_from("<H", fssm, 4)[0], "endpgm": ends,
-                     "tags": sorted(hex(t) for t in ents)})
+                     "tags": sorted(hex(t) for t in ents), "xbch_payloads": payloads})
     with open(os.path.join(src, "fssm_index.json"), "w", encoding="utf-8") as f:
         json.dump(rows, f)
     print(f"{len(rows)} FSSM blobs, problems: {dict(problems)}")
