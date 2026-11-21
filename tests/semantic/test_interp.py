@@ -31,6 +31,9 @@ OpEntryPoint Fragment %main "main" %out
 %f2 = OpConstant %float 2
 %f3 = OpConstant %float 3
 %f70000 = OpConstant %float 70000
+%f2p5 = OpConstant %float 2.5
+%f3p5 = OpConstant %float 3.5
+%int = OpTypeInt 32 1
 %t = OpConstantTrue %bool
 %f = OpConstantFalse %bool
 %_ptr_Function_uint = OpTypePointer Function %uint
@@ -103,6 +106,31 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%b = OpFOrdLessThan %bool %f1 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
         self.assertEqual(run_word("%b = OpFUnordNotEqual %bool %f1 %f1\n"
                                   "%res = OpSelect %uint %b %c1 %c0\n"), 0)
+
+    def test_conversions(self):
+        # SToF reads its operand as signed; FToU and FToS round toward zero.
+        self.assertEqual(run_word("%x = OpConvertUToF %float %c8\n%res = OpBitcast %uint %x\n"), 0x41000000)
+        self.assertEqual(run_word("%x = OpConvertUToF %float %cFF\n%res = OpBitcast %uint %x\n"), 0x4F800000)
+        self.assertEqual(run_word("%x = OpConvertSToF %float %cFF\n%res = OpBitcast %uint %x\n"), 0xBF800000)
+        self.assertEqual(run_word("%x = OpConvertSToF %float %cF0\n%res = OpBitcast %uint %x\n"), 0xC1800000)
+        self.assertEqual(run_word("%x = OpFNegate %float %f2p5\n%res = OpConvertFToS %int %x\n"), 0xFFFFFFFE)
+        self.assertEqual(run_word("%res = OpConvertFToU %uint %f2p5\n"), 2)
+        self.assertEqual(run_word("%res = OpConvertFToU %uint %f70000\n"), 70000)
+
+    def test_round_even_clamp_max(self):
+        # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl RoundEven %f2p5\n%res = OpBitcast %uint %x\n"),
+                         0x40000000)
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl RoundEven %f3p5\n%res = OpBitcast %uint %x\n"),
+                         0x40800000)
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl FClamp %f3 %f1 %f2\n%res = OpBitcast %uint %x\n"),
+                         0x40000000)
+        self.assertEqual(run_word("%n = OpFNegate %float %f3\n%x = OpExtInst %float %glsl FClamp %n %f1 %f2\n"
+                                  "%res = OpBitcast %uint %x\n"), 0x3F800000)
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl FClamp %f2p5 %f1 %f3\n%res = OpBitcast %uint %x\n"),
+                         0x40200000)
+        self.assertEqual(run_word("%x = OpExtInst %float %glsl FMax %f1 %f3\n%res = OpBitcast %uint %x\n"),
+                         0x40400000)
 
     def test_64bit_arithmetic(self):
         text = HEADER.replace("%c0 = OpConstant %uint 0",
@@ -207,6 +235,9 @@ class InterpreterTests(unittest.TestCase):
                      "%res = OpBitFieldUExtract %uint %cFF %c32 %c1\n",                  # undefined per spec
                      "%res = OpShiftLeftLogical %uint %cFF %c32\n",                     # undefined per spec
                      "%res = OpShiftRightLogical %uint %cFF %c32\n",                    # undefined per spec
+                     "%x = OpBitcast %float %cFF\n%res = OpConvertFToU %uint %x\n",     # NaN: undefined per spec
+                     "%x = OpFNegate %float %f1\n%res = OpConvertFToU %uint %x\n",      # negative: out of range
+                     "%x = OpExtInst %float %glsl FClamp %f1 %f2 %f1\n%res = OpBitcast %uint %x\n",  # lo > hi
                      "%res = OpSelect %uint %c1 %c1 %c2\n",                              # condition not a bool
                      "OpBranch %entry\n%res = OpCopyObject %uint %c1\n",                 # unconditional branch
                      "OpBranchConditional %t %entry %entry\n%res = OpCopyObject %uint %c1\n"):  # backward branch

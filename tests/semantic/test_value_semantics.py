@@ -19,7 +19,9 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
 
 The appended cases for ps_ops5/ps_ops6 also pin the op_sel source-half selection for packed shifts, which the
 GPU-checked ps_ops4 does not exercise. cs_bounds (compute) pins the buffer num_records bounds checks: an
-out-of-bounds store must not modify memory and an out-of-bounds load must return 0.
+out-of-bounds store must not modify memory and an out-of-bounds load must return 0. cs_fmt_1010102 (compute) pins
+the channel order of the 10:10:10:2 typed-buffer formats: the names list the channel widths from the top bit, so
+2_10_10_10 (50) is R10G10B10A2 and 10_10_10_2 (44) has a 2-bit x (Mesa gfx10_format_table.py, ac_formats.c).
 """
 import math
 import struct
@@ -35,6 +37,10 @@ EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
 EXPECTED_BOUNDS = {0x00: 0x12345678, 0x04: 0x12345678, 0x08: 0x00000000, 0x0C: 0xEEEEEEEE}
+EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x0C: 0x3F800000,
+                        0x10: 0x3F800000, 0x14: 0x00000000, 0x18: 0x3F800000, 0x1C: 0x00000000,
+                        0x20: 0x00000000, 0x24: 0x3F800000, 0x28: 0x00000000, 0x2C: 0x3F800000,
+                        0x30: 0xC00FFC00, 0x34: 0x003FF003, 0x38: 0xE00003FF, 0x3C: 0xFFE00003}
 
 
 def _f32_bits(x):
@@ -117,6 +123,35 @@ def reference_bounds():
     return {0x00: 0x12345678, 0x04: 0x12345678, 0x08: 0, 0x0C: 0xEEEEEEEE}
 
 
+WIDTHS_1010102 = {50: (10, 10, 10, 2),     # 2_10_10_10_UNORM, R10G10B10A2
+                  44: (2, 10, 10, 10)}     # 10_10_10_2_UNORM
+
+
+def _unorm_unpack(word, widths):
+    out, bit = [], 0
+    for w in widths:
+        out.append(_f32_bits(((word >> bit) & ((1 << w) - 1)) / ((1 << w) - 1)))
+        bit += w
+    return out
+
+
+def _unorm_pack(values, widths):
+    word, bit = 0, 0
+    for v, w in zip(values, widths):
+        word |= round(min(max(v, 0.0), 1.0) * ((1 << w) - 1)) << bit
+        bit += w
+    return word
+
+
+def reference_fmt_1010102():
+    # Every field is 0 or full scale, so the decoded floats are exact.
+    src50, src44, stored = 0xC00FFC00, 0x003FF003, (1.0, 0.0, 0.5, 1.0)
+    words = (_unorm_unpack(src50, WIDTHS_1010102[50]) + _unorm_unpack(src44, WIDTHS_1010102[44])
+             + _unorm_unpack(src50, WIDTHS_1010102[50])
+             + [src50, src44, _unorm_pack(stored, WIDTHS_1010102[50]), _unorm_pack(stored, WIDTHS_1010102[44])])
+    return {4 * i: w for i, w in enumerate(words)}
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -157,6 +192,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_vcc_x2(), EXPECTED_VCC_X2)
         self.assertEqual(reference_flat(), EXPECTED_FLAT)
         self.assertEqual(reference_bounds(), EXPECTED_BOUNDS)
+        self.assertEqual(reference_fmt_1010102(), EXPECTED_FMT_1010102)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -217,6 +253,18 @@ class TranslatorValueSemantics(unittest.TestCase):
                 self.assertEqual(memory.get(address), want)
         with self.subTest(what="out-of-bounds store"):
             self.assertNotIn(0x10, memory)
+
+    def test_buffer_format_10_10_10_2_channel_order(self):
+        # The layout of out[] is in the comment at the top of cs_fmt_1010102.asm.
+        spv = support.translate_fixture("cs_fmt_1010102", fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        outputs = support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x100, 0] + [0] * 28, memory=memory)
+        self.assertEqual(outputs, {})
+        for address, want in EXPECTED_FMT_1010102.items():
+            with self.subTest(address=address):
+                self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
 
 
 if __name__ == "__main__":
