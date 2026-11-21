@@ -25,13 +25,19 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 # tests, pixel tests, the two-mip draw and three mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
-         + 7)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32 and both texture draws
+         + 8)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, both texture draws and cs_user_sgprs
 
 
 class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False):
-        def harness(_tool, shader, *args):
+        def harness(_tool, shader, *args, env=None):
             name = Path(shader).stem
+            if name == "cs_user_sgprs":
+                # The seeded words come back only if check.py passed them in VKC_SGPRS.
+                seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
+                words = check.USER_SGPRS_WORDS if seeded else [0] * 4 + [0xEEEEEEEE] * 4
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
+            self.assertNotIn("VKC_SGPRS", env or {})
             if name in PARTIAL:
                 self.assertNotIn("--require-wave64", args)
                 words = (WAVE64_DUMPS[name] + [0] * 8)[:8]
