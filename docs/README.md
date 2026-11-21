@@ -17,6 +17,7 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [models.md](models.md) | 155,598 models exported to OBJ with bounds, shader index and material keys. |
+| [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
 | [textures.md](textures.md) | 308,895 TTPF textures exported; 48,220 skips, mostly BCPack. |
 | [textures_arrays.md](textures_arrays.md) | 678 TTPF array/volume descriptors: 90 tile-mode-9 cubes have a validated 6-slice allocation layout; 588 remain unresolved. |
 | [animation.md](animation.md) | 130,470 `anim.rpf` streams, 95.4% readable; 1,126 rig sets / 6,677 source-to-rig entries / 3,669 rigs. |

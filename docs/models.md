@@ -55,6 +55,10 @@ a drawable or fragment header (`RageModelDecoder.LooksLikeResource`). `RecoverAt
 the following zlib blocks, splits the inflated bytes into the system segment and the graphics
 segment, probes the extents, and calls `RageModelDecoder.Decode`.
 
+To locate a named drawable before decoding, `tools/rpf9_names.py` indexes the measured
+`name.#dr`/`#ft`/`#dd` spellings in bounded zlib prefixes without the encrypted TOC; see
+[resource_names.md](resource_names.md).
+
 For each returned entry, `tools/rpf9dump/Program.cs` reads the segments, splits at
 `ResourceSystemBytes`, decodes the model, writes one OBJ, and writes the manifest. The manifest is
 `<outdir>/<archive>/models/manifest.json` with `src`, `Count`, and `Items[]`. Each item records the
