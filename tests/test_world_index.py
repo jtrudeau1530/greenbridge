@@ -1,0 +1,198 @@
+"""Tests for tools/world_index.py, built from synthetic 0x7a headers (no game data).
+
+    python -I tests/test_world_index.py
+"""
+import csv
+import importlib.util
+import json
+import os
+import struct
+import tempfile
+import unittest
+import zlib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_tool():
+    path = os.path.join(ROOT, "tools", "world_index.py")
+    spec = importlib.util.spec_from_file_location("world_index_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+WI = load_tool()
+PTR = 0x50000000
+
+
+def ptr(off):
+    return PTR | off
+
+
+def member(hash_, off, ty, sub=0, ref=0, extra=0):
+    return struct.pack("<IIBBHI", hash_, off, ty, sub, ref, extra)
+
+
+def struct_def(hash_, size, members, at, member_at):
+    return struct.pack("<IIIIQIHH", hash_, 0, 0, 0, ptr(member_at), size, 0, len(members))
+
+
+def make_resource(map_file=True):
+    """A minimal, valid 0x7a resource with one entity and (optionally) a map root."""
+    b = bytearray(0x700)
+    b[0x10:0x14] = b"0DRP"
+    b[0x14] = 0x7A
+    struct.pack_into("<I", b, 0x20, 1)       # root objects
+    struct.pack_into("<Q", b, 0x28, ptr(0x100))
+    struct.pack_into("<Q", b, 0x38, ptr(0x200))
+    nst = 2 if map_file else 1
+    nbl = 2 if map_file else 1
+    struct.pack_into("<HHHH", b, 0x48, nst, 0, nbl, 0)
+
+    members = [
+        member(WI.FIELD["archetypeName"], 0x44, 0x4A),
+        member(WI.FIELD["position"], 0x38, 0x32),
+        member(WI.FIELD["rotation"], 0x10, 0x34),
+        member(WI.FIELD["scaleXY"], 0x54, 0x21),
+        member(WI.FIELD["scaleZ"], 0x58, 0x21),
+        member(WI.FIELD["flags"], 0x48, 0x15),
+        member(WI.FIELD["guid"], 0x20, 0x4F),
+        member(WI.FIELD["lodLevel"], 0x7E, 0x60),
+        member(WI.FIELD["lodDist"], 0x60, 0x21),
+    ]
+    entity_members = 0x300
+    for i, m in enumerate(members):
+        b[entity_members + 16 * i:entity_members + 16 * (i + 1)] = m
+    b[0x100:0x120] = struct_def(WI.ENTITY, 0x90, members, 0x100, entity_members)
+    struct.pack_into("<IIQ", b, 0x200, WI.ENTITY, 0x90, ptr(0x400))
+
+    e = 0x400
+    struct.pack_into("<4f", b, e + 0x10, 0.0, 0.0, 0.0, 1.0)
+    struct.pack_into("<Q", b, e + 0x20, 0x1122334455667788)
+    struct.pack_into("<3f", b, e + 0x38, 1.5, 2.5, 3.5)
+    struct.pack_into("<I", b, e + 0x44, 0xDEADBEEF)
+    struct.pack_into("<I", b, e + 0x48, 5)
+    struct.pack_into("<2f", b, e + 0x54, 1.0, 1.0)
+    struct.pack_into("<f", b, e + 0x60, 250.0)
+    b[e + 0x7E] = 1  # LOD
+
+    if map_file:
+        mm = [
+            member(WI.FIELD["name"], 0x08, 0x4A),
+            member(WI.FIELD["parent"], 0x68, 0x4A),
+            member(WI.FIELD["streamingExtentsMin"], 0x70, 0x32),
+            member(WI.FIELD["streamingExtentsMax"], 0x7C, 0x32),
+            member(WI.FIELD["flags_map"], 0x88, 0x15),
+            member(WI.FIELD["contentFlags"], 0x8C, 0x15),
+        ]
+        map_members = 0x3A0
+        for i, m in enumerate(mm):
+            b[map_members + 16 * i:map_members + 16 * (i + 1)] = m
+        b[0x120:0x140] = struct_def(WI.MAPDATA, 0x120, mm, 0x120, map_members)
+        struct.pack_into("<IIQ", b, 0x210, WI.MAPDATA, 0x120, ptr(0x500))
+        root = 0x500
+        struct.pack_into("<I", b, root + 0x08, 0x11223344)
+        struct.pack_into("<I", b, root + 0x68, 0xAABBCCDD)
+        struct.pack_into("<3f", b, root + 0x70, -10.0, -20.0, -30.0)
+        struct.pack_into("<3f", b, root + 0x7C, 10.0, 20.0, 30.0)
+        struct.pack_into("<I", b, root + 0x88, 2)
+        struct.pack_into("<I", b, root + 0x8C, 65)
+    return bytes(b)
+
+
+def make_rpf_streams(parts, start=0x40):
+    """A minimal RPF9-looking file: header word + compressed parts, 16-byte aligned."""
+    out = bytearray(start)
+    out[:4] = b"9FPR"
+    struct.pack_into("<I", out, 4, start)
+    for part in parts:
+        pos = (len(out) + 15) & ~15
+        out.extend(b"\0" * (pos - len(out)))
+        out.extend(zlib.compress(part))
+    return bytes(out)
+
+
+class WorldIndexTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_map_resource_fields(self):
+        row = WI.parse_resource(make_resource())
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "map")
+        self.assertEqual(row["version"], 122)
+        self.assertEqual(row["entities"], 1)
+        self.assertEqual(row["entity_size"], 0x90)
+        self.assertEqual(row["archetypes"], 1)
+        self.assertEqual(row["map_name"], 0x11223344)
+        self.assertEqual(row["parent"], 0xAABBCCDD)
+        self.assertEqual(row["extent_min"], [-10.0, -20.0, -30.0])
+        self.assertEqual(row["extent_max"], [10.0, 20.0, 30.0])
+        self.assertEqual(row["position_min"], [1.5, 2.5, 3.5])
+        self.assertEqual(row["lod"], {"LOD": 1})
+        self.assertEqual(row["lod_dist_min"], 250.0)
+
+    def test_non_map_resource_is_meta(self):
+        row = WI.parse_resource(make_resource(map_file=False))
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "meta")
+        self.assertNotIn("entities", row)
+
+    def test_bad_version_is_rejected(self):
+        b = bytearray(make_resource())
+        b[0x14] = 0x79
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+    def test_bad_table_pointer_is_rejected(self):
+        b = bytearray(make_resource())
+        struct.pack_into("<Q", b, 0x28, 0x60000000)
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+    def test_split_resource_needs_continuation(self):
+        self.assertFalse(WI._needs_continuation(make_resource()))
+        self.assertTrue(WI._needs_continuation(make_resource()[:0x150]))
+
+    def test_rpf_scan_joins_a_split_stream(self):
+        blob = make_resource()
+        path = os.path.join(self.dir, "sample.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf_streams([blob[:0x150], blob[0x150:]]))
+        rows, stats = WI.scan_rpf(path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(stats["streams"], 2)
+        self.assertEqual(rows[0]["kind"], "map")
+        self.assertEqual(rows[0]["entities"], 1)
+
+    def test_directory_scan_and_outputs(self):
+        with open(os.path.join(self.dir, "map.bin"), "wb") as f:
+            f.write(make_resource())
+        with open(os.path.join(self.dir, "meta.bin"), "wb") as f:
+            f.write(make_resource(map_file=False))
+        rows, stats = WI.scan_path(self.dir)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(stats["files"], 2)
+        self.assertEqual(sum(1 for r in rows if r["kind"] == "map"), 1)
+        self.assertEqual(sum(r.get("entities") or 0 for r in rows), 1)
+
+        out = os.path.join(self.dir, "out.json")
+        csv_out = os.path.join(self.dir, "out.csv")
+        self.assertEqual(WI.main([self.dir, "--out", out, "--csv", csv_out]), 0)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["resources"], 2)
+        self.assertEqual(doc["summary"]["maps"], 1)
+        self.assertEqual(doc["summary"]["entities"], 1)
+        with open(csv_out, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["signature"], "0DRPz")
+        self.assertEqual(rows[0]["version"], "122")
+
+
+if __name__ == "__main__":
+    unittest.main()
