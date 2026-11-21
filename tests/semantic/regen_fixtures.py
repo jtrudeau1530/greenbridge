@@ -16,7 +16,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 ASM_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 FIXTURE_DIR = os.path.join(HERE, "fixtures", "disasm")
-SHADERS = ("ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_legacy_mul")
+SHADERS = ("ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_ops5", "ps_ops6", "ps_legacy_mul",
+           "ps_vcc_x2", "ps_flat", "cs_bounds")
 
 
 def render(name):

@@ -91,6 +91,65 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%res = OpShiftRightLogical %uint %cF0 %c4\n"), 0x0FFFFFFF)
         self.assertEqual(run_word("%res = OpBitwiseXor %uint %cF0 %cFF\n"), 0xF)
         self.assertEqual(run_word("%res = OpNot %uint %cF0\n"), 0xF)
+        self.assertEqual(run_word("%res = OpBitCount %uint %cFF\n"), 32)
+        self.assertEqual(run_word("%res = OpBitCount %uint %c0\n"), 0)
+
+    def test_float_ops(self):
+        self.assertEqual(run_word("%x = OpFMul %float %f2 %f3\n%res = OpBitcast %uint %x\n"), 0x40C00000)
+        self.assertEqual(run_word("%x = OpFSub %float %f2 %f3\n%res = OpBitcast %uint %x\n"), 0xBF800000)
+        self.assertEqual(run_word("%x = OpFAdd %float %f1 %f2\n%res = OpBitcast %uint %x\n"), 0x40400000)
+        self.assertEqual(run_word("%x = OpFNegate %float %f3\n%res = OpBitcast %uint %x\n"), 0xC0400000)
+        self.assertEqual(run_word("%b = OpFOrdEqual %bool %f2 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpFOrdLessThan %bool %f1 %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpFUnordNotEqual %bool %f1 %f1\n"
+                                  "%res = OpSelect %uint %b %c1 %c0\n"), 0)
+
+    def test_64bit_arithmetic(self):
+        text = HEADER.replace("%c0 = OpConstant %uint 0",
+                              "%ulong = OpTypeInt 64 0\n"
+                              "%c64_1 = OpConstant %ulong 1\n"
+                              "%c64_32 = OpConstant %ulong 32\n"
+                              "%c0 = OpConstant %uint 0")
+        text += ("%sh = OpShiftLeftLogical %ulong %c64_1 %c64_32\n"
+                 "%sum = OpIAdd %ulong %sh %c64_1\n"
+                 "%prod = OpIMul %ulong %sum %c64_1\n"
+                 "%res = OpUConvert %uint %prod\n" + "OpStore %out %res\n" + FOOTER)
+        self.assertEqual(si.run_fragment(text)["%out"][0], 1)
+
+    def test_64bit_pointer_load(self):
+        text = HEADER.replace("OpMemoryModel Logical GLSL450",
+                              'OpCapability PhysicalStorageBufferAddresses\n'
+                              'OpExtension "SPV_KHR_physical_storage_buffer"\n'
+                              "OpMemoryModel PhysicalStorageBuffer64 GLSL450")
+        decls = ("%ulong = OpTypeInt 64 0\n"
+                 "%rt = OpTypeRuntimeArray %uint\n"
+                 "%_ptr_PSB_rt = OpTypePointer PhysicalStorageBuffer %rt\n"
+                 "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint\n"
+                 "%addr = OpConstant %ulong 4096\n")
+        text = text.replace("%main = OpFunction", decls + "%main = OpFunction")
+        text += ("%p = OpConvertUToPtr %_ptr_PSB_rt %addr\n"
+                 "%q = OpAccessChain %_ptr_PSB_uint %p %c1\n"
+                 "%res = OpLoad %uint %q\n"
+                 "OpStore %out %res\n" + FOOTER)
+        self.assertEqual(si.run_fragment(text, memory={4100: 0x12345678})["%out"][0], 0x12345678)
+
+    def test_inputs_and_push_constants_can_be_seeded(self):
+        text = HEADER.replace('OpEntryPoint Fragment %main "main" %out',
+                              'OpEntryPoint Fragment %main "main" %out %in')
+        decls = ("%v4float = OpTypeVector %float 4\n"
+                 "%_ptr_Input_v4 = OpTypePointer Input %v4float\n"
+                 "%_ptr_Input_float = OpTypePointer Input %float\n"
+                 "%in = OpVariable %_ptr_Input_v4 Input\n")
+        text = text.replace("%main = OpFunction", decls + "%main = OpFunction")
+        text += ("%ip = OpAccessChain %_ptr_Input_float %in %c2\n"
+                 "%iv = OpLoad %float %ip\n"
+                 "%ib = OpBitcast %uint %iv\n"
+                 "%pp = OpAccessChain %_ptr_PC_uint %pc %c0\n"
+                 "%pv = OpLoad %uint %pp\n"
+                 "%res = OpIAdd %uint %ib %pv\n"
+                 "OpStore %out %res\n" + FOOTER)
+        out = si.run_fragment(text, inputs={"%in": (0.0, 0.0, 1.5, 0.0)}, push_constants=[0x100])
+        self.assertEqual(out["%out"][0], 0x3FC00100)
 
     def test_sub_borrow_and_comparisons(self):
         self.assertEqual(run_word("%s = OpISubBorrow %umul %c1 %c2\n"
@@ -124,6 +183,16 @@ class InterpreterTests(unittest.TestCase):
                 "OpBranchConditional %f %live %dead\n%dead = OpLabel\nOpKill\n%live = OpLabel\n" + FOOTER)
         self.assertEqual(si.run_fragment(live)["%out"][0], 1)
         self.assertEqual(si.run_fragment(dead), {})
+
+    def test_phi_selects_the_value_from_the_taken_predecessor(self):
+        for cond, want in (("%t", 1), ("%f", 2)):
+            text = (HEADER + f"OpSelectionMerge %merge None\nOpBranchConditional {cond} %a %b\n"
+                    "%a = OpLabel\nOpBranch %merge\n"
+                    "%b = OpLabel\nOpBranch %merge\n"
+                    "%merge = OpLabel\n%res = OpPhi %uint %c1 %a %c2 %b\n"
+                    "OpStore %out %res\n" + FOOTER)
+            with self.subTest(cond=cond):
+                self.assertEqual(si.run_fragment(text)["%out"][0], want)
 
     def test_function_array_access(self):
         self.assertEqual(run_word("%arr_v = OpVariable %_ptr_Function_arr Function %null_arr\n"

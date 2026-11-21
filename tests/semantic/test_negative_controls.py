@@ -5,6 +5,7 @@ import unittest
 
 import support
 import test_ps_semantics as sem
+import test_value_semantics as vals
 
 CONTROLS = [
     # (shader, expected words, text to replace, replacement, what the sabotage models)
@@ -18,6 +19,8 @@ CONTROLS = [
     ("ps_ops3", sem.EXPECTED_PS_OPS3, "OpNot %uint", "OpCopyObject %uint", "v_xnor_b32 missing final bitwise invert"),
     ("ps_ops4", sem.EXPECTED_PS_OPS4, "OpShiftRightLogical", "OpShiftLeftLogical", "v_pk_lshrrev_b16 shifting left"),
     ("ps_legacy_mul", sem.EXPECTED_PS_LEGACY_MUL, "OpLogicalOr %bool", "OpLogicalAnd %bool", "v_mul_legacy_f32 requiring both operands zero"),
+    ("ps_ops5", vals.EXPECTED_OPS5, "OpBitFieldSExtract", "OpBitFieldUExtract",
+     "v_ashrrev_i16 source not sign-extended"),
 ]
 
 
