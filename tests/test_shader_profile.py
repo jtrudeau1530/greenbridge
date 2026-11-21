@@ -342,7 +342,7 @@ class TestCommandLineEndToEnd(unittest.TestCase):
                                       "sgpr_mean": 4.0, "vgpr_hist": {"32": 1}})
         self.assertEqual(regs["vs"]["vgpr_max"], 4)
         self.assertEqual(regs["vs"]["sgpr_max"], 0)
-        self.assertIn("ps registers: VGPR max 2", res.stdout)
+        self.assertIn("ps registers: VGPR max 2", stdout)
         self.assertNotIn("per_shader", data)
 
         res = subprocess.run(cmd + ["--per-shader"], capture_output=True, text=True)
