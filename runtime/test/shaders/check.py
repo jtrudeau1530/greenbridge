@@ -181,21 +181,26 @@ def pixels(tools, spirv, name, fmt):
         env = dict(env or os.environ, **PIXEL_ENV[name])
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
-        code, _ = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
-                      os.path.join(spirv, name + ".spv"), raw, env=env)
+        code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
+                        os.path.join(spirv, name + ".spv"), raw, env=env)
+        if code == UNSUPPORTED:   # vk_harness: the shader needs a device feature this GPU lacks
+            return Skip(""), out
         if code or not raw.is_file():
-            return None
+            return None, out
         data = raw.read_bytes()
     if len(data) != 64 * 64 * 16:  # default harness viewport, four 32-bit components per pixel
-        return None
-    return list(struct.iter_unpack(fmt, data))
+        return None, out
+    return list(struct.iter_unpack(fmt, data)), out
 
 
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
-    px = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch") else "<4I")
+    px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch") else "<4I")
+    if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
     if not px:
         return "vk_harness failed or returned no pixels"
     n = len(px)

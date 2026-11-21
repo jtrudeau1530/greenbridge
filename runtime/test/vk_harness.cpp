@@ -11,6 +11,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,16 +39,25 @@ static std::vector<uint32_t> read_spv(const char* path) {
 }
 
 static bool parse_u32(const char*& s, uint32_t& v) {
+    const bool hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    const char* digits = hex ? s + 2 : s;
+    if (!(hex ? std::isxdigit(uint8_t(*digits)) : std::isdigit(uint8_t(*digits)))) return false;   // no sign or space
     char* end;
-    unsigned long long x = std::strtoull(s, &end, 0);
-    if (end == s || x > 0xFFFFFFFFull) return false;
+    unsigned long long x = std::strtoull(digits, &end, hex ? 16 : 10);
+    if (x > 0xFFFFFFFFull) return false;
     v = uint32_t(x); s = end;
     return true;
 }
 
+// A list separator must be followed by another item: "1,2," is rejected.
+static bool next_item(const char*& s) {
+    if (!*s) return true;
+    return *s++ == ',' && *s;
+}
+
 static bool parse_sgprs(const char* s, uint32_t* sgprs) {
     for (uint32_t i = 0; *s; i++) {
-        if (i == 32 || !parse_u32(s, sgprs[i]) || (*s && *s++ != ',')) return false;
+        if (i == 32 || !parse_u32(s, sgprs[i]) || !next_item(s)) return false;
     }
     return true;
 }
@@ -55,7 +65,7 @@ static bool parse_sgprs(const char* s, uint32_t* sgprs) {
 static bool parse_heap(const char* s, std::vector<std::pair<uint32_t, uint32_t>>& words, uint32_t heap_bytes) {
     while (*s) {
         uint32_t addr, word;
-        if (!parse_u32(s, addr) || *s++ != '=' || !parse_u32(s, word) || (*s && *s++ != ',')) return false;
+        if (!parse_u32(s, addr) || *s++ != '=' || !parse_u32(s, word) || !next_item(s)) return false;
         if (addr % 4 || addr > heap_bytes - 4) return false;
         words.emplace_back(addr, word);
     }
@@ -76,6 +86,7 @@ int main(int argc, char** argv) {
     }
     const uint32_t heap_bytes = 64 * 1024;
     const char* heap_env = std::getenv("VKH_HEAP");
+    if (heap_env && !*heap_env) heap_env = nullptr;
     std::vector<std::pair<uint32_t, uint32_t>> heap_words;
     if (heap_env && !parse_heap(heap_env, heap_words, heap_bytes)) {
         std::fprintf(stderr, "VKH_HEAP: expected addr=word pairs, 4-byte aligned below 0x%x, got \"%s\"\n",
@@ -175,7 +186,8 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     if (heap_env) {
-        if (!f12q.bufferDeviceAddress) { std::fprintf(stderr, "VKH_HEAP: no bufferDeviceAddress\n"); return 1; }
+        // 77 is the "this device cannot run the test" code that check.py and run_gpu_tests.py report as SKIP.
+        if (!f12q.bufferDeviceAddress) { std::fprintf(stderr, "unsupported: VKH_HEAP needs bufferDeviceAddress\n"); return 77; }
         f12.bufferDeviceAddress = VK_TRUE;
         f12.pNext = chain;
         chain = &f12;
@@ -192,7 +204,7 @@ int main(int argc, char** argv) {
     feats.shaderClipDistance = f2q.features.shaderClipDistance;
     feats.shaderCullDistance = f2q.features.shaderCullDistance;
     if (heap_env) {
-        if (!f2q.features.shaderInt64) { std::fprintf(stderr, "VKH_HEAP: no shaderInt64\n"); return 1; }
+        if (!f2q.features.shaderInt64) { std::fprintf(stderr, "unsupported: VKH_HEAP needs shaderInt64\n"); return 77; }
         feats.shaderInt64 = VK_TRUE;   // heap addresses are 64-bit
     }
     dci.pEnabledFeatures = &feats;

@@ -438,7 +438,7 @@ def run_suite(a, work: str) -> int:
     results: list[tuple[str, bool, str]] = []
     for fname in asm_files:
         name = os.path.splitext(fname)[0]
-        spv =os.path.join(spirv_dir, f"{name}.spv")
+        spv = os.path.join(spirv_dir, f"{name}.spv")
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))
             continue
@@ -528,6 +528,10 @@ def run_suite(a, work: str) -> int:
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
+            if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
+                m = re.search(r"unsupported: .*", msg)
+                results.append((name, None, f"SKIP ({m.group(0) if m else 'unsupported device'})"))
+                continue
             if rc != 0:
                 results.append((name, False, msg))
                 continue

@@ -132,13 +132,14 @@ class Wave64Checks(unittest.TestCase):
 class SeededPixelTests(unittest.TestCase):
     """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""
 
-    def run_pixel_test(self, words):
+    def run_pixel_test(self, words, code=0, out=""):
         seen = {}
 
         def harness(_tool, _vs, _fs, raw, env=None):
             seen["env"] = env
-            Path(raw).write_bytes(struct.pack("<4I", *words) * (64 * 64))
-            return 0, ""
+            if not code:
+                Path(raw).write_bytes(struct.pack("<4I", *words) * (64 * 64))
+            return code, out
 
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "ps_vcc_x2.spv").touch()
@@ -155,6 +156,15 @@ class SeededPixelTests(unittest.TestCase):
     def test_unseeded_result_fails(self):
         problem, _ = self.run_pixel_test((0, 0, 0, 0))
         self.assertIn("4096 of 4096 pixels differ", problem)
+
+    def test_device_without_buffer_addresses_skips(self):
+        problem, _ = self.run_pixel_test((), code=77, out="unsupported: VKH_HEAP needs bufferDeviceAddress\n")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("needs bufferDeviceAddress", problem)
+
+    def test_harness_failure_fails(self):
+        problem, _ = self.run_pixel_test((), code=1, out="FAILED vkCreateDevice\n")
+        self.assertEqual(problem, "vk_harness failed or returned no pixels")
 
 
 if __name__ == "__main__":
