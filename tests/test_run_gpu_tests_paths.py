@@ -108,5 +108,27 @@ class BuildConfigurations(unittest.TestCase):
             self.assertIsNone(run_gpu_tests.find_test_programs(tmp, ".exe"))
 
 
+    def test_main_passes_visual_studio_config_directory_to_suite(self):
+        ext = ".exe" if os.name == "nt" else ""
+        for config_name in run_gpu_tests.BUILD_CONFIGS:
+            with self.subTest(config=config_name), tempfile.TemporaryDirectory() as tmp:
+                build = Path(tmp) / "build"
+                config = build / config_name
+                config.mkdir(parents=True)
+                for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                    (config / (tool + ext)).touch()
+                seen = {}
+
+                def suite(a, work):
+                    seen["build"] = a.build
+                    return 0
+
+                with (patch.object(sys, "argv", [
+                          "run_gpu_tests.py", "--build", str(build), "--work", str(Path(tmp) / "work")]),
+                      patch.object(run_gpu_tests, "run_suite", side_effect=suite)):
+                    self.assertEqual(run_gpu_tests.main(), 0)
+                self.assertEqual(Path(seen["build"]).resolve(), config.resolve())
+
+
 if __name__ == "__main__":
     unittest.main()
