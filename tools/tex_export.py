@@ -1,5 +1,9 @@
 """Export textures found by tex_headers.py as standard DDS files (top mip, slice 0), detiled from AMD SW_4K_S.
 
+The compact TTPF mip-tail rule lives in tex_headers.py and is used by tools/ttpf_mips.py.
+This carve exporter cannot apply it: the carved descriptor has no tile-mode field or native
+allocation span, so the first/last heuristic below stays the only verified placement here.
+
 For each texture:
   - element size from the DXGI format (BC: 8/16 bytes per 4x4 block; uncompressed: bytes per pixel)
   - the top mip is either at the data offset or at the end of the mip chain (GFX10 stores mips smallest first);
