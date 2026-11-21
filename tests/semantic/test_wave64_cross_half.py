@@ -16,7 +16,9 @@ by spirv_mini_interp.run_workgroup as one 64-thread workgroup, in two layouts:
     - a v_readlane_b32 from the other half shuffles from lane >= 32 of a 32-wide subgroup, which SPIR-V leaves
       undefined. Strictly that is UndefinedResult. Under the wrap model (lane Id mod 32, the symptom in issue
       #94, an observation and not the specification) the expected words below are what a 32-wide GPU without
-      --wave64-emulate would show; they are a prediction to measure, not a requirement.
+      --wave64-emulate shows. Measured: NVIDIA GeForce RTX 4070 SUPER (subgroup 32), driver 610.88, Vulkan SDK
+      1.4.363.0, `vk_compute_test <name>.spv 1 dump` on the non-emulated build of run_gpu_tests.py: all 24
+      words equal WRAP32_EXPECTED. That is one driver's behaviour, not a requirement.
 
 Limits: --wave64-emulate output uses Workgroup memory and a round loop, which the interpreter rejects, so the
 emulated path is covered only by the GPU tests. The subgroup layout (invocation i in subgroup i // 32) is the

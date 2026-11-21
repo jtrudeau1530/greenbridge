@@ -27,8 +27,8 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   `spirv_mini_interp.run_workgroup`. On one 64-wide subgroup the 24 words must equal the GPU check's values
   (`runtime/test/shaders/check.py`). On two 32-wide subgroups (NVIDIA without emulation) `ds_bpermute` stays
   exact, `v_writelane` writes stay exact, and a `v_readlane` from the other half is a shuffle from lane >= 32,
-  undefined in SPIR-V (`UndefinedResult`); a "lane mod 32" model of issue #94 gives the words a 32-wide GPU is
-  predicted to show. Two SPIR-V sabotages (readlane lane & 31, bpermute without its half base) must change the
+  undefined in SPIR-V (`UndefinedResult`); a "lane mod 32" model of issue #94 gives the words a 32-wide GPU
+  shows (all 24 matched on an RTX 4070 SUPER, driver 610.88, without `--wave64-emulate`). Two SPIR-V sabotages (readlane lane & 31, bpermute without its half base) must change the
   64-wide result.
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
