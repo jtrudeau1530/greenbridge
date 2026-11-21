@@ -16,6 +16,8 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
+sys.path.insert(0, SHADER_DIR)
+from compute_fixture import compute_header
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -54,13 +56,6 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2) -> byt
     r[27] = topology  # 2 = triangles
     struct.pack_into("<III", r, 36, threads_x, 1, 1)
     return struct.pack("<I", len(r)) + bytes(r)
-
-
-def make_cs_fssm(rsrc2: int = 0x8088, lx: int = 64, ly: int = 1, lz: int = 1) -> bytes:
-    """Build minimal FSSM header (0x148 bytes) with COMPUTE_PGM_RSRC2 and group size."""
-    buf = bytearray(0x148)
-    struct.pack_into("<4I", buf, 0x138, rsrc2, lx, ly, lz)
-    return bytes(buf)
 
 
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
@@ -354,7 +349,7 @@ def run_suite(a, work: str) -> int:
             f.write(dxbc)
         if name.startswith("cs_"):
             with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
-                f.write(make_cs_fssm())
+                f.write(compute_header(name))
         assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), os.path.join(disasm_dir, f"{name}.s"), name)
 
     # 2. Translate all .s -> .spv
@@ -396,7 +391,10 @@ def run_suite(a, work: str) -> int:
         cs_env = dict(os.environ, VKC_SUBGROUP_SIZE=str(sg)) if sg else None
         gfx_env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
 
-        if name == "cs_lds":
+        if name == "cs_workgroup_yz":
+            rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
+            results.append((name, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches" in msg.splitlines(), msg))
+        elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name == "cs_exec64":

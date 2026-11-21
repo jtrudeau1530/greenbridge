@@ -6,15 +6,13 @@ Each .asm is RDNA2 assembly. It is assembled with llvm-mc (LLVM 21+ with the AMD
 path, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are staged in a temporary
 directory. After validation, the build writes <out>/spirv/<name>.spv and the translator metadata.
 
-Compute shaders get the header the tests were written for: RSRC2 0x8088 (4 user SGPRs holding the V#, the
-workgroup id in s4, 512 bytes of LDS) and a 64x1x1 group. The stage comes from the name's prefix. Mesh and
+Compute shaders get the header specified in compute_fixture.py. The stage comes from the name's prefix. Mesh and
 geometry shaders (ms_, gs_) also need a DXBC container with their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
 """
 import json
 import os
 import re
-import struct
 import subprocess
 import sys
 import tempfile
@@ -23,7 +21,8 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRANSLATOR = os.path.join(HERE, "..", "..", "..", "tools", "rdna2spirv.py")
 LLVM_MC = os.environ.get("LLVM_MC", "llvm-mc")
-RSRC2, GROUP = 0x8088, (64, 1, 1)
+sys.path.insert(0, HERE)  # this script is also run with python -I
+from compute_fixture import compute_header
 
 
 def asm_mattr(path):
@@ -57,9 +56,7 @@ def translate_tests(work, names):
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
         (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
         if n.startswith("cs_"):
-            header = bytearray(0x148)
-            struct.pack_into("<4I", header, 0x138, RSRC2, *GROUP)
-            (fssm / (n + ".fssm")).write_bytes(header)
+            (fssm / (n + ".fssm")).write_bytes(compute_header(n))
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     return subprocess.run([sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]).returncode

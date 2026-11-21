@@ -21,7 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
-COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh")]
+COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
+           ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
@@ -64,7 +65,10 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         return failure(code, out, 2)
     if require_wave64 and "compute subgroup size: 64" not in out.splitlines():
         return "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
-    if expected_words is not None:
+    if mode == "workgroup_yz":
+        if "2x3x4 workgroup Y/Z: 0 mismatches" in out.splitlines():
+            return ""
+    elif expected_words is not None:
         m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
         if m and [int(x) for x in m.group(1).split()][:len(expected_words)] == expected_words:
             return ""
