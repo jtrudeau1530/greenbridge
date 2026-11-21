@@ -85,8 +85,10 @@ imports are unknown until it is available.
 
 ## Tests
 
+For a Visual Studio build, pass CTest the same configuration you built above.
+
 ```powershell
-ctest --test-dir runtime/build --output-on-failure
+ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure
 ```
 
 On Windows the build configures the CPU tests that do not need a GPU or game files, including the
