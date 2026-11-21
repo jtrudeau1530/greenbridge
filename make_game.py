@@ -301,20 +301,29 @@ def shaders(game: str, work: str, jobs: int) -> None:
         log("shaders: moving disasm into the carve folder and translating again")
         os.rename(old, disasm)
         shutil.rmtree(spirv, ignore_errors=True)
+        mark_done(disassembled)
+    if not os.path.isfile(disassembled) and os.path.isfile(translated):
+        # A work folder from before disasm.done existed: its translation finished, so its disassembly had too.
+        # Without this, every earlier build would disassemble and translate the whole corpus again.
+        mark_done(disassembled)
     if not os.path.isfile(disassembled):
         need(os.environ.get("LLVM_MC", "llvm-mc"),
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's path or whole command.")
         log("shaders: disassembling (gfx1013)")
         drop(translated)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
-        with open(disassembled, "w", encoding="utf-8") as f:
-            f.write("shader_disasm.py finished\n")
+        mark_done(disassembled)
     if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
         translate(disasm, spirv, jobs)
     log("shaders: done")
+
+
+def mark_done(path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("shader_disasm.py finished\n")
 
 
 def drop(*paths: str) -> None:

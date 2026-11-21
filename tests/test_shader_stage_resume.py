@@ -145,6 +145,22 @@ class ShaderStageResumeTest(unittest.TestCase):
         os.remove(os.path.join(self.dxbc, "fssm_index.json"))
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
 
+    def test_folder_finished_before_the_markers_keeps_its_work(self):
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        self.touch(self.dxbc, "disasm", "s0.s")
+        self.touch(self.spirv, "index.json")                # translated by a build from before disasm.done
+        self.assertEqual(self.run_stage(), [])
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+
+    def test_disasm_moved_from_the_old_place_is_kept_and_translated_again(self):
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        self.touch(self.work, "shaders", "disasm", "s0.s")  # disasm next to the carve folder, the old layout
+        self.touch(self.spirv, "index.json")
+        self.assertEqual(self.run_stage(), ["translate"])
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "s0.s")))
+
 
 if __name__ == "__main__":
     unittest.main()
