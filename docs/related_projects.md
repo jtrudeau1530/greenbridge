@@ -38,6 +38,38 @@ deviations, the descriptor-heap start-handle return convention, the root-signatu
 compute-pipeline path. Those are observations to verify, not code to port. The document paraphrases them; no code or
 long passages are copied.
 
+## breadbbbb/rpf9-explorer
+
+<https://github.com/breadbbbb/rpf9-explorer>
+
+A Windows viewer for RPF archives, and the source of the Core library behind `tools/rpf9dump` (models, textures,
+TTPF pools and AWC audio). It is a `third_party` **submodule**, not code copied into this repository.
+
+**Licence:** the repository has **no licence file** (GitHub reports no licence), so all rights are reserved by
+default. A submodule is an external dependency; it is not a grant to copy its code. Do not paste its functions,
+tables or comments into Leonida. If a format fact learned from it is useful, verify it against the package and
+write our own implementation. The model-recovery gap measured in [models.md](models.md) is in that submodule; the
+fix should go upstream, not into a copy.
+
+## p-portela/SCARAB
+
+<https://github.com/p-portela/SCARAB>
+
+A GPL-3.0 "Scarlett Compatibility And Runtime API Bridge" that forwards the console D3D12 runtime to PC D3D12 (and
+to vkd3d-proton on Linux). It carries a measured catalogue of the console `d3d12_xs.dll` export surface, standard
+and console-only IIDs, extension interfaces, command-list interception and presentation entry points.
+
+**Licence:** GPL-3.0. That is compatible with this project's GPL-3.0-or-later for study, and adapted code can be
+used with attribution and the original licence notice, unlike the two projects above. Even so, **facts first**:
+verify a claim against SCARAB's code and, where possible, this package; write the implementation in our style; and
+say in the pull request which file a borrowed fact came from. Do not copy a whole component just because the
+licence allows it.
+
+**What we use it for:** the measured console runtime surface (see `docs/d3d12_xs_surface.md` when that study
+lands), the IID/extension tables, and the call-sequence observations that Leonida's own
+[d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) still lists as unknown. SCARAB forwards to
+D3D12; Leonida translates to Vulkan. The ABI facts carry over, the forwarding architecture does not.
+
 ## The line
 
 | Fine | Not fine |
