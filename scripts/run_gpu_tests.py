@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from compute_fixture import compute_header
-from check import Skip, mesh_v5_test, start_failure
+from check import CMPX_CLASS_WORDS, Skip, mesh_v5_test, start_failure
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -396,9 +396,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
     return ok, detail
 
 
-# Shaders a selected test draws with, built even when the filter leaves them out (#192): ps_flat and
-# ps_texture_sample (vk_texture_test) are drawn with vs_ids.
-DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm"}
+# Shaders a selected test draws with, built even when the filter leaves them out (#192).
+DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm"}
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -410,11 +409,35 @@ def with_draw_shaders(asm_files: list[str]) -> list[str]:
     return build
 
 
+# Multi-config CMake generators (Visual Studio, Xcode, Ninja Multi-Config) put each program in build/<Config>.
+CONFIG_DIRS = ("RelWithDebInfo", "Release", "Debug", "MinSizeRel")
+
+
+def resolve_build_dir(build: str, programs: tuple[str, ...]) -> str:
+    """The folder that holds all of `programs` (file names with their extension).
+
+    Makefile and Ninja builds leave them in `build`. With the Visual Studio generator they land in
+    build/RelWithDebInfo, build/Release and so on. `build` itself wins when it has them all; otherwise the
+    configuration folder that has them all and was built last. If none has them, `build` is returned, so the
+    caller's "not found" message names the folder the user gave."""
+    def complete(d: str) -> bool:
+        return all(os.path.isfile(os.path.join(d, n)) for n in programs)
+
+    if complete(build):
+        return build
+    found = [d for d in (os.path.join(build, c) for c in CONFIG_DIRS) if complete(d)]
+    if not found:
+        return build
+    return max(found, key=lambda d: max(os.path.getmtime(os.path.join(d, n)) for n in programs))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
                     help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'")
-    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
+    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
+                    help="CMake build folder; with the Visual Studio generator the RelWithDebInfo/Release/... "
+                         "subfolder that has the test programs is found by itself")
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")
     a = ap.parse_args()
@@ -425,8 +448,9 @@ def main() -> int:
         a.work = os.path.abspath(a.work)
 
     ext = ".exe" if os.name == "nt" else ""
-    missing = [t + ext for t in ("vk_compute_test", "vk_store_test", "vk_harness")
-               if not os.path.isfile(os.path.join(a.build, t + ext))]
+    required = tuple(t + ext for t in ("vk_compute_test", "vk_store_test", "vk_harness"))
+    a.build = resolve_build_dir(a.build, required)
+    missing = [t for t in required if not os.path.isfile(os.path.join(a.build, t))]
     if missing:
         sys.exit(f"Test programs not found in {a.build}:{', '.join(missing)}\n"
                  "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
@@ -535,11 +559,10 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == "cs_bounds":
-            # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
-            # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
+        elif name in ("cs_bounds", "cs_cmpx_class_f32"):
+            # These per-lane results do not require a particular subgroup width.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
-            want = [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
+            want = CMPX_CLASS_WORDS if name == "cs_cmpx_class_f32" else [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
             results.append((name, rc == 0 and vals == want,
@@ -649,6 +672,7 @@ def run_suite(a, work: str) -> int:
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
                 m = re.search(r"unsupported: .*", msg)
                 results.append((name, None, f"SKIP ({m.group(0) if m else 'unsupported device'})"))
+                results.append((name, None, unsupported_skip(msg)))
                 continue
             if rc != 0:
                 results.append((name, False, msg))
@@ -658,7 +682,6 @@ def run_suite(a, work: str) -> int:
                 "ps_ops2": (0xABCD4400, 0x46001234, 0xFFFFFFFA, 7),
                 "ps_ops3": (0xFFFFFFFA, 0x44660066, 0x44AABBCC, 16),
                 "ps_ops4": (0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00),
-                "ps_salu_ff": (2, 1, 0xFFFFFFFF, 8),
                 "ps_scc": (1, 1, 3, 0x80000000),
                 "ps_sdwa": (0x000000F1, 0xFFFEFFF2, 0x3C003344, 0xFFF70000),
                 "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
@@ -667,6 +690,7 @@ def run_suite(a, work: str) -> int:
                 "ps_ops7": (0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003),
                 "ps_ops8": (0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F),
                 "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
+                "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])

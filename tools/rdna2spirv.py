@@ -1200,8 +1200,8 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
-    def cmp_class(self, a):
-        """v_cmp_class_f32 dst, x, mask: true if x's class bit is set in mask.
+    def cmp_class(self, a, exec_only=False):
+        """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
         Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
         x, mask = self.src_f(a[-2]), self.src_u(a[-1])
         u = self.tou(x)
@@ -1241,6 +1241,10 @@ class Gen:
             hit = b(f"OpLogicalAnd %bool {on} {c}")
             acc = b(f"OpLogicalOr %bool {acc} {hit}")
         acc = b(f"OpLogicalAnd %bool {acc} {self.active_b()}")   # inactive lanes write 0
+        if exec_only:
+            self.emit(f"OpStore %active {acc}")
+            self.uses_active = True
+            return
         r = b(f"OpSelect %uint {acc} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         d = a[0]
         if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
@@ -2035,8 +2039,8 @@ class Gen:
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
-        elif op == "v_cmp_class_f32":
-            self.cmp_class(a)
+        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32"):
+            self.cmp_class(a, exec_only=op == "v_cmpx_class_f32")
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
             x = self.src_u(a[1])
@@ -2201,9 +2205,6 @@ class Gen:
                     half = self.mask_half(a[1])
                     if half is not None:
                         lo, hi = (hi if half == "hi" else lo), self.cu(0)
-            elif a[1]["k"] == "imm" and op.endswith("b32"):
-                # A 32-bit constant is a value, as for s_bcnt*_b32: mask_src would turn it into this lane's bit.
-                lo, hi = self.src_u(a[1]), self.cu(0)
             elif a[1]["k"] != "sgpr" or a[1].get("n") != 2:
                 lo, hi = self.mask_src(a[1]), self.cu(0)
             else:
@@ -2680,10 +2681,12 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %uint %glsl {'SMin' if 'min' in op else 'SMax'} {x} {y}")
             self.dst(a[0], r)
-            # SCC = (src0 selected) per ISA; select-src0 iff src0 <= src1 (min) / >= (max)
+            # SCC = 1 when S0 is the one chosen: the ISA's D = S0 < S1 ? S0 : S1 (min) / S0 > S1 ? S0 : S1 (max)
+            # picks S1 on a tie, so SCC = S0 < S1 / S0 > S1, compared signed (as s_min_u32/s_max_u32 do unsigned).
+            # Until 2026-11-21 equal operands set SCC to 1.
             c, z = self.tmp(), self.tmp()
             xi, yi = self.as_int(x), self.as_int(y)
-            self.emit(f"{c} = {'OpSLessThanEqual' if 'min' in op else 'OpSGreaterThanEqual'} %bool {xi} {yi}")
+            self.emit(f"{c} = {'OpSLessThan' if 'min' in op else 'OpSGreaterThan'} %bool {xi} {yi}")
             self.emit(f"{z} = OpSelect %uint {c} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
         elif op == "v_fma_f16":
@@ -3434,15 +3437,36 @@ class Gen:
             self.emit(f"{r} = OpConvertUToF %float {m}")
             self.dst(a[0], self.tou(r))
         elif op in ("v_cvt_u32_f32", "v_cvt_i32_f32"):
-            x = self.src_f(a[1])
-            r = self.tmp()
+            # Compare binary32 words before converting: the raw SPIR-V conversion
+            # must only see a representable operand, even when its result is discarded.
+            bits = self.src_u(a[1])
+            zero = self.cu(0)
+            past_inf = self.cu(0x7F800001)
+            in_range, saturated, safe, converted, result = (self.tmp() for _ in range(5))
             if op == "v_cvt_u32_f32":
-                self.emit(f"{r} = OpConvertFToU %uint {x}")
+                positive = self.tmp()
+                self.emit(f"{in_range} = OpULessThan %bool {bits} {self.cu(0x4F800000)}")  # +2^32
+                # Positive overflow through +inf saturates. Negative values and NaNs give zero.
+                self.emit(f"{positive} = OpULessThan %bool {bits} {past_inf}")
+                self.emit(f"{saturated} = OpSelect %uint {positive} {self.cu(0xFFFFFFFF)} {zero}")
             else:
-                i = self.tmp()
-                self.emit(f"{i} = OpConvertFToS %int {x}")
-                self.emit(f"{r} = OpBitcast %uint {i}")
-            self.dst(a[0], r)
+                magnitude, negative, not_nan, bound = (self.tmp() for _ in range(4))
+                self.emit(f"{magnitude} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{in_range} = OpULessThan %bool {magnitude} {self.cu(0x4F000000)}")  # 2^31
+                self.emit(f"{negative} = OpINotEqual %bool {bits} {magnitude}")
+                self.emit(f"{not_nan} = OpULessThan %bool {magnitude} {past_inf}")
+                self.emit(f"{bound} = OpSelect %uint {negative} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{saturated} = OpSelect %uint {not_nan} {bound} {zero}")
+            self.emit(f"{safe} = OpSelect %uint {in_range} {bits} {zero}")
+            x = self.tof(safe)
+            if op == "v_cvt_u32_f32":
+                self.emit(f"{converted} = OpConvertFToU %uint {x}")
+            else:
+                signed = self.tmp()
+                self.emit(f"{signed} = OpConvertFToS %int {x}")
+                self.emit(f"{converted} = OpBitcast %uint {signed}")
+            self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
+            self.dst(a[0], result)
         elif op in U2 or op in S2:
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
@@ -5563,9 +5587,65 @@ def assemble(gen):
                 "%live = OpLabel\n         OpReturn\n         OpFunctionEnd\n")
     else:
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
-    return no_contraction(dedupe_types(
+    return split_big_switch(no_contraction(dedupe_types(
         "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
-        "\n" + "\n".join(gen.body) + "\n" + tail))
+        "\n" + "\n".join(gen.body) + "\n" + tail)))
+
+
+# SPIR-V caps an instruction at 65,535 words. The dispatch loop's OpSwitch has one (literal, label) pair per block,
+# and with --wave64-emulate the two ScreenProbes compute shaders reach ~37k blocks (74k words). Past the limit the
+# switch becomes two levels: an outer one on pc / SWITCH_CHUNK picks a chunk; each chunk is its own selection
+# construct (inner OpSwitch on pc, merge %swm<k>), and that chunk's blocks branch to %swm<k>, which goes on to
+# %sw_merge. Every block keeps its label and code, so only the routing changes.
+SWITCH_CHUNK = 16000      # spirv-val also caps a switch at 16,383 (literal, label) pairs
+_BIG_SWITCH = re.compile(r"^(\s*)OpSwitch %pcv %sw_default ((?:\d+ %\w+ ?)+)$", re.M)
+
+
+def split_big_switch(text):
+    m = _BIG_SWITCH.search(text)
+    if not m:
+        return text
+    pairs = m.group(2).split()
+    cases = [(int(pairs[i]), pairs[i + 1]) for i in range(0, len(pairs), 2)]
+    if len(cases) <= 16383 and 3 + 2 * len(cases) <= 65535:
+        return text
+    ind = m.group(1)
+    chunk_of = {lbl: v // SWITCH_CHUNK for v, lbl in cases}
+    chunks = sorted(set(chunk_of.values()))
+    outer = f"{ind}OpSwitch %pcc %sw_default " + " ".join(f"{k} %swc{k}" for k in chunks)
+    heads = []
+    for k in chunks:
+        inner = " ".join(f"{v} {lbl}" for v, lbl in cases if chunk_of[lbl] == k)
+        heads += [f"%swc{k} = OpLabel", f"{ind}OpSelectionMerge %swm{k} None", f"{ind}OpSwitch %pcv %swm{k} {inner}"]
+    # OpSelectionMerge must stay right before its switch, so the chunk index is computed above it
+    pre = text[:m.start()]
+    sel = pre.rfind("OpSelectionMerge %sw_merge None")
+    sel = pre.rfind("\n", 0, sel) + 1
+    pre = pre[:sel] + f"{ind}%pcc = OpUDiv %uint %pcv %c_swchunk\n" + pre[sel:]
+    lines = pre.split("\n") + [outer] + heads + text[m.end():].split("\n")[1:]
+    # route each block's exits to its chunk's merge: a block runs from its label to the next case label
+    out, cur = [], None
+    for line in lines:
+        st = line.strip()
+        if st.endswith("= OpLabel"):
+            lbl = st.split(" = ")[0]
+            if lbl in chunk_of:
+                cur = chunk_of[lbl]
+            elif lbl in ("%sw_default", "%sw_merge") or lbl.startswith("%swc"):
+                cur = None
+        if lbl_is_sw_default(st):
+            out += [f"%swm{k} = OpLabel\n{ind}OpBranch %sw_merge" for k in chunks]   # after every chunk's blocks
+        if cur is not None and st == "OpBranch %sw_merge":
+            line = line.replace("OpBranch %sw_merge", f"OpBranch %swm{cur}")
+        out.append(line)
+    text = "\n".join(out)
+    # the chunk-size constant, next to the other uint constants
+    first = re.search(r"^\s*%\w+ = OpConstant %uint \d+$", text, re.M)
+    return text[:first.start()] + f"%c_swchunk = OpConstant %uint {SWITCH_CHUNK}\n" + text[first.start():]
+
+
+def lbl_is_sw_default(st):
+    return st == "%sw_default = OpLabel"
 
 
 _FLOAT_ARITH = re.compile(r"^\s*(%\w+) = Op(?:FMul|FAdd|FSub|FDiv|FNegate|FRem|FMod) ", re.M)

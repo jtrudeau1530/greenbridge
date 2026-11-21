@@ -46,6 +46,8 @@ WATCHED = ("WAVE_MMA", "SHADING_RATE", "VIEW_ID", "ROVS", "STENCIL_REF", "INNER_
 ALL_STAGES = ("vs", "ps", "gs", "hs", "ds", "cs", "ms", "as", "lib")
 
 MMA = re.compile(r"^\s*(v_mfma\w*|v_wmma\w*|v_smfmac\w*)\b")
+# Ordered count, GWS and the GS-register adds are the GDS-side instructions NGG stream output relies on. ds_append /
+# ds_consume are included as the other counter-style DS ops (LDS unless they carry `gds`, which GDS below catches).
 ORDERED = re.compile(r"^\s*(ds_ordered_count|ds_gws_\w+|ds_append|ds_consume|ds_add_gs_reg\w*|ds_sub_gs_reg\w*)\b")
 GDS = re.compile(r"^\s*ds_\w+\b[^;]*\bgds\b")
 

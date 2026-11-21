@@ -19,9 +19,10 @@ removing instructions that do not matter), 2 on a harness error. Skips are count
 
 By default the opcodes in LANE_MASK_OPS are left out: the translator models those 64-bit values (and
 s_wqm_b32) as per-lane wave masks, so a 64-bit integer reference disagrees with them by design (--ops
-names them explicitly). Known divergences: s_min/max_i32 SCC on a tie until SHADER-40 (#332) lands, and
-s_bfe_i32 with offset + width > 32, where the reference follows the ISA pseudocode literally and the
-translator sign-extends from bit 31; which one hardware does is an open question in #156.
+names them explicitly). s_bfe_* control words stay inside offset + width <= 32 unless --bfe-any: past
+that the reference follows the ISA pseudocode literally and the translator sign-extends s_bfe_i32 from
+bit 31, and which one hardware does is an open question in #156. Known divergence on main: s_ff0/ff1_i32_b32
+with a constant source, until SHADER-46 (#349) lands.
 """
 import argparse
 import gc
@@ -48,6 +49,7 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 REGS = tuple(range(4, 20))
 PAIRS = tuple(range(4, 20, 2))
 OUT_SCC = 30   # s_cselect_b32 s30, 1, 0 observes SCC at the end
+BFE_ANY = False    # any s_bfe_* control word (--bfe-any), not only offset + width <= 32
 INLINE64 = False   # inline constants in 64-bit positions (--inline64); the translator reads those as lane masks
 
 LANE_MASK_OPS = ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_not_b64", "s_wqm_b64",
@@ -242,7 +244,7 @@ def emit(rng, name):
     form = OPS[name][0]
     d, p = rng.choice(REGS), rng.choice(PAIRS)
     if form == "sop2":
-        b = _bfe_ctl(rng) if name.startswith("s_bfe") and rng.random() < 0.7 else _src32(rng)
+        b = _src32(rng) if name.startswith("s_bfe") and BFE_ANY and rng.random() < 0.3 else             _bfe_ctl(rng) if name.startswith("s_bfe") else _src32(rng)
         return f"{name} s{d}, {_src32(rng)}, {b}"
     if form == "sop2_64":
         return f"{name} {_pair(p)}, {_src64(rng)}, {_src64(rng)}"
@@ -477,11 +479,15 @@ def main(argv=None):
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--all-failures", action="store_true", help="print every failing program, not just the first")
+    ap.add_argument("--bfe-any", action="store_true",
+                    help="also give s_bfe_* control words past offset + width = 32 (an open hardware question)")
     ap.add_argument("--inline64", action="store_true",
                     help="also use inline constants as 64-bit sources (the translator reads them as lane masks)")
     a = ap.parse_args(argv)
-    global INLINE64
-    INLINE64 = a.inline64
+    if a.programs < 1 or a.max_ops < 1:
+        ap.error("--programs and --max-ops must be at least 1")
+    global INLINE64, BFE_ANY
+    INLINE64, BFE_ANY = a.inline64, a.bfe_any
     if a.list_ops:
         for name in sorted(OPS):
             print(f"{name:20} {OPS[name][0]}")

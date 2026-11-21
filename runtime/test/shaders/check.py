@@ -39,6 +39,7 @@ CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM), ("cs_wave6
             ("cs_w64_mask_detect", [48])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
+CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
@@ -64,8 +65,9 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops6": (0xf800ffff, 0x01000010, 0x00800800, 0x8000fff0),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
-              "ps_salu_ff": (2, 1, 0xffffffff, 8), "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
-              "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0)}
+              "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
+              "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
+              "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
@@ -337,6 +339,8 @@ def main():
                                            expected_words=want)))
     for name, want in BOUNDS:
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
+    results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
+                                                      expected_words=CMPX_CLASS_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))

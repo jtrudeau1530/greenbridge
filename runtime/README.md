@@ -111,6 +111,8 @@ the files in place and never copy or commit game data.
 
 ## Current limits
 
+`gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its
+own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
@@ -120,3 +122,17 @@ in [docs/design.md](../docs/design.md), and the differential-validation design i
 work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
+
+### Typed UINT clear regression
+
+`clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
+`d3d12_uint_clear_test` compares 21 full/rectangle readbacks with Windows WARP across the three
+currently supported typed UINT render-target formats. Fixtures are synthetic; no shaders or game data are needed.
+The GPU test runs explicitly, while the CPU test is registered in CTest.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^clear_color$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_uint_clear_test.exe
+```

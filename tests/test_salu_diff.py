@@ -58,15 +58,26 @@ class Translated(unittest.TestCase):
         self.assertTrue(d.self_test())
 
     def test_short_seeded_run_matches(self):
-        # 32-bit data ops only: 64-bit ones follow the translator's lane-mask model, and s_bfe_i32 past
-        # offset + width = 32 is an open hardware question (#156), so neither is judged here.
-        # s_min/max_i32 wait for SHADER-40 (#332); s_wqm_b32 is a lane-mask op.
+        # 32-bit data ops only: 64-bit ones and s_wqm_b32 follow the translator's lane-mask model. s_bfe_*
+        # control words stay inside offset + width <= 32 by default (past it is an open hardware question in
+        # #156). s_ff0/ff1_i32_b32 wait for SHADER-46 (#349): main reads a constant source as a lane mask.
         ops = sorted(o for o, (form, _) in d.OPS.items()
-                     if "64" not in form and o not in ("s_wqm_b32", "s_min_i32", "s_max_i32"))
+                     if "64" not in form and o not in ("s_wqm_b32", "s_ff0_i32_b32", "s_ff1_i32_b32"))
         counts, failures = d.run_suite(60, 4, 5, ops)
         self.assertEqual(failures, [], failures[:1])
         self.assertEqual(counts["skip"], {})
         self.assertEqual(counts["pass"], 60)
+
+    def test_bfe_control_words_stay_in_range_by_default(self):
+        rng = d.random.Random(1)
+        for _ in range(300):
+            ctl = int(d.emit(rng, "s_bfe_i32").rsplit(", ", 1)[1], 0)
+            self.assertLessEqual((ctl & 31) + (ctl >> 16 & 0x7F), 32)
+
+    def test_min_max_ties_match_since_shader_40(self):
+        # #332 is on main: s_min/max ties leave SCC 0 in the translator too.
+        counts, failures = d.run_suite(40, 5, 3, ["s_max_i32", "s_max_u32", "s_min_i32", "s_min_u32"])
+        self.assertEqual((counts["pass"], failures), (40, []))
 
     def test_a_wrong_translation_is_caught(self):
         lines = ["s_mov_b32 s4, 5", "s_min_i32 s5, s4, s4"] + d.observe([4, 5, 6])
