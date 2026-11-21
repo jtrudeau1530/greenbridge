@@ -15,7 +15,7 @@ import check
 WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS if n not in ("cs_store", "cs_wave64_ballot")}
 
 
-TOTAL = 19 + len(WAVE64_DUMPS)   # every test check.py runs (19 = the compute, store and pixel tests)
+TOTAL = len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + 2 + len(check.PIXEL_TESTS)   # every test check.py runs: compute, cs_wavemask, dumps, the two store tests, pixel
 
 
 class Wave64Checks(unittest.TestCase):
