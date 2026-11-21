@@ -1,6 +1,7 @@
 """Exercise the synthetic Vulkan test runner without a Vulkan device."""
 import contextlib
 import io
+import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -19,9 +20,9 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 
 
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, and ms_w64x_ballot (skipped here: build.py does not build mesh shaders)
+# tests, pixel tests, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + 1)
+         + len(check.PIXEL_TESTS) + 2)
 
 
 class Wave64Checks(unittest.TestCase):
@@ -87,7 +88,7 @@ class Wave64Checks(unittest.TestCase):
         self.assertRegex(out, r"cs_wavemask +SKIP")
         self.assertRegex(out, r"cs_wave64_ballot +SKIP")
         self.assertRegex(out, r"cs_exec64 +ok")
-        self.assertIn(f"{TOTAL - 3 - len(WAVE64_DUMPS)} of {TOTAL} pass, {3 + len(WAVE64_DUMPS)} skipped", out)
+        self.assertIn(f"{TOTAL - 4 - len(WAVE64_DUMPS)} of {TOTAL} pass, {4 + len(WAVE64_DUMPS)} skipped", out)
 
     def test_full_wave_checks_pass_with_expected_results(self):
         status, out = self.run_checks(
@@ -96,7 +97,7 @@ class Wave64Checks(unittest.TestCase):
         )
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_wave64_ballot +ok")
-        self.assertIn(f"{TOTAL - 1} of {TOTAL} pass, 1 skipped", out)
+        self.assertIn(f"{TOTAL - 2} of {TOTAL} pass, 2 skipped", out)
 
     def test_emulated_wave64_runs_without_a_64_wide_subgroup(self):
         # LEONIDA_W64_EMULATE=1: the shaders were translated with --wave64-emulate, so no wave64 test asks the
@@ -105,7 +106,7 @@ class Wave64Checks(unittest.TestCase):
         status, out = self.run_checks(unsupported, unsupported, emulated=True)
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_w64x_wg128_branches +ok")
-        self.assertIn(f"{TOTAL - 1} of {TOTAL} pass, 1 skipped", out)
+        self.assertIn(f"{TOTAL - 2} of {TOTAL} pass, 2 skipped", out)
 
     def test_ballot_mismatches_and_harness_errors_fail(self):
         wavemask = 0, "compute subgroup size: 64\n0 mismatches\n"
@@ -119,13 +120,22 @@ class Wave64Checks(unittest.TestCase):
                 status, out = self.run_checks(wavemask, ballot)
                 self.assertEqual(status, 1, out)
                 self.assertRegex(out, rf"cs_wave64_ballot +{detail}")
-                self.assertIn(f"{TOTAL - 2} of {TOTAL} pass, 1 skipped", out)
+                self.assertIn(f"{TOTAL - 3} of {TOTAL} pass, 2 skipped", out)
 
     def test_missing_wave64_fixture_fails_even_on_wave32(self):
         unsupported = 77, "full 64-wide compute subgroups unavailable\n"
         status, out = self.run_checks(unsupported, unsupported, missing_ballot=True)
         self.assertEqual(status, 1, out)
         self.assertIn("missing cs_wave64_ballot.spv", out)
+
+
+class MeshWorkgroupChecks(unittest.TestCase):
+    def test_every_group_has_its_own_pixel(self):
+        pixels = [struct.pack("<4f", value, value, value, 1) for value in range(24)]
+        self.assertEqual(check.check_mesh_v5(b"".join(pixels)), "")
+        pixels[6], pixels[2] = pixels[2], pixels[6]
+        self.assertIn("2/24 mismatches; first (0,1,0)", check.check_mesh_v5(b"".join(pixels)))
+        self.assertIn("384 bytes", check.check_mesh_v5(b"".join(pixels[:-1])))
 
 
 if __name__ == "__main__":

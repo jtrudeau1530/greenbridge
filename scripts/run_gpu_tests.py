@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
@@ -22,6 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from compute_fixture import compute_header
+from check import Skip, mesh_v5_test
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -52,9 +54,10 @@ def make_sig_chunk(elements: list[tuple[int, int, int, int, int]]) -> bytes:
     return bytes(out)
 
 
-def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2) -> bytes:
+def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_shared: int = 0) -> bytes:
     """Build PSV0 payload for a mesh shader (stage 13)."""
     r = bytearray(48)
+    struct.pack_into("<I", r, 0, group_shared)
     struct.pack_into("<HH", r, 12, maxv, maxp)
     r[24] = 13  # mesh stage
     r[27] = topology  # 2 = triangles
@@ -392,6 +395,8 @@ def run_suite(a, work: str) -> int:
             ])
         elif name in ("ms_tri", "ms_w64x_ballot"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
+        elif name == "ms_v5_workgroup":
+            dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
         elif name == "ms_clip":
             dxbc = make_dxbc([
                 (b"PSV0", make_ms_psv0(128, 64, 64, 2)),
@@ -406,6 +411,8 @@ def run_suite(a, work: str) -> int:
             with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
                 f.write(compute_header(os.path.join(SHADER_DIR, fname)))
         assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), os.path.join(disasm_dir, f"{name}.s"), name)
+        # A failed translation must not run an old binary left in a reused --work directory.
+        Path(spirv_dir, f"{name}.spv").unlink(missing_ok=True)
 
     # 2. Translate all .s -> .spv
     cmd = [sys.executable, "-I", TRANSLATOR, disasm_dir, "--out", spirv_dir]
@@ -566,6 +573,14 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_grad(raw, 0.0, 0.0)
                 results.append((name, ok, detail))
+        elif name == "ms_v5_workgroup":
+            rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
+            if rc:
+                results.append((name, False, msg))
+                continue
+            problem = mesh_v5_test(a.build, spirv_dir, Path(raw_dir) / f"{name}.raw")
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))
         elif name in ("ms_tri", "ms_w64x_ballot"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_MESH="1")
