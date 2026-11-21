@@ -63,7 +63,7 @@ def nested():
 
 def rbf0():
     data = b"RBF0" + struct.pack("<H", 0xFFFB) + struct.pack("<I", 1) + struct.pack("<H", 21)
-    data += b"rage__crRigSetManager\x00"
+    data += b"test_schema\x00"
     return data + bytes(64 - len(data))
 
 
@@ -123,10 +123,10 @@ class ClassifyTest(unittest.TestCase):
 
     def test_psin_header_offset(self):
         data = bytearray(psin())
-        data[4:8] = (0x40).to_bytes(4, "big")
+        data[4:8] = (0x80).to_bytes(4, "big")
         chain = story_index.psin_sections(bytes(data))
-        self.assertEqual([t for t, _, _ in chain], ["LSCH", "LENM", "LSNS", "LGID", "LRSC", "CHKS"])
-        self.assertEqual(chain[0][1], 0x40)
+        self.assertEqual([t for t, _, _ in chain], ["LENM", "LSNS", "LGID", "LRSC", "CHKS"])
+        self.assertEqual(chain[0][1], 0x80)
 
     def test_page_header(self):
         r = story_index.classify(page(), 0x200, 40)

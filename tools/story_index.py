@@ -44,26 +44,14 @@ def _be32(data, at):
 
 
 def psin_sections(data):
-    """Return the longest valid PSIN section chain as [(tag, offset, length), ...].
+    """Return a valid PSIN section chain as [(tag, offset, length), ...].
 
-    The header's big-endian first-section offset at +4 is tried first, then every LSCH occurrence.
-    A record is tag + big-endian u32 length, and the length counts the record header. The chain
-    ends at CHKS or when the next record is not a known tag. Only measured tags are accepted.
+    The header's big-endian first-section offset at +4 is authoritative when it points at a known
+    tag. Otherwise every LSCH occurrence is tried and the longest chain wins. A record is tag +
+    big-endian u32 length, and the length counts the record header. The chain ends at CHKS or when
+    the next record is not a known tag. Only measured tags are accepted.
     """
-    starts = []
-    first = _be32(data, 4)
-    if 8 <= first < len(data) and data[first:first + 4] in PSIN_TAGS:
-        starts.append(first)
-    start = 0
-    while True:
-        at = data.find(b"LSCH", start)
-        if at < 0:
-            break
-        if at not in starts:
-            starts.append(at)
-        start = at + 1
-    best = []
-    for at in starts:
+    def parse(at):
         chain = []
         pos = at
         while pos + 8 <= len(data):
@@ -77,8 +65,23 @@ def psin_sections(data):
             if tag == b"CHKS":
                 break
             pos += size
+        return chain
+
+    first = _be32(data, 4)
+    if 8 <= first < len(data) and data[first:first + 4] in PSIN_TAGS:
+        chain = parse(first)
+        if chain:
+            return chain
+    best = []
+    start = 0
+    while True:
+        at = data.find(b"LSCH", start)
+        if at < 0:
+            break
+        chain = parse(at)
         if len(chain) > len(best):
             best = chain
+        start = at + 1
     return best
 
 

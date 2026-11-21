@@ -23,8 +23,8 @@ first 1 GiB of the data area, and the full-file non-inflating signature scan is 
 Readable is the carver's `stored / span`; Bink 2 streams count as readable. The first `story000`
 row scans file offsets `0xA120`-`0x4000A11F`.
 
-A full 20 GB walk was attempted. At 72% (about 14.4 billion bytes, 106,000 streams) a false zlib
-header expanded to 8.5 GB in memory, so the run was stopped and is not reported as a full index.
+A full 20 GB walk was attempted. At 72% (about 14.4 billion bytes, 106,000 streams) one zlib
+candidate expanded to 8.5 GB in memory, so the run was stopped and is not reported as a full index.
 The bounded windows below and the non-inflating signature scan cover the rest without that risk.
 
 ## `story000.rpf` layout
@@ -35,7 +35,7 @@ samples below, separates four regions:
 | Region | zlib carver result | Full-file signature result |
 |---|---|---|
 | GiB 0-4 | 93-100% readable in 1 GiB and 256 MiB samples; `0DRP` pages, `zero-prefix` pages, type-hash and clip headers | no RSC8 |
-| GiB 5-13 | 0 streams in every sampled window: 5, 6, 8, 10 and 12 GiB | 225,281 `RSC8` headers, all version 8001, declared-size sum 2,677,370,916 |
+| GiB 5-13 | 0 streams in every sampled window: 5, 6, 8, 10 and 12 GiB | 225,281 `RSC8` headers, all version 8001, u32@8 sum 2,677,370,916 |
 | GiB 14 | 2,547 streams / 268,670,234 stored / 472,245,792 inflated in a 256 MiB window; 780 `42 40 00 00` pages | no RSC8 |
 | GiB 15-18 | Bink 2 only in the sampled windows; 42 streams at 16 GiB, 2 at 18 GiB | 264 valid Bink 2 streams, 3,327,650,728 bytes |
 
@@ -57,10 +57,9 @@ Window samples (each starts at the stated file offset and scans 256 MiB unless n
 | 18 GiB | 2 | 208,322,272 | 208,322,272 | 77.6% | Bink 2 |
 
 `RSC8` headers by 1 GiB bucket: 6 GiB 33,846; 7 GiB 41,391; 8 GiB 33,334; 9 GiB 29,687;
-10 GiB 25,685; 11 GiB 25,983; 12 GiB 28,619; 13 GiB 6,736. The declared size field sums to
-2.49 GiB; the raw region itself is about 7 GiB, so the field is not the total stored size of each
-resource. Every one of the 225,281 headers has version 8001 (`0x1F41`); no `RSC7` header exists
-anywhere in the file.
+10 GiB 25,685; 11 GiB 25,983; 12 GiB 28,619; 13 GiB 6,736. The u32 at +8 sums to 2.49 GiB; the raw
+region itself is about 7 GiB, so that field is not the total stored size of each resource. Every one
+of the 225,281 headers has version 8001 (`0x1F41`); no `RSC7` header was found anywhere in the file.
 
 Bink 2 by 1 GiB bucket: 15 GiB 78; 16 GiB 169; 17 GiB 10; 18 GiB 7. The 264 streams carry valid
 `KB2[a-z]` headers and dimensions from 540x960 to 2560x1440. They account for 3.10 GiB of the
@@ -88,14 +87,14 @@ were the 21,980 page directories.
 
 | Class | Streams | Stored | Inflated | Measured field |
 |---|---:|---:|---:|---|
-| `42 40 00 00` resource page | 1,255 | 304,089,245 | 656,802,672 | 0x4042 marker; payload begins with sizes and float records |
+| `42 40 00 00` resource page | 1,255 | 304,089,245 | 656,802,672 | 0x4042 marker; four u32s then float records |
 | zero-prefix page | 1,782 | 104,870,151 | 188,050,712 | first 8 bytes zero |
 | `0DRP` page directory at +16 | 787 | 6,251,535 | 19,538,880 | version 122; page counts 1 = 578, 2 = 192, 4 = 4, 6 = 3 |
 | `PSIN` | 73 | 164,290 | 556,280 | 70 full six-section chains; 3 without a chain |
 | `63 30 00 00` record page | 45 | 4,470,231 | 14,894,128 | float records, not decoded |
 | XML text | 16 | 11,500 | 57,317 | UTF-8 BOM + `<?xml` |
 | other text | 10 | 131,472 | 6,985,204 | printable NUL-terminated strings |
-| raw `RSC8` header | 1,957 | - | - | version 8001; declared-size sum 32,904,308 |
+| raw `RSC8` header | 1,957 | - | - | version 8001; u32@8 sum 32,904,308 |
 
 The 362 MB unread region is not empty: a 360 MB gap holds five page-aligned nested `RPF9`
 headers and the 1,957 `RSC8` headers; the archive has 49 nested headers in total. The `RSC8`
@@ -134,7 +133,7 @@ The chain is contiguous. In one 22,952-byte stream it runs from +0x2EE0 to +0x59
 | `CHKS` | 0x14 | end |
 
 Chain completeness: 2,118 streams have all six sections; 38 have `LSCH` and `LENM`; 4 have
-`LSCH` only; 149 have no parseable chain. The other 323 streams are small pages and raw starts.
+`LSCH` only; 149 have no parseable chain. The other 323 streams are pages and raw starts.
 No `SCRP` or `YSC` container appears, so the script archive's metadata is `PSIN`, not a named
 script container.
 
@@ -154,12 +153,12 @@ the story archive.
 
 | Archive | Streams | Inflated | Content | Overlap with main |
 |---|---:|---:|---|---:|
-| `story000_bvh4.rpf` | 4 | 16,677 | 4 XML change-set documents (2 ids); no binary BVH payload | 0 of 4 SHA-256 |
-| `shared_minigame000_bvh4.rpf` | 2,560 | 970,044,012 | 2,555 binary zero-prefix pages + 5 XML documents (3 ids) | 0 of 2,560 SHA-256 |
+| `story000_bvh4.rpf` | 4 | 16,677 | 4 XML streams (2 ids); no binary BVH payload | 0 of 4 SHA-256 |
+| `shared_minigame000_bvh4.rpf` | 2,560 | 970,044,012 | 2,555 binary zero-prefix pages + 5 XML streams (3 ids) | 0 of 2,560 SHA-256 |
 
-The XML definitions identify themselves as environment-BVH change sets and carry 61 file-like
-entries in `story000_bvh4` and 9 in `shared_minigame000_bvh4`. One filename string is common to
-both, but the inflated stream sets have **no common SHA-256**. The binary pages start with zeroes, `0x50xxxxxx` pointers and identity matrices,
+The XML streams identify themselves as environment-BVH change sets and carry 61 file-like entries
+in `story000_bvh4` and 9 in `shared_minigame000_bvh4`. One filename string is common to both, but
+the inflated stream sets have **no common SHA-256**. The binary pages start with zeroes, `0x50xxxxxx` pointers and identity matrices,
 consistent with BVH node pages.
 These are independent BVH archives, not empty indexes and not shared page sets. `story000_bvh4` is
 metadata-only; `shared_minigame000_bvh4` has the payload.
@@ -176,10 +175,10 @@ remaining 19 GB.
 | zlib `78 01/5e/9c/da` | +0 | inflates cleanly to stream end | 93.4% of the first `story000` GiB; 54.7% of minigame |
 | `PSIN` | +0 | section chain with big-endian lengths | 2,309 in script; 73 in minigame; 3 in restofworld |
 | `0DRP` | +16 | version 122 at +0x14; page count u64 at +0x20 | 21,980 first `story000` GiB; 787 minigame; 101 restofworld |
-| `RSC8` | +0 | version 8001 at +4; declared size u32 +8; flags u32 +12; name at +0x30 | 225,281 in `story000`; 1,957 minigame; 9 restofworld |
+| `RSC8` | +0 | version 8001 at +4; u32 at +8; flags u32 at +12; name at +0x30 | 225,281 in `story000`; 1,957 minigame; 9 restofworld |
 | `RSC7` | +0 | - | 0 in every full-file scan |
 | `KB2[a-z]` | +0 | size u32 +4; width +0x14; height +0x18 | 264 in `story000`; 7 in restofworld |
-| `42 40 00 00` | +0 | 0x4042 marker; size fields and float records | 1,255 minigame; 780 in the 14 GiB `story000` window |
+| `42 40 00 00` | +0 | 0x4042 marker; u32s and float records | 1,255 minigame; 780 in the 14 GiB `story000` window |
 | `RBF0` | +0 | schema string | 0 at stream starts; 2 raw occurrences in 20 GB (not container starts) |
 | `SCRP`, `YSC` | +0 | - | 0 validated |
 | `AWC\0`, `FSSM` | +0 | - | 0 validated |
@@ -207,8 +206,8 @@ The bytes support a **new RAGE resource family in an RPF9 container**:
   `story000` headers are page-aligned).
 - `0DRP` is a page header, not a GTA V `RSC7` header: magic at +16, version 122, page count at
   +0x20, and payload pages after it.
-- `RSC8` is the resource header in the raw story region: version 8001, declared size, flags and a
-  name string. There is no `RSC7` anywhere in 20 GB.
+- `RSC8` is the resource header in the raw story region: version 8001, a u32 at +8, flags and a
+  name string. No `RSC7` header was found in 20 GB.
 - `PSIN` is a sectioned metadata container, not a script opcode stream. Repository notes already
   describe it as PSO metadata; this pass confirms the section names and the big-endian length
   chain, not the section semantics.
