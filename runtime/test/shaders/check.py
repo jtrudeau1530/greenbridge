@@ -8,8 +8,8 @@ with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
-to check a translator that emulates wave64 on them. ms_w64x_ballot is a mesh shader that build.py does not build:
-scripts/run_gpu_tests.py makes it (and fs_passthru.spv); here it runs when both .spv files are in <out dir>/spirv.
+to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
+fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
 """
 import collections
 import json
@@ -79,6 +79,37 @@ def failure(code, output, lines):
 
 class Skip(str):
     """A result that is neither a pass nor a failure: the device can't run the test."""
+
+
+def check_mesh_v5(data):
+    if len(data) != 24 * 16:
+        return f"expected 24 RGBA32F pixels (384 bytes), got {len(data)} bytes"
+    pixels = iter(struct.iter_unpack("<4f", data))
+    errors = []
+    for z in range(4):
+        for y in range(3):
+            for x in range(2):
+                pixel = next(pixels)
+                expected = x + 2*y + 6*z
+                want = (expected, expected, expected, 1)
+                if pixel != want:
+                    errors.append(f"({x},{y},{z}): got {pixel}, expected {want}")
+    return f"{len(errors)}/24 mismatches; first {errors[0]}" if errors else ""
+
+
+def mesh_v5_test(tools, spirv, raw):
+    shader = Path(spirv) / "ms_v5_workgroup.spv"
+    if not shader.is_file():
+        return Skip("SKIP (build the mesh fixture with scripts/run_gpu_tests.py)")
+    fs = Path(spirv) / "fs_passthru.spv"
+    if not fs.is_file():
+        return "missing fs_passthru.spv"
+    code, out = run(os.path.join(tools, "vk_harness" + EXE), shader, fs, raw, "--mesh-group-readback", "2", "3", "4")
+    if code == UNSUPPORTED:
+        return Skip("SKIP (mesh shading unavailable)")
+    if code or not raw.is_file():
+        return failure(code, out, 3)
+    return check_mesh_v5(raw.read_bytes())
 
 
 def partial_wave_test(tools, spirv, name, expected_words):
@@ -239,6 +270,8 @@ def main():
     for name, want in W64X_PARTIAL:
         results.append((name, partial_wave_test(tools, spirv, name, want)))
     results.append(("ms_w64x_ballot", mesh_w64x_test(tools, spirv, "ms_w64x_ballot")))
+    with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
+        results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
