@@ -6,6 +6,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_xs_device.h"
 
 #include <algorithm>
 #include <atomic>
@@ -325,6 +326,18 @@ public:
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties"));
         if (!get_device || !state_.format_properties || !memory_properties) return;
         memory_properties(info.physical, &state_.memory);
+
+        if (state_.info.max_push_constants_size == 0 && info.physical && info.get_instance_proc) {
+            const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
+            if (get_props) {
+                VkPhysicalDeviceProperties props{};
+                get_props(info.physical, &props);
+                state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
+                state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
+            }
+        }
+
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts);
     }
@@ -340,6 +353,7 @@ public:
     }
 
     bool ok() const { return state_.context && state_.context->loaded(); }
+    const VulkanDeviceInfo& info() const { return state_.info; }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
@@ -625,6 +639,22 @@ VkImage vulkan_image(ID3D12Resource* resource) {
     return r ? r->image() : VK_NULL_HANDLE;
 }
 
+std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    if (auto* d = Device::from<Device>(real)) return d->info().max_push_constants_size;
+    return 0;
+}
+
+bool device_push_constants_need_fallback(ID3D12Device* device) {
+    if (!device) return false;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    if (auto* d = Device::from<Device>(real)) return d->info().push_constants_need_fallback;
+    return false;
+}
+
 // Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!out) return E_POINTER;
@@ -735,7 +765,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
     reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"))(
         owned.device, info.queue_family, 0, &info.queue);
-    std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s\n", chosen.deviceName);
+    info.max_push_constants_size = chosen.limits.maxPushConstantsSize;
+    info.push_constants_need_fallback = (info.max_push_constants_size < 144);
+    std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,
+                 chosen.limits.maxPushConstantsSize);
+    if (info.push_constants_need_fallback) {
+        std::fprintf(stderr,
+                     "[rt] d3d12: WARNING: GPU maxPushConstantsSize (%u bytes) is below the 144 bytes required by "
+                     "the shader contract; uniform-buffer fallback required for the 16-byte tail\n",
+                     chosen.limits.maxPushConstantsSize);
+    }
 
     auto* device = new Device(info);
     device->own(owned);  // destroyed with the device from here on, even on failure

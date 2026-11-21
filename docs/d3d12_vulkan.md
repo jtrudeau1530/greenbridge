@@ -828,9 +828,7 @@ contract, not a runtime bug:
   adds a descriptor binding and a load per `s_getpc`, but avoids growing push constants. Decide after measuring
   how many real PSOs have two code-base stages.
 
-**Open:** the exact count of such PSOs, and the minimum `maxPushConstantsSize` across target GPUs. If a GPU only
-supports 128 bytes, the current 144-byte contract already fails; the layer needs a fallback (uniform buffer for the
-tail) regardless.
+**Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). On Intel Arc (Alchemist, Battlemage), Vulkan exposes the 128-byte specification minimum (`maxPushConstantsSize == 128`), which cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
 
 ### 5.3 Descriptor T#/S# parsing
 
@@ -1011,7 +1009,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 | 10 | Does the game use binning, DCC, VRS, wave MMA, stream output, tessellation, or amplification shaders? | Scan the PSO/stream subobjects and the shader corpus. Ignore binning for correctness; implement VRS/mesh if present; map WMMA only if `v_mfma` appears. |
 | 11 | What should `CheckFeatureSupport` answer for UMA, resource binding tier, mesh tier, RT tier? | Log every feature query and the game's subsequent behaviour; answer truthfully from Vulkan first. |
 | 12 | Does the game rely on async compute or copy queues for correctness? | Trace queue creation and cross-queue fences. If only performance, serialize on one queue for boot. |
-| 13 | Is 144 bytes of push constants available on all target GPUs? | Check `maxPushConstantsSize` at device creation; if below 144, implement the uniform-buffer fallback and adjust the translator contract. |
+| 13 | Is 144 bytes of push constants available on all target GPUs? | **Resolved / Measured** (D3D-14). Checked at device creation in `runtime/shims/d3d12_vulkan_device.cpp`. Measured across the test fleet (#166): NVIDIA (256 B), AMD (256 B), and Apple M1/MoltenVK (4096 B) satisfy 144 B natively; Intel Arc exposes only the core minimum 128 B (`maxPushConstantsSize == 128`). Below 144 B, the device logs a warning and marks `push_constants_need_fallback`, routing the 16-byte tail (dwords 32..35: heap base and code base) to a uniform-buffer fallback. |
 | 14 | Are there PSOs with two code-base stages? | Count from the PSO/shader hash table and the index metadata. If yes, implement per-stage code-base slots (section 5.2). |
 | 15 | Is `ExecuteIndirect` used with signatures Vulkan cannot express directly? | Trace `CreateCommandSignature` and `ExecuteIndirect`; implement simple signatures first, expand the complex ones with compute. |
 | 16 | Does the game use append/consume UAV counters or typed buffer formats the translator does not model? | Trace UAV descs and shader `buffer_*` ops; extend the translator/runtime together. |
