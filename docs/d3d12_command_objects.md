@@ -1,0 +1,532 @@
+# D3D12 command objects: the measured queue, list, fence and `PresentX` surface
+
+Status: gap analysis, sourced. This page records what can be measured about the Xbox Series
+`ID3D12CommandQueue`, `ID3D12GraphicsCommandList` (and 4/6/8), `ID3D12Fence`,
+`ID3D12CommandAllocator` and `PresentX` from the shipped package and from the Windows SDK, and
+separates that from prior-art claims. It does not propose a vtable and does not copy code.
+
+Confidence legend, consistent with [d3d12_vulkan.md](d3d12_vulkan.md) and
+[d3d12_xs_surface.md](d3d12_xs_surface.md):
+
+- **Measured** — produced in this tree by a read-only inspection (PE import/export scan, GUID
+  byte scan, static disassembly) or by a test in this repository.
+- **SDK** — checked against the installed Windows SDK 10.0.26100.0 headers.
+- **Prior art** — a claim by another project, not independently reproduced here.
+- **Derived** — follows from a documented rule plus stated anchors; the derivation is shown.
+- **Open** — no evidence.
+
+Scope limit: no game data, keys or decryption was used; no vendor binary was executed. The
+package DLLs are read-only inputs. The game executable that would answer most of the remaining
+questions is not in the package (section 1).
+
+## 1. What the package contains, and what it does not
+
+### 1.1 Inventory
+
+The package root contains **16 DLLs** and no D3D12 runtime DLL:
+
+| Group | Modules |
+|---|---|
+| Middleware | `amd_fidelityfx_loader_xbox.dll`, `amd_fidelityfx_upscaler_xbox.dll`, `Bink2Scarlett.dll`, `libHttpClient.GDK.dll`, `XboxBvhBuilder.dll`, `XCurl.dll` |
+| CRT | `concrt140.dll`, `msvcp140.dll`, `msvcp140_1.dll`, `msvcp140_2.dll`, `msvcp140_atomic_wait.dll`, `msvcp140_codecvt_ids.dll`, `vccorlib140.dll`, `vcomp140.dll`, `vcruntime140.dll`, `vcruntime140_1.dll` |
+
+The following files are **absent** from the package root and from every subdirectory:
+
+- `d3d12_xs.dll` — the console D3D12 runtime that owns the queue/list/fence/allocator vtables
+  and the `PresentX` method;
+- `xgameruntime.dll` — the GDK runtime;
+- `game_scarlett_master.exe` — the executable that imports the runtime and calls the command
+  objects.
+
+The package layout XML lists the executable at
+`layout_3202719e-b4b4-421c-9f8f-70d1c4a7d60b_xs.xml:14`, but the file is not in the folder. The
+same XML lists the 16 DLLs; it does not list `d3d12_xs.dll` or `xgameruntime.dll`, which are
+system/GDK dependencies rather than package payload. This confirms
+[d3d12_vulkan.md §2](d3d12_vulkan.md) and Appendix A.4, which already record the absent
+executable.
+
+**Consequence:** the export table, import table and vtable of `d3d12_xs.dll` cannot be read from
+this package. Any statement about the console queue/list/fence/allocator slot order in this page
+is either SDK-derived, prior art, or a measurement of a *client* of those interfaces (the shipped
+BVH builder), never a measurement of the runtime itself.
+
+### 1.2 What the 16 DLLs import
+
+A PE import scan (normal and delay-load) of all 16 DLLs gives the complete static D3D12 picture:
+
+| DLL | `d3d12_xs.dll` import | `d3d12.dll` / `dxgi.dll` import | `xmem.dll` import |
+|---|---|---|---|
+| `XboxBvhBuilder.dll` | `D3D12SerializeVersionedRootSignature` (1) | none | `XMemVirtualQuery` (1) |
+| `amd_fidelityfx_upscaler_xbox.dll` | `D3D12CreateRootSignatureDeserializer` (1) | none | `XMemAlloc`, `XMemFree`, `XMemGetWorkingSetStatistics` (3) |
+| `Bink2Scarlett.dll` | none | none | `XMemAlloc`, `XMemFree` (2) |
+| the other 13 DLLs | none | none | none |
+
+No shipped module imports `d3d12.dll`, `dxgi.dll` or `xgameruntime.dll`. No shipped module
+imports a queue, list, fence, allocator or `PresentX` free function. The only two `d3d12_xs`
+imports are the root-signature calls already recorded in
+[d3d12_vulkan.md §2](d3d12_vulkan.md) and
+[`docs/related_projects.md` §americas-recomp](related_projects.md). This is consistent with the
+prior-art statement that the bundled middleware surface is tiny and the command-object surface
+belongs to the executable.
+
+Reproduce: `python tools/pe_inspect.py <dll> --game-dir <package> --out <dir>` for each DLL, or
+the import scan described in section 8.2.
+
+### 1.3 What this rules out
+
+The package cannot tell us:
+
+- the `d3d12_xs.dll` export names or ordinals for `D3D12CreateDevice`/`D3D12XboxCreateDevice`,
+  `D3D12SerializeVersionedRootSignature`, the `DXGIX*` present functions or
+  `InternalDriverCallX`;
+- the Xbox queue, command-list, fence or allocator vtable layout;
+- the `PresentX` slot, signature or plane struct;
+- any return-convention quirk on those interfaces.
+
+It can tell us which interfaces the shipped BVH builder was compiled against, and it contains
+one client that actually calls a command list. That is the useful measurement in section 3.
+
+## 2. The public slot baseline
+
+This section is the **SDK** baseline a replacement runtime can implement today. It is not a
+statement that the Xbox build uses these slots; section 3 gives the few Xbox call sites that
+have been measured.
+
+Slots are absolute vtable indices including `IUnknown` (0–2) and `ID3D12Object` (3–6). A byte
+offset in an 8-byte-slot vtable is `slot * 8`. The counts below were produced by parsing
+`d3d12.h` in the installed SDK; each interface's declaration line is given.
+
+### 2.1 Device creation slots
+
+| Slot | Byte offset | Method | SDK line |
+|---:|---:|---|---|
+| 8 | `0x040` | `ID3D12Device::CreateCommandQueue` | `d3d12.h:9006` |
+| 9 | `0x048` | `ID3D12Device::CreateCommandAllocator` | `d3d12.h:9011` |
+| 12 | `0x060` | `ID3D12Device::CreateCommandList` | `d3d12.h:9026` |
+| 36 | `0x120` | `ID3D12Device::CreateFence` | `d3d12.h:9178` |
+
+The Xbox device is **not** uniformly the public order. Prior art measured slots
+1/14/15/16/18/19/27/38 in desktop order, plus a compute-PSO method at 62 and an extra
+texture-creation method at 76 where the PC interface has `CreateStateObject`/something else
+([d3d12_vulkan.md §7](d3d12_vulkan.md),
+[`d3d12_xs_surface.md §2.4`](d3d12_xs_surface.md)). **Slots 8, 9, 12 and 36 were not measured
+by that work.** They are the four calls a game must make before it can have a queue, allocator,
+list or fence, so they are the first thing a trace must confirm.
+
+### 2.2 Queue, allocator and fence
+
+`ID3D12CommandQueue` is declared at `d3d12.h:8701`. It has 19 slots (0–18); its own methods start
+at 8 because `IUnknown` + `ID3D12Object` + `ID3D12DeviceChild` + `ID3D12Pageable` contribute
+eight slots and `ID3D12Pageable` adds none.
+
+| Slot | Byte offset | Method | SDK line |
+|---:|---:|---|---|
+| 8 | `0x040` | `UpdateTileMappings` | `d3d12.h:8704` |
+| 9 | `0x048` | `CopyTileMappings` | `d3d12.h:8716` |
+| 10 | `0x050` | `ExecuteCommandLists` | `d3d12.h:8724` |
+| 11 | `0x058` | `SetMarker` | `d3d12.h:8728` |
+| 12 | `0x060` | `BeginEvent` | `d3d12.h:8733` |
+| 13 | `0x068` | `EndEvent` | `d3d12.h:8738` |
+| 14 | `0x070` | `Signal` | `d3d12.h:8740` |
+| 15 | `0x078` | `Wait` | `d3d12.h:8744` |
+| 16 | `0x080` | `GetTimestampFrequency` | `d3d12.h:8748` |
+| 17 | `0x088` | `GetClockCalibration` | `d3d12.h:8751` |
+| 18 | `0x090` | `GetDesc` (returns the 16-byte desc by value on MSVC) | `d3d12.h:8756` |
+
+`ID3D12CommandAllocator` is declared at `d3d12.h:5193`; it has 9 slots (0–8), with
+`Reset` at slot 8 (`d3d12.h:5196`).
+
+`ID3D12Fence` is declared at `d3d12.h:5323`; it has 11 slots (0–10):
+
+| Slot | Byte offset | Method | SDK line |
+|---:|---:|---|---|
+| 8 | `0x040` | `GetCompletedValue` | `d3d12.h:5326` |
+| 9 | `0x048` | `SetEventOnCompletion` | `d3d12.h:5328` |
+| 10 | `0x050` | `Signal` | `d3d12.h:5332` |
+
+`ID3D12Fence1` (`d3d12.h:5477`) adds `GetCreationFlags` at slot 11 (`d3d12.h:5480`), for 12
+slots total. The console runtime's exported IID table stops at `IID_ID3D12Fence1` and
+`IID_ID3D12GraphicsCommandList2`; that is a property of the **exported IID set**, not a bound on
+the interfaces the game uses ([`d3d12_xs_surface.md §2.4`](d3d12_xs_surface.md)).
+
+### 2.3 `ID3D12GraphicsCommandList` and 1–8
+
+`ID3D12GraphicsCommandList` is declared at `d3d12.h:6337`. Its own methods occupy slots 9–59
+(51 methods), after `IUnknown` (3), `ID3D12Object` (4), `ID3D12DeviceChild` (1) and
+`ID3D12CommandList` (1). The chain then grows as follows:
+
+| Interface | Own slots | Total slots | Last byte offset | SDK line |
+|---|---|---:|---:|---|
+| `ID3D12GraphicsCommandList` | 9–59 | 60 | `0x1d8` | `d3d12.h:6337` |
+| `ID3D12GraphicsCommandList1` | 60–65 | 66 | `0x208` | `d3d12.h:7216` |
+| `ID3D12GraphicsCommandList2` | 66 | 67 | `0x210` | `d3d12.h:7982` |
+| `ID3D12GraphicsCommandList3` | 67 | 68 | `0x218` | `d3d12.h:20165` |
+| `ID3D12GraphicsCommandList4` | 68–76 | 77 | `0x260` | `d3d12.h:21255` |
+| `ID3D12GraphicsCommandList5` | 77–78 | 79 | `0x270` | `d3d12.h:30275` |
+| `ID3D12GraphicsCommandList6` | 79 | 80 | `0x278` | `d3d12.h:31123` |
+| `ID3D12GraphicsCommandList7` | 80 | 81 | `0x280` | `d3d12.h:31965` |
+| `ID3D12GraphicsCommandList8` | 81 | 82 | `0x288` | `d3d12.h:32816` |
+
+The methods that matter for this page:
+
+| Slot | Byte offset | Method | SDK line |
+|---:|---:|---|---|
+| 9 | `0x048` | `Close` | `d3d12.h:6340` |
+| 10 | `0x050` | `Reset` | `d3d12.h:6342` |
+| 14 | `0x070` | `Dispatch` | `d3d12.h:6362` |
+| 25 | `0x0c8` | `SetPipelineState` | `d3d12.h:6418` |
+| 26 | `0x0d0` | `ResourceBarrier` | `d3d12.h:6421` |
+| 33 | `0x108` | `SetComputeRoot32BitConstant` | `d3d12.h:6446` |
+| 39 | `0x138` | `SetComputeRootShaderResourceView` | `d3d12.h:6476` |
+| 45 | `0x168` | `SOSetTargets` | `d3d12.h:6500` |
+| 59 | `0x1d8` | `ExecuteIndirect` | `d3d12.h:6580` |
+| 68 | `0x220` | `GCL4::BeginRenderPass` | `d3d12.h:21258` |
+| 69 | `0x228` | `GCL4::EndRenderPass` | `d3d12.h:21264` |
+| 72 | `0x240` | `GCL4::BuildRaytracingAccelerationStructure` | `d3d12.h:21276` |
+| 73 | `0x248` | `GCL4::EmitRaytracingAccelerationStructurePostbuildInfo` | `d3d12.h:21281` |
+| 74 | `0x250` | `GCL4::CopyRaytracingAccelerationStructure` | `d3d12.h:21286` |
+| 75 | `0x258` | `GCL4::SetPipelineState1` | `d3d12.h:21291` |
+| 76 | `0x260` | `GCL4::DispatchRays` | `d3d12.h:21294` |
+| 79 | `0x278` | `GCL6::DispatchMesh` | `d3d12.h:31126` |
+| 80 | `0x280` | `GCL7::Barrier` (enhanced barriers) | `d3d12.h:31968` |
+| 81 | `0x288` | `GCL8::OMSetFrontAndBackStencilRef` | `d3d12.h:32819` |
+
+**Not a bound on the game.** The console runtime's 93 GUID exports include only
+`IID_ID3D12GraphicsCommandList`, `…1`, `…2`; the shipped BVH builder names `…4`, `…6` and `…8`
+in its exported signatures (section 3.1). The export table's IID set is therefore not the game's
+interface set, a point already made in [`d3d12_xs_surface.md §2.4`](d3d12_xs_surface.md).
+
+## 3. Direct measurements from the shipped binaries
+
+### 3.1 `XboxBvhBuilder.dll`'s interface types
+
+`XboxBvhBuilder.dll` is 884,224 bytes, PE32+ x86-64, with 12 named exports (ordinals 1–12).
+The mangled export names are direct evidence of the C++ parameter types the DLL was compiled
+against; no symbols were guessed. The relevant exports:
+
+| Ordinal | RVA | Export (demangled shape) | Interface named |
+|---:|---:|---|---|
+| 1 | `0x21330` | `XboxBvhBuilder(ID3D12Device11*, bool)` | `ID3D12Device11` |
+| 3 | `0x21610` | `BuildRaytracingAccelerationStructure(ID3D12GraphicsCommandList4*, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*, UINT, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*)` | GCL4 |
+| 4 | `0x216a0` | `BuildRaytracingAccelerationStructureBatched2X(ID3D12GraphicsCommandList6*, UINT, const D3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2*)` | GCL6 |
+| 5 | `0x21980` | `CopyRaytracingAccelerationStructure(ID3D12GraphicsCommandList4*, UINT64, UINT64, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE)` | GCL4 |
+| 6 | `0x21b40` | `CpuValidateResultX(ID3D12GraphicsCommandList4*, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*)` | GCL4 |
+| 8 | `0x219d0` | `RehydrateRaytracingAccelerationStructureBatched2X(ID3D12GraphicsCommandList8*, UINT, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*, const UINT64*)` | GCL8 |
+| 9 | `0x219a0` | `RehydrateRaytracingAccelerationStructureBatchedX(ID3D12GraphicsCommandList8*, UINT, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*)` | GCL8 |
+| 10 | `0x219f0` | `RehydrateRaytracingAccelerationStructureX(ID3D12Device11*, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*)` | `ID3D12Device11` |
+
+The DLL imports only `d3d12_xs.dll!D3D12SerializeVersionedRootSignature` and
+`xmem.dll!XMemVirtualQuery`; it does not import a queue, list, fence or allocator function.
+This is the same import result recorded in
+[d3d12_vulkan.md Appendix A.2](d3d12_vulkan.md), re-measured here.
+
+**What this proves:** the helper's public signatures require GCL4, GCL6, GCL8 and Device11
+objects. **What this does not prove:** that the helper calls the public vtable slots for those
+interfaces. Section 3.3 measures the call sites.
+
+### 3.2 The shipped modules do not contain the command-object IIDs
+
+A byte scan for the 80 `IID_ID3D12*` values defined by the installed `d3d12.h`, plus the two
+console GUIDs recorded in [`d3d12_xs_surface.md §4`](d3d12_xs_surface.md), found:
+
+| Binary | IIDs found |
+|---|---|
+| `XboxBvhBuilder.dll` | `IID_ID3D12RootSignature` at `0xc9ee8`, `IID_ID3D12PipelineState` at `0xc9ed8` |
+| `amd_fidelityfx_upscaler_xbox.dll` | `IID_ID3D12Device` `0x472f0`, `IID_ID3D12Resource` `0x47310`, `IID_ID3D12RootSignatureDeserializer` `0x47320`, `IID_ID3D12PipelineState` `0x47330`, `IID_ID3D12Heap` `0x47340`, `IID_ID3D12RootSignature` `0x47350`, `IID_ID3D12DescriptorHeap` `0x472e0`, `IID_ID3D12CommandSignature` `0x47300` |
+| the other 14 DLLs | none of the scanned IIDs |
+
+No shipped module contains `IID_ID3D12CommandQueue`, `IID_ID3D12GraphicsCommandList` (any
+version), `IID_ID3D12Fence`/`Fence1`, `IID_ID3D12CommandAllocator` or
+`IID_ID3D12ConsDmaCommandList`. The helper receives command lists through its exported
+parameters; the corresponding IID constants are not in its own data. That is a fact about the
+shipped modules, not a claim that the game never queries for them.
+
+The `GraphicsCommandList` ASCII string occurs 30 times in `XboxBvhBuilder.dll` (type/debug
+names); `PresentX` does not occur in any of the 16 DLLs.
+
+### 3.3 The BVH builder's command-list call sites
+
+The exported `BuildRaytracingAccelerationStructure` (ordinal 3, RVA `0x21610`) copies the input
+description into a stack structure and **delegates to ordinal 4**
+(`BuildRaytracingAccelerationStructureBatched2X`) at RVA `0x2166d`, passing the same command-list
+pointer in RDX and a count of 1. The batched entry therefore carries both the non-batched and the
+batched paths.
+
+Disassembling the exported bodies and the functions they call directly gives these calls through
+the object received in the command-list parameter:
+
+| RVA | Vtable offset | Public slot if PC order | Observed arguments | Confidence |
+|---:|---:|---:|---|---|
+| `0x2171e` | `+0xd0` | 26 `ResourceBarrier` | `NumBarriers=1`, `&{Type=2 (UAV), Flags=0, pResource=null}` | **Measured**: the shape is a global UAV barrier; slot 26 is the SDK `ResourceBarrier` |
+| `0x1d9cb` | `+0x70` | 14 `Dispatch` | `(1, 1, 1)` | **Measured**: exact `Dispatch` shape |
+| `0x1d85e` | `+0xc8` | 25 `SetPipelineState` | `RCX=list`; RDX is not re-set at the call site | Inferred: offset and object match; the pipeline argument is not proven |
+| `0x1d7f4` | `+0x108` | 33 `SetComputeRoot32BitConstant` | root index, value and offset registers | Inferred |
+| `0x1d8b9`, `0x1d956` | `+0x138` | 39 `SetComputeRootShaderResourceView` | `(root=3, value, …)` | Inferred |
+| `0x1d8f9` | `+0x168` | 45 `SOSetTargets` | `NumBuffers=0` (a no-op), resource in R8 | Inferred; `NumBuffers=0` means the view pointer is not read |
+| `0x1da02` | `+0x490` | **none** | `(1, &{0, 1, pointer, …})` | **Measured offset**; method identity **Open** |
+
+The `+0x490` call is after the `Dispatch(1,1,1)` at `0x1d9cb`, in the per-descriptor path. It is
+**beyond the last public GCL8 slot**: slot 81 is `0x288`, so `0x490` is 65 slots past the end of
+the public chain. It is either an appended console command-list method or a method of an internal
+class that the helper receives through the command-list parameter; the evidence below favours the
+second reading. Its arguments are not a public D3D12 method shape.
+
+The same two inner functions (`0x1d540` and `0x1d7c0`) contain the `+0x70`, `+0xc8`, `+0x108`,
+`+0x138`, `+0x168` and `+0x490` calls; the outer batched function contains the `+0xd0` barrier.
+The exported `CopyRaytracingAccelerationStructure` (ordinal 5) and the rehydrate exports
+(ordinals 8–9) do not call the passed command list in their exported bodies; they forward to
+internal functions using objects cached in the builder (`[this+0x10]` and `[this+8]`). Their
+signatures still require GCL4/GCL8 objects, but those bodies do not measure command-list slots.
+
+### 3.4 The object is wider than the public vtable
+
+The inner function at `0x1d7c0` receives the command-list pointer in RDX, copies it to RBX
+(`0x1d7da`–`0x1d7dd`), and then does more than call public methods:
+
+- writes 16 bytes at `[rbx+0x544]` (`0x1d803`);
+- writes a byte at `[rbx+0x140]` (`0x1d841`, `0x1d884`);
+- reads `[rbx+0x350]` (`0x1d877`) and `[rbx+0x344]` (`0x1d8c9`);
+- maintains a pointer at `[rbx+0x18]` against limits at `[rbx+0x30]` (`0x1d818`, `0x1d871`);
+- calls a method at vtable offset `+0x490` (`0x1da02`), past the end of the public GCL8 chain.
+
+A client that knows only the public COM interface cannot legally read or write those fields.
+The helper is therefore compiled against a **wider contract** than the public vtable: either the
+Xbox command-list object is an internal class whose layout first-party code may use, or the game
+passes a builder-specific object that also implements the interface. The byte offsets are facts;
+the field meanings and the method at `+0x490` are **Open**.
+
+This is the most important compatibility finding on this page. A replacement command list that
+implements only the public GCL7/GCL8 vtable is safe for the game's own public calls, but it is
+**not** safe to hand to `XboxBvhBuilder`'s build path. The helper will touch fields the public
+object does not define and call `+0x490`, which a public-only vtable does not have.
+
+### 3.5 What the package does not measure
+
+There is no shipped client for `ID3D12CommandQueue`, `ID3D12Fence`, `ID3D12CommandAllocator`,
+`PresentX`, `CreateCommandQueueX`, `SuspendX` or `ResumeX`:
+
+- the BVH builder's constructor takes a device, and its build functions take a command list; no
+  call at the public device creation slots 8/9/12/36 appears in its `pdata` functions, and it
+  does not create a swapchain;
+- no shipped module imports `d3d12_xs.dll` beyond the two root-signature calls;
+- no shipped module contains a queue/fence/allocator IID or the string `PresentX`.
+
+The queue/fence/allocator Xbox surface is therefore **not measured here at all**. The only
+command-object facts from the package are the command-list call sites in section 3.3.
+
+## 4. Prior-art claims
+
+Prior art is cited for facts only; no code is copied. Licence details are in section 8.
+
+### 4.1 SCARAB (GPL-3.0-only)
+
+SCARAB measured the console `d3d12_xs.dll` export surface and reports the console-only
+extensions. The parts relevant to this page:
+
+| Claim | Status | Detail |
+|---|---|---|
+| `PresentX` is an `ID3D12CommandQueue` method | **Prior art** | Class-attributed by a UMD validation message and by 367 call sites in the console SDK samples ([`d3d12-xs-wrapper.md:69-97`](https://github.com/p-portela/SCARAB/blob/d304fa2/docs/d3d12-xs-wrapper.md)). |
+| `PresentX` carries at most 2 planes and 8 views per plane | **Prior art** | `D3D12CONS_PRESENT_PLANES_MAX = 2`, `D3D12CONS_PRESENT_VIEWS_MAX = 8`; the UMD message names `pPlaneParameters[%d].ResourceCount <= 2`. |
+| Present flags `NONE`, `IMMEDIATE`, `PERSIST`, `UNIQUE_VIEW_RESOURCES` exist | **Prior art** | Names are recovered; the numeric values are **not** measured. `console_extensions.h` assigns `0x1/0x2/0x4` while `present_adapter.h` says the values are unknown and uses zero; the two contradict each other ([`d3d12_xs_surface.md §7`](d3d12_xs_surface.md)). |
+| `PresentX` signature and slot | **Open** | No signature, slot or call sequence is recovered. |
+| `SuspendX` / `ResumeX` are queue methods | **Prior art** | 122 sample call sites each; no signature or slot. |
+| `CreateCommandQueueX` is a device method | **Prior art** | UMD message ties it to `ID3D12Device`; the inferred shape is `(pDesc, pShaderQueueParams, riid, out)`; the UMD says a shader-based queue supports only `D3D12_COMMAND_LIST_TYPE_COMPUTE`; SCARAB returns `E_NOTIMPL`. Slot and parameter layout are **Open**. |
+| `ID3D12ConsDmaCommandList` IID `30bc77b9-8379-4b25-95de-b8588c42275d` | **Prior art** | Exported at ordinal 100; the DMA list rule is quoted from the UMD. `D3D12CONS_COMMAND_LIST_TYPE_DMA = 6` is **Derived** by appending to the PC enum, not measured. |
+| Command-list extension order | **Assumed** | SCARAB's own header says the order within the appended block is not recovered; every appended slot logs its name and raw arguments ([`console_extensions.h:13-31`](https://github.com/p-portela/SCARAB/blob/d304fa2/components/extension-wrapper/console_extensions.h)). Do not copy it. |
+| `OMSetFrontAndBackStencilRef` is public GCL8 | **SDK fact, not an extension** | Same signature at `d3d12.h:32819`; the SCARAB catalogue's placement after GCL6 would land in the wrong slot ([`d3d12_xs_surface.md §5.1`](d3d12_xs_surface.md)). |
+
+The `DXGIXPresentArray`, `DXGIXSetFrameNotification`, `DXGIXSetVLineNotification` and
+`DXGIXGetFrameStatistics` names are **free functions** at ordinals 20/21/22/19, not queue
+methods; no parameter layouts are recovered. `DXGIXGetFrameStatistics` is reported to write 64
+bytes, so a zero-argument stub is not safe ([`d3d12_xs_surface.md §7`](d3d12_xs_surface.md)).
+
+### 4.2 `americas-recomp` (GPL-2.0-only)
+
+The prior art that ran the package DLLs against a PC D3D12 device measured the **device**
+surface, not the command objects:
+
+- device slots 1/14/15/16/18/19/27/38 in desktop order; slot 14 is `CreateDescriptorHeap`;
+- device slot 62 is called as `CreateComputePipelineState` (the PC interface's slot 62 is
+  `CreateStateObject`), and slot 76 is Xbox texture creation;
+- descriptor-heap `GetCPU/GPUDescriptorHandleForHeapStart` (heap slots 9/10) return the 8-byte
+  handle in RAX;
+- Xbox root-signature descriptors carry flags `0x03000000`, masked on a copy;
+- the BVH builder's 53 compute shaders are Xbox DXIL.
+
+Its own summary explicitly stops before **presentation (`PresentX` and plane parameters),
+command-list extensions, and queue/fence creation slots**
+([`d3d12_vulkan.md §7`](d3d12_vulkan.md),
+[`PLATFORM_SURFACE.md`](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md)).
+So it adds **no** measured queue/list/fence slot to this page. The device slots it did measure
+are useful context: they are the reason a replacement cannot assume the whole device vtable is
+public order, and the reason the four creation slots 8/9/12/36 still need a trace.
+
+### 4.3 What prior art does not close
+
+Even taking both projects at face value, the following remain **Open**:
+
+- the Xbox slots for `CreateCommandQueue`, `CreateCommandAllocator`, `CreateCommandList`,
+  `CreateFence`;
+- the Xbox queue vtable beyond the public chain (`PresentX`, `SuspendX`, `ResumeX`);
+- the `PresentX` signature, plane struct, resource/view arrays and swapchain parameters;
+- the command-list extension slots (only `0x490` is measured here, without a name);
+- the DMA list type's real numeric value and the compute/copy console list IIDs;
+- any Xbox-specific return convention on these interfaces.
+
+## 5. What a runtime can do without the executable
+
+### 5.1 Implementable and testable now
+
+The repository already implements the public-chain objects on Vulkan:
+
+- `ID3D12CommandQueue`, `ID3D12CommandAllocator`, `ID3D12GraphicsCommandList7` and
+  `ID3D12Fence1` are defined in `runtime/shims/d3d12_com.cpp:41-352`, on the Windows SDK vtable
+  order, with generated stubs for every method they do not implement
+  (`runtime/shims/d3d12_com.h:1-5`);
+- `CreateCommandQueue`/`CreateCommandAllocator`/`CreateCommandList`/`CreateFence` are wired at
+  the public device slots in `runtime/shims/d3d12_vulkan_device.cpp:345-382`;
+- `runtime/test/d3d12_com_test.cpp:77-153` creates all four, records clears and both barrier
+  kinds, rejects an open list at `ExecuteCommandLists`, executes behind a queue `Wait`, and
+  checks fence signalling and `SetEventOnCompletion`. The test is source-level evidence; this
+  page did not rebuild the Vulkan runtime.
+
+The builder's `ResourceBarrier` call at `+0xd0` and `Dispatch(1,1,1)` at `+0x70` are consistent
+with the SDK slots the runtime already implements. Legacy barriers (slot 26) and enhanced
+barriers (slot 80 in GCL7) both have IR and Vulkan replay support
+(`runtime/src/command_list.h`, `runtime/src/vulkan_replay.h`; see
+[d3d12_vulkan.md §3.2](d3d12_vulkan.md)).
+
+### 5.2 Implementable, but unverified against the Xbox device
+
+A runtime can create the four objects and hand them out at the **public** device slots 8/9/12/36
+today. That is an assumption, not a measurement: the Xbox device was measured at
+1/14/15/16/18/19/27/38/62/76, and slots 8/9/12/36 are exactly the ones this page needs. If the
+Xbox slots differ, a generic forward-to-PC thunk calls the wrong method. The current proxy
+(`runtime/shims/d3d12_xs_device.h:1-18`) forwards every unshadowed slot in PC order and logs
+first calls; a wrong slot would therefore be visible as a misnamed call, not a silent success.
+
+The same caveat applies to **return conventions**: the public AMD64 COM convention (HRESULT in
+EAX, `void` methods, out-parameters through pointers, `GetDesc` returning a 16-byte struct by
+value) is what the runtime implements. No Xbox-specific convention on a queue, list, fence or
+allocator has been measured. The only measured Xbox return-convention quirk in the graphics
+surface is the descriptor-heap start handle in RAX (prior art), which is a heap method, not a
+command object.
+
+### 5.3 Blocked on the executable or console driver
+
+| Item | Why it is blocked |
+|---|---|
+| `PresentX` | No slot, signature, plane struct or swapchain/plane parameters. Prior art gives only names, the 2-plane/8-view limits and four flag names. |
+| `CreateCommandQueueX` | No slot or parameter layout; only the UMD message and an inferred shape. |
+| `SuspendX` / `ResumeX` | No slot or signature. |
+| Xbox queue/list/fence/allocator slot deviations | No runtime binary and no game executable; the package has no queue, fence or allocator client, and its only command-list client is the BVH builder. |
+| Command-list method at `+0x490` | Offset measured; identity, signature and whether it is an appended COM method or an internal class method are unknown. |
+| Builder's internal field layout (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x350`, `+0x544`) | No header or symbol; the helper's writes prove the contract is wider than the public vtable, but not what the fields mean. |
+| DMA list use/value | The IID is prior art; type 6 is derived; no shipped module uses it. |
+
+### 5.4 A concrete current gap: GCL8
+
+The shipped builder's rehydrate exports name `ID3D12GraphicsCommandList8`, and
+`OMSetFrontAndBackStencilRef` is public GCL8 at slot 81. The repository's command-list class is
+`ID3D12GraphicsCommandList7` (`runtime/shims/d3d12_com.cpp:57-61`), so it cannot answer
+`IID_ID3D12GraphicsCommandList8` and has no slot 81. `d3d12_vulkan.md` §4's table says the
+command list "supports … front/back stencil ref", but no such implementation exists in
+`runtime/` (a source grep finds no `OMSetFrontAndBackStencilRef` or front/back stencil command).
+Adding the public GCL8 interface is a small, justified runtime change: one method, one standard
+IID, no Xbox extension. It would not close the builder's `+0x490` gap, but it would let a GCL8
+pointer be served instead of refused.
+
+## 6. Return conventions
+
+| Interface | Public convention | Xbox-specific measurement |
+|---|---|---|
+| `ID3D12CommandQueue` | `ExecuteCommandLists`, `SetMarker`, `BeginEvent`, `EndEvent` are `void`; `Signal`, `Wait`, `GetTimestampFrequency`, `GetClockCalibration` return `HRESULT`; `GetDesc` returns `D3D12_COMMAND_QUEUE_DESC` by value | None measured |
+| `ID3D12CommandAllocator` | `Reset` returns `HRESULT` | None measured |
+| `ID3D12Fence`/`Fence1` | `GetCompletedValue` returns `UINT64`; `SetEventOnCompletion`/`Signal` return `HRESULT`; `GetCreationFlags` returns the flags enum | None measured |
+| `ID3D12GraphicsCommandList`/1–8 | Most recording methods are `void`; `Close`/`Reset` return `HRESULT`; `GetType` returns the list type; GCL8 `OMSetFrontAndBackStencilRef` is `void` | The builder's `+0xd0` and `+0x70` calls ignore RAX, consistent with `void`; no other convention measured |
+
+The `GetDesc` by-value return is the one place a generic thunk can get the ABI wrong on x64;
+the runtime implements it directly (`runtime/shims/d3d12_com.cpp:309`). No Xbox variant of that
+return has been measured.
+
+## 7. Next measurable step
+
+The executable is absent, so the next step should use the one shipped client that exists rather
+than invent slots.
+
+1. **Trace the builder's command-list calls with a logging proxy.** Create a test-only command
+   list whose public GCL6/GCL8 vtable logs `(slot, raw arguments)` and whose tail is a page of
+   logged unknown slots. Pass it to
+   `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X` with a minimal non-empty
+   descriptor. The `+0xd0` barrier and `+0x70` dispatch should be observed first; the `+0x490`
+   call will be recorded with its raw arguments. This turns `0x490` from an offset into a
+   call shape and tests the "wider than the public vtable" hypothesis without a GPU. If the
+   builder validates its inputs before reaching the dispatch, use a descriptor shaped like the
+   one its own `GetRaytracingAccelerationStructurePrebuildInfo` accepts (prior art measured a
+   3,000-vertex triangle geometry; the prebuild answer is 204,800 bytes / 128,704 scratch).
+2. **Add GCL8 to the runtime** (public, one method, slot 81) so the rehydrate entry points can
+   be handed a real object. This is a code change for a separate PR, not this document.
+3. **When the executable appears, trace the four creation calls first.** Per-slot counters on
+   device slots 8/9/12/36, then queue slots 10/14/15, fence slots 8/9/10, and every slot beyond
+   the public chain. The first `PresentX` call and the queue vtable tail are the only way to
+   recover the present surface; a DXGI import would make the DXGI path the first
+   implementation instead ([d3d12_vulkan.md §8.2 Q6](d3d12_vulkan.md)).
+
+Do not fill the unknown slots with guesses. A wrong slot is worse than a clean refusal; the
+existing device proxy already follows that rule (`runtime/shims/d3d12_xs_device.h:16-18`).
+
+## 8. References and provenance
+
+### 8.1 Licence
+
+Leonida is GPL-3.0-or-later. SCARAB is GPL-3.0-only and `americas-recomp` is GPL-2.0-only; both
+are cited for ABI facts only. No code, headers, generated stubs, comments or tables were copied
+from either project. The PE and disassembly facts in section 3 were produced locally from the
+shipped `XboxBvhBuilder.dll`; the public slot table was parsed from the installed Windows SDK
+10.0.26100.0. No game data was read, decrypted or executed. See
+[`docs/related_projects.md`](related_projects.md) for the project-level rule.
+
+The XboxBvhBuilder export names quoted in section 3.1 are mangled C++ symbols from the DLL's
+export table, reproduced as ABI facts. The GUID values in section 3.2 are 16-byte constants from
+the SDK; the console GUIDs are attributed to SCARAB in
+[`d3d12_xs_surface.md §4`](d3d12_xs_surface.md).
+
+### 8.2 Reproduction
+
+- Package inventory and absent files: directory listing plus
+  `layout_3202719e-b4b4-421c-9f8f-70d1c4a7d60b_xs.xml:14`.
+- Imports/exports: `python tools/pe_inspect.py <dll> --game-dir <package> --out <dir>`; the
+  16-DLL summary in section 1.2 used `pefile` normal + delay-load directories.
+- IID scan: read the 80 `DEFINE_GUID(IID_ID3D12…)` values from
+  `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\d3d12.h`, plus the two console
+  GUIDs from [`d3d12_xs_surface.md §4`](d3d12_xs_surface.md), and search each DLL for the
+  16-byte little-endian value. Absence is evidence about static constants, not about runtime
+  `QueryInterface` calls.
+- Builder call sites: Capstone 5.0.7 x86-64 disassembly of the 12 exported functions and the
+  functions they call directly; RVAs are file-relative virtual addresses from the PE. The
+  `0xd0` call is in the batched entry (`0x216a0`, site `0x2171e`); the `0x490` call is in the
+  per-descriptor function reached from it (`0x1d7c0`, site `0x1da02`).
+- Public slots: parse the `MIDL_INTERFACE`/`virtual` declarations in `d3d12.h`; the counts in
+  section 2 include the seven `IUnknown`+`ID3D12Object` slots. Cross-check selected values with
+  `python tools/d3d12_xs_surface.py --check --sdk` (116 slots, 83 standard GUIDs) and
+  `python -I tests/test_d3d12_xs_surface.py`.
+
+### 8.3 References
+
+- [d3d12_vulkan.md](d3d12_vulkan.md) §3.1, §3.2, §4, §4.4, §4.5, §7, §8.2, Appendix A.2,
+  Appendix B — the COM/vtable assumptions, the record/replay design, the known/unknown list and
+  the BVH builder evidence.
+- [d3d12_xs_surface.md](d3d12_xs_surface.md) §2, §4, §5, §5.1, §6, §7, §9 — the export/IID
+  contract, console GUIDs, extension catalogue, GCL8 correction, DMA list rule and `PresentX`
+  status.
+- [related_projects.md](related_projects.md) — the GPL-2.0-only and GPL-3.0-only provenance
+  rules.
+- SCARAB, pinned at `d304fa26c0292e2f3ba76f23b15c9f30734bec02`:
+  [`docs/d3d12-xs-wrapper.md:69-97`](https://github.com/p-portela/SCARAB/blob/d304fa2/docs/d3d12-xs-wrapper.md),
+  [`components/extension-wrapper/console_extensions.h:13-31,45-72,84-191`](https://github.com/p-portela/SCARAB/blob/d304fa2/components/extension-wrapper/console_extensions.h),
+  [`docs/d3d12-xs-bridge.md:239-245`](https://github.com/p-portela/SCARAB/blob/d304fa2/docs/d3d12-xs-bridge.md).
+- `americas-recomp`, branch `xbox-series`:
+  [`docs/xbox/PLATFORM_SURFACE.md`](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md),
+  [`tools/xbox/platform/README.md`](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md).
+- Windows SDK 10.0.26100.0:
+  `um/d3d12.h:5193,5323,5477,6337,7216,7982,8701,9006,9011,9026,9178,20165,21255,30275,31123,31965,32816`.
