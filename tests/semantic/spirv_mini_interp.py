@@ -8,8 +8,8 @@ Design rules (see tests/semantic/README.md):
     UnsupportedConstruct. Nothing is skipped or approximated silently, so a translator change that starts
     emitting something new makes the test error out instead of passing.
   * One invocation (one lane), or with run_workgroup several in lockstep, which meet only at
-    OpGroupNonUniformShuffle and OpGroupNonUniformBallot (the subgroup operations modelled, with
-    BallotBitExtract). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
+    subgroup operations (Shuffle, Ballot, Any, All, BitwiseOr Reduce; BallotBitExtract and BallotFindLSB
+    are per lane). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
     branches the translator emits: OpBranch / OpBranchConditional to a later label plus OpPhi at the merge block.
     Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores use a flat
@@ -57,7 +57,8 @@ UNDEF = _Undef()
 _PURE = frozenset({
     "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
     "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUConvert", "OpBitCount", "OpIEqual",
-    "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThanEqual", "OpCopyObject", "OpBitcast",
+    "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThan", "OpUGreaterThanEqual", "OpCopyObject",
+    "OpBitcast",
     "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
 })
 
@@ -167,66 +168,89 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
 
     Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
-    invocation order). `inputs_for(i)` gives invocation i's Input values (see run_fragment); push constants and
-    the physical-address memory are shared. Every invocation must reach every subgroup operation, in the same
-    order (the translator emits them in uniform control flow and models EXEC with a variable, so a lane that is
-    off in EXEC still executes them).
+    invocation order). When `invocations` is not a multiple of `subgroup_size` the last subgroup is partial: its
+    missing lanes are not running. `inputs_for(i)` gives invocation i's Input values (see run_fragment); push
+    constants and the physical-address memory are shared. Every invocation must reach every subgroup operation,
+    in the same order (the translator emits them in uniform control flow and models EXEC with a variable, so a
+    lane that is off in EXEC still executes them).
 
-    OpGroupNonUniformShuffle (Subgroup scope) returns the value of lane Id of the caller's own subgroup. An Id at
-    or past `subgroup_size` is undefined in SPIR-V: `out_of_range="raise"` raises UndefinedResult;
-    `out_of_range="wrap"` takes lane Id mod subgroup_size instead, a model of one observed driver behaviour
-    and not of the specification (Leonida issue #94: on a 32-wide NVIDIA subgroup lane 40 read lane 8).
-    OpGroupNonUniformBallot sets bit l for each lane l of the caller's subgroup whose predicate is true (every
-    invocation of the workgroup is running).
+    Subgroup operations (Subgroup scope), over the running lanes of the caller's subgroup:
+      * OpGroupNonUniformShuffle returns the value of lane Id. An Id at or past `subgroup_size` is undefined in
+        SPIR-V: `out_of_range="raise"` raises UndefinedResult; `out_of_range="wrap"` takes lane Id mod
+        subgroup_size instead, a model of one observed driver behaviour and not of the specification (Leonida
+        issue #94: on a 32-wide NVIDIA subgroup lane 40 read lane 8). An Id inside the subgroup whose lane is not
+        running gives an undefined value (raises only if used, see _Undef).
+      * OpGroupNonUniformBallot sets bit l for each running lane l whose predicate is true.
+      * OpGroupNonUniformAny / All: the predicate of any / every running lane.
+      * OpGroupNonUniformBitwiseOr Reduce: the OR of every running lane's value.
     """
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
-    if invocations % subgroup_size:
-        raise UnsupportedConstruct("a partial subgroup")
     memory = {} if memory is None else memory
-    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory)
+    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True)
             for i in range(invocations)]
-    pending = [None] * invocations
-    live = set()
-    for i, g in enumerate(gens):
+    pending = [None] * invocations             # what each invocation yielded last; None once it has returned
+
+    def advance(i, value):
         try:
-            pending[i] = next(g)
-            live.add(i)
+            pending[i] = gens[i].send(value)
         except StopIteration:
-            pass
-    while live:
+            pending[i] = None
+
+    for i in range(invocations):
+        advance(i, None)
+    while True:
+        # One instruction per invocation per round, in invocation order: invocations at the same instruction
+        # execute it one after the other before any goes on, as the lanes of a SIMD wave do, so a load that
+        # follows a store in program order sees every lane's store and none from a later instruction.
+        while any(req is not None and req[0] == "tick" for req in pending):
+            for i in range(invocations):
+                if pending[i] is not None and pending[i][0] == "tick":
+                    advance(i, None)
+        live = [i for i in range(invocations) if pending[i] is not None]
+        if not live:
+            break
         if len(live) != invocations or len({pending[i][1] for i in live}) != 1:
             raise UnsupportedConstruct("subgroup operation not reached by every invocation at the same point")
         results = []
         for i in range(invocations):
             kind, _, _value, ident = pending[i]
+            base = (i // subgroup_size) * subgroup_size
+            group = [pending[j] for j in range(base, min(base + subgroup_size, invocations))]
             if kind == "OpGroupNonUniformBallot":
                 # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
-                base = (i // subgroup_size) * subgroup_size
-                bits = sum(1 << l for l in range(subgroup_size) if pending[base + l][2])
+                bits = sum(1 << l for l, req in enumerate(group) if req[2])
                 results.append(tuple((bits >> (32 * w)) & MASK for w in range(4)))
-                continue
-            if kind != "OpGroupNonUniformShuffle":
+            elif kind == "OpGroupNonUniformAny":
+                results.append(any(req[2] for req in group))
+            elif kind == "OpGroupNonUniformAll":
+                results.append(all(req[2] for req in group))
+            elif kind == "OpGroupNonUniformBitwiseOr":
+                acc = 0
+                for req in group:
+                    acc |= req[2]
+                results.append(acc)
+            elif kind == "OpGroupNonUniformShuffle":
+                if not 0 <= ident < subgroup_size:
+                    if out_of_range == "raise":
+                        raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a "
+                                              f"{subgroup_size}-wide subgroup")
+                    ident %= subgroup_size
+                results.append(group[ident][2] if ident < len(group) else UNDEF)
+            else:
                 raise UnsupportedConstruct(kind)
-            if not 0 <= ident < subgroup_size:
-                if out_of_range == "raise":
-                    raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a {subgroup_size}-wide "
-                                          f"subgroup")
-                ident %= subgroup_size
-            src = (i // subgroup_size) * subgroup_size + ident
-            results.append(pending[src][2])
         for i in range(invocations):
-            try:
-                pending[i] = gens[i].send(results[i])
-            except StopIteration:
-                live.discard(i)
-                pending[i] = None
+            advance(i, results[i])
     return memory
 
 
-def _invocation(text, inputs, push_constants, memory):
+_TICK = ("tick", None, None, None)
+
+
+def _invocation(text, inputs, push_constants, memory, step=False):
     """One invocation as a generator. It yields (opcode, instruction index, value, id) at each subgroup operation
-    and expects that operation's result back; it returns run_fragment's result."""
+    and expects that operation's result back; with `step` it also yields _TICK before each instruction. It
+    returns run_fragment's result."""
     inputs = inputs or {}
     push_constants = list(push_constants or [])
     memory = {} if memory is None else memory
@@ -367,6 +391,8 @@ def _invocation(text, inputs, push_constants, memory):
     killed = False
     cur_label = prev_label = None
     while pc < len(body):
+        if step:
+            yield _TICK
         res, op, a, line = body[pc]
         pc += 1
         if res and a:
@@ -567,6 +593,23 @@ def _invocation(text, inputs, push_constants, memory):
             if k[0] != "vec" or k[2] != 4 or val(a[1]) != 3 or not isinstance(val(a[2]), bool):
                 raise UnsupportedConstruct("OpGroupNonUniformBallot other than a Subgroup-scope uvec4")
             values[res] = yield (op, pc - 1, val(a[2]), None)
+        elif op in ("OpGroupNonUniformAny", "OpGroupNonUniformAll"):
+            # <bool> <scope> <bool predicate>
+            if val(a[1]) != 3 or not isinstance(val(a[2]), bool):
+                raise UnsupportedConstruct(f"{op} other than a Subgroup-scope bool")
+            values[res] = yield (op, pc - 1, val(a[2]), None)
+        elif op == "OpGroupNonUniformBitwiseOr":
+            # <type> <scope> <group operation> <value>: only Reduce over a 32-bit integer.
+            if val(a[1]) != 3 or a[2] != "Reduce" or types.t[a[0]][:2] != ("int", 32):
+                raise UnsupportedConstruct("OpGroupNonUniformBitwiseOr other than a Subgroup-scope 32-bit Reduce")
+            values[res] = yield (op, pc - 1, val(a[3]) & MASK, None)
+        elif op == "OpGroupNonUniformBallotFindLSB":
+            # <uint> <scope> <uvec4 ballot>: the lowest set bit; undefined when no bit is set.
+            ballot = val(a[2])
+            if val(a[1]) != 3:
+                raise UnsupportedConstruct("OpGroupNonUniformBallotFindLSB scope")
+            bits = sum(w << (32 * k) for k, w in enumerate(ballot))
+            values[res] = (bits & -bits).bit_length() - 1 if bits else UNDEF
         elif op == "OpGroupNonUniformBallotBitExtract":
             # OpGroupNonUniformBallotBitExtract <bool> <scope> <uvec4 ballot> <index>: needs no other lane.
             ballot, idx = val(a[2]), val(a[3])
