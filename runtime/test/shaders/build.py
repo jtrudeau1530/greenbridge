@@ -7,7 +7,8 @@ path, as for the shaders stage). Listings, synthetic FSSM headers and DXBC conta
 directory. After validation, the build writes <out>/spirv/<name>.spv and the translator metadata.
 
 Compute shaders get the header the tests were written for: RSRC2 0x8088 (4 user SGPRs holding the V#, the
-workgroup id in s4, 512 bytes of LDS) and a 64x1x1 group. The stage comes from the name's prefix. Mesh and
+workgroup id in s4, 512 bytes of LDS) and a 64x1x1 group (a "; group: X,Y,Z" comment at the top of the .asm
+overrides the size). The stage comes from the name's prefix. Mesh and
 geometry shaders (ms_, gs_) also need a DXBC container with their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
 """
@@ -39,6 +40,20 @@ def asm_mattr(path):
     return None
 
 
+def asm_group(path):
+    """Thread-group size from a leading "; group: X,Y,Z" comment (default GROUP)."""
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith(";"):
+            break
+        m = re.match(r";\s*group:\s*(\d+),(\d+),(\d+)", s)
+        if m:
+            return tuple(int(x) for x in m.groups())
+    return GROUP
+
+
 def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
@@ -58,11 +73,14 @@ def translate_tests(work, names):
         (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
         if n.startswith("cs_"):
             header = bytearray(0x148)
-            struct.pack_into("<4I", header, 0x138, RSRC2, *GROUP)
+            struct.pack_into("<4I", header, 0x138, RSRC2, *asm_group(asm_path))
             (fssm / (n + ".fssm")).write_bytes(header)
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
-    return subprocess.run([sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]).returncode
+    cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
+    if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
+        cmd.append("--wave64-emulate")
+    return subprocess.run(cmd).returncode
 
 
 def main():

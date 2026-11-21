@@ -358,3 +358,26 @@ def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
     asm_vcc = vcc_half.translate()
     vcc_half.validate(asm_vcc)
     assert asm_vcc.count("OpBitCount %uint %c0") == 2
+
+
+EMULATE_SAMPLES = [p for p in SAMPLES if os.path.basename(p).startswith(("cs_", "ms_"))]
+
+
+@pytest.mark.parametrize("path", EMULATE_SAMPLES, ids=[os.path.basename(p) for p in EMULATE_SAMPLES])
+def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
+    """--wave64-emulate: a wave64 compute or mesh shader validates and uses no subgroup operation (everything
+    cross-lane goes through %x_buf); a wave32 one comes out exactly as without the flag."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.startswith("ms_") and stem not in SAMPLE_DXBC:
+        pytest.skip(f"no synthetic PSV0 for {stem} in conftest.SAMPLE_DXBC")
+    with open(path, encoding="utf-8") as f:
+        shader = make_shader(f.read(), stem, dxbc=SAMPLE_DXBC.get(stem, EMPTY_DXBC))
+    plain = shader.translate()
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    emulated = shader.translate()
+    if not rdna2spirv.translate.last_gen.wave64:
+        assert emulated == plain
+        return
+    shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
+    assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
+    assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
