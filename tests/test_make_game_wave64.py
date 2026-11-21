@@ -188,6 +188,31 @@ class KeepEmulatedFlagTest(unittest.TestCase):
 
 
 class SubgroupInfoToolTest(unittest.TestCase):
+    def test_enumeration_failures_do_not_select_from_a_partial_list(self):
+        import ctypes
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import vk_subgroup_info as v
+
+        for name, responses in (("count error", [(-3, 0)]),
+                                ("partial list", [(0, 1), (5, 1), (0, 2), (-3, 0)])):
+            with self.subTest(name=name):
+                vk = mock.Mock()
+                vk.vkCreateInstance.return_value = 0
+                results = iter(responses)
+
+                def enumerate_devices(_instance, count, _devices):
+                    status, written = next(results)
+                    ctypes.cast(count, ctypes.POINTER(ctypes.c_uint32))[0] = written
+                    return status
+
+                vk.vkEnumeratePhysicalDevices.side_effect = enumerate_devices
+                with mock.patch.object(v, "load_vulkan", return_value=vk):
+                    with self.assertRaisesRegex(RuntimeError, "vkEnumeratePhysicalDevices.*-3"):
+                        v.query()
+                self.assertEqual(vk.vkEnumeratePhysicalDevices.call_count, len(responses))
+                vk.vkGetPhysicalDeviceProperties2.assert_not_called()
+                vk.vkDestroyInstance.assert_called_once()
+
     def test_sizes_and_offsets_match_the_vulkan_headers_on_x64(self):
         # Literal values from vulkan_core.h (sizeof/offsetof on x86-64), not derived from the tool's own constants
         import ctypes

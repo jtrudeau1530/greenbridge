@@ -1,0 +1,56 @@
+#version 460
+// A compute shader that finds and samples an image the way translated shaders do (docs/design.md, "Images"; the
+// lookup is tools/rdna2spirv.py desc_probe), for d3d12_descriptor_test. A translated shader loads a T# and an S#
+// from its descriptor tables; this one is handed them as push constants: the eight dwords of a heap slot and the
+// four of a sampler slot. It looks both up in the hash table at set 0 binding 2 (FNV-1a over the eight key dwords,
+// eight probes, a miss is index 0; an S# key is its four dwords and four of 0xFFFFFFFF), samples the 2D image
+// array at binding 0 with the sampler array at binding 1, and writes
+//   result[first + i] = the texel at ((i % 8) + 0.5, (i / 8) + 0.5) / 8 + (1, 0), as RGBA8 with red in the low byte.
+// The whole tile to the right in U: a sampler that wraps in U gives the texel at the same place in the image,
+// one that clamps (as the fallback sampler at index 0 does) the image's right edge. So the result shows that
+// the S# was found, not only the T#.
+// Set 0 is the device's bindless set; set 1 is the test's output buffer.
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Descriptors {
+    uint tsharp[8];
+    uint ssharp[4];
+    uint first;
+} pc;
+
+layout(set = 0, binding = 0) uniform texture2D images[];
+layout(set = 0, binding = 1) uniform sampler samplers[];
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
+    uint map[];  // mask, then 10 uints per slot: key[8], index, pad
+};
+layout(set = 1, binding = 0, std430) writeonly buffer Result {
+    uint result[];
+};
+
+uint lookup(uint key[8]) {
+    uint h = 2166136261u;
+    for (int i = 0; i < 8; ++i) h = (h ^ key[i]) * 16777619u;
+    const uint mask = map[0];
+    for (uint k = 0; k < 8; ++k) {
+        const uint slot = 1 + ((h + k) & mask) * 10;
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && map[slot + i] == key[i];
+        if (same) return map[slot + 8];
+    }
+    return 0;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    uint image_key[8], sampler_key[8];
+    for (int k = 0; k < 8; ++k) {
+        image_key[k] = pc.tsharp[k];
+        sampler_key[k] = k < 4 ? pc.ssharp[k] : 0xffffffffu;
+    }
+    const uint image = lookup(image_key), smp = lookup(sampler_key);
+    const vec2 uv = (vec2(i % 8, i / 8) + 0.5) / 8.0 + vec2(1.0, 0.0);
+    const vec4 texel = textureLod(sampler2D(images[image], samplers[smp]), uv, 0.0);
+    result[pc.first + i] = packUnorm4x8(texel);
+}

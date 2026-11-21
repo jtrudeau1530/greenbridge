@@ -176,14 +176,14 @@ def stage_index(path):
     directory (parent holds index.json) and a directory that contains index.json are accepted.
     """
     base = path if os.path.isdir(path) else os.path.dirname(path)
-    for candidate in (os.path.join(base, "..", "index.json"), os.path.join(base, "index.json")):
+    for candidate in (os.path.join(base, "index.json"), os.path.join(base, "..", "index.json")):
         if os.path.isfile(candidate):
             try:
                 with open(candidate, encoding="utf-8") as f:
                     rows = json.load(f)
                 return {os.path.splitext(row["file"])[0]: row.get("stage") for row in rows}
             except (OSError, ValueError, KeyError, TypeError):
-                return {}
+                continue
     return {}
 
 

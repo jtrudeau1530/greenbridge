@@ -9,12 +9,11 @@ def _565(c):
     return np.stack([r, g, b], -1)
 
 
-def bc1_average(blocks: np.ndarray) -> np.ndarray:
-    """blocks: (N, 8) uint8 -> (N, 3) float average colour of the 16 decoded pixels."""
+def _color_average(blocks: np.ndarray, force_four_colors: bool = False) -> np.ndarray:
     c0 = blocks[:, 0].astype(np.uint32) | (blocks[:, 1].astype(np.uint32) << 8)
     c1 = blocks[:, 2].astype(np.uint32) | (blocks[:, 3].astype(np.uint32) << 8)
     p0, p1 = _565(c0), _565(c1)
-    four = (c0 > c1)[:, None]
+    four = (force_four_colors | (c0 > c1))[:, None]
     p2 = np.where(four, (2 * p0 + p1) / 3, (p0 + p1) / 2)
     p3 = np.where(four, (p0 + 2 * p1) / 3, 0)
     idx = blocks[:, 4:8].astype(np.uint32)
@@ -27,8 +26,16 @@ def bc1_average(blocks: np.ndarray) -> np.ndarray:
     return (pal * counts[:, :, None]).sum(1) / 16
 
 
+def bc1_average(blocks: np.ndarray) -> np.ndarray:
+    """blocks: (N, 8) uint8 -> (N, 3) float average colour of the 16 decoded pixels."""
+    return _color_average(blocks)
+
+
 def block_average(blocks: np.ndarray, bpe: int) -> np.ndarray:
-    return bc1_average(blocks if bpe == 8 else blocks[:, 8:16])
+    if bpe == 8:
+        return bc1_average(blocks)
+    # BC3 colour uses four entries regardless of endpoint order (EXT_texture_compression_s3tc).
+    return _color_average(blocks[:, 8:16], force_four_colors=True)
 
 
 def smoothness(img: np.ndarray) -> float:

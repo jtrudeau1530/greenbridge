@@ -73,7 +73,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(row["bounds_min"], [-1.5, -2.0, -3.0])
         self.assertEqual(row["bounds_max"], [4.5, 5.0, 6.0])
         self.assertEqual(row["flags"], bvh_index.TAG)
-        self.assertEqual(row["version"], "0x81020006")
+        self.assertEqual(row["version"], 6)
         self.assertEqual(row["crc32"], 0x9ABCDEF0)
         self.assertEqual(row["num_elements"], 7)
         self.assertEqual(row["offset_to_nodes"], 0x1234)
@@ -89,6 +89,9 @@ class ClassifyTest(unittest.TestCase):
     def test_header_fields(self):
         hdr = bvh_index.parse_header(bvh_payload(4))
         self.assertIsNotNone(hdr)
+        self.assertEqual(hdr["version"], 6)
+        self.assertEqual(hdr["offset_to_prim_remap"], -5)
+        self.assertEqual(hdr["offset_to_parents"], 0xFFFFAB40)
         self.assertEqual(hdr["node_count"], 4)
         self.assertEqual(hdr["root_node_index"], 9941)
         self.assertEqual(hdr["root_node_type"], 4)

@@ -18,12 +18,13 @@ WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS + check.W64X_DUMPS + check.W64X_
                 if n not in (*check.WAVE32_DUMPS, "cs_wave64_ballot")}
 # A group smaller than a wave can't ask for full subgroups: it asks for subgroup size 64 and reads the device's range.
 PARTIAL = {n for n, _ in check.W64X_PARTIAL}
+WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
 # tests, pixel tests, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + len(check.BOUNDS) + 5)  # two mesh, two texture and cs_cmpx_class_f32
+         + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + 5)  # two mesh, two texture and cs_cmpx_class_f32
 
 
 class Wave64Checks(unittest.TestCase):
@@ -66,6 +67,8 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CS_SMEM)) + "\n"
+            if name in WAVE32_WORDS:           # wave32 dumps run on any subgroup size
+                return 0, "out[0..7] = " + " ".join(map(str, WAVE32_WORDS[name])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
             if name in ("cs_imgstore", "cs_imgload"):
@@ -82,6 +85,7 @@ class Wave64Checks(unittest.TestCase):
                 (spirv / "cs_wave64_ballot.spv").touch()
             output = io.StringIO()
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
+                  patch.object(check, "clip_test", return_value=""),
                   patch.object(check, "pixel_test", return_value=""), patch.object(check, "bindless_test", return_value=""),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "W64_EMULATED", emulated),
