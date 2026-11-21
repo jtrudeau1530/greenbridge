@@ -1564,6 +1564,16 @@ class Gen:
         self.emit(f"{sh} = OpShiftRightLogical %uint {m} {self.cu(31)}")
         self.scc_nonzero(sh)
 
+    def bfe_width(self, off, wid):
+        """A bitfield-extract width cut to 32 - off (off in 0-31): SPIR-V leaves offset + count > 32 undefined. The
+        field then runs to bit 31, which is the hardware result: LLVM's constantFoldBFE (AMDGPUISelLowering.cpp)
+        gives Src0 >> Offset there, logical for the unsigned and arithmetic for the signed extract."""
+        room, fits, w = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{room} = OpISub %uint {self.cu(32)} {off}")
+        self.emit(f"{fits} = OpULessThan %bool {wid} {room}")
+        self.emit(f"{w} = OpSelect %uint {fits} {wid} {room}")
+        return w
+
     def tmp_bool_nz(self, v):
         b = self.tmp()
         self.emit(f"{b} = OpINotEqual %bool {v} {self.cu(0)}")
@@ -3133,6 +3143,7 @@ class Gen:
             off, wid, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{off} = OpBitwiseAnd %uint {ctl} {self.cu(31)}")
             self.emit(f"{wid} = OpBitFieldUExtract %uint {ctl} {self.cu(16)} {self.cu(7)}")
+            wid = self.bfe_width(off, wid)
             if op == "s_bfe_u32":
                 self.emit(f"{r} = OpBitFieldUExtract %uint {x} {off} {wid}")
             else:
@@ -3406,8 +3417,9 @@ class Gen:
             om, wm, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{om} = OpBitwiseAnd %uint {o} {self.cu(31)}")
             self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
+            wc = self.bfe_width(om, wm)
             f = "OpBitFieldSExtract" if op.endswith("i32") else "OpBitFieldUExtract"
-            self.emit(f"{r} = {f} %uint {x} {om} {wm}")
+            self.emit(f"{r} = {f} %uint {x} {om} {wc}")
             self.dst(a[0], r)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])
