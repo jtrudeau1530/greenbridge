@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -758,22 +759,32 @@ int main(int argc, char** argv) {
     std::vector<std::thread> pool;
     for (uint32_t t = 0; t < jobs; t++) pool.emplace_back(worker);
     // Watchdog: names every compile running past 60 s (about once a minute) and saves the cache every 10 minutes.
+    std::condition_variable watch_cv;
+    bool all_done = false;
     std::thread watch([&] {
         auto last_save = std::chrono::steady_clock::now();
-        while (done < work.size()) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::unique_lock<std::mutex> g(mu);
+        while (!all_done) {
+            if (watch_cv.wait_for(g, std::chrono::seconds(5), [&] { return all_done; })) break;
             const auto now = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> g(mu);
-                for (auto& [tid, job] : inflight) {
-                    const double s = std::chrono::duration<double>(now - job.second).count();
-                    if (s > 60 && int(s) % 60 < 5) std::fprintf(stderr, "  still compiling %s after %.0fs\n", job.first.c_str(), s);
-                }
+            for (auto& [tid, job] : inflight) {
+                const double s = std::chrono::duration<double>(now - job.second).count();
+                if (s > 60 && int(s) % 60 < 5) std::fprintf(stderr, "  still compiling %s after %.0fs\n", job.first.c_str(), s);
             }
-            if (now - last_save > std::chrono::minutes(10)) { save_cache(false); last_save = now; }
+            if (now - last_save > std::chrono::minutes(10)) {
+                g.unlock();
+                save_cache(false);
+                g.lock();
+                last_save = now;
+            }
         }
     });
     for (auto& t : pool) t.join();
+    {
+        std::lock_guard<std::mutex> g(mu);
+        all_done = true;
+    }
+    watch_cv.notify_one();
     watch.join();
 
     for (auto& [_, mod] : stub_cache) if (mod) vkDestroyShaderModule(dev, mod, nullptr);
