@@ -24,6 +24,7 @@ method, scope and caveats. No game data is included.
 | [bvh.md](bvh.md) | 565,596 `core_bvh4.rpf` streams; 271,627 BVH4 streams and 269,106 instances, prebuilt acceleration data. |
 | [rbf0.md](rbf0.md) | 1,263 RBF0 resources, 475,461 elements; UI/Scaleform definitions, not a sectioned container; strict JSON/CSV/XML tree decoder. |
 | [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN. |
+| [gamedata_graph.md](gamedata_graph.md) | `common.rpf` mount graph: 25 manifest documents, 30 content-set ids, 14 include refs (12 resolve), 3,386 target refs, 0 cycles. |
 | [world.md](world.md) | `levels.rpf` placement: 9,918 map files / 680,228 entities measured in 55% of the archive (lower bound; estimate 16k-39.6k / 1.03M-2.64M); `0x7a` resource layout. |
 | [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact. |
 | [world_names.md](world_names.md) | Name resolution: `archetypeName` and map `name`/`parent` are lower-cased joaat; 64-bit keys are MurmurHash3 x64 low 64. 79,738 local names resolve 8,263/203,799 sampled entities; 5/23,535 map names, all five confirmed by the map 64-bit key. |
