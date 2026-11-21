@@ -1,9 +1,11 @@
 # Differential shader validation
 
-This note designs a value-level check for the RDNA2 → SPIR-V translator. It is a plan and a
-prototype, not a claim that the corpus is correct. The prototype in `tools/cpu_ref.py` executes a
-small straight-line instruction subset from a `shader_ir` listing; the GPU side and the corpus
-runner described here are not implemented yet.
+This note describes a value-level check for the RDNA2 → SPIR-V translator; it is not a claim that
+the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is implemented and
+tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
+translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
+Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
+harness itself). The GPU-side runner described below is still future work.
 
 ## Why `spirv-val` is not enough
 
@@ -38,10 +40,11 @@ Two independent computations start from the same architectural state:
 The comparison is bit-for-bit on every value the test declares observable. A mismatch is reported
 with the first differing lane/register, both bit patterns, the random seed, and (in the future
 runner) the RDNA2 instruction that last wrote the value. The translator is the path under test; the
-CPU and GPU are the two independent oracles. The existing translator → `spirv-as`/`spirv-val` →
-Vulkan tools path is what the GPU oracle runs, not a reference to be trusted. A hand-written SPIR-V
-twin of a test program is a useful third control: it checks the harness and driver without involving
-the translator, so a harness failure is not blamed on translation.
+CPU model and the SPIR-V interpreter are the two independent oracles in the shipped CPU runner. The
+translator → `spirv-as`/`spirv-val` → Vulkan tools path is what the future GPU oracle will run, not
+a reference to be trusted. A hand-written SPIR-V twin of a test program is a useful third control: it
+checks the harness and driver without involving the translator, so a harness failure is not blamed on
+translation.
 
 The CPU model is deliberately not a second translator. It interprets the listing's mnemonics and
 operands; it never consumes SPIR-V. That independence is what makes a disagreement meaningful.
@@ -77,7 +80,7 @@ operands; it never consumes SPIR-V. That independence is what makes a disagreeme
 
 The repository already has the pieces: `runtime/test/shaders/build.py` assembles `.asm` with
 `llvm-mc`, `tools/rdna2spirv.py` translates the resulting `.s`, and the `runtime/test/vk_*_test.cpp`
-programs dispatch SPIR-V on Vulkan and read buffers/images back. A differential runner would:
+programs dispatch SPIR-V on Vulkan and read buffers/images back. A GPU-side differential runner would:
 
 1. assemble the `.asm` to a `.s` listing with `llvm-mc -show-encoding`;
 2. run the CPU model on that listing with the test's inputs;
