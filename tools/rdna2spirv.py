@@ -98,7 +98,6 @@ class Gen:
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
         self.uses_ballot = False       # wave mask ballot (OpGroupNonUniformBallot)
-        self.mask_sgprs = set()        # SGPRs currently holding a per-lane wave mask
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
         self.cur_masks = frozenset()
@@ -146,8 +145,6 @@ class Gen:
         return t
 
     def store_reg(self, kind, r, val):
-        if kind == "sgpr":
-            self.mask_sgprs.discard(r)
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
         p = self.tmp()
         self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
@@ -348,9 +345,6 @@ class Gen:
             raise Unsupported("s_mov_b64 source")
         self.store_reg("sgpr", d["r"], lo)
         self.store_reg("sgpr", d["r"] + 1, hi)
-        if (s["k"] == "special" and s["t"] in ("exec", "exec_lo", "vcc", "vcc_lo")) or \
-                (s["k"] == "sgpr" and s["r"] in self.mask_sgprs):
-            self.mask_sgprs.update((d["r"], d["r"] + 1))
 
     def compare(self, op, a, scalar, exec_only=False):
         """v_cmp_* / s_cmp_*: lane result into VCC/SGPR mask (vector), SCC (scalar), or EXEC (v_cmpx)."""
@@ -1379,36 +1373,12 @@ class Gen:
             self.set_exec(v)
         elif d["k"] == "sgpr":
             self.store_reg("sgpr", d["r"], v)
-            self.mask_sgprs.add(d["r"])
             if d.get("n") == 2:
                 self.store_reg("sgpr", d["r"] + 1, v)
-                self.mask_sgprs.add(d["r"] + 1)
         elif d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {v}")
         else:
             raise Unsupported("mask destination")
-
-    def ballot_pair(self, arg, is64):
-        """Return (lo, hi) 32-bit mask words. If arg holds a per-lane wave mask, reconstruct the wave-wide
-        64-bit bitmask via OpGroupNonUniformBallot."""
-        is_mask = (arg["k"] == "special" and arg["t"] in ("exec", "exec_lo", "vcc", "vcc_lo")) or \
-                  (arg["k"] == "sgpr" and arg["r"] in self.mask_sgprs)
-        if is_mask:
-            self.uses_ballot = True
-            self.uses_subgroup = True
-            pred = self.tmp_bool_nz(self.mask_src(arg))
-            bal, lo = self.tmp(), self.tmp()
-            self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 {pred}")
-            self.emit(f"{lo} = OpCompositeExtract %uint {bal} 0")
-            if is64:
-                hi = self.tmp()
-                self.emit(f"{hi} = OpCompositeExtract %uint {bal} 1")
-            else:
-                hi = self.cu(0)
-            return lo, hi
-        if is64 and arg["k"] == "sgpr" and arg.get("n") == 2:
-            return self.load_reg("sgpr", arg["r"]), self.load_reg("sgpr", arg["r"] + 1)
-        return self.src_u(arg), self.cu(0)
 
     def clamp_mods(self, v, mods):
         # Output modifier (mul:2 / mul:4 / div:2) is applied before clamp, as on hardware.
@@ -5313,7 +5283,6 @@ def translate(path):
     for n, blk in enumerate(blocks):
         g.body = []
         g.block_label = f"%blk{n}"
-        g.mask_sgprs.clear()
         term = None
         for ins in blk:
             op = base_op(ins["op"])
