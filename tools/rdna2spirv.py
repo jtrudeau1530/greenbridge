@@ -2205,6 +2205,9 @@ class Gen:
                     half = self.mask_half(a[1])
                     if half is not None:
                         lo, hi = (hi if half == "hi" else lo), self.cu(0)
+            elif op.endswith("b32") or a[1]["k"] == "imm":
+                # A b32 source is a plain scalar value, not a lane mask; for b64 an immediate is the low word.
+                lo, hi = self.src_u(a[1]), self.cu(0)
             elif a[1]["k"] != "sgpr" or a[1].get("n") != 2:
                 lo, hi = self.mask_src(a[1]), self.cu(0)
             else:
