@@ -5,6 +5,7 @@
 The test programs are vk_compute_test, vk_store_test and vk_harness (runtime/build by default). Each line is one
 shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes 0-31, since a GPU
 with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
+The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 """
 import collections
 import math
@@ -19,9 +20,9 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
 
-COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_wavemask", "1", "wavemask"),
-           ("cs_bvh", "1", "bvh")]
+COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
+WAVE64_BALLOT = [32, 16, 24, 40, 8, 48]  # cs_wave64_ballot.asm: three (popcount, first lane) pairs
 PIXEL_BITS = {"ps_ops": (0x48804300, 5, 7, 0xfffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xfffffffa, 7),
               "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000)}
@@ -36,6 +37,32 @@ def run(*cmd):
 def failure(code, output, lines):
     details = "\n".join(output.strip().splitlines()[-lines:])
     return f"exit {code}: {details or 'no test output'}"
+
+
+def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None):
+    """Return an empty string for a pass, None for unsupported wave64, or a failure diagnostic."""
+    shader = os.path.join(spirv, name + ".spv")
+    args = []
+    if require_wave64:
+        if not os.path.isfile(shader):
+            return f"missing {name}.spv"
+        args.append("--require-wave64")
+    code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args)
+    if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
+        return None
+    if code != 0:
+        return failure(code, out, 2)
+    if require_wave64 and "compute subgroup size: 64" not in out.splitlines():
+        return "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    if expected_words is not None:
+        m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
+        if m and [int(x) for x in m.group(1).split()][:len(expected_words)] == expected_words:
+            return ""
+    else:
+        m = re.search(r"(\d+) mismatches", out)
+        if m and m.group(1) == "0":
+            return ""
+    return failure(code, out, 2)
 
 
 def pixels(tools, spirv, name, fmt):
@@ -92,13 +119,11 @@ def main():
     tools = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, "..", "..", "build")
     results = []
     for name, groups, expect in COMPUTE:
-        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"), groups, expect)
-        m = re.search(r"(\d+) mismatches", out)
-        results.append((name, "" if code == 0 and m and m.group(1) == "0" else failure(code, out, 2)))
-    code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, "cs_store.spv"), "1", "dump")
-    m = re.search(r"out\[0\.\.7\] = (.*)", out)
-    got = [int(x) for x in m.group(1).split()[:6]] if m else None
-    results.append(("cs_store", "" if code == 0 and got == CS_STORE else failure(code, out, 2)))
+        results.append((name, compute_test(tools, spirv, name, groups, expect)))
+    results.append(("cs_store", compute_test(tools, spirv, "cs_store", "1", "dump", expected_words=CS_STORE)))
+    results.append(("cs_wavemask", compute_test(tools, spirv, "cs_wavemask", "1", "wavemask", require_wave64=True)))
+    results.append(("cs_wave64_ballot", compute_test(tools, spirv, "cs_wave64_ballot", "1", "dump",
+                                                    require_wave64=True, expected_words=WAVE64_BALLOT)))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         bad = re.findall(r"(\d+) bad", out)
@@ -106,9 +131,12 @@ def main():
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
     for name, problem in results:
+        if problem is None:
+            problem = "SKIP (full 64-wide compute subgroups unavailable)"
         print(f"{name:20} {'ok' if not problem else problem}")
     failed = sum(bool(p) for _, p in results)
-    print(f"{len(results) - failed} of {len(results)} pass")
+    skipped = sum(p is None for _, p in results)
+    print(f"{len(results) - failed - skipped} of {len(results)} pass, {skipped} skipped")
     return 1 if failed else 0
 
 

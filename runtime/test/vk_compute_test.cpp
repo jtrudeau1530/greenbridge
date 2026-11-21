@@ -1,7 +1,8 @@
 // Headless Vulkan compute test for translated compute shaders.
-// Usage: vk_compute_test cs.spv groups expect
+// Usage: vk_compute_test cs.spv groups expect [--require-wave64]
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
 //            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
+//   --require-wave64: require full 64-wide subgroups (local size X must be a multiple of 64), or exit 77.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
 #include "vulkan_loader.h"
@@ -25,8 +26,9 @@ static PFN_vkGetInstanceProcAddr gipa;
     } while (0)
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect\n");
+    const bool require_wave64 = argc == 5 && !std::strcmp(argv[4], "--require-wave64");
+    if (argc != 4 && !require_wave64) {
+        std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
         return 2;
     }
     const uint32_t groups = uint32_t(atoi(argv[2]));
@@ -53,10 +55,16 @@ int main(int argc, char** argv) {
         VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
         if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
     }
+    if (!pd) {
+        std::fprintf(stderr, "no Vulkan physical device found\n");
+        return 1;
+    }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    subgroup.pNext = &sgProps;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    props2.pNext = &sgProps;
+    props2.pNext = &subgroup;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
     uint32_t qn = 0;
@@ -72,11 +80,21 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
+    const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
+    const uint32_t req_sg = require_wave64 ? 64u : (sg_env ? uint32_t(std::atoi(sg_env)) : 0u);
+    const bool can_request_size = req_sg > 0 && f13q.subgroupSizeControl &&
+        req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize &&
+        (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+    if (require_wave64 && (!f13q.computeFullSubgroups || (!can_request_size && subgroup.subgroupSize != 64))) {
+        std::fprintf(stderr, "full 64-wide compute subgroups unavailable\n");
+        return 77;
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
-    if (f13q.subgroupSizeControl) {
-        f13.subgroupSizeControl = VK_TRUE;
+    if (f13q.subgroupSizeControl || require_wave64) {
+        f13.subgroupSizeControl = f13q.subgroupSizeControl;
+        f13.computeFullSubgroups = require_wave64 ? VK_TRUE : VK_FALSE;
         f12.pNext = &f13;
     }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -144,17 +162,16 @@ int main(int argc, char** argv) {
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
-    const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
-    const uint32_t req_sg = sg_env ? uint32_t(std::atoi(sg_env)) : 0;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
     reqSg.requiredSubgroupSize = req_sg;
-    if (req_sg > 0 && f13q.subgroupSizeControl &&
-        req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize &&
-        (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
+    if (can_request_size)
         cpi.stage.pNext = &reqSg;
+    if (require_wave64)
+        cpi.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     cpi.layout = pl;
     VkPipeline pipe; CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
+    if (require_wave64) std::printf("compute subgroup size: 64\n");
 
     uint32_t pc[36] = {};
     pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0;     // V#: base 0, stride 0, num_records max

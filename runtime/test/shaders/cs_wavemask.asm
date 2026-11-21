@@ -7,7 +7,7 @@
 ; with all lanes on, and moved into EXEC: lanes 16-47 again, which set bit 7 of the top byte. A second copy goes
 ; through the vector unit (v_mov_b32 / v_or3_b32 / v_readfirstlane_b32, the way three SGPRs get ORed) into s[12:13]
 ; and into EXEC: the same lanes set bit 6.
-; Same FSSM header as cs_lds. Run: vk_compute_test cs_wavemask.spv 1 wavemask
+; Same FSSM header as cs_lds. Run: vk_compute_test cs_wavemask.spv 1 wavemask --require-wave64
 ;   -> out[t] = 65 | 16 << 8 | 8 << 16 | (0xc0 + t - 16 for t in 16..47, else 0) << 24
 v_mbcnt_lo_u32_b32 v1, -1, 0
 v_mbcnt_hi_u32_b32 v1, -1, v1

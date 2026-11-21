@@ -65,9 +65,11 @@ python -I runtime/test/shaders/build.py <out>
 python -I runtime/test/shaders/check.py <out> [runtime-build-directory]
 ```
 
-On an AMD Radeon RX 9070 XT, all 17 checks pass. The wave-mask fixture checks every lane and the flat-input
-fixture checks both integer IDs and interpolated UVs. The corpus comparison is a separate test and uses
-shader files from the local build.
+The wave-mask fixture checks every lane and the wave64 ballot fixture checks mask counts and first-set lanes
+across both halves of a wave. Rebuild `vk_compute_test` before running `check.py`. It uses a full 64-wide compute
+subgroup for these two checks, and the summary reports them as skipped if the device cannot provide one.
+`cs_exec64` still checks per-lane EXEC writes on 32-wide subgroups. The flat-input fixture checks both integer
+IDs and interpolated UVs. The corpus comparison is a separate test and uses shader files from the local build.
 
 ## Build the runtime
 
