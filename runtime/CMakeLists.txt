@@ -159,6 +159,8 @@ if(BUILD_TESTING)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
+  add_executable(descriptor_table_test test/descriptor_table_test.cpp)
+  add_test(NAME descriptor_table COMMAND descriptor_table_test)
   if(WIN32)
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_decode_test

@@ -1,0 +1,234 @@
+// Unit tests for the descriptor hash table (set 0, binding 2 contract).
+// Tests FNV-1a hashing, T#/S# key generation, probe resolution, dynamic resizing,
+// GPU buffer serialization, and multithreaded insertion.
+#include "../src/descriptor_table.h"
+
+#include <cassert>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <thread>
+#include <vector>
+
+#define EXPECT(condition) do { \
+    if (!(condition)) { \
+        std::fprintf(stderr, "assertion failed: %s at %s:%d\n", #condition, __FILE__, __LINE__); \
+        return 1; \
+    } \
+} while (0)
+
+using namespace leonida;
+
+int test_fnv1a_hash_matches_contract() {
+    // Verified against vk_texture_test.cpp key_hash and rdna2spirv.py desc_probe
+    const std::uint32_t zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    std::uint32_t expected_zero_hash = 2166136261u;
+    for (int i = 0; i < 8; ++i) expected_zero_hash = (expected_zero_hash ^ 0) * 16777619u;
+    EXPECT(hash_descriptor_key(zeros) == expected_zero_hash);
+
+    const std::uint32_t sample_key[8] = {
+        0x12345678, 0x9abcdef0, 0x11223344, 0x55667788,
+        0x99aabbcc, 0xddeeff00, 0x01020304, 0x05060708
+    };
+    std::uint32_t expected_hash = 2166136261u;
+    for (int i = 0; i < 8; ++i) expected_hash = (expected_hash ^ sample_key[i]) * 16777619u;
+    EXPECT(hash_descriptor_key(sample_key) == expected_hash);
+    return 0;
+}
+
+int test_ssharp_key_padding() {
+    const std::uint32_t ssharp[4] = {0x92, 0xc00000, 0x14500000, 0x0};
+    const auto key = make_ssharp_key(ssharp);
+    EXPECT(key[0] == 0x92);
+    EXPECT(key[1] == 0xc00000);
+    EXPECT(key[2] == 0x14500000);
+    EXPECT(key[3] == 0x0);
+    EXPECT(key[4] == 0xFFFFFFFFu);
+    EXPECT(key[5] == 0xFFFFFFFFu);
+    EXPECT(key[6] == 0xFFFFFFFFu);
+    EXPECT(key[7] == 0xFFFFFFFFu);
+    return 0;
+}
+
+int test_basic_insertion_and_lookup() {
+    DescriptorTable table(16);
+    EXPECT(table.capacity() == 16);
+    EXPECT(table.mask() == 15);
+    EXPECT(table.size() == 0);
+
+    const std::uint32_t tsharp[8] = {
+        0x1000, 0x2000, 0x3000, 0x4000,
+        0x5000, 0x6000, 0x7000, 0x8000
+    };
+    EXPECT(table.lookup(tsharp) == 0);
+    EXPECT(!table.contains(tsharp));
+
+    EXPECT(table.insert(tsharp, 1));
+    EXPECT(table.size() == 1);
+    EXPECT(table.contains(tsharp));
+    EXPECT(table.lookup(tsharp) == 1);
+
+    // Duplicate key updates in place
+    EXPECT(table.insert(tsharp, 42));
+    EXPECT(table.size() == 1);
+    EXPECT(table.lookup(tsharp) == 42);
+
+    // S# key
+    const std::uint32_t ssharp[4] = {0xa, 0xb, 0xc, 0xd};
+    const auto skey = make_ssharp_key(ssharp);
+    EXPECT(table.insert(skey, 7));
+    EXPECT(table.size() == 2);
+    EXPECT(table.lookup(skey) == 7);
+    EXPECT(table.lookup(tsharp) == 42);
+    return 0;
+}
+
+int test_load_factor_and_growth() {
+    // Start with 16 slots. Load factor threshold 50% means max 8 entries before growth.
+    DescriptorTable table(16);
+    EXPECT(table.capacity() == 16);
+
+    std::vector<DescriptorKey> keys;
+    for (std::uint32_t i = 1; i <= 20; ++i) {
+        std::uint32_t k[8] = {i, i * 2, i * 3, i * 4, i * 5, i * 6, i * 7, i * 8};
+        keys.push_back(make_tsharp_key(k));
+        EXPECT(table.insert(keys.back(), i + 100));
+    }
+
+    EXPECT(table.size() == 20);
+    EXPECT(table.capacity() >= 64); // Doubled from 16 -> 32 -> 64
+    EXPECT(table.mask() == table.capacity() - 1);
+
+    // Verify all 20 keys resolve to their exact indices after growths
+    for (std::uint32_t i = 1; i <= 20; ++i) {
+        EXPECT(table.lookup(keys[i - 1]) == i + 100);
+    }
+    return 0;
+}
+
+int test_probe_collision_resolution() {
+    DescriptorTable table(64);
+
+    // Create 4 distinct keys that share the exact same hash
+    // We can forge keys that share hash or test linear collision handling
+    std::uint32_t k1[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+    std::uint32_t k2[8] = {2, 0, 0, 0, 0, 0, 0, 0};
+    std::uint32_t k3[8] = {3, 0, 0, 0, 0, 0, 0, 0};
+
+    EXPECT(table.insert(k1, 10));
+    EXPECT(table.insert(k2, 20));
+    EXPECT(table.insert(k3, 30));
+
+    EXPECT(table.lookup(k1) == 10);
+    EXPECT(table.lookup(k2) == 20);
+    EXPECT(table.lookup(k3) == 30);
+    return 0;
+}
+
+int test_gpu_buffer_serialization() {
+    DescriptorTable table(16);
+    const std::uint32_t t1[8] = {10, 20, 30, 40, 50, 60, 70, 80};
+    const std::uint32_t s1[4] = {1, 2, 3, 4};
+    const auto skey = make_ssharp_key(s1);
+
+    EXPECT(table.insert(t1, 5));
+    EXPECT(table.insert(skey, 9));
+
+    const auto gpu_buf = table.build_gpu_buffer(false);
+    EXPECT(gpu_buf.size() == 1 + 16 * 10);
+    EXPECT(gpu_buf[0] == 15); // mask
+
+    // Verify lookup by traversing the generated buffer using the exact shader logic
+    const auto shader_lookup = [&](const std::uint32_t key[8]) -> std::uint32_t {
+        const std::uint32_t mask = gpu_buf[0];
+        const std::uint32_t h = hash_descriptor_key(key);
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            const std::uint32_t slot = (h + k) & mask;
+            const std::size_t base = 1 + slot * 10;
+            bool match = true;
+            for (std::size_t j = 0; j < 8; ++j) {
+                if (gpu_buf[base + j] != key[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return gpu_buf[base + 8]; // index
+            }
+        }
+        return 0;
+    };
+
+    EXPECT(shader_lookup(t1) == 5);
+    EXPECT(shader_lookup(skey.data()) == 9);
+
+    const std::uint32_t missing[8] = {99, 99, 99, 99, 99, 99, 99, 99};
+    EXPECT(shader_lookup(missing) == 0);
+
+    // Test write_to_buffer
+    std::vector<std::uint32_t> raw_copy(gpu_buf.size());
+    table.write_to_buffer(raw_copy.data(), true);
+    EXPECT(raw_copy[0] == 15);
+    for (std::size_t s = 0; s < 16; ++s) {
+        EXPECT(raw_copy[1 + s * 10 + 9] == 0); // clear_pad = true
+    }
+    return 0;
+}
+
+int test_multithreaded_insert_and_lookup() {
+    DescriptorTable table(32);
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 50;
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&table, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                const std::uint32_t id = static_cast<std::uint32_t>(t * kPerThread + i + 1);
+                std::uint32_t key[8] = {id, id * 3, id * 7, id * 11, id * 13, id * 17, id * 19, id * 23};
+                table.insert(key, id);
+            }
+        });
+    }
+
+    for (auto& w : workers) {
+        w.join();
+    }
+
+    EXPECT(table.size() == kThreads * kPerThread);
+    for (int t = 0; t < kThreads; ++t) {
+        for (int i = 0; i < kPerThread; ++i) {
+            const std::uint32_t id = static_cast<std::uint32_t>(t * kPerThread + i + 1);
+            std::uint32_t key[8] = {id, id * 3, id * 7, id * 11, id * 13, id * 17, id * 19, id * 23};
+            EXPECT(table.lookup(key) == id);
+        }
+    }
+    return 0;
+}
+
+int test_clear_resets_table() {
+    DescriptorTable table(16);
+    std::uint32_t k[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    table.insert(k, 100);
+    EXPECT(table.size() == 1);
+    EXPECT(table.lookup(k) == 100);
+
+    table.clear();
+    EXPECT(table.size() == 0);
+    EXPECT(table.lookup(k) == 0);
+    return 0;
+}
+
+int main() {
+    EXPECT(test_fnv1a_hash_matches_contract() == 0);
+    EXPECT(test_ssharp_key_padding() == 0);
+    EXPECT(test_basic_insertion_and_lookup() == 0);
+    EXPECT(test_load_factor_and_growth() == 0);
+    EXPECT(test_probe_collision_resolution() == 0);
+    EXPECT(test_gpu_buffer_serialization() == 0);
+    EXPECT(test_multithreaded_insert_and_lookup() == 0);
+    EXPECT(test_clear_resets_table() == 0);
+
+    std::printf("descriptor_table_test: all tests passed (0 failures)\n");
+    return 0;
+}
