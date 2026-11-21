@@ -343,6 +343,19 @@ def test_ms_clip_and_cull_distances_across_pos1_pos2(make_shader):
     assert not ({1, 2} & set(meta.get("params", [])))
 
 
+def test_wave64_detected_from_mask_ops_without_exec_markers(make_shader):
+    """#210 part 2 / SHADER-28: s_bcnt1_i32_b64 on ordinary SGPRs marks the shader wave64 (no exec_hi / saveexec)."""
+    shader = make_shader(
+        "; mattr: +wavefrontsize64,-wavefrontsize32\n"
+        "v_and_b32_e32 v5, 5, v0\nv_cmp_ne_u32_e64 s[20:21], 0, v5\n"
+        "s_bcnt1_i32_b64 s30, s[20:21]\nv_mov_b32 v1, s30\ns_endpgm\n",
+        name="cs_mask_detect_ci",
+    )
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.wave64
+
+
 def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
     """Wave64 s_bfm_b64 must use wave_lane() and reconstruct the 64-bit mask; 32-bit half ops must guard their half."""
     bfm = make_shader("s_mov_b64 exec, -1\ns_bfm_b64 s[6:7], 16, 8\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n",

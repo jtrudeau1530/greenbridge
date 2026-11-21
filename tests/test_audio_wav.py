@@ -64,5 +64,80 @@ class AudioWavTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import audio_wav  # noqa: E402
+
+# Stands in for ffmpeg: writes the input's file name into the output, so each WAV shows which file it came from.
+FAKE_FFMPEG = """import os, sys
+args = sys.argv[1:]
+src = args[args.index("-i") + 1]
+with open(args[-1], "wb") as f:
+    f.write(b"FAKE:" + os.path.basename(src).encode())
+"""
+
+
+class SameStemTest(unittest.TestCase):
+    """x.ogg and x.opus both decoded to x.wav: two jobs raced on one file and one result was lost."""
+
+    def test_inputs_that_share_a_stem_keep_their_extension(self):
+        items = [("d/x.ogg", "x"), ("d/x.opus", "x"), ("d/y.ogg", "y")]
+        self.assertEqual(audio_wav.output_names(items),
+                         ([("d/x.ogg", "x.ogg"), ("d/x.opus", "x.opus"), ("d/y.ogg", "y")], 2))
+
+    def test_unique_names_are_unchanged(self):
+        items = [("a/x.ogg", os.path.join("a", "x")), ("b/x.opus", os.path.join("b", "x")), ("y.opus", "y")]
+        self.assertEqual(audio_wav.output_names(items), (items, 0))
+
+    def test_a_name_that_still_clashes_gets_a_counter(self):
+        # x.ogg keeps its extension (it clashes with x.opus) and then meets x.ogg.ogg's plain stem.
+        items = [("x.ogg", "x"), ("x.ogg.ogg", "x.ogg"), ("x.opus", "x")]
+        named, _ = audio_wav.output_names(items)
+        self.assertEqual(named, [("x.ogg", "x.ogg"), ("x.ogg.ogg", "x.ogg~2"), ("x.opus", "x.opus")])
+
+    def test_names_that_differ_only_in_case_clash_where_the_file_system_ignores_case(self):
+        items = [("x.ogg", "x"), ("X.OPUS", "X")]
+        named, renamed = audio_wav.output_names(items)
+        if os.path.normcase("X") == os.path.normcase("x"):
+            self.assertEqual((named, renamed), ([("x.ogg", "x.ogg"), ("X.OPUS", "X.OPUS")], 2))
+        else:
+            self.assertEqual((named, renamed), (items, 0))
+
+    def test_every_input_gets_its_own_wav(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            out = os.path.join(tmp, "out")
+            os.makedirs(src)
+            for name in ("x.ogg", "x.opus", "y.ogg"):
+                with open(os.path.join(src, name), "wb") as f:
+                    f.write(b"OggS" + b"\0" * 24 + b"OpusHead" + bytes(64))
+            script = os.path.join(tmp, "fake_ffmpeg.py")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write(FAKE_FFMPEG)
+            if os.name == "nt":
+                ffmpeg = os.path.join(tmp, "ffmpeg.cmd")
+                with open(ffmpeg, "w", encoding="utf-8") as f:
+                    f.write(f'@"{sys.executable}" "{script}" %*\n')
+            else:
+                ffmpeg = os.path.join(tmp, "ffmpeg")
+                with open(ffmpeg, "w", encoding="utf-8") as f:
+                    f.write(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+                os.chmod(ffmpeg, 0o755)
+
+            run = [sys.executable, "-I", TOOL, src, "--out", out, "--jobs", "3", "--ffmpeg", ffmpeg]
+            p = subprocess.run(run, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("3 WAV written", p.stdout)
+            self.assertIn("2 file(s) share a name", p.stdout)
+            got = {}
+            for name in sorted(os.listdir(out)):
+                with open(os.path.join(out, name), "rb") as f:
+                    got[name] = f.read()
+            self.assertEqual(got, {"x.ogg.wav": b"FAKE:x.ogg", "x.opus.wav": b"FAKE:x.opus", "y.wav": b"FAKE:y.ogg"})
+
+            p = subprocess.run(run, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("0 WAV written, 3 already present", p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

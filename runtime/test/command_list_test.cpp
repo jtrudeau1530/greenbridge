@@ -119,12 +119,25 @@ int main() {
     CHECK(!list.copy_texture({texture, 0, 0, 0, texture, true, {2, 2, 0, 2, 6, 1}}));          // empty box
     CHECK(list.copy_resource({5, 6}));
     CHECK(!list.copy_resource({5, 5}));
+    // A volume's box has a z range, and its footprint a depth; a resolve needs two different resources.
+    CHECK(list.copy_texture({texture, 0, 0, 2, {4, true, 0, 512, 4, 4, 4, 256}, true, {0, 0, 1, 4, 4, 3}}));
+    CHECK(!list.copy_texture({texture, 0, 0, 0, {4, true, 0, 512, 4, 4, 0, 256}, false, {}}));  // no slices
+    CHECK(!list.copy_texture({texture, 0, 0, 0, texture, true, {0, 0, 2, 4, 4, 2}}));           // empty in z
+    CHECK(list.resolve_subresource({7, 1, 8, 0}));
+    CHECK(!list.resolve_subresource({7, 0, 7, 0}));
+    CHECK(!list.resolve_subresource({0, 0, 8, 0}));
+    CHECK(!list.resolve_subresource({7, 0, 0, 0}));
     CHECK(list.close());
-    CHECK(list.commands().size() == 4);
+    CHECK(!list.resolve_subresource({7, 1, 8, 0}));
+    CHECK(list.commands().size() == 6);
     CHECK(std::get<CopyBuffer>(list.commands()[0]).src_offset == 16);
     CHECK(std::get<CopyTexture>(list.commands()[1]).src.footprint && !std::get<CopyTexture>(list.commands()[1]).has_box);
     CHECK(std::get<CopyTexture>(list.commands()[2]).box.right == 6);
     CHECK(std::get<CopyResource>(list.commands()[3]).src == 6);
+    const auto& slices = std::get<CopyTexture>(list.commands()[4]);
+    CHECK(slices.z == 2 && slices.src.depth == 4 && slices.box.front == 1 && slices.box.back == 3);
+    const auto& resolved = std::get<ResolveSubresource>(list.commands()[5]);
+    CHECK(resolved.dst == 7 && resolved.dst_subresource == 1 && resolved.src == 8 && resolved.src_subresource == 0);
 
     CHECK(list.reset());
     CHECK(!list.closed() && list.commands().empty());

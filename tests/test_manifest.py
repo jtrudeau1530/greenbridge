@@ -327,6 +327,66 @@ class ManifestCliTest(unittest.TestCase):
                     with open(self.out_manifest, "rb") as f:
                         self.assertEqual(f.read(), original)
 
+    def test_cli_verify_reports_a_damaged_manifest_without_a_traceback(self):
+        damaged = {
+            "truncated": b'{"created": "x", "files": {"sample.dat": {"si',
+            "not_utf8": b'\xff\xfe{"files": {}}',
+            "not_an_object": b"[]",
+            "files_is_a_list": b'{"files": []}',
+            "no_files": b'{"created": "x"}',
+            "entry_is_a_number": b'{"files": {"sample.dat": 5}}',
+            "no_sha256": b'{"files": {"sample.dat": {"size": 22}}}',
+            "size_is_a_string": b'{"files": {"sample.dat": {"size": "22", "sha256": "00"}}}',
+        }
+        for name, data in damaged.items():
+            with self.subTest(name=name):
+                path = os.path.join(self.tmp.name, f"{name}.json")
+                with open(path, "wb") as f:
+                    f.write(data)
+                result = self.run_cli("verify", self.pkg, "--manifest", path, "--jobs", "1")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertIn(f"{name}.json", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+
+class ManifestAtomicCreateTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pkg = os.path.join(self.tmp.name, "pkg")
+        os.makedirs(self.pkg)
+        with open(os.path.join(self.pkg, "sample.dat"), "wb") as f:
+            f.write(b"atomic create payload")
+        self.out = os.path.join(self.tmp.name, "manifest.json")
+
+    def create(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return manifest.create(self.pkg, self.out, jobs=1)
+
+    def test_an_interrupted_create_keeps_the_previous_manifest(self):
+        self.assertEqual(self.create(), 0)
+        with open(self.out, "rb") as f:
+            original = f.read()
+        with open(os.path.join(self.pkg, "added.dat"), "wb") as f:
+            f.write(b"new file")
+
+        for error in (OSError, KeyboardInterrupt):
+            with self.subTest(error=error.__name__):
+                def fail(obj, f, **kwargs):
+                    f.write('{"created": "')
+                    raise error("stopped")
+                with patch.object(manifest.json, "dump", side_effect=fail):
+                    with self.assertRaises(error):
+                        self.create()
+                with open(self.out, "rb") as f:
+                    self.assertEqual(f.read(), original)
+                self.assertEqual(sorted(os.listdir(self.tmp.name)), ["manifest.json", "pkg"])
+
+        self.assertEqual(self.create(), 0)
+        self.assertEqual(sorted(manifest.load_manifest(self.out)), ["added.dat", "sample.dat"])
+
 
 class ManifestBelowNormalTest(unittest.TestCase):
     def test_below_normal_callable(self):

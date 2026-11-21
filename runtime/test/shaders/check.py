@@ -2,14 +2,15 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test and vk_harness (runtime/build by default). Each line is one
-shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes 0-31, since a GPU
-with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
+The test programs are vk_compute_test, vk_store_test, vk_harness and vk_bindless_test (runtime/build by default).
+Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
+0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
 to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
 fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
+ps_tex is skipped when the device lacks a feature the bindless set or the shader needs.
 """
 import collections
 import json
@@ -33,7 +34,9 @@ CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed001
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
-            ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48])]
+            ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
+            # mask-only wave64: s_bcnt1_i32_b64 on ordinary SGPRs, no WAVE64_RE EXEC markers (#210 / SHADER-28)
+            ("cs_w64_mask_detect", [48])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
@@ -209,6 +212,20 @@ def subgroup_size(spirv, name):
         return None
 
 
+def bindless_test(tools, spirv):
+    """ps_tex: a texture found through the descriptor hash table and the bindless set (vk_bindless_test)."""
+    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_tex")]
+    for path in shaders:
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    code, out = run(os.path.join(tools, "vk_bindless_test" + EXE), *shaders)
+    if code == UNSUPPORTED:
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    m = re.search(r"(\d+) draws read back, (\d+) bad pixels", out)
+    return "" if code == 0 and m and m.group(2) == "0" else failure(code, out, 3)
+
+
 def pixels(tools, spirv, name, fmt):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
@@ -332,6 +349,7 @@ def main():
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
+    results.append(("ps_tex", bindless_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"

@@ -634,7 +634,8 @@ class Gen:
             self.dst({"k": "vgpr", "r": vd["r"] + i, "n": 1}, v)
 
     # GFX10 buffer formats (from Mesa src/amd/registers/gfx10-rsrc.json, GFX10_FORMAT):
-    #   code: (bytes, kind, component bit widths)
+    #   code: (bytes, kind, component bit widths from bit 0)
+    # The names list the widths from the top bit down, so 2_10_10_10 (50) is R10G10B10A2.
     FORMATS = {22: (4, "f32", (32,)), 64: (8, "f32", (32, 32)), 74: (12, "f32", (32, 32, 32)),
                77: (16, "f32", (32, 32, 32, 32)), 20: (4, "u32", (32,)), 62: (8, "u32", (32, 32)),
                75: (16, "u32", (32, 32, 32, 32)), 13: (2, "f16", (16,)), 29: (4, "f16", (16, 16)),
@@ -642,7 +643,7 @@ class Gen:
                56: (4, "unorm", (8, 8, 8, 8)), 57: (4, "snorm", (8, 8, 8, 8)), 60: (4, "uint", (8, 8, 8, 8)),
                7: (2, "unorm", (16,)), 23: (4, "unorm", (16, 16)), 24: (4, "snorm", (16, 16)),
                65: (8, "unorm", (16, 16, 16, 16)), 66: (8, "snorm", (16, 16, 16, 16)),
-               44: (4, "unorm", (10, 10, 10, 2)), 50: (4, "unorm", (2, 10, 10, 10)),
+               44: (4, "unorm", (2, 10, 10, 10)), 50: (4, "unorm", (10, 10, 10, 2)),
                69: (8, "uint", (16, 16, 16, 16)), 27: (4, "uint", (16, 16))}
 
     def encode_format(self, fcomps, icomps, code):
@@ -870,9 +871,15 @@ class Gen:
             self.emit(f"{v} = OpPhi %uint {v_do} {lbl_do} {self.cu(0)} {pre_label}")
             words.append(v)
         # Sub-dword formats start at the byte shift inside dword 0 (and may spill into dword 1).
-        w0s, w1s, nz, w1sh, merged, bw0 = (self.tmp() for _ in range(6))
+        w0s, w1s, nz, left, w1sh, merged, bw0 = (self.tmp() for _ in range(7))
         self.emit(f"{w0s} = OpShiftRightLogical %uint {words[0]} {bsh}")
-        self.emit(f"{w1sh} = OpISub %uint {self.cu(32)} {bsh}")
+        self.emit(f"{left} = OpISub %uint {self.cu(32)} {bsh}")
+        self.emit(f"{w1sh} = OpBitwiseAnd %uint {left} {self.cu(31)}")    # 32 when aligned, an undefined shift
+        # (32 - bsh) & 31 keeps the left shift below 32 for an aligned element; that result is discarded by the OpSelect.
+        w0s, w1s, nz, w1sh0, w1sh, merged, bw0 = (self.tmp() for _ in range(7))
+        self.emit(f"{w0s} = OpShiftRightLogical %uint {words[0]} {bsh}")
+        self.emit(f"{w1sh0} = OpISub %uint {self.cu(32)} {bsh}")
+        self.emit(f"{w1sh} = OpBitwiseAnd %uint {w1sh0} {self.cu(31)}")
         self.emit(f"{w1s} = OpShiftLeftLogical %uint {words[1]} {w1sh}")
         self.emit(f"{nz} = OpINotEqual %bool {bsh} {self.cu(0)}")
         self.emit(f"{merged} = OpBitwiseOr %uint {w0s} {w1s}")
@@ -1563,6 +1570,16 @@ class Gen:
         self.emit(f"{m} = OpBitwiseAnd %uint {a1} {a2}")
         self.emit(f"{sh} = OpShiftRightLogical %uint {m} {self.cu(31)}")
         self.scc_nonzero(sh)
+
+    def bfe_width(self, off, wid):
+        """A bitfield-extract width cut to 32 - off (off in 0-31): SPIR-V leaves offset + count > 32 undefined. The
+        field then runs to bit 31, which is the hardware result: LLVM's constantFoldBFE (AMDGPUISelLowering.cpp)
+        gives Src0 >> Offset there, logical for the unsigned and arithmetic for the signed extract."""
+        room, fits, w = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{room} = OpISub %uint {self.cu(32)} {off}")
+        self.emit(f"{fits} = OpULessThan %bool {wid} {room}")
+        self.emit(f"{w} = OpSelect %uint {fits} {wid} {room}")
+        return w
 
     def tmp_bool_nz(self, v):
         b = self.tmp()
@@ -2408,11 +2425,13 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_alignbyte_b32":
             # (({src0, src1} as 64 bits) >> (8 * (src2 & 3))) low 32 bits
+            # (32 - b) & 31 keeps the left shift below 32 when b == 0; that result is discarded by the OpSelect.
             hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
-            m, b, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(8))
+            m, b, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(9))
             self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
             self.emit(f"{b} = OpShiftLeftLogical %uint {m} {self.cu(3)}")
-            self.emit(f"{inv} = OpISub %uint {self.cu(32)} {b}")
+            self.emit(f"{inv0} = OpISub %uint {self.cu(32)} {b}")
+            self.emit(f"{inv} = OpBitwiseAnd %uint {inv0} {self.cu(31)}")
             self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {b}")
             self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {inv}")
             self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
@@ -3133,6 +3152,7 @@ class Gen:
             off, wid, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{off} = OpBitwiseAnd %uint {ctl} {self.cu(31)}")
             self.emit(f"{wid} = OpBitFieldUExtract %uint {ctl} {self.cu(16)} {self.cu(7)}")
+            wid = self.bfe_width(off, wid)
             if op == "s_bfe_u32":
                 self.emit(f"{r} = OpBitFieldUExtract %uint {x} {off} {wid}")
             else:
@@ -3406,8 +3426,9 @@ class Gen:
             om, wm, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{om} = OpBitwiseAnd %uint {o} {self.cu(31)}")
             self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
+            wc = self.bfe_width(om, wm)
             f = "OpBitFieldSExtract" if op.endswith("i32") else "OpBitFieldUExtract"
-            self.emit(f"{r} = {f} %uint {x} {om} {wm}")
+            self.emit(f"{r} = {f} %uint {x} {om} {wc}")
             self.dst(a[0], r)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])
@@ -5509,7 +5530,12 @@ def stage_of(name, path):
     return _STAGES.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
 
 
-WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
+# Wave64 markers in the instruction text. Besides EXEC/VCC forms, 64-bit lane-mask SOP1/SOP2 ops
+# (bcnt/ff/wqm/bfm) imply a 64-lane wave even when the mask lives in ordinary SGPR pairs (#210 part 2).
+WAVE64_RE = re.compile(
+    r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64|"
+    r"s_bcnt[01]_i32_b64|s_ff[01]_i32_b64|s_wqm_b64|s_bfm_b64"
+)
 
 
 def fold_far_branches(insns):
@@ -5632,15 +5658,27 @@ def input_signature(path, name):
 def same_encoding(raw, printed, op):
     """True if the bytes in the blob are the instruction LLVM printed. Exact match, except for fields the
     hardware ignores that LLVM re-encodes with its default: VOP3P op_sel_hi[2] (bit 14) on two-source packed
-    ops (seen: v_pk_add_f16 stored with 0, printed with 1)."""
+    ops (seen: v_pk_add_f16 stored with 0, printed with 1), and unused VOP3/VOP3P SRC1 (bits 49:41) and SRC2
+    (bits 58:50) fields, which the game's compiler stores as 0 and LLVM 23 prints as 0x80 (inline constant 0;
+    seen on two-source v_mul_legacy_f32/v_sub_f32/v_cmp_*_e64/v_mul_lo_u32/v_pk_mul_f16 and one-source
+    v_rcp/v_log/v_sqrt_f32_e64). LLVM decoded these bytes, so a source it actually reads would have printed as
+    s0, not 0x80."""
     if raw == printed:
         return True
     if len(raw) != len(printed) or len(raw) < 8:
         return False
-    diff = int.from_bytes(raw, "little") ^ int.from_bytes(printed, "little")
+    r = int.from_bytes(raw, "little")
+    diff = r ^ int.from_bytes(printed, "little")
+    vop3 = (printed[3] >> 2) == 0x35               # VOP3 (encoding 110101)
     vop3p = printed[3] == 0xCC
+    if vop3 or vop3p:
+        for shift in (41, 50):                     # SRC1, SRC2: unused field stored 0, printed 0x80
+            if (diff >> shift) & 0x1FF == 0x80 and (r >> shift) & 0x1FF == 0:
+                diff &= ~(0x1FF << shift)
     two_src = op.startswith("v_pk_") and not any(k in op for k in ("fma", "mad"))
-    return vop3p and two_src and diff == 1 << 14
+    if vop3p and two_src:
+        diff &= ~(1 << 14)
+    return diff == 0
 
 
 def output_signature(path, name):

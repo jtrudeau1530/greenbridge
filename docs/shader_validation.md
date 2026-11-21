@@ -153,8 +153,8 @@ double-rounded answer.
 
 ## Harness design
 
-A future `tools/shader_diff.py` would own the test table, the seed and the comparison, leaving
-`cpu_ref.py` a pure interpreter. Per case:
+`tools/shader_diff.py` owns the test table, the seed and the comparison, leaving
+`cpu_ref.py` a pure interpreter (it is never modified by the runner). Per case:
 
 - **Inputs.** Initial SGPRs/VGPRs (per lane), VCC, EXEC, and later buffer/image contents. Inputs are
   generated from a named seed (SplitMix64 or `random.Random(seed)`), so a failure is reproducible
