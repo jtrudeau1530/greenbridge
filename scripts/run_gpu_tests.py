@@ -396,9 +396,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
     return ok, detail
 
 
-# Shaders a selected test draws with, built even when the filter leaves them out (#192): ps_flat and
-# ps_texture_sample (vk_texture_test) are drawn with vs_ids.
-DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm"}
+# Shaders a selected test draws with, built even when the filter leaves them out (#192).
+DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm"}
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
