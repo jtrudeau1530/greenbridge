@@ -17,6 +17,10 @@ class DrawShaders(unittest.TestCase):
         self.assertEqual(run_gpu_tests.with_draw_shaders(["ps_texture_sample.asm"]),
                          ["ps_texture_sample.asm", "vs_ids.asm"])
 
+    def test_cube_sample_brings_vs_ids(self):
+        self.assertEqual(run_gpu_tests.with_draw_shaders(["ps_cube_sample.asm"]),
+                         ["ps_cube_sample.asm", "vs_ids.asm"])
+
     def test_flat_still_brings_vs_ids(self):
         self.assertEqual(run_gpu_tests.with_draw_shaders(["ps_flat.asm"]), ["ps_flat.asm", "vs_ids.asm"])
 

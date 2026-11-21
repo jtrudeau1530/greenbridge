@@ -15,7 +15,9 @@ Thanks for helping. A few rules keep the project safe to host:
 Claim the work in [#156](https://github.com/ItsNotRexed/Leonida/issues/156) first: check its tables and the open
 pull requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID
 in your pull request. When two pull requests overlap anyway, the one that lands first is merged and the other is
-asked to rebase or close. GPU test results go in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
+asked to rebase or close. GPU test results go in [#166](https://github.com/ItsNotRexed/Leonida/issues/166). Work on
+the D3D12 → Vulkan layer has its own page, [#313](https://github.com/ItsNotRexed/Leonida/issues/313): the critical
+path, who builds what, and which D3D12 methods are still open.
 
 ## Working on the code
 
@@ -36,6 +38,7 @@ asked to rebase or close. GPU test results go in [#166](https://github.com/ItsNo
 - GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` there turns them into
   SPIR-V (it needs `llvm-mc`, so WSL or a Linux container), and `check.py` runs them on your GPU and compares
   the results. A new test gets its expected values in the comment at its top and a check in `check.py`.
+  [docs/testing.md](docs/testing.md) has the setup per OS and the problems testers have run into.
 - Say what you tested and on which GPU in the pull request.
 - Run the translator tests with `python -m unittest discover -s tests/semantic -v` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.

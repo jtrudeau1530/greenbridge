@@ -18,10 +18,24 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   are also asserted there, duplicating the matching `test_ps_semantics.py` cases. As above, constants are
   written by hand and recomputed by plain-Python references checked against each other. `cs_fmt_1010102` runs
   as compute too and asserts 16 dwords: 10:10:10:2 words read through formats 50 and 44 (from the V# and from
-  tbuffer's own format) and stored in both.
+  tbuffer's own format) and stored in both. `ps_scc_minmax` asserts SCC after `s_min`/`s_max` `_i32`/`_u32`:
+  0 on a tie, and 1 on a pair (-1 against 1) that only the right signedness orders that way.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
+- `test_wave64_cross_half.py` translates the GPU tests `cs_w64x_readlane`, `cs_w64x_writelane` and
+  `cs_w64x_bpermute` (no `--wave64-emulate`) and runs all 64 lanes in lockstep with
+  `spirv_mini_interp.run_workgroup`. On one 64-wide subgroup the 24 words must equal the GPU check's values
+  (`runtime/test/shaders/check.py`). On two 32-wide subgroups (NVIDIA without emulation) `ds_bpermute` stays
+  exact, `v_writelane` writes stay exact, and a `v_readlane` from the other half is a shuffle from lane >= 32,
+  undefined in SPIR-V (`UndefinedResult`); a "lane mod 32" model of issue #94 gives the words a 32-wide GPU
+  shows (all 24 matched on an RTX 4070 SUPER, driver 610.88, without `--wave64-emulate`). Two SPIR-V sabotages (readlane lane & 31, bpermute without its half base) must change the
+  64-wide result.
+- `test_wave64_subgroup_ops.py` runs eight more wave64 GPU tests the same way (`cs_w64x_ballot`,
+  `_readfirstlane`, `_load_ballot_load`, `_partial`, `cs_wave64_ballot`, `cs_wm_bfm64`, `cs_wm_half_cmp`,
+  `cs_wavemask`): on one 64-wide subgroup every word equals the GPU check; on two 32-wide subgroups the
+  words pinned there are the ones an RTX 4070 SUPER (driver 610.88) wrote without `--wave64-emulate`. The
+  cs_w64x tests with branches need llvm-mc encodings and are not covered.
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,
@@ -30,9 +44,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
 
-Limits: single lane, forward-only structured control flow (the fragment-exit discard test and the compute
+Limits: single lane (or lanes in lockstep, one instruction per lane per round, that exchange values only through
+`OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), forward-only structured control flow (the fragment-exit discard test and the compute
 dynamic-bounds merge; no backward branches, loops, calls or switches), no texture access. PushConstant words,
-Input variables and a flat physical-address `{address: word}` map can be supplied per run. Values that pass
+Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
+undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
 through a float op lose NaN payloads (Python floats), so expected output words avoid NaN bit patterns. `Fma` is
 computed in double precision then rounded to binary32 (exact for the f16-derived operands used). The `.asm`
 sources are written for `llvm-mc -mcpu=gfx1013`; these tests do not assemble them, so assembler syntax is not

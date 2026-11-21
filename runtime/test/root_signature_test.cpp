@@ -216,6 +216,99 @@ int main() {
               "walked RTS0 model matches payload");
     }
 
+    // RTS0 descriptor tables: the payload is {num_ranges, ranges_offset} and the ranges sit at that offset, as the
+    // PC serializer writes them (root_signature_oracle_test); here a 1.1 table with two 24-byte ranges placed after
+    // a gap, so reading them inline after the count would fail.
+    {
+        std::vector<uint8_t> p;
+        put_u32(p, 2);   // version 1.1
+        put_u32(p, 1);   // 1 param
+        put_u32(p, 24);  // params table offset
+        put_u32(p, 0);   // 0 samplers
+        put_u32(p, 0);
+        put_u32(p, 0);   // flags
+        put_u32(p, 0);   // entry 0: descriptor table
+        put_u32(p, 5);   // pixel
+        put_u32(p, 36);  // table payload
+        put_u32(p, 2);   // 2 ranges
+        put_u32(p, 52);  // at 52
+        put_u32(p, 0xdeadbeefu);  // gap
+        put_u32(p, 0xdeadbeefu);
+        for (const uint32_t v : {0u, 4u, 0u, 0u, 0xffffffffu, 0u,      // SRV x4
+                                 2u, 1u, 3u, 1u, 0xffffffffu, 0u})     // CBV x1
+            put_u32(p, v);
+        const DecodeResult d = parse_rts0(p.data(), p.size());
+        check(d.ok && d.sig.params.size() == 1 && d.sig.params[0].type == ParamType::Table &&
+                  d.sig.params[0].visibility == Visibility::Pixel && d.sig.params[0].ranges.size() == 2 &&
+                  d.sig.params[0].ranges[0].range_type == 0 && d.sig.params[0].ranges[0].num_descriptors == 4 &&
+                  d.sig.params[0].ranges[1].range_type == 2 && d.sig.params[0].ranges[1].num_descriptors == 1,
+              "RTS0 table ranges read from their offset");
+        std::vector<uint8_t> wild = p;
+        wild[40] = 0xF0;  // ranges offset far past the payload
+        check(!parse_rts0(wild.data(), wild.size()).ok, "RTS0 ranges offset past the payload rejected");
+    }
+
+    // Version 1.2: the canonical codec carries the static-sampler flags, and only for 1.2, so 1.0/1.1 encodings are
+    // byte-for-byte what they were before 1.2 existed.
+    {
+        RootSignature sig;
+        sig.version = Version::V1_2;
+        sig.params = {consts(1)};
+        StaticSampler s;
+        s.border_color = 5;  // D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT
+        s.flags = 1;         // D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR
+        StaticSampler plain;
+        plain.shader_register = 1;
+        sig.static_samplers = {s, plain};
+        const std::vector<uint8_t> v12 = encode_canonical(sig);
+        const DecodeResult d = decode_canonical(v12.data(), v12.size());
+        check(d.ok && d.sig.version == Version::V1_2 && d.sig.static_samplers.size() == 2 &&
+                  d.sig.static_samplers[0].flags == 1 && d.sig.static_samplers[0].border_color == 5 &&
+                  d.sig.static_samplers[1].flags == 0 && d.sig.static_samplers[1].shader_register == 1,
+              "canonical 1.2 round-trips sampler flags");
+        check(!decode_canonical(v12.data(), v12.size() - 4).ok, "canonical 1.2 without the last flags is truncated");
+        sig.version = Version::V1_1;
+        const std::vector<uint8_t> v11 = encode_canonical(sig);
+        check(v11.size() + 2 * 4 == v12.size(), "canonical 1.1 has no sampler flags dword");
+        const DecodeResult d11 = decode_canonical(v11.data(), v11.size());
+        check(d11.ok && d11.sig.static_samplers[0].flags == 0, "canonical 1.1 decodes with flags 0");
+    }
+
+    // RTS0 version 3 (1.2): 1.1-style descriptor flags, then a 14-dword sampler whose last dword is its flags.
+    {
+        std::vector<uint8_t> p;
+        put_u32(p, 3);   // version 1.2
+        put_u32(p, 1);   // 1 param
+        put_u32(p, 24);  // params table offset
+        put_u32(p, 1);   // 1 sampler
+        put_u32(p, 48);  // samplers offset
+        put_u32(p, 0);   // flags
+        put_u32(p, 2);   // entry 0: CBV
+        put_u32(p, 0);
+        put_u32(p, 36);
+        put_u32(p, 9);   // register
+        put_u32(p, 0);   // space
+        put_u32(p, 4);   // descriptor flags (DATA_STATIC_WHILE_SET_AT_EXECUTE)
+        const uint32_t sampler[14] = {0x15, 1, 2, 3, 0, 16, 4, 5, 0, 0x7f7fffffu, 3, 1, 5, 2};
+        for (const uint32_t v : sampler) put_u32(p, v);
+        const DecodeResult d = parse_rts0(p.data(), p.size());
+        check(d.ok, "hand-built RTS0 1.2 parses");
+        check(d.ok && d.sig.version == Version::V1_2 && d.sig.params.size() == 1 &&
+                  d.sig.params[0].descriptor_register == 9 && d.sig.static_samplers.size() == 1 &&
+                  d.sig.static_samplers[0].filter == 0x15 && d.sig.static_samplers[0].max_anisotropy == 16 &&
+                  d.sig.static_samplers[0].border_color == 5 && d.sig.static_samplers[0].shader_register == 3 &&
+                  d.sig.static_samplers[0].register_space == 1 &&
+                  d.sig.static_samplers[0].visibility == Visibility::Pixel &&
+                  d.sig.static_samplers[0].flags == 2,
+              "RTS0 1.2 sampler fields and flags");
+        std::vector<uint8_t> cut = p;
+        cut.resize(cut.size() - 4);  // a 13-dword (1.0/1.1-sized) sampler in a 1.2 blob
+        check(!parse_rts0(cut.data(), cut.size()).ok, "RTS0 1.2 sampler without flags rejected");
+        std::vector<uint8_t> v4 = p;
+        v4[0] = 4;
+        check(!parse_rts0(v4.data(), v4.size()).ok, "RTS0 version 4 rejected");
+    }
+
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

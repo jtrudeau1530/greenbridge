@@ -6,6 +6,8 @@ import importlib.util
 import json
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
@@ -100,6 +102,46 @@ class WorldCensusTest(unittest.TestCase):
         blob = TWI.make_resource(True)
         self.assertEqual(WC.required_len(blob), len(blob))
         self.assertGreater(WC.required_len(blob[:0x150]), 0x150)
+
+
+class CensusArgumentTest(unittest.TestCase):
+    """--shard-size 0 planned shards forever (memory grew without bound); --jobs 0 crashed in ProcessPoolExecutor."""
+
+    def test_expected_shards_rejects_a_size_below_one(self):
+        self.assertEqual(WC._expected_shards(0, 10, 4),
+                         [{"index": 0, "start": 0, "end": 4}, {"index": 1, "start": 4, "end": 8},
+                          {"index": 2, "start": 8, "end": 10}])
+
+        class Counted(int):
+            """Counts pos + shard_size, so a missing guard fails here instead of looping forever."""
+            adds = 0
+
+            def __radd__(self, other):
+                Counted.adds += 1
+                if Counted.adds > 1000:
+                    raise RuntimeError("shard planning never finished")
+                return other + int(self)
+
+        for size in (0, -5):
+            Counted.adds = 0
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                WC._expected_shards(0, 10, Counted(size))
+
+    def test_cli_rejects_shard_size_and_jobs_below_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "sample.rpf")
+            make_archive(arc)
+            out = os.path.join(tmp, "out")
+            tool = os.path.join(ROOT, "tools", "world_census.py")
+            for flag, value in (("--shard-size", "0"), ("--shard-size", "-1"), ("--jobs", "0")):
+                with self.subTest(flag=flag, value=value):
+                    # A subprocess with a timeout, so the old endless loop fails the test instead of hanging it.
+                    p = subprocess.run([sys.executable, "-I", tool, arc, "--out", out, flag, value],
+                                       capture_output=True, text=True, timeout=10)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertIn("must be at least 1", p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":

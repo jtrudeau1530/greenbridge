@@ -25,7 +25,11 @@
 </head>
 <body>
 <div id="hud"></div>
-<div id="banner"></div>
+<div id="banner" class="hidden">
+  <b>TEST TERRAIN</b>: generated in the browser. <span id="world-status"></span><br>
+  Build chunks with <code>python -I tools/world_build.py &lt;work&gt;\assets --out &lt;work&gt;\world</code>
+  and serve with <code>python -I viewer/serve.py --world &lt;work&gt;\world</code>.
+</div>
 <div id="help">
   <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
   <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>Esc</kbd> release mouse
@@ -44,26 +48,55 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // ---------- world description ----------
 // world/world.json: { "spawn": [x,y,z], "chunks": [ { "id", "url", "bounds": [minx,miny,minz,maxx,maxy,maxz] } ] }
-// Each chunk is a .glb in world space (Y up, metres). When no world.json exists the viewer
-// generates TEST terrain locally and says so on screen.
-async function loadWorld() {
-  if (new URLSearchParams(location.search).has("test")) return testWorld();
-  try {
-    const r = await fetch("world/world.json", { cache: "no-store" });
-    if (!r.ok) throw new Error(r.status);
-    const w = await r.json();
-    w.test = false;
-    return w;
-  } catch { return testWorld(); }
+// Each chunk is a .glb in world space (Y up, metres). Validate the manifest before
+// the camera and streaming code use its coordinates and chunk identifiers.
+function manifestError(world) {
+  const isPosition = (value, length) =>
+    Array.isArray(value) && value.length === length && value.every(Number.isFinite);
+  const isNonemptyString = value => typeof value === "string" && value.trim().length > 0;
+  if (!isPosition(world?.spawn, 3)) return "spawn must contain three finite coordinates";
+  if (!Array.isArray(world.chunks)) return "chunks must be an array";
+  const ids = new Set();
+  for (const [i, chunk] of world.chunks.entries()) {
+    if (!isNonemptyString(chunk?.id) || ids.has(chunk.id)) return `chunks[${i}].id must be a unique, nonempty string`;
+    if (!isNonemptyString(chunk.url)) return `chunks[${i}].url must be a nonempty string`;
+    const b = chunk.bounds;
+    if (!isPosition(b, 6) || b[0] > b[3] || b[1] > b[4] || b[2] > b[5])
+      return `chunks[${i}].bounds must contain six finite, ordered coordinates`;
+    ids.add(chunk.id);
+  }
+  return null;
 }
 
-function testWorld() {
+async function loadWorld() {
+  if (new URLSearchParams(location.search).has("test")) return testWorld("Test mode was requested.");
+  let response;
+  try {
+    response = await fetch("world/world.json", { cache: "no-store" });
+  } catch {
+    return testWorld("world/world.json could not be loaded.");
+  }
+  if (response.status === 404) return testWorld("world/world.json was not found.");
+  if (!response.ok) return testWorld(`world/world.json returned HTTP ${response.status}.`);
+
+  let world;
+  try {
+    world = await response.json();
+  } catch {
+    return testWorld("world/world.json could not be read as valid JSON.");
+  }
+  const error = manifestError(world);
+  if (error) return testWorld(`Invalid world/world.json: ${error}.`);
+  return { ...world, test: false };
+}
+
+function testWorld(reason) {
   const size = 256, n = 24, chunks = [];
   for (let z = -n / 2; z < n / 2; z++)
     for (let x = -n / 2; x < n / 2; x++)
       chunks.push({ id: `test_${x}_${z}`, test: [x, z, size],
                     bounds: [x * size, -50, z * size, (x + 1) * size, 200, (z + 1) * size] });
-  return { test: true, spawn: [0, 120, 0], chunks };
+  return { test: true, reason, spawn: [0, 120, 0], chunks };
 }
 
 // Deterministic test terrain: rolling hills plus a grid of boxes. Nothing here comes from the game.
@@ -252,11 +285,10 @@ function stream(now = performance.now()) {
 // ---------- main loop ----------
 const world = await loadWorld();
 camera.position.fromArray(world.spawn);
-const banner = document.getElementById("banner");
-if (world.test) banner.innerHTML = "<b>TEST TERRAIN</b>: generated in the browser. No <code>world/world.json</code> found.<br>" +
-  "Build chunks with <code>python -I tools/world_build.py &lt;work&gt;\\assets --out &lt;work&gt;\\world</code> and serve with " +
-  "<code>python -I viewer/serve.py --world &lt;work&gt;\\world</code>.";
-else banner.classList.add("hidden");
+if (world.test) {
+  document.getElementById("world-status").textContent = world.reason;
+  document.getElementById("banner").classList.remove("hidden");
+}
 for (const c of world.chunks) {
   const b = c.bounds, box = new THREE.Box3(new THREE.Vector3(b[0], b[1], b[2]), new THREE.Vector3(b[3], b[4], b[5]));
   boundsGroup.add(new THREE.Box3Helper(box, 0x5fb3ff));
