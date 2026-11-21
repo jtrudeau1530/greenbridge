@@ -5814,6 +5814,7 @@ def translate(path):
         if not (1 <= psv["threads"] <= 1024) or not (1 <= psv["maxv"] <= 256) or not (1 <= psv["maxp"] <= 512):
             raise Unsupported("mesh limits")
         g.ms = psv
+        g.cu(psv["threads"])     # the v5 seed (assemble) multiplies by it; constants must exist before assembly
         # LDS: the declared group-shared size, grown to cover every constant offset the code uses.
         need = (psv.get("shared", 0) + 3) // 4
         for ins in insns:
