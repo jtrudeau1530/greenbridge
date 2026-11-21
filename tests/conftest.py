@@ -140,13 +140,11 @@ SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_
                "ms_v5_workgroup": make_dxbc([mesh_psv0_chunk(threads=(32, 1, 1), max_vertices=3,
                                                            max_primitives=1, group_shared=128)])}
 
-# spirv-val errors on valid-looking output, by sample. ms_tri: SPIRV-Tools 2025.1 (Ubuntu 24.04) rejects the
-# CullPrimitiveEXT output although it is declared as the spec asks (PerPrimitiveEXT array of bool, MeshEXT model).
-KNOWN_VAL_ISSUES = {
-    "ms_tri": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036",
-    "ms_clip": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036",
-    "ms_v5_workgroup": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036",
-}
+# spirv-val errors on valid-looking output, by sample.
+# CullPrimitiveEXT used to need a waiver for SPIRV-Tools ≤2025.1 (#5980) when emitted as OpTypeArray of
+# bool; the translator now uses the Block+bool-member form (also allowed by VUID-07036), which those
+# validators accept. Keep this map for unrelated known false positives.
+KNOWN_VAL_ISSUES = {}
 
 # Compute shaders take their system registers from the FSSM header (rdna2spirv.translate reads it from
 # <disasm dir>/../fssm/<name>.fssm): word 0x138 is COMPUTE_PGM_RSRC2, words 0x13C/0x140/0x144 the thread-group size.

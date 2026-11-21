@@ -364,6 +364,8 @@ def summarise(rows, records, span, zero, unread, mode):
 def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
     """Walk an RPF9 data area and return (rows, records, summary). No table of contents is read or decrypted."""
     rows = []
+    if os.path.getsize(path) == 0:
+        raise ValueError("empty file")
     with open(path, "rb") as fh:
         mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         size = len(mm)
@@ -490,13 +492,16 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     limit = None if a.all_strings else a.strings
-    if os.path.isdir(a.source):
-        rows, records, summary = scan_dir(a.source, string_limit=limit)
-    else:
-        def progress(n, pos, end):
-            if not a.quiet:
-                print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
-        rows, records, summary = scan_rpf(a.source, a.start, a.limit, progress, string_limit=limit)
+    try:
+        if os.path.isdir(a.source):
+            rows, records, summary = scan_dir(a.source, string_limit=limit)
+        else:
+            def progress(n, pos, end):
+                if not a.quiet:
+                    print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
+            rows, records, summary = scan_rpf(a.source, a.start, a.limit, progress, string_limit=limit)
+    except ValueError as e:
+        sys.exit(f"{a.source}: {e}")
     write_output(a.out, records, summary, all_strings=a.all_strings)
     if not a.quiet:
         s = summary["rbf0"]

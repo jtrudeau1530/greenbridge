@@ -1,4 +1,4 @@
-// Loads the Vulkan loader at run time: vulkan-1.dll on Windows, MoltenVK on macOS, libvulkan.so.1 elsewhere. No import library.
+// Loads Vulkan at run time. The macOS test tools default to MoltenVK.
 #pragma once
 
 #ifndef VK_NO_PROTOTYPES
@@ -7,6 +7,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -21,19 +22,31 @@ inline PFN_vkGetInstanceProcAddr load_vulkan() {
     static const auto library = LoadLibraryA(library_name);
     const auto entry = library ? GetProcAddress(library, "vkGetInstanceProcAddr") : nullptr;
 #elif defined(__APPLE__)
-    // MoltenVK directly: through the loader it is a portability driver, which every vkCreateInstance here would
-    // have to opt into. The Vulkan SDK installs it in /usr/local/lib (a default search path), Homebrew does not.
-    constexpr auto library_name = "libMoltenVK.dylib";
-    static const auto library = [] {
-        auto handle = dlopen(library_name, RTLD_NOW | RTLD_LOCAL);
-        return handle ? handle : dlopen("/opt/homebrew/lib/libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
+    static const auto entry = []() -> void* {
+        // The default is direct MoltenVK: a portability driver would otherwise require instance opt-in.
+        const char* requested = std::getenv("LEONIDA_VULKAN_LOADER");
+        const bool overridden = requested && *requested;
+        const char* name = overridden ? requested : "libMoltenVK.dylib";
+        auto library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (!library && !overridden) {
+            name = "/opt/homebrew/lib/libMoltenVK.dylib";
+            library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        }
+        if (!library) {
+            std::fprintf(stderr, "could not load %s: %s\n", name, dlerror());
+            return nullptr;
+        }
+        const auto symbol = dlsym(library, "vkGetInstanceProcAddr");
+        if (!symbol) std::fprintf(stderr, "%s has no vkGetInstanceProcAddr\n", name);
+        return symbol;
     }();
-    const auto entry = library ? dlsym(library, "vkGetInstanceProcAddr") : nullptr;
 #else
     constexpr auto library_name = "libvulkan.so.1";
     static const auto library = dlopen(library_name, RTLD_NOW | RTLD_LOCAL);
     const auto entry = library ? dlsym(library, "vkGetInstanceProcAddr") : nullptr;
 #endif
+#ifndef __APPLE__
     if (!entry) std::fprintf(stderr, "could not load vkGetInstanceProcAddr from %s\n", library_name);
+#endif
     return reinterpret_cast<PFN_vkGetInstanceProcAddr>(entry);
 }

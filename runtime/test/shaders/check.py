@@ -47,6 +47,9 @@ W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_readfirstlane", [140, 140, 163, 132, 100, 105, 133, 48]),
               ("cs_w64x_bpermute", [36, 316, 253, 218, 435, 225, 0, 442]),
               ("cs_w64x_branch", [0, 0, 0, 0, 5, 5, 9, 9]),
+              ("cs_w64x_mask_reuse", [8, 40, 8, 40, 2, 20, 10, 64]),
+              ("cs_w64x_mask_reuse2", [10, 20, 8, 8, 5, 2, 132, 131]),
+              ("cs_w64x_chain_barrier", [564, 563, 500, 627]),                   # 128-thread group
               ("cs_w64x_ballot", [2053, 2061, 2069, 2077, 2085, 2093, 2101, 2109]),
               ("cs_w64x_wg128_branches", [121, 121, 343, 343, 14, 31, 19812, 22728]),   # 128-thread group
               ("cs_w64x_lds_raw", [132, 137, 100, 108, 131, 101, 149, 118]),
@@ -62,14 +65,37 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops6": (0xf800ffff, 0x01000010, 0x00800800, 0x8000fff0),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
-              "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000)}
+              "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
+              "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0)}
+# Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
+# tests/semantic/test_value_semantics.py does for the interpreter.
+PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
+
+
+# Windows error codes for a program the system refuses to start, and who refused it.
+BLOCKED_BY = {4551: "Windows Application Control (Smart App Control or an App Control policy)",
+              1260: "a Windows software restriction policy",
+              225: "Microsoft Defender, which reported it as a threat"}
+
+
+def start_failure(exe, err):
+    """One result line for a test program that could not be started, instead of a traceback that ends the run.
+    Smart App Control blocks unsigned programs it has no reputation for, so a fresh build can be refused."""
+    name = os.path.basename(str(exe))
+    who = BLOCKED_BY.get(getattr(err, "winerror", None))
+    if who is None:
+        return f"could not start {name}: {err}"
+    return (f"could not start {name}: blocked by {who}. A freshly built test program has no reputation yet: "
+            "allow it, or turn Smart App Control off (Windows Security > App & browser control), and run again")
 
 
 def run(*cmd, env=None):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    except FileNotFoundError:
+    except OSError as e:
+        if not isinstance(e, FileNotFoundError):
+            return 1, start_failure(cmd[0], e)
         tools = os.path.abspath(os.path.dirname(cmd[0]))
         missing = [t + EXE for t in ("vk_compute_test", "vk_store_test", "vk_harness")
                    if not os.path.isfile(os.path.join(tools, t + EXE))]
@@ -186,7 +212,11 @@ def mesh_w64x_test(tools, spirv, name):
         env["VKH_SUBGROUP_SIZE"] = "64"
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         raw = Path(tmp) / "pixels.raw"
-        r = subprocess.run([os.path.join(tools, "vk_harness" + EXE), shader, fs, raw], capture_output=True, text=True, env=env)
+        harness = os.path.join(tools, "vk_harness" + EXE)
+        try:
+            r = subprocess.run([harness, shader, fs, raw], capture_output=True, text=True, env=env)
+        except OSError as e:
+            return start_failure(harness, e)
         if r.returncode == UNSUPPORTED:   # vk_harness: the device has no VK_EXT_mesh_shader
             m = re.search(r"unsupported: .*", r.stderr)
             return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
@@ -231,6 +261,8 @@ def pixels(tools, spirv, name, fmt):
     # (RADV's default on RDNA1) reads lanes it was never written for.
     sg = subgroup_size(spirv, name)
     env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
+    if name in PIXEL_ENV:
+        env = dict(env or os.environ, **PIXEL_ENV[name])
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
@@ -253,8 +285,16 @@ def pixel_test(tools, spirv, name):
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    if name == "ps_bitmask_perm":
+        # Decide from the reported width before the pixel count: a narrow device's frame can be short, and with no
+        # width line the lanes 0-31 this shader writes are not known to exist.
+        m = re.search(r"subgroup \d+\.\.(\d+)", out)
+        if not m:
+            return Skip("SKIP (vk_harness reported no subgroup width)")
+        if int(m.group(1)) < 32:
+            return Skip(f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)")
     if not px:
-        return "vk_harness failed or returned no pixels"
+        return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
     n = len(px)
     if name in PIXEL_BITS:
         wrong = sum(p != PIXEL_BITS[name] for p in px)
@@ -272,9 +312,6 @@ def pixel_test(tools, spirv, name):
         err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
         return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}"
     if name == "ps_bitmask_perm":
-        m = re.search(r"subgroup \d+\.\.(\d+)", out)
-        if m and int(m.group(1)) < 32:   # the shader writes lanes 0-31; a narrower subgroup has no such lanes
-            return Skip(f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)")
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"

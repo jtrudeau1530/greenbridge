@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "../shims/shims.h"
 #include "../src/pe_loader.h"
 
 namespace {
@@ -136,6 +137,12 @@ void* host_symbol(const char* dll, const char* name) {
     HMODULE h = GetModuleHandleA(dll);
     return h ? reinterpret_cast<void*>(GetProcAddress(h, name)) : nullptr;
 }
+
+// A shim table for the forwarder test, so the test does not depend on the real xmem shim. Registering it at startup
+// exercises the same registry a packaged module reaches.
+int g_test_shim_target = 0;
+void* test_shim_function() { return &g_test_shim_target; }
+SHIM_TABLE(test_forwarder_shim, {"testshim.dll", "F", reinterpret_cast<void*>(&test_shim_function)});
 
 // 0 when the image loaded, 1 when it was rejected. A crash here is a test failure, which is the point.
 int load(const std::filesystem::path& p, std::string& error) {
@@ -583,6 +590,22 @@ void test_forwarded_exports() {
             failed(what, e.what());
         }
     }
+    {
+        const char* what = "a forwarder to a shimmed module binds to the shim";
+        write_image_as(make_forwarder_image("testshim.F", 0x180000000), "prov_shim.dll");
+        auto importer = write_image_as(make_import_image("prov_shim.dll", "fwd"), "importer_shim.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(importer);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Shim)
+                return failed(what, "the import did not bind as a shim");
+            if (*reinterpret_cast<void**>(m.base + 0x1180) != reinterpret_cast<void*>(&test_shim_function))
+                return failed(what, "the address table does not hold the shim function");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
 }
 
 void test_delay_descriptor_fields() {
@@ -631,6 +654,90 @@ void test_delay_descriptor_fields() {
     }
 }
 
+// make_image() plus an exception directory at RVA 0x1100 whose entries all share one minimal UNWIND_INFO at 0x1180
+// (version 1, no flags, no prologue, no codes). Every RVA here lies inside the single .text section, so file offset
+// = RVA - 0x1000 + 0x200.
+constexpr uint32_t kPdataRva = 0x1100;
+constexpr uint32_t kUnwindRva = 0x1180;
+
+std::vector<uint8_t> make_unwind_image(const std::vector<RUNTIME_FUNCTION>& entries) {
+    auto img = make_image();
+    std::memset(img.data() + 0x200 + (kPdataRva - 0x1000), 0, 0x100);
+    const uint8_t unwind_info[4] = {1, 0, 0, 0};
+    std::memcpy(img.data() + 0x200 + (kUnwindRva - 0x1000), unwind_info, sizeof(unwind_info));
+    std::memcpy(img.data() + 0x200 + (kPdataRva - 0x1000), entries.data(), entries.size() * sizeof(RUNTIME_FUNCTION));
+    auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    dir.VirtualAddress = kPdataRva;
+    dir.Size = static_cast<DWORD>(entries.size() * sizeof(RUNTIME_FUNCTION));
+    nt_of(img)->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    return img;
+}
+
+void test_unwind_registration() {
+    const std::vector<RUNTIME_FUNCTION> entries = {{0x1000, 0x1010, kUnwindRva}, {0x1010, 0x1020, kUnwindRva}};
+    uintptr_t pc = 0;
+    {
+        auto img = make_unwind_image(entries);
+        auto p = write_image(img);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            pc = reinterpret_cast<uintptr_t>(m.base) + 0x1014;  // inside the second function
+            DWORD64 image_base = 0;
+            auto* found = RtlLookupFunctionEntry(pc, &image_base, nullptr);
+            if (m.function_count != 2)
+                failed("the exception directory is registered", "function_count is " + std::to_string(m.function_count));
+            else if (!found)
+                failed("the exception directory is registered", "RtlLookupFunctionEntry found nothing");
+            else if (image_base != reinterpret_cast<DWORD64>(m.base) ||
+                     reinterpret_cast<uint8_t*>(found) != m.base + kPdataRva + sizeof(RUNTIME_FUNCTION))
+                failed("the exception directory is registered", "the lookup returned the wrong entry or image base");
+            else
+                pass("the exception directory is registered");
+        } catch (const std::exception& e) {
+            failed("the exception directory is registered", e.what());
+        }
+        DWORD64 image_base = 0;
+        if (pc && RtlLookupFunctionEntry(pc, &image_base, nullptr))
+            failed("the unwind table is removed with the loader", "the lookup still finds the freed image");
+        else
+            pass("the unwind table is removed with the loader");
+    }
+    {
+        // The system loader drops a trailing partial entry rather than rejecting the image; so does this one.
+        auto img = make_unwind_image(entries);
+        nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size += 5;
+        auto p = write_image(img);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            if (m.function_count != 2)
+                failed("a trailing partial unwind entry is ignored", "function_count is " + std::to_string(m.function_count));
+            else
+                pass("a trailing partial unwind entry is ignored");
+        } catch (const std::exception& e) {
+            failed("a trailing partial unwind entry is ignored", e.what());
+        }
+    }
+    // A zero-length entry appears in a shipped Windows image (symcryptk.dll), so it has to be accepted.
+    expect_loads("a zero-length unwind entry is accepted",
+                 make_unwind_image({{0x1000, 0x1000, kUnwindRva}, {0x1000, 0x1020, kUnwindRva}}));
+    {
+        auto img = make_unwind_image(entries);
+        nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress = 0x1FF0;
+        expect_rejects("an exception directory past the image", img);
+    }
+    expect_rejects("an unwind entry ending past the image",
+                   make_unwind_image({{0x1000, 0x2001, kUnwindRva}}));
+    expect_rejects("an unwind entry that ends before it starts",
+                   make_unwind_image({{0x1010, 0x1000, kUnwindRva}}));
+    expect_rejects("unwind entries out of order",
+                   make_unwind_image({{0x1010, 0x1020, kUnwindRva}, {0x1000, 0x1010, kUnwindRva}}));
+    expect_rejects("overlapping unwind entries",
+                   make_unwind_image({{0x1000, 0x1018, kUnwindRva}, {0x1010, 0x1020, kUnwindRva}}));
+    expect_rejects("unwind data past the image", make_unwind_image({{0x1000, 0x1010, 0x1FFE}}));
+}
+
 }  // namespace
 
 int main() {
@@ -655,6 +762,7 @@ int main() {
     test_initialise_rejects();
     test_delay_descriptor_fields();
     test_forwarded_exports();
+    test_unwind_registration();
 
     std::filesystem::remove_all(g_dir, ec);
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);

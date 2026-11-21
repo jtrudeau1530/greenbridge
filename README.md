@@ -105,8 +105,10 @@ python -I make_game.py --wave64-emulate off            # auto (default), on or o
 `--wave64-emulate` decides whether wave64 compute and mesh shaders are translated to be exact on any subgroup size
 (see "Wave64 emulation" in [docs/design.md](docs/design.md)). NVIDIA and Intel GPUs have 32-wide subgroups and need
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns it on unless every GPU reports 64-wide
-subgroups, or when it can't tell. The mode is saved next to the translated shaders, and changing it translates them
-again.
+subgroups, or when it can't tell; it also turns it on when the GPU the runtime would use can't be made to run
+compute and mesh shaders 64-wide. The mode is saved next to the translated shaders, and changing it translates them
+again. With `auto`, shaders already translated with emulation are kept even when this run would not emulate (they are
+exact on every GPU); `--wave64-emulate off` translates them natively.
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
@@ -152,7 +154,9 @@ read and the licence limits on it.
 
 The biggest open pieces:
 
-- **Compute, mesh and geometry shaders**: their per-stage system-value register layout.
+- **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
+  [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
+  unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
 - **Xbox D3D12 → Vulkan**: the `d3d12_xs` command list and descriptor heap model.
 - **Model layouts** the decoder rejects today.
 
