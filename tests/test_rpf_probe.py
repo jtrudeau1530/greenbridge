@@ -149,15 +149,18 @@ class MainTests(unittest.TestCase):
         self.assertIn("0 archives", out)
 
     def test_failed_scan_preserves_the_existing_report(self):
-        self.write("a.rpf", archive_bytes())
+        archive = self.write("a.rpf", archive_bytes())
         self.run_main()
         before = self.rows()
         missing = os.path.join(self.tmp, "missing")
-        err = io.StringIO()
-        with mock.patch("sys.argv", ["rpf_probe.py", missing, "--out", self.out]), contextlib.redirect_stderr(err):
-            self.assertEqual(probe.main(), 2)
-        self.assertIn(missing, err.getvalue())
-        self.assertEqual(self.rows(), before)
+        for source in (missing, archive):
+            with self.subTest(source=source):
+                err = io.StringIO()
+                argv = ["rpf_probe.py", source, "--out", self.out]
+                with mock.patch("sys.argv", argv), contextlib.redirect_stderr(err):
+                    self.assertEqual(probe.main(), 2)
+                self.assertIn(source, err.getvalue())
+                self.assertEqual(self.rows(), before)
 
 
 if __name__ == "__main__":
