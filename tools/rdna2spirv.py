@@ -3384,7 +3384,7 @@ class Gen:
         read = self.x_round(data=v)[0]
         self.emit(f"{r} = OpCopyObject %uint {read(src)}")
 
-    def ds_lane_read(self, dst: str, data: str, src: str, lane: str) -> None:
+    def ds_lane_read(self, dst: dict, data: str, src: str, lane: str) -> None:
         """DS swizzle and backward permute read zero from an inactive or absent source lane."""
         value, result = self.tmp(), self.tmp()
         self.emit(f"{value} = OpSelect %uint {self.active_b()} {data} {self.cu(0)}")
