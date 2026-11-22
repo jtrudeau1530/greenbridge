@@ -138,6 +138,10 @@ def oracle_sincos_f16(
     if not f16_is_finite(h):
         return None
     val_f = h2f(h)
+    # The hardware gives an exact +0 for sin at an odd half turn and cos at an odd quarter turn, where Sin/Cos of a
+    # rounded 2*pi give a 1-ulp denormal (SHADER-134, docs/design.md).
+    if val_f != 0.0 and abs(val_f - round(val_f)) == (0.5 if "sin" in op else 0.25):
+        return 0
     ang = reduce_turn_angle(val_f)
     res_f = f32(math.sin(ang) if "sin" in op else math.cos(ang))
     if clamp_:
@@ -442,7 +446,7 @@ class SinCosSIMDAndPackedHalfwordTests(unittest.TestCase):
             f"v_mov_b32 v1, {v1_val:#x}",
             "v_sin_f16 v2, v1",           # sin(lo=0.0) -> 0.0 in v2.lo
             "v_lshrrev_b32 v3, 16, v1",   # hi=0.25 in v3.lo
-            "v_cos_f16 v4, v3",           # cos(hi=0.25) -> ~0.0 (0x8001) in v4.lo
+            "v_cos_f16 v4, v3",           # cos(hi=0.25) -> +0 in v4.lo (SHADER-134)
             "v_pack_b32_f16 v0, v2, v4",  # packed [cos(hi), sin(lo)]
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",

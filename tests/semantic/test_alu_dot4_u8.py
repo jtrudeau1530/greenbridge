@@ -726,8 +726,8 @@ class SpirvEmissionAndOverflowTests(unittest.TestCase):
 class NegativeControlTests(unittest.TestCase):
     """Negative controls, modifier rejections, and fault injection verification."""
 
-    def test_unpatched_rdna2spirv_raises_unsupported(self) -> None:
-        """Without patch, standard rdna2spirv refuses v_dot4_u32_u8 cleanly."""
+    def test_unpatched_rdna2spirv_translates_dot4(self) -> None:
+        """The translator itself now lowers v_dot4_u32_u8 (docs/design.md, packed integer dot products)."""
         lines = [
             "v_mov_b32_e32 v1, 1",
             "v_mov_b32_e32 v2, 1",
@@ -736,9 +736,7 @@ class NegativeControlTests(unittest.TestCase):
             "exp mrt0 v8, v8, v8, v8 done vm",
             "s_endpgm",
         ]
-        with self.assertRaises(rdna2spirv.Unsupported) as cm:
-            support.translate_lines("ps_dot4_unpatched", lines)
-        self.assertIn("v_dot4_u32_u8", str(cm.exception))
+        support.translate_lines("ps_dot4_unpatched", lines)
 
     def test_clamp_modifier_is_refused(self) -> None:
         """The translator refuses clamp modifier on v_dot4_u32_u8 rather than guessing."""

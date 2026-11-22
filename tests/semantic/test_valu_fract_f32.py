@@ -258,6 +258,8 @@ def oracle_fract_f32(
         w &= 0x7FFFFFFF
     if neg:
         w ^= 0x80000000
+    if w & 0x7F800000 == 0:
+        w = 0  # a denormal (or -0) operand reads as +0 with f32 denormals flushed, as on RDNA2 in the game's MODE
     r = exact_fract_f32_fraction(w)
     if r is None:
         return None
@@ -498,13 +500,13 @@ class OracleF32Tests(unittest.TestCase):
         rows = [
             (F_POS_ZERO, F_POS_ZERO),
             (F_NEG_ZERO, F_POS_ZERO),
-            (F_SUB_MIN, F_SUB_MIN),
-            (F_SUB_1E40, F_SUB_1E40),
-            (F_SUB_MAX, F_SUB_MAX),
+            (F_SUB_MIN, F_POS_ZERO),       # denormal operands read as zero (f32 denormals flushed)
+            (F_SUB_1E40, F_POS_ZERO),
+            (F_SUB_MAX, F_POS_ZERO),
             (F_NORM_MIN, F_NORM_MIN),
-            (F_NEG_SUB_MIN, F_NEAR_ONE),
-            (F_NEG_SUB_1E40, F_NEAR_ONE),
-            (F_NEG_SUB_MAX, F_NEAR_ONE),
+            (F_NEG_SUB_MIN, F_POS_ZERO),   # denormal operands read as zero: fract(0) = +0
+            (F_NEG_SUB_1E40, F_POS_ZERO),
+            (F_NEG_SUB_MAX, F_POS_ZERO),
             (F_NEG_NORM_MIN, F_NEAR_ONE),
             (F_NEG_1E10, F_NEAR_ONE),
             (F_NEG_2PM26, F_NEAR_ONE),
@@ -992,7 +994,8 @@ class SubnormalAndRoundingBoundaryTests(unittest.TestCase):
     """Audits subnormal numbers, boundary rounding transitions, and clamp behavior."""
 
     def test_f32_positive_subnormals(self):
-        # Positive subnormals x have floor(x) == 0, so fract(x) == x.
+        # A subnormal operand reads as zero (f32 denormals flushed, docs/design.md), so fract gives +0; the smallest
+        # normal is unaffected and gives itself.
         cases = [
             F_SUB_MIN,
             F_SUB_1E40,
@@ -1000,18 +1003,19 @@ class SubnormalAndRoundingBoundaryTests(unittest.TestCase):
             F_NORM_MIN,
         ]
         for w in cases:
+            want = w if w == F_NORM_MIN else 0
             with self.subTest(w=hex(w)):
-                self.assertEqual(oracle_fract_f32(w), w)
-                self.assertEqual(run_op("v_fract_f32_e32 v0, v1", w), w)
-                self.assertEqual(run_op("v_fract_f32 v0, v1", w), w)
+                self.assertEqual(oracle_fract_f32(w), want)
+                self.assertEqual(run_op("v_fract_f32_e32 v0, v1", w), want)
+                self.assertEqual(run_op("v_fract_f32 v0, v1", w), want)
 
     def test_f32_tiny_negatives_and_rounding_transition(self):
         # For x in (-2^-24, 0), exact x - floor(x) rounds to 1.0 in binary32.
         # Under RDNA2 hardware semantics and fract_below_one, this must return 0x3F7FFFFF (never 1.0).
         cases = [
-            (F_NEG_SUB_MIN, F_NEAR_ONE),
-            (F_NEG_SUB_1E40, F_NEAR_ONE),
-            (F_NEG_SUB_MAX, F_NEAR_ONE),
+            (F_NEG_SUB_MIN, F_POS_ZERO),   # denormal operands read as zero: fract(0) = +0
+            (F_NEG_SUB_1E40, F_POS_ZERO),
+            (F_NEG_SUB_MAX, F_POS_ZERO),
             (F_NEG_NORM_MIN, F_NEAR_ONE),
             (F_NEG_1E10, F_NEAR_ONE),
             (F_NEG_2PM26, F_NEAR_ONE),

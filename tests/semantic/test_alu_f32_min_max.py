@@ -813,11 +813,9 @@ class TestNegativeControls(unittest.TestCase):
         with self.assertRaises(si.UnsupportedConstruct):
             run_f32_2op("v_min_f32", QNAN, QNAN, e64=True, clamp=True)
 
-    def test_med3_third_operand_nan_fclamp_undefined(self) -> None:
-        # rdna2spirv lowers v_med3_f32 by evaluating FClamp(z, lo, hi) eagerly, which triggers
-        # UnsupportedConstruct in spirv_mini_interp when z is NaN (tracked by PR #2029).
-        with self.assertRaises(si.UnsupportedConstruct):
-            run_f32_3op("v_med3_f32", ONE, TWO, QNAN)
+    def test_med3_third_operand_nan_is_min3(self) -> None:
+        # Since #2029 a NaN operand gives min3 of the operands (measured on gfx1030), not an eager FClamp on NaN.
+        self.assertEqual(run_f32_3op("v_med3_f32", ONE, TWO, QNAN), ONE)
 
     def test_bit_exactness_rejects_sign_mismatch(self) -> None:
         # Negative control: verify that +0.0 and -0.0 are distinct 32-bit words.
