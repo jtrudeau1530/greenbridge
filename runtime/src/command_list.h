@@ -466,6 +466,14 @@ public:
         return append(copy);
     }
 
+    // ExecuteBundle copies the closed bundle's commands at the call site. The COM layer validates D3D12 list
+    // types and bundle-only restrictions before calling this method.
+    bool execute_bundle(const CommandList& bundle) {
+        if (this == &bundle || closed_ || !bundle.closed_) return false;
+        commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
+        return true;
+    }
+
     bool close() {
         if (closed_) return false;
         closed_ = true;

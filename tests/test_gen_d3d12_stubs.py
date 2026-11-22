@@ -4,6 +4,8 @@
 """
 import importlib.util
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -238,6 +240,16 @@ class MainTests(unittest.TestCase):
     def test_unknown_interface_raises(self):
         with self.assertRaises(SystemExit):
             self.run_main("IWho")
+
+    def test_circular_inheritance_reports_an_error(self):
+        with open(self.header, "w", encoding="utf-8") as f:
+            f.write(GOOD_HEADER.replace("IBase : public IUnknown", "IBase : public IChild"))
+        tool = os.path.join(ROOT, "tools", "gen_d3d12_stubs.py")
+        result = subprocess.run([sys.executable, "-I", tool, "--header", self.header,
+                                 "--out", self.out, "IChild"], capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("IChild -> IBase -> IChild", result.stderr)
+        self.assertFalse(os.path.exists(self.out))
 
     def test_find_header_uses_the_include_environment(self):
         with mock.patch.dict(os.environ, {"INCLUDE": self.dir}, clear=False):

@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#include "process.h"
+#include "process_shim.h"
 #include "shims.h"
 
 namespace rt::process {

@@ -196,6 +196,18 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["signature"], "0DRPz")
         self.assertEqual(rows[0]["version"], "122")
 
+    def test_directory_inflate_cap_does_not_exclude_large_archives(self):
+        resource = make_resource()
+        cap = len(resource)
+        with open(os.path.join(self.dir, "large.rpf"), "wb") as f:
+            f.write(make_rpf_streams([resource]) + bytes(cap))
+        with open(os.path.join(self.dir, "oversized.bin"), "wb") as f:
+            f.write(resource + b"\0")
+        rows, stats = WI.scan_path(self.dir, max_inflate=cap)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "map")
+        self.assertEqual(stats["files"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

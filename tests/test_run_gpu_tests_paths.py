@@ -34,7 +34,9 @@ class DrawShaders(unittest.TestCase):
     def test_every_shader_named_exists(self):
         shaders = Path(run_gpu_tests.SHADER_DIR)
         for name, extra in run_gpu_tests.DRAWN_WITH.items():
-            self.assertTrue((shaders / f"{name}.asm").is_file(), name)
+            # the clip cases (#193) are variants of vs_clip.asm with different signatures, not files of their own
+            source = "vs_clip" if name in run_gpu_tests.CLIP_CASES else name
+            self.assertTrue((shaders / f"{source}.asm").is_file(), name)
             self.assertTrue((shaders / extra).is_file(), extra)
 
 

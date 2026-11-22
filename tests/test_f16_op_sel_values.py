@@ -23,6 +23,7 @@ def median(a, b, c):
 OPS = {
     "v_add_f16": ("v_add_f16_e64 v3, {0}, {1}", 2, lambda a, b: a + b),
     "v_sub_f16": ("v_sub_f16_e64 v3, {0}, {1}", 2, lambda a, b: a - b),
+    "v_subrev_f16": ("v_subrev_f16_e64 v3, {0}, {1}", 2, lambda a, b: b - a),
     "v_mul_f16": ("v_mul_f16_e64 v3, {0}, {1}", 2, lambda a, b: a * b),
     "v_max_f16": ("v_max_f16_e64 v3, {0}, {1}", 2, max),
     "v_min_f16": ("v_min_f16_e64 v3, {0}, {1}", 2, min),

@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <span>
@@ -32,7 +33,7 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCmdUpdateBuffer)
+    X(vkCmdResolveImage) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -134,6 +135,15 @@ public:
         return tracker_.layout(id, subresource);
     }
 
+    // `prepare` is called with the context locked, at the start of the command buffer of every
+    // ExecuteCommandLists, before the lists are written: the device brings the bindless set 0 of the translated
+    // shaders up to date there (vulkan_bindless.h) and records what the set needs first. When it fails, nothing
+    // of that call is executed.
+    void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
+        std::lock_guard lock(mutex_);
+        bindless_prepare_ = std::move(prepare);
+    }
+
     VulkanDeviceFunctions vk;
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
@@ -170,6 +180,7 @@ private:
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
+    std::function<bool(VkCommandBuffer)> bindless_prepare_;
     ReplayFunctions replay_;
 };
 
@@ -268,6 +279,12 @@ public:
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         context_.vk.vkBeginCommandBuffer(command_buffer, &begin);
+        if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
+            // The command buffer holds at most what the set recorded for itself; submit it so the buffer is reused.
+            context_.vk.vkEndCommandBuffer(command_buffer);
+            submit(command_buffer, VK_NULL_HANDLE, 0);
+            return ReplayResult::unsupported;
+        }
         for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.

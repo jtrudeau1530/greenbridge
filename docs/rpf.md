@@ -65,6 +65,10 @@ textures; the original RPF paths still require the missing executable/key.
 `tools/manifest.py` is independent of RPF: it hashes a directory tree and verifies it later, with `--jobs` on
 both paths. It is used to check exported assets without keeping a second copy.
 
+`tools/rpf9_names.py` is the lightweight lookup pass: it walks the same data area, inflates a bounded prefix
+of each zlib stream and indexes the measured `name.#dr`/`#ft`/`#dd` spellings with their archive offsets. It
+does not decode a resource or need the TOC; see [resource_names.md](resource_names.md).
+
 ## Limits
 
 - The TOC is the hard boundary. File names, original paths and the exact file boundaries come from the TOC,

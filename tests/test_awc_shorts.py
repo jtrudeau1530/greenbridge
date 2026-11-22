@@ -118,6 +118,17 @@ class ShortsTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(shorts.main(["x", self.out, "--min-seconds", "6", "--max-seconds", "5"]), 2)
 
+    def test_nested_banks_keep_both_clips(self):
+        for folder, toc in (("left", 0x78), ("right", 0xFC)):
+            os.mkdir(os.path.join(self.tmp.name, folder))
+            self.write(os.path.join(folder, "shared.awc"), toc, 480000)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", "1"]), 0)
+        for folder, expected in (("left", 1), ("right", 2)):
+            with open(os.path.join(self.out, folder, "shared", "00001234.ogg"), "rb") as f:
+                channels, _ = ogg_head_and_last_granule(f.read())
+            self.assertEqual(channels, expected)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

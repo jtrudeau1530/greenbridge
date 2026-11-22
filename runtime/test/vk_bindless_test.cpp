@@ -4,13 +4,15 @@
 //
 //   vk_bindless_test <vs_ids.spv> <ps_tex.spv>
 //
-// A full-screen triangle is drawn into 64x64 RGBA32F and read back, five times:
+// A full-screen triangle is drawn into 64x64 RGBA32F and read back, seven times:
 //   1. the T# and S# are in the table behind keys that share the T#'s first slot, so the shader has to probe:
 //      every pixel is the texel of an 8x8 gradient under it;
 //   2. the T# is erased: every pixel is the fallback at index 0 (zeros);
 //   3. the T# is back among 200 more keys and the table has grown into a new buffer: the gradient again;
-//   4. the index is given another view: that image's colour;
-//   5. the index is removed: the fallback.
+//   4. the T# is rebound to the decoy index: that image's colour;
+//   5. the T# is rebound to the original index: the gradient again;
+//   6. the original index is given another view: the decoy image's colour;
+//   7. the original index is removed: the fallback.
 // This runs with the descriptor-indexing flags the device has (update after bind, partially bound) and again
 // without any. Exit 77 with "unsupported: ..." when the device lacks a feature the shaders need.
 // LEONIDA_VK_VALIDATION=1 runs under VK_LAYER_KHRONOS_validation; a validation error fails the test.
@@ -215,6 +217,9 @@ int main(int argc, char** argv) {
     LD(vkGetBufferMemoryRequirements); LD(vkBindBufferMemory); LD(vkMapMemory); LD(vkGetBufferDeviceAddress);
     LD(vkCreateSampler); LD(vkCmdBindDescriptorSets); LD(vkCmdPushConstants); LD(vkCmdPipelineBarrier);
     LD(vkDeviceWaitIdle); LD(vkDestroyPipeline); LD(vkDestroyPipelineLayout);
+    LD(vkDestroyCommandPool); LD(vkDestroyShaderModule); LD(vkDestroyFramebuffer); LD(vkDestroyRenderPass);
+    LD(vkDestroySampler); LD(vkDestroyImageView); LD(vkDestroyImage); LD(vkDestroyBuffer);
+    LD(vkFreeMemory); LD(vkDestroyDevice);
     VkQueue queue = VK_NULL_HANDLE;
     vkGetDeviceQueue(dev, qi, 0, &queue);
     VkPhysicalDeviceMemoryProperties mp;
@@ -224,6 +229,7 @@ int main(int argc, char** argv) {
             if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
         return 0u;
     };
+    std::vector<VkDeviceMemory> allocations;
     const auto make_buffer = [&](VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer* b, void** map) {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = size;
@@ -241,6 +247,7 @@ int main(int argc, char** argv) {
         VkDeviceMemory m;
         r = vkAllocateMemory(dev, &ai, nullptr, &m);
         if (r) return r;
+        allocations.push_back(m);
         r = vkBindBufferMemory(dev, *b, m, 0);
         if (r) return r;
         return vkMapMemory(dev, m, 0, size, 0, map);
@@ -265,7 +272,9 @@ int main(int argc, char** argv) {
         VkDeviceMemory m;
         r = vkAllocateMemory(dev, &ai, nullptr, &m);
         if (r) return r;
-        vkBindImageMemory(dev, *image, m, 0);
+        allocations.push_back(m);
+        r = vkBindImageMemory(dev, *image, m, 0);
+        if (r) return r;
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = *image;
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -593,7 +602,7 @@ int main(int argc, char** argv) {
             const std::uint32_t brief_index = set.add_image(ImageDimension::dim_2d, brief, VK_IMAGE_LAYOUT_GENERAL, brief_storage);
             EXPECT(brief_index >= 1 && brief_index < bindless::storage_indices && brief_index != stored_index);
             set.remove_image(ImageDimension::dim_2d, brief_index);
-            reinterpret_cast<PFN_vkDestroyImageView>(vkGetDeviceProcAddr(dev, "vkDestroyImageView"))(dev, brief, nullptr);
+            vkDestroyImageView(dev, brief, nullptr);
         }
 
         // 1. The T# behind three keys that share its first slot, the S#, and other keys that name the decoy.
@@ -633,19 +642,31 @@ int main(int argc, char** argv) {
         compare("3 grown", nullptr);
         set.release_retired();
 
-        // 4. Another view at the same index, then 5. the index removed.
         const float orange_colour[4] = {1.0f, 128.0f / 255.0f, 0.0f, 1.0f};
+        // Rewriting the same mapping is a no-op. Changing it needs idle even with no table growth.
+        const std::uint32_t grown_slots = slot_count();
+        EXPECT(set.insert_key(tsharp, gradient_index) && !set.flush_needs_idle());
+        EXPECT(set.insert_key(tsharp, decoy_index) && slot_count() == grown_slots && set.flush_needs_idle());
+        EXPECT(set.flush() && !set.flush_needs_idle());
+        CHECK(draw());
+        compare("4 rebound", orange_colour);
+        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_needs_idle());
+        EXPECT(set.flush());
+        CHECK(draw());
+        compare("5 restored", nullptr);
+
+        // Another view at the same index, then removal of the index.
         set.update_image(ImageDimension::dim_2d, gradient_index, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         EXPECT(set.flush());
         CHECK(draw());
-        compare("4 other view", orange_colour);
+        compare("6 other view", orange_colour);
         set.remove_image(ImageDimension::dim_2d, gradient_index);
         EXPECT(set.flush());
         CHECK(draw());
-        compare("5 removed", zeros);
+        compare("7 removed", zeros);
         EXPECT(set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) == gradient_index);
 
-        std::printf("%s: gradient at the %uth slot probed, miss, table grown %u -> %u slots, other view, removed\n", name,
+        std::printf("%s: gradient at the %uth slot probed, miss, table grown %u -> %u slots, rebound, restored, other view, removed\n", name,
                     depth + 1, slots, slot_count());
         ++runs;
         vkDeviceWaitIdle(dev);
@@ -653,11 +674,31 @@ int main(int argc, char** argv) {
         vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
     }
 
+    // Let validation observe resource and device destruction before reporting its final error count.
+    vkDestroyCommandPool(dev, pool, nullptr);
+    vkDestroyFramebuffer(dev, framebuffer, nullptr);
+    vkDestroyRenderPass(dev, pass, nullptr);
+    vkDestroyShaderModule(dev, fs, nullptr);
+    vkDestroyShaderModule(dev, vs, nullptr);
+    vkDestroySampler(dev, nearest, nullptr);
+    for (const auto view : {target_view, stored_view, decoy_view, gradient_view})
+        vkDestroyImageView(dev, view, nullptr);
+    for (const auto image : {target, stored, decoy, gradient}) vkDestroyImage(dev, image, nullptr);
+    for (const auto buffer : {readback, upload, heap}) vkDestroyBuffer(dev, buffer, nullptr);
+    for (const auto memory : allocations) vkFreeMemory(dev, memory, nullptr);
+    vkDestroyDevice(dev, nullptr);
+    if (messenger) {
+        LI(vkDestroyDebugUtilsMessengerEXT);
+        vkDestroyDebugUtilsMessengerEXT(inst, messenger, nullptr);
+    }
+    LI(vkDestroyInstance);
+    vkDestroyInstance(inst, nullptr);
+
     if (!runs) {
         std::printf("unsupported: the bindless set does not fit this device's descriptor limits\n");
         return unsupported;
     }
-    std::printf("bindless: %u draws read back, %u bad pixels, largest error %g\n", runs * 5, mismatches, double(worst));
+    std::printf("bindless: %u draws read back, %u bad pixels, largest error %g\n", runs * 7, mismatches, double(worst));
     if (g_validation_errors) {
         std::fprintf(stderr, "%u validation errors\n", g_validation_errors);
         return 1;
