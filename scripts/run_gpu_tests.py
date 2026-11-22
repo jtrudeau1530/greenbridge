@@ -34,7 +34,8 @@ from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
-from check import WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, narrow_subgroup_skip, wave32_lane_skip   # as in check.py
+from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
+                   wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem   # ps_interp_f16_high's producers and check
 
 
@@ -323,8 +324,10 @@ def check_bary(raw_path: str) -> tuple[bool, str]:
     return (bad == 0), (first if bad else "4096/4096 pixels exact")
 
 
-def check_bitmask_perm(raw_path: str) -> tuple[bool, str]:
+def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
     px = read_raw_u32(raw_path)
+    if skip := bitmask_perm_narrow_skip(msg, px):
+        return None, str(skip)
     bad = 0
     first = ""
     judged = 0
@@ -988,7 +991,7 @@ def run_suite(a, work: str) -> int:
                 if m and int(m.group(1)) < 32:
                     ok, detail = None, f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)"
                 else:
-                    ok, detail = check_bitmask_perm(raw)
+                    ok, detail = check_bitmask_perm(raw, msg)
             elif name in ("ps_uniform_branch", "ps_scc_mask32"):   # same expected pattern (see the .asm headers)
                 ok, detail = check_uniform_branch(raw)
             elif name == "ps_wqm":

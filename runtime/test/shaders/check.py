@@ -429,6 +429,22 @@ def wave32_lane_skip(out):
     return narrow_subgroup_skip(out) or unpinned_subgroup_skip(out)
 
 
+def bitmask_perm_narrow_skip(out, px):
+    """A Skip when ps_bitmask_perm ran narrower than 32 lanes on a device whose subgroup range permits it (#618).
+    Requires every lane 0..width-1 of a power-of-two width in [min, 32), so a broken v_mbcnt still fails."""
+    m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
+    if not m or len(px) != 64 * 64:
+        return None
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if lo >= 32:
+        return None
+    lanes = {p[0] for p in px}
+    width = max(lanes) + 1
+    if lo <= width < 32 and width & (width - 1) == 0 and lanes == set(range(width)):
+        return Skip(f"SKIP (fragment subgroup ran at {width} lanes on {lo}..{hi} device; needs 32)")
+    return None
+
+
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
                  env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
@@ -785,6 +801,8 @@ def pixel_test(tools, spirv, name):
     if name == "ps_interp_f16_high":
         return interp_f16_high_problem(px)
     if name == "ps_bitmask_perm":
+        if skip := bitmask_perm_narrow_skip(out, px):
+            return skip
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"

@@ -76,6 +76,26 @@ class PixelChecks(unittest.TestCase):
             with self.subTest(check=name):
                 self.assertFalse(check(empty)[0])
 
+    def test_bitmask_perm_narrow_fragment_subgroup_skip(self):
+        import check
+        self.assertIs(rgt.bitmask_perm_narrow_skip, check.bitmask_perm_narrow_skip)
+        simd16 = self.raw(b"".join(struct.pack("<4I", i % 16, (i % 16) ^ 9, 0, 0) for i in range(64 * 64)))
+        ok, detail = rgt.check_bitmask_perm(simd16, "device: Intel ANV (subgroup 8..32)\nok 64x64\n")
+        self.assertIsNone(ok)
+        self.assertIn("16 lanes", detail)
+
+        # Same narrow output on a fixed 32..32 device is a real failure, not a skip.
+        ok, detail = rgt.check_bitmask_perm(simd16, "device: NVIDIA (subgroup 32..32)\nok 64x64\n")
+        self.assertIs(ok, False)
+        self.assertIn("want (9,17,0)", detail)
+
+        # Full 32-lane output on an 8..32 device is still judged.
+        simd32 = self.raw(b"".join(
+            struct.pack("<4I", i % 32, (i % 32) ^ 9, (((i % 32) & 5) | 16) ^ 1, 0) for i in range(64 * 64)))
+        ok, detail = rgt.check_bitmask_perm(simd32, "device: Intel ANV (subgroup 8..32)\nok 64x64\n")
+        self.assertIs(ok, True)
+        self.assertIn("4096/4096", detail)
+
 
 if __name__ == "__main__":
     unittest.main()
