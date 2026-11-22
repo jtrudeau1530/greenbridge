@@ -294,3 +294,25 @@ jobs:
         env:
           LEONIDA_W64_EMULATE: "1"
         run: python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --work "$RUNNER_TEMP/gpu-w64" --filter cs_
+      - name: GPU tests on llvmpipe with the barycentric fallback
+        # llvmpipe has no VK_KHR_fragment_shader_barycentric, so the native run skips the pixel shaders that read raw
+        # barycentrics. Under --bary-fallback they read them from an input a pass-through geometry shader feeds
+        # (tools/bary_fallback_gs.py), the path for GPUs without the extension (NVIDIA Pascal). Every shader that
+        # got such a geometry shader has to pass here, not skip.
+        shell: bash
+        env:
+          LEONIDA_BARY_FALLBACK: "1"
+        run: |
+          log="$RUNNER_TEMP/gpu-bary.log"
+          python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --work "$RUNNER_TEMP/gpu-bary" | tee "$log"
+          names=$(sed -n 's/^bary fallback GS: \(.*\)\.bary_gs\.spv$/\1/p' "$log")
+          if [ -z "$names" ]; then
+            echo "::error::no barycentric fallback geometry shader was built"
+            exit 1
+          fi
+          while read -r name; do
+            if ! grep -Eq "^  PASS  ${name}( |\$)" "$log"; then
+              echo "::error::$name did not pass under the barycentric fallback"
+              exit 1
+            fi
+          done <<< "$names"

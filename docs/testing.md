@@ -226,13 +226,17 @@ cmake -S runtime -B runtime/build/linux && cmake --build runtime/build/linux --p
 python -I scripts/run_gpu_tests.py --build runtime/build/linux --llvm-mc /usr/lib/llvm-18/bin/llvm-mc
 LEONIDA_W64_EMULATE=1 python -I scripts/run_gpu_tests.py --build runtime/build/linux \
     --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --filter cs_
+LEONIDA_BARY_FALLBACK=1 python -I scripts/run_gpu_tests.py --build runtime/build/linux \
+    --llvm-mc /usr/lib/llvm-18/bin/llvm-mc
 ```
 
 With Mesa 25.2 (llvmpipe, LLVM 20) the first run passes 52 of 88 and skips 36, the second passes 37 of 39 and
 skips 2. The skips are expected: llvmpipe has 8-wide subgroups (so every wave64 test skips without emulation, and
 the 32-lane tests `ps_bitmask_perm`, `cs_wqm_w32` and `cs_w32_lane_wrap` skip in both runs), no
 `VK_KHR_fragment_shader_barycentric` (`ps_bary`, `ps_uniform_branch`, `ps_scc_mask32`) and no
-`VK_KHR_maintenance8` (`ps_texoff`). With
+`VK_KHR_maintenance8` (`ps_texoff`). The third run draws those three barycentric tests through the fallback below
+(with Mesa 26.0.8 it passes 123 of 189, the first run 120), and CI fails it unless every shader that got a fallback
+geometry shader passes. With
 `LEONIDA_W64_EMULATE=1` the mesh tests abort inside llvmpipe's compiler ("LLVM ERROR: Cannot emit physreg copy
 instruction"), which is why the second run is limited to compute. llvmpipe is not a substitute for a result from a
 real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
@@ -241,13 +245,17 @@ differences.
 ## GPUs without fragment barycentrics (NVIDIA Volta, Pascal and older)
 
 `ps_bary`, `ps_uniform_branch` and `ps_scc_mask32` read raw barycentrics, which need
-`VK_KHR_fragment_shader_barycentric`; so do `ps_interp_f16_high` and `ms_f16_pack` (16-bit interpolants are
-`PerVertexKHR` inputs, and `--bary-fallback` cannot express them, so they skip under it). NVIDIA has it from Turing on; Volta (V100, Titan V) and older lack it, as do
-llvmpipe and some other drivers. Where the device lacks it they're skipped; that's expected, not a failure. To
-test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`** (or
-for `run_gpu_tests.py`). The shaders are then translated with `--bary-fallback` and drawn through a pass-through
-geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric fallback"), so the device needs
-geometry shaders instead.
+`VK_KHR_fragment_shader_barycentric`. NVIDIA has it from Turing on; Volta (V100, Titan V) and older lack it, as do
+llvmpipe and some other drivers. Where the device lacks it those three are skipped; that's expected, not a failure.
+To test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`**
+(or for `run_gpu_tests.py`; CI does this on llvmpipe). The shaders are then translated with `--bary-fallback` and
+drawn through a pass-through geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric
+fallback"), so the device needs geometry shaders instead.
+
+`ps_interp_f16_high` and `ms_f16_pack` read 16-bit interpolants as `PerVertexKHR` inputs, which need the extension
+too and which `--bary-fallback` can't express. With `LEONIDA_F16_INTERP_FALLBACK=1` they read halves the producer
+exports decoded instead (see Macs, below) and run with or without the bary fallback; `run_gpu_tests.py` turns that
+on by itself where the device lacks the extension. Under the bary fallback without it they skip.
 
 ## Macs: 16-bit interpolation without PerVertexKHR
 
