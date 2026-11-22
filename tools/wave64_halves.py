@@ -204,7 +204,7 @@ class Analysis:
         (an immediate, an untainted register), the tag's k for a lane id, -1 for anything else."""
         if a.get("k") in ("imm", "fimm"):
             return 32
-        if self.is_mask(ins, a):
+        if self.is_mask(ins, a) or a.get("neg") or a.get("abs"):
             return -1
         regs = _regs(a)
         if not regs or self.rd(st, ins, a):
@@ -216,6 +216,11 @@ class Analysis:
     def lmod_result(self, st, ins, op, a):
         """k of a VALU result whose only partition-dependent source is a lane id exact modulo 2**k: sums,
         differences and bitwise ops with invariant values keep k, a left shift by an immediate c raises it to k + c."""
+        # SDWA selects, DPP, op_sel and integer clamp change the value: no tag
+        mods = ins.get("mods") or []
+        if ins["op"].endswith(("_sdwa", "_dpp")) or any(
+                m == "clamp" or m.startswith(("op_sel", "dst_unused")) or "_sel:" in m for m in mods):
+            return None
         src = a[1:]
         ks = [self.lmod(st, ins, x) for x in src]
         if not src or min(ks) < 0:

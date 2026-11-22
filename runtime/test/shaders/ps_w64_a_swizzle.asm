@@ -9,6 +9,8 @@
 ;       back, so r2 = p.
 ;  r3 = bitmask mode, and 0x1c (offset 0x001c, swizzle(BROADCAST,4,0)): every lane reads its quad's first lane,
 ;       (x & ~1) + 64 * (y & ~1).
+; The reads that go out and come back also need the partner lane to hold a pixel: vs_ids' full-screen triangle on
+; the 64x64 target fills every wave.
 ; Run: vk_harness vs_ids.spv ps_w64_a_swizzle.spv out.raw with VKH_SUBGROUP_SIZE=64 and 32: equal images, equal to
 ; the derived words.
 ; mattr: +wavefrontsize64,-wavefrontsize32

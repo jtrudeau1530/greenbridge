@@ -9,6 +9,8 @@
 ;       then back, so r2 = p.
 ;  r3 = permlanex16 with selects lane ^ 3 (0x45670123, 0xcdef89ab) of a value already read from lane ^ 3 of the other
 ;       row (the same selects with permlanex16), so r3 = p again, through a non-identity mapping.
+; The reads that go out and come back also need the partner lane to hold a pixel: vs_ids' full-screen triangle on
+; the 64x64 target fills every wave.
 ; Run: vk_harness vs_ids.spv ps_w64_a_permlane.spv out.raw with VKH_SUBGROUP_SIZE=64 and 32: equal images, equal to
 ; the derived words.
 ; mattr: +wavefrontsize64,-wavefrontsize32

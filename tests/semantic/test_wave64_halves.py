@@ -194,6 +194,14 @@ class Classification(unittest.TestCase):
         # combined with a lane mask: the mask is not the same in the wave and in a half
         self.tier("ps_c_bperm_mask", ps([*LANE_ID, "v_and_b32_e32 v11, s10, v10", "v_lshlrev_b32_e32 v11, 2, v11",
                                          "ds_bpermute_b32 v6, v11, v0", "s_waitcnt lgkmcnt(0)"]), "C")
+        # SDWA selects and integer clamp change the value: a byte of id << 7, a saturating id - 32
+        self.tier("ps_c_bperm_sdwa", ps([*LANE_ID, "v_lshlrev_b32_e32 v11, 7, v10",
+                                         "v_mov_b32_sdwa v12, v11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
+                                         "v_lshlrev_b32_e32 v12, 2, v12", "ds_bpermute_b32 v6, v12, v0",
+                                         "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
+        self.tier("ps_c_bperm_clamp", ps([*LANE_ID, "v_add_nc_u32_e64 v11, v10, -32 clamp",
+                                          "v_lshlrev_b32_e32 v11, 2, v11", "ds_bpermute_b32 v6, v11, v0",
+                                          "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])
         # the lane id still taints the data it permutes, and the lane id itself
         self.tier("ps_c_bperm_data", ps([*LANE_ID, "v_lshlrev_b32_e32 v11, 2, v10", "ds_bpermute_b32 v6, v11, v10",
                                          "s_waitcnt lgkmcnt(0)"]), "C", ["lane-id"])

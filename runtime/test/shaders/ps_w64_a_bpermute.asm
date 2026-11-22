@@ -7,6 +7,8 @@
 ;  r1 = ds_bpermute from lane ^ 3: the diagonal pixel, (x ^ 1) + 64 * (y ^ 1).
 ;  r2 = ds_bpermute from lane ^ 16, twice: back to the own pixel, p.
 ;  r3 = ds_bpermute from lane & ~3 + 2 (the quad's bottom-left lane): (x & ~1) + 64 * (y | 1).
+; The reads that go out and come back also need the partner lane to hold a pixel: vs_ids' full-screen triangle on
+; the 64x64 target fills every wave.
 ; Run: vk_harness vs_ids.spv ps_w64_a_bpermute.spv out.raw with VKH_SUBGROUP_SIZE=64 and 32: equal images, equal to
 ; the derived words.
 ; mattr: +wavefrontsize64,-wavefrontsize32
