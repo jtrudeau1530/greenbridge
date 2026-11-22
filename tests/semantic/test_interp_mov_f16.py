@@ -981,5 +981,176 @@ class TestInterpMovF16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res_max_clamped & MASK16, H_ONE)
 
 
+def parse_interp_mov_f16_asm(line: str) -> ASTInstruction:
+    """Parse a textual v_interp_mov_f16 assembly instruction string."""
+    line = line.strip()
+    if not line:
+        raise ValueError("Empty assembly line")
+
+    tokens = line.split(None, 1)
+    if not tokens or tokens[0] != Opcode.V_INTERP_MOV_F16.value:
+        raise ValueError(f"Expected opcode '{Opcode.V_INTERP_MOV_F16.value}', got '{tokens[0] if tokens else ''}'")
+
+    if len(tokens) < 2:
+        raise ValueError("Missing operands in assembly line")
+
+    rest = tokens[1].strip()
+    # Fields: dst, param, attr [high] [clamp]
+    parts = [p.strip() for p in rest.split(",")]
+    if len(parts) < 3:
+        raise ValueError(f"Expected at least 3 comma-separated fields, got {len(parts)}")
+
+    dst_str = parts[0]
+    param_str = parts[1]
+    last_tokens = parts[2].split()
+    if not last_tokens:
+        raise ValueError("Missing attribute operand")
+
+    attr_str = last_tokens[0]
+    mod_tokens = last_tokens[1:]
+
+    # Parse dst
+    if not dst_str.startswith("v"):
+        raise ValueError(f"Destination must be a VGPR (e.g. v0), got '{dst_str}'")
+    try:
+        dst_idx = int(dst_str[1:])
+    except ValueError:
+        raise ValueError(f"Invalid VGPR number: {dst_str}")
+
+    # Parse param
+    param_lower = param_str.lower()
+    if param_lower == "p0":
+        param = ParamType.P0
+    elif param_lower == "p10":
+        param = ParamType.P10
+    elif param_lower == "p20":
+        param = ParamType.P20
+    else:
+        raise ValueError(f"Invalid parameter type: {param_str}")
+
+    # Parse attr: format attrN.C
+    if not attr_str.startswith("attr") or "." not in attr_str:
+        raise ValueError(f"Malformed attribute reference: {attr_str}")
+    attr_num_str, chan_str = attr_str[4:].split(".", 1)
+    try:
+        attr_idx = int(attr_num_str)
+    except ValueError:
+        raise ValueError(f"Invalid attribute index: {attr_num_str}")
+    chan = Channel.from_str(chan_str)
+
+    high_src = False
+    high_dst = False
+    clamp = False
+
+    for mod in mod_tokens:
+        if mod == "high":
+            high_src = True
+        elif mod == "clamp":
+            clamp = True
+        else:
+            raise ValueError(f"Unknown modifier: {mod}")
+
+    inst = ASTInstruction(
+        opcode=Opcode.V_INTERP_MOV_F16,
+        dst=ASTOperand(dst_idx, high=high_dst),
+        param=param,
+        attr=AttributeRef(attr_idx, chan),
+        high_src=high_src,
+        clamp=clamp,
+    )
+    inst.validate()
+    return inst
+
+
+class TestInterpMovF16NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, and mutation detection."""
+
+    def test_syntax_rejection_malformed_instructions(self):
+        # Empty line
+        with self.assertRaises(ValueError):
+            parse_interp_mov_f16_asm("")
+
+        # Wrong opcode
+        with self.assertRaises(ValueError):
+            parse_interp_mov_f16_asm("v_interp_mov_f32 v0, p0, attr0.x")
+
+        # Destination is SGPR
+        with self.assertRaises(ValueError):
+            parse_interp_mov_f16_asm("v_interp_mov_f16 s0, p0, attr0.x")
+
+        # Destination out of bounds
+        with self.assertRaises(ValueError):
+            parse_interp_mov_f16_asm("v_interp_mov_f16 v256, p0, attr0.x")
+
+        # Invalid param
+        with self.assertRaises(ValueError):
+            parse_interp_mov_f16_asm("v_interp_mov_f16 v0, p30, attr0.x")
+
+        # Invalid attribute index
+        with self.assertRaises(ValueError):
+            parse_interp_mov_f16_asm("v_interp_mov_f16 v0, p0, attr32.x")
+
+        # Invalid channel
+        with self.assertRaises(ValueError):
+            parse_interp_mov_f16_asm("v_interp_mov_f16 v0, p0, attr0.k")
+
+        # Unknown modifier
+        with self.assertRaises(ValueError):
+            parse_interp_mov_f16_asm("v_interp_mov_f16 v0, p0, attr0.x clamp_invalid")
+
+    def test_mutation_detection_high_src_ignored(self):
+        # Mutant: high_src flag ignored, always reads low half
+        def mutated_oracle(word: int, *, high_src: bool, old: int) -> int:
+            lo, _ = unpack_f16_pair(word)
+            return pack_f16_pair(lo, old >> 16)
+
+        attr_word = pack_f16_pair(0x1111, 0x2222)
+        correct = ref_interp_mov_f16(attr_word, high_src=True, old_dst_u32=0)
+        mutated = mutated_oracle(attr_word, high_src=True, old=0)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(correct, 0x00002222)
+        self.assertEqual(mutated, 0x00001111)
+
+    def test_mutation_detection_half_preservation_wiped(self):
+        # Mutant: writes destination but wipes the other half to zero
+        def mutated_write_low(word: int, old: int) -> int:
+            lo, _ = unpack_f16_pair(word)
+            return pack_f16_pair(lo, 0)  # Bug: clobbers high half to 0
+
+        canary_old = 0xBEEF5555
+        attr_word = pack_f16_pair(0x3C00, 0)
+        correct = ref_interp_mov_f16(attr_word, high_src=False, high_dst=False, old_dst_u32=canary_old)
+        mutated = mutated_write_low(attr_word, canary_old)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(correct, 0xBEEF3C00)
+        self.assertEqual(mutated, 0x00003C00)
+
+    def test_mutation_detection_clamp_omission(self):
+        # Mutant: clamp modifier ignored
+        def mutated_clamp(u16_val: int) -> int:
+            return u16_val  # Bug: no clamp
+
+        # 3.0 (0x4200) clamped must be 1.0 (0x3C00)
+        correct = apply_clamp_f16(0x4200)
+        mutated = mutated_clamp(0x4200)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(correct, H_ONE)
+        self.assertEqual(mutated, 0x4200)
+
+    def test_mutation_detection_nan_clamp_omission(self):
+        # Mutant: clamp maps negative values to 0, but leaves NaN intact
+        def mutated_clamp_nan(u16_val: int) -> int:
+            v = u16_to_f16(u16_val)
+            if math.isnan(v):
+                return u16_val  # Bug: leaves NaN untouched
+            return apply_clamp_f16(u16_val)
+
+        correct = apply_clamp_f16(H_QNAN)
+        mutated = mutated_clamp_nan(H_QNAN)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(correct, H_POS_ZERO)
+        self.assertEqual(mutated, H_QNAN)
+
+
 if __name__ == "__main__":
     unittest.main()
