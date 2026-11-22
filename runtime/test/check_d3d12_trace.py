@@ -56,6 +56,9 @@ def main():
             "ID3D12GraphicsCommandList::Close ok",
             "ID3D12GraphicsCommandList::Close failed",
             "ID3D12GraphicsCommandList::Reset ok",
+            "ID3D12GraphicsCommandList::DrawInstanced called",
+            "ID3D12GraphicsCommandList::DrawIndexedInstanced called",
+            "ID3D12GraphicsCommandList::Close failed",
         ]
 
     observed = iter(entries)
