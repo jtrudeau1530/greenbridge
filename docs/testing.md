@@ -151,8 +151,8 @@ x86_64 headers for Win11SDK_10.0.26100".
 On a machine without a display (a server, a container, WSL without WSLg), Wine has no graphics driver to create a
 Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (VkResult -3)` and, with
 `WINEDEBUG=+vulkan`, "Failed to load Wine graphics driver supporting Vulkan". Run the tests under a virtual X server,
-as CI does: `xvfb-run -a ctest --test-dir runtime/build/windows` (package `xvfb`). With Mesa installed, the tests
-then run on llvmpipe.
+as CI does: `WINEPREFIX="$HOME/.local/share/leonida-wine" xvfb-run -a ctest --test-dir runtime/build/windows`
+(packages `xvfb` and `xauth`, which `xvfb-run` needs). With Mesa installed, the tests then run on llvmpipe.
 
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
