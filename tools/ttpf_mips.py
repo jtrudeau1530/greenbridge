@@ -1421,85 +1421,79 @@ def dds_bytes(width, height, fmt, mips, linear, payload,
     return bytes(hdr) + struct.pack("<IIIII", fmt, dim, misc, dx10_array, 0) + payload
 
 
-def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=False, history=None):
-    a = analyze(pool, index)
+def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
+    """Build the complete DDS in memory before publishing it to disk."""
     if "layout" not in a or "available" not in a:
-        print(f"texture {index}: {a.get('blocked', 'layout unavailable')}", file=sys.stderr)
-        return 2
+        raise ValueError(a.get("blocked", "layout unavailable"))
     d = a["descriptor"]
     shape = a.get("shape", "2d")
     if shape != "volume" and d["format"] not in BC_FORMATS:
-        print(f"texture {index}: format {d['format']} is uncompressed; this tool does not "
-              "validate uncompressed 2D tiling, so it will not write a DDS", file=sys.stderr)
-        return 2
+        raise ValueError(f"format {d['format']} is uncompressed; this tool does not validate uncompressed 2D tiling")
     if shape == "volume" and d["format"] not in VOLUME_FLOAT_FORMATS:
-        print(f"texture {index}: volume format {d['format']} is not validated for export",
-              file=sys.stderr)
-        return 2
+        raise ValueError(f"volume format {d['format']} is not validated for export")
     if not a["full_chain"]:
-        print(f"texture {index}: not every source mip uses a supported codec "
-              "(zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)", file=sys.stderr)
-        return 2
+        raise ValueError("not every source mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     count = d["mips"] if mips is None else mips
     if count < 1 or count > d["mips"]:
-        print(f"texture {index}: --mips must be 1..{d['mips']}", file=sys.stderr)
-        return 2
+        raise ValueError(f"--mips must be 1..{d['mips']}")
     layout = a["layout"]
     cache = {}
     bcpack_mode = "provisional" if allow_provisional else "strict"
     payload = bytearray()
-    try:
-        if shape == "volume":
-            tiled = pool.read_range(d["base"], layout["size"], cache,
-                                    bcpack_mode=bcpack_mode, bcpack_history=history)
-            payload += detile_volume(layout, tiled)
-        elif shape == "2d_array":
-            for s in range(d["depth"]):
-                for mip in layout["mips"][:count]:
-                    tiled = pool.read_range(d["base"] + mip["offset"] + s * mip["slice_stride"],
-                                            mip["region"], cache,
-                                            bcpack_mode=bcpack_mode, bcpack_history=history)
-                    payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
-        elif shape == "cubemap":
-            face_base = d["base"] + layout["data_offset"]
-            for face in range(6):
-                for mip in layout["mips"][:count]:
-                    tiled = pool.read_range(face_base + face * layout["face_size"] + mip["offset"],
-                                            mip["region"], cache,
-                                            bcpack_mode=bcpack_mode, bcpack_history=history)
-                    payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
-        else:
+    if shape == "volume":
+        tiled = pool.read_range(d["base"], layout["size"], cache,
+                                bcpack_mode=bcpack_mode, bcpack_history=history)
+        payload += detile_volume(layout, tiled)
+    elif shape == "2d_array":
+        for s in range(d["depth"]):
             for mip in layout["mips"][:count]:
-                tiled = pool.read_range(d["base"] + mip["offset"], mip["region"], cache,
+                tiled = pool.read_range(d["base"] + mip["offset"] + s * mip["slice_stride"],
+                                        mip["region"], cache,
                                         bcpack_mode=bcpack_mode, bcpack_history=history)
                 payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
-    except BcpackRequired as exc:
-        print(f"texture {index}: {exc}", file=sys.stderr)
-        return 2
-    except bcpack.BcpackProvisionalError as exc:
-        print(f"texture {index}: provisional BCPack history required ({exc}); "
-              "pass --allow-provisional", file=sys.stderr)
-        return 2
-    except (OSError, ValueError) as exc:
-        print(f"texture {index}: {exc}", file=sys.stderr)
-        return 2
+    elif shape == "cubemap":
+        face_base = d["base"] + layout["data_offset"]
+        for face in range(6):
+            for mip in layout["mips"][:count]:
+                tiled = pool.read_range(face_base + face * layout["face_size"] + mip["offset"],
+                                        mip["region"], cache,
+                                        bcpack_mode=bcpack_mode, bcpack_history=history)
+                payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
+    else:
+        for mip in layout["mips"][:count]:
+            tiled = pool.read_range(d["base"] + mip["offset"], mip["region"], cache,
+                                    bcpack_mode=bcpack_mode, bcpack_history=history)
+            payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
     if 148 + len(payload) > MAX_OUTPUT:
-        # MipGeometryError from _visible_rows is a ValueError and is reported above.
-        print("DDS exceeds the 256 MiB output limit", file=sys.stderr)
-        return 2
-    if os.path.exists(out_path) and not force:
-        print(f"{out_path} exists; pass --force to replace it", file=sys.stderr)
-        return 2
+        raise ValueError("DDS exceeds the 256 MiB output limit")
     top_w, top_h = (_visible_grid(layout["mips"][0]) if d["format"] in BC_FORMATS else (0, 0))
     linear = (top_w * top_h * layout["element_bytes"]
               if d["format"] in BC_FORMATS else d["width"] * layout["element_bytes"])
-    blob = dds_bytes(
+    return dds_bytes(
         d["width"], d["height"], d["format"], count, linear, bytes(payload),
         depth=d["depth"] if shape == "volume" else 1,
         array_size=d["depth"] if shape == "2d_array" else 1,
         is_cube=(shape == "cubemap"),
         is_volume=(shape == "volume"),
     )
+
+
+def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=False, history=None):
+    a = analyze(pool, index)
+    try:
+        blob = texture_dds(pool, a, mips, allow_provisional=allow_provisional, history=history)
+    except bcpack.BcpackProvisionalError as exc:
+        print(f"texture {index}: provisional BCPack history required ({exc}); pass --allow-provisional", file=sys.stderr)
+        return 2
+    except (BcpackRequired, OSError, ValueError) as exc:
+        print(f"texture {index}: {exc}", file=sys.stderr)
+        return 2
+    if os.path.exists(out_path) and not force:
+        print(f"{out_path} exists; pass --force to replace it", file=sys.stderr)
+        return 2
+    d = a["descriptor"]
+    count = d["mips"] if mips is None else mips
+    shape = a.get("shape", "2d")
     with open(out_path, "wb") as f:
         f.write(blob)
     dims = (f"{d['width']}x{d['height']}x{d['depth']}" if shape in ("2d_array", "volume")

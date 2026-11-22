@@ -17,6 +17,7 @@ Stages, in order (each skips work that is already done, so a stopped build conti
     check     file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
+              BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
     runtime   build the loader (needs the game's executable to run, not to build). Off Windows, or to skip the
               build, --runtime-build DIR takes a Windows build of runtime/ instead (the runtime-windows artifact of
               the Runtime workflow, or your own) and, off Windows, writes gta6rt.sh to start it with Wine
@@ -647,7 +648,7 @@ def rpf9dump(work: str) -> str:
     return exe
 
 
-def ttpf_complete(pool_dir: str) -> bool:
+def ttpf_manifest(pool_dir: str) -> dict | None:
     """An older exporter could publish the manifest after a failed DDS write. Check its promised files on resume."""
     try:
         with open(os.path.join(pool_dir, "manifest.json"), encoding="utf-8") as f:
@@ -655,28 +656,33 @@ def ttpf_complete(pool_dir: str) -> bool:
         with os.scandir(pool_dir) as it:
             have = {e.name for e in it if e.is_file()}
     except (OSError, ValueError, RecursionError):
-        return False
+        return None
     if not isinstance(doc, dict):
-        return False
+        return None
     rows, count = doc.get("Textures"), doc.get("Count")
     if not isinstance(rows, list) or type(count) is not int or count != len(rows):
-        return False
+        return None
     for row in rows:
         if not isinstance(row, dict) or "File" not in row:
-            return False
+            return None
         name = row["File"]
         if name is None:  # The catalog marked this texture unsupported.
             continue
         if not isinstance(name, str):
-            return False
+            return None
         if name not in have:
             # An existing file may use another spelling on a case-insensitive volume.
             if name != os.path.basename(name) or not os.path.isfile(os.path.join(pool_dir, name)):
-                return False
-    return True
+                return None
+    return doc
 
 
 def assets(game: str, work: str, wav: bool, jobs: int) -> None:
+    # make_game.py also runs under python -I, which omits the script directory.
+    if TOOLS not in sys.path:
+        sys.path.insert(0, TOOLS)
+    import ttpf_assets
+
     get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
     for rel in MODEL_ARCHIVES:
@@ -692,14 +698,22 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     pools = []
     for root, _, files in os.walk(game):
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
+    settings = ttpf_assets.load_profile(work) if pools else None
     for p in sorted(pools, key=os.path.getsize):
         name = os.path.splitext(os.path.basename(p))[0]
         parts = os.path.relpath(p, game).replace("\\", "/").split("/")
         dest = os.path.join(out, "ttpf_pack", parts[1]) if parts[0] == "pack" else os.path.join(out, "ttpf")
-        if ttpf_complete(os.path.join(dest, name)):
-            continue
-        log(f"assets: texture pool {os.path.relpath(p, game)}")
-        run([get_exporter(work), "ttpf", p, dest])
+        pool_dir = os.path.join(dest, name)
+        manifest = ttpf_manifest(pool_dir)
+        if manifest is None:
+            log(f"assets: texture pool {os.path.relpath(p, game)}")
+            run([get_exporter(work), "ttpf", p, dest])
+            manifest = ttpf_manifest(pool_dir)
+            if manifest is None:
+                fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
+        written, blocked = ttpf_assets.complete_pool(p, pool_dir, manifest, settings)
+        if written or blocked:
+            log(f"assets: {name}: {written} full BCPack DDS written, {blocked} limited (see manifest.json)")
     if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):
         log("assets: audio banks")
         run([get_exporter(work), "audio", os.path.join(game, "audio.rpf"), out])

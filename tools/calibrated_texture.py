@@ -111,6 +111,8 @@ def bc7_blocks(s, config, seed):
 class LocalDecoder:
     """One calibrated pool reader. Its chunk cache belongs to this instance."""
 
+    formats = frozenset((71, 72, 77, 78, 80, 83, 95, 96, 98, 99))
+
     def __init__(self, pool, calibration):
         self.pool = pool
         self.cal = calibration
@@ -244,7 +246,7 @@ class LocalDecoder:
     def dds(self, index, mips=None):
         d = self.pool.descriptor(index)
         width, height, fmt = d["width"], d["height"], d["format"]
-        if fmt not in (71, 72, 77, 78, 80, 83, 95, 96, 98, 99) or d["dimension"] != 1:
+        if fmt not in self.formats or d["dimension"] != 1:
             raise ValueError(
                 "Calibrated export requires a supported BCn 2D texture or array"
             )
@@ -298,6 +300,9 @@ class LocalDecoder:
             .get(Path(self.pool.path).name, {})
             .get(str(index), "base")
         )
+        span = self.pool.span(index, d["base"])
+        if not span or d["base"] < self.edges[0]:
+            raise ValueError("Texture has no mapped allocation")
         payload = bytearray()
         for face in range(faces):
             for i, (w, h) in enumerate(grids[:count]):
@@ -308,6 +313,8 @@ class LocalDecoder:
                     + face * stride
                     + offset
                 )
+                if at.max() + bs > d["base"] + span:
+                    raise ValueError("Texture crosses its allocation boundary")
                 payload.extend(self.surface(at, bs, profile))
         return ttpf.dds_bytes(
             width, height, fmt, count, linear, bytes(payload), array_size=faces
