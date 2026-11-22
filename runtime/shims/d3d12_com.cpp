@@ -12,7 +12,9 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -190,10 +192,20 @@ public:
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         record_into(command_allocator);
         invalid_ = false;
+        calls_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
-        stencil_ref_set_ = false;
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
         return d3d12_trace::result(method, S_OK);
+    }
+
+    // CreateCommandList's pipeline state. As SetPipelineState on a direct list; on a bundle it is the first deferred
+    // call, which the application did not make, so it is not traced.
+    void set_initial_pipeline(ID3D12PipelineState* state) {
+        if (!state) return;
+        if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) return SetPipelineState(state);
+        defer([=](GraphicsCommandList& l) { l.set_pipeline(state); });
+        hold(state);
     }
 
     void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* command_list) override {
@@ -203,15 +215,17 @@ public:
         if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ ||
             !bundle->list_.closed())
             return check(false);
-        if (!list_.execute_bundle(bundle->list_)) return check(false);
-
-        // Only the sticky state currently recorded by this COM layer is carried back from the bundle.
-        if (bundle->blend_factor_set_) blend_factor_ = bundle->blend_factor_;
-        if (bundle->stencil_ref_set_) {
-            front_stencil_ref_ = bundle->front_stencil_ref_;
-            back_stencil_ref_ = bundle->back_stencil_ref_;
-            stencil_ref_set_ = true;
+        // The bundle's state calls and draws play on this list through the members the application would have
+        // called, so a draw sees this list's state plus what the bundle set, and what the bundle set stays here
+        // afterwards (measured on the PC runtime, docs/d3d12_vulkan.md section 3.2). Commands that need no state
+        // were recorded in the bundle's own list and are copied between them, in order.
+        std::size_t copied = 0;
+        for (const BundleCall& call : bundle->calls_) {
+            if (!list_.execute_bundle(bundle->list_, copied, call.commands)) return check(false);
+            copied = call.commands;
+            call.run(*this);
         }
+        check(list_.execute_bundle(bundle->list_, copied));
     }
 
     // Root signatures, pipeline state and root arguments. The arguments are packed into the 32 user-data dwords
@@ -226,6 +240,7 @@ public:
 
     void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
+        if (defer([=](GraphicsCommandList& l) { l.set_pipeline(state); })) return hold(state);
         set_pipeline(state);
     }
 
@@ -270,8 +285,8 @@ public:
     }
 
     void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
-        if (!compute_pipeline_ || !compute_.layout) return check(false);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        if (defer([=](GraphicsCommandList& l) { l.record_dispatch(x, y, z); }, true)) return;
+        record_dispatch(x, y, z);
     }
 
     // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
@@ -279,20 +294,27 @@ public:
 
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
+        if (defer([=](GraphicsCommandList& l) { l.topology_ = u(topology); })) return;
         topology_ = u(topology);
     }
 
     void STDMETHODCALLTYPE IASetVertexBuffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) override {
         if (std::uint64_t(start) + count > vertex_buffers_.size()) return check(false);
-        for (UINT i = 0; i < count; ++i)
-            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
-                                                                          views[i].StrideInBytes}
-                                               : leonida::VertexBufferView{};
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            std::vector<D3D12_VERTEX_BUFFER_VIEW> copy;
+            if (views) copy.assign(views, views + count);
+            defer([=, copy = std::move(copy), bound = views != nullptr](GraphicsCommandList& l) {
+                l.set_vertex_buffers(start, count, bound ? copy.data() : nullptr);
+            });
+            return;
+        }
+        set_vertex_buffers(start, count, views);
     }
 
     void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
-        index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
-                      : leonida::IndexBufferView{};
+        const std::optional<D3D12_INDEX_BUFFER_VIEW> copy = view ? std::optional(*view) : std::nullopt;
+        if (defer([=](GraphicsCommandList& l) { l.set_index_buffer(copy ? &*copy : nullptr); })) return;
+        set_index_buffer(view);
     }
 
     // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
@@ -326,24 +348,32 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
-        blend_factor_set_ = true;
-        blend_factor_ = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
-                               : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
+        const std::array<float, 4> value = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
+                                                  : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
+        if (defer([=](GraphicsCommandList& l) { l.blend_factor_ = value; })) return;
+        blend_factor_ = value;
     }
 
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
+        if (defer([=](GraphicsCommandList& l) { l.front_stencil_ref_ = l.back_stencil_ref_ = reference; })) return;
         front_stencil_ref_ = back_stencil_ref_ = reference;
-        stencil_ref_set_ = true;  // the bundle carry-back in ExecuteBundle needs to see this
     }
 
     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::DrawInstanced");
+        if (defer([=](GraphicsCommandList& l) { l.record_draw(false, vertices, instances, first_vertex, 0, first_instance); },
+                  true))
+            return;
         record_draw(false, vertices, instances, first_vertex, 0, first_instance);
     }
 
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT indices, UINT instances, UINT first_index, INT base_vertex,
                                                 UINT first_instance) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::DrawIndexedInstanced");
+        if (defer([=](GraphicsCommandList& l) {
+                l.record_draw(true, indices, instances, first_index, base_vertex, first_instance);
+            }, true))
+            return;
         record_draw(true, indices, instances, first_index, base_vertex, first_instance);
     }
 
@@ -565,9 +595,13 @@ public:
     void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT front, UINT back) override {
         d3d12_trace::record("ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef");
         if (list_.closed()) return check(false);
+        if (defer([=](GraphicsCommandList& l) {
+                l.front_stencil_ref_ = front;
+                l.back_stencil_ref_ = back;
+            }))
+            return;
         front_stencil_ref_ = front;
         back_stencil_ref_ = back;
-        stencil_ref_set_ = true;
     }
 
     // Debug markers, recorded in order with the other commands and replayed as VK_EXT_debug_utils labels. The trace
@@ -747,6 +781,7 @@ private:
 
     void clear_unordered_access(D3D12_CPU_DESCRIPTOR_HANDLE view, ID3D12Resource* resource, bool is_float,
                                 const std::array<std::uint32_t, 4>& values, UINT count, const D3D12_RECT* rects) {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);  // no clear is allowed in a bundle
         leonida::UavView target{};
         if (!view.ptr || !resource || !unordered_access_view(view, resource, target)) return check(false);
         check(list_.clear_unordered_access(target, is_float, values, to_rects(count, rects)));
@@ -815,6 +850,10 @@ private:
     // signature that is already bound changes nothing: "existing root signature bindings do not become stale"
     // (D3D12, "Using a Root Signature"), and engines rebind routinely.
     void bind_root(RootState& state, ID3D12RootSignature* signature) {
+        if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
+                l.bind_root(compute ? l.compute_ : l.graphics_, signature);
+            }))
+            return hold(signature);  // the bundle keeps it for as long as it can be executed
         const RootArgumentLayout* layout = root_signature_layout(signature);
         if (layout && layout == state.layout) return;
         hold(signature);  // state.layout points into it
@@ -842,6 +881,22 @@ private:
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            // The layout is the executing list's, so the range is checked when it runs; no signature takes more
+            // than D3D12_MAX_ROOT_COST dwords, which bounds what is copied from the caller's memory.
+            if (count > D3D12_MAX_ROOT_COST) return check(false);
+            const auto* words = static_cast<const std::uint32_t*>(data);
+            std::vector<std::uint32_t> copy;
+            if (data) copy.assign(words, words + count);
+            // A count of 0 with a non-null pointer is a valid call; an empty vector's data() may be null.
+            static constexpr std::uint32_t none = 0;
+            defer([=, compute = &state == &compute_, copy = std::move(copy),
+                   given = data != nullptr](GraphicsCommandList& l) {
+                l.constants(compute ? l.compute_ : l.graphics_, index, count,
+                            !given ? nullptr : copy.empty() ? &none : copy.data(), offset);
+            });
+            return;
+        }
         const RootArgumentLayout::Parameter* p = parameter(state, index, rt::rootsig::ParamType::Constants);
         if (!p) return;
         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
@@ -850,6 +905,10 @@ private:
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
+        if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
+                l.address(compute ? l.compute_ : l.graphics_, index, va, type);
+            }))
+            return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
         write(state, p->user_offset, std::uint32_t(va));
@@ -862,7 +921,6 @@ private:
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
-    bool stencil_ref_set_ = false;
     RootState compute_;
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
@@ -875,13 +933,37 @@ private:
     std::vector<leonida::TargetView> render_targets_;
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
-    bool blend_factor_set_ = false;
 
     // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
     // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
     // layout it reads and the pipeline ExecuteCommandLists looks up still exist. (Keeping them alive while the GPU
     // runs the submission stays the application's job, as in D3D12.)
     std::vector<IUnknown*> held_;
+
+    // A bundle keeps its state calls and draws instead of applying them: it has no render targets, viewport or root
+    // signature of its own to resolve them against, and what it sets belongs to the list that executes it.
+    // `commands` is how much of the bundle's own list was recorded before the call, so ExecuteBundle can replay the
+    // calls and copy the state-free commands (markers, immediate writes) in their original order. Returns whether the
+    // call was kept; on any other list it is false and the caller does the work.
+    struct BundleCall {
+        std::size_t commands;
+        std::function<void(GraphicsCommandList&)> run;
+    };
+    std::vector<BundleCall> calls_;
+
+    // Every deferred call replays through a private member that does not trace: the trace line is written once, when
+    // the application makes the call, and not again at each ExecuteBundle. After Close nothing is appended, since
+    // another list may be executing the bundle: a state call is ignored, and a draw or dispatch (`command`) makes
+    // the list invalid.
+    bool defer(std::function<void(GraphicsCommandList&)> run, bool command = false) {
+        if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) return false;
+        if (list_.closed()) {
+            if (command) check(false);
+            return true;
+        }
+        calls_.push_back({list_.commands().size(), std::move(run)});
+        return true;
+    }
 
     void hold(IUnknown* object) {
         if (!object || std::find(held_.begin(), held_.end(), object) != held_.end()) return;
@@ -914,8 +996,24 @@ private:
         render_targets_.clear();
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
-        blend_factor_set_ = false;
         set_pipeline(state);
+    }
+
+    void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
+        for (UINT i = 0; i < count; ++i)
+            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
+                                                                          views[i].StrideInBytes}
+                                               : leonida::VertexBufferView{};
+    }
+
+    void set_index_buffer(const D3D12_INDEX_BUFFER_VIEW* view) {
+        index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
+                      : leonida::IndexBufferView{};
+    }
+
+    void record_dispatch(UINT x, UINT y, UINT z) {
+        if (!compute_pipeline_ || !compute_.layout) return check(false);
+        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
@@ -1290,7 +1388,7 @@ HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void
 }
 
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
-                            void** out, IUnknown* device) {
+                            void** out, IUnknown* device, ID3D12PipelineState* initial_state) {
     if (!out) return E_POINTER;
     *out = nullptr;
     CommandAllocator* command_allocator = CommandAllocator::from(allocator);
@@ -1303,7 +1401,12 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
     auto* object = new GraphicsCommandList(type);  // created open, as D3D12 does
     object->record_into(command_allocator);
     object->attach_device(device);
-    return hand_out(object, riid, out);
+    const HRESULT hr = hand_out(object, riid, out);  // releases the creation reference, so a failure frees the list
+    // The initial pipeline state only once the list exists for the caller, as SetPipelineState on it would be.
+    if (SUCCEEDED(hr) && initial_state)
+        if (GraphicsCommandList* list = GraphicsCommandList::from(static_cast<IUnknown*>(*out)))
+            list->set_initial_pipeline(initial_state);
+    return hr;
 }
 
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
@@ -1381,6 +1484,14 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     if (!l) return false;
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
+    return true;
+}
+
+bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    const auto recorded = l->commands().commands();
+    commands.assign(recorded.begin(), recorded.end());
     return true;
 }
 
