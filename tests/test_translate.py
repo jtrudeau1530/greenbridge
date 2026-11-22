@@ -1265,6 +1265,79 @@ def test_array_resinfo_queries_width_height_layers_and_mip_count(make_shader):
         assert f"OpCompositeExtract %int {size[1]} {axis}" in asm
 
 
+class _ResinfoStub:
+    """Just enough of the generator for Gen.resinfo_words; the lines are evaluated by _eval_resinfo."""
+    def __init__(self):
+        self.n, self.lines = 0, []
+
+    def tmp(self):
+        self.n += 1
+        return f"%t{self.n}"
+
+    def cu(self, v):
+        return f"%c{v & 0xFFFFFFFF:x}"
+
+    def emit(self, s):
+        self.lines.append(s)
+
+    def as_int(self, u):
+        i = self.tmp()
+        self.emit(f"{i} = OpBitcast %int {u}")
+        return i
+
+
+def _eval_resinfo(lines, view, level, word3):
+    """view: (width, height, layers, levels) of the Vulkan view, which starts at the T#'s BASE_LEVEL. Values are
+    Python ints (uint words); OpImageQuerySizeLod refuses a level the view doesn't have, as Vulkan leaves it undefined."""
+    width, height, layers, levels = view
+    env = {"%img": None, "%level": level, "%word3": word3}
+
+    def val(x):
+        return int(x[2:], 16) if x.startswith("%c") else env[x]
+    for line in lines:
+        dst, _, op, _type, *args = line.split()
+        if op == "OpImageQueryLevels":
+            env[dst] = levels
+        elif op == "OpImageQuerySizeLod":
+            lod = val(args[1])
+            assert 0 <= lod < levels, f"OpImageQuerySizeLod at level {lod} of a {levels}-level view"
+            env[dst] = (max(1, width >> lod), max(1, height >> lod), layers)
+        elif op == "OpCompositeExtract":
+            env[dst] = env[args[0]][int(args[1])]
+        elif op == "OpExtInst":
+            assert args[1] == "UMax"
+            env[dst] = max(val(args[2]), val(args[3]))
+        elif op == "OpBitFieldUExtract":
+            env[dst] = (val(args[0]) >> val(args[1])) & ((1 << val(args[2])) - 1)
+        else:
+            a = [val(x) for x in args]
+            env[dst] = {"OpBitcast": lambda: a[0], "OpULessThan": lambda: a[0] < a[1],
+                        "OpSelect": lambda: a[1] if a[0] else a[2], "OpIAdd": lambda: (a[0] + a[1]) & 0xFFFFFFFF,
+                        "OpShiftRightLogical": lambda: a[0] >> a[1] if a[1] < 32 else 0}[op]()
+    return env
+
+
+@pytest.mark.parametrize("array", [False, True])
+def test_resinfo_words_follow_rdna2(array):
+    """SHADER-388 (tools/image_query_probe.py on gfx1036): a 2D depth word is 0; a 2D array's layer count is
+    minified from BASE_LEVEL; past the last level width, height and depth are 0 and the level count stays; a level
+    with bit 31 set is past the last level too (the address VGPR is unsigned)."""
+    cases = {  # (T# full size w, h, layers, BASE_LEVEL, LAST_LEVEL, level) -> words, as measured
+        (16, 4, 1, 0, 4, 0): [16, 4, 0, 5], (16, 4, 1, 0, 4, 3): [2, 1, 0, 5], (16, 4, 1, 0, 4, 5): [0, 0, 0, 5],
+        (16, 4, 1, 1, 4, 0): [8, 2, 0, 4], (16, 4, 1, 0, 4, 0x80000000): [0, 0, 0, 5],
+    } if not array else {
+        (256, 256, 6, 0, 8, 1): [128, 128, 3, 9], (256, 256, 7, 0, 8, 2): [64, 64, 1, 9],
+        (256, 256, 100, 1, 8, 3): [16, 16, 6, 8], (256, 256, 100, 0, 8, 0): [256, 256, 100, 9],
+        (16, 4, 6, 0, 2, 3): [0, 0, 0, 3], (16, 4, 6, 0, 2, 9): [0, 0, 0, 3],
+    }
+    for (w, h, layers, base, last, level), want in cases.items():
+        stub = _ResinfoStub()
+        ids = rdna2spirv.Gen.resinfo_words(stub, "%img", "%level", array, "%word3")
+        view = (max(1, w >> base), max(1, h >> base), layers, last - base + 1)
+        env = _eval_resinfo(stub.lines, view, level, base << 12 | last << 16 | (10 if array else 9) << 28)
+        assert [env[i] & 0xFFFFFFFF for i in ids] == want, (w, h, layers, base, last, level)
+
+
 def test_image_sample_d16_avoids_packhalf2x16(make_shader):
     """d16 image_sample packs f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (

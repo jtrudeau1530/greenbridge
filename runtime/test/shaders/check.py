@@ -402,8 +402,10 @@ STORE_WORDS = {
     "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
                        {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
     # image_get_resinfo on a 16x4 image with five levels: (width, height, depth, levels) of levels 0, 1 and 3, then
-    # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone
-    "cs_resinfo": ({**dict(enumerate([16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD])), 16: 2, 17: 5, 18: 5},
+    # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone, and
+    # level 5, past the last (2D depth 0 and the past-the-end zeros measured on RDNA2, SHADER-388)
+    "cs_resinfo": ({**dict(enumerate([16, 4, 0, 5, 8, 2, 0, 5, 2, 1, 0, 5, 4, 1, 0xABCD])), 16: 2, 17: 5, 18: 5,
+                    20: 0, 21: 0, 22: 0, 23: 5},
                    {}, {}),
 }
 # TEST-184: image_get_lod on vk_texture_test's textures. Per fixture, its draws: S# word 1 (MIN_LOD [11:0], MAX_LOD
