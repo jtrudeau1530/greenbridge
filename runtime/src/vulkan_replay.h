@@ -363,9 +363,11 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
-    case VK_FORMAT_R32G32_SFLOAT: return {8, 1};
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32_UINT: return {8, 1};
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_R8G8B8A8_UINT:
@@ -378,6 +380,9 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_D32_SFLOAT_S8_UINT:  // depth aspect
     case VK_FORMAT_D24_UNORM_S8_UINT: return {4, 1};
     case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8_SNORM:
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
     case VK_FORMAT_R16_SFLOAT:
     case VK_FORMAT_R16_UNORM:
     case VK_FORMAT_D16_UNORM: return {2, 1};
@@ -747,8 +752,20 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         const auto from_depth = std::max(1u, p.source.depth >> src.baseMipLevel);
         const auto to_depth = std::max(1u, p.binding.depth >> dst.baseMipLevel);
         const CopyBox box = copy.has_box ? copy.box : CopyBox{0, 0, 0, from.width, from.height, from_depth};
-        if (box.right > from.width || box.bottom > from.height || box.back > from_depth) return ReplayResult::invalid_copy;
-        const std::uint32_t w = box.right - box.left, h = box.bottom - box.top, d = box.back - box.front;
+        // A block-compressed box is in whole blocks and may run to the block-padded edge of the mip (the host runtime
+        // accepts it); Vulkan wants the extent to stop at the mip edge, as with a footprint.
+        const std::uint32_t block = block_format(p.source.format, src.aspectMask).block;
+        const auto padded = [block](std::uint32_t size) { return (size + block - 1) / block * block; };
+        if (box.right > padded(from.width) || box.bottom > padded(from.height) || box.back > from_depth)
+            return ReplayResult::invalid_copy;
+        std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
+        const std::uint32_t d = box.back - box.front;
+        if (block > 1) {
+            if (box.left >= from.width || box.top >= from.height || copy.x >= to.width || copy.y >= to.height)
+                return ReplayResult::invalid_copy;
+            w = std::min({w, from.width - box.left, to.width - copy.x});
+            h = std::min({h, from.height - box.top, to.height - copy.y});
+        }
         if (!within(copy.x, w, to.width) || !within(copy.y, h, to.height) || !within(copy.z, d, to_depth))
             return ReplayResult::invalid_copy;
         p.image_copies.push_back({{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1},

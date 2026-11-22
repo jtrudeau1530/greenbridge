@@ -160,7 +160,9 @@ What is implemented (all of it testable without the game):
   transfer clears inside a layout round trip; rectangle clears are `vkCmdClearAttachments` in a dynamic-rendering
   scope, with rectangles clipped to the mip. Copies become `vkCmdCopyBuffer`, `vkCmdCopyBufferToImage`,
   `vkCmdCopyImageToBuffer` and `vkCmdCopyImage`. A placed footprint's row pitch becomes `bufferRowLength`, and
-  block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not). Each
+  block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not; a
+  texture-to-texture box of a block-compressed format may likewise run to the padded edge, as on the PC runtime, and
+  the Vulkan extent is cut at the mip edge). Each
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
@@ -328,8 +330,35 @@ and any validation error fails them.
   resolved into a texture that is read back; the multisampled shapes D3D12 refuses are refused, and so is a
   resolve from a single-sampled texture. `GetCopyableFootprints` is compared with the PC runtime's, and a short
   run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
-  round trip and a buffer region. `GetCopyableFootprints` is compared with the PC runtime's, and a short run
-  repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
+  The comparison tests run against a PC D3D12 device: the default adapter, or the one named by
+  `LEONIDA_HOST_ADAPTER` (`warp`, or part of an adapter's name; the adapter used is printed). Some answers are the
+  driver's choice, so pick the host side when two adapters disagree: `GetResourceTiling` differs between an NVIDIA
+  host and an AMD or WARP host on a machine that has both.
+  - Copies against the host (D3D-46, `d3d12_copy_compare.h`): the same scenario runs on the layer and on the host and
+    the bytes read back are compared; a failing case prints its name, the region (subresource, mip, slice, plane)
+    and the first differing byte. Every case uploads deterministic bytes into a texture and then runs
+    `CopyResource`, `CopyTextureRegion` texture to texture (an inner box to the origin, and the origin box into
+    another array slice at an offset), footprint to texture (an inner box at an offset) and texture to footprint
+    (an inner box at an offset into a readback buffer prefilled with `0xcd`), and reads every subresource back.
+    Formats: R8, R8G8 SNORM, RGBA8 (UNORM, SRGB, typeless), BGRA8, R16 UNORM, RG16 and RGBA16 float, R32 UINT,
+    RG32 UINT, RGBA32 float, R10G10B10A2, R11G11B10, R9G9B9E5, B5G6R5, B5G5R5A1, D16, D32, D24S8, D32S8 and BC1-BC7
+    (SRGB and signed variants included), as a 36x20 texture with three slices and six mips (odd mip sizes), 3D
+    textures with boxes in depth, a single-mip single-slice texture and a one-block BC7. Buffers: `CopyBufferRegion`
+    at odd offsets and sizes, a `CopyResource` of a 4093-byte buffer, and an upload buffer straight to a readback
+    buffer. Only the bytes inside a footprint row are compared (row padding is the driver's; a difference there is
+    printed, not failed); every byte a partial copy must leave alone is compared. It found:
+    - `R8G8_SNORM`, `R16_UNORM`, `R32G32_UINT`, `R9G9B9E5_SHAREDEXP`, `B5G6R5_UNORM` and `B5G5R5A1_UNORM` textures were
+      refused (no Vulkan mapping); they map to `R8G8_SNORM`, `R16_UNORM`, `R32G32_UINT`, `E5B9G9R9_UFLOAT_PACK32`,
+      `R5G6B5_UNORM_PACK16` and `A1R5G5B5_UNORM_PACK16`.
+    - A texture-to-texture box on a block-compressed texture that reaches the padded edge of a mip (for example a
+      box of whole blocks over a 9x5 mip) was refused as `invalid_copy`; the PC runtime accepts it.
+
+    Known differences, not fixed: `TEXTURE1D` resources are not supported by the layer (creation, footprints and
+    allocation info refuse them), so 1D copies are not compared. On a GPU without `D24_UNORM_S8_UINT` (the Radeon
+    880M) the layer stores it as `D32_SFLOAT_S8_UINT` and copies the bits without converting 24-bit to float, so a
+    D24 round trip changes the value; that case is skipped there. On a GPU with it, a readback leaves the
+    unspecified `X8` byte of the depth plane untouched where the PC runtime writes 0; the comparison ignores it.
+    A PC driver's copy flushes denormal float depth to zero, so the test keeps its values normal.
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
