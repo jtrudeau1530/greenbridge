@@ -819,7 +819,7 @@ if(TARGET Vulkan::Headers)
               ${_stubs_header}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
               ID3D12Device11 ID3D12DescriptorHeap ID3D12Heap ID3D12Resource ID3D12QueryHeap ID3D12RootSignature
-              ID3D12PipelineState ID3D12CommandSignature
+              ID3D12PipelineState ID3D12CommandSignature ID3D12PipelineLibrary1
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
@@ -1332,6 +1332,16 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      add_executable(d3d12_pipeline_library_test test/d3d12_pipeline_library_test.cpp
+                     ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_pipeline_library_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_pipeline_library_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}"
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_pipeline_library_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_pipeline_library COMMAND d3d12_pipeline_library_test)
+      set_tests_properties(d3d12_pipeline_library PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
     endif()
