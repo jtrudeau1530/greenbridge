@@ -138,7 +138,7 @@ class Gen:
         self.uses_tex_3d = False
         self.uses_v4uint = False
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
-        self.uses_store_reads = False  # typed image_load through the uint/sint views
+        self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
         self.writes_depth = False
         self.uses_smul = False
         self.uses_minlod = False
@@ -5766,6 +5766,9 @@ class Gen:
     # class 0 = float, 1 = uint, 2 = sint (Vulkan needs the shader's component type to match the image format).
     STORE_DIMS = {"dim:SQ_RSRC_IMG_2D": (0, "2D", 0, 2), "dim:SQ_RSRC_IMG_2D_ARRAY": (1, "2D", 1, 3),
                   "dim:SQ_RSRC_IMG_3D": (2, "3D", 0, 3), "dim:SQ_RSRC_IMG_1D": (3, "1D", 0, 1)}
+    # The sampled array of each STORE_DIMS index: its binding in set 0 (assemble declares %images, %images_arr,
+    # %images_3d and %images_1d there). Typed image_load reads UINT/SINT images through uint/sint aliases of it.
+    SAMPLED_BINDINGS = {0: 0, 1: 3, 2: 6, 3: 5}
     INT_FORMATS = None          # (uint mask words, sint mask words) over the 512 GFX10 formats
 
     @classmethod
@@ -5799,16 +5802,24 @@ class Gen:
         return flags
 
     def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, d16=False):
-        """image_load with the image's numeric type decided at run time (T# FORMAT): UINT/SINT formats are read
-        through the uint/sint storage views (OpImageRead, read-without-format), everything else through the float
-        sampled view (OpImageFetch, as before). Vulkan requires the view's component type to match the format, so a
-        float view of an integer image would be undefined. Results are the raw bits of the dmask components.
+        """image_load with the image's numeric type decided at run time (T# FORMAT). Every format is fetched
+        (OpImageFetch) from the sampled array of the image's dimension, where the runtime binds the T#'s view in the
+        T#'s own format: UINT/SINT formats through a uint/sint alias of that array (same set and binding, an
+        OpTypeImage of %uint/%int), everything else through the float array as before. Vulkan requires the image
+        type's component type to match the view's format, so a float fetch of an integer view would be undefined.
+        No storage view is involved, so no shaderStorageImageReadWithoutFormat (SHADER-151: Intel Xe-LP lacks it),
+        and read-only integer textures, which have no storage view, are read too. A lookup miss (index 0) takes the
+        float path: index 0 holds the RGBA8_UNORM fallback, which an integer alias must not read; it gives zeros.
+        Results are the raw bits of the dmask components; with d16, two per VGPR (see write).
         t1 is the T#'s second dword (FORMAT), idx the bindless index image_load already looked up."""
         di = self.STORE_DIMS[dim][0]
-        self.uses_store_views.add(di)
-        self.uses_store_reads = True
+        self.uses_int_fetch.add(di)
         is_u, is_s = self.fmt_int_flags(t1)
-        act = self.active_b()
+        hit = self.tmp()
+        self.emit(f"{hit} = OpINotEqual %bool {idx} {self.cu(0)}")
+        use_u, use_s = self.tmp(), self.tmp()
+        self.emit(f"{use_u} = OpLogicalAnd %bool {is_u} {hit}")
+        self.emit(f"{use_s} = OpLogicalAnd %bool {is_s} {hit}")
         L = {k: self.tmp() + "_" + k for k in ("s", "rest", "e2", "u", "f", "e3")}
 
         def write(v4u, f16=False):
@@ -5836,25 +5847,24 @@ class Gen:
                     self.emit(f"{w} = OpBitwiseOr %uint {lo} {hi}")
                 self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, w)
 
-        def read(cls, ty):
+        def fetch(cls, ty):
             ip, im, r, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_stv{cls}_{di} %stv{cls}_{di} {idx}")
-            self.emit(f"{im} = OpLoad %stimg{cls}_{di} {ip}")
-            self.emit(f"{r} = OpImageRead {ty} {im} {iv}")
+            self.emit(f"{ip} = OpAccessChain %_ptr_UC_itx{cls}_{di} %itx{cls}_{di} {idx}")
+            self.emit(f"{im} = OpLoad %itximg{cls}_{di} {ip}")
+            self.emit(f"{r} = OpImageFetch {ty} {im} {iv} Lod {self.cu(0)}")
             self.emit(f"{b} = OpBitcast %v4uint_st {r}")
             write(b)
 
-        _ = act
         self.emit(f"OpSelectionMerge {L['e2']} None")
-        self.emit(f"OpBranchConditional {is_s} {L['s']} {L['rest']}")
+        self.emit(f"OpBranchConditional {use_s} {L['s']} {L['rest']}")
         self.emit(f"{L['s']} = OpLabel")
-        read(2, "%v4int_st")
+        fetch(2, "%v4int_st")
         self.emit(f"OpBranch {L['e2']}")
         self.emit(f"{L['rest']} = OpLabel")
         self.emit(f"OpSelectionMerge {L['e3']} None")
-        self.emit(f"OpBranchConditional {is_u} {L['u']} {L['f']}")
+        self.emit(f"OpBranchConditional {use_u} {L['u']} {L['f']}")
         self.emit(f"{L['u']} = OpLabel")
-        read(1, "%v4uint_st")
+        fetch(1, "%v4uint_st")
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
         res, b = self.tmp(), self.tmp()
@@ -6924,8 +6934,9 @@ def assemble(gen):
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)])) if ms else []) + (
         ["%x_buf"] if gen.emulate or gen.bar_rounds else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
-         [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         ((["%fmt_uint_mask", "%fmt_sint_mask"] +
-          [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)]) if gen.uses_store_views else [])
+         [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
+        [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
+        [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
     psb = gen.uses_psb
     tex = gen.uses_tex
     sg = gen.uses_subgroup
@@ -6978,8 +6989,6 @@ def assemble(gen):
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
         if 3 in gen.uses_store_views:
             caps.append("Image1D")
-        if gen.uses_store_reads:
-            caps.append("StorageImageReadWithoutFormat")     # shaderStorageImageReadWithoutFormat
     if gsx:
         caps.append("Geometry")
     if ms and not msc:
@@ -7201,7 +7210,7 @@ def assemble(gen):
         types += ["%double = OpTypeFloat 64", "%v2uint_d = OpTypeVector %uint 2"]
     if gen.uses_ballot:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
-    if gen.uses_store_views:
+    if gen.uses_store_views or gen.uses_int_fetch:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
                   f"%fmt_mask_arr = OpTypeArray %uint {gen.cu(16)}",
@@ -7211,6 +7220,19 @@ def assemble(gen):
             ids = " ".join(gen.cu(w) for w in words)
             types += [f"%fmt_{nm}_init = OpConstantComposite %fmt_mask_arr {ids}"]
             gvars += [f"%fmt_{nm}_mask = OpVariable %_ptr_Private_fmt Private %fmt_{nm}_init"]
+        # Typed image_load: uint/sint aliases of the dimension's sampled array (same set and binding; Vulkan allows
+        # several variables on one binding when the descriptor type fits). The runtime binds each image's view in
+        # its own format there, so the alias whose component type matches it is the one a shader reads through.
+        for di in sorted(gen.uses_int_fetch):
+            _, sdim, arr, _ = next(v for v in Gen.STORE_DIMS.values() if v[0] == di)
+            for cls, st in ((1, "%uint"), (2, "%int")):
+                types += [f"%itximg{cls}_{di} = OpTypeImage {st} {sdim} 0 {arr} 0 1 Unknown",
+                          f"%rt_itx{cls}_{di} = OpTypeRuntimeArray %itximg{cls}_{di}",
+                          f"%_ptr_UC_rt_itx{cls}_{di} = OpTypePointer UniformConstant %rt_itx{cls}_{di}",
+                          f"%_ptr_UC_itx{cls}_{di} = OpTypePointer UniformConstant %itximg{cls}_{di}"]
+                dec += [f"OpDecorate %itx{cls}_{di} DescriptorSet 0",
+                        f"OpDecorate %itx{cls}_{di} Binding {Gen.SAMPLED_BINDINGS[di]}"]
+                gvars += [f"%itx{cls}_{di} = OpVariable %_ptr_UC_rt_itx{cls}_{di} UniformConstant"]
         for di in sorted(gen.uses_store_views):
             _, sdim, arr, _ = next(v for v in Gen.STORE_DIMS.values() if v[0] == di)
             for cls, st in enumerate(("%float", "%uint", "%int")):
