@@ -789,18 +789,17 @@ def wave64_emulate(mode: str) -> bool:
         return True
     on = size < 64
     if not on and runtime_gpu_native64() is False:
-        log(f"shaders: smallest maximum subgroup size is {size}, but the GPU the runtime would use can't be made to "
-            "run compute and mesh shaders 64-wide (subgroupSizeControl and the stage bits): wave64 emulation on")
+        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for both "
+            "compute and mesh (fixed default size or required-size control): wave64 emulation on")
         return True
     log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
     return on
 
 
 def runtime_gpu_native64():
-    """True or False as tools/vk_subgroup_info.py answers for the GPU the runtime would use (the same test as
-    vk_pipeline_check's can_require_sg: subgroupSizeControl, and compute and mesh in requiredSubgroupSizeStages),
-    or None when it can't tell. It only ever turns emulation on: vulkaninfo's maxSubgroupSize alone doesn't say
-    that a 64-wide subgroup can be requested."""
+    """Whether current translated shaders can use native wave64 on the GPU the runtime would use, or None when
+    the Vulkan query cannot tell. For the current SPIR-V 1.5 modules, either a fixed default size of 64 in both
+    stages or required-size support for both compute and mesh avoids emulation."""
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
                            capture_output=True, text=True, timeout=60)
