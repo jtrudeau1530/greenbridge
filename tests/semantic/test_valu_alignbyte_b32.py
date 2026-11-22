@@ -405,5 +405,164 @@ class TestValuAlignbyteB32AST(unittest.TestCase):
         self.assertEqual(prog.to_assembly(), expected)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar interpreter for GFX10/RDNA2 VALU v_alignbyte_b32."""
+
+    def __init__(self) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            if not (0 <= idx < 256):
+                raise IndexError(f"VGPR index out of bounds: {idx}")
+            return self.vgprs[idx] & MASK32
+        if not (0 <= idx < 106):
+            raise IndexError(f"SGPR index out of bounds: {idx}")
+        return self.sgprs[idx] & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            if not (0 <= idx < 256):
+                raise IndexError(f"VGPR index out of bounds: {idx}")
+            self.vgprs[idx] = val32
+        else:
+            if not (0 <= idx < 106):
+                raise IndexError(f"SGPR index out of bounds: {idx}")
+            self.sgprs[idx] = val32
+
+    def read_operand(self, op: Register | Immediate) -> int:
+        if isinstance(op, Immediate):
+            return op.bits
+        if isinstance(op, Register):
+            return self.read_reg_u32(op.kind, op.index)
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(self, inst: Instruction) -> int:
+        """Executes a single VALU alignbyte instruction with strict read-before-write semantics."""
+        # Latch all input operands before writing destination
+        s0_val = self.read_operand(inst.src0)
+        s1_val = self.read_operand(inst.src1)
+        s2_val = self.read_operand(inst.src2)
+
+        if inst.opcode == Opcode.V_ALIGNBYTE_B32:
+            res = ref_alignbyte_b32(s0_val, s1_val, s2_val)
+        else:
+            raise NotImplementedError(f"Unsupported opcode in scalar interpreter: {inst.opcode}")
+
+        self.write_reg_u32(inst.dst.kind, inst.dst.index, res)
+        self.trace.append(f"{inst.to_assembly()} => {res:#010x}")
+        return res
+
+    def run_program(self, prog: Program) -> list[int]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
+class TestValuAlignbyteB32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar VALU instruction interpreter."""
+
+    def test_scalar_register_read_write(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, 0x12345678)
+        interp.write_reg_u32(RegKind.SGPR, 4, 0x9ABCDEF0)
+
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0x12345678)
+        self.assertEqual(interp.read_reg_u32(RegKind.SGPR, 4), 0x9ABCDEF0)
+
+    def test_scalar_execution_vgpr_sources(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # S1 = v1 = 0x44332211, S0 = v0 = 0x88776655, S2 = v2 = 1
+        interp.write_reg_u32(RegKind.VGPR, 0, 0x88776655)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0x44332211)
+        interp.write_reg_u32(RegKind.VGPR, 2, 1)
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 3),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Register(RegKind.VGPR, 2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0x55443322)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 3), 0x55443322)
+
+    def test_scalar_execution_sgpr_sources(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # S0 from SGPR s0, S1 from VGPR v1, shift from SGPR s2
+        interp.write_reg_u32(RegKind.SGPR, 0, 0xAABBCCDD)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0x11223344)
+        interp.write_reg_u32(RegKind.SGPR, 2, 2)
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.SGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Register(RegKind.SGPR, 2),
+        )
+        res = interp.step(inst)
+        # S1=0x11223344, S0=0xAABBCCDD, shift=2 -> [0x33, 0x44, 0xDD, 0xCC] -> 0xCCDD1122 ?
+        # S1 bytes: 44, 33, 22, 11; S0 bytes: DD, CC, BB, AA
+        # shift 2 bytes: bytes [2,3,4,5] -> [22, 11, DD, CC] -> 0xCCDD1122
+        expected = ref_alignbyte_b32(0xAABBCCDD, 0x11223344, 2)
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), expected)
+
+    def test_scalar_immediate_operand(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 1, 0x88776655)
+        interp.write_reg_u32(RegKind.VGPR, 2, 0x44332211)
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Immediate(3),
+        )
+        res = interp.step(inst)
+        expected = ref_alignbyte_b32(0x88776655, 0x44332211, 3)
+        self.assertEqual(res, expected)
+
+    def test_scalar_program_execution_chain(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 1, 0x01020304)
+        interp.write_reg_u32(RegKind.VGPR, 2, 0x05060708)
+
+        prog = Program()
+        # Step 1: v0 = alignbyte(v1, v2, 1)
+        prog.append(Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Immediate(1),
+        ))
+        # Step 2: v3 = alignbyte(v0, v1, 2)
+        prog.append(Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 3),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Immediate(2),
+        ))
+
+        results = interp.run_program(prog)
+        r0 = ref_alignbyte_b32(0x01020304, 0x05060708, 1)
+        r1 = ref_alignbyte_b32(r0, 0x01020304, 2)
+        self.assertEqual(results, [r0, r1])
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 3), r1)
+        self.assertEqual(len(interp.trace), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
