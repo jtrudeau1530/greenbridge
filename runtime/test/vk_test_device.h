@@ -4,6 +4,7 @@
 #pragma once
 
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -184,7 +185,7 @@ public:
         for (auto candidate : devices) {
             VkPhysicalDeviceProperties props{};
             properties_of(candidate, &props);
-            if (props.apiVersion < VK_API_VERSION_1_3) continue;
+            if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
             std::uint32_t family_count = 0;
             families_of(candidate, &family_count, nullptr);
             std::vector<VkQueueFamilyProperties> families(family_count);
@@ -200,6 +201,12 @@ public:
             }
         }
         if (!physical) {
+            if (const std::string filter = leonida::vulkan_device_filter(); !filter.empty()) {
+                // A filter that matches nothing fails the test instead of skipping it.
+                std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 device with a graphics queue matches\n",
+                             filter.c_str());
+                return DeviceStatus::failed;
+            }
             std::fprintf(stderr, "no Vulkan 1.3 device with a graphics queue\n");
             return DeviceStatus::unavailable;
         }
