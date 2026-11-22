@@ -3,7 +3,8 @@
 // The execution side of the D3D12 layer, without COM: the per-device Vulkan context (resources, layout tracker,
 // image views), queues that execute command lists, and timeline-semaphore fences. The COM objects in
 // shims/d3d12_com.cpp are thin wrappers over these. Needs Vulkan 1.2 timeline semaphores; rectangle clears and
-// enhanced barriers need the Vulkan 1.3 functions (dynamicRendering, synchronization2) to be enabled.
+// enhanced barriers need the Vulkan 1.3 functions (dynamicRendering, synchronization2) to be enabled, as core
+// features or through their KHR extensions on a 1.2 device (vulkan13_features.h).
 
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -12,6 +13,7 @@
 #include "occlusion_sum_spirv.h"
 #include "retire_tickets.h"
 #include "statistics_sum_spirv.h"
+#include "vulkan13_features.h"
 #include "vulkan_depth24.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
@@ -84,7 +86,7 @@ struct VulkanDeviceFunctions {
     // extension is not enabled, and the query functions are optional (a list that uses queries without them is
     // unsupported). The compute and descriptor functions are needed for normalized or summed occlusion results.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
-#define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
+#define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(leonida::device_proc_or_khr(get, device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
 #undef LEONIDA_VK_LOAD
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
