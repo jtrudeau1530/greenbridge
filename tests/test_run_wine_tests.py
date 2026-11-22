@@ -55,6 +55,13 @@ class PathMappingTest(unittest.TestCase):
         self.assertEqual(rwt.map_path("D:/win/root/inside/../runner.exe", WINDOWS_ROOT, "/repo"),
                          os.path.join("/repo", "runner.exe"))
 
+    def test_dot_and_repeated_separators_normalize_before_mapping(self):
+        self.assertEqual(rwt.map_path("D:/win/root/./runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "runner.exe"))
+        self.assertEqual(rwt.map_path("D:/win/root//sub//runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "sub", "runner.exe"))
+        self.assertIsNone(rwt.map_path("D:/win/root/../../outside.exe", WINDOWS_ROOT, "/repo"))
+
     def test_wine_path_uses_the_z_drive(self):
         self.assertEqual(rwt.wine_path("/tmp/x y"), "Z:" + os.path.abspath("/tmp/x y").replace("/", "\\"))
 
