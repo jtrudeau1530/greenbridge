@@ -840,5 +840,121 @@ class TestDSMaxRtnU64SIMDMultiLane(unittest.TestCase):
         self.assertEqual(detect_lds_qword_bank_conflicts(eff_addrs_no_conflict), {})
 
 
+class TestDSMaxRtnU64RegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(size_bytes=4096)
+        self.state = ScalarThreadState64(lds=self.lds)
+        self.interp = ScalarDSInterpreter64()
+
+    def test_alias_vdst_lo_equals_vaddr(self) -> None:
+        # ds_max_rtn_u64 v[0:1], v0, v[2:3]
+        addr = 0x30
+        self.lds.write_qword(addr, 0x1111222233334444)
+        self.state.set_vgpr_u32(0, addr)
+        self.state.set_vgpr_u32(1, 0)
+        self.state.set_vgpr_u64(2, 0x5555666677778888)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(0, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(2, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x1111222233334444)
+        self.assertEqual(self.state.get_vgpr_u64(0), 0x1111222233334444)
+        self.assertEqual(self.state.get_vgpr_u64(2), 0x5555666677778888)
+        self.assertEqual(self.lds.read_qword(addr), 0x5555666677778888)
+
+    def test_alias_vdst_hi_equals_vaddr(self) -> None:
+        # ds_max_rtn_u64 v[0:1], v1, v[2:3]
+        addr = 0x50
+        self.lds.write_qword(addr, 0x9999000011112222)
+        self.state.set_vgpr_u32(0, 0)
+        self.state.set_vgpr_u32(1, addr)
+        self.state.set_vgpr_u64(2, 0xAAAA0000BBBBCCCC)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(1, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(2, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x9999000011112222)
+        self.assertEqual(self.state.get_vgpr_u64(0), 0x9999000011112222)
+        self.assertEqual(self.lds.read_qword(addr), 0xAAAA0000BBBBCCCC)
+
+    def test_alias_vdst_equals_vdata(self) -> None:
+        # ds_max_rtn_u64 v[2:3], v0, v[2:3]
+        addr = 0x60
+        self.lds.write_qword(addr, 0x7777777777777777)
+        self.state.set_vgpr_u32(0, addr)
+        self.state.set_vgpr_u64(2, 0x3333333333333333)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(2, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(0, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(2, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        # v[2:3] must receive the old memory value 0x7777777777777777
+        self.assertEqual(ret, 0x7777777777777777)
+        self.assertEqual(self.state.get_vgpr_u64(2), 0x7777777777777777)
+        self.assertEqual(self.state.get_vgpr_u32(0), addr)
+        self.assertEqual(self.lds.read_qword(addr), 0x7777777777777777)
+
+    def test_alias_vdst_equals_vdata_and_vaddr(self) -> None:
+        # ds_max_rtn_u64 v[0:1], v0, v[0:1]
+        addr = 0x20
+        self.lds.write_qword(addr, 10)
+        # Low dword of v[0:1] holds addr (0x20)
+        self.state.set_vgpr_u32(0, addr)
+        self.state.set_vgpr_u32(1, 0)  # total u64 value is 0x20 = 32
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(0, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(0, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 10)
+        self.assertEqual(self.state.get_vgpr_u64(0), 10)
+        self.assertEqual(self.lds.read_qword(addr), 32)  # max(10, 32) = 32
+
+    def test_unreferenced_registers_preserved(self) -> None:
+        addr = 0x40
+        self.lds.write_qword(addr, 0x100)
+        self.state.set_vgpr_u32(2, addr)
+        self.state.set_vgpr_u64(4, 0x200)
+
+        # Set canary values on all other registers
+        for r in range(DEFAULT_NUM_VGPRS):
+            if r not in (0, 1, 2, 4, 5):
+                self.state.set_vgpr_u32(r, 0x70000000 + r)
+        for s in range(DEFAULT_NUM_SGPRS):
+            self.state.sgprs[s] = 0x80000000 + s
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+        self.interp.execute(self.state, inst)
+
+        # Output received old memory
+        self.assertEqual(self.state.get_vgpr_u64(0), 0x100)
+        # All background registers intact
+        for r in range(DEFAULT_NUM_VGPRS):
+            if r not in (0, 1, 2, 4, 5):
+                self.assertEqual(self.state.get_vgpr_u32(r), 0x70000000 + r)
+        for s in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(self.state.sgprs[s], 0x80000000 + s)
+
+
 if __name__ == "__main__":
     unittest.main()
