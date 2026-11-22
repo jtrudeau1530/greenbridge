@@ -46,6 +46,16 @@ def offsets_for(eq, bb, bpe, wb, hb):
     return (o + ((y // bh) * nbx + x // bw) * (1 << bb)) // bpe
 
 
+def gpu_blob(carve, t):
+    """The texture's whole GPU blob: every carved part of `gpu_chain` in order (data_off counts from the first),
+    as tex_export.py reads it; a single `gpu` file when the index has no chain."""
+    parts = []
+    for off, _ in t.get("gpu_chain") or [[t["gpu"], t["gpu_size"]]]:
+        with open(os.path.join(carve, t["archive"], f"{off:012x}.bin"), "rb") as f:
+            parts.append(f.read())
+    return b"".join(parts)
+
+
 def positive_int(text):
     """--n: 0 probed nothing and printed an empty ranking as a result; a negative N dropped the last N textures."""
     try:
@@ -80,10 +90,10 @@ def main():
                         eq = equation(nib, e, bb)
                         cands.setdefault((bb, tuple(eq)), f"{tname.replace('GFX10_SW_', '').replace('_PATINFO', '')} {e[5][:22]}")
     wins = Counter()
+    skipped = 0
     for t in texs:
         bpe = bc_bpe(t["fmt_name"])
-        with open(os.path.join(a.carve, t["archive"], f"{t['gpu']:012x}.bin"), "rb") as f:
-            G = f.read()
+        G = gpu_blob(a.carve, t)
         wb, hb = (t["w"] + 3) // 4, (t["h"] + 3) // 4
         mips = (t["flags"] >> 16) & 0xFF
         res = []
@@ -107,7 +117,11 @@ def main():
             print(f"{t['w']}x{t['h']} {t['fmt_name']} mips={mips} gpu={t['gpu_size']}  best {res[0][0]:.4f} {res[0][1]} [{res[0][2]}]"
                   f"  2nd {second}  linear {lin:.4f}")
             wins[(res[0][1].split(' ')[0], res[0][2])] += 1
+        else:
+            skipped += 1
+            print(f"{t['w']}x{t['h']} {t['fmt_name']} gpu={t['gpu']:#x}  skipped: no candidate fits in the GPU blob")
     print("winners:", wins.most_common())
+    print(f"probed {len(texs) - skipped} of {len(texs)} textures; {skipped} skipped")
 
 
 if __name__ == "__main__":
