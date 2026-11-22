@@ -1732,13 +1732,14 @@ class Gen:
             self.emit(f"{old} = {self.LDS_ATOMICS[name]} %uint {p} {sc} {sem} {self.src_u(dat)}")
             if d is not None:
                 self.dst(d, old)
-        elif op == "ds_cmpst_rtn_b32":
-            # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; return tmp
-            d, ad, cmp_, src = a[0], a[1], a[2], a[3]
+        elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
+            # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
+            d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
             p = self.lds_ptr(self.src_u(ad), off)
             old = self.tmp()
             self.emit(f"{old} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {self.src_u(src)} {self.src_u(cmp_)}")
-            self.dst(d, old)
+            if d is not None:
+                self.dst(d, old)
         else:
             raise Unsupported(op)
         self.emit(f"OpBranch {lbl_end}")
