@@ -698,5 +698,80 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(actual, expected)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_inplace_dst_equals_src0_u32(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(0, 0x80000000)
+        interp.vgpr.set_vgpr(1, 4)
+
+        # v0 = v_mul_hi_u32 v0, v1 -> (0x80000000 * 4) >> 32 = 0x200000000 >> 32 = 2
+        res = interp.execute_asm("v_mul_hi_u32 v0, v0, v1")
+        self.assertEqual(res, 2)
+        self.assertEqual(interp.vgpr.get_vgpr(0), 2)
+        # v1 must remain untouched
+        self.assertEqual(interp.vgpr.get_vgpr(1), 4)
+
+    def test_inplace_dst_equals_src1_u32(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(0, 0x80000000)
+        interp.vgpr.set_vgpr(1, 6)
+
+        # v1 = v_mul_hi_u32 v0, v1 -> (0x80000000 * 6) >> 32 = 3
+        res = interp.execute_asm("v_mul_hi_u32 v1, v0, v1")
+        self.assertEqual(res, 3)
+        self.assertEqual(interp.vgpr.get_vgpr(1), 3)
+        # v0 must remain untouched
+        self.assertEqual(interp.vgpr.get_vgpr(0), 0x80000000)
+
+    def test_inplace_self_squaring_u32(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(2, UINT32_MAX)
+
+        # v2 = v_mul_hi_u32 v2, v2 -> (0xFFFFFFFF)^2 >> 32 = 0xFFFFFFFE
+        res = interp.execute_asm("v_mul_hi_u32 v2, v2, v2")
+        self.assertEqual(res, 0xFFFFFFFE)
+        self.assertEqual(interp.vgpr.get_vgpr(2), 0xFFFFFFFE)
+
+    def test_inplace_dst_equals_src0_i32(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(3, to_u32(-2))
+        interp.vgpr.set_vgpr(4, 10)
+
+        # v3 = v_mul_hi_i32 v3, v4 -> (-2 * 10) = -20 -> hi = 0xFFFFFFFF
+        res = interp.execute_asm("v_mul_hi_i32 v3, v3, v4")
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(interp.vgpr.get_vgpr(3), 0xFFFFFFFF)
+        self.assertEqual(interp.vgpr.get_vgpr(4), 10)
+
+    def test_inplace_self_squaring_i32(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(5, 0x80000000)  # -2^31
+
+        # v5 = v_mul_hi_i32 v5, v5 -> (-2^31)^2 = 2^62 = 0x40000000_00000000 -> hi = 0x40000000
+        res = interp.execute_asm("v_mul_hi_i32 v5, v5, v5")
+        self.assertEqual(res, 0x40000000)
+        self.assertEqual(interp.vgpr.get_vgpr(5), 0x40000000)
+
+    def test_simd_inplace_divergent_mask(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        init_vals = [0x80000000 for _ in range(32)]
+        multiplier_vals = [i + 1 for i in range(32)]
+        sim.store_vgpr_wave(0, init_vals)
+        sim.store_vgpr_wave(1, multiplier_vals)
+
+        # Active on even lanes only
+        sim.exec_mask = 0x55555555
+        res = sim.step_v_mul_hi(Opcode.V_MUL_HI_U32, 0, 0, 1)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                expected = (0x80000000 * (lane + 1)) >> 32
+                self.assertEqual(res[lane], expected)
+            else:
+                self.assertEqual(res[lane], init_vals[lane])
+
+
 if __name__ == "__main__":
     unittest.main()
