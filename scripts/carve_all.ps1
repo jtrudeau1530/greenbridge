@@ -40,13 +40,16 @@ foreach ($archive in $archives) {
                 throw "summary.$field must be a non-negative integer."
             }
         }
-        if ($s.span -eq 0) { throw 'summary.span must be positive.' }
+        if ($s.span -eq 0 -and ($s.compressed_bytes -ne 0 -or $s.unread_bytes -ne 0)) {
+            throw 'A zero summary.span requires zero compressed and unread bytes.'
+        }
     } catch {
         throw "Invalid carve index '$index': $($_.Exception.Message)"
     }
+    $denominator = [math]::Max(1L, $s.span)
     $rows += [pscustomobject]@{ archive = $rel; files = $s.files; bink2 = $s.bink2_files; span = $s.span
-                               readable = [math]::Round(($s.compressed_bytes) / $s.span, 4)
-                               unread = [math]::Round($s.unread_bytes / $s.span, 4); inflated = $s.inflated_bytes }
+                               readable = [math]::Round($s.compressed_bytes / $denominator, 4)
+                               unread = [math]::Round($s.unread_bytes / $denominator, 4); inflated = $s.inflated_bytes }
 }
 $rows | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $Out "coverage.json")
 $rows | Format-Table archive, files, bink2, @{n = "GiB"; e = { [math]::Round($_.span / 1GB, 2) } }, readable, unread -AutoSize | Out-String -Width 200

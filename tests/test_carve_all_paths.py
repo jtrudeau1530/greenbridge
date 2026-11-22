@@ -27,7 +27,8 @@ class CarveAllGamePathTest(unittest.TestCase):
             invalid_indexes = {
                 "invalid JSON": "{",
                 "missing summary": "{}",
-                "zero span": json.dumps({"summary": {**summary, "span": 0}}),
+                "negative span": json.dumps({"summary": {**summary, "span": -1}}),
+                "bytes in empty span": json.dumps({"summary": {**summary, "span": 0}}),
                 "non-numeric span": json.dumps({"summary": {**summary, "span": "ten"}}),
                 "missing count": json.dumps({"summary": {k: v for k, v in summary.items() if k != "files"}}),
             }
@@ -43,6 +44,24 @@ class CarveAllGamePathTest(unittest.TestCase):
                     self.assertIn("Invalid carve index", result.stderr)
                     self.assertIn("index.json", result.stderr)
                     self.assertEqual(coverage.read_bytes(), b"[]\n")
+
+    def test_empty_cached_data_area_reports_zero_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game, out = Path(tmp, "game"), Path(tmp, "out")
+            game.mkdir()
+            (game / "empty.rpf").write_bytes(b"x")
+            cached = out / "empty"
+            cached.mkdir(parents=True)
+            summary = {key: 0 for key in INDEX["summary"]}
+            (cached / "index.json").write_text(json.dumps({"summary": summary, "files": []}), encoding="utf-8")
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", str(game), "-Out", str(out)], capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            row = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
+            self.assertEqual(row, {"archive": "empty.rpf", "files": 0, "bink2": 0, "span": 0,
+                                   "readable": 0, "unread": 0, "inflated": 0})
 
     def test_failed_carver_stops_without_replacing_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
