@@ -38,10 +38,18 @@ enum class Visibility : uint32_t {
     Mesh = 7,
 };
 
-// One descriptor range inside a table (SRV/CBV/UAV/sampler + count).
+// D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND: the range starts right after the previous one in its table.
+constexpr uint32_t kRangeOffsetAppend = 0xFFFFFFFFu;
+
+// One descriptor range inside a table (SRV/CBV/UAV/sampler + count), with every field of D3D12_DESCRIPTOR_RANGE1.
 struct DescriptorRange {
     uint32_t range_type = 0;  // 0 SRV, 1 UAV, 2 CBV, 3 sampler (D3D12 order)
     uint32_t num_descriptors = 0;
+    uint32_t base_shader_register = 0;
+    uint32_t register_space = 0;
+    // D3D12_DESCRIPTOR_RANGE_FLAGS, 1.1 and 1.2 only. A 1.0 range has no flags dword; it stays 0 here.
+    uint32_t flags = 0;
+    uint32_t offset_in_table = 0;  // OffsetInDescriptorsFromTableStart, or kRangeOffsetAppend
 };
 
 // Static sampler: no user-SGPR dwords; registered in the hash table instead.
@@ -127,7 +135,8 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 // format: it round-trips pack() inputs byte-exactly and is fully tested on
 // every CI leg. Never write game blobs in this format and claim otherwise.
 // Static samplers carry their flags dword only in version 1.2 signatures, so
-// 1.0/1.1 encodings are unchanged.
+// 1.0/1.1 encodings are unchanged. Codec version 2 stores all six range
+// fields (version 1 stored only type and count, and is no longer read).
 [[nodiscard]] std::vector<uint8_t> encode_canonical(const RootSignature& sig);
 
 struct DecodeResult {
@@ -152,6 +161,8 @@ struct DecodeResult {
 // Versions 1 (1.0), 2 (1.1) and 3 (1.2): 1.1 and 1.2 add a flags dword to
 // root descriptors and ranges; 1.2 adds one to each static sampler (13 dwords
 // before, 14 after), as the PC serializer writes them (root_signature_oracle_test).
+// A range record follows D3D12_DESCRIPTOR_RANGE1 order: type, count, base
+// register, space, then Flags (1.1/1.2 only) BEFORE the table offset.
 // Returns ok == false with a reason for unknown versions or truncation.
 [[nodiscard]] DecodeResult parse_rts0(const uint8_t* data, size_t size);
 

@@ -133,17 +133,17 @@ and 1,100 x 1,100) was an artifact. The prefix is the zeroed row headers of
 the empty rows, and the grid is 2048 x 2048. The largest square that ends at
 the payload end happened to fit the byte count, but it is not the format.
 
-### `PAMH`: `HMAP` v1.2, 144 x 164 max/min heightmap
+### `PAMH`: `HMAP` max/min heightmap (`common.rpf` 144 x 164, tiles 64 x 64)
 
 | Header | Offset | Type | Measured |
 |---|---|---|---|
 | magic | 0x00 | 4 bytes | `PAMH` (little-endian `HMAP`) |
-| version | 0x04 | 2 x `u8` | 1.2 |
-| pad | 0x06 | `u16` | 0 |
-| flag word | 0x08 | `u32` | `0x1BBC8CED` (GTA V's `compressed` field) |
-| width, height | 0x0C | 2 x `u16` | 144, 164 |
+| version | 0x04 | 2 x `u8` | 1.2 in `common.rpf`; overwritten in the `levels.rpf` tiles |
+| pad | 0x06 | `u16` | 0 in `common.rpf`; text in the tiles |
+| flag word | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`; padding in the tiles |
+| width, height | 0x0C | 2 x `u16` | 144, 164 in `common.rpf`; 64, 64 in every tile |
 | six bounds | 0x10 | 6 x `f32` | `(-13312, -9728, -302)` to `(5120, 11264, 404)` |
-| data size | 0x28 | `u32` | 48,544 |
+| data size | 0x28 | `u32` | 48,544 in `common.rpf`; 8,704 in a tile |
 
 At 0x2C there are 164 row records, then `width * height` **max** bytes and
 `width * height` **min** bytes. The measured max layer runs 110..255 and the
@@ -153,6 +153,34 @@ on land. The min layer is the ground or sea floor.
 
 The earlier u16 reading interleaved the two arrays: every measured `0x6E6E`
 was a `(110, 110)` max/min pair, not the value 28,270.
+
+### The 1,476 `PAMH` tiles in `levels.rpf`
+
+`levels.rpf` holds 1,476 more `PAMH` payloads. All of them decode with the
+same rules: a 44-byte header, 64 x 64 cells, 64 full-width row records with
+`start = 0`, `count = 64` and `offset = y * 64`, then 4,096 **max** bytes and
+4,096 **min** bytes. That is 6,045,696 cells in total.
+
+- The tiles are a 36 x 41 rectangle with **512 m** spacing, so they cover the
+  same `(-13312, -9728)` to `(5120, 11264)` box as the `common.rpf` payload,
+  with the same Z box `-302` to `404`.
+- Max values span 0..255 and min values 0..254. `min <= max` in all but 62
+  cells, all in the tile at `(-5120, 2048)`, where the encoder wrote a min
+  above its max.
+- Bytes 0x05..0x0B are leftover text, not a version minor and a flag. 0x04
+  stays 1, 0x05.. hold the tile name `n_m` (column + 1, row + 1), and the
+  remaining bytes keep the tail of the string `height`, right-aligned at 0x0B.
+  The 28 distinct 0x08..0x0B words are all text; none is zero and none changes
+  the arrays.
+- The census groups by grid size, not by the 0x04 version bytes, because
+  0x05 is the first digit of the name. Nothing depends on the 0x08 word.
+
+```powershell
+python -I tools/gamedata_maps.py <work>\carve\levels --json levels.json
+```
+
+The tool prints one `PAMH census 64x64: ...` line and writes the per-group
+counts. Only header fields and counts are written, never the height bytes.
 
 ### Cross-check and Z mapping
 
@@ -176,9 +204,12 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
 
 ### Checksum and unknown fields
 
-- `PAMH` 0x08 is the HMAP `compressed` word (GTA V writes 1). The measured
-  `0x1BBC8CED` is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib digest of
-  the max/min arrays; it is reported as a flag word, not a proven checksum.
+- `PAMH` 0x08 is GTA V's `compressed` word only in the `common.rpf` payload,
+  where it holds `0x1BBC8CED`. In the 1,476 `levels.rpf` tiles bytes 0x04..0x0B
+  are leftover text (tile name plus `height`), so 0x08 is padding there. The
+  `0x1BBC8CED` value is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib
+  digest of the max/min arrays; it is reported as a flag word, not a proven
+  checksum.
 - `MHIU` 0x28 is a `u8` default height, not a 32-bit word (ASSET-48). Its
   value is 23 in both payloads, the same value the empty rows were measured
   to hold, and the row cropping above uses it. A full scan of all 12 archives

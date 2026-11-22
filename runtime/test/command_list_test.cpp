@@ -147,6 +147,39 @@ int main() {
     CHECK(list.commands().size() == 1);
     CHECK(std::get<ClearRenderTarget>(list.commands()[0]).target.resource == 36);
 
+    // D3D-26: discards, immediate writes and atomic copies.
+    CHECK(list.reset());
+    CHECK(list.discard({40, 0, 0, false, true}));                  // the whole resource
+    CHECK(list.discard({40, 2, 3, true}));
+    CHECK(list.discard({40, 0, 0, false}));                       // nothing to discard: not recorded
+    CHECK(!list.discard({0, 0, 0, false, true}));
+    CHECK(!list.discard({40, 0xfffffff0u, 0x20, false}));         // past the last subresource index
+    CHECK(!list.discard({40, 1, all_subresources, false}));       // an explicit count of UINT_MAX is a range
+    CHECK(!list.discard({40, all_subresources, 1, false}));
+    CHECK(list.write_immediate({0x1000, 7, write_immediate_mode::marker_out}));
+    CHECK(!list.write_immediate({0, 7, 0}));                      // null address
+    CHECK(!list.write_immediate({0x1002, 7, 0}));                 // not 4-byte aligned
+    CHECK(!list.write_immediate({0x1000, 7, 3}));                 // not a mode
+    const DependentRange dependent{41, 0, 0, 64};
+    CHECK(list.atomic_copy({42, 8, 43, 16, 8, {dependent}}));
+    CHECK(list.atomic_copy({42, 4, 42, 8, 4, {dependent}}));      // within one buffer
+    CHECK(!list.atomic_copy({42, 8, 42, 8, 8, {dependent}}));     // onto itself
+    CHECK(!list.atomic_copy({42, 4, 43, 16, 8, {dependent}}));    // UINT64 at an offset that is not 8-aligned
+    CHECK(!list.atomic_copy({42, 8, 43, 16, 2, {dependent}}));    // neither UINT nor UINT64
+    CHECK(!list.atomic_copy({42, 8, 43, 16, 4, {}}));             // no dependencies
+    CHECK(!list.atomic_copy({42, 8, 43, 16, 4, {{0, 0, 0, 4}}})); // a null dependent resource
+    CHECK(!list.atomic_copy({0, 8, 43, 16, 4, {dependent}}));
+    CHECK(list.close());
+    CHECK(!list.discard({40, 0, 0, false, true}) && !list.discard({40, 0, 0, false}));
+    CHECK(list.commands().size() == 5);
+    CHECK(std::get<DiscardResource>(list.commands()[0]).whole);
+    CHECK(std::get<DiscardResource>(list.commands()[1]).first_subresource == 2 &&
+          std::get<DiscardResource>(list.commands()[1]).partial && !std::get<DiscardResource>(list.commands()[1]).whole);
+    CHECK(std::get<WriteImmediate>(list.commands()[2]).value == 7);
+    const auto& atomic = std::get<AtomicCopyBuffer>(list.commands()[3]);
+    CHECK(atomic.bytes == 8 && atomic.dst_offset == 8 && atomic.dependencies.size() == 1 &&
+          atomic.dependencies[0].end == 64);
+
     // Synthetic IR values here test copy-by-value mechanics only; the COM test below enforces D3D12 bundle
     // restrictions on every currently implemented forbidden operation.
     // Bundles are copied into the parent at ExecuteBundle time and can be reused independently.

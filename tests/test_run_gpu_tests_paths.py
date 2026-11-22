@@ -49,6 +49,35 @@ class DrawShaders(unittest.TestCase):
 
 
 class FilterSelection(unittest.TestCase):
+    def test_reused_work_translates_only_selected_shaders_and_dependencies(self):
+        passes = []
+
+        def write_disassembly(_llvm, _asm, path, name):
+            Path(path).write_text(name, encoding="utf-8")
+
+        def translate(cmd):
+            inputs = Path(cmd[3])
+            files = sorted(inputs.glob("*.s"))
+            passes.append([path.name for path in files])
+            for path in files:
+                self.assertEqual(path.read_text(encoding="utf-8"), path.stem)
+                self.assertTrue((inputs.parent / f"{path.stem}.dxbc").is_file())
+            return 1, "stop before running GPU tests"
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("sys.stdout", io.StringIO()), \
+                patch.object(run_gpu_tests, "assemble_to_s", side_effect=write_disassembly), \
+                patch.object(run_gpu_tests, "run_cmd", side_effect=translate):
+            for shader_filter in ("ps_bary", "ps_flat"):
+                args = SimpleNamespace(filter=shader_filter, llvm_mc="unused")
+                self.assertEqual(run_gpu_tests.run_suite(args, tmp), 1)
+
+            self.assertEqual(passes, [["ps_bary.s"], ["ps_flat.s", "vs_ids.s"]])
+            disasm = Path(tmp) / "disasm"
+            self.assertEqual((disasm / "ps_bary.s").read_text(encoding="utf-8"), "ps_bary")
+            self.assertTrue((disasm / "ps_flat.s").is_file())
+            self.assertTrue((disasm / "vs_ids.s").is_file())
+
     def test_unmatched_filter_fails_before_running_shader_tools(self):
         args = SimpleNamespace(filter="no_matching_shader", build="unused")
         err = io.StringIO()

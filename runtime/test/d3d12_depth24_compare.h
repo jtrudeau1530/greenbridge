@@ -40,7 +40,7 @@ inline std::vector<float> depth24_clear_values() {
 // One scenario on one device: every value cleared into a 4x4 texture (a whole-view clear) and into a column of a wide
 // one (a rectangle clear), the planes of both read back. out.bytes holds them, regions say where.
 inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<float>& values, Outcome& out,
-                               DXGI_FORMAT format = DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                               DXGI_FORMAT format = DXGI_FORMAT_D24_UNORM_S8_UINT, bool d24_native = true) {
     const UINT count = UINT(values.size());
     const UINT whole = std::min<UINT>(count, 160);  // whole-view clears, one texture each; the wide one takes all
     D3D12_RESOURCE_DESC tiny{};
@@ -135,10 +135,11 @@ inline void run_depth24_clears(Run& run, ID3D12Device* host, const std::vector<f
             leonida::gfx10::ImageWords image_words{};
             std::memcpy(image_words.data(), reinterpret_cast<const void*>(slot.ptr), sizeof(image_words));
             leonida::gfx10::Image decoded{};
-            // The T# is the texture as the application made it (8_24_UNORM for D24, the console's format) whether or not
-            // the GPU stores it as D24; the stencil plane is 8_UINT.
+            // The depth plane's T# code follows the texture's backing format (D3D-75): X24_8_32_FLOAT where the GPU has no
+            // D24 and the layer stores D32_SFLOAT_S8_UINT, 8_24_UNORM where it has one; the stencil plane is 8_UINT.
             const std::uint32_t want = plane ? leonida::gfx10::stencil_format
-                                             : leonida::gfx10::format_from_vulkan(VK_FORMAT_D24_UNORM_S8_UINT);
+                                             : leonida::gfx10::format_from_vulkan(d24_native ? VK_FORMAT_D24_UNORM_S8_UINT
+                                                                                             : VK_FORMAT_D32_SFLOAT_S8_UINT);
             if (!leonida::gfx10::is_image(image_words) || !leonida::gfx10::decode(image_words, decoded) || decoded.format != want || !want) {
                 out.error = std::string("the shader-resource view of ") + (plane ? "X24_TYPELESS_G8_UINT" : "R24_UNORM_X8_TYPELESS") +
                             " did not write the expected T#";
@@ -297,7 +298,7 @@ inline int compare_depth24_clears(const char* name, const Outcome& a, const Outc
 }
 
 // Returns the number of differences, or -1 with no host device.
-inline int compare_depth24(ID3D12Device* ours) {
+inline int compare_depth24(ID3D12Device* ours, bool d24_native) {
     Ptr<ID3D12Device> host;
     std::string adapter;
     if (!create_host(host, adapter)) return -1;
@@ -319,7 +320,7 @@ inline int compare_depth24(ID3D12Device* ours) {
     Outcome ta, tb;
     Run ours_typeless, host_typeless;
     if (!ours_typeless.init(ours, true) || !host_typeless.init(host.p, false)) return r + 1;
-    run_depth24_clears(ours_typeless, host.p, few, ta, DXGI_FORMAT_R24G8_TYPELESS);
+    run_depth24_clears(ours_typeless, host.p, few, ta, DXGI_FORMAT_R24G8_TYPELESS, d24_native);
     run_depth24_clears(host_typeless, host.p, few, tb, DXGI_FORMAT_R24G8_TYPELESS);
     const int typeless = compare_depth24_clears("R24G8_TYPELESS clears", ta, tb, few);
     if (!typeless) std::printf("depth24 typeless: R24G8_TYPELESS with a D24 DSV, %zu values, match the host\n", few.size());
