@@ -20,28 +20,28 @@ class TestSameEncodingBytecodeBoundary(unittest.TestCase):
     """Exercise same_encoding() with synthetic short buffers, exact matches, and opcode bitfield tolerances."""
 
     def test_exact_matches_any_length(self):
-        self.assertTrue(rdna2spirv.same_encoding(b"", b"", "v_mov_b32"))
-        self.assertTrue(rdna2spirv.same_encoding(b"\x00", b"\x00", "v_mov_b32"))
-        self.assertTrue(rdna2spirv.same_encoding(b"\x12\x34\x56\x78", b"\x12\x34\x56\x78", "v_mov_b32"))
-        self.assertTrue(rdna2spirv.same_encoding(bytes(7), bytes(7), "v_mov_b32"))
-        self.assertTrue(rdna2spirv.same_encoding(bytes(8), bytes(8), "v_mov_b32"))
-        self.assertTrue(rdna2spirv.same_encoding(bytes(16), bytes(16), "v_mov_b32"))
+        self.assertTrue(rdna2spirv.same_encoding(b"", b"", "v_mov_b32", 2))
+        self.assertTrue(rdna2spirv.same_encoding(b"\x00", b"\x00", "v_mov_b32", 2))
+        self.assertTrue(rdna2spirv.same_encoding(b"\x12\x34\x56\x78", b"\x12\x34\x56\x78", "v_mov_b32", 2))
+        self.assertTrue(rdna2spirv.same_encoding(bytes(7), bytes(7), "v_mov_b32", 2))
+        self.assertTrue(rdna2spirv.same_encoding(bytes(8), bytes(8), "v_mov_b32", 2))
+        self.assertTrue(rdna2spirv.same_encoding(bytes(16), bytes(16), "v_mov_b32", 2))
 
     def test_short_buffers_rejected(self):
         # Different buffers under 8 bytes must be rejected immediately (returns False).
-        self.assertFalse(rdna2spirv.same_encoding(b"", b"\x00", "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(b"\x00", b"\x01", "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(b"\x00\x01", b"\x00\x02", "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(b"\x00" * 4, b"\x00" * 3 + b"\x01", "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(b"\x00" * 7, b"\x00" * 6 + b"\x01", "v_mov_b32"))
+        self.assertFalse(rdna2spirv.same_encoding(b"", b"\x00", "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(b"\x00", b"\x01", "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(b"\x00\x01", b"\x00\x02", "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(b"\x00" * 4, b"\x00" * 3 + b"\x01", "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(b"\x00" * 7, b"\x00" * 6 + b"\x01", "v_mov_b32", 2))
 
         # Unequal buffer lengths must be rejected.
-        self.assertFalse(rdna2spirv.same_encoding(bytes(4), bytes(8), "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(bytes(8), bytes(4), "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(bytes(7), bytes(8), "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(bytes(8), bytes(7), "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(bytes(8), bytes(12), "v_mov_b32"))
-        self.assertFalse(rdna2spirv.same_encoding(bytes(12), bytes(8), "v_mov_b32"))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(4), bytes(8), "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(8), bytes(4), "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(7), bytes(8), "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(8), bytes(7), "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(8), bytes(12), "v_mov_b32", 2))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(12), bytes(8), "v_mov_b32", 2))
 
     def test_non_vop3_mismatched_opcodes_rejected(self):
         # 8-byte buffers that are neither VOP3 nor VOP3P: any bit differences must return False.
@@ -53,12 +53,12 @@ class TestSameEncodingBytecodeBoundary(unittest.TestCase):
         # Diff at bit 41 (SRC1)
         val_printed = int.from_bytes(printed, "little") | (0x80 << 41)
         p_bytes = val_printed.to_bytes(8, "little")
-        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), p_bytes, "v_mov_b32"))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), p_bytes, "v_mov_b32", 2))
 
         # Diff at bit 14
         val_printed = int.from_bytes(printed, "little") | (1 << 14)
         p_bytes = val_printed.to_bytes(8, "little")
-        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), p_bytes, "v_pk_add_f16"))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), p_bytes, "v_pk_add_f16", 3))
 
     def test_vop3_boundary_and_opcode_checks(self):
         # VOP3 byte 3 has (byte >> 2) == 0x35, e.g. 0xD4 (0xD4 >> 2 == 0x35)
@@ -69,35 +69,47 @@ class TestSameEncodingBytecodeBoundary(unittest.TestCase):
         # 1. Unused SRC1 (bits 49:41): raw stored 0, printed 0x80 -> tolerated
         val_printed = val_raw | (0x80 << 41)
         printed = val_printed.to_bytes(8, "little")
-        self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed, "v_mul_legacy_f32"))
+        self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed, "v_rcp_f32", 2))
 
         # Raw has non-zero at SRC1: rejected
         raw_nonzero = (val_raw | (1 << 41)).to_bytes(8, "little")
-        self.assertFalse(rdna2spirv.same_encoding(raw_nonzero, printed, "v_mul_legacy_f32"))
+        self.assertFalse(rdna2spirv.same_encoding(raw_nonzero, printed, "v_rcp_f32", 2))
 
         # Printed has invalid diff value (not 0x80): rejected
         val_printed_bad = val_raw | (0x81 << 41)
-        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), val_printed_bad.to_bytes(8, "little"), "v_mul_legacy_f32"))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), val_printed_bad.to_bytes(8, "little"), "v_rcp_f32", 2))
         val_printed_bad2 = val_raw | (0x40 << 41)
-        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), val_printed_bad2.to_bytes(8, "little"), "v_mul_legacy_f32"))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), val_printed_bad2.to_bytes(8, "little"), "v_rcp_f32", 2))
 
         # 2. Unused SRC2 (bits 58:50): raw stored 0, printed 0x80 -> tolerated
         val_printed2 = val_raw | (0x80 << 50)
         printed2 = val_printed2.to_bytes(8, "little")
-        self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed2, "v_rcp_f32"))
+        self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed2, "v_sub_f32", 3))
 
         # Raw has non-zero at SRC2: rejected
         raw_nonzero2 = (val_raw | (1 << 50)).to_bytes(8, "little")
-        self.assertFalse(rdna2spirv.same_encoding(raw_nonzero2, printed2, "v_rcp_f32"))
+        self.assertFalse(rdna2spirv.same_encoding(raw_nonzero2, printed2, "v_rcp_f32", 2))
 
         # 3. Both SRC1 and SRC2 unused fields stored 0, printed 0x80 -> tolerated
         val_both = val_raw | (0x80 << 41) | (0x80 << 50)
         printed_both = val_both.to_bytes(8, "little")
-        self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed_both, "v_sub_f32"))
+        self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed_both, "v_rcp_f32", 2))
 
         # 4. Other bits modified (e.g. bit 0) -> rejected
         val_other = val_both | 1
-        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), val_other.to_bytes(8, "little"), "v_sub_f32"))
+        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), val_other.to_bytes(8, "little"), "v_rcp_f32", 2))
+
+    def test_vop3_implicit_and_scalar_destinations(self):
+        raw = (0xD4 << 24).to_bytes(8, "little")
+        val_raw = int.from_bytes(raw, "little")
+        src1 = (val_raw | (0x80 << 41)).to_bytes(8, "little")
+        src2 = (val_raw | (0x80 << 50)).to_bytes(8, "little")
+        # Both comparison inputs are used even when the EXEC destination is implicit.
+        self.assertFalse(rdna2spirv.same_encoding(raw, src1, "v_cmpx_lt_f16_e64", 2))
+        self.assertTrue(rdna2spirv.same_encoding(raw, src2, "v_cmpx_lt_f16_e64", 2))
+        # The carry-out destination is not a source. Only the carry-in form uses SRC2.
+        self.assertTrue(rdna2spirv.same_encoding(raw, src2, "v_add_co_u32", 4))
+        self.assertFalse(rdna2spirv.same_encoding(raw, src2, "v_add_co_ci_u32", 5))
 
     def test_vop3p_boundary_and_packed_opcodes(self):
         # VOP3P byte 3 is 0xCC
@@ -112,27 +124,29 @@ class TestSameEncodingBytecodeBoundary(unittest.TestCase):
         two_src_ops = ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_sub_f16", "v_pk_min_f16", "v_pk_max_f16")
         for op in two_src_ops:
             with self.subTest(op=op):
-                self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed14, op))
+                self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed14, op, 3))
 
         # Three-source packed ops (fma/mad): bit 14 diff is NOT tolerated
         three_src_ops = ("v_pk_fma_f16", "v_pk_mad_i16", "v_pk_fma_i16", "v_pk_mad_u16")
         for op in three_src_ops:
             with self.subTest(op=op):
-                self.assertFalse(rdna2spirv.same_encoding(bytes(raw), printed14, op))
+                self.assertFalse(rdna2spirv.same_encoding(bytes(raw), printed14, op, 4))
 
         # Non-packed ops with VOP3P encoding: bit 14 diff is NOT tolerated
         for op in ("v_mov_b32", "v_add_f32", "s_mov_b32"):
             with self.subTest(op=op):
-                self.assertFalse(rdna2spirv.same_encoding(bytes(raw), printed14, op))
+                self.assertFalse(rdna2spirv.same_encoding(bytes(raw), printed14, op, 3))
 
-        # Two-source packed ops tolerating bit 14 + SRC1 + SRC2 simultaneously
-        val_all = val_raw | (1 << 14) | (0x80 << 41) | (0x80 << 50)
-        printed_all = val_all.to_bytes(8, "little")
-        self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed_all, "v_pk_add_f16"))
+        # A two-source packed op tolerates both defaults, but has a live SRC1.
+        val_defaults = val_raw | (1 << 14) | (0x80 << 50)
+        printed_defaults = val_defaults.to_bytes(8, "little")
+        self.assertTrue(rdna2spirv.same_encoding(bytes(raw), printed_defaults, "v_pk_add_f16", 3))
+        changed_src1 = (val_defaults | (0x80 << 41)).to_bytes(8, "little")
+        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), changed_src1, "v_pk_add_f16", 3))
 
         # Extra bit modified -> rejected
-        val_all_bad = val_all | 2
-        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), val_all_bad.to_bytes(8, "little"), "v_pk_add_f16"))
+        bad = (val_defaults | 2).to_bytes(8, "little")
+        self.assertFalse(rdna2spirv.same_encoding(bytes(raw), bad, "v_pk_add_f16", 3))
 
 
 class TestBaseOpDecoder(unittest.TestCase):

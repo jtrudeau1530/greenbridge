@@ -11364,14 +11364,21 @@ def input_signature(path, name):
     return []
 
 
-def same_encoding(raw, printed, op):
+# RDNA2 VOP3_SDST_ENC forms have both VDST and SDST in the printed operands.
+VOP3_TWO_DESTS = frozenset({
+    "v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32",
+    "v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
+    "v_div_scale_f32", "v_div_scale_f64", "v_mad_u64_u32", "v_mad_i64_i32",
+})
+
+
+def same_encoding(raw, printed, op, operand_count):
     """True if the bytes in the blob are the instruction LLVM printed. Exact match, except for fields the
     hardware ignores that LLVM re-encodes with its default: VOP3P op_sel_hi[2] (bit 14) on two-source packed
     ops (seen: v_pk_add_f16 stored with 0, printed with 1), and unused VOP3/VOP3P SRC1 (bits 49:41) and SRC2
     (bits 58:50) fields, which the game's compiler stores as 0 and LLVM 23 prints as 0x80 (inline constant 0;
     seen on two-source v_mul_legacy_f32/v_sub_f32/v_cmp_*_e64/v_mul_lo_u32/v_pk_mul_f16 and one-source
-    v_rcp/v_log/v_sqrt_f32_e64). LLVM decoded these bytes, so a source it actually reads would have printed as
-    s0, not 0x80."""
+    v_rcp/v_log/v_sqrt_f32_e64). A used source encoded as 0 reads s0 and is not equivalent to inline zero."""
     if raw == printed:
         return True
     if len(raw) != len(printed) or len(raw) < 8:
@@ -11380,12 +11387,19 @@ def same_encoding(raw, printed, op):
     diff = r ^ int.from_bytes(printed, "little")
     vop3 = (printed[3] >> 2) == 0x35               # VOP3 (encoding 110101)
     vop3p = printed[3] == 0xCC
-    if vop3 or vop3p:
-        for shift in (41, 50):                     # SRC1, SRC2: unused field stored 0, printed 0x80
-            if (diff >> shift) & 0x1FF == 0x80 and (r >> shift) & 0x1FF == 0:
-                diff &= ~(0x1FF << shift)
+    if not (vop3 or vop3p):
+        return False
+    op = base_op(op)
+    if op.startswith("v_cmpx_"):
+        source_count = 2                          # EXEC is implicit on gfx10, but some listings spell it out.
+    else:
+        dest_count = 2 if op in VOP3_TWO_DESTS else 1
+        source_count = operand_count - dest_count
+    for index, shift in enumerate((41, 50), start=1):   # SRC1, SRC2
+        if 0 <= source_count <= index and (diff >> shift) & 0x1FF == 0x80 and (r >> shift) & 0x1FF == 0:
+            diff &= ~(0x1FF << shift)
     two_src = op.startswith("v_pk_") and not any(k in op for k in ("fma", "mad"))
-    if vop3p and two_src:
+    if vop3p and source_count == 2 and two_src:
         diff &= ~(1 << 14)
     return diff == 0
 
@@ -11555,7 +11569,7 @@ def check_printed_encodings(path, info):
             continue
         enc = bytes.fromhex(ins["enc"])
         raw = blob[ins["pc"]:ins["pc"] + len(enc)]
-        if not same_encoding(raw, enc, base_op(ins["op"])):
+        if not same_encoding(raw, enc, ins["op"], len(ins["args"])):
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
                               f"{enc.hex()} (a field the disassembler dropped)")
 
@@ -11590,8 +11604,9 @@ def translate(path):
         pos = info["code_start"]
         for ins in insns:
             enc = bytes.fromhex(ins["enc"])
+            op, operand_count = ins["op"], len(ins["args"])
             skipped, at = 0, pos
-            while not same_encoding(blob[at:at + len(enc)], enc, base_op(ins["op"])):
+            while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
                 at += 4
                 skipped += 4
                 if skipped > 4096 or at >= len(blob):
