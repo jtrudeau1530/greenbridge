@@ -935,6 +935,143 @@ class RcpExecMaskingTests(unittest.TestCase):
                 )
 
 
+# -----------------------------------------------------------------------------
+# 6. Newton-Raphson Multi-Step Division Emulation (v_rcp_f32 + v_fma_f32 + v_mul_f32)
+# -----------------------------------------------------------------------------
+
+def run_nr_fdiv_ps(a_bits: int, b_bits: int) -> int:
+    """Execute 4-step Newton-Raphson division in a pixel shader and return quotient bits."""
+    return run_ps_v0([
+        f"v_mov_b32 v0, {a_bits:#x}",
+        f"v_mov_b32 v1, {b_bits:#x}",
+        "v_rcp_f32_e32 v2, v1",
+        "v_fma_f32 v3, -v1, v2, 1.0",
+        "v_fma_f32 v4, v2, v3, v2",
+        "v_mul_f32_e32 v0, v0, v4",
+    ])
+
+
+def run_nr_fdiv_steps_cs(a_bits: int, b_bits: int) -> tuple[int, int, int, int]:
+    """Execute 4-step Newton-Raphson division in a compute shader and capture all intermediate registers."""
+    mem: dict[int, int] = {}
+    lines = [
+        f"v_mov_b32 v0, {a_bits:#x}",
+        f"v_mov_b32 v1, {b_bits:#x}",
+        "v_rcp_f32_e32 v2, v1",
+        "v_fma_f32 v3, -v1, v2, 1.0",
+        "v_fma_f32 v4, v2, v3, v2",
+        "v_mul_f32_e32 v5, v0, v4",
+        "v_mov_b32 v6, 0",
+        "buffer_store_dword v2, v6, s[0:3], 0 offen offset:0",
+        "buffer_store_dword v3, v6, s[0:3], 0 offen offset:4",
+        "buffer_store_dword v4, v6, s[0:3], 0 offen offset:8",
+        "buffer_store_dword v5, v6, s[0:3], 0 offen offset:12",
+    ]
+    run_cs(lines, group_size=1, subgroup_size=32, memory=mem)
+    return mem[0], mem[4], mem[8], mem[12]
+
+
+class NewtonRaphsonMultiStepEmulationTests(unittest.TestCase):
+    def test_hand_worked_pipeline_steps_match_oracle(self):
+        for name, a_bits, b_bits, want_steps in NR_FDIV_HAND_WORKED:
+            with self.subTest(case=name):
+                got_steps = run_nr_fdiv_steps_cs(a_bits, b_bits)
+                self.assertEqual(got_steps, want_steps)
+
+    def test_end_to_end_quotients_match_oracle(self):
+        cases = (
+            (f32_bits(1.0), f32_bits(2.0)),
+            (f32_bits(3.5), f32_bits(1.75)),
+            (f32_bits(10.0), f32_bits(3.0)),
+            (f32_bits(-15.0), f32_bits(4.0)),
+            (f32_bits(100.5), f32_bits(-20.25)),
+            (f32_bits(1e6), f32_bits(3.0)),
+            (f32_bits(2.5e-5), f32_bits(4.0e5)),
+            (f32_bits(1.0), f32_bits(7.0)),
+            (f32_bits(22.0), f32_bits(7.0)),
+            (f32_bits(-0.125), f32_bits(8.0)),
+            (0x00000000, f32_bits(4.0)),
+            (0x80000000, f32_bits(4.0)),
+            (0x00000000, f32_bits(-4.0)),
+            (0x80000000, f32_bits(-4.0)),
+        )
+        for a_bits, b_bits in cases:
+            with self.subTest(a=hex(a_bits), b=hex(b_bits)):
+                got = run_nr_fdiv_ps(a_bits, b_bits)
+                want = ref_newton_raphson_fdiv_f32(a_bits, b_bits)
+                self.assertEqual(got, want)
+
+    def test_vop3_encodings_and_register_reuse(self):
+        # In-place register reuse: v0 = dividend, v1 = divisor, v2 = y0 -> y1, v0 = quotient
+        lines = [
+            f"v_mov_b32 v0, {f32_bits(10.0):#x}",
+            f"v_mov_b32 v1, {f32_bits(2.0):#x}",
+            "v_rcp_f32_e64 v2, v1",
+            "v_fma_f32 v3, -v1, v2, 1.0",
+            "v_fma_f32 v2, v2, v3, v2",
+            "v_mul_f32_e64 v0, v0, v2",
+        ]
+        self.assertEqual(run_ps_v0(lines), f32_bits(5.0))
+
+        # Negative dividend and divisor with VOP3
+        lines_neg = [
+            f"v_mov_b32 v0, {f32_bits(-24.0):#x}",
+            f"v_mov_b32 v1, {f32_bits(-6.0):#x}",
+            "v_rcp_f32_e64 v2, v1",
+            "v_fma_f32 v3, -v1, v2, 1.0",
+            "v_fma_f32 v2, v2, v3, v2",
+            "v_mul_f32_e64 v0, v0, v2",
+        ]
+        self.assertEqual(run_ps_v0(lines_neg), f32_bits(4.0))
+
+    def test_sgpr_and_inline_constant_operands(self):
+        # SGPR divisor
+        lines_sgpr = [
+            f"s_mov_b32 s4, {f32_bits(4.0):#x}",
+            f"v_mov_b32 v0, {f32_bits(2.0):#x}",
+            "v_rcp_f32_e32 v2, s4",
+            "v_fma_f32 v3, -s4, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        self.assertEqual(run_ps_v0(lines_sgpr), f32_bits(0.5))
+
+        # Inline float constants as divisor (2.0)
+        lines_imm = [
+            f"v_mov_b32 v0, {f32_bits(12.0):#x}",
+            "v_rcp_f32_e32 v2, 2.0",
+            "v_fma_f32 v3, -2.0, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        self.assertEqual(run_ps_v0(lines_imm), f32_bits(6.0))
+
+    def test_multilane_simd_divergence_under_exec_mask(self):
+        mem: dict[int, int] = {}
+        lines = [
+            "v_lshlrev_b32 v6, 2, v0",
+            f"v_mov_b32 v7, {f32_bits(10.0):#x}",
+            f"v_mov_b32 v8, {f32_bits(2.0):#x}",
+            "v_cmp_eq_u32 vcc, v0, 2",
+            f"v_cndmask_b32 v7, v7, {f32_bits(-15.0):#x}, vcc",
+            f"v_cndmask_b32 v8, v8, {f32_bits(5.0):#x}, vcc",
+            f"v_mov_b32 v5, {OLD:#x}",
+            "v_and_b32 v9, v0, 1",
+            "v_cmpx_eq_u32 v9, 0",
+            "v_rcp_f32_e32 v2, v8",
+            "v_fma_f32 v3, -v8, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v5, v7, v4",
+            "s_mov_b32 exec_lo, -1",
+            "buffer_store_dword v5, v6, s[0:3], 0 offen",
+        ]
+        run_cs(lines, group_size=4, subgroup_size=32, memory=mem)
+        self.assertEqual(
+            [mem[4 * i] for i in range(4)],
+            [f32_bits(5.0), OLD, f32_bits(-3.0), OLD],
+        )
+
+
 class NegativeControlTests(unittest.TestCase):
     def test_sabotaged_spirv_is_detected(self):
         cases = (
