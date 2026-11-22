@@ -383,7 +383,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             if mm[s:s + 3] == b"KB2":
                 blen = (_u32(mm, s + 4) or 0) + 8
                 w, h = _u32(mm, s + 0x14), _u32(mm, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
                 gap = mm[last:s]
@@ -396,8 +396,8 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             d = zlib.decompressobj()
             chunks, p = [], s
             try:
-                while not d.eof and p < size:
-                    block = mm[p:p + (1 << 20)]
+                while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                    block = mm[p:min(p + (1 << 20), end)]
                     chunks.append(d.decompress(block))
                     p += len(block)
                     if d.unused_data or d.eof:
