@@ -136,16 +136,26 @@ def export_one(t, carve, out, blob_cache):
     return "ok:" + place
 
 
+def positive_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("index")
     ap.add_argument("carve")
     ap.add_argument("out")
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--limit", type=positive_int, help="export only the first N textures (N >= 1)")
     a = ap.parse_args()
     texs = json.load(open(a.index, encoding="utf-8"))
     texs.sort(key=lambda t: (t["archive"], t["gpu"]))
-    if a.limit:
+    if a.limit is not None:         # 0 used to read as "no limit", and a negative N dropped the last N
         texs = texs[: a.limit]
     os.makedirs(a.out, exist_ok=True)
     res, cache = Counter(), {}

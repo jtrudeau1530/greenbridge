@@ -91,10 +91,20 @@ def main(argv=None) -> int:
                     help="tag-0x0D payload when a container has more than one (default: last)")
     a = ap.parse_args(argv)
     src = a.src
+    # Check before anything is created: makedirs below would otherwise make a mistyped source folder.
+    if not os.path.isdir(src):
+        what = "is not a folder" if os.path.exists(src) else "does not exist"
+        print(f"ERROR: {src} {what}. Give the folder with the carved .dxbc files.", file=sys.stderr)
+        return 2
+    try:
+        names = sorted(os.listdir(src))
+    except OSError as e:
+        print(f"ERROR: cannot list {src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     out = os.path.join(src, "fssm")
     os.makedirs(out, exist_ok=True)
     rows, problems = [], Counter()
-    for name in sorted(os.listdir(src)):
+    for name in names:
         if not name.endswith(".dxbc"):
             continue
         with open(os.path.join(src, name), "rb") as f:

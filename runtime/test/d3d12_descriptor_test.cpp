@@ -8,6 +8,10 @@
 //     and with a slot holding bytes no view was made for, which must give the fallback image. The sampler wraps
 //     in U and the shader samples one tile to the right, so a missed S# would show as well (the fallback
 //     sampler clamps).
+//   - UINT border colours (#538, Vonsek's case): an R8G8B8A8_UINT texture sampled one tile to the right through
+//     CreateSampler2 samplers that clamp to a UINT (0,0,0,0) and (1,1,1,1) border, and a float white border on
+//     the UNORM texture. Every texel is the border: 0, 1 and 255 in each channel. Both white borders are built in
+//     at the same S# type, so this also checks that they are two samplers, not one.
 // The device has no pipelines yet, so the test makes that one pipeline in Vulkan itself and binds the device's set
 // (rt::d3d12::bindless_set). The shader is test/glsl/cs_sample.comp; without glslangValidator at build time the
 // sampling is skipped. No game data.
@@ -81,6 +85,7 @@ struct SampleKeys {
     std::uint32_t tsharp[8];
     std::uint32_t ssharp[4];
     std::uint32_t first;
+    std::uint32_t integer;  // the image is an integer one: cs_sample.comp reads it as a utexture2D
 };
 
 // Runs test/glsl/cs_sample.comp once for each of `keys` on `set0`, the device's bindless set, and copies the
@@ -189,7 +194,7 @@ int main() {
     EXPECT(d.create());
 
     constexpr UINT size = 8, texels = size * size, bytes = texels * 4;
-    std::vector<std::uint8_t> results(3 * bytes), after_destruction(bytes);
+    std::vector<std::uint8_t> results(3 * bytes), after_destruction(bytes), borders(3 * bytes);
     bool sampled_through_set = false;
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -311,6 +316,20 @@ int main() {
             for (UINT x = 0; x < size; ++x)
                 std::memcpy(static_cast<std::uint8_t*>(mapped) + placed.Offset + y * placed.Footprint.RowPitch + x * 4,
                             texel(x, y).data(), 4);
+        // The same bytes in an R8G8B8A8_UINT texture, from further into the upload buffer.
+        D3D12_RESOURCE_DESC uint_desc = texture_desc;
+        uint_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+        Ref<ID3D12Resource> uint_texture;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uint_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&uint_texture.p))));
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT uint_placed{};
+        device->GetCopyableFootprints(&uint_desc, 0, 1, 32768, &uint_placed, nullptr, nullptr, nullptr);
+        for (UINT y = 0; y < size; ++y)
+            for (UINT x = 0; x < size; ++x)
+                std::memcpy(static_cast<std::uint8_t*>(mapped) + uint_placed.Offset +
+                                y * uint_placed.Footprint.RowPitch + x * 4,
+                            texel(x, y).data(), 4);
 
         // Shader-visible heaps, start handles in the Xbox shape.
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -372,6 +391,38 @@ int main() {
         EXPECT(sampler.address_u == g::AddressMode::wrap && sampler.address_v == g::AddressMode::clamp_last_texel &&
                sampler.address_w == g::AddressMode::clamp_last_texel);
         EXPECT(sampler.compare == g::CompareFunction::never && sampler.min_lod == 0.0f && sampler.max_lod > 14.9f);
+
+        // The UINT texture's view in slot 0, and three border samplers after the first: UINT (0,0,0,0) and
+        // (1,1,1,1) from CreateSampler2, which the proxy does not have (the inner device does), and float white.
+        constexpr UINT uint_slot = 0, uint_black = 1, uint_white = 2, float_white = 3;
+        device->CreateShaderResourceView(uint_texture.p, nullptr, view_slot(uint_slot));
+        {
+            Ref<ID3D12Device11> inner11;
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&inner11.p))));
+            D3D12_SAMPLER_DESC2 border_desc{};
+            border_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+            border_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+            border_desc.AddressV = border_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            border_desc.MaxAnisotropy = 1;
+            border_desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            const auto at = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu + i * sampler_step)}; };
+            border_desc.Flags = D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+            inner11->CreateSampler2(&border_desc, at(uint_black));
+            for (UINT& c : border_desc.UintBorderColor) c = 1;
+            inner11->CreateSampler2(&border_desc, at(uint_white));
+            border_desc.Flags = D3D12_SAMPLER_FLAG_NONE;
+            for (FLOAT& c : border_desc.FloatBorderColor) c = 1.0f;
+            inner11->CreateSampler2(&border_desc, at(float_white));
+        }
+        const auto sampler_at = [&](UINT i) {
+            return reinterpret_cast<const std::uint8_t*>(sampler_cpu + i * sampler_step);
+        };
+        // The two white borders differ only in the integer mark.
+        g::SamplerWords white_words{}, float_white_words{};
+        std::memcpy(white_words.data(), sampler_at(uint_white), sizeof(white_words));
+        std::memcpy(float_white_words.data(), sampler_at(float_white), sizeof(float_white_words));
+        EXPECT(white_words != float_white_words && g::decode(white_words).integer_border);
+        EXPECT(white_words[3] == (float_white_words[3] | g::kIntegerBorderPtr));
 
         // A view with every field away from its default: mips 1 and 2 of a BGRA cube, with the view's mapping
         // swapping red and blue and forcing alpha to one. The texture is another one, so its address differs.
@@ -479,9 +530,13 @@ int main() {
         from_upload.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         from_upload.PlacedFootprint = placed;
         list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
-        const auto sampled = transition(texture.p, D3D12_RESOURCE_STATE_COPY_DEST,
-                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        list->ResourceBarrier(1, &sampled);
+        to_texture.pResource = uint_texture.p;
+        from_upload.PlacedFootprint = uint_placed;
+        list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        const D3D12_RESOURCE_BARRIER sampled[] = {
+            transition(texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+        list->ResourceBarrier(2, sampled);
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -504,6 +559,18 @@ int main() {
         }
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
+
+        // The border samplers, one tile to the right: every texel is the border.
+        SampleKeys border_keys[3] = {};
+        const UINT border_views[3] = {uint_slot, uint_slot, own};
+        const UINT border_samplers[3] = {uint_black, uint_white, float_white};
+        for (UINT k = 0; k < 3; ++k) {
+            std::memcpy(border_keys[k].tsharp, view_bytes(border_views[k]), sizeof(border_keys[k].tsharp));
+            std::memcpy(border_keys[k].ssharp, sampler_at(border_samplers[k]), sizeof(border_keys[k].ssharp));
+            border_keys[k].first = k * texels;
+            border_keys[k].integer = border_views[k] == uint_slot;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, border_keys, borders.data()));
 #endif
 
         // A destroyed texture takes its views out of the set: the next ExecuteCommandLists writes that, and nothing
@@ -523,6 +590,7 @@ int main() {
 #endif
 
         upload.reset();
+        uint_texture.reset();
         view_heap.reset();
         sampler_heap.reset();
         list.reset();
@@ -565,12 +633,24 @@ int main() {
             std::fprintf(stderr, "texel %u after the texture was destroyed is not the fallback\n", i);
     }
     EXPECT(!mismatches);
+    // UINT (0,0,0,0), UINT (1,1,1,1) and float white borders: 0, 1 and 255 in every channel of every texel.
+    const std::uint8_t border_values[3] = {0, 1, 255};
+    const char* border_names[3] = {"UINT transparent black", "UINT opaque white", "float opaque white"};
+    for (UINT k = 0; k < 3; ++k)
+        for (UINT i = 0; i < texels * 4; ++i) {
+            const std::uint8_t got = borders[k * bytes + i];
+            if (got != border_values[k] && mismatches++ < 4)
+                std::fprintf(stderr, "%s border, texel %u channel %u: got %u, want %u\n", border_names[k], i / 4,
+                             i % 4, unsigned(got), unsigned(border_values[k]));
+        }
+    EXPECT(!mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
     std::printf("descriptors: copies matched; a T# and an S# from CreateShaderResourceView and CreateSampler were "
                 "found in the device's bindless set by a shader, %u texels matched twice, and an unknown descriptor "
-                "and a destroyed texture's gave the fallback\n", texels);
+                "and a destroyed texture's gave the fallback; UINT black, UINT white and float white borders read "
+                "0, 1 and 255\n", texels);
     return 0;
 }
