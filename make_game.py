@@ -409,7 +409,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         missing.append("Python 3.12 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
         mc = mc_command()[0]
-        if not tool_available(mc):
+        if not (os.path.isfile(mc) or shutil.which(mc)):
             missing.append(
                 "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
                 "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "

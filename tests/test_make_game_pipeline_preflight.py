@@ -28,7 +28,7 @@ class PreflightEnv:
         os.makedirs(self.work)
         # Satisfy every other prerequisite so only the checker under test can make preflight fail.
         for patcher in (mock.patch("sys.version_info", (3, 12, 0)),
-                        mock.patch("make_game.tool_available", return_value=True),
+                        mock.patch.dict(os.environ, {"LLVM_MC": "llvm-mc"}),
                         mock.patch("shutil.which", return_value="/bin/tool"),
                         mock.patch("shutil.disk_usage", return_value=mock.Mock(free=500 * 2**30))):
             patcher.start()
@@ -99,7 +99,8 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
                 self.assertIn("vk_pipeline_check", err)
 
     def test_missing_checker_is_listed_with_other_missing_prerequisites(self):
-        with mock.patch("os.name", "nt"), mock.patch("make_game.tool_available", return_value=False), \
+        with mock.patch("os.name", "nt"), \
+                mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \
                 mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
             err = self.assert_preflight_fails(["shaders", "pipelines"], "vk_pipeline_check")
         self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
@@ -136,7 +137,7 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
         build.assert_not_called()
 
     def test_another_missing_prerequisite_stops_before_the_build(self):
-        with mock.patch("make_game.tool_available", return_value=False), \
+        with mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:
             self.assert_preflight_fails(["shaders", "pipelines"], "llvm-mc")
         build.assert_not_called()
