@@ -327,6 +327,7 @@ int compare_footprints(ID3D12Device* ours) {
         {volume_desc(5), 5},
         {buffer_desc(300), 1},
         {texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
+        {texture_desc(13, 7, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, 4), 4},
         {texture_desc(10, 6, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE, 4), 4},
         {texture_desc(4, 4, DXGI_FORMAT_BC7_UNORM_SRGB, D3D12_RESOURCE_FLAG_NONE, 1, 3), 3},
@@ -1167,7 +1168,7 @@ int main() {
         }
 
         // Descriptor heaps from slot 14, start handles in the Xbox shape.
-        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
         heap_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -1178,7 +1179,7 @@ int main() {
         const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         EXPECT(rtv_start && dsv_start && increment >= sizeof(leonida::TargetView));
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv0{SIZE_T(rtv_start)}, rtv1{SIZE_T(rtv_start + increment)},
-            dsv0{SIZE_T(dsv_start)};
+            rtv565{SIZE_T(rtv_start + 2 * increment)}, dsv0{SIZE_T(dsv_start)};
 
         // Resources: the render target through slot 76 with the Xbox tiled layout word, the others through the
         // PC CreateCommittedResource.
@@ -1200,7 +1201,7 @@ int main() {
         EXPECT(create(default_heap, invalid_buffer_samples, D3D12_RESOURCE_STATE_COPY_DEST, refused_buffer) ==
                E_INVALIDARG && !refused_buffer.p);
 
-        Ref<ID3D12Resource> rt_resource, ds, untouched, upload, readback, volume;
+        Ref<ID3D12Resource> rt_resource, packed565, ds, untouched, upload, readback, volume;
         D3D12_RESOURCE_DESC xbox_rt =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         xbox_rt.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
@@ -1208,6 +1209,9 @@ int main() {
         EXPECT(SUCCEEDED(reinterpret_cast<XboxCreateResourceFn>(slot(device.p, 76))(
             device.p, &default_heap, D3D12_HEAP_FLAG_NONE, &xbox_rt, D3D12_RESOURCE_STATE_COMMON, nullptr,
             &resource_iid, reinterpret_cast<void**>(&rt_resource.p))));
+        EXPECT(SUCCEEDED(create(default_heap,
+                                texture_desc(size, size, DXGI_FORMAT_B5G6R5_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                                D3D12_RESOURCE_STATE_RENDER_TARGET, packed565)));
         EXPECT(SUCCEEDED(create(default_heap,
                                 texture_desc(size, size, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
                                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
@@ -1241,11 +1245,13 @@ int main() {
         rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         device->CreateRenderTargetView(rt_resource.p, &rtv_desc, rtv1);
         device->CreateDepthStencilView(ds.p, nullptr, dsv0);
+        device->CreateRenderTargetView(packed565.p, nullptr, rtv565);
 
         // List 1: clears and barriers on never-written resources (their first use zero-fills them), then copies of
         // the colour, depth plane, stencil plane and the untouched texture into the readback buffer.
         UINT64 cursor = 0;
         const auto rt_place = place(device.p, rt_resource.p, 0, cursor);
+        const auto packed_place = place(device.p, packed565.p, 0, cursor);
         const auto depth_place = place(device.p, ds.p, 0, cursor);
         const auto stencil_place = place(device.p, ds.p, 1, cursor);
         const auto untouched_place = place(device.p, untouched.p, 0, cursor);
@@ -1260,6 +1266,11 @@ int main() {
         const D3D12_RECT square{2, 2, 6, 6}, top_half{0, 0, 8, 4};
         list->ClearRenderTargetView(rtv0, red, 0, nullptr);
         list->ClearRenderTargetView(rtv1, blue, 1, &square);
+        const FLOAT packed_full[4] = {1, 0.25f, 0, 1}, packed_rect[4] = {0, 0.75f, 1, 0};
+        list->ClearRenderTargetView(rtv565, packed_full, 0, nullptr);
+        list->ClearRenderTargetView(rtv565, packed_rect, 1, &square);
+        barrier = transition(packed565.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &barrier);
         list->ClearDepthStencilView(dsv0, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.25f, 0x42, 1, &top_half);
         barrier = transition(rt_resource.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &barrier);
@@ -1282,7 +1293,8 @@ int main() {
         group.pTextureBarriers = &readable;
         list7->Barrier(1, &group);
         for (const auto& [resource, index, placed] :
-             {std::tuple{rt_resource.p, 0u, rt_place}, std::tuple{ds.p, 0u, depth_place},
+             {std::tuple{rt_resource.p, 0u, rt_place}, std::tuple{packed565.p, 0u, packed_place},
+              std::tuple{ds.p, 0u, depth_place},
               std::tuple{ds.p, 1u, stencil_place}, std::tuple{untouched.p, 0u, untouched_place}}) {
             const auto dst = footprint(readback.p, placed);
             const auto src = subresource(resource, index);
@@ -1303,6 +1315,11 @@ int main() {
                 const std::uint8_t want[4] = {std::uint8_t(inside ? 0 : 255), 0, std::uint8_t(inside ? 255 : 0), 255};
                 report("colour texel", row * size + col,
                        down + rt_place.Offset + row * rt_place.Footprint.RowPitch + col * 4, want, 4);
+                // B is in bits 0..4, G in 5..10 and R in 11..15. The green levels round to 16 and 47.
+                const std::uint16_t packed_word = inside ? 0x05ff : 0xfa00;
+                report("B5G6R5 texel", row * size + col,
+                       down + packed_place.Offset + row * packed_place.Footprint.RowPitch + col * 2,
+                       reinterpret_cast<const std::uint8_t*>(&packed_word), sizeof(packed_word));
                 const float depth = row < 4 ? 0.25f : 0.0f;  // the bottom half was zero-filled, never cleared
                 report("depth texel", row * size + col,
                        down + depth_place.Offset + row * depth_place.Footprint.RowPitch + col * 4,
@@ -1748,7 +1765,7 @@ int main() {
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
-        for (auto* r : {&rt_resource, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc}) r->reset();
+        for (auto* r : {&rt_resource, &packed565, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc}) r->reset();
         list7.reset();
         list.reset();
         allocator.reset();

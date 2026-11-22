@@ -644,7 +644,7 @@ def pipeline_check_exe():
     return next((p for p in found if os.path.isfile(p)), None)
 
 
-def pipelines(work: str, out: str) -> None:
+def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
     exe = pipeline_check_exe()
     spirv = os.path.join(work, "shaders", "spirv")
     if not exe and os.name == "nt":
@@ -657,7 +657,8 @@ def pipelines(work: str, out: str) -> None:
         fail("No translated shaders yet: run the shaders stage first.")
     log("pipelines: creating every shader module and compute pipeline on this GPU")
     os.makedirs(out, exist_ok=True)
-    run([exe, spirv, os.path.join(out, "pipeline_cache.bin")])
+    # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
+    run([exe, spirv, os.path.join(out, "pipeline_cache.bin"), *(["--jobs", str(jobs)] if jobs else [])])
     log("pipelines: done")
 
 
@@ -722,7 +723,7 @@ def main() -> int:
     if "runtime" in stages:
         runtime(game, out, v)
     if "pipelines" in stages:
-        pipelines(work, out)
+        pipelines(work, out, a.jobs)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

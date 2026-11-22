@@ -1,10 +1,11 @@
-"""gamedata_maps.py must decode MHIU/PAMH headers and arrays from synthetic payloads.
+"""gamedata_maps.py must decode the measured MHIU and PAMH (HMAP) layouts.
 
     python -I tests/test_gamedata_maps.py
 
-Every fixture here is synthetic. The MHIU fixture has a zero-filled prefix and a square grid; the
-PAMH fixture has a valid row table and u16 grid. The archive test builds a carve-shaped directory
-and checks the CLI, including a MHIU split across two 64 KiB streams.
+Every fixture is synthetic. MHIU is a 44-byte header, a row table and packed
+u8 heights with a default fill. PAMH is HMAP v1.2: a row table, a max u8 array
+and a min u8 array. The archive tests build a carve-shaped directory and check
+the CLI, including a MHIU split across two 64 KiB streams.
 """
 import json
 import os
@@ -15,29 +16,45 @@ import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOL = os.path.join(ROOT, "tools", "gamedata_maps.py")
+TOOLS = os.path.join(ROOT, "tools")
+TOOL = os.path.join(TOOLS, "gamedata_maps.py")
+sys.path.insert(0, TOOLS)
+
+import gamedata_maps  # noqa: E402
 
 
-def mhiu_payload(grid: bytes, prefix: int = 0, prefix_byte: int = 0) -> bytes:
-    data = bytes([prefix_byte]) * prefix + grid
+def mhiu_payload(width: int, height: int, rows, pixels: bytes,
+                 default: int = 23) -> bytes:
+    """`rows` is a list of (start, count, values); offsets are assigned in order."""
+    table = bytearray()
+    packed = bytearray()
+    for start, count, values in rows:
+        assert len(values) == count
+        offset = len(packed) - start
+        table += struct.pack("<HHi", start, count, offset)
+        packed += bytes(values)
+    table += b"\0" * (8 * (height - len(rows)))
+    data = bytes(table) + bytes(packed) + pixels
     head = bytearray(44)
     head[:4] = b"MHIU"
-    struct.pack_into("<I", head, 0x04, 0x08000001)
-    struct.pack_into("<I", head, 0x08, 2048)
+    struct.pack_into("<H", head, 0x04, 1)
+    struct.pack_into("<HH", head, 0x06, width, height)
     struct.pack_into("<6f", head, 0x0C, -10.0, -20.0, -30.0, 40.0, 50.0, 60.0)
     struct.pack_into("<I", head, 0x24, len(data))
-    struct.pack_into("<I", head, 0x28, 0)
+    struct.pack_into("<I", head, 0x28, 0x12345678)
     return bytes(head) + data
 
 
-def pamh_payload(width: int, height: int) -> bytes:
-    rows = b"".join(struct.pack("<HHI", 0, width, i * width) for i in range(height))
-    grid = struct.pack(f"<{width * height}H", *range(100, 100 + width * height))
-    data = rows + grid
+def pamh_payload(width: int, height: int, maximum, minimum,
+                 flag: int = 0x1BBC8CED) -> bytes:
+    rows = b"".join(struct.pack("<HHi", 0, width, i * width)
+                    for i in range(height))
+    data = rows + bytes(maximum) + bytes(minimum)
     head = bytearray(44)
     head[:4] = b"PAMH"
-    struct.pack_into("<I", head, 0x04, 0x00000201)
-    struct.pack_into("<I", head, 0x08, 0)
+    head[0x04] = 1
+    head[0x05] = 2
+    struct.pack_into("<I", head, 0x08, flag)
     struct.pack_into("<HH", head, 0x0C, width, height)
     struct.pack_into("<6f", head, 0x10, -10.0, -20.0, -30.0, 40.0, 50.0, 60.0)
     struct.pack_into("<I", head, 0x28, len(data))
@@ -82,31 +99,73 @@ class GamedataMapsTest(unittest.TestCase):
                 data = json.load(f)
         return p, data
 
-    def test_decodes_mhiu_and_pamh(self):
-        self.add(mhiu_payload(bytes(range(1, 17)), prefix=3))
-        self.add(pamh_payload(3, 2))
+    def test_mhiu_row_table_and_default_fill(self):
+        payload = mhiu_payload(4, 3, [
+            (0, 0, []),
+            (1, 2, [7, 8]),
+            (0, 4, [9, 10, 11, 12]),
+        ], pixels=b"")
+        p = gamedata_maps.parse_mhiu(payload)
+        self.assertEqual(p["header"]["width"], 4)
+        self.assertEqual(p["header"]["height"], 3)
+        self.assertEqual(p["header"]["bounds"]["min"], [-10.0, -20.0, -30.0])
+        self.assertEqual(p["header"]["field28"], 0x12345678)
+        self.assertEqual(p["grid"]["filled_rows"], 2)
+        self.assertEqual(p["grid"]["empty_rows"], 1)
+        self.assertEqual(p["grid"]["filled_cells"], 6)
+        self.assertEqual(p["grid"]["default"], 23)
+        self.assertEqual(list(p["_grid"]), [23, 23, 23, 23,
+                                            23, 7, 8, 23,
+                                            9, 10, 11, 12])
+
+    def test_mhiu_rejects_a_row_past_the_pixels(self):
+        payload = mhiu_payload(4, 1, [(0, 4, [1, 2, 3, 4])], pixels=b"")
+        head = bytearray(payload)
+        struct.pack_into("<i", head, 0x2C + 4, 1000)
+        with self.assertRaisesRegex(ValueError, "pixel data"):
+            gamedata_maps.parse_mhiu(bytes(head))
+
+    def test_pamh_splits_max_and_min_arrays(self):
+        payload = pamh_payload(3, 2,
+                               [1, 2, 3, 4, 5, 6],
+                               [0, 1, 2, 3, 4, 7])
+        p = gamedata_maps.parse_pamh(payload)
+        self.assertEqual(p["header"]["version_major"], 1)
+        self.assertEqual(p["header"]["version_minor"], 2)
+        self.assertEqual(p["header"]["flag"], 0x1BBC8CED)
+        self.assertEqual(p["header"]["bounds"]["max"], [40.0, 50.0, 60.0])
+        self.assertEqual(list(p["_max"]), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(list(p["_min"]), [0, 1, 2, 3, 4, 7])
+        self.assertEqual(p["grid"]["min_above_max"], 1)
+
+    def test_pamh_rejects_a_short_row_body(self):
+        payload = pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3])
+        head = bytearray(payload[:-1])
+        struct.pack_into("<I", head, 0x28, len(head) - 44)
+        with self.assertRaisesRegex(ValueError, "max and min rows"):
+            gamedata_maps.parse_pamh(bytes(head))
+
+    def test_decodes_mhiu_and_pamh_from_a_carve(self):
+        self.add(mhiu_payload(4, 3, [(0, 0, []), (1, 2, [7, 8]), (0, 4, [9, 10, 11, 12])],
+                              pixels=b""))
+        self.add(pamh_payload(3, 2, [1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 7]))
         self.finish()
 
         p, data = self.run_tool()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         mhiu, pamh = data["payloads"]
         self.assertEqual(mhiu["type"], "MHIU")
-        self.assertEqual(mhiu["grid"]["width"], 4)
-        self.assertEqual(mhiu["grid"]["height"], 4)
-        self.assertEqual(mhiu["grid"]["cells"], 16)
-        self.assertEqual(mhiu["grid"]["prefix_bytes"], 3)
-        self.assertEqual(mhiu["header"]["bounds"]["min"], [-10.0, -20.0, -30.0])
+        self.assertEqual((mhiu["grid"]["width"], mhiu["grid"]["height"]), (4, 3))
+        self.assertEqual(mhiu["grid"]["filled_rows"], 2)
         self.assertEqual(pamh["type"], "PAMH")
-        self.assertEqual(pamh["grid"]["width"], 3)
-        self.assertEqual(pamh["grid"]["height"], 2)
+        self.assertEqual((pamh["grid"]["width"], pamh["grid"]["height"]), (3, 2))
         self.assertEqual(pamh["grid"]["cells"], 6)
-        self.assertEqual(pamh["grid"]["row_records"], 2)
-        self.assertIn("MHIU", p.stdout)
-        self.assertIn("PAMH", p.stdout)
+        self.assertIn("filled rows", p.stdout)
+        self.assertIn("min>max", p.stdout)
 
     def test_groups_mhiu_continuation_stream(self):
-        grid = b"\x07" * (300 * 300)
-        payload = mhiu_payload(grid, prefix=7)
+        payload = mhiu_payload(300, 1, [(0, 300, [i % 256 for i in range(300)])], pixels=b"\x07" * 90000)
+        self.assertGreater(len(payload), 65536)
         self.add(payload, [payload[:65536], payload[65536:]])
         self.finish()
 
@@ -115,10 +174,10 @@ class GamedataMapsTest(unittest.TestCase):
         mhiu = data["payloads"][0]
         self.assertEqual(mhiu["chunks"], 2)
         self.assertEqual(mhiu["grid"]["width"], 300)
-        self.assertEqual(mhiu["grid"]["height"], 300)
+        self.assertEqual(mhiu["grid"]["height"], 1)
 
     def test_complete_64k_map_leaves_the_next_stream_alone(self):
-        payload = mhiu_payload(b"\x07" * (255 * 255), prefix=65536 - 44 - 255 * 255)
+        payload = mhiu_payload(255, 1, [(0, 255, [7] * 255)], pixels=b"\x00" * 65229)
         self.assertEqual(len(payload), 65536)
         self.add(payload)
         self.add(b"unrelated resource")
@@ -129,15 +188,6 @@ class GamedataMapsTest(unittest.TestCase):
         row, = data["payloads"]
         self.assertEqual((row["size"], row["chunks"]), (65536, 1))
         self.assertEqual(row["grid"]["width"], 255)
-
-    def test_rejects_nonzero_prefix(self):
-        self.add(mhiu_payload(bytes(range(1, 17)), prefix=3, prefix_byte=1))
-        self.finish()
-
-        p, data = self.run_tool()
-        self.assertEqual(p.returncode, 1)
-        self.assertIn("square grid", p.stderr + p.stdout)
-        self.assertIsNone(data)
 
 
 if __name__ == "__main__":

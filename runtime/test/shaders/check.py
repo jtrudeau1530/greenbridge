@@ -75,15 +75,17 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
-WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2")
+WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is.
-WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap")
+WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
             ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
+            # SHADER-90: ds_permute_b32, the forward (scatter) permute; unwritten lane 0, EXEC gates the destination
+            ("cs_w32_permute", [218, 29, 8, 211, 0, 15, 99, 15]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
@@ -101,12 +103,26 @@ FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
                                                  0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE])]
+# cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
+USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
+USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
+USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_cvt_f32_sat.asm (#300): s4 is a binary32 input, out[0] = v_cvt_u32_f32, out[1] = v_cvt_i32_f32 (truncate,
+# saturate, NaN -> 0). One dispatch per input through VKC_SGPRS; the inputs of tests/semantic/test_float_to_int.py.
+CVT_F32_SAT_CASES = (
+    (0x00000000, 0, 0), (0x80000000, 0, 0), (0x00000001, 0, 0), (0x3FC00000, 1, 1), (0xBFC00000, 0, 0xFFFFFFFF),
+    (0x4EFFFFFF, 0x7FFFFF80, 0x7FFFFF80), (0x4F000000, 0x80000000, 0x7FFFFFFF), (0x4F7FFFFF, 0xFFFFFF00, 0x7FFFFFFF),
+    (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
+    (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
+    (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
               ("cs_w64x_readfirstlane", [140, 140, 163, 132, 100, 105, 133, 48]),
               ("cs_w64x_bpermute", [36, 316, 253, 218, 435, 225, 0, 442]),
+              # SHADER-90: ds_permute_b32 on each wave32 half; unwritten lane 0, EXEC gates the destination
+              ("cs_w64x_permute", [218, 442, 435, 239, 0, 99, 239, 232]),
               ("cs_w64x_branch", [0, 0, 0, 0, 5, 5, 9, 9]),
               ("cs_w64x_mask_reuse", [8, 40, 8, 40, 2, 20, 10, 64]),
               ("cs_w64x_mask_reuse2", [10, 20, 8, 8, 5, 2, 132, 131]),
@@ -126,6 +142,7 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops6": (0xf800ffff, 0x01000010, 0x00800800, 0x8000fff0),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
+              "ps_f32_mods": (0xc0256a01, 0x3f800000, 0x41e00000, 0x3fc00000),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
               "ps_med3_mods": (0x3f800000, 0x40400000, 0x40c00000, 0x3f400000),
@@ -146,12 +163,11 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_uniform_branch"))
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_uniform_branch",
-                      "ps_wqm"))
+# One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
+# the standalone run. Keep every pixel fixture in this tuple.
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
+                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
 
@@ -282,16 +298,19 @@ def narrow_subgroup_skip(out):
     return None
 
 
-def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False):
+def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
+                 env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
-    narrower than 32 lanes (needs_32_lanes), or a failure diagnostic."""
+    narrower than 32 lanes (needs_32_lanes), or a failure diagnostic. `env` adds variables for vk_compute_test
+    (VKC_SGPRS)."""
     shader = os.path.join(spirv, name + ".spv")
     args = []
     if require_wave64:
         if not os.path.isfile(shader):
             return f"missing {name}.spv"
         args.append("--require-wave64")
-    code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args)
+    extra = {"env": dict(os.environ, **env)} if env else {}
+    code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args, **extra)
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
     if needs_32_lanes and (skip := narrow_subgroup_skip(out)):
@@ -312,6 +331,17 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         if m and m.group(1) == "0":
             return ""
     return failure(code, out, 2)
+
+
+def cvt_f32_sat_test(tools, spirv):
+    """cs_cvt_f32_sat once per input of CVT_F32_SAT_CASES: an empty string when every pair of words is exact."""
+    wrong = []
+    for bits, unsigned, signed in CVT_F32_SAT_CASES:
+        problem = compute_test(tools, spirv, "cs_cvt_f32_sat", "1", "dump", expected_words=[unsigned, signed],
+                               env={"VKC_SGPRS": f"{bits:#010x}"})
+        if problem:
+            wrong.append(f"{bits:#010x}: {problem}")
+    return f"{len(wrong)} of {len(CVT_F32_SAT_CASES)} inputs wrong, first {wrong[0]}" if wrong else ""
 
 
 def mesh_w64x_test(tools, spirv, name):
@@ -509,7 +539,6 @@ def pixel_test(tools, spirv, name):
         return f"missing {name}.spv"
     if name == "ps_texoff":
         return texoff_test(tools, spirv, name)
-    px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch") else "<4I")
     px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I")
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)
@@ -606,6 +635,9 @@ def main():
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
+    results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
+                                                  expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
+    results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
