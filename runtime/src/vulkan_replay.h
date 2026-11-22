@@ -23,6 +23,7 @@
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
+#include "depth24.h"
 
 #include <vulkan/vulkan.h>
 
@@ -60,6 +61,9 @@ struct ResourceBinding {
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
     bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
+    // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
+    // (depth24.h) and clears quantise to 24 bits.
+    bool depth24_as_float = false;
 };
 
 struct VulkanAccess {
@@ -585,6 +589,10 @@ struct ReplayFunctions {
     PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
+    // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
+    // for a job while the list is checked, `depth24_run` records its dispatch. Without them such a copy is unsupported.
+    std::function<bool(Depth24Job&)> depth24_prepare;
+    std::function<void(VkCommandBuffer, const Depth24Job&)> depth24_run;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
 };
 
@@ -614,6 +622,8 @@ struct Prepared {
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
+    bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
+    Depth24Job depth24;
 };
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
@@ -1146,6 +1156,26 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.buffer_copies.push_back({buffer_copy->src_offset, buffer_copy->dst_offset, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
+                // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
+                const bool upload = texture_copy->src.footprint;
+                const ResourceBinding& image = upload ? p.binding : p.source;
+                if (result == ReplayResult::success && image.depth24_as_float && !p.buffer_image_copies.empty() &&
+                    p.buffer_image_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) {
+                    const VkBufferImageCopy& region = p.buffer_image_copies[0];
+                    const ResourceBinding& buffer = upload ? p.source : p.binding;
+                    Depth24Job& job = p.depth24;
+                    job.to_float = upload;
+                    job.app = buffer.buffer;
+                    job.app_offset = region.bufferOffset;
+                    job.app_size = buffer.size;
+                    job.width = region.imageExtent.width;
+                    job.height = region.imageExtent.height;
+                    job.slices = region.imageExtent.depth;
+                    job.app_row_words = region.bufferRowLength ? region.bufferRowLength : job.width;
+                    job.app_slice_words = job.app_row_words * (region.bufferImageHeight ? region.bufferImageHeight : job.height);
+                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job)) return ReplayResult::unsupported;
+                    p.has_depth24 = true;
+                }
             } else {
                 result = detail::prepare_resource_copy(p);
             }
@@ -1330,7 +1360,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            const VkClearDepthStencilValue value{depth_clear->depth, depth_clear->stencil};
+            const float depth = p.binding.depth24_as_float ? depth24_clear_value(depth_clear->depth)  // see depth24.h
+                                                           : depth_clear->depth;
+            const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
@@ -1374,17 +1406,51 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
                               std::uint32_t(p.image_copies.size()), p.image_copies.data());
             } else if (p.binding.image) {
+                VkBuffer source = p.source.buffer;
+                std::vector<VkBufferImageCopy> converted;
+                const std::vector<VkBufferImageCopy>* regions = &p.buffer_image_copies;
+                if (p.has_depth24) {
+                    // The words become floats in the scratch buffer, which the copy then reads (tightly packed).
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    vk.depth24_run(command_buffer, p.depth24);
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    converted = p.buffer_image_copies;
+                    converted[0].bufferOffset = p.depth24.scratch_offset;
+                    converted[0].bufferRowLength = 0;
+                    converted[0].bufferImageHeight = 0;
+                    regions = &converted;
+                    source = p.depth24.scratch;
+                }
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
-                vk.copy_buffer_to_image(command_buffer, p.source.buffer, p.binding.image, dst_layout,
-                                        std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+                vk.copy_buffer_to_image(command_buffer, source, p.binding.image, dst_layout,
+                                        std::uint32_t(regions->size()), regions->data());
             } else {
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
-                vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
-                                        std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+                if (!p.has_depth24) {
+                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
+                                            std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+                } else {
+                    // The floats land tightly packed in the scratch buffer; the pass turns them into the footprint's words.
+                    VkBufferImageCopy region = p.buffer_image_copies[0];
+                    region.bufferOffset = p.depth24.scratch_offset;
+                    region.bufferRowLength = 0;
+                    region.bufferImageHeight = 0;
+                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.depth24.scratch, 1, &region);
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    vk.depth24_run(command_buffer, p.depth24);
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                }
             }
         } else if (std::holds_alternative<ResolveSubresource>(command)) {
             // resolve_source and resolve_dest are the transfer layouts, as copy_source and copy_dest are.

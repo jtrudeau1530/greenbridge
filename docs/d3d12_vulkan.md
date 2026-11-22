@@ -167,6 +167,21 @@ What is implemented (all of it testable without the game):
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
+  **D24_UNORM_S8_UINT without a native D24** (the Radeon 880M, AMD hardware generally, RADV): the layer stores
+  `D32_SFLOAT_S8_UINT` and makes it behave as D24 (`src/depth24.h`, `src/vulkan_depth24.h`, D3D-47). A footprint
+  of the depth plane holds 24-bit UNORM words (bits 0-23; the top byte is unspecified, the PC runtime reads it as
+  nothing and writes 0), the stencil plane is plain bytes. An upload converts the words with a compute pass
+  (`src/depth24_convert.comp`, integer arithmetic) into a scratch buffer of floats, the nearest float to
+  `d / 16777215`, which `vkCmdCopyBufferToImage` then moves into the image; a readback copies the image into the
+  scratch and the pass writes the words (a float is multiplied by 16777215 in float and rounded to nearest, ties to
+  even, which is what WARP and AMD's D3D12 driver do; NaN and negatives are 0, 1 and above the maximum). Every
+  24-bit word makes the round trip unchanged (checked on all 16777216 by `depth24_convert_test`). Texture to
+  texture copies move the floats as they are. `ClearDepthStencilView` stores the float of the quantised value,
+  so the texture reads back as D3D's quantisation of the clear value. The scratch buffers and descriptors live
+  until the submission that used them completes. NVIDIA's D3D12 driver breaks some of those ties the other way
+  (and so does its native D24 in Vulkan); the layer follows WARP and AMD there. Not covered: a depth test or
+  a depth write by the rasteriser works on D32 and may differ from D24 by up to the 24-bit step, and a depth
+  texture sampled in a shader sees the float; only copies, clears and readbacks are bit-exact.
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. `ResolveSubresourceRegion` uses the same
   Vulkan operation for non-integer colour with average mode, taking a source rectangle (or the entire subresource)
@@ -413,15 +428,19 @@ and any validation error fails them.
       `invalid_copy`. A fix needs a staging copy through a buffer. The test prints these as known differences.
     - **`TEXTURE1D`** resources are not supported by the layer (creation, footprints and allocation info refuse
       them), so 1D copies are not compared.
-    - **`D24_UNORM_S8_UINT` on a GPU without it (the Radeon 880M)**: the layer stores `D32_SFLOAT_S8_UINT`, and an
-      upload or readback copies the bits without converting 24-bit unorm to float, so the values a D24 texture
-      holds are not the ones the game wrote. Only the bit-preserving copies (`CopyResource`, box and slice copies
-      between two D24 textures) are checked there, against the layer's own readback of the source; the upload
-      and readback paths are not compared. A fix needs a conversion pass (compute) around such copies.
-    - On a GPU with D24, a readback leaves the unspecified `X8` byte of the depth plane untouched where the PC
-      runtime writes 0; the comparison ignores it.
+    - On a GPU with a native D24, a readback leaves the unspecified `X8` byte of the depth plane untouched where the PC
+      runtime writes 0; the comparison ignores it. Where the layer stores D24 as D32 (see section 3.2) it writes 0.
     A PC driver's copy flushes denormal float depth to zero, so the test keeps its values normal. A
     `LEONIDA_HOST_ADAPTER` that matches no adapter fails the run instead of skipping the comparisons.
+  - D24 against the host (D3D-47, `d3d12_depth24_compare.h`, `depth24_convert_test`): the D24S8 row of the copy test
+    above runs with random 24-bit words on every GPU, the Radeon 880M's `D32_SFLOAT_S8_UINT` fallback included
+    (72 regions, byte for byte, upload, readback and copies). `d3d12_depth24_compare.h` clears 5215 depth values
+    (steps, half steps and the floats around them, powers of two, random) as a whole-view clear of a 4x4 texture
+    (the first 160) and as one rectangle clear per value of a wide texture, with a stencil value, and compares both
+    planes read back. The layer matches WARP and the Radeon host exactly; NVIDIA's host (and the RTX 5070's native
+    D24 through the layer) rounds some ties the other way and agrees with itself only. `depth24_convert_test`
+    runs the compute pass on the GPU for all 16777216 words (to float, and back), 16777216 float bit patterns
+    against `depth24_quantize`, and a pitched copy at an offset.
 - `d3d12_method_variants_test`: each variant against the method it wraps, on the device directly (the proxy's
   slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 12 creation cases (buffers on the
   three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every

@@ -43,6 +43,7 @@ struct Format {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects = 0;
     bool typeless = false;  // created with MUTABLE_FORMAT so typed views can reinterpret it
+    bool d24_as_float = false;  // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU)
 };
 
 // DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. Typeless depth families
@@ -201,6 +202,7 @@ struct DeviceState {
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
             log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
             format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+            format.d24_as_float = true;
         }
         return format;
     }
@@ -534,7 +536,8 @@ public:
         VkImageCreateInfo info = texture_create_info(desc_, format);
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
-        host_transfer_ = cpu_visible() && samples == 1 && device_.host_transfer_format(format.format);
+        // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert.)
+        host_transfer_ = cpu_visible() && samples == 1 && !format.d24_as_float && device_.host_transfer_format(format.format);
         if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
         if (samples > 1 && !device_.samples_usable(info)) {
             log_once("sample count not supported by the GPU for this format:", int(samples));
@@ -550,6 +553,7 @@ public:
         leonida::ResourceBinding binding{};
         binding.image = image_;
         binding.rgba8_typeless = desc_.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        binding.depth24_as_float = format.d24_as_float;
         binding.format = format.format;
         binding.aspects = format.aspects;
         binding.width = std::uint32_t(desc_.Width);
@@ -770,7 +774,7 @@ private:
         staging.size = pitch * r.rows * r.slices;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = staging.size;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;  // storage: D24 depth conversion
         if (vk.vkCreateBuffer(dev, &info, nullptr, &staging.buffer) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
@@ -1014,6 +1018,10 @@ public:
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering);
         if (info.host_image_copy) load_host_image_copy(get_device);
+        // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
+        state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
+            return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        });
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
     }

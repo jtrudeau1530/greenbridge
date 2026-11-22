@@ -8,12 +8,14 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include "vulkan_depth24.h"
 #include "vulkan_replay.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -140,6 +142,21 @@ public:
         bindless_prepare_ = std::move(prepare);
     }
 
+    // D24_UNORM_S8_UINT stored as D32: copies of its depth plane run a compute pass (vulkan_depth24.h). `allocate`
+    // gives the scratch buffers device-local memory. Without this such a copy is refused as unsupported.
+    void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate) {
+        std::lock_guard lock(mutex_);
+        depth24_ = std::make_unique<Depth24Converter>(get, device_, std::move(allocate));
+        if (!depth24_->loaded()) {
+            depth24_.reset();
+            return;
+        }
+        replay_.depth24_prepare = [this](Depth24Job& job) { return depth24_->prepare(job); };
+        replay_.depth24_run = [this](VkCommandBuffer command_buffer, const Depth24Job& job) {
+            depth24_->run(command_buffer, job);
+        };
+    }
+
     VulkanDeviceFunctions vk;
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
@@ -182,6 +199,7 @@ private:
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
+    std::unique_ptr<Depth24Converter> depth24_;
     ReplayFunctions replay_;
 };
 
@@ -256,6 +274,10 @@ public:
             std::lock_guard lock(context_.submit_mutex());
             vk.vkQueueWaitIdle(queue_);
         }
+        if (progress_) {
+            std::lock_guard lock(context_.mutex_);
+            if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
+        }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
     }
@@ -269,6 +291,7 @@ public:
     // the layout tracker as it was. Pending Wait()s are attached to this submission.
     ReplayResult execute(std::span<const CommandList* const> lists) {
         std::lock_guard lock(context_.mutex_);
+        if (context_.depth24_) context_.depth24_->collect();
         std::vector<PreparedList> prepared(lists.size());
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         for (std::size_t i = 0; i < lists.size(); ++i) {
@@ -295,7 +318,9 @@ public:
         context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                                          0, 1, &host, 0, nullptr, 0, nullptr);
         context_.vk.vkEndCommandBuffer(command_buffer);
-        return submit(command_buffer, VK_NULL_HANDLE, 0) ? ReplayResult::success : ReplayResult::unsupported;
+        const bool submitted = submit(command_buffer, VK_NULL_HANDLE, 0);
+        if (context_.depth24_) context_.depth24_->retire(progress_, submitted_);  // what this list's copies prepared
+        return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
 
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far.

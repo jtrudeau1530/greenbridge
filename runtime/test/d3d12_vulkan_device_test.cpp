@@ -10,6 +10,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
+#include "d3d12_depth24_compare.h"  // D3D-47: D24 clears compared with the host runtime
 
 #include <algorithm>
 #include <array>
@@ -1063,9 +1064,12 @@ int main() {
         EXPECT(allocation_mismatches <= 0);
 
         // D3D-46: copies against the host runtime (d3d12_copy_compare.h).
-        const int copy_mismatches = copycmp::compare_copies(device.p, d.bc, d.depth_format_usable(VK_FORMAT_D24_UNORM_S8_UINT));
+        const int copy_mismatches = copycmp::compare_copies(device.p, d.bc);
         if (copy_mismatches < 0) std::printf("Copies: no host D3D12 device to compare with, skipped\n");
         EXPECT(copy_mismatches <= 0);
+        const int depth24_mismatches = copycmp::compare_depth24(device.p);
+        if (depth24_mismatches < 0) std::printf("D24 clears: no host D3D12 device to compare with, skipped\n");
+        EXPECT(depth24_mismatches <= 0);
         const int tiling_mismatches = compare_tiling(device.p);
         if (tiling_mismatches < 0)
             std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
