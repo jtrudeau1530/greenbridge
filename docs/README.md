@@ -17,8 +17,7 @@ method, scope and caveats. No game data is included.
 
 | Document | Measured content |
 |---|---|
-| [models.md](models.md) | 382,781 models (0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children; the other archives measure 4,686 fragments, 30,343 bone-bound and 126,301,454 triangles, while the `levels.rpf` geometry cells are not independently reproduced; the re-count table is in models.md. |
-| [models.md](models.md) | 382,781 models (2.64 billion triangles, 0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children and 55,417 fragments; the re-count table is in models.md. |
+| [models.md](models.md) | 382,781 models (0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children; the other archives measure 4,686 fragments, 30,343 bone-bound and 126,301,454 triangles, while the `levels.rpf` geometry cells are not independently reproduced (**†**); the re-count table is in models.md. |
 | [character_models.md](character_models.md) | `packs.rpf` character parts at `e293917`: 26,585 rows / 11,335 unique names, 2,865 fragments (all a flat 25-vertex / 32-triangle 5x5 bounds grid at z=0), Lucia's 22 named records and the decoded 13-part export, the `player_story000_00` drawable set, slot-name token counts, texture coverage (184/215), and what is not decoded (fragment children, ped variation, hair, bind pose). |
 | [character_skeleton.md](character_skeleton.md) | Character `.#ft` fragments: the 597-name shared skeleton table (596 `joaat32` hashes), the 597-record instance tree with 580 measured parents, the model-side bone-hash mapping, and the measured vertex joint-index/skin-weight layouts (`tools/skin_streams.py`); the reference TRS is not the bind pose. |
 | [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
