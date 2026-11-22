@@ -176,14 +176,62 @@ def bits_f32(b):
 
 
 def half_to_float(h):
-    return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
+    # Bit-level f16 -> f32 (sign, exponent, fraction; every result is exact in binary32). struct's '<e' is not
+    # used because its NaN result depends on the Python version: before 3.14 it drops the payload and returns
+    # the canonical quiet NaN, from 3.14 it keeps sign and payload (CPython gh-130317). Chosen rule, the one
+    # CI's 3.12 and every pinned expected word use: a NaN half expands to the canonical quiet NaN with its
+    # sign, payload dropped. The binary32 round trip below only widens the bit pattern, which no version changes.
+    h &= 0xFFFF
+    sign = (h >> 15) << 31
+    exp = (h >> 10) & 0x1F
+    frac = h & 0x03FF
+    if exp == 0x1F:
+        bits = sign | (0x7FC00000 if frac else 0x7F800000)     # NaN: canonical quiet, payload dropped; infinity
+    elif exp == 0 and frac:
+        b = frac.bit_length()
+        bits = sign | ((b + 102) << 23) | ((frac << (24 - b)) & 0x7FFFFF)   # subnormal half -> normal f32
+    elif exp == 0:
+        bits = sign                                            # +-0
+    else:
+        bits = sign | ((exp + 112) << 23) | (frac << 13)       # normal half -> f32, exact
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
 
 
 def float_to_half(x):
+    # Bit-level f32 -> f16, round to nearest even, with the same Python-version pin as half_to_float above:
+    # any NaN becomes the canonical quiet NaN with the operand's sign, payload dropped. Rounding runs on the
+    # binary32 bit pattern of x (the interpreter's value model keeps floats rounded to binary32), so the result
+    # cannot change with the Python version: RNE at normal and subnormal midpoints, subnormals kept, overflow
+    # to infinity.
     try:
-        return struct.unpack("<H", struct.pack("<e", x))[0]   # round to nearest even
+        bits = struct.unpack("<I", struct.pack("<f", x))[0]
     except OverflowError:
         return 0x7C00 if x > 0 else 0xFC00
+    sign = bits >> 31
+    exp = (bits >> 23) & 0xFF
+    frac = bits & 0x7FFFFF
+    if exp == 0xFF:
+        return (sign << 15) | (0x7E00 if frac else 0x7C00)     # NaN: canonical quiet, sign kept; infinity
+    e = exp - 127
+    if e < -14:
+        # Subnormal half: value = full * 2**(e - 23), so n = full * 2**(e + 1) rounded to nearest even.
+        full = (0x800000 | frac) if exp else frac
+        drop = -(e + 1)
+        n = full >> drop
+        rem = full & ((1 << drop) - 1)
+        if rem > (1 << (drop - 1)) or (rem == (1 << (drop - 1)) and n & 1):
+            n += 1
+        if n > 0x3FF:                                          # rounds up to the smallest normal
+            return (sign << 15) | 0x0400
+        return (sign << 15) | n
+    m = frac >> 13                                             # keep the top 10 fraction bits, RNE the rest
+    rem = frac & 0x1FFF
+    if rem > 0x1000 or (rem == 0x1000 and m & 1):
+        m += 1
+    e += m >> 10                                               # mantissa overflow bumps the exponent
+    if e > 15:                                                 # overflow, incl. the 65520 RNE tie
+        return (sign << 15) | 0x7C00
+    return (sign << 15) | ((e + 15) << 10) | (m & 0x3FF)
 
 
 def _s32(x):
