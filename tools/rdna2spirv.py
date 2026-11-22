@@ -1539,8 +1539,11 @@ class Gen:
             packed.append(bw)
         words = packed
         if fixed_fmt is not None:
-            # tbuffer: the format is in the instruction, so only that one is decoded.
-            comps = self.decode_format(words, fixed_fmt, fixed=True) if fixed_fmt in self.FORMATS else [self.cu(0)] * 4
+            # MTBUF takes both the format and its identity selectors from the instruction:
+            # X000, XY00, XYZ0 or XYZW. The V# selectors apply only to MUBUF.
+            comps = self.decode_format(words, fixed_fmt, fixed=True)
+            widths = self.FORMATS[fixed_fmt][2]
+            d3 = self.cu(sum((4 + c) << (3 * c) for c in range(len(widths))))
         else:
             comps = self.format_decode_call(fmt, words)
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
