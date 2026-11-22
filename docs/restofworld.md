@@ -72,10 +72,12 @@ pages are a larger upper bound on the page population, not 924 decoded models.
   resources, so this page does not raise that count.
 - **Metadata.** One standalone `0DRP` resource at offset 53,899,280 has version 122 and 16 at +0x20.
   `world_index.py` classifies it as `meta`, not a map: 1 resource, 0 maps, 0 entities. Six `PSIN` streams
-  follow: five complete six-section chains and one partial `LSCH`+`LENM` stream. Their `LRSC` payload
-  is 80 bytes of `0DRP` + 122, with page counts 7, 5, 7, 2 and 2. The `u32` at `PSIN+8` is 257 on four
-  of the six; it is not called a version because it varies and the story report already found it
-  unstable.
+  follow: five complete six-section chains and one partial `LSCH`+`LENM` stream before an unread gap.
+  Joining the standalone resource's continuation stream completes its `0x7a` tables (18 structs, 2 enums,
+  18 blocks), while the five `LRSC` payloads are 80-byte `0DRP` + 122 summary records with zero at
+  `+0x08..+0x0f`, `0xbb`-filled pointer slots and 1-based `root_block` indices 7, 5, 7, 2 and 2 at `+0x10`
+  (within block counts 7, 5, 8, 3 and 2). The `u32` at `PSIN+8` is 257 on four of the six; it is not called
+  a version because it varies and the story report already found it unstable.
 - **Schemas and text.** The three `RBF0` records name `CMovieSubtitleContainer` (2) and
   `VfxTextureAtlasMetadataInfoMgr` (1). The 10 XML streams have the roots
   `CDataFileMgr__ContentChangeSetDef` (8), `CDataFileMgr__ContentDef` (1) and `SSetupData` (1). They are
@@ -107,10 +109,12 @@ pages are a larger upper bound on the page population, not 924 decoded models.
   pages. `world_index.py` classifies all 101 as `meta`, not maps: 101 resources, 0 maps, 0 entities.
   The 400 zero-prefix system pages account for 92.7 MB inflated. Only one page has model-name strings
   (3 `.#dr` names), so this is not a model archive.
-- The three `PSIN` streams are 2 complete chains and 1 stream with no parseable chain. Two complete
-  `LRSC` payloads are present. The 13 XML streams are again content definitions (11 change-set, 1
-  content-def, 1 `SSetupData`); the three text streams are 59,848, 146 and 70 bytes; the three clip
-  streams have the measured `u32 2/3 + 01 01 00 00` header.
+- The three `PSIN` stream starts are 2 single-stream chains and 1 multi-stream container that completes
+  across four contiguous continuation streams (321,992 inflated bytes total), giving 3 complete `LRSC`
+  payloads alongside the 101 standalone `meta` resources (36 single-stream, 65 joined with one continuation
+  stream). The 13 XML streams are again content definitions (11 change-set, 1 content-def, 1 `SSetupData`);
+  the three text streams are 59,848, 146 and 70 bytes; the three clip streams have the measured
+  `u32 2/3 + 01 01 00 00` header.
 - The 19 `9FPR` headers are the outer archive plus 18 nested headers on 4 KiB boundaries. The 9.33 MB
   unread region holds nine `RSC8` headers (version 8001, flags 1, declared size 4,852-13,764, sum
   71,380) between offsets 70,697,336 and 70,877,704, but no `RSC7`. In these nine headers the bytes at
@@ -145,9 +149,11 @@ record: 4-byte tag + big-endian u32 total size (includes the 8-byte record heade
 | `LRSC` | 2,118 | 88 | 88 |
 | `CHKS` | 2,118 | 20 | 20 |
 
-Of the 2,309 containers, 2,118 have all six sections, 38 have `LSCH`+`LENM`, 4 have `LSCH` only and
-149 have no parseable chain. An all-offset scan finds 2,275 `0DRP` occurrences in the inflated set: the
-2,118 `LRSC` payloads plus 157 in page payloads. The tag/length chain is contiguous and ends at `CHKS`,
+Of the 2,309 containers, 2,118 have all six sections in a single stream, 38 have `LSCH`+`LENM`, 4 have
+`LSCH` only and 149 cross a stream boundary before their first section. An all-offset scan finds 2,275
+`0DRP` occurrences in the inflated set, and all 2,275 are `PSIN` `LRSC` records (0 standalone `0x7a`
+resources): 2,118 in single-stream containers, 152 in contiguous multi-stream `PSIN` continuations and 5
+in `LRSC`+`CHKS` stream tails after an unread gap. The tag/length chain is contiguous and ends at `CHKS`,
 which is the same layout measured for `script.rpf`. The `LSNS` payload is high-entropy (5.228-7.990
 bits/byte, median 7.888) and none of the 2,118 payloads decompresses with zlib; its block layout (a block table
 and 16-byte records) is decoded in [psin.md](psin.md#lsns), the record contents are not. No `SCRP`, `YSC`,
@@ -187,7 +193,7 @@ text is recorded as a substring, not as a container.
 | zlib `78 01/5e/9c/da` | +0 | inflates cleanly to the stream end | 2,370 core, 624 story-rest, 2,632 script, 33 core001, 3 licenses |
 | `KB2[a-z]` (Bink 2) | +0 | size u32 +4, width +0x14, height +0x18, valid bounds | 11 core (all `KB2n`), 7 story-rest (all `KB2n`) |
 | `PSIN` | +0 | tag/length chain below EOF, six measured tags | 6 core, 3 story-rest, 2,309 script |
-| `0DRP` | +0x10 or +0 | version 122 at magic+4; count at +0x20 (at +0x10) or +0x0C (at +0) | 1 core, 101 story-rest; plus 5 `LRSC` payloads in core, 2 in story-rest, 2,118 in script |
+| `0DRP` | +0x10 or +0 | version 122 at magic+4; `0x50xxxxxx` pointers + `root_objects` at +0x20 (standalone `+0x10`), or `0xbb` pointer fill + `root_block` at +0x10 (`LRSC` `+0`) | 1 core, 101 story-rest standalone; plus 5 `LRSC` records in core, 3 in story-rest, 2,275 in script |
 | `RBF0` | +0 | printable schema string after the 8-byte header | 3 core |
 | `RSC8` | +0 | version 8001 at +4, flags 1 at +12, declared size below EOF | 0 at stream starts; 9 raw headers in the story-rest unread gap |
 | `RSC7` | +0 | - | 0 everywhere |
@@ -267,6 +273,43 @@ No inflated stream SHA-256 is shared across `core_restofworld`, `story000_restof
 `story000_script`, `script.rpf`, `core_restofworld001` and `core_licenses_data`. The core and story-rest
 Bink sets also have 0 common stored-body SHA-256. These are distinct corpora, not copies at different
 block boundaries.
+
+### Standalone `0DRP`/`0x7a` versus `PSIN` `LRSC` (ASSET-156)
+
+Both placements serialize the same 80-byte (`0x50`-byte) `0DRP` + `u32 122` (`0x7a`) header frame in two
+mutually exclusive forms:
+
+| Frame offset (`magic+`) | Standalone `0x7a` resource (`stream +0x10`, `0x60` B header) | `PSIN` `LRSC` record (`LRSC +0x08`, `88` B section) |
+|---|---|---|
+| prefix (`stream +0x00..+0x0f`) | `8` zero bytes + `0x50000000`-based page-map pointer at `+0x08` | none (`"LRSC"` + big-endian `88` precedes `magic+0x00`) |
+| `+0x00..+0x07` | `"0DRP"` + `u32 122` (`0x7a`) | `"0DRP"` + `u32 122` (`0x7a`) |
+| `+0x08..+0x0f` | `8` zero bytes (`stream +0x18..+0x1f`) | `8` zero bytes (`LRSC` payload `+0x0c` is always `0`) |
+| `+0x10..+0x17` | `u32 root_objects` (`stream +0x20`), `u32 0` | `u32 root_block` (`1 <= root_block <= blocks`), `u32 0` |
+| `+0x18..+0x37` | four `u64` table slots (`+0x28` structs, `+0x30` enums, `+0x38` blocks, `+0x40`): `0` or `0x50000000`-based virtual pointers | `32` bytes of `0xbb` (`0xbbbbbbbbbbbbbbbb` x 4); schemas and blocks live in `LSCH`, `LENM` and `PSIN+0x08` |
+| `+0x38..+0x3f` | four `u16`: `(structs, enums, blocks, unknown_4e)` (`stream +0x48`) | four `u16`: `(structs, enums, blocks, 0)` matching `(len(LSCH), len(LENM), len(block_table), 0)` |
+| `+0x40..+0x47` | `0` or `0x50000000`-based virtual pointer (`stream +0x50`) | `8` bytes of `0xbb` (`0xbbbbbbbbbbbbbbbb`) |
+| `+0x48..+0x4f` | `8` zero bytes (`stream +0x58..+0x5f`) | `8` zero bytes, followed by `CHKS` (`20` bytes) |
+
+`tools/odrp_7a.py` validates both placements, joins contiguous 16-byte-aligned continuation streams when a
+standalone `0x7a` resource or `PSIN` container crosses a stream boundary, and detects unjoined `PSIN` tail
+streams ending with `LRSC` (`88` bytes) + `CHKS` (`20` bytes) after an unread gap. Across the six archives
+in this note plus `script.rpf`, `data.rpf` and `shared_minigame000.rpf`, all 22,235 records validate as
+complete (`0` incomplete):
+
+| Archive | Records | Standalone (`meta` / `map`) | Standalone joined | `PSIN` `LRSC` | `LRSC` joined / `psin_tail` |
+|---|---:|---:|---:|---:|---:|
+| `core_restofworld.rpf` | 6 | 1 (`1` / `0`) | 1 | 5 | 0 / 0 |
+| `story000_restofworld.rpf` | 104 | 101 (`101` / `0`) | 65 | 3 | 1 / 0 |
+| `story000_script.rpf` | 2,275 | 0 | 0 | 2,275 | 152 / 5 |
+| `core_restofworld001.rpf`, `appdata0.rpf`, `core_licenses_data.rpf` | 0 | 0 | 0 | 0 | 0 / 0 |
+| `script.rpf` (cross-check) | 1,012 | 0 | 0 | 1,012 | 3 / 0 |
+| `data.rpf` (cross-check) | 17,978 | 15,768 (`15,768` / `0`) | 159 | 2,210 | 118 / 11 |
+| `shared_minigame000.rpf` (cross-check) | 860 | 787 (`685` / `102`, 20,339 entities) | 13 | 73 | 3 / 0 |
+
+```powershell
+python -I tools/odrp_7a.py <archive.rpf> <work>\odrp.json
+python -I tests/test_odrp_7a.py
+```
 
 ## Readable versus opaque
 
@@ -409,6 +452,67 @@ bindings are reported as unresolved.
 python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 ```
 
+**System-to-graphics model-page join (ASSET-157).** `tools/restofworld_model_join.py` joins model system pages to
+their owning graphics pages directly from an RPF9 archive or a carved stream directory without the encrypted TOC.
+The earlier 37-model figure came from `rpf9dump` at `48557ea`, before `pgDictionary<rmcDrawable>`, optional-pointer
+fragment and zero-radius drawable support (`e293917`; see [models.md](models.md)). Four in-band structural rules
+pair every model resource unambiguously:
+
+1. **Top-level framing and root header.** In an RPF9 data area, every top-level resource starts on a 4,096-byte
+   boundary plus `0x10` (`(offset & 0xFFF) == 0x10`) preceded by 16 zero bytes, with `u64@+0x00 == 0` and a
+   `0x50000000`-based system pointer at `+0x08` (`+0x10..+0x13 != "0DRP"`). Root headers separate into standalone
+   `rmcDrawable`, `fragType` (`fragment`), `pgDictionary<rmcDrawable>` (`drawable_dict`), standalone
+   `pgDictionary<grcTexture>` (`140` in `core_restofworld.rpf`: `115` `1+1`, `25` `1+2`), and `44` other non-model
+   system resources.
+2. **In-band `datResourceMap` page counts.** At `page_map = u64@+0x08 - 0x50000000`, `u32@+0x00 == 0`,
+   `u32@+0x04 == 0`, `u8@+0x08 = system_pages`, `u8@+0x09 = graphics_pages`, `u16@+0x0A == 0`, and `u32@+0x0C == 0`,
+   followed at `+0x10` by `system_pages + graphics_pages` zero-initialised `u64` runtime page-base slots (`924 / 924`
+   in `core_restofworld.rpf`, `1 / 1` in `story000_restofworld.rpf`). When `system_pages > 1`, `page_map` lies in the
+   final system stream after concatenating preceding 64 KiB system streams.
+3. **Contiguous 16-byte-padded runs and 64 KiB blocking.** Each resource owns `system_pages` contiguous zlib streams
+   followed immediately by `graphics_pages` contiguous zlib streams, with `0..15` zero padding bytes at every
+   internal boundary (`924 / 924`). Every non-final system stream (`2 / 2`) and every non-final graphics stream
+   (`96 / 96`) inflates to an exact multiple of 64 KiB (`(size & 0xFFFF) == 0`); the trailing `graphics_pages == 2`
+   continuation stream ranges from `656` to `63,520` bytes.
+4. **Cross-page LOD, vertex-block and meshlet validation.** Across all four LOD slots (`+0x50..+0x68`) of every
+   drawable (`583` 1-LOD, `287` 2-LOD, `25` 3-LOD, `41` 4-LOD), `vb+0x18` (`0x60000000`-based) lands on a `0x42`
+   (`(8, 16)`) or `0x63` (`(12, 6)`) vertex block whose byte span covers `u32@(fvf+0x138) >> 10` vertices, and
+   `geo+0x40` lands on a meshlet index buffer whose cluster count (`countFlags & 0xFFFF` when bone-palette bit
+   `0x40000000` is set, else `countFlags & 0x7FFFFFFF`), 8-bit per-cluster triangle counts (`((packed >> 7) & 0xFF) + 1`),
+   running offsets, packed triangle indices and vertex references all match the system descriptor and reach into the
+   final declared graphics page (`924 / 924`).
+
+| `core_restofworld.rpf` model class | Resources | `1+1` | `1+2` | `2+2` | System streams | Graphics streams | Drawables | Primary-LOD tris | All-LOD tris |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `drawable_dict` (`795` x 1 child, `1` x 13) | 796 | 740 | 56 | 0 | 796 | 852 | 808 | 743,663 | 1,158,313 |
+| Standalone `drawable` | 75 | 58 | 16 | 1 | 76 | 93 | 75 | 312,068 | 369,031 |
+| `fragment` | 53 | 30 | 22 | 1 | 54 | 75 | 53 | 183,865 | 301,456 |
+| **Total joined (`0` unjoined)** | **924** | **828** | **94** | **2** | **926** | **1,020** | **936** | **1,239,596** | **1,828,800** |
+
+The join accounts for both page populations in full:
+
+- **System pages (`926` streams, `924` name-bearing):** all `922` single-system-page resources carry their `.#dr`/`.#ft`
+  name strings in `sys_page0`, while the two `2+2` resources (`1` standalone drawable `[131,072, 3,728]` and `1`
+  fragment `[65,536, 9,680]`) hold root and geometry structures in a nameless 64 KiB-multiple `sys_page0` and place
+  their name strings and `datResourceMap` tails in `sys_page1` (`922 + 2 = 924` name-bearing zero-prefix pages;
+  `936` drawables = `883` `.#dr` + `53` `.#ft`, `849` bone-bound, `75` with an empty embedded texture dictionary).
+- **Graphics pages (`1,020` streams):** all `924` `gfx_page0` streams start with `42 40 00 00`, and the `96`
+  `gfx_page1` continuation streams split into `34` `42 40 00 00` starts plus `62` meshlet-led starts (`924 + 34 = 958`,
+  claiming **958 / 958** `42 40 00 00`-start streams in the archive). All **13 / 13** streams that reach a
+  `42 40 00 00` vertex block after earlier meshlet groups (`8` standalone drawables, `5` fragments) sit inside those
+  `62` meshlet-led `gfx_page1` continuations (`47` `gfx_page1` streams carry a pointed-to `42 40 00 00` block; `49`
+  hold meshlet groups only). Primary-LOD geometry totals (`1,177` geometries, `1,001,667` vertices, `1,239,596`
+  triangles) match [models.md](models.md) to the triangle; all LODs total `2,021` geometries and `1,598,782` vertices.
+- **Other rest-of-world archives:** `story000_restofworld.rpf` joins **1 / 1** model resource (`drawable_dict`, `1+1`,
+  `3` child drawables, `3` geometries, `1,808` vertices, `2,620` triangles, claiming **1 / 1** `42 40 00 00`-start
+  stream); `core_restofworld001.rpf` has `0` model candidates and `0` `42 40 00 00` streams.
+
+```powershell
+python -I tools/restofworld_model_join.py <archive.rpf> <work>\model_join.json
+python -I tools/restofworld_model_join.py <work>\carve\<name> <work>\model_join.csv
+python -I tests/test_restofworld_model_join.py -v
+```
+
 **Component types (full corpus).** `tools/vertex_types.py` (at `1aef69e`, with the running-sum fix to
 `group_edges`) was run over the seven archives that hold target blocks: `data`, `packs`, `levels`, `story000`,
 `core_restofworld`, `shared_minigame000` and `story000_restofworld`. It measures a block only when the
@@ -441,19 +545,39 @@ vertices and 0 on 17.2%; each of bytes 0-2 is constant within a block in 36,544 
 change smoothly over edges (block-weighted median edge/random difference ratio 0.18 to 0.27), as a colour or
 blend weight would. As a packed normal it scores no better than random directions (below).
 
-**Tag `0x21` (slot 2) is still unsolved.** For each block the tool reads 256 sampled triangles and counts the
-vertices whose decoded vector is within `|cos| > 0.8` of the face normal; random directions score 0.2. Of the
-19 candidate decodings (snorm8/unorm8 xyz, snorm10/unorm10 10:10:10, six octahedral 8- and 16-bit variants,
-and each column of a quaternion tangent frame in three packings), the best block-weighted medians are unorm10 xyz at 0.479
-(per archive 0.318 to 0.667) and octahedral unorm8 bytes 0-1 at 0.331. Every other candidate is between 0.13
-and 0.31. Only 12.1% of vertices are unit length as snorm10 and 7.7% as snorm8. The stream is smooth over
-edges (block-weighted medians 0.46 to 0.71 for bytes 0-2), so it varies with the surface, but none of these
-encodings is a plain per-vertex normal.
+**Tag `0x21` (slot 2) is an octahedral normal whose width depends on bit 31.** The face-normal check: for each
+block the tool reads 256 sampled triangles and counts the vertices whose decoded vector is within `|cos| > 0.8`
+of the face normal; random directions score 0.2. None of the 19 fixed decodings scores well over the whole
+corpus (best block-weighted medians: unorm10 xyz 0.479, octahedral unorm8 bytes 0-1 0.331, the rest 0.13 to
+0.31), because the stream mixes two encodings. The mesh shaders show which one each vertex uses (6,285 of the
+9,282 mesh shaders contain the octahedral `v_sub_f32 ..., 1.0, |x|`): after
+`buffer_load_dword` of the vertex word they branch on its sign. With bit 31 set they take x = bits 0-9 and
+y = bits 10-19 (`v_and_b32 0x3ff`, `v_bfe_u32 ..., 10, 10`), map each by `v * 2/1023 - 1`, and unfold the
+octahedron (`z = 1 - |x| - |y|`, the `-z` clamp added back with each sign, then `v_rsq_f32`). With bit 31
+clear they take bytes 0 and 1 (`v_cvt_f32_ubyte0/1`), map each by `v / 127.5 - 1`, and unfold the same way.
+`normal_0x21` in `tools/vertex_types.py` is that decode (candidate `oct_bit31_10_or_8`).
+
+Scored separately on the first streams of two archives (core_restofworld: 120 streams, 143 blocks;
+levels: 200 streams, 187 blocks), each class matches the face normals only under its own branch:
+
+| Vertices | Decode | core_restofworld p25 / median / p90 | levels p25 / median / p90 |
+| --- | --- | --- | --- |
+| bit 31 set | 10-bit octahedral | 0.53 / 0.73 / 0.98 | 0.89 / 1.00 / 1.00 |
+| bit 31 set | 8-bit octahedral | 0.19 / 0.20 / 0.30 | 0.12 / 0.23 / 0.57 |
+| bit 31 clear | 8-bit octahedral | 0.44 / 0.61 / 1.00 | 0.67 / 1.00 / 1.00 |
+| bit 31 clear | 10-bit octahedral | 0.00 / 0.16 / 0.26 | 0.00 / 0.00 / 0.75 |
+| all | both, by bit 31 | 0.53 / 0.63 / 0.96 | 0.89 / 1.00 / 1.00 |
+
+Bit 31 is set on 48,046 of the 60,600 sampled core_restofworld vertices (79.3%). Model axis order is the one
+`+0x6C` gives for positions; the other five axis orders and sign flips of the decoded vector score 0.27 to
+0.36 there. Some core_restofworld blocks score lower under the matching decode than levels blocks do; this
+check does not say why. Not decoded: bits 20-30 of the 10-bit form (they vary
+within 142 of 143 blocks) and bytes 2-3 of the 8-bit form.
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
-core graphics blocks, final-slot widths remain unresolved, and of the component types only `0x21`
-(see above). The stride check
+core graphics blocks, final-slot widths remain unresolved, and of the component types the non-normal
+bits of `0x21` (see above). The stride check
 also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
 "Unread" in the tables above is not a claim that those bytes are empty: in
 `story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and
@@ -467,9 +591,10 @@ The bytes support the existing **RPF9/RAGE family**, not a new container:
   story-rest, 4 in script; most sit on 4 KiB boundaries).
 - Bink 2 video is `KB2n` and is separate from the resource pages; core is video-first, story-rest is
   video plus metadata/pages.
-- `0DRP` version 122 is the metadata/page-directory family. In a standalone stream it is a `0x7a`
-  metadata resource; in a `PSIN` `LRSC` payload it is an 80-byte page-directory record. Neither form
-  carries map-placement structs here.
+- `0DRP` version 122 reuses one 80-byte header frame across two distinct placements: in a standalone
+  stream (`+0x10` after the 16-byte system prefix) it is a `0x7a` metadata resource with `0x50000000`
+  table pointers, while in a `PSIN` `LRSC` section it is an 80-byte root/count summary record with
+  `0xbb`-filled pointer slots. Neither form carries map-placement structs in these six archives.
 - `PSIN` is a sectioned metadata container, not a compiled-script container. The six tags and the
   big-endian length chain are measured; the `LSNS` block layout is decoded, its record contents are not.
 - `RBF0` records carry schema names (movie subtitles, VFX texture-atlas metadata); XML records carry
@@ -539,6 +664,41 @@ child order; it establishes parsing fidelity, not the game's interpretation of f
 Synthetic tests cover the three schemas, unknown fields, symbolic references, duplicate/ambiguous fields,
 chunk boundaries, UTF-16, malformed/DTD input, limits, split carve payloads, missing blocks and the CLI.
 
+## Textures (`ASSET-148`)
+
+The stream-start scan above found zero `DDS`, `TXTR`, `DXT` or `BC` signatures because rest-of-world textures are
+not raw stream-start images. Measured on the 1.0.2.1 package, they live in two places:
+
+1. **Embedded RAGE9 `0x980` texture descriptors inside `zero-prefix` CPU-segment streams** (the same `grcTexture`
+   layout `tools/tex_headers.py` reads in the main archives: `q[k-1] == 0x980`, 256-byte-aligned GPU pointer
+   `0x60000000 + offset` at `q[k]`, `(width, height, depth, byte6, dxgi_format)` at `q[k+4]`, `flags | (mips << 16)`
+   at `q[k+5]`), paired with the following GPU-segment stream chain. `tools/restofworld_index.py` now detects these
+   descriptors inside `zero-prefix` streams (`tex980=`, `dict=`, and summary fields `texture_streams`,
+   `texture_dictionaries`, `texture_headers`):
+
+   | Archive | Texture streams | Standalone `pgDictionary` | Total `0x980` headers | GPU chain fit | Formats and tiling |
+   |---|---:|---:|---:|---:|---|
+   | `core_restofworld.rpf` | 145 | 144 (72×1, 72×2) | 278 | 278 / 278 | 216 tiled (`flags & 0xffff = 0x5`, 1–10 mips: `BC1_UNORM` 146, `BC1_UNORM_SRGB` 31, `BC7_UNORM` 26, `BC5_UNORM` 9, `BC7_UNORM_SRGB` 4) in the 144 dictionaries; 62 linear (`0x0`, 1 mip, `R16G16B16A16_FLOAT`, e.g. `16x4`–`16x10`) in one 576 KiB resource page |
+   | `story000_restofworld.rpf` | 1 | 0 | 51 | 51 / 51 | 51 linear (`0x0`, 1 mip, `R16G16B16A16_FLOAT`, `16x4`–`16x10`) in one 320 KiB resource page |
+   | `core_restofworld001.rpf` | 0 | 0 | 0 | — | textures are in the companion TTPF pool below |
+   | `story000_script.rpf` | 0 | 0 | 0 | — | none |
+
+   All 329 embedded descriptors across these archives have `dtype = 0x980`, `depth = 1`, `byte6 = 1`, and 100% fit
+   within their following GPU-segment stream chain (`data_off + mip0_bytes <= gpu_chain_bytes`).
+
+2. **Companion RDS5/TTPF texture pools** alongside the archives under `pack/core_restofworld*/data/ttdb/` (6 pools,
+   88,795,904 bytes total, **635** 2D textures, already walked and exported by `make_game.py`'s `assets` stage
+   under `ttpf_pack/core_restofworld/` and `ttpf_pack/core_restofworld001/`):
+
+   | Pool | Bytes | Textures | Formats |
+   |---|---:|---:|---|
+   | `pack/core_restofworld/data/ttdb/props/ttdb_props.ttpf` | 35,286,784 | 211 | `BC1_UNORM` 110, `BC1_UNORM_SRGB` 72, `BC7_UNORM_SRGB` 11, `BC7_UNORM` 9, `BC3_UNORM_SRGB` 8, `BC6H_UF16` 1 |
+   | `pack/core_restofworld/data/ttdb/textures_loose.ttpf` | 21,081,856 | 194 | `BC1_UNORM` 89, `BC4_UNORM` 67, `BC7_UNORM` 17, `BC7_UNORM_SRGB` 13, `BC5_UNORM` 5, `BC6H_UF16` 2, `BC3_UNORM_SRGB` 1 |
+   | `pack/core_restofworld/data/ttdb/peds/ttdb_peds.ttpf` | 24,529,408 | 165 | `BC1_UNORM` 67, `BC1_UNORM_SRGB` 46, `BC7_UNORM` 35, `BC5_UNORM` 9, `BC7_UNORM_SRGB` 5, `BC3_UNORM_SRGB` 1, other 2 |
+   | `pack/core_restofworld/data/ttdb/ui/ttdb_ui.ttpf` | 4,729,600 | 43 | `BC1_UNORM` 37, `BC7_UNORM` 6 |
+   | `pack/core_restofworld/data/ttdb/vfx/ttdb_vfx.ttpf` | 3,129,600 | 17 | `BC7_UNORM_SRGB` 5, `BC1_UNORM` 5, `BC5_UNORM` 5, `BC4_UNORM` 1, `BC3_UNORM_SRGB` 1 |
+   | `pack/core_restofworld001/data/ttdb/ui/ttdb_ui.ttpf` | 38,656 | 5 | `BC7_UNORM` 3, `BC3_UNORM` 2 |
+
 ## What a future decoder needs
 
 1. The RPF9 table-of-contents key/schema for names, paths and exact entry boundaries. This project
@@ -546,19 +706,24 @@ chunk boundaries, UTF-16, malformed/DTD input, limits, split carve payloads, mis
 2. A recursive RPF9 walker. The flat carve crosses 10/18/4 embedded archives; a decoder needs their
    spans and TOCs to group pages into resources.
 3. A Bink 2 decoder for the 11 core and 7 story-rest videos (`KB2n`; see `docs/movies.md`).
-4. An `0DRP`/`0x7a` parser that distinguishes a standalone metadata resource from a `PSIN` `LRSC`
-   page-directory record. `docs/world.md` already validates the `0x7a` header and schema tables; this
-   page adds the two placements.
+4. An `0DRP`/`0x7a` parser (`tools/odrp_7a.py`, ASSET-156) now distinguishes and validates standalone
+   `0x7a` metadata/map resources (`0x50000000` table pointers at stream `+0x10`) against `PSIN` `LRSC`
+   root/count summary records (`0xbb`-filled pointer slots at `LRSC+0x08`) across single and
+   continuation-joined streams (see [world.md](world.md) and [psin.md](psin.md)); decoding resource payload
+   fields beyond schema/block layout still needs per-type definitions.
 5. A `PSIN` section walker for `LSCH`, `LENM`, `LSNS`, `LGID`, `LRSC` and `CHKS`. The chain is
    measured; `LSNS` is a block table and 16-byte records ([psin.md](psin.md#lsns)), not zlib. Do not call it
    bytecode without evidence.
-6. A model-page joiner. `rpf9dump` already exports 37 core models; the 924 name-bearing system pages
-   are the larger page population, but grouping them into complete resources needs the missing TOC or
-   a page-graph rule.
+6. Model-page joining is implemented in `tools/restofworld_model_join.py` (and `rpf9dump` at `e293917`):
+   the `+0x08` `datResourceMap` page counts, 64 KiB stream blocking and `0x60000000` buffer validation join
+   all 924 `core_restofworld` model resources (936 drawables across 926 system and 1,020 graphics streams)
+   and the single `story000_restofworld` drawable dictionary (3 drawables) without the TOC. Archive path
+   names and external texture-dictionary links still need the TOC or hash matching.
 7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths;
    decoding vertex values still requires component types, final-stream widths and a way to
-   locate the owning geometry when only a graphics page is available. Texture identification also remains open:
-   the stream-start scan found no DDS, `TXTR`, DXT or BC signature.
+   locate the owning geometry when only a graphics page is available. (Texture identification is
+   resolved above under **Textures (`ASSET-148`)**: embedded `0x980` descriptors in `zero-prefix`
+   CPU-segment streams plus the companion `ttdb/*.ttpf` pools.)
 8. Runtime consumers for the XML content-definition records read by `tools/content_definitions.py`
    (see above). Their roots describe configuration, not UI layout; reference resolution and mapping
    to resources remain unimplemented.

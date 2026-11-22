@@ -23,6 +23,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus as awc  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 
 FIELDS = ("bank", "stream", "duration_s", "channels", "packets", "file")
 
@@ -126,7 +127,7 @@ def main(argv=None) -> int:
             if i % 200 == 0:
                 print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     else:
-        with ProcessPoolExecutor(max_workers=a.jobs) as ex:
+        with ProcessPoolExecutor(max_workers=process_workers(a.jobs)) as ex:
             futures = {ex.submit(export_bank, path, a.out, a.min_seconds, a.max_seconds, bank=bank): bank
                        for path, bank in banks}
             for i, fut in enumerate(as_completed(futures), 1):

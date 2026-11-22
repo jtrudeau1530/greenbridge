@@ -21,10 +21,12 @@ $cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
 $ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
 $cfg = if ($Debug) { "Debug" } else { "RelWithDebInfo" }
 $sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
+# With VULKAN_SDK set, a configure that still finds no Vulkan headers fails instead of dropping the Vulkan D3D12 device.
+$vk = if ($env:VULKAN_SDK) { "-DLEONIDA_REQUIRE_VULKAN=ON" } else { "" }
 
 if ((Test-Path $cmake) -and (Test-Path $ninja)) {
     $body = @"
-"$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl || exit /b 1
+"$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk || exit /b 1
 "$cmake" --build "$out" -j $jobs || exit /b 1
 "@
 } else {
@@ -33,7 +35,7 @@ if ((Test-Path $cmake) -and (Test-Path $ninja)) {
     Write-Warning "VS C++ CMake tools not found: building with cl.exe directly, without the GameInput shim (SDL3). Install the CMake tools component to get it."
     $xtaskqueueDir = Join-Path $root "third_party\xtaskqueue"
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
-    $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }
+    $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }
     $includes = "/I `"$src\src`" /I `"$src\shims`" /I `"$src\shims\xtaskqueue`" /I `"$xtaskqueueDir\Include`" /I `"$xtaskqueueDir\Source\Task`" /I `"$xtaskqueueDir\Source\Common`""
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
     $body = @"
@@ -61,7 +63,9 @@ if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNO
 # Switch to UTF-8 (CP 65001) before invoking CMake/Ninja/cl.exe so non-English MSVC /showIncludes prefixes
 # (e.g. Spanish "Nota: inclusión del archivo:") match Ninja's msvc_deps_prefix instead of being mojibaked in OEM CP.
 $bat = Join-Path $out "_build.cmd"
-"@echo off`r`nchcp 65001 >nul`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body" | Set-Content -Encoding ascii $bat
+# Keep the paths encoded for CP 65001 and start with an ASCII command that cmd.exe can read before switching.
+$batchText = "@echo off`r`nchcp 65001 >nul`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body`r`n"
+[System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
 $p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
 $null = $p.Handle  # keeps the exit code readable after WaitForExit

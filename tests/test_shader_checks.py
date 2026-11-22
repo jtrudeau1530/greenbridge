@@ -35,8 +35,8 @@ TOTAL = (len(check.COMPUTE) + 6 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures and
-         # ps_ssharp
+         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
+         # ps_ssharp and vs_base_ids
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -162,6 +162,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "texture_constant_test", return_value=""),
+                  patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):
@@ -598,7 +599,7 @@ class StoreWordsChecks(unittest.TestCase):
                          {57: 257 + 16, 19: 3, 6: 0xD00D, 39: 239 ^ 0xFF})
         self.assertEqual((volume[44], volume[30]), (244, 230))      # smax with -16 and the missed cmpswap keep theirs
         uint, sint, volume = check.store_words("cs_resinfo")
-        self.assertEqual(uint[:19], [16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD, 115, 2, 5, 5])
+        self.assertEqual(uint[:24], [16, 4, 0, 5, 8, 2, 0, 5, 2, 1, 0, 5, 4, 1, 0xABCD, 115, 2, 5, 5, 119, 0, 0, 0, 5])
         self.assertEqual((sint, volume), ([-2 * i & 0xFFFFFFFF for i in range(64)], [200 + i for i in range(64)]))
 
     def test_expected_words_pass_and_any_other_word_fails(self):
@@ -888,6 +889,16 @@ class SamplerMipChecks(unittest.TestCase):
             self.assertTrue(check.sampler_mismatch(bytes(bad), words, view).startswith("(63,63):"))
         self.assertIn("bytes", check.sampler_mismatch(good[:-16], words, view))
 
+    def test_nan_in_any_sampler_channel_fails(self) -> None:
+        words, view = check.ssharp_words(1), (0, 1)
+        good = self.image(0, 1)
+        self.assertEqual(check.sampler_mismatch(good, words, view), "")
+        for channel in range(4):
+            with self.subTest(channel=channel):
+                bad = bytearray(good)
+                struct.pack_into("<I", bad, len(good) - 16 + 4 * channel, 0x7FC00000)
+                self.assertTrue(check.sampler_mismatch(bytes(bad), words, view).startswith("(63,63):"))
+
     def test_a_wrong_level_or_swapped_uv_fails_where_predicted(self):
         words, view = check.ssharp_words(1), (0, 1)
         self.assertTrue(check.sampler_mismatch(self.image(1, 1), words, view).startswith("(0,0):"))
@@ -901,10 +912,34 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TexelOffsetFormsChecks(unittest.TestCase):
+    """ps_texoff_forms (image_sample_o, image_sample_b_o, image_gather4_l_o): the judgement of a dump."""
+
+    @staticmethod
+    def dump(words):
+        return b"".join(struct.pack("<4I", *words(i % 64, i // 64)) for i in range(64 * 64))
+
+    def test_the_rule_passes_and_both_samples_are_judged(self):
+        good = self.dump(lambda px, py: check.texoff_words(px, py, "ps_texoff_forms"))
+        problem, covered = check.texoff_problem(good, "device: gpu\n", name="ps_texoff_forms")
+        self.assertEqual(problem, "")
+        self.assertIn("image_sample_b_o", covered)
+        self.assertEqual(check.texoff_words(20, 50, "ps_texoff_forms"), (0x62, 0x62, 0x1221, 0x5566))
+
+    def test_a_dropped_or_swapped_offset_fails(self):
+        for label, broken in (("dropped in .y", lambda px, py: (lambda w: (w[0], 0x44, w[2], w[3]))(
+                                  check.texoff_words(px, py, "ps_texoff_forms"))),
+                              ("swapped in .x", lambda px, py: (lambda w: ((py >> 3) | (px >> 3) << 4, *w[1:]))(
+                                  check.texoff_words(px, py, "ps_texoff_forms")))):
+            with self.subTest(label):
+                problem, _ = check.texoff_problem(self.dump(broken), "device: gpu\n", name="ps_texoff_forms")
+                self.assertIn("pixels differ", problem)
+
+
 class PixelTestRegistry(unittest.TestCase):
     def test_pixel_tests_include_every_pixel_fixture(self):
         # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.
-        for name in ("ps_texoff", "ps_wqm", "ps_scc_mask32"):
+        for name in ("ps_texoff", "ps_texoff_forms", "ps_wqm", "ps_scc_mask32"):
             with self.subTest(name=name):
                 self.assertIn(name, check.PIXEL_TESTS)
         self.assertEqual(len(check.PIXEL_TESTS), len(set(check.PIXEL_TESTS)))

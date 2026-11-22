@@ -513,7 +513,10 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                         with open(path, "w", encoding="utf-8") as handle:
                             handle.write(content + "\n")
                 disasm_parts = ("disasm",) if legacy_layout else ("dxbc", "disasm")
-                os.makedirs(os.path.join(shader_root, *disasm_parts))
+                disasm = os.path.join(shader_root, *disasm_parts)
+                os.makedirs(disasm)
+                with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("synthetic listing\n")
                 with mock.patch("sys.version_info", (3, 12, 0)), \
                      mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
                      mock.patch("make_game.tool_available", return_value=True), \
@@ -539,6 +542,19 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
                                         match="about 330 GB is needed")
                 self.assertIn("250 GB free", err)
+
+    def test_preflight_low_space_points_at_run_only_stages(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            with mock.patch("sys.version_info", (3, 12, 0)), \
+                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+                 mock.patch("make_game.tool_available", return_value=True), \
+                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
+                err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
+                                        match="assets stage is optional")
+                self.assertIn("--stages check,shaders,runtime", err)
+                self.assertIn("about 330 GB is needed", err)
 
     def test_ensure_submodule_present_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:

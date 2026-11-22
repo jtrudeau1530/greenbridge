@@ -285,16 +285,21 @@ ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 
 
 def _needs_continuation(b):
-    """True when a 0x7a header's instance table or a system block pointer lies beyond this stream."""
+    """True when a 0x7a header's instance table or a system block extends beyond this stream."""
     if len(b) < 0x50 or b[0x10:0x14] != SIGNATURE or b[0x14] != VERSION:
         return False
-    it = _ptr(_u64(b, 0x38), len(b))
     nbl = _u16(b, 0x4C)
+    if nbl == 0 or nbl > 4096:
+        return False
+    it = _ptr(_u64(b, 0x38), len(b))
     if it is None or it + 16 * nbl > len(b):
         return True
     for i in range(nbl):
-        p = _u64(b, it + 16 * i + 8)
-        if p >> 28 == 5 and (p & 0x0FFFFFFF) >= len(b):
+        o = it + 16 * i
+        size, p = _u32(b, o + 4), _u64(b, o + 8)
+        if size > (1 << 24):
+            return False
+        if p >> 28 == 5 and (p & 0x0FFFFFFF) + size > len(b):
             return True
     return False
 
@@ -371,10 +376,10 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                     if not mt:
                         break
                     try:
-                        more, mused, meof, _ = _inflate_stream(m, nxt, end, max_inflate, keep=True)
+                        more, mused, meof, more_is_meta = _inflate_stream(m, nxt, end, max_inflate, keep=True)
                     except zlib.error:
                         break
-                    if not meof or not more:
+                    if not meof or not more or more_is_meta:
                         break
                     data += more
                     used += mused
@@ -472,6 +477,8 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                     break
                 with open(q, "rb") as f:
                     more = f.read()
+                if more[0x10:0x15] == b"0DRPz":
+                    break
                 b += more
                 consumed.add(q)
                 stats["files"] += 1
