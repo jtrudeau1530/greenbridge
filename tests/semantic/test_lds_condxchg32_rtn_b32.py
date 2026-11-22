@@ -15,6 +15,8 @@ Semantics:
 """
 from __future__ import annotations
 
+import math
+import struct
 import unittest
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -1156,6 +1158,213 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
                 exchanged=True,
             )
             self.assertTrue(flags_unaligned.unaligned_addr)
+
+
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 Single-Precision (binary32) Architectural Constants
+F32_POS_ZERO: int = 0x0000_0000
+F32_NEG_ZERO: int = 0x8000_0000
+F32_POS_INF: int = 0x7F80_0000
+F32_NEG_INF: int = 0xFF80_0000
+F32_CANONICAL_QNAN: int = 0x7FC0_0000
+F32_SIGNALING_NAN: int = 0x7F80_0001
+F32_MIN_SUBNORMAL: int = 0x0000_0001
+F32_MAX_SUBNORMAL: int = 0x007F_FFFF
+F32_MIN_NORMAL: int = 0x0080_0000
+F32_MAX_NORMAL: int = 0x7F7F_FFFF
+
+
+def f32_to_bits(val: float) -> int:
+    """Convert float to IEEE 754 32-bit unsigned integer representation."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Convert IEEE 754 32-bit integer representation to Python float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK_32))[0]
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Check if bits represent an IEEE 754 NaN."""
+    return ((bits & 0x7F80_0000) == 0x7F80_0000) and ((bits & 0x007F_FFFF) != 0)
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Check if bits represent an IEEE 754 subnormal number."""
+    return ((bits & 0x7F80_0000) == 0) and ((bits & 0x007F_FFFF) != 0)
+
+
+class TestIEEE754BoundaryExtremesAndBitwiseLimits(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSModel()
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState(lds=self.lds)
+
+    def test_signed_zeros_are_bitwise_distinct(self) -> None:
+        """+0.0 (0x00000000) and -0.0 (0x80000000) are distinct bitpatterns in LDS atomics."""
+        addr = 0x100
+        self.lds.write_dword(addr, F32_POS_ZERO)
+        self.state.set_vgpr(0, addr)
+
+        # Attempt exchange matching -0.0
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(1),
+            addr=VGPR(0),
+            cmp_val=Immediate(F32_NEG_ZERO),
+            new_val=Immediate(0x1234),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertFalse(swapped)
+        self.assertEqual(old, F32_POS_ZERO)
+        self.assertEqual(mem, F32_POS_ZERO)
+        self.assertEqual(self.lds.read_dword(addr), F32_POS_ZERO)
+
+        # Now attempt exchange matching +0.0
+        instr_match = DSCondxchg32Instruction(
+            dst=VGPR(1),
+            addr=VGPR(0),
+            cmp_val=Immediate(F32_POS_ZERO),
+            new_val=Immediate(F32_NEG_ZERO),
+        )
+        old2, mem2, swapped2 = self.interp.step(instr_match, self.state)
+        self.assertTrue(swapped2)
+        self.assertEqual(old2, F32_POS_ZERO)
+        self.assertEqual(mem2, F32_NEG_ZERO)
+        self.assertEqual(self.lds.read_dword(addr), F32_NEG_ZERO)
+
+    def test_quiet_nan_payload_exact_match(self) -> None:
+        """Quiet NaNs with identical payload match in bitwise comparison."""
+        nan_payload1 = 0x7FC0_1234
+        addr = 0x200
+        self.lds.write_dword(addr, nan_payload1)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(2),
+            addr=VGPR(0),
+            cmp_val=Immediate(nan_payload1),
+            new_val=Immediate(0xCAFE),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, nan_payload1)
+        self.assertEqual(mem, 0xCAFE)
+
+    def test_quiet_nan_differing_payloads_do_not_match(self) -> None:
+        """Quiet NaNs with differing payloads do not match."""
+        nan_payload1 = 0x7FC0_0001
+        nan_payload2 = 0x7FC0_0002
+        addr = 0x240
+        self.lds.write_dword(addr, nan_payload1)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(2),
+            addr=VGPR(0),
+            cmp_val=Immediate(nan_payload2),
+            new_val=Immediate(0x9999),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertFalse(swapped)
+        self.assertEqual(old, nan_payload1)
+
+    def test_signaling_nan_preserved_without_quietening(self) -> None:
+        """Signaling NaNs are not quietened when exchanged through LDS."""
+        addr = 0x300
+        self.lds.write_dword(addr, 0x1111)
+        self.state.set_vgpr(0, addr)
+
+        # Write signaling NaN into memory
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(3),
+            addr=VGPR(0),
+            cmp_val=Immediate(0x1111),
+            new_val=Immediate(F32_SIGNALING_NAN),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(mem, F32_SIGNALING_NAN)
+        self.assertEqual(self.lds.read_dword(addr), F32_SIGNALING_NAN)
+        # MSB of fraction bit 22 is 0 (signaling, not quiet)
+        self.assertEqual(mem & 0x0040_0000, 0)
+
+    def test_positive_and_negative_infinities(self) -> None:
+        """Infinities exchange cleanly and do not compare equal across signs."""
+        addr = 0x400
+        self.lds.write_dword(addr, F32_POS_INF)
+        self.state.set_vgpr(0, addr)
+
+        # -inf should not match +inf
+        instr_neg = DSCondxchg32Instruction(
+            dst=VGPR(4),
+            addr=VGPR(0),
+            cmp_val=Immediate(F32_NEG_INF),
+            new_val=Immediate(0),
+        )
+        old, mem, swapped = self.interp.step(instr_neg, self.state)
+        self.assertFalse(swapped)
+        self.assertEqual(old, F32_POS_INF)
+
+        # +inf matches +inf
+        instr_pos = DSCondxchg32Instruction(
+            dst=VGPR(4),
+            addr=VGPR(0),
+            cmp_val=Immediate(F32_POS_INF),
+            new_val=Immediate(F32_NEG_INF),
+        )
+        old2, mem2, swapped2 = self.interp.step(instr_pos, self.state)
+        self.assertTrue(swapped2)
+        self.assertEqual(old2, F32_POS_INF)
+        self.assertEqual(mem2, F32_NEG_INF)
+
+    def test_subnormals_preserved_no_flush_to_zero(self) -> None:
+        """Subnormal floating point patterns are not flushed to zero."""
+        self.assertTrue(is_f32_subnormal(F32_MIN_SUBNORMAL))
+        self.assertTrue(is_f32_subnormal(F32_MAX_SUBNORMAL))
+
+        addr = 0x500
+        self.lds.write_dword(addr, F32_MIN_SUBNORMAL)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(5),
+            addr=VGPR(0),
+            cmp_val=Immediate(F32_MIN_SUBNORMAL),
+            new_val=Immediate(F32_MAX_SUBNORMAL),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, F32_MIN_SUBNORMAL)
+        self.assertEqual(mem, F32_MAX_SUBNORMAL)
+        self.assertNotEqual(mem, 0)
+
+    def test_integer_extremes_boundary_values(self) -> None:
+        """Check all 32-bit extreme boundary integers."""
+        extremes = [0x0000_0000, 0xFFFF_FFFF, 0x7FFF_FFFF, 0x8000_0000, 0x0000_0001, 0xFFFF_FFFE]
+        addr = 0x600
+        self.state.set_vgpr(0, addr)
+
+        for i in range(len(extremes) - 1):
+            curr_val = extremes[i]
+            next_val = extremes[i + 1]
+            self.lds.write_dword(addr, curr_val)
+
+            instr = DSCondxchg32Instruction(
+                dst=VGPR(6),
+                addr=VGPR(0),
+                cmp_val=Immediate(curr_val),
+                new_val=Immediate(next_val),
+            )
+            old, mem, swapped = self.interp.step(instr, self.state)
+            self.assertTrue(swapped)
+            self.assertEqual(old, curr_val)
+            self.assertEqual(mem, next_val)
+            self.assertEqual(self.lds.read_dword(addr), next_val)
 
 
 if __name__ == "__main__":
