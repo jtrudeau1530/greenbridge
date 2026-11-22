@@ -1095,5 +1095,69 @@ class TestBufferAtomicSubOracle(unittest.TestCase):
         self.assertEqual(self.mem.read_u32(44), 0)
 
 
+class TestBufferAtomicSubBoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and IEEE 754 float pattern handling."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, 50)
+        ret, in_bounds = ref_buffer_atomic_sub(self.mem, desc, soffset=0, vaddr=96, sub_val=8, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 50)
+        self.assertEqual(self.mem.read_u32(96), 42)
+
+        # Offsets 97, 98, 99, 100 all exceed num_records (97 + 4 = 101 > 100)
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_sub(self.mem, desc, soffset=0, vaddr=oob_off, sub_val=10, glc=True)
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_sub(self.mem, desc, soffset=0, vaddr=0, sub_val=1, glc=True)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_integer_extremes_and_overflow(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # INT32_MIN - 1 = INT32_MAX (two's complement wrap)
+        self.mem.write_u32(0, 0x80000000)
+        ret, in_bounds = ref_buffer_atomic_sub(self.mem, desc, soffset=0, vaddr=0, sub_val=1, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x80000000)
+        self.assertEqual(self.mem.read_u32(0), 0x7FFFFFFF)
+
+        # 0 - 0xFFFFFFFF = 1 (wraparound)
+        self.mem.write_u32(4, 0)
+        ret, in_bounds = ref_buffer_atomic_sub(self.mem, desc, soffset=0, vaddr=4, sub_val=0xFFFFFFFF, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.mem.read_u32(4), 1)
+
+    def test_float_and_nan_bit_patterns_preserve_integer_arithmetic(self) -> None:
+        # Buffer atomic sub operates purely on 32-bit bit patterns, even if holding float/NaN bits
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        patterns = [
+            0x7FC00000,  # Single-precision quiet NaN
+            0x7F800001,  # Single-precision signaling NaN
+            0x7F800000,  # Single-precision +Infinity
+            0xFF800000,  # Single-precision -Infinity
+            0x00000001,  # Subnormal / Denormal float
+            0x80000000,  # Negative zero (-0.0)
+        ]
+        addr = 0
+        for pat in patterns:
+            self.mem.write_u32(addr, pat)
+            ret, in_bounds = ref_buffer_atomic_sub(self.mem, desc, soffset=0, vaddr=addr, sub_val=1, glc=True)
+            self.assertTrue(in_bounds)
+            self.assertEqual(ret, pat)
+            self.assertEqual(self.mem.read_u32(addr), (pat - 1) & MASK32)
+            addr += 4
+
+
 if __name__ == "__main__":
     unittest.main()
