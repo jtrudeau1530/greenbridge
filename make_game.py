@@ -22,7 +22,6 @@ Stages, in order (each skips work that is already done, so a stopped build conti
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
 """
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -489,6 +488,7 @@ SHARD_PLAN = "shards.json"   # beside the index parts: the --jobs, mode and tran
 def translator_digest() -> str:
     """SHA-256 over every file directly in tools/: rdna2spirv.py, the modules it imports and the data it reads
     (gfx10_formats.json). Any change there counts, so parts made by other code are never merged with new ones."""
+    import hashlib
     h = hashlib.sha256()
     for name in sorted(os.listdir(TOOLS)):
         path = os.path.join(TOOLS, name)
