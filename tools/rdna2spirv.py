@@ -5373,9 +5373,12 @@ class Gen:
                 out = acc
             self.dst(a[0], out)
         elif op in ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64",
-                    "s_and_b32_mask", "s_or_b32_mask"):
+                    "s_nand_b64", "s_nor_b64", "s_xnor_b64", "s_and_b32_mask", "s_or_b32_mask"):
             k = {"and": "OpBitwiseAnd", "or": "OpBitwiseOr", "xor": "OpBitwiseXor", "andn2": "OpBitwiseAnd",
-                 "orn2": "OpBitwiseOr"}[op.split("_")[1]]
+                 "orn2": "OpBitwiseOr", "nand": "OpBitwiseAnd", "nor": "OpBitwiseOr",
+                 "xnor": "OpBitwiseXor"}[op.split("_")[1]]
+            # s_nand/nor/xnor_b64: D = ~(S0 op S1). A lane's mask value is 0 or ~0, so the NOT is per lane too.
+            inv = op in ("s_nand_b64", "s_nor_b64", "s_xnor_b64")
             if op.endswith("_mask") or \
                     (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
                     self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
@@ -5386,6 +5389,9 @@ class Gen:
                     self.emit(f"{n} = OpNot %uint {y}")
                     y = n
                 self.emit(f"{r} = {k} %uint {x} {y}")
+                if inv:
+                    t, r = r, self.tmp()
+                    self.emit(f"{r} = OpNot %uint {t}")
                 self.mask_dst(a[0], r)
                 self.scc_from_mask(r)
             else:
@@ -5403,6 +5409,10 @@ class Gen:
                 rlo, rhi = self.tmp(), self.tmp()
                 self.emit(f"{rlo} = {k} %uint {xlo} {ylo}")
                 self.emit(f"{rhi} = {k} %uint {xhi} {yhi}")
+                if inv:
+                    (tlo, thi), rlo, rhi = (rlo, rhi), self.tmp(), self.tmp()
+                    self.emit(f"{rlo} = OpNot %uint {tlo}")
+                    self.emit(f"{rhi} = OpNot %uint {thi}")
                 self.dst64_data(a[0], rlo, rhi, op, allow_null=True)
                 orr = self.tmp()
                 self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
