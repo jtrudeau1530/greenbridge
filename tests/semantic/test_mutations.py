@@ -116,7 +116,8 @@ def apply_mutation(path, old, new):
         raw = f.read()
     sep = "\r\n" if "\r\n" in raw else "\n"
     text = raw.replace("\r\n", "\n")
-    assert text.count(old) == 1, f"mutation anchor must occur exactly once: {old!r}"
+    if text.count(old) != 1:
+        raise AssertionError(f"mutation anchor must occur exactly once: {old!r}")
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(text.replace(old, new).replace("\n", sep))
 
