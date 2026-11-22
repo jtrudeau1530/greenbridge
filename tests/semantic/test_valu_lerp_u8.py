@@ -300,6 +300,79 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class PackedByteFlags:
+    """Architectural condition codes and status flags for packed 8-bit operations."""
+    zero: bool
+    all_zero: bool
+    any_zero: bool
+    lane_zero: Tuple[bool, bool, bool, bool]
+    lane_max: Tuple[bool, bool, bool, bool]
+    carry_out: Tuple[bool, bool, bool, bool]
+    round_carry: Tuple[bool, bool, bool, bool]
+    odd_parity: Tuple[bool, bool, bool, bool]
+
+
+def compute_byte_parity(val: int) -> bool:
+    """Return True if 8-bit byte has odd number of set bits."""
+    return bin(val & MASK8).count("1") % 2 == 1
+
+
+def compute_lerp_byte_carry_generation(b0: int, b1: int, r: int) -> Tuple[int, int, int]:
+    """Compute 9-bit intermediate sum, bit 8 carry out, and 8-bit quotient for a byte lane."""
+    sum9 = (b0 & MASK8) + (b1 & MASK8) + (r & 0x01)
+    carry_out = 1 if sum9 >= 256 else 0
+    quotient = (sum9 >> 1) & MASK8
+    return sum9, carry_out, quotient
+
+
+def evaluate_v_lerp_u8_flags(src0: int, src1: int, src2: int, res: int) -> PackedByteFlags:
+    """Evaluate packed byte condition codes, zero states, and carry generation flags."""
+    b0_lanes = unpack_bytes_u32(src0)
+    b1_lanes = unpack_bytes_u32(src1)
+    b2_lanes = unpack_bytes_u32(src2)
+    res_lanes = unpack_bytes_u32(res)
+
+    lane_zero: List[bool] = []
+    lane_max: List[bool] = []
+    carry_out: List[bool] = []
+    round_carry: List[bool] = []
+    odd_parity: List[bool] = []
+
+    for i in range(4):
+        b0 = b0_lanes[i]
+        b1 = b1_lanes[i]
+        r = b2_lanes[i] & 0x01
+        res_b = res_lanes[i]
+
+        sum9, carry, _ = compute_lerp_byte_carry_generation(b0, b1, r)
+
+        lane_zero.append(res_b == 0)
+        lane_max.append(res_b == 0xFF)
+        carry_out.append(bool(carry))
+        round_carry.append(((b0 + b1) % 2 == 1) and (r == 1))
+        odd_parity.append(compute_byte_parity(res_b))
+
+    all_z = all(lane_zero)
+    any_z = any(lane_zero)
+
+    return PackedByteFlags(
+        zero=all_z,
+        all_zero=all_z,
+        any_zero=any_z,
+        lane_zero=(lane_zero[0], lane_zero[1], lane_zero[2], lane_zero[3]),
+        lane_max=(lane_max[0], lane_max[1], lane_max[2], lane_max[3]),
+        carry_out=(carry_out[0], carry_out[1], carry_out[2], carry_out[3]),
+        round_carry=(round_carry[0], round_carry[1], round_carry[2], round_carry[3]),
+        odd_parity=(odd_parity[0], odd_parity[1], odd_parity[2], odd_parity[3]),
+    )
+
+
+
 
 
 
@@ -836,6 +909,88 @@ class TestRegisterAliasing(unittest.TestCase):
         # (50 + 200 + 0) >> 1 = 125 (0x7D)
         self.assertEqual(res2, 0x7D7D7D7D)
         self.assertEqual(state.get_vgpr(0), 0x7D7D7D7D)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_all_zero_flag(self) -> None:
+        res = oracle_v_lerp_u8(0, 0, 0)
+        flags = evaluate_v_lerp_u8_flags(0, 0, 0, res)
+        self.assertTrue(flags.zero)
+        self.assertTrue(flags.all_zero)
+        self.assertTrue(flags.any_zero)
+        self.assertEqual(flags.lane_zero, (True, True, True, True))
+        self.assertEqual(flags.lane_max, (False, False, False, False))
+        self.assertEqual(flags.carry_out, (False, False, False, False))
+
+    def test_partial_lane_zero_flags(self) -> None:
+        # Lane 0 is 0, Lane 1 is 10, Lane 2 is 20, Lane 3 is 30
+        s0 = pack_bytes_u32(0, 20, 40, 60)
+        s1 = pack_bytes_u32(0, 0, 0, 0)
+        res = oracle_v_lerp_u8(s0, s1, 0)
+        flags = evaluate_v_lerp_u8_flags(s0, s1, 0, res)
+
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.all_zero)
+        self.assertTrue(flags.any_zero)
+        self.assertEqual(flags.lane_zero, (True, False, False, False))
+
+    def test_lane_max_flags(self) -> None:
+        s0 = pack_bytes_u32(0xFF, 0xFE, 0xFF, 0x80)
+        s1 = pack_bytes_u32(0xFF, 0xFF, 0xFF, 0x80)
+        s2 = pack_bytes_u32(0x01, 0x01, 0x00, 0x00)
+        # Lane 0: (255+255+1)>>1 = 255 (0xFF) -> lane_max True
+        # Lane 1: (254+255+1)>>1 = 255 (0xFF) -> lane_max True
+        # Lane 2: (255+255+0)>>1 = 255 (0xFF) -> lane_max True
+        # Lane 3: (128+128+0)>>1 = 128 (0x80) -> lane_max False
+        res = oracle_v_lerp_u8(s0, s1, s2)
+        flags = evaluate_v_lerp_u8_flags(s0, s1, s2, res)
+        self.assertEqual(flags.lane_max, (True, True, True, False))
+
+    def test_carry_out_bit8_generation(self) -> None:
+        # Lane 0: 127 + 128 + 0 = 255 (sum < 256 -> carry_out False)
+        # Lane 1: 128 + 128 + 0 = 256 (sum >= 256 -> carry_out True)
+        # Lane 2: 200 + 100 + 0 = 300 (sum >= 256 -> carry_out True)
+        # Lane 3: 255 + 255 + 1 = 511 (sum >= 256 -> carry_out True)
+        s0 = pack_bytes_u32(127, 128, 200, 255)
+        s1 = pack_bytes_u32(128, 128, 100, 255)
+        s2 = pack_bytes_u32(0, 0, 0, 1)
+
+        res = oracle_v_lerp_u8(s0, s1, s2)
+        flags = evaluate_v_lerp_u8_flags(s0, s1, s2, res)
+        self.assertEqual(flags.carry_out, (False, True, True, True))
+
+    def test_round_carry_generation(self) -> None:
+        # Lane 0: 1 + 2 + 1 -> (1+2)=3 is odd, r=1 -> round_carry True, res=(4>>1)=2
+        # Lane 1: 1 + 2 + 0 -> (1+2)=3 is odd, r=0 -> round_carry False, res=(3>>1)=1
+        # Lane 2: 2 + 4 + 1 -> (2+4)=6 is even, r=1 -> round_carry False, res=(7>>1)=3
+        # Lane 3: 2 + 4 + 0 -> (2+4)=6 is even, r=0 -> round_carry False, res=(6>>1)=3
+        s0 = pack_bytes_u32(1, 1, 2, 2)
+        s1 = pack_bytes_u32(2, 2, 4, 4)
+        s2 = pack_bytes_u32(1, 0, 1, 0)
+
+        res = oracle_v_lerp_u8(s0, s1, s2)
+        flags = evaluate_v_lerp_u8_flags(s0, s1, s2, res)
+        self.assertEqual(flags.round_carry, (True, False, False, False))
+
+    def test_odd_parity_per_lane(self) -> None:
+        # Byte values: 0 (0 ones -> even/False), 1 (1 one -> odd/True),
+        # 3 (2 ones -> even/False), 7 (3 ones -> odd/True)
+        res = pack_bytes_u32(0, 1, 3, 7)
+        flags = evaluate_v_lerp_u8_flags(0, 0, 0, res)
+        self.assertEqual(flags.odd_parity, (False, True, False, True))
+
+    def test_compute_lerp_byte_carry_generation_helper(self) -> None:
+        sum9, carry, q = compute_lerp_byte_carry_generation(255, 255, 1)
+        self.assertEqual(sum9, 511)
+        self.assertEqual(carry, 1)
+        self.assertEqual(q, 255)
+
+        sum9_zero, carry_zero, q_zero = compute_lerp_byte_carry_generation(0, 0, 0)
+        self.assertEqual(sum9_zero, 0)
+        self.assertEqual(carry_zero, 0)
+        self.assertEqual(q_zero, 0)
 
 
 if __name__ == "__main__":
