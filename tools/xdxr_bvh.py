@@ -507,10 +507,10 @@ def triangle_test(v, org, d, remap=REMAP_IDENTITY):
     if missed:
         return (INF, 1.0, 0.0, 0.0)
     e = (U, V, W)
-    i_num = e[remap & 3] if remap & 3 < 3 else U          # selector 3 falls back to U, as the public path does
-    j_num = e[(remap >> 2) & 3] if (remap >> 2) & 3 < 3 else U
-    if (i_num < 0 < t_den) or (i_num > 0 > t_den):
-        i_num, j_num = -i_num, -j_num
+    # t_den carries dd[2], so scale i_num/j_num by dd[2] too: i_num / t_den = e_i / (U + V + W),
+    # which is both ray-scale invariant and non-negative even when i_num == 0 and dd[2] < 0.
+    i_num = (e[remap & 3] if remap & 3 < 3 else U) * dd[2]   # selector 3 falls back to U, as the public path does
+    j_num = (e[(remap >> 2) & 3] if (remap >> 2) & 3 < 3 else U) * dd[2]
     return (t_num, t_den, i_num, j_num)
 
 
