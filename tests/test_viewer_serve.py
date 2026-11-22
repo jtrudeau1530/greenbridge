@@ -296,9 +296,86 @@ class HandlerTest(unittest.TestCase):
                 opened.assert_not_called()
 
     def test_the_viewer_page_itself_is_served(self):
-        status, _, body = raw_request(self.port, "/index.html", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 200)
-        self.assertIn(b"<title>viewer</title>", body)
+        # http.server itself folds a leading "//" into "/" before the handler sees the path.
+        for target in ("/index.html", "/", "/?x=1", "/index.html?v=2", "/index.html#pos", "//index.html"):
+            for method in ("GET", "HEAD"):
+                with self.subTest(target=target, method=method):
+                    status, head, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}",
+                                                     method=method)
+                    self.assertEqual(status, 200)
+                    self.assertIn("content-type: text/html", head.lower())
+                    if method == "GET":
+                        self.assertIn(b"<title>viewer</title>", body)
+
+    def test_nothing_else_outside_world_is_served(self):
+        # These reached SimpleHTTPRequestHandler unguarded: on Windows /NUL opened the device (200, empty) and
+        # the stream, trailing-dot and trailing-space forms returned the page or the server's own source.
+        site = Path(self._tmp.name) / "site"
+        (site / "other.txt").write_text("other-bytes", encoding="utf-8")
+        (site / "sub").mkdir(exist_ok=True)
+        (site / "sub" / "index.html").write_text("<title>nested</title>", encoding="utf-8")
+        targets = ("/NUL", "/nul.html", "/CON", "/COM1", "/CONIN%24", "/index.html::$DATA", "/index.html::%24DATA",
+                   "/index.html.", "/index.html%20", "/index.html/", "/INDEX.HTML", "/index%2Ehtml",
+                   "/./index.html", "/sub/../index.html", "/other.txt", "/other.txt::$DATA",
+                   "/sub/", "/sub/index.html", "/../secret.txt", "/%2e%2e/secret.txt", "/..%5csecret.txt",
+                   "/world", "/worldx/ok.bin", "/favicon.ico")
+        with mock.patch("builtins.open", side_effect=AssertionError("a refused path reached open")) as opened:
+            for method in ("GET", "HEAD"):
+                for target in targets:
+                    with self.subTest(method=method, target=target):
+                        status, head, body = raw_request(self.port, target, method=method)
+                        self.assertEqual(status, 404)
+                        self.assertIn("cache-control: no-store", head.lower())
+                        for leaked in (b"<title>viewer", b"<title>nested", b"other-bytes", b"secret", b"world-bytes"):
+                            self.assertNotIn(leaked, body)
+            opened.assert_not_called()
+
+    def test_translate_path_refuses_what_send_head_refuses(self):
+        handler = serve.Handler.__new__(serve.Handler)      # no socket: only the path mapping is under test
+        handler.directory = str(Path(self._tmp.name) / "site")
+        handler.world = None
+        for target in ("/NUL", "/index.html::$DATA", "/index.html.", "/other.txt", "/world/ok.bin"):
+            with self.subTest(target=target):
+                self.assertEqual(handler.translate_path(target), "")
+        self.assertTrue(handler.translate_path("/index.html").endswith("index.html"))
+
+
+class NoWorldHandlerTest(unittest.TestCase):
+    """Without --world the page is still served and /world/ is simply absent (the viewer shows test terrain)."""
+
+    def test_world_paths_are_404_and_the_page_is_served(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            site = Path(tmp) / "site"
+            (site / "world").mkdir(parents=True)
+            (site / "index.html").write_text("<title>viewer</title>", encoding="utf-8")
+            (site / "world" / "world.json").write_text("{}", encoding="utf-8")
+
+            class QuietHandler(serve.Handler):
+                world = None
+
+                def log_message(self, *args):
+                    pass
+
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), functools.partial(QuietHandler, directory=str(site)))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                status, _, body = raw_request(port, "/", host=f"127.0.0.1:{port}")
+                self.assertEqual(status, 200)
+                self.assertIn(b"<title>viewer</title>", body)
+                # A world folder that happens to sit in the viewer folder is not served: /world/ exists only
+                # with --world, behind safe_world_path.
+                for target in ("/world/world.json", "/world/NUL", "/world/world.json::$DATA"):
+                    with self.subTest(target=target):
+                        status, _, body = raw_request(port, target, host=f"127.0.0.1:{port}")
+                        self.assertEqual(status, 404)
+                        self.assertNotIn(b"{}", body)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(5)
 
 
 class WorldArgumentTest(unittest.TestCase):
