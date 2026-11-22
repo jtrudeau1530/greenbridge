@@ -555,9 +555,8 @@ private:
     }
 
     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
-    // swapchain and is retried on the next present. Nothing is published until every piece exists: on any failure
-    // the presenter is left with no swapchain and stale_ set, so the next present tries again, and no image is ever
-    // acquired without its per-image semaphore.
+    // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
+    // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
     bool recreate(bool vsync, bool srgb) {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
@@ -569,25 +568,25 @@ private:
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
-        VkSwapchainKHR old = swapchain_;
-        swapchain_ = VK_NULL_HANDLE;
         if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
-            release(old);
+            release(swapchain_);
+            swapchain_ = VK_NULL_HANDLE;
             vsync_ = vsync;
             swapchain_srgb_ = srgb;
             stale_ = false;
             return true;
         }
-        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-            release(old);
-            return false;
-        }
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if ((caps.supportedUsageFlags & usage) != usage) return false;
 
         std::uint32_t count = 0;
-        vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr);
+        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
+            return false;
         std::vector<VkSurfaceFormatKHR> formats(count);
-        vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data());
-        if (formats.empty()) return false;
+        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data()) != VK_SUCCESS || !count)
+            return false;
+        formats.resize(count);
         // An sRGB source wants an sRGB swapchain (the blit decodes and encodes, which cancel); any other source
         // wants UNORM (the bytes go through as they are). BGRA before RGBA, as the surface lists them.
         VkSurfaceFormatKHR chosen = formats[0];
@@ -612,9 +611,12 @@ private:
                     break;
                 }
         }
-        vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, nullptr);
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
+            return false;
         std::vector<VkPresentModeKHR> modes(count);
-        vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, modes.data());
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, modes.data()) != VK_SUCCESS || !count)
+            return false;
+        modes.resize(count);
         VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;  // always available
         if (!vsync) {
             for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR})
@@ -632,11 +634,7 @@ private:
         info.imageColorSpace = chosen.colorSpace;
         info.imageExtent = caps.currentExtent;
         info.imageArrayLayers = 1;
-        info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (capture_) {
-            if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) return false;
-            info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        }
+        info.imageUsage = usage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         info.preTransform = caps.currentTransform;
         info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -656,6 +654,8 @@ private:
         }
 #endif
         info.clipped = VK_TRUE;
+        const VkSwapchainKHR old = swapchain_;
+        swapchain_ = VK_NULL_HANDLE;
         info.oldSwapchain = old;
         VkSwapchainKHR fresh = VK_NULL_HANDLE;
         const VkResult created = vkCreateSwapchainKHR_(device, &info, nullptr, &fresh);

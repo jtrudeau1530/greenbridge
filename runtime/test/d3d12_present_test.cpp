@@ -106,9 +106,15 @@ PFN_vkQueueSubmit real_submit = nullptr;
 PFN_vkQueuePresentKHR real_present = nullptr;
 PFN_vkCreateSemaphore real_create_semaphore = nullptr;
 PFN_vkDestroySemaphore real_destroy_semaphore = nullptr;
+PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real_surface_formats = nullptr;
+PFN_vkCreateSwapchainKHR real_create_swapchain = nullptr;
 VkResult fail_next_submit = VK_SUCCESS;  // armed: the next vkQueueSubmit returns this and submits nothing
 VkResult next_present = VK_SUCCESS;      // armed: the next present that succeeds reports this instead
 int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore from now fails
+bool fail_surface_formats = false;       // armed: the next surface-format query fails before creation
+bool observe_next_swapchain = false;
+VkSwapchainKHR last_created_swapchain = VK_NULL_HANDLE;
+VkSwapchainKHR observed_old_swapchain = VK_NULL_HANDLE;
 unsigned out_of_date = 0;                // presents the real driver reported out of date
 std::vector<VkSemaphore> binary;         // binary semaphores alive (the device's fences are timeline ones)
 
@@ -151,17 +157,40 @@ VKAPI_ATTR void VKAPI_CALL destroy_semaphore(VkDevice device, VkSemaphore semaph
     real_destroy_semaphore(device, semaphore, allocator);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice physical, VkSurfaceKHR surface,
+                                               std::uint32_t* count, VkSurfaceFormatKHR* formats) {
+    if (fail_surface_formats) {
+        fail_surface_formats = false;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    return real_surface_formats(physical, surface, count, formats);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+                                                const VkAllocationCallbacks* allocator, VkSwapchainKHR* out) {
+    if (observe_next_swapchain) {
+        observed_old_swapchain = info->oldSwapchain;
+        observe_next_swapchain = false;
+    }
+    const VkResult result = real_create_swapchain(device, info, allocator, out);
+    if (result == VK_SUCCESS) last_created_swapchain = *out;
+    return result;
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     const std::string_view n = name;
     if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
     if (n == "vkQueuePresentKHR") return reinterpret_cast<PFN_vkVoidFunction>(queue_present);
     if (n == "vkCreateSemaphore") return reinterpret_cast<PFN_vkVoidFunction>(create_semaphore);
     if (n == "vkDestroySemaphore") return reinterpret_cast<PFN_vkVoidFunction>(destroy_semaphore);
+    if (n == "vkCreateSwapchainKHR") return reinterpret_cast<PFN_vkVoidFunction>(create_swapchain);
     return real_get_device(device, name);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
     if (std::string_view(name) == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    if (std::string_view(name) == "vkGetPhysicalDeviceSurfaceFormatsKHR")
+        return reinterpret_cast<PFN_vkVoidFunction>(surface_formats);
     return real_get_instance(instance, name);
 }
 
@@ -172,6 +201,9 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_present = reinterpret_cast<PFN_vkQueuePresentKHR>(real_get_device(device, "vkQueuePresentKHR"));
     real_create_semaphore = reinterpret_cast<PFN_vkCreateSemaphore>(real_get_device(device, "vkCreateSemaphore"));
     real_destroy_semaphore = reinterpret_cast<PFN_vkDestroySemaphore>(real_get_device(device, "vkDestroySemaphore"));
+    real_surface_formats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
+        instance_proc(instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+    real_create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(real_get_device(device, "vkCreateSwapchainKHR"));
 }
 }  // namespace driver
 
@@ -294,6 +326,8 @@ int main() {
             driver::fail_next_submit = VK_SUCCESS;  // whatever the present did not use
             driver::next_present = VK_SUCCESS;
             driver::fail_semaphore_in = 0;
+            driver::fail_surface_formats = false;
+            driver::observe_next_swapchain = false;
             if (FAILED(presented)) return false;
             return SUCCEEDED(queue->Signal(fence.p, ++signalled));
         };
@@ -324,6 +358,16 @@ int main() {
         EXPECT(frame(0, [] { driver::next_present = VK_SUBOPTIMAL_KHR; }));
         EXPECT(presenter->presented() == before + 1);
         EXPECT(frame(0));
+
+        // A transient surface-format query failure happens before vkCreateSwapchainKHR can retire the old one.
+        // A retry can still use the old swapchain for replacement; before this, its handle was lost on failure.
+        before = presenter->presented();
+        const VkSwapchainKHR old_swapchain = driver::last_created_swapchain;
+        EXPECT(old_swapchain);
+        EXPECT(!frame(1, [] { driver::fail_surface_formats = true; }));
+        EXPECT(presenter->presented() == before);
+        EXPECT(frame(0, [] { driver::observe_next_swapchain = true; }));
+        EXPECT(driver::observed_old_swapchain == old_swapchain);
 
         // 2. A swapchain recreation (here for a vsync change) whose second per-image semaphore cannot be made fails
         //    whole: the half-made semaphores and swapchain go, and a retry at the same vsync makes a complete one
