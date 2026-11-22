@@ -12387,13 +12387,27 @@ def merge_shard_parts(out):
     return merged
 
 
-def assemble_spirv(sa, sv):
-    """Keep the assembled module out of the final path until validation succeeds."""
+def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
+    """Keep the assembled module out of the final path until validation succeeds.
+
+    `assembler="spirv-as"` invokes the external spirv-as binary on `sa` (default);
+    `assembler="python"` encodes `asm_text` (or reads `sa`) directly in memory with
+    tools/spirv_asm.py, avoiding the spirv-as subprocess and temporary .spvasm I/O.
+    """
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
     try:
-        result = subprocess.run(["spirv-as", sa, "-o", str(tmp), "--target-env", "vulkan1.2"],
-                                capture_output=True, text=True)
+        if assembler == "python":
+            import spirv_asm
+            try:
+                text = asm_text if asm_text is not None else Path(sa).read_text(encoding="utf-8")
+                tmp.write_bytes(spirv_asm.assemble(text, target_env="vulkan1.2"))
+                result = subprocess.CompletedProcess(["spirv_asm"], 0, "", "")
+            except (OSError, spirv_asm.SpirvAsmError) as exc:
+                result = subprocess.CompletedProcess(["spirv_asm"], 1, "", str(exc))
+        else:
+            result = subprocess.run(["spirv-as", sa, "-o", str(tmp), "--target-env", "vulkan1.2"],
+                                    capture_output=True, text=True)
         if result.returncode == 0:
             # Offset on non-gather: VK_KHR_maintenance8
             result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
@@ -12440,6 +12454,9 @@ def main():
                          "then merge the index.part*.json files with --merge)")
     ap.add_argument("--no-asm", action="store_true",
                     help="delete each .spvasm once its .spv is written (the text is ~2.7x the binary: 35 GB for the corpus)")
+    ap.add_argument("--assembler", choices=("spirv-as", "python"), default="spirv-as",
+                    help="SPIR-V binary assembler: spirv-as (default, external binary) or python (in-process "
+                         "tools/spirv_asm.py; skips writing .spvasm to disk when combined with --no-asm)")
     ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
     ap.add_argument("--fssm-dir", default=None,
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
@@ -12545,9 +12562,11 @@ def main():
         ok += 1
         sa = os.path.join(a.out, name + ".spvasm")
         sv = os.path.join(a.out, name + ".spv")
-        with open(sa, "w", newline="\n") as f:
-            f.write(asm)
-        r = assemble_spirv(sa, sv)
+        write_asm = not (a.no_asm and a.assembler == "python")
+        if write_asm:
+            with open(sa, "w", newline="\n") as f:
+                f.write(asm)
+        r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler)
         if r.returncode == 0:
             valid += 1
             try:
@@ -12556,6 +12575,9 @@ def main():
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
+            if not write_asm:
+                with open(sa, "w", newline="\n") as f:
+                    f.write(asm)
             drop_stale(name)
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
         if a.no_asm and os.path.exists(sa):
