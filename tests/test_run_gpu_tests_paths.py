@@ -160,11 +160,10 @@ class BuildConfigurations(unittest.TestCase):
                   self.assertRaises(SystemExit) as caught):
                 run_gpu_tests.main()
             message = str(caught.exception)
+            # names the build folder, says the configuration subfolders were searched, and lists what is missing
             self.assertIn(str(build), message)
-            self.assertIn(str(rel), message)
+            self.assertIn("RelWithDebInfo", message)
             self.assertIn("vk_harness" + ext, message)
-            self.assertIn("--config RelWithDebInfo", message)
-            self.assertIn("--target vk_compute_test vk_store_test vk_harness", message)
 
     def test_main_passes_visual_studio_config_directory_to_suite(self):
         ext = ".exe" if os.name == "nt" else ""

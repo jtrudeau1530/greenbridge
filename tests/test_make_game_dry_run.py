@@ -191,7 +191,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
             mock_pipelines.assert_called_once()
 
     def test_skip_assets_preflight_bypasses_dotnet_sdk_and_submodule_checks(self) -> None:
-        with mock.patch("sys.version_info", (3, 11, 0)), \
+        with mock.patch("sys.version_info", (3, 12, 0)), \
                 mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
                 mock.patch.object(make_game, "dotnet_sdk_ok") as mock_dotnet, \
                 mock.patch.object(make_game, "ensure_submodule") as mock_submodule, \
@@ -203,7 +203,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
             mock_submodule.assert_not_called()
 
     def test_skip_assets_preflight_avoids_ffmpeg_requirement_even_when_wav_requested(self) -> None:
-        with mock.patch("sys.version_info", (3, 11, 0)), \
+        with mock.patch("sys.version_info", (3, 12, 0)), \
                 mock.patch.object(make_game, "dotnet_sdk_ok", return_value=True), \
                 mock.patch.object(make_game, "tool_available", return_value=True), \
                 mock.patch("shutil.which", side_effect=lambda cmd: None if cmd == "ffmpeg" else "/bin/ok"), \
@@ -212,7 +212,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
 
     def test_skip_assets_preflight_reduces_disk_space_requirement(self) -> None:
         stderr_buf = io.StringIO()
-        with mock.patch("sys.version_info", (3, 11, 0)), \
+        with mock.patch("sys.version_info", (3, 12, 0)), \
                 mock.patch.object(make_game, "dotnet_sdk_ok", return_value=True), \
                 mock.patch.object(make_game, "ensure_submodule"), \
                 mock.patch.object(make_game, "tool_available", return_value=True), \
@@ -224,7 +224,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 1)
             self.assertIn("330 GB is needed", stderr_buf.getvalue())
 
-        with mock.patch("sys.version_info", (3, 11, 0)), \
+        with mock.patch("sys.version_info", (3, 12, 0)), \
                 mock.patch.object(make_game, "tool_available", return_value=True), \
                 mock.patch("shutil.which", return_value="/bin/ok"), \
                 mock.patch("shutil.disk_usage", return_value=mock.Mock(free=50 * (2**30))):
