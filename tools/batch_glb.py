@@ -17,6 +17,7 @@ import argparse
 import concurrent.futures
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -48,22 +49,44 @@ def _load_png_bytes(tex_path: str, max_size: int = 0) -> tuple[bytes | None, str
     if lower.endswith(".png"):
         try:
             with open(tex_path, "rb") as f:
-                return f.read(), ""
+                data = f.read()
         except OSError as exc:
             return None, str(exc)
+        if not data:
+            return None, "the PNG file is empty"
+        return data, ""
     elif lower.endswith(".dds"):
         try:
-            return dds_png.dds_file_to_png_bytes(tex_path, max_size=max_size), ""
+            data = dds_png.dds_file_to_png_bytes(tex_path, max_size=max_size)
         except Exception as exc:
             return None, f"DDS decode: {exc}"
+        if not data:
+            return None, "DDS decode produced no bytes"
+        return data, ""
     return None, "not a .png or .dds"
 
 
+class TextureCache:
+    """Thread-safe (bytes, reason) per texture path, so the batch decodes a broken DDS once even when two
+    worker threads reach the same file at the same time (the pool runs one model per thread)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[str, tuple[bytes | None, str]] = {}
+
+    def get_or_load(self, path: str, max_size: int = 0) -> tuple[bytes | None, str]:
+        with self._lock:
+            if path not in self._entries:
+                self._entries[path] = _load_png_bytes(path, max_size=max_size)
+            return self._entries[path]
+
+
 def convert_single(
-    args_tuple: tuple[str, str, str, dict[str, str], int, dict[str, tuple[bytes | None, str]]],
+    args_tuple: tuple[str, str, str, dict[str, str], int, TextureCache],
 ) -> tuple[bool, str, str, list[tuple[str, str]]]:
     in_path, out_path, up_axis, tex_index, max_tex_size, tex_cache = args_tuple
     dropped: list[tuple[str, str]] = []
+    dropped_seen: set[str] = set()
     try:
         primitives = glb_writer.parse_obj(in_path, is_path=True, up_axis=up_axis)
         materials: dict[str, dict] = {}
@@ -96,12 +119,9 @@ def convert_single(
                         break
 
                 if found_path:
-                    cached = tex_cache.get(found_path)
-                    if cached is None:
-                        cached = _load_png_bytes(found_path, max_size=max_tex_size)
-                        tex_cache[found_path] = cached      # failures too: decode a broken DDS once
-                    png_bytes, why_not = cached
-                    if why_not:
+                    png_bytes, why_not = tex_cache.get_or_load(found_path, max_size=max_tex_size)
+                    if why_not and found_path not in dropped_seen:
+                        dropped_seen.add(found_path)        # one line per texture per model, not per primitive
                         dropped.append((found_path, why_not))
                     if png_bytes:
                         mat_key = mat_name if mat_name else clean_stem
@@ -134,7 +154,7 @@ def batch_convert(
     ]
 
     tex_index = _build_texture_index(texture_dir)
-    tex_cache: dict[str, tuple[bytes | None, str]] = {}
+    tex_cache = TextureCache()
 
     tasks = [
         (
