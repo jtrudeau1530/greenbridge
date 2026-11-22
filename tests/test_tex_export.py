@@ -222,9 +222,11 @@ def test_unsupported_format_is_reported():
     assert T.export_one(texture(9999, "X", 4, 4, 1), "unused", "unused", {}) == "unsupported format"
 
 
-@pytest.mark.parametrize("fmt,bpe", [(61, 1), (56, 2), (10, 8)])
+@pytest.mark.parametrize("fmt,bpe", [(61, 1), (56, 2), (10, 8), (28, 4)])
 @pytest.mark.parametrize("w,h", [(5, 3), (5, 1), (1, 5)])
-def test_raw_score_prefers_a_smooth_gradient(fmt, bpe, w, h):
+def test_score_prefers_a_smooth_gradient(fmt, bpe, w, h):
+    if fmt in T.PILLOW_OK:
+        pytest.importorskip("PIL")
     pixels = max(w, h)
     values = [i * 240 // (pixels - 1) for i in range(pixels)]
     zigzag = values[::2] + values[1::2][::-1]
@@ -266,3 +268,17 @@ def test_main_writes_the_log_and_honours_limit(eq, tmp_path, monkeypatch, capsys
     monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), carve, str(out), "--limit", "1"])
     T.main()
     assert len(json.loads((out / "export_log.json").read_text(encoding="utf-8"))) == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "x"])
+def test_main_rejects_a_limit_below_one(tmp_path, monkeypatch, capsys, value):
+    # --limit 0 exported every texture (0 read as "no limit") and -1 silently dropped the last one.
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), str(tmp_path), str(out), "--limit", value])
+    with pytest.raises(SystemExit) as e:
+        T.main()
+    assert e.value.code == 2
+    assert "--limit" in capsys.readouterr().err
+    assert not out.exists()

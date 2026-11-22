@@ -342,7 +342,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_success_all_tools_present_and_space_sufficient(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
@@ -354,7 +354,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_aggregates_multiple_missing_tools_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value=None), \
                  mock.patch("make_game.tool_available", return_value=False), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
@@ -386,21 +386,21 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_python_version_check(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 10, 8)), \
+            with mock.patch("sys.version_info", (3, 11, 9)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("os.path.isfile", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 100 * 2**30, 900 * 2**30)):
                 self.assert_fails(make_game.preflight, ["shaders"], tmp_work, wav=False,
-                                  match="Python 3.11 or newer:")
+                                  match="Python 3.12 or newer:")
 
     def test_preflight_wav_without_assets_does_not_require_ffmpeg(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             def mock_which(cmd):
                 return None if cmd == "ffmpeg" else f"/bin/{cmd}"
 
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", side_effect=mock_which), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 100 * 2**30, 900 * 2**30)):
@@ -412,7 +412,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             def mock_which(cmd):
                 return None if cmd == "ffmpeg" else f"/bin/{cmd}"
 
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", side_effect=mock_which), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 100 * 2**30, 900 * 2**30)):
@@ -421,7 +421,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_disk_space_insufficient(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \
@@ -433,7 +433,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
 
     def test_preflight_disk_space_stage_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp_work:
-            with mock.patch("sys.version_info", (3, 11, 0)), \
+            with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None), \

@@ -149,10 +149,57 @@ def test_short_signature():
     assert failures == 0, f"{failures} short-signature check(s) failed"
 
 
+def test_part_payload_outside_container_is_unreadable():
+    # Allow the flags to fit physically, while the declared part extends past EOF.
+    data = bytearray(dxbc([("SFI0", struct.pack("<Q", 0x8000000))]))
+    offset, = struct.unpack_from("<I", data, 32)
+    struct.pack_into("<I", data, offset + 4, 16)
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "bad.dxbc"), "wb") as f:
+            f.write(data)
+        with open(os.path.join(tmp, "valid.dxbc"), "wb") as f:
+            f.write(dxbc([("SFI0", struct.pack("<Q", 0x8000000))]))
+        rows = [{"file": "bad.dxbc", "stage": "ps"}, {"file": "valid.dxbc", "stage": "gs"}]
+        result = F.scan_dxbc(tmp, rows)
+        check(result["unreadable"] == 1, "a DXBC part extending past EOF counts as unreadable")
+        check(result["sfi0"] == {"WAVE_MMA": {"gs": 1}}, "only the valid file contributes feature flags")
+    assert failures == 0, f"{failures} DXBC bounds check(s) failed"
+
+
+def test_bad_shaders_folder_is_one_line():
+    tool = os.path.join(TOOLS, "feature_scan.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        as_file = os.path.join(tmp, "shaders.txt")
+        with open(as_file, "w", encoding="utf-8") as f:
+            f.write("not a folder")
+        no_index = os.path.join(tmp, "no_index")
+        os.makedirs(os.path.join(no_index, "dxbc"))
+        broken = os.path.join(tmp, "broken")
+        os.makedirs(os.path.join(broken, "dxbc"))
+        with open(os.path.join(broken, "dxbc", "index.json"), "w", encoding="utf-8") as f:
+            f.write("[{")
+        not_list = os.path.join(tmp, "not_list")
+        os.makedirs(os.path.join(not_list, "dxbc"))
+        with open(os.path.join(not_list, "dxbc", "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"files": []}, f)
+        out = os.path.join(tmp, "out.json")
+        for src, expect in ((os.path.join(tmp, "missing"), "does not exist"), (as_file, "is not a folder"),
+                            (no_index, "Run the shaders stage"), (broken, "cannot read"),
+                            (not_list, "is not a shader list")):
+            r = subprocess.run([sys.executable, "-I", tool, src, "--out", out], capture_output=True, text=True)
+            check(r.returncode == 2 and expect in r.stderr and "Traceback" not in r.stderr and not r.stdout,
+                  f"{os.path.basename(src)}: exit 2 with one line ({expect!r}), got {r.returncode}: "
+                  f"{r.stderr.strip().splitlines()[-1:] if r.stderr.strip() else ''}")
+        check(not os.path.exists(out), "no --out is written for a bad shaders folder")
+    assert failures == 0, f"{failures} bad-input check(s) failed"
+
+
 if __name__ == "__main__":
     try:
         test_feature_scan()
         test_short_signature()
+        test_part_payload_outside_container_is_unreadable()
+        test_bad_shaders_folder_is_one_line()
     except AssertionError:
         pass
     print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")

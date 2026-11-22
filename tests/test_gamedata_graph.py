@@ -97,6 +97,14 @@ class GamedataGraphTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
 
+    def test_cycle_at_end_of_a_deep_include_chain(self):
+        size = sys.getrecursionlimit() + 50
+        adjacency = {node: [node + 1] for node in range(size - 1)}
+        adjacency[size - 1] = [size - 2]
+        components = gg._strongly_connected(list(range(size)), adjacency)
+        self.assertEqual(len(components), size - 1)
+        self.assertEqual([set(c) for c in components if len(c) > 1], [{size - 2, size - 1}])
+
     def test_carve_graph_counts_cycles_reachability_and_no_leak(self):
         self.add(ALPHA)
         self.add(BETA)

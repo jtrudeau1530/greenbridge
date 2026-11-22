@@ -131,7 +131,26 @@ bool prefer_host_copy(const std::string& dll) {
 
 }  // namespace
 
+namespace {
+bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t& rva) {
+    for (const Module* m : static_cast<Loader*>(ctx)->modules()) {
+        const auto base = reinterpret_cast<uint64_t>(m->base);
+        if (m->base && address >= base && address - base < m->size) {
+            module = m->name;
+            rva = static_cast<uint32_t>(address - base);
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
+    shims::add_module_lookup(this, &lookup_in_loader);
+}
+
 Loader::~Loader() {
+    shims::remove_module_lookup(this);
     for (auto* m : order_) {
         // TLS state must go away before the image and its TLS block are unmapped.
         if (m->tls_index != kNoTlsIndex) {
@@ -592,9 +611,12 @@ void Loader::bind_imports(Module& m) {
             if (!d->ImportAddressTableRVA)
                 throw std::runtime_error(m.name + ": a delay-import descriptor has no address table");
             std::string dll = read_string(m.name, m.base, m.size, d->DllNameRVA, "a delay-imported DLL name");
-            // The name table is optional: without it, entries are read back through the address table itself.
-            bind_thunks(dll, d->ImportNameTableRVA ? d->ImportNameTableRVA : d->ImportAddressTableRVA,
-                        d->ImportAddressTableRVA);
+            // Without a name table the IAT still holds delay thunks, not import names, so there is no symbol to bind
+            // eagerly. Every MSVC delay descriptor and every System32 DLL has one; reject the form instead of reading
+            // thunk addresses as name RVAs.
+            if (!d->ImportNameTableRVA)
+                throw std::runtime_error(m.name + ": a delay-import descriptor has no name table");
+            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA);
         }
     }
 }

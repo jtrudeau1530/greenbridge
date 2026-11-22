@@ -1,6 +1,10 @@
-"""Format checks for the texture mode probe, without addrlib or game files."""
+"""Format checks for the texture mode probe, without addrlib or game files.
+
+    python -I -m pytest tests/test_tex_mode_probe.py
+"""
 import pytest
 
+import json
 from pathlib import Path
 import sys
 
@@ -19,3 +23,13 @@ def test_probe_refuses_formats_without_a_color_scorer(fmt, monkeypatch, capsys, 
         tex_mode_probe.main()
     assert exc.value.code == 2
     assert fmt in capsys.readouterr().err
+
+
+def test_format_prefix_does_not_select_an_unsupported_index_row(monkeypatch, capsys, tmp_path):
+    index = tmp_path / "index.json"
+    rows = [{"fmt_name": "BC10_UNORM", "w": 256, "h": 256, "archive": "synthetic", "gpu": 16}]
+    index.write_text(json.dumps(rows), encoding="utf-8")
+    monkeypatch.setattr(tex_mode_probe, "load", lambda: ({}, {}))
+    monkeypatch.setattr(sys, "argv", ["tex_mode_probe.py", str(index), str(tmp_path), "--fmt", "BC1"])
+    tex_mode_probe.main()
+    assert capsys.readouterr().out == "winners: []\n"

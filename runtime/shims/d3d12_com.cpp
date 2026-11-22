@@ -28,6 +28,14 @@ void stub(const char* method) {
 
 namespace {
 
+// Reports a deliberate simplification once (unlike stub, which reports a method not implemented).
+void note_once(const char* what) {
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::lock_guard lock(mutex);
+    if (seen.insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
+}
+
 const char* name(leonida::ReplayResult result) {
     switch (result) {
     case leonida::ReplayResult::success: return "success";
@@ -204,6 +212,12 @@ public:
         leonida::ResolveRegion region{x, y, std::nullopt};
         if (rect) region.src_rect = leonida::Rect{rect->left, rect->top, rect->right, rect->bottom};
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
+    }
+
+    // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.
+    void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buffer, UINT64 offset, D3D12_PREDICATION_OP op) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        check(list_.set_predication({resource_id(buffer), offset, u(op)}));
     }
 
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,
@@ -472,6 +486,22 @@ public:
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
                          name(last_result_));
+    }
+
+    // Reserved resources are fully backed at creation (docs/d3d12_vulkan.md section 4.2), so tile mappings are not
+    // emulated: every tile keeps its own memory. What that loses is reported once each: two resources mapped to the
+    // same heap tiles do not alias, and a tile unmapped (or remapped) keeps its contents.
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
+                                              const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT,
+                                              const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+                                              D3D12_TILE_MAPPING_FLAGS) override {
+        note_once("ID3D12CommandQueue::UpdateTileMappings ignored: reserved resources are fully backed, mappings are not emulated");
+    }
+
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*,
+                                            const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*,
+                                            D3D12_TILE_MAPPING_FLAGS) override {
+        note_once("ID3D12CommandQueue::CopyTileMappings ignored: reserved resources are fully backed, mappings are not emulated");
     }
 
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {

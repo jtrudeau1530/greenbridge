@@ -95,8 +95,11 @@ keyframe data. The marker is reported as a page marker, not as a known GTA V res
 ```
 +0x00  "MoVE"                  (bytes 4D 6F 56 45)
 +0x04  u32 19                 (all 324)
-+0x14  u32 size hint           (e.g. 852 for an 898-byte stream)
++0x14  u32 32-bit hash         (324 distinct values; not a size)
++0x18  u32 payload size        (184/324 equal len-46; the rest have 5/10/15/20 bytes of padding)
 ```
+
+The header is **46 bytes**.
 
 Stored 330,677 bytes, inflated 1,488,625 bytes. All 324 payloads are distinct. Entropy is 1.67–4.49 bits/byte, so
 the payload is structured, not zlib-compressed. No readable name is stored at the start. The remaining fields are
@@ -162,8 +165,47 @@ describes `PSIN` as PSO metadata, and these bytes do not show that it is animati
 
 The leading u32 is 2 or 3; the next four bytes are constant. Stored 18,168,950 bytes, inflated 32,691,776 bytes.
 1,767 distinct payloads (duplicates up to 10 copies). Entropy 4.03–7.79 bits/byte, so these are packed/quantized
-bitstreams rather than zlib streams. The 24-byte header has five small fields after the type, but their meaning
-is not established; no name is stored in the stream.
+bitstreams rather than zlib streams. The 24-byte header has five small fields after the type; the measured
+version split and the track side are below. No keyframe values are claimed.
+
+### Partial clip decode
+
+Two named clips were followed from their `pack:/...` name-table records to page-0 payloads. The name record
+stores `joaat32(stem)`, a second hash, and two 64-bit `0x50xxxxxx` pointers; the pointer rule is page-0 offset
+when it is below the page-0 size, otherwise a name-table page offset.
+
+| Clip | Name hash | Page-0 stream | Clip record | Duration | Tracks |
+|---|---|---:|---:|---:|---:|
+| `breakout_quick_front` | `0xDC5BEF77` | `0x1D284010` | page0 `0x1F8A0` | 3.2333 s | 10 |
+| `idle` | `0x71C21326` | `0x9F0E0010` | page0 `0xF580` | 6.0000 s | 8 |
+
+The durations are `f32` at record `+0x78` (breakout) and `+0x68` (idle). Track arrays are `0x48`-byte records
+with `type = 0xFFFF0001` and two hashes per record.
+
+Bone masks:
+
+- Breakout: a 63-entry body mask and a 38-entry finger mask.
+- Idle: a 12-entry head mask and the same 38-entry finger mask.
+- The 38-entry mask is byte-identical between the clips and **all 38 hashes resolve** to
+  `SKEL_{L,R}_Finger{00..02,10..13,20..23,30..33,40..43}`.
+- The 63-entry mask maps 25 body/`PH_` names; its other 38 entries are unresolved (likely facial or accessory
+  bones, not assumed).
+
+The 2,064-byte motionmatcher table also re-parses cleanly: 15 names, parent entries, and all 8 record hashes
+resolve.
+
+Header fields measured over the 1,781 streams:
+
+- `+0x04` is always `0x00000101`.
+- Version 3 (1,253 streams): `+0x0C = 0x0113` on 1,235, `+0x14 = 0x0207` on all 1,253.
+- Version 2 (528 streams): `+0x0C = 0x0207` on all 528; `+0x14` is a 32-bit hash.
+- `+0x08` is the leading packed-region length; the first 16-byte `(hash, 0, index, 0)` table follows a short
+  sub-header (for example at `0x2C8`, `0x4C8`, `0x6C8` in one page).
+
+**Still missing:** the page → packed-stream join. None of the 1,781 streams contains any of the 30 known bone
+hashes or the nine tested clip-name hashes, as 32-bit or 64-bit values; only the shared track-type hash
+`0x9A7B6E6D` crosses over. The track records and quantization-like blocks are visible, but the exact component
+count/order/delta coding did not survive a unit-quaternion norm test. No keyframe value is claimed.
 
 ### Tail `RBF0` rig-set manager
 
@@ -290,9 +332,11 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
 ## Readable, compressed and still opaque
 
 - **Readable:** all 273 name tables (2,298 paths), the `0DRP` version/page count, 1,371 type-hash headers,
-  1,781 clip-stream headers, the RBF0 mapping (1,126 rig sets / 6,677 entries / 3,669 rigs), one standalone
-  bone-name list, and three motion matcher streams with embedded bone tables (30-name union; 19 bone hashes
-  present). Some `MoVE` and zero-prefixed pages expose counts and float arrays directly.
+  1,781 clip-stream headers with their version split, two named clip records (durations and 0x48-byte track
+  arrays), the 63/38 and 12/38 bone masks (all 38 finger hashes resolve), the RBF0 mapping (1,126 rig sets /
+  6,677 entries / 3,669 rigs), one standalone bone-name list, and three motion matcher streams with embedded
+  bone tables (30-name union; 19 bone hashes present). Some `MoVE` and zero-prefixed pages expose counts and
+  float arrays directly.
 - **Outer compression:** the only compression this work inverts is the RPF9 zlib framing. Inflating the 130,470
   streams accounts for the 11.59 GB above.
 - **No nested zlib:** in eight sampled zero-prefixed pages, none of the `78 01/5E/9C/DA` byte pairs started a
@@ -302,10 +346,10 @@ high-entropy stream; it is not at a header boundary and is treated as coincidenc
   sampled positions.
   No Oodle signature is known from these bytes; none is guessed.
 - **Still opaque:** high-entropy blocks inside `other` and zero-prefixed pages (4 KiB blocks up to 7.96
-  bits/byte), the 1,781 packed clip streams, the fields of `MoVE` beyond the version and size hint, the 56 empty
-  rig sets, the RBF0 numeric fields, and the rig→skeleton link (0 measured matches). Of the 30 bone names, 19
-  have a confirmed stored hash and 11 do not; the four motionmatcher paths bind to embedded tables, but not to
-  an RBF0 rig.
+  bits/byte), the packed component coding of the 1,781 clip streams, the page → packed-stream join, the
+  fields of `MoVE` beyond the version/hash/size words, the 56 empty rig sets, the RBF0 numeric fields, and
+  the rig→skeleton link (0 measured matches). Of the 30 bone names, 19 have a confirmed stored hash and 11 do
+  not; the four motionmatcher paths bind to embedded tables, but not to an RBF0 rig.
 
 ## Cross-check with the model and XML work
 
@@ -344,8 +388,10 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
 
 - `0DRP` is a page marker with a version, page count and pointers. Its role is inferred from the page layout, not
   decoded, and the marker is not proven to be animation-specific.
-- `MoVE` is named like motion data, but its fields beyond the version and size hint are unmapped.
-- The 2/3 streams are packed bitstreams with a constant four-byte prefix. No clip has been decoded.
+- `MoVE` is named like motion data; the version, 32-bit hash and payload-size words are mapped, the remaining
+  fields are not.
+- The 2/3 streams expose header variants, track arrays and bone masks, but the packed component coding and the
+  page → stream join are not decoded. No keyframe has been decoded.
 - The `RBF0` rig-set/rig/group entries are parsed. The numeric fields, the schema type table and the
   rig→skeleton reference are not; the measured skeleton match is 0.
 - The three motion matcher streams embed bone tables, but whether those define a full skeleton or only the
@@ -368,10 +414,12 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
    the stem (path without `pack:/` and without the final extension). The record stride varies (16 or 32 bytes in
    sampled tables), so do not assume one layout. The recurring `0x98e1750c` needs a meaning before it can be
    used as a type or source id.
-5. **Join rigs to clips, then decode a known clip.** Pick one `.clip` name table entry, follow its pointer into
-   the page, and use the rig entry for its rig identity. The rig→skeleton key still has to come from step 2.
-   The 24-byte header and the packed bitstream are the blocking unknowns. `MoVE` (version 19, size hint at
-   +0x14) is a second, separate format; map its fields only after a known payload decodes.
+5. **Join rigs to clips, then decode a known clip.** Two named clips are already followed to page-0 payloads
+   (durations and track arrays above). The missing link is the **page → packed stream**: none of the 1,781
+   packed streams contains the 30 known bone hashes or the nine tested clip hashes. Map the track records and
+   the 16-byte `(hash, 0, index, 0)` tables first, then test a component count/order/delta coding against a
+   unit-quaternion norm. `MoVE` (version 19, header 46 bytes, hash at `+0x14`, payload size at `+0x18`) is a
+   second, separate format; map its fields only after a known payload decodes.
 6. **Keep the compression boundary explicit.** Outer RPF9 zlib is understood. Do not add a zlib pass inside a
    page without evidence; the sampled pages had no valid nested stream.
 7. **Re-run the model cross-check with the full export.** The current 1,350-model data.rpf manifest has bone
