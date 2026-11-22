@@ -134,8 +134,9 @@ The build records which translator sources produced the shaders. A change to tho
 saved disassembly. Older work folders need one translation after upgrading to record this information.
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
-GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
-on `--jobs` processes (half the CPU threads by default).
+GPU driver, checks that they compile, and saves a pipeline cache to `pipeline_cache.bin` in `--out`; the runtime
+doesn't load that cache yet, so it doesn't speed up the first boot). The shader translation is the longest
+step: it runs on `--jobs` processes (half the CPU threads by default).
 
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.
