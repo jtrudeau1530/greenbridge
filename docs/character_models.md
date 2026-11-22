@@ -166,7 +166,10 @@ untextured base proxy for a reconstruction, not Lucia's body.
 A separate bare female mesh exists only as a **scene monster** in `packs.rpf`:
 `sc_fast_demon_bodyuppergen_fr1_000_m_full` (10,048 v / 13,124 t) and
 `sc_fast_demon_bodylowergen_fr1_000_m_full` (3,717 v / 4,082 t), shader `0x210FBC6A`, with no
-garment parts. It is a monster asset, not a player or ped body.
+garment parts. It is a monster asset, not a player or ped body. The `bodyupper`/`bodylower`
+families confirm the negative: all 18 rows are human male (`cs_farmm`, `cs_mister_mangrove`,
+`u_m_m_farm_monster_man`) or monsters (`sc_*`), none female. The `hc_stripper_delights`,
+`hc_stripper_joh` and `hc_stripper_nine1nine` characters ship heads and eyes only, with no body.
 
 The player and cutscene body is a separate shared **clothed** fragment,
 `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full` (874 v), used by `cs_lucia`, `cs_monalisa`
@@ -177,18 +180,13 @@ silhouette is geometry, not a painted-on atlas.
 
 ## What is not decoded
 
-- **Fragment children.** All 2,865 fragments export as the 25-vertex bounds cube described above.
-  A shared body that is only a child drawable would be invisible to the current export.
-- **Fragment children.** All 2,865 fragments export as the flat 25-vertex / 32-triangle bounds
-  grid described above. A shared body that is only a child drawable would be invisible to the
-  current export.
-- **Fragment children (tested).** A SixNG fragment-child walk (2026-11-21 build) finds **no**
-  child drawables in any of the 2,865 character fragments; every one is the flat 25-vertex /
-  32-triangle grid. The path is alive on world fragments (`bus2_frag_hi`: 14 model structs, 11
-  children, a 650 KB `model_parts.glb`), so the negative is a property of the character files.
-  `ambient_femalebody` is a 596-bone skeleton plus the same 25-vertex grid; it has no skin mesh.
-  A body that exists only as a child drawable is therefore not present in `packs.rpf`'s character
-  fragments.
+- **Fragment children.** A raw child-array walk covers all 2,865 `packs.rpf` fragments: every one
+  has a single drawable and the flat 25-vertex / 32-triangle bounds grid, with **no child arrays**.
+  The four `gmt_mannequin*` fragments have no child arrays either; `ambient_femalebody` is a
+  596-bone skeleton plus the same grid, with no skin mesh. The path is alive on world fragments
+  (`bus2_frag_hi`: 14 model structs, 11 children, a 650 KB `model_parts.glb`), so the negative is
+  a property of the character files. The remaining 50,798 `levels.rpf` fragments are covered by
+  the main-drawable census but were not raw-walked for child arrays; that is the one bounded gap.
 - **A ped-variation table.** `common.rpf` contains `CPedVariationBodyTypeManager`
   (`0x226000`) and `CPedComponentSetManager` (`0x228000`), but neither maps a component variation
   index to a drawable plus texture. The first is height and body-shape presets
