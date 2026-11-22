@@ -627,9 +627,13 @@ public:
         }
         return E_INVALIDARG;
     }
-    HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE, DWORD* cookie) override {
-        if (cookie) *cookie = 0;
-        return E_NOTIMPL;
+    // Microsoft documents only "an HRESULT success or error code" and a cookie for
+    // UnregisterVideoMemoryBudgetChangeNotification. The budget here is recomputed on every QueryVideoMemoryInfo and
+    // never changes by itself, so the event is registered and never signalled.
+    HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return E_INVALIDARG;
+        *cookie = next_budget_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
     }
     void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(DWORD) override {}
 
@@ -698,6 +702,7 @@ private:
         }
     }
 
+    std::atomic<DWORD> next_budget_cookie_{1};
     std::atomic<ULONG> refs_{1};
     IDXGIFactory4* parent_ = nullptr;
     PFN_vkGetInstanceProcAddr gipa_ = nullptr;

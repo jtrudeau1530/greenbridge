@@ -801,6 +801,20 @@ int main() {
             adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, nullptr) != E_INVALIDARG)
             return fail("QueryVideoMemoryInfo invalid args should return E_INVALIDARG");
 
+        // Budget-change notification (Microsoft: IDXGIAdapter3::RegisterVideoMemoryBudgetChangeNotificationEvent
+        // returns a success code and a cookie for UnregisterVideoMemoryBudgetChangeNotification).
+        HANDLE budget_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        DWORD budget_cookie = 0, budget_cookie2 = 0;
+        if (adapter3->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_ev, &budget_cookie) != S_OK ||
+            budget_cookie == 0)
+            return fail("RegisterVideoMemoryBudgetChangeNotificationEvent should succeed with a cookie");
+        if (adapter3->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_ev, &budget_cookie2) != S_OK ||
+            budget_cookie2 == 0 || budget_cookie2 == budget_cookie)
+            return fail("a second budget-change registration should get its own cookie");
+        adapter3->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie);
+        adapter3->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie2);
+        CloseHandle(budget_ev);
+
         adapter3->Release();
         adapter1->Release();
     }
