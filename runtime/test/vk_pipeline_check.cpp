@@ -922,6 +922,12 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(pd, &f2);            // fills every linked struct with what's supported
+    VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+    if (ext_mesh && mesh.meshShader) {
+        VkPhysicalDeviceProperties2 mesh_device_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        mesh_device_props.pNext = &mesh_props;
+        vkGetPhysicalDeviceProperties2(pd, &mesh_device_props);
+    }
     if (ext_mesh) {
         mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = mesh.meshShaderQueries = VK_FALSE;
         mesh.taskShader = VK_FALSE;
@@ -1257,11 +1263,15 @@ int main(int argc, char** argv) {
                 ++done;
                 continue;
             }
-            if (stage == "cs" && meta.lds_bytes > props.limits.maxComputeSharedMemorySize) {
+            uint32_t shared_memory_limit = 0;
+            if (stage == "cs") shared_memory_limit = props.limits.maxComputeSharedMemorySize;
+            else if (stage == "ms") shared_memory_limit = mesh_props.maxMeshSharedMemorySize;
+            if (shared_memory_limit && meta.lds_bytes > shared_memory_limit) {
+                const char* limit_name = stage == "cs" ? "maxComputeSharedMemorySize" : "maxMeshSharedMemorySize";
                 std::lock_guard<std::mutex> g(mu);
                 modules_bad[stage]++;
-                std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds maxComputeSharedMemorySize %u)\n",
-                            name.c_str(), meta.lds_bytes, props.limits.maxComputeSharedMemorySize);
+                std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds %s %u)\n",
+                            name.c_str(), meta.lds_bytes, limit_name, shared_memory_limit);
                 ++done;
                 continue;
             }
