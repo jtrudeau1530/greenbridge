@@ -150,7 +150,7 @@ def main():
     import asm
     import runner
     try:
-        oracle = runner.Oracle()
+        oracle = runner.open_oracle()
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
