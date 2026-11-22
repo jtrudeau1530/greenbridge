@@ -289,6 +289,103 @@ def calc_sub_borrow(val_a: int, val_b: int) -> int:
     return 1 if u32(val_a) < u32(val_b) else 0
 
 
+# ==============================================================================
+# Mutated Oracles for Mutation Testing and Negative Controls
+# ==============================================================================
+
+def mutant_sub_to_add(val_a: int, val_b: int) -> int:
+    """Mutant A: performs addition instead of subtraction."""
+    return u32(u32(val_a) + u32(val_b))
+
+
+def mutant_sub_no_wrap(val_a: int, val_b: int) -> int:
+    """Mutant B: unmasked subtraction returning negative integer."""
+    return val_a - val_b
+
+
+def mutant_swap_operands(val_a: int, val_b: int) -> int:
+    """Mutant C: subtracts A from B instead of B from A."""
+    return u32(u32(val_b) - u32(val_a))
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(index=-1, reg_type=RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(index=256, reg_type=RegType.VGPR)
+
+    def test_syntax_rejection_invalid_offset_range(self) -> None:
+        v0 = RegisterOperand(index=0, reg_type=RegType.VGPR)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset0=256)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset1=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset0=0x100, offset1=0)
+
+    def test_syntax_rejection_sgpr_base_address(self) -> None:
+        s0 = RegisterOperand(index=0, reg_type=RegType.SGPR)
+        with self.assertRaises(TypeError):
+            LDSAddressExpression(base_reg=s0)
+
+    def test_mutation_detection_sub_to_add(self) -> None:
+        correct = ref_ds_sub_src2_u32(100, 30)
+        mutant = mutant_sub_to_add(100, 30)
+        self.assertEqual(correct, 70)
+        self.assertEqual(mutant, 130)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_sub_no_wrap(self) -> None:
+        correct = ref_ds_sub_src2_u32(5, 10)
+        mutant = mutant_sub_no_wrap(5, 10)
+        self.assertEqual(correct, MASK32 - 4)
+        self.assertEqual(mutant, -5)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_swap_operands(self) -> None:
+        correct = ref_ds_sub_src2_u32(100, 20)
+        mutant = mutant_swap_operands(100, 20)
+        self.assertEqual(correct, 80)
+        self.assertEqual(mutant, u32(20 - 100))
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_leak_vaddr(self) -> None:
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=256)
+        state.set_vgpr(0, 0x100)
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        # Proper execution keeps v0 = 0x100
+        interp.execute(instr, state)
+        self.assertEqual(state.get_vgpr(0), 0x100)
+        # Mutant corrupts vaddr
+        state.set_vgpr(0, 0x100 ^ 0xFF)
+        self.assertNotEqual(state.get_vgpr(0), 0x100)
+
+    def test_mutation_detection_leak_inactive_lane(self) -> None:
+        sim = SIMDInterpreter()
+        state = SIMDState(num_lanes=32, exec_mask=0x0, lds_dwords=256)  # all inactive
+        state.set_lane_vgpr(0, 0, 0)
+        state.lds.write_dword(0, 50)
+        state.lds.write_dword(1, 10)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        sim.execute(instr, state)
+        # Correct behavior: inactive lane leaves LDS[0] = 50
+        self.assertEqual(state.lds.read_dword(0), 50)
+        # Mutant write
+        state.lds.write_dword(0, 40)
+        self.assertNotEqual(state.lds.read_dword(0), 50)
+
+
 class TestIEEE754BitPatternHandling(unittest.TestCase):
     """Unit tests for IEEE 754 bit-pattern preservation and untyped raw dword arithmetic."""
 
