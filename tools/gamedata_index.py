@@ -333,6 +333,9 @@ def main() -> int:
     ap.add_argument("--json", help="write the summary and rows to this JSON")
     a = ap.parse_args()
 
+    if not os.path.exists(a.target):
+        print(f"ERROR: {a.target} does not exist", file=sys.stderr)
+        return 2
     source = None
     try:
         if os.path.isdir(a.target):
@@ -341,6 +344,17 @@ def main() -> int:
             source = ArchiveSource(a.target, a.carve_dir)
         rows = build_rows(source.rows, source)
         summary = summarize(rows, source.summary, a.target)
+    except RuntimeError as e:          # rpf9_carve.py refused the archive; its own message says why
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as e:
+        print(f"ERROR: {e.filename} is missing. Give a carve folder from rpf9_carve.py or an .rpf archive.",
+              file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        where = getattr(e, "filename", None) or a.target
+        print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
+        return 2
     finally:
         if isinstance(source, ArchiveSource):
             source.close()

@@ -59,6 +59,8 @@ def select_candidates(index, disasm_dir, spirv_dir, count=150, loops="none", nam
     """
     if loops not in ("none", "only"):
         raise ValueError("loops must be 'none' or 'only'")
+    if count < 1:       # the check below runs after the first append, so 0 or less still picked one shader
+        raise ValueError("count must be at least 1")
     if names_file:
         with open(names_file, encoding="utf-8") as f:
             return [name for name in f.read().split("\n") if name]
@@ -174,19 +176,32 @@ OpFunctionEnd
     return dst
 
 
+def positive_int(text):
+    """--count, --runs and --timeout: a whole number of at least 1. --runs 0 rendered nothing and reported every
+    shader as "dispatch form failed to run"; --count 0 still ran one shader."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("shaders")
     ap.add_argument("out")
-    ap.add_argument("--count", type=int, default=150)
+    ap.add_argument("--count", type=positive_int, default=150)
     ap.add_argument("--harness", help="path to vk_texture_test (default: the Windows build in the repo)")
     ap.add_argument("--loops", choices=("none", "only"), default="none",
                     help="'only': shaders with backward branches. Use a software driver for those: one that never "
                          "terminates is killed after --timeout seconds, where a real GPU would reset its driver")
-    ap.add_argument("--timeout", type=int, default=60)
+    ap.add_argument("--timeout", type=positive_int, default=60)
     ap.add_argument("--names", help="run exactly the shaders listed in this file (one per line), no selection")
-    ap.add_argument("--runs", type=int, default=1, help="render each form this many times; all must agree")
+    ap.add_argument("--runs", type=positive_int, default=1,
+                    help="render each form this many times; all must agree")
     a = ap.parse_args(argv)
     disasm = os.path.join(a.shaders, "dxbc", "disasm")
     old = os.path.join(a.shaders, "spirv")

@@ -128,6 +128,7 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_med3_mods": (0x3f800000, 0x40400000, 0x40c00000, 0x3f400000),
               "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
+              "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
               "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),
               "ps_f16_med3_mods": (0x41005555, 0x3c005555, 0x41003800, 0xaaaaba00),
@@ -340,6 +341,32 @@ def bindless_test(tools, spirv):
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
     m = re.search(r"(\d+) draws read back, (\d+) bad pixels", out)
     return "" if code == 0 and m and m.group(2) == "0" else failure(code, out, 3)
+
+
+def texture_gradient_a16_test(tools: str, spirv: str) -> str:
+    """Check every pixel of the mixed f32-gradient/a16-coordinate sample."""
+    vs = os.path.join(spirv, "vs_ids.spv")
+    fs = os.path.join(spirv, "ps_texture_grad_a16.spv")
+    with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw,
+                        "0", "92", "c00000", "14500000", "0")
+        if code or not raw.is_file():
+            return failure(code, out, 3)
+        data = raw.read_bytes()
+    if len(data) != 64 * 64 * 16:
+        return "vk_texture_test returned an unexpected pixel count"
+    wrong = 0
+    first = ""
+    for index, pixel in enumerate(struct.iter_unpack("<4f", data)):
+        x, y = index % 64, index // 64
+        want = (32 * (x // 8) / 255, 32 * (y // 8) / 255, 128 / 255, 1.0)
+        if any(not math.isclose(actual, expected, rel_tol=0, abs_tol=1e-6)
+               for actual, expected in zip(pixel, want)):
+            if not wrong:
+                first = f"at ({x},{y}): got {pixel}, expected {want}"
+            wrong += 1
+    return f"{wrong} of 4096 pixels differ; {first}" if wrong else ""
 
 
 def pixels(tools, spirv, name, fmt):
@@ -576,6 +603,7 @@ def main():
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
+    results.append(("ps_texture_grad_a16", texture_gradient_a16_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"

@@ -27,7 +27,7 @@ from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test
 from compute_fixture import compute_header
 from check import (CMPX_CLASS_WORDS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST, Skip,
-                   mesh_v5_test, not_found_message, pick_build_dir, start_failure, texture_mip_test)
+                   mesh_v5_test, not_found_message, pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import WAVE32_LANE_DUMPS, narrow_subgroup_skip   # wave32 lane-mask dumps skip below 32 lanes, as in check.py
 
@@ -426,6 +426,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
+              "ps_texture_grad_a16": "vs_ids.asm",
               "vs_clip": "ps_ops.asm"}
 
 
@@ -715,6 +716,9 @@ def run_suite(a, work: str) -> int:
             problem = texture_mip_test(a.build, spirv_dir)
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
+        elif name == "ps_texture_grad_a16":
+            problem = texture_gradient_a16_test(a.build, spirv_dir)
+            results.append((name, not problem, problem or "4096 RGBA pixels matched"))
         elif name in ("ps_texture_sample", "ps_cube_sample"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)
@@ -781,6 +785,7 @@ def run_suite(a, work: str) -> int:
                 "ps_med3_mods": (0x3F800000, 0x40400000, 0x40C00000, 0x3F400000),
                 "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
+                "ps_f64_mods": (0x40040000, 0x3FF00000, 0x3FE40000, 0x3FF00000),   # needs shaderFloat64
                 # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)
                 "ps_f16_med3_opsel": (0xAAAA4100, 0xAAAA4200, 0xAAAA3E00, 0x40005555),
                 "ps_f16_med3_mods": (0x41005555, 0x3C005555, 0x41003800, 0xAAAABA00),
