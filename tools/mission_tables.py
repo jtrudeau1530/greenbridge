@@ -260,7 +260,7 @@ def find_chunks(blob, end, elements):
                 covered[record_at:record_at + RECORD_SIZE] = b"\x01" * RECORD_SIZE
             at = nxt
         else:
-            at += RECORD_SIZE
+            at += 4
     return chunks
 
 
@@ -321,21 +321,14 @@ def resolve(record, elements, pool_base, blocks=None, stride=None):
     if count == 0:
         return [], "empty", 0
     default_step = stride or ELEMENT_SIZE
-    candidates = []
-    if record["poolOffset"] in elements:
-        candidates.append((record["poolOffset"], "absolute", ELEMENT_SIZE))
+    candidates = [(record["poolOffset"], "absolute", ELEMENT_SIZE)]
     if pool_base is not None:
-        address = pool_base + (record["poolOffset"] >> POOL_SHIFT)
-        if address in elements:
-            candidates.append((address, "pool", ELEMENT_SIZE))
+        candidates.append((pool_base + (record["poolOffset"] >> POOL_SHIFT), "pool", ELEMENT_SIZE))
     base, size = block_at(blocks, record)
     if base is not None:
         offset = pool_byte_offset(record)
-        address = base + offset
-        if offset + count * default_step <= size and address in elements:
-            candidates.append((address, "block", default_step))
-    if not candidates:
-        return [], "unresolved", count
+        if offset + count * default_step <= size:
+            candidates.append((base + offset, "block", default_step))
     best = None
     for base_at, mode, slot_step in candidates:
         entities = []
@@ -347,28 +340,29 @@ def resolve(record, elements, pool_base, blocks=None, stride=None):
                 skipped += 1
             else:
                 entities.append((address, element))
-        if best is None or len(entities) > len(best[0]):
+        if entities and (best is None or len(entities) > len(best[0])):
             best = (entities, mode, skipped)
-    entities, mode, skipped = best
-    if not entities:
-        return [], "unresolved", skipped
-    return entities, mode, skipped
+    if best is None:
+        return [], "unresolved", count
+    return best
 
 
 def parse_blob(blob, name="<memory>"):
     """Parse one inflated stream (PSIN or bare bytes) into the tool's per-file record."""
     first_section = len(blob)
+    is_psin = False
     blocks = []
     if psin_index is not None and blob[:4] == b"PSIN":
         parsed = psin_index.parse(blob)
         if parsed is not None:
+            is_psin = True
             first_section = min(max(parsed["first_section"], 0), len(blob))
             if psin_data is not None:
                 try:
                     blocks, _fill = psin_data.block_table(blob, first_section)
                 except (ValueError, struct.error):
                     blocks = []
-    end = first_section if first_section >= RECORD_SIZE else len(blob)
+    end = first_section if (is_psin and first_section > 0) or first_section >= RECORD_SIZE else len(blob)
     elements = scan_elements(blob, end)
     chunks = find_chunks(blob, end, elements)
     table_blocks = record_blocks(blob, blocks) if blocks else []
