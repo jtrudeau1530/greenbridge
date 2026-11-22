@@ -259,7 +259,7 @@ def align(names, streams, scorer, skip_cost=SKIP_COST, max_skip=MAX_SKIP):
             if arg is not None:
                 score[j][i] = best + scorer.unary(names[i], streams[j])
                 back[j][i] = arg
-    last = score[n_streams - 1]
+    last = {i: value for i, value in score[-1].items() if n_names - 1 - i <= max_skip}
     if not last:
         raise ValueError("no alignment within --max-skip; the lists do not match this source")
     i = max(last, key=lambda k: last[k] - skip_cost * (n_names - 1 - k))
@@ -328,7 +328,9 @@ def main(argv=None):
                     help="a mount-list XML, an archive or carve directory holding the lists, or a directory to "
                          "search (repeatable)")
     ap.add_argument("--pins", help="CSV with offset,path[,source] of streams identified by viewing them")
-    ap.add_argument("--max-skip", type=int, default=MAX_SKIP, help="most list entries skipped in a row")
+    ap.add_argument("--max-skip", type=int, default=MAX_SKIP,
+                    help="most list entries skipped before, between or after stream matches "
+                         "(an empty source leaves all entries unmatched)")
     ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
     a = ap.parse_args(argv)
     if a.max_skip < 0:
