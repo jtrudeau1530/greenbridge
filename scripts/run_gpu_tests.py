@@ -753,7 +753,7 @@ def run_suite(a, work: str) -> int:
                     ok, detail = None, f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)"
                 else:
                     ok, detail = check_bitmask_perm(raw)
-            elif name == "ps_uniform_branch":
+            elif name in ("ps_uniform_branch", "ps_scc_mask32"):   # same expected pattern (see the .asm headers)
                 ok, detail = check_uniform_branch(raw)
             elif name == "ps_wqm":
                 ok, detail = check_wqm(raw)

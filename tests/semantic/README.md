@@ -21,6 +21,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   as compute too and asserts 16 dwords: 10:10:10:2 words read through formats 50 and 44 (from the V# and from
   tbuffer's own format) and stored in both. `ps_scc_minmax` asserts SCC after `s_min`/`s_max` `_i32`/`_u32`:
   0 on a tie, and 1 on a pair (-1 against 1) that only the right signedness orders that way.
+- `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
+  (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
+  operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
+  `test_spirv_wave_interp.py` pins its convergence rules on hand-written modules.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.

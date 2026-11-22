@@ -1626,6 +1626,21 @@ class Gen:
         self.emit(f"{z} = OpSelect %uint {any_} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpStore %scc {z}")
 
+    def scc_logic(self, a, r):
+        """SCC of a 32-bit bitwise SOP2 (s_and/or/xor/andn2/orn2/nand/nor/xnor_b32): D != 0. In a wave32 program
+        an operation on lane masks (a source holds one, or it writes EXEC) has the whole wave's mask as D, so SCC
+        is the vote of scc_from_mask, as for the _b64 forms. Until 2026-11-22 it was this lane's bit instead:
+        `s_and_b32 s0, vcc_lo, exec_lo; s_cbranch_scc0` skipped the block in the lanes whose own bit was 0
+        although the wave runs it, and a loop closed by `s_andn2_b32 exec_lo, ...; s_cbranch_scc1` let each lane
+        leave on its last iteration, before the wave did (tools/cf_diff.py, FUZZ-8). In a wave64 program the
+        same op works on one half of a mask (lanes 0-31 or 32-63), whose SCC would be a vote of that half only;
+        that case still takes the lane's bit and is not covered by the fuzzer yet."""
+        writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
+        if not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2])):
+            self.scc_from_mask(r)
+        else:
+            self.scc_nonzero(r)
+
     SGPRS = 128                     # size of the %sgpr array without the parking slots
 
     def park_masks(self, blocks):
@@ -3298,7 +3313,7 @@ class Gen:
             # SCC (RDNA ISA): bitwise ops -> result != 0; s_add/sub_i32 -> signed overflow;
             # s_min_u32 -> S0 < S1, s_max_u32 -> S0 > S1; s_cselect leaves SCC.
             if op in ("s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
-                self.scc_nonzero(r)
+                self.scc_logic(a, r)
             elif op in ("s_add_i32", "s_sub_i32"):
                 self.scc_add_overflow(x, y, r, sub=op == "s_sub_i32")
             elif op in ("s_min_u32", "s_max_u32"):
@@ -3699,7 +3714,9 @@ class Gen:
                     y = m
                 self.emit(f"{r} = {kind} %uint {x} {y}")
             self.dst(a[0], r)
-            if op in ("s_and_b32", "s_or_b32", "s_lshl_b32", "s_lshr_b32"):
+            if op in ("s_and_b32", "s_or_b32"):
+                self.scc_logic(a, r)
+            elif op in ("s_lshl_b32", "s_lshr_b32"):
                 self.scc_nonzero(r)
         elif op in SHIFT_REV:
             sh, x = self.src_u(a[1]), self.src_u(a[2])
