@@ -2392,7 +2392,7 @@ class Gen:
         elif op == "s_mulk_i32":
             v = a[1]["v"] & 0xFFFF
             k = v - 0x10000 if v & 0x8000 else v
-            x = self.load_reg("sgpr", a[0]["r"])
+            x = self.src_u(a[0])
             r = self.tmp()
             self.emit(f"{r} = OpIMul %uint {x} {self.cu(k)}")
             self.dst(a[0], r)
@@ -3002,7 +3002,7 @@ class Gen:
             m, sh, old, r = (self.tmp() for _ in range(4))
             self.emit(f"{m} = OpBitwiseAnd %uint {b} {self.cu(31)}")
             self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {m}")
-            self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', a[0]['r'])}")
+            self.emit(f"{old} = OpCopyObject %uint {self.src_u(a[0])}")
             self.emit(f"{r} = OpBitwiseOr %uint {old} {sh}")
             self.dst(a[0], r)
         elif op in ("v_mul_hi_u32_u24", "v_mul_hi_i32_i24"):
@@ -3283,7 +3283,7 @@ class Gen:
             self.emit(f"{m} = OpBitwiseAnd %uint {b} {self.cu(31)}")
             self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {m}")
             self.emit(f"{n} = OpNot %uint {sh}")
-            self.emit(f"{r} = OpBitwiseAnd %uint {self.load_reg('sgpr', a[0]['r'])} {n}")
+            self.emit(f"{r} = OpBitwiseAnd %uint {self.src_u(a[0])} {n}")
             self.dst(a[0], r)
         elif op in ("s_min_i32", "s_max_i32"):
             x, y = self.src_u(a[1]), self.src_u(a[2])
