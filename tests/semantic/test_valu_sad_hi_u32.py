@@ -829,5 +829,61 @@ class TestValuSadHiU32StatusFlags(unittest.TestCase):
         self.assertEqual(carry, 1)
 
 
+class TestValuSadHiU32IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit pattern boundaries and integer extreme limits."""
+
+    def test_ieee754_special_floats_as_raw_integers(self) -> None:
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+
+        patterns = [pos_zero, neg_zero, pos_inf, neg_inf, qnan, snan]
+        for f0 in patterns:
+            for f1 in patterns:
+                for f2 in [0, 1, 0x8000_0000, 0xFFFF_FFFF]:
+                    with self.subTest(f0=hex(f0), f1=hex(f1), f2=hex(f2)):
+                        hi = ref_sad_hi_u32(f0, f1, f2)
+                        diff = abs(f0 - f1)
+                        expected = 1 if ((diff + f2) >= (1 << 32)) else 0
+                        self.assertEqual(hi, expected)
+
+    def test_subnormal_float_bits_no_ftz(self) -> None:
+        # Subnormal float 1: 0x00000001
+        # Subnormal float 2: 0x00000002
+        # |sub1 - sub2| = 1.
+        # Adding 0xFFFFFFFF gives 0x100000000 -> carry = 1.
+        # If hardware erroneously flushed subnormals to zero (FTZ),
+        # diff would be 0, resulting in carry = 0!
+        sub1 = 0x0000_0001
+        sub2 = 0x0000_0002
+        res = ref_sad_hi_u32(sub1, sub2, 0xFFFF_FFFF)
+        self.assertEqual(res, 1)
+
+    def test_nan_payloads_as_raw_integers(self) -> None:
+        # NaN payloads are treated as unsigned integer magnitudes
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+        diff = ref_abs_diff_u32(qnan, snan)
+        self.assertEqual(diff, qnan - snan)
+        # Adding (2^32 - diff) exactly produces carry = 1
+        acc = (1 << 32) - diff
+        self.assertEqual(ref_sad_hi_u32(qnan, snan, acc), 1)
+        self.assertEqual(ref_sad_hi_u32(qnan, snan, acc - 1), 0)
+
+    def test_integer_extreme_matrix_32bit(self) -> None:
+        extremes = [0, 1, 2, 0x7FFF_FFFE, 0x7FFF_FFFF, 0x8000_0000, 0x8000_0001, 0xFFFF_FFFE, 0xFFFF_FFFF]
+        for s0 in extremes:
+            for s1 in extremes:
+                for s2 in [0, 1, 0xFFFF_FFFF]:
+                    hi = ref_sad_hi_u32(s0, s1, s2)
+                    self.assertIn(hi, (0, 1))
+                    diff = abs(s0 - s1)
+                    expected = 1 if (diff + s2 >= 0x1_0000_0000) else 0
+                    self.assertEqual(hi, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
