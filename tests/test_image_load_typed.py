@@ -141,6 +141,23 @@ def format_class(fmt):
 
 
 class LoadOnlyShaders(unittest.TestCase):
+    def test_2d_explicit_mip_reaches_every_typed_fetch(self):
+        m = Module(translate(["image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                              "s_waitcnt vmcnt(0)"]))
+        fetches = m.fetches()
+        self.assertEqual({image[0] for _, _, image in fetches}, {"%float", "%uint", "%int"})
+        for rid, var, _ in fetches:
+            self.assertEqual(m.binding[var], 0)
+            operands = m.defs[rid][1]
+            self.assertEqual(operands[-2], "Lod")
+            op, cast = m.defs[operands[-1]]
+            self.assertEqual(op, "OpBitcast")
+            op, load = m.defs[cast[1]]
+            self.assertEqual(op, "OpLoad")
+            op, source = m.defs[load[1]]
+            self.assertEqual((op, source[1]), ("OpAccessChain", "%vgpr"))
+            self.assertEqual(m.value(source[2], 0, 0), 6)
+
     def test_no_storage_image_capability_and_no_storage_binding(self):
         for dim in DIMS:
             with self.subTest(dim=dim):
