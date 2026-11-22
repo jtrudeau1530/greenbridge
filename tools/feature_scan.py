@@ -172,8 +172,24 @@ def main() -> int:
     a = ap.parse_args()
 
     dxbc_dir = os.path.join(a.shaders, "dxbc")
-    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
-        index = json.load(f)
+    index_path = os.path.join(dxbc_dir, "index.json")
+    if not os.path.isdir(a.shaders):
+        what = "is not a folder" if os.path.exists(a.shaders) else "does not exist"
+        print(f"ERROR: {a.shaders} {what}. Give the <work>/shaders folder make_game.py writes.", file=sys.stderr)
+        return 2
+    if not os.path.isfile(index_path):
+        print(f"ERROR: {index_path} is missing. Run the shaders stage of make_game.py first.", file=sys.stderr)
+        return 2
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read {index_path}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+        return 2
+    if not isinstance(index, list):
+        print(f"ERROR: {index_path} is not a shader list. Run the shaders stage of make_game.py again.",
+              file=sys.stderr)
+        return 2
     result = {"shaders": len(index), "dxbc": scan_dxbc(dxbc_dir, index)}
     stage_of = {os.path.splitext(e["file"])[0]: e.get("stage") or "?" for e in index}
     stage_of |= {e["name"]: e.get("stage") or "?" for e in index}

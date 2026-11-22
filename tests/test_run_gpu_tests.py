@@ -134,5 +134,21 @@ class UniformBranchCheck(unittest.TestCase):
         self.assertFalse(self.judge([(7, 1, 0.5), (8, 0, 0.1), (7, 0, 0.1)])[0])
 
 
+class Wave32LaneDumps(unittest.TestCase):
+    """run_gpu_tests.py skips cs_wqm_w32 and cs_w32_lane_wrap below 32 lanes with check.py's rule."""
+    def test_uses_check_py_rule(self):
+        import check
+        self.assertIs(rgt.narrow_subgroup_skip, check.narrow_subgroup_skip)
+        self.assertEqual(rgt.WAVE32_LANE_DUMPS, ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_bpermute32"))
+
+    def test_rule(self):
+        self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),
+                         "SKIP (subgroup 8 is narrower than 32 lanes)")
+        for out in ("device: X (subgroup 32..32)\n", "device: X (subgroup 8..32)\n", "device: X (subgroup 32..64)\n",
+                    "no device line\n"):
+            with self.subTest(out=out):
+                self.assertIsNone(rgt.narrow_subgroup_skip(out))
+
+
 if __name__ == "__main__":
     unittest.main()
