@@ -7,7 +7,9 @@ namespace leonida {
 
 // Global submission tickets may finish out of order on independent Vulkan queues. Only the
 // contiguous completed prefix is safe for deferred resource destruction. The caller serializes
-// record(), completed() and queue_idle() with the device submission mutex.
+// record(), completed() and queue_idle() with the device submission mutex. record() must
+// receive strictly increasing global ticket numbers; otherwise a duplicate or backward ticket
+// can make the completed prefix stall or move backward.
 template<class Semaphore>
 class RetireTickets {
 public:
@@ -26,7 +28,8 @@ public:
         return completed_;
     }
 
-    // The owning queue has been waited idle and may now destroy its progress semaphore.
+    // Call only after the owning queue's wait-idle succeeded. Merely requesting idle does not
+    // prove its submissions completed and must not advance the retirement prefix.
     void queue_idle(Semaphore semaphore) {
         for (Entry& entry : pending_)
             if (entry.semaphore == semaphore) entry.idle = true;

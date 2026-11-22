@@ -957,6 +957,7 @@ public:
 
     std::uint64_t completed_retire_ticket() {
         std::lock_guard lock(submit_mutex_);
+        if (is_device_lost()) return 0;
         return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
             std::uint64_t done = 0;
             return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
@@ -1152,8 +1153,12 @@ public:
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
-            vk.vkQueueWaitIdle(queue_);
-            if (progress_) context_.retire_queue_idle_locked(progress_);
+            const VkResult idle_result = vk.vkQueueWaitIdle(queue_);
+            if (idle_result == VK_SUCCESS) {
+                if (progress_) context_.retire_queue_idle_locked(progress_);
+            } else {
+                context_.mark_device_lost();
+            }
         }
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
