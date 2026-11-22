@@ -146,7 +146,9 @@ class DivFixupF16Tests(unittest.TestCase):
             ("zero_div_finite_pos", H_ONE, H_NEG2, H_NEG0, H_POS0),
             ("finite_div_zero_neg", H_ONE, H_NEG0, H_ONE, H_NINF),
             ("inf_div_finite_pos", H_ONE, H_NEG2, H_NINF, H_INF),
-            ("nan_quot_overflow", H_QNAN2, H_NEG2, H_ONE, H_NINF),
+            ("nan_quot_signed_passthrough", 0x7E35, H_NEG2, H_ONE, 0xFE35),
+            ("exp_underflow_to_zero", H_ONE, 0x7800, 0x0400, H_POS0),     # 2^-14 / 2^15 = 2^-29 -> +0
+            ("exp_overflow_to_inf", H_ONE, 0x0400, 0x7800, H_INF),        # 2^15 / 2^-14 = 2^29 -> +inf
         )
         for name, s0, s1, s2, want in cases:
             with self.subTest(case=name):
@@ -189,7 +191,9 @@ class DivFixupF64Tests(unittest.TestCase):
             ("zero_div_finite_pos", D_ONE, D_NEG2, D_NEG0, D_POS0),
             ("finite_div_zero_neg", D_ONE, D_NEG0, D_ONE, D_NINF),
             ("inf_div_finite_pos", D_ONE, D_NEG2, D_NINF, D_INF),
-            ("nan_quot_overflow", D_QNAN2, D_NEG2, D_ONE, D_NINF),
+            ("nan_quot_signed_passthrough", 0xFFF8123456789ABC, D_NEG2 & ~(1 << 63), D_ONE, 0x7FF8123456789ABC),
+            ("exp_underflow_to_zero", D_ONE, 0x4630000000000000, 0x0010000000000000, D_POS0),  # 2^-1022 / 2^100
+            ("exp_overflow_to_inf", D_ONE, 0x0010000000000000, 0x4630000000000000, D_INF),     # 2^100 / 2^-1022
         )
         for name, s0, s1, s2, want in cases:
             with self.subTest(case=name):
