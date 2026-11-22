@@ -11,6 +11,7 @@ Features and specifications:
 - Destination register half preservation on scalar f16 ops.
 - VOP3 op_sel and input modifiers (negation, absolute value).
 - Multi-lane SIMD divergence under EXEC mask.
+- Deterministic seeded sweep and negative control sabotage tests.
 - Standard library Python only; zero game data.
 """
 from __future__ import annotations
@@ -18,6 +19,8 @@ from __future__ import annotations
 import gc
 import math
 import os
+import random
+import re
 import struct
 import sys
 import tempfile
@@ -132,7 +135,6 @@ def ref_min_f16(a_bits: int, b_bits: int, *, clamp: bool = False) -> int:
     elif b_nan:
         chosen_bits = a_bits & MASK16
     else:
-        # Check signed zero tie-break: -0.0 is strictly smaller than +0.0
         is_a_neg_zero = (a_bits & MASK16) == NEG_ZERO
         is_a_pos_zero = (a_bits & MASK16) == POS_ZERO
         is_b_neg_zero = (b_bits & MASK16) == NEG_ZERO
@@ -470,23 +472,17 @@ class PackedReferenceOracleTests(unittest.TestCase):
     """Test packed reference oracle logic."""
 
     def test_packed_reference_basic(self):
-        # lo: min(1.0, 2.0) = 1.0; hi: min(0.5, 3.0) = 0.5
         v1 = pack2(POS_ONE, POS_HALF)
         v2 = pack2(POS_TWO, POS_THREE)
         self.assertEqual(ref_pk_f16("v_pk_min_f16", v1, v2), pack2(POS_ONE, POS_HALF))
         self.assertEqual(ref_pk_f16("v_pk_max_f16", v1, v2), pack2(POS_TWO, POS_THREE))
 
     def test_packed_reference_modifiers(self):
-        # Swizzling with op_sel and op_sel_hi
-        v1 = pack2(POS_ONE, POS_HALF)     # lo=1.0, hi=0.5
-        v2 = pack2(POS_TWO, POS_THREE)    # lo=2.0, hi=3.0
-        # lo takes v1.lo (1.0) and v2.hi (3.0) -> min 1.0
-        # hi takes v1.hi (0.5) and v2.lo (2.0) -> min 0.5
+        v1 = pack2(POS_ONE, POS_HALF)
+        v2 = pack2(POS_TWO, POS_THREE)
         got = ref_pk_f16("v_pk_min_f16", v1, v2, op_sel=(0, 1), op_sel_hi=(1, 0))
         self.assertEqual(got, pack2(POS_ONE, POS_HALF))
 
-        # Negation with neg_lo
-        # lo takes -v1.lo (-1.0) and v2.lo (2.0) -> min -1.0
         got_neg = ref_pk_f16("v_pk_min_f16", v1, v2, neg_lo=(1, 0))
         self.assertEqual(got_neg, pack2(NEG_ONE, POS_HALF))
 
@@ -495,23 +491,16 @@ class PackedMinMaxF16Tests(unittest.TestCase):
     """End-to-end tests for packed v_pk_min_f16 and v_pk_max_f16 instructions."""
 
     def test_packed_min_max_basic(self):
-        # v1: lo=2.0, hi=1.0
-        # v2: lo=0.5, hi=3.0
         v1 = pack2(POS_TWO, POS_ONE)
         v2 = pack2(POS_HALF, POS_THREE)
 
-        # v_pk_min_f16: lo=min(2.0, 0.5)=0.5, hi=min(1.0, 3.0)=1.0 -> 0x3C003800
         got_min = run_op("v_pk_min_f16 v0, v1, v2", v1=v1, v2=v2)
         self.assertEqual(got_min, pack2(POS_HALF, POS_ONE))
 
-        # v_pk_max_f16: lo=max(2.0, 0.5)=2.0, hi=max(1.0, 3.0)=3.0 -> 0x42004000
         got_max = run_op("v_pk_max_f16 v0, v1, v2", v1=v1, v2=v2)
         self.assertEqual(got_max, pack2(POS_TWO, POS_THREE))
 
     def test_packed_subnormal_lanes(self):
-        # Both lanes independently processing subnormals and gradual underflow
-        # lo: POS_MIN_SUBNORM vs POS_ZERO
-        # hi: POS_MAX_SUBNORM vs POS_MIN_NORMAL
         v1 = pack2(POS_MIN_SUBNORM, POS_MAX_SUBNORM)
         v2 = pack2(POS_ZERO, POS_MIN_NORMAL)
 
@@ -522,35 +511,21 @@ class PackedMinMaxF16Tests(unittest.TestCase):
         self.assertEqual(got_max, pack2(POS_MIN_SUBNORM, POS_MIN_NORMAL))
 
     def test_packed_clamp(self):
-        # Clamping both lanes to [0.0, 1.0]
-        # lo: min(-2.0, -0.5) = -2.0 -> clamped to 0.0
-        # hi: min(3.0, 2.0) = 2.0 -> clamped to 1.0
         v1 = pack2(NEG_TWO, POS_THREE)
         v2 = pack2(NEG_HALF, POS_TWO)
         got = run_op("v_pk_min_f16 v0, v1, v2 clamp", v1=v1, v2=v2)
         self.assertEqual(got, pack2(POS_ZERO, POS_ONE))
 
-        # max with clamp:
-        # lo: max(-2.0, -1.0) = -1.0 -> clamped to 0.0
-        # hi: max(0.5, 0.25) = 0.5 -> unchanged 0.5
         got2 = run_op("v_pk_max_f16 v0, v1, v2 clamp", v1=pack2(NEG_TWO, POS_HALF), v2=pack2(NEG_ONE, POS_ZERO))
         self.assertEqual(got2, pack2(POS_ZERO, POS_HALF))
 
     def test_packed_opsel_swizzle(self):
-        # v1: lo=2.0, hi=1.0
-        # v2: lo=0.5, hi=3.0
-        # op_sel:[0, 1]: lo takes v1.lo (2.0) and v2.hi (3.0) -> min is 2.0
-        # op_sel_hi:[1, 0]: hi takes v1.hi (1.0) and v2.lo (0.5) -> min is 0.5
         v1 = pack2(POS_TWO, POS_ONE)
         v2 = pack2(POS_HALF, POS_THREE)
         got = run_op("v_pk_min_f16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[1,0]", v1=v1, v2=v2)
         self.assertEqual(got, pack2(POS_TWO, POS_HALF))
 
     def test_packed_negation_modifiers(self):
-        # v1: lo=1.0, hi=2.0
-        # v2: lo=0.5, hi=3.0
-        # neg_lo:[1, 0]: negate v1.lo -> -1.0 vs 0.5 -> min is -1.0
-        # neg_hi:[0, 1]: negate v2.hi -> 2.0 vs -3.0 -> min is -3.0
         v1 = pack2(POS_ONE, POS_TWO)
         v2 = pack2(POS_HALF, POS_THREE)
         got = run_op("v_pk_min_f16 v0, v1, v2 neg_lo:[1,0] neg_hi:[0,1]", v1=v1, v2=v2)
@@ -567,7 +542,6 @@ class SimdExecMaskDivergenceTests(unittest.TestCase):
     """Test multi-lane SIMD divergence and execution under partial EXEC masks."""
 
     def test_single_lane_exec_mask_toggle(self):
-        # When exec_lo is 0, v_min_f16 and v_pk_min_f16 must NOT modify v0!
         got_masked = run_ps([
             f"v_mov_b32 v0, {OLD:#x}",
             f"v_mov_b32 v1, {POS_ONE:#x}",
@@ -578,7 +552,6 @@ class SimdExecMaskDivergenceTests(unittest.TestCase):
         ])
         self.assertEqual(got_masked, OLD)
 
-        # Packed form with exec_lo = 0 preserves destination
         got_pk_masked = run_ps([
             f"v_mov_b32 v0, {OLD:#x}",
             f"v_mov_b32 v1, {pack2(POS_ONE, POS_TWO):#x}",
@@ -590,8 +563,6 @@ class SimdExecMaskDivergenceTests(unittest.TestCase):
         self.assertEqual(got_pk_masked, OLD)
 
     def test_multilane_workgroup_divergence(self):
-        # 8-lane compute workgroup where even lanes are active and odd lanes are masked off.
-        # Active lanes compute v_pk_min_f16, while masked lanes must retain previous register data.
         lane_v1 = [
             pack2(POS_TWO, POS_ONE),
             pack2(POS_THREE, POS_TWO),
@@ -629,7 +600,7 @@ class SimdExecMaskDivergenceTests(unittest.TestCase):
             "buffer_load_dword v2, v7, s[0:3], 0 offen",
             "buffer_load_dword v3, v8, s[0:3], 0 offen",
             "v_and_b32_e32 v4, 1, v0",
-            "v_cmp_eq_u32_e32 vcc_lo, 0, v4",       # even lanes active
+            "v_cmp_eq_u32_e32 vcc_lo, 0, v4",
             "s_and_saveexec_b32 s6, vcc_lo",
             "v_pk_min_f16 v3, v1, v2",
             "s_mov_b32 exec_lo, s6",
@@ -639,12 +610,185 @@ class SimdExecMaskDivergenceTests(unittest.TestCase):
         for lane in range(8):
             got = mem.get(4 * lane)
             if lane % 2 == 1:
-                # Odd lane was inactive: must keep old word
                 self.assertEqual(got, lane_olds[lane], f"Lane {lane} was masked out but was overwritten!")
             else:
-                # Even lane was active: must match reference
                 want = ref_pk_f16("v_pk_min_f16", lane_v1[lane], lane_v2[lane])
                 self.assertEqual(got, want, f"Lane {lane} active result mismatch: got {got:#x}, want {want:#x}")
+
+
+# -----------------------------------------------------------------------------
+# Commit 3 Tests: NaN Suppression, Signed Zero Tie-Breaking, Negative Controls
+# -----------------------------------------------------------------------------
+
+class NanSuppressionTests(unittest.TestCase):
+    """Test IEEE 754-2008 / RDNA NaN suppression rules."""
+
+    def test_scalar_nan_suppression_single_nan(self):
+        # min(NaN, x) = x and min(x, NaN) = x
+        for nan_val in (QNAN_CANONICAL, QNAN_ALT, SNAN, NEG_QNAN):
+            for num_val in (POS_ONE, NEG_TWO, POS_ZERO, NEG_ZERO, POS_MIN_SUBNORM, POS_INF):
+                with self.subTest(nan=hex(nan_val), num=hex(num_val)):
+                    # min
+                    got_min_1 = run_op("v_min_f16_e32 v0, v1, v2", v1=nan_val, v2=num_val)
+                    self.assertEqual(got_min_1, merge_half(num_val, dst_hi=0))
+                    got_min_2 = run_op("v_min_f16_e32 v0, v1, v2", v1=num_val, v2=nan_val)
+                    self.assertEqual(got_min_2, merge_half(num_val, dst_hi=0))
+
+                    # max
+                    got_max_1 = run_op("v_max_f16_e32 v0, v1, v2", v1=nan_val, v2=num_val)
+                    self.assertEqual(got_max_1, merge_half(num_val, dst_hi=0))
+                    got_max_2 = run_op("v_max_f16_e32 v0, v1, v2", v1=num_val, v2=nan_val)
+                    self.assertEqual(got_max_2, merge_half(num_val, dst_hi=0))
+
+    def test_scalar_both_nan_returns_quiet_nan(self):
+        got_min = run_op("v_min_f16_e32 v0, v1, v2", v1=QNAN_CANONICAL, v2=QNAN_ALT)
+        self.assertTrue(is_nan16(got_min & 0xFFFF))
+
+        got_max = run_op("v_max_f16_e32 v0, v1, v2", v1=QNAN_ALT, v2=NEG_QNAN)
+        self.assertTrue(is_nan16(got_max & 0xFFFF))
+
+    def test_packed_nan_suppression(self):
+        # Mixed lane NaN:
+        # lo: min(QNAN_ALT, 1.0) = 1.0
+        # hi: min(2.0, QNAN_CANONICAL) = 2.0
+        v1 = pack2(QNAN_ALT, POS_TWO)
+        v2 = pack2(POS_ONE, QNAN_CANONICAL)
+        got = run_op("v_pk_min_f16 v0, v1, v2", v1=v1, v2=v2)
+        self.assertEqual(got, pack2(POS_ONE, POS_TWO))
+
+        # Packed max with NaNs:
+        # lo: max(-1.0, NEG_QNAN) = -1.0
+        # hi: max(QNAN_ALT, 0.5) = 0.5
+        v3 = pack2(NEG_ONE, QNAN_ALT)
+        v4 = pack2(NEG_QNAN, POS_HALF)
+        got2 = run_op("v_pk_max_f16 v0, v1, v2", v1=v3, v2=v4)
+        self.assertEqual(got2, pack2(NEG_ONE, POS_HALF))
+
+
+class SignedZeroTieBreakingTests(unittest.TestCase):
+    """Test IEEE 754-2008 / RDNA signed zero tie-breaking: -0.0 < +0.0."""
+
+    def test_scalar_signed_zero_min(self):
+        # min(-0.0, +0.0) == -0.0 (0x8000)
+        got1 = run_op("v_min_f16_e32 v0, v1, v2", v1=NEG_ZERO, v2=POS_ZERO)
+        self.assertEqual(got1, merge_half(NEG_ZERO, dst_hi=0))
+
+        # min(+0.0, -0.0) == -0.0 (0x8000)
+        got2 = run_op("v_min_f16_e32 v0, v1, v2", v1=POS_ZERO, v2=NEG_ZERO)
+        self.assertEqual(got2, merge_half(NEG_ZERO, dst_hi=0))
+
+        # min(-0.0, -0.0) == -0.0
+        got3 = run_op("v_min_f16_e32 v0, v1, v2", v1=NEG_ZERO, v2=NEG_ZERO)
+        self.assertEqual(got3, merge_half(NEG_ZERO, dst_hi=0))
+
+    def test_scalar_signed_zero_max(self):
+        # max(-0.0, +0.0) == +0.0 (0x0000)
+        got1 = run_op("v_max_f16_e32 v0, v1, v2", v1=NEG_ZERO, v2=POS_ZERO)
+        self.assertEqual(got1, merge_half(POS_ZERO, dst_hi=0))
+
+        # max(+0.0, -0.0) == +0.0 (0x0000)
+        got2 = run_op("v_max_f16_e32 v0, v1, v2", v1=POS_ZERO, v2=NEG_ZERO)
+        self.assertEqual(got2, merge_half(POS_ZERO, dst_hi=0))
+
+        # max(+0.0, +0.0) == +0.0
+        got3 = run_op("v_max_f16_e32 v0, v1, v2", v1=POS_ZERO, v2=POS_ZERO)
+        self.assertEqual(got3, merge_half(POS_ZERO, dst_hi=0))
+
+    def test_packed_signed_zero_tie_breaking(self):
+        # lo: min(-0.0, +0.0) = -0.0 (0x8000)
+        # hi: max(-0.0, +0.0) = +0.0 (0x0000)
+        # result: (0x0000 << 16) | 0x8000 = 0x00008000
+        v1 = pack2(NEG_ZERO, NEG_ZERO)
+        v2 = pack2(POS_ZERO, POS_ZERO)
+        got = run_op("v_pk_min_f16 v0, v1, v2", v1=v1, v2=v2)
+        # For v_pk_min_f16: both lanes compute min, so both give -0.0 -> 0x80008000
+        self.assertEqual(got, pack2(NEG_ZERO, NEG_ZERO))
+
+        # For v_pk_max_f16: both lanes compute max, so both give +0.0 -> 0x00000000
+        got_max = run_op("v_pk_max_f16 v0, v1, v2", v1=v1, v2=v2)
+        self.assertEqual(got_max, pack2(POS_ZERO, POS_ZERO))
+
+
+class DeterministicSweepTests(unittest.TestCase):
+    """Deterministic pseudorandom sweep comparing simulated execution against oracle."""
+
+    def test_seeded_sweep(self):
+        rng = random.Random(0x7F16)
+        pool = [
+            POS_ZERO, NEG_ZERO, POS_ONE, NEG_ONE, POS_HALF, NEG_HALF,
+            POS_TWO, NEG_TWO, POS_THREE, NEG_THREE, POS_INF, NEG_INF,
+            POS_MIN_SUBNORM, POS_MAX_SUBNORM, NEG_MIN_SUBNORM,
+            POS_MIN_NORMAL, POS_MAX_NORMAL, NEG_MAX_NORMAL,
+            QNAN_CANONICAL, QNAN_ALT,
+        ]
+
+        for _ in range(30):
+            a = rng.choice(pool)
+            b = rng.choice(pool)
+
+            # Scalar min test
+            got_min = run_op("v_min_f16_e32 v0, v1, v2", v1=a, v2=b) & 0xFFFF
+            want_min = ref_min_f16(a, b)
+            if is_nan16(want_min):
+                self.assertTrue(is_nan16(got_min))
+            else:
+                self.assertEqual(got_min, want_min, f"min({a:#x}, {b:#x}) mismatch")
+
+            # Scalar max test
+            got_max = run_op("v_max_f16_e32 v0, v1, v2", v1=a, v2=b) & 0xFFFF
+            want_max = ref_max_f16(a, b)
+            if is_nan16(want_max):
+                self.assertTrue(is_nan16(got_max))
+            else:
+                self.assertEqual(got_max, want_max, f"max({a:#x}, {b:#x}) mismatch")
+
+
+class NegativeControlsAndSabotageTests(unittest.TestCase):
+    """Negative controls and mutation detection tests verifying test suite vigilance."""
+
+    def test_opcode_sabotage_fails(self):
+        # Invert NMin to NMax in translated SPIR-V: must detect divergence!
+        spv = translate_ps([
+            f"v_mov_b32 v1, {POS_ONE:#x}",
+            f"v_mov_b32 v2, {POS_TWO:#x}",
+            "v_min_f16_e32 v0, v1, v2",
+        ])
+        self.assertIn("NMin", spv)
+        bad_spv, count = re.subn(r"NMin", "NMax", spv)
+        self.assertGreaterEqual(count, 1)
+
+        out_good = si.run_fragment(spv)["%out_mrt0"][0] & 0xFFFF
+        out_bad = si.run_fragment(bad_spv)["%out_mrt0"][0] & 0xFFFF
+
+        self.assertEqual(out_good, POS_ONE)
+        self.assertEqual(out_bad, POS_TWO)
+        self.assertNotEqual(out_good, out_bad)
+
+    def test_clamp_omission_sabotage_fails(self):
+        # Removing FClamp from clamped v_min_f16 translation must fail clamp expectation
+        spv = translate_ps([
+            f"v_mov_b32 v1, {POS_TWO:#x}",
+            f"v_mov_b32 v2, {POS_THREE:#x}",
+            "v_min_f16_e64 v0, v1, v2 clamp",
+        ])
+        self.assertIn("FClamp", spv)
+        # Sabotage FClamp by bypassing it with OpCopyObject of its first argument
+        bad_spv, count = re.subn(r"OpExtInst %float %glsl FClamp (%\w+) (%\w+) (%\w+)", r"OpCopyObject %float \1", spv)
+        self.assertGreaterEqual(count, 1)
+
+        out_good = si.run_fragment(spv)["%out_mrt0"][0] & 0xFFFF
+        out_bad = si.run_fragment(bad_spv)["%out_mrt0"][0] & 0xFFFF
+
+        self.assertEqual(out_good, POS_ONE)
+        self.assertEqual(out_bad, POS_TWO)
+        self.assertNotEqual(out_good, out_bad)
+
+    def test_signed_zero_tie_break_sabotage_fails(self):
+        # Tampering with signed zero ordering in oracle or hardware asserts
+        # min(-0.0, +0.0) must be -0.0 (0x8000), not +0.0 (0x0000)
+        got = run_op("v_min_f16_e32 v0, v1, v2", v1=NEG_ZERO, v2=POS_ZERO) & 0xFFFF
+        self.assertEqual(got, NEG_ZERO)
+        self.assertNotEqual(got, POS_ZERO)
 
 
 if __name__ == "__main__":
