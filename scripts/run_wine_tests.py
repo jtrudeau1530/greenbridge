@@ -118,6 +118,9 @@ def regex_list(value: str | list[str]) -> list[str]:
 
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
+    props = properties(test)
+    if truthy(props.get("DISABLED")):
+        return "skip", "disabled by CTest"
     command = test.get("command")
     if not command:
         return "fail", "no command (target not built?)"
@@ -131,7 +134,6 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     for a in command[1:]:
         mapped = map_path(a, args.windows_root, args.root)
         argv.append(wine_path(mapped) if mapped is not None else a)
-    props = properties(test)
     cwd = props.get("WORKING_DIRECTORY")
     cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
     if not cwd or not os.path.isdir(cwd):
