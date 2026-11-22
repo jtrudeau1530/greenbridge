@@ -77,7 +77,7 @@ def grass_instances():
     return out
 
 
-def resource():
+def resource(*, rotation_first: bool = False) -> tuple[bytes, bytes]:
     """Virtual buffer (header, schema, lists) and physical buffer (instances) of one 0x7a resource."""
     V = bytearray(0x1000)
     V[0x10:0x15] = b"0DRPz"
@@ -88,6 +88,9 @@ def resource():
     struct.pack_into("<Q", V, 0x38, 0x50000000 | it)
     for i, n in enumerate(names):
         size, spec = SCHEMA[n]
+        if n == il.GRASS_INST and rotation_first:
+            spec = [(field, 0 if field == "RotationIdx" else offset + 1, kind)
+                    for field, offset, kind in spec]
         table = members(spec)
         V[mt:mt + len(table)] = table
         o = st + 32 * i
@@ -98,7 +101,12 @@ def resource():
         mt += len(table)
     pl, gl = prop_list(), grass_list()
     pl_at, gl_at = 0x800, 0xA00
-    P = bytearray(prop_instances() + grass_instances())
+    grass = grass_instances()
+    if rotation_first:
+        # Move RotationIdx from byte 13 to byte 0 of each 16-byte record.
+        grass = b"".join(grass[at + 13:at + 14] + grass[at:at + 13] + grass[at + 14:at + 16]
+                         for at in range(0, len(grass), 16))
+    P = bytearray(prop_instances() + grass)
     blocks = [(il.PROP_LIST, len(pl), 0x50000000 | pl_at), (il.GRASS_LIST, len(gl), 0x50000000 | gl_at),
               (il.PROP_INST, 0x80, 0x60000000), (il.GRASS_INST, 0x30, 0x60000000 | 0x80)]
     for i, (n, size, p) in enumerate(blocks):
@@ -145,6 +153,13 @@ class MeasureTests(unittest.TestCase):
         self.assertEqual(g["scale_zero"], 1)
         self.assertEqual(g["rotation_idx_max"], 72)
         self.assertEqual(g["instance_loddist_le_loddist"], 1)
+
+    def test_grass_measure_uses_zero_rotation_offset(self) -> None:
+        virtual, physical = resource(rotation_first=True)
+        summary: dict = {}
+        self.assertTrue(il.measure(virtual, physical, summary))
+        self.assertEqual(summary["grass"]["rotation_idx_max"], 72)
+        self.assertEqual(summary["grass"], self.T["grass"])
 
     def test_empty_list_is_counted(self):
         V = bytearray(self.V)
