@@ -9,6 +9,11 @@
 #include <string>
 #include <system_error>
 
+#ifdef _WIN32
+#include <thread>
+#include <windows.h>
+#endif
+
 inline std::error_code write_pipeline_cache_file(const std::filesystem::path& destination,
                                                 const char* data, size_t size) {
     namespace fs = std::filesystem;
@@ -40,7 +45,17 @@ inline std::error_code write_pipeline_cache_file(const std::filesystem::path& de
     }
     if (std::fflush(file) != 0 && !error) error = {errno ? errno : EIO, std::generic_category()};
     if (std::fclose(file) != 0 && !error) error = {errno ? errno : EIO, std::generic_category()};
-    if (!error) fs::rename(staged, destination, error);
+    if (!error) {
+        fs::rename(staged, destination, error);
+#ifdef _WIN32
+        // A checker reading the previous cache can briefly block replacement if it did not share delete access.
+        for (int retry = 0; retry < 8; ++retry) {
+            if (error != std::errc::permission_denied && error.value() != ERROR_SHARING_VIOLATION) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            fs::rename(staged, destination, error);
+        }
+#endif
+    }
     if (error) {
         std::error_code ignored;
         fs::remove(staged, ignored);

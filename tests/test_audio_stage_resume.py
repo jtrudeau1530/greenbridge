@@ -156,5 +156,42 @@ class AudioStageResumeTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.audio, "ogg.done")))
 
 
+# Stands in for ffmpeg: writes what it could read from its stdin into the output file.
+STDIN_FFMPEG = """import sys
+with open(sys.argv[-1], "w", encoding="utf-8") as f:
+    f.write(repr(sys.stdin.buffer.read() if sys.stdin else b""))
+"""
+
+
+class DecodeXmaStdinTest(unittest.TestCase):
+    """ffmpeg reads stdin for key commands. Given the build's stdin, it stops a build in the background of a terminal
+    ("Stopped (tty output)") at the first XMA2 stream and swallows input piped to make_game.py."""
+
+    def test_ffmpeg_gets_no_stdin(self):
+        with tempfile.TemporaryDirectory() as d:
+            xma = os.path.join(d, "xma")
+            os.makedirs(os.path.join(xma, "bank"))
+            open(os.path.join(xma, "bank", "s1.xma.wav"), "wb").close()
+            script = os.path.join(d, "fake_ffmpeg.py")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write(STDIN_FFMPEG)
+            if os.name == "nt":
+                ffmpeg = os.path.join(d, "ffmpeg.cmd")
+                with open(ffmpeg, "w", encoding="utf-8") as f:
+                    f.write(f'@"{sys.executable}" "{script}" %*\n')
+            else:
+                ffmpeg = os.path.join(d, "ffmpeg")
+                with open(ffmpeg, "w", encoding="utf-8") as f:
+                    f.write(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+                os.chmod(ffmpeg, 0o755)
+            # A child process, so that decode_xma() runs with a stdin this test controls.
+            code = "import sys; sys.path.insert(0, sys.argv[1]); import make_game; make_game.decode_xma(*sys.argv[2:])"
+            p = subprocess.run([sys.executable, "-I", "-c", code, ROOT, ffmpeg, xma],
+                               input="tests/test_next.py\n", capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            with open(os.path.join(xma, "bank", "s1.wav"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "b''")
+
+
 if __name__ == "__main__":
     unittest.main()

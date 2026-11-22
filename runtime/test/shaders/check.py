@@ -138,6 +138,20 @@ CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
+# cs_fmt_xy_xyz.asm (TEST-185): 12 xy/xyz loads, then the 9 store regions read back, as a Radeon 680M (gfx1035) gives
+# them natively. Layout and rules in the .asm header.
+FMT_XY_XYZ_WORDS = [
+    0x3F800000, 0x40000000, 0x5A5A0008, 0x5A5A000C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A001C,
+    0x3F800000, 0x40000000, 0x5A5A0028, 0x5A5A002C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A003C,
+    0x3F800000, 0x40000000, 0x3F800000, 0x5A5A004C, 0x3F800000, 0x3F800000, 0x5A5A0058, 0x5A5A005C,
+    0x3F800000, 0x40000000, 0x5A5A0068, 0x5A5A006C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A007C,
+    0x00000000, 0x00000000, 0x5A5A0088, 0x5A5A008C, 0x00000000, 0x00000000, 0x00000000, 0x5A5A009C,
+    0x3F800000, 0x40000000, 0x5A5A00A8, 0x5A5A00AC, 0x00000000, 0x00000000, 0x00000000, 0x5A5A00BC,
+    0x3F800000, 0x40000000, 0x00000000, 0x00000000, 0x3F800000, 0x40000000, 0x40400000, 0x00000000,
+    0x40003C00, 0x00000000, 0xA5A50268, 0xA5A5026C, 0x40003C00, 0x00004200, 0xA5A50278, 0xA5A5027C,
+    0x3F800000, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0x0000FFFF, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
+    0x00030201, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
+    0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
@@ -176,7 +190,9 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_lds_raw", [132, 137, 100, 108, 131, 101, 149, 118]),
               ("cs_w64x_lds_war", [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031]),
               ("cs_w64x_sbarrier", [605, 605, 686, 686, 3032, 3013, 3032, 3031]),         # 128-thread group
-              ("cs_w64x_load_ballot_load", [43, 74, 75, 42, 42, 18, 41, 32])]
+              ("cs_w64x_load_ballot_load", [43, 74, 75, 42, 42, 18, 41, 32]),
+              # s_andn2_saveexec_b64 / s_andn2_wrexec_b64: EXEC = S0 & ~EXEC over both halves, D old / new EXEC, SCC
+              ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
@@ -340,26 +356,37 @@ def failure(code, output, lines):
     return f"exit {code}: {details or 'no test output'}"
 
 
-def fmt_1010102_test(tools, spirv, env=None):
-    """Check both packed stores and the untouched tail. The console dump stops at word 7."""
-    want = FMT_1010102_WORDS + [0xEEEEEEEE] * 48
+def dump_test(tools, spirv, name, want, words, env=None):
+    """Run one group with a heap of `words` words and compare the first len(want) words of the whole dump. The
+    console dump stops at word 7."""
     with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
         dump = Path(tmp) / "out.bin"
-        # VKC_OUT_WORDS sets a minimum. Pin this dispatch to a single group's 64 words.
-        child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS="64")
-        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, "cs_fmt_1010102.spv"),
+        # VKC_OUT_WORDS sets a minimum. Pin this dispatch to exactly `words` words.
+        child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS=str(words))
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"),
                         "1", "dump", env=child)
         if code:
             return failure(code, out, 3)
         if not dump.is_file():
             return "no VKC_DUMP file written"
         data = dump.read_bytes()
-    if len(data) != 4 * len(want):
-        return f"expected {4 * len(want)} dump bytes, got {len(data)}"
-    for i, (expected, got) in enumerate(zip(want, struct.unpack("<64I", data))):
+    if len(data) != 4 * words:
+        return f"expected {4 * words} dump bytes, got {len(data)}"
+    for i, (expected, got) in enumerate(zip(want, struct.unpack(f"<{words}I", data))):
         if got != expected:
             return f"word {i}: expected {expected:#010x}, got {got:#010x}"
     return ""
+
+
+def fmt_1010102_test(tools, spirv, env=None):
+    """Check both packed stores and the untouched tail of a single group's 64 words."""
+    return dump_test(tools, spirv, "cs_fmt_1010102", FMT_1010102_WORDS + [0xEEEEEEEE] * 48, 64, env)
+
+
+def fmt_xy_xyz_test(tools, spirv, env=None):
+    """TEST-185: the 84 result words and the untouched words after them, up to the inputs at 0x200. The heap needs
+    0x2d0 bytes, so it is 192 words."""
+    return dump_test(tools, spirv, "cs_fmt_xy_xyz", FMT_XY_XYZ_WORDS + [0xEEEEEEEE] * 44, 192, env)
 
 
 class Skip(str):
@@ -977,6 +1004,7 @@ def main():
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
+    results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",

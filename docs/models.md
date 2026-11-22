@@ -2,7 +2,8 @@
 
 Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
 upstream `rpf9-explorer` fix that closes it. The fix is merged upstream and the submodule is
-pinned at `917e9b9`.
+pinned at `e293917` (the 350,248-model counts below were measured at `917e9b9`, before
+upstream `v1.2` PRs #8–#12 landed).
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -12,11 +13,15 @@ dropped valid models in three validation paths, all in `third_party/rpf9-explore
 
 [Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
 fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged, and
-`third_party/rpf9-explorer` is pinned at upstream `917e9b9` (was `48557ea`). The later upstream
-commits add the `packs.rpf` drawable-dictionary roots (one drawable per entry), the TTPF
-array/cubemap/volume layouts, and the external drawable-skeleton reader. This page keeps the
-pre-pin measurements as the control and records the new pin's `packs.rpf` count below; it is not
-a competing patch.
+`third_party/rpf9-explorer` is now pinned at upstream `e293917` (was `917e9b9`, originally
+`48557ea`). Commits up to `917e9b9` added the `packs.rpf` drawable-dictionary roots (one drawable
+per entry), the TTPF compact/array/cubemap/volume layouts, and the external drawable-skeleton
+reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (PRs #8–#12:
+optional fragment pointers, skipping texture dictionaries in drawable-dictionary scans, 16-bit
+bone-palette indices, probe-count parity, and zero-radius drawables) plus BCPack BC1/BC3/BC4/BC5
+decoding (PR #7). The 350,248-model counts below were measured at `917e9b9` and have not yet been
+re-counted at `e293917`. This page keeps the pre-pin measurements as the control and records the
+`917e9b9` counts below; it is not a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
 Leonida, including 169 previously rejected candidates (also verified after archive readback). A
@@ -396,9 +401,8 @@ own light bones).
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
-2. **Done:** the pin is `917e9b9` (was `48557ea`).
-3. `tools/rpf9dump models` has been re-run over the model-bearing archives at the new pin; the
-   counts are in the table above. Triangle totals were not re-run, and the texture counts in
-   [textures.md](textures.md) come from the Python TTPF tool, which is independent of the
-   submodule pin.
+2. **Done:** the pin is `e293917` (was `917e9b9`, originally `48557ea`).
+3. `tools/rpf9dump models` was re-run over the model-bearing archives at `917e9b9` (counts in the
+   table above). A fresh re-count at `e293917` is still needed to measure the delta from upstream
+   `v1.2` PRs #8–#12. Triangle totals were not re-run.
 4. Keep the README and issue #29 in sync with the new counts.
