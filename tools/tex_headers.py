@@ -726,6 +726,21 @@ def same_output_path(first, second):
         return False
 
 
+def input_files(carve, archs):
+    """Yield (kind, path) for every file the scan reads from the selected carve archives.
+
+    Each archive contributes its ``index.json`` manifest and the ``<offset>.bin`` streams next to it.
+    A report path only has to match one of these, not the carve folder argument itself.
+    """
+    for arch in archs:
+        folder = os.path.join(carve, arch)
+        yield "manifest", os.path.join(folder, "index.json")
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.lower().endswith(".bin"):
+                    yield "blob", entry.path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve")
@@ -744,10 +759,9 @@ def main():
     path = a.out or os.path.join(a.carve, "textures_index.json")
     if os.path.isdir(path):
         ap.error(f"{path} is a directory, not a .json file")
-    for arch in archs:
-        manifest = os.path.join(a.carve, arch, "index.json")
-        if same_output_path(manifest, path):
-            ap.error(f"output would overwrite an input manifest: {path}")
+    for kind, source in input_files(a.carve, archs):
+        if same_output_path(source, path):
+            ap.error(f"output would overwrite an input {kind}: {path}")
     allt = []
     for arch in archs:
         try:
