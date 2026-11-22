@@ -534,6 +534,144 @@ class SIMDInterpreter:
         return results
 
 
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class CvtStatusFlags:
+    """Architectural status flags, condition codes, and saturation indicators."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    saturated: bool = False
+
+
+def evaluate_cvt_flags(
+    opcode: Opcode,
+    src_val: int,
+    res_val: int,
+    abs_mod: bool = False,
+    neg_mod: bool = False,
+    clamp: bool = False,
+) -> CvtStatusFlags:
+    """Evaluate architectural condition codes and status flags for conversion instructions."""
+    invalid = False
+    overflow = False
+    underflow = False
+    inexact = False
+    zero = False
+    negative = False
+    saturated = False
+
+    if opcode == Opcode.V_CVT_F64_I32:
+        s_val = u32_to_i32(src_val)
+        zero = (res_val == POS_ZERO_64 or res_val == NEG_ZERO_64)
+        negative = bool(res_val & SIGN_MASK_64)
+        if clamp:
+            if s_val < 0 or s_val > 1:
+                saturated = True
+            if s_val < 0:
+                underflow = True
+            elif s_val > 1:
+                overflow = True
+
+    elif opcode == Opcode.V_CVT_F64_U32:
+        u_val = src_val & MASK32
+        zero = (res_val == POS_ZERO_64)
+        negative = False
+        if clamp:
+            if u_val > 1:
+                saturated = True
+                overflow = True
+
+    elif opcode == Opcode.V_CVT_I32_F64:
+        s0 = apply_f64_modifiers(src_val, abs_mod, neg_mod)
+        if is_nan_f64(s0):
+            invalid = True
+            zero = True
+        elif is_inf_f64(s0):
+            invalid = True
+            overflow = True
+            saturated = True
+            if s0 == NEG_INF_64:
+                negative = True
+        else:
+            f = bits_to_f64(s0)
+            zero = (res_val == 0)
+            negative = bool(res_val & 0x8000_0000)
+            if math.trunc(f) != f:
+                inexact = True
+            if f >= INT32_MAX:
+                overflow = True
+                if f > INT32_MAX:
+                    saturated = True
+            elif f <= INT32_MIN:
+                underflow = True
+                if f < INT32_MIN:
+                    saturated = True
+            if is_subnormal_f64(s0):
+                underflow = True
+
+    elif opcode == Opcode.V_CVT_U32_F64:
+        s0 = apply_f64_modifiers(src_val, abs_mod, neg_mod)
+        if is_nan_f64(s0):
+            invalid = True
+            zero = True
+        elif is_inf_f64(s0):
+            invalid = True
+            if s0 == POS_INF_64:
+                overflow = True
+                saturated = True
+            else:
+                underflow = True
+                zero = True
+                saturated = True
+        else:
+            f = bits_to_f64(s0)
+            zero = (res_val == 0)
+            negative = False
+            if math.trunc(f) != f:
+                inexact = True
+            if f >= UINT32_MAX:
+                overflow = True
+                if f > UINT32_MAX:
+                    saturated = True
+            elif f < 0.0:
+                underflow = True
+                saturated = True
+            if is_subnormal_f64(s0):
+                underflow = True
+
+    return CvtStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero,
+        negative=negative,
+        saturated=saturated,
+    )
+
+
+def compute_f64_to_int_carry_borrow(val: float, is_signed: bool) -> Tuple[int, int]:
+    """Demonstrate 32-bit architectural boundary carry/borrow generation for float truncation."""
+    if math.isnan(val):
+        return 0, 0
+    t = int(math.trunc(val))
+    if is_signed:
+        carry = 1 if t > INT32_MAX else 0
+        borrow = 1 if t < INT32_MIN else 0
+    else:
+        carry = 1 if t > UINT32_MAX else 0
+        borrow = 1 if t < 0 else 0
+    return carry, borrow
+
+
 # ==============================================================================
 # Unit Tests: Mathematical Model and Reference Oracles
 # ==============================================================================
@@ -1152,6 +1290,99 @@ class TestRegisterAliasing(unittest.TestCase):
             # High word of original double in v1 remains untouched
             orig_hi = f64_bits_to_words(f64_to_bits(float(lane * 10) + 0.75))[1]
             self.assertEqual(state.vgprs[lane][1], orig_hi)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_exact_integer_flags(self) -> None:
+        # v_cvt_f64_i32(0) -> 0.0
+        res = oracle_v_cvt_f64_i32(0)
+        flags = evaluate_cvt_flags(Opcode.V_CVT_F64_I32, 0, res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.saturated)
+
+        # v_cvt_f64_i32(-5) -> -5.0
+        res_neg = oracle_v_cvt_f64_i32(-5)
+        flags_neg = evaluate_cvt_flags(Opcode.V_CVT_F64_I32, -5, res_neg)
+        self.assertFalse(flags_neg.zero)
+        self.assertTrue(flags_neg.negative)
+
+    def test_clamp_saturation_flags(self) -> None:
+        # v_cvt_f64_i32(-10, clamp=True) -> 0.0
+        res = oracle_v_cvt_f64_i32(-10, clamp=True)
+        flags = evaluate_cvt_flags(Opcode.V_CVT_F64_I32, -10, res, clamp=True)
+        self.assertTrue(flags.underflow)
+        self.assertTrue(flags.saturated)
+        self.assertTrue(flags.zero)
+
+        # v_cvt_f64_u32(100, clamp=True) -> 1.0
+        res_ov = oracle_v_cvt_f64_u32(100, clamp=True)
+        flags_ov = evaluate_cvt_flags(Opcode.V_CVT_F64_U32, 100, res_ov, clamp=True)
+        self.assertTrue(flags_ov.overflow)
+        self.assertTrue(flags_ov.saturated)
+
+    def test_inexact_truncation_flag(self) -> None:
+        # 12.345 truncated to 12
+        src = f64_to_bits(12.345)
+        res = oracle_v_cvt_i32_f64(src)
+        flags = evaluate_cvt_flags(Opcode.V_CVT_I32_F64, src, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.saturated)
+
+        # 12.0 exact integer
+        src_exact = f64_to_bits(12.0)
+        res_exact = oracle_v_cvt_i32_f64(src_exact)
+        flags_exact = evaluate_cvt_flags(Opcode.V_CVT_I32_F64, src_exact, res_exact)
+        self.assertFalse(flags_exact.inexact)
+
+    def test_overflow_and_saturation_flags(self) -> None:
+        # Float exceeding INT32_MAX
+        src_large = f64_to_bits(3e9)
+        res_large = oracle_v_cvt_i32_f64(src_large)
+        flags_large = evaluate_cvt_flags(Opcode.V_CVT_I32_F64, src_large, res_large)
+        self.assertTrue(flags_large.overflow)
+        self.assertTrue(flags_large.saturated)
+        self.assertEqual(res_large, INT32_MAX)
+
+        # Negative float underflow in u32
+        src_neg = f64_to_bits(-42.5)
+        res_u32 = oracle_v_cvt_u32_f64(src_neg)
+        flags_u32 = evaluate_cvt_flags(Opcode.V_CVT_U32_F64, src_neg, res_u32)
+        self.assertTrue(flags_u32.underflow)
+        self.assertTrue(flags_u32.saturated)
+        self.assertTrue(flags_u32.zero)
+
+    def test_invalid_nan_flags(self) -> None:
+        res = oracle_v_cvt_i32_f64(CANONICAL_QNAN_64)
+        flags = evaluate_cvt_flags(Opcode.V_CVT_I32_F64, CANONICAL_QNAN_64, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.zero)
+        self.assertEqual(res, 0)
+
+    def test_carry_borrow_generation(self) -> None:
+        # Float within signed range
+        c, b = compute_f64_to_int_carry_borrow(100.5, is_signed=True)
+        self.assertEqual(c, 0)
+        self.assertEqual(b, 0)
+
+        # Float exceeding INT32_MAX triggers carry
+        c_ov, b_ov = compute_f64_to_int_carry_borrow(2147483648.0, is_signed=True)
+        self.assertEqual(c_ov, 1)
+        self.assertEqual(b_ov, 0)
+
+        # Float below INT32_MIN triggers borrow
+        c_un, b_un = compute_f64_to_int_carry_borrow(-2147483649.0, is_signed=True)
+        self.assertEqual(c_un, 0)
+        self.assertEqual(b_un, 1)
+
+        # Negative float in unsigned context triggers borrow
+        c_u, b_u = compute_f64_to_int_carry_borrow(-1.0, is_signed=False)
+        self.assertEqual(c_u, 0)
+        self.assertEqual(b_u, 1)
 
 
 if __name__ == "__main__":
