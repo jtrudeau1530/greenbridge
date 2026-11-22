@@ -75,6 +75,10 @@ FIELD = {
 # Per-entity 64-bit archetype key (Murmur3-64 of the archetype name, docs/world_names.md); the engine name of
 # this member is not recovered.
 ARCHETYPE_KEY = 0xC8A7B90A
+# CMapData.entities and the measured terrain map-reference array and entity selector (docs/world.md).
+MAP_ENTITIES = 0xCCAB9307
+PARENT_MAPS = 0x75D16ADF
+PARENT_MAP_SLOT = 0x84799847
 LOD_NAMES = {0: "HD", 1: "LOD", 2: "SLOD1", 3: "SLOD2", 4: "SLOD3", 5: "ORPHAN_HD", 6: "SLOD4"}
 
 
@@ -148,13 +152,56 @@ def _r4(values):
     return [round(v, 4) for v in values] if values else None
 
 
+def _typed_member(schema, key, ty, width):
+    size, members = schema
+    m = members.get(key)
+    return m if m is not None and m[1] == ty and m[0] + width <= size else None
+
+
+def _placement_tables(b, blocks, map_schema, entity_schema):
+    """Index encoded entity references by their original slot in the declared map root."""
+    root = _u32(b, 0x20)
+    if not 1 <= root <= len(blocks):
+        return None, {}, ()
+    tag, size, at = blocks[root - 1]
+    name = _typed_member(map_schema, FIELD["name"], 0x4A, 4)
+    if (tag != MAPDATA or at is None or name is None or map_schema[0] > size
+            or at + map_schema[0] > len(b)):
+        return None, {}, ()
+
+    def array(key, block_type, fmt):
+        member = _typed_member(map_schema, key, 0x52, 12)
+        if member is None:
+            return ()
+        ref, count, capacity = struct.unpack_from("<QHH", b, at + member[0])
+        number, offset = ref & 0xFFFFF, ref >> 20
+        if not count or count > capacity or not 1 <= number <= len(blocks):
+            return ()
+        kind, length, base = blocks[number - 1]
+        end = offset + count * struct.calcsize("<" + fmt)
+        if kind != block_type or base is None or end > length or base + end > len(b):
+            return ()
+        return struct.unpack_from(f"<{count}{fmt}", b, base + offset)
+
+    ordinals = {}
+    for i, ref in enumerate(array(MAP_ENTITIES, 7, "Q")):
+        # A repeated reference has no unique ordinal. Other classes still occupy their authored slots.
+        ordinals[ref] = None if ref in ordinals else i
+    parents = ()
+    if (ordinals and _typed_member(entity_schema, PARENT_MAP_SLOT, 0x10, 1)
+            and _typed_member(entity_schema, FIELD["parentIndex"], 0x12, 2)
+            and _typed_member(entity_schema, FIELD["parentInstance"], 0x12, 2)):
+        parents = array(PARENT_MAPS, 0x4A, "I")
+    return f"{_u32(b, at + name[0]):08x}", ordinals, parents
+
+
 def parse_resource(b, collect=None):
     """Return a row dict for a 0x7a resource, or None if the header/schema does not validate.
 
     When ``collect`` is given (a list, or an object with ``append`` such as ``ArchetypeCounts``), one dict per
     CEntityDef is appended to it. ``complete`` is False for an entity whose record is not entirely inside ``b``,
-    including every entity of a block whose start lies past the end of ``b``. The CLI uses it only for
-    ``--archetypes-out``, which writes aggregate counts.
+    including every entity of a block whose start lies past the end of ``b``. The CLI uses collectors for
+    ``--archetypes-out`` counts and ``--entities-out`` placement rows.
     """
     if len(b) < 0x50 or b[0x10:0x14] != SIGNATURE or b[0x14] != VERSION:
         return None
@@ -204,11 +251,14 @@ def parse_resource(b, collect=None):
 
     em = structs[ENTITY][1]
     mm = structs[MAPDATA][1]
+    map_name, ordinals, parents = None, {}, ()
+    if getattr(collect, "placement_ids", False):
+        map_name, ordinals, parents = _placement_tables(b, blocks, structs[MAPDATA], structs[ENTITY])
     lod = {}
     archetypes = set()
     positions = []
     lod_dists = []
-    for name, size, off in blocks:
+    for block_number, (name, size, off) in enumerate(blocks, 1):
         if name != ENTITY or entity_size == 0 or size % entity_size:
             continue
         if off is None:
@@ -232,7 +282,7 @@ def parse_resource(b, collect=None):
             if isinstance(dist, float) and dist >= 0:
                 lod_dists.append(dist)
             if collect is not None:
-                collect.append({
+                entity = {
                     "complete": o + entity_size <= len(b),
                     "archetype": a,
                     "archetype_key": _value(b, o, em.get(ARCHETYPE_KEY)),
@@ -248,7 +298,16 @@ def parse_resource(b, collect=None):
                     "num_children": _value(b, o, em.get(FIELD["numChildren"])),
                     "lod_dist": dist,
                     "child_lod_dist": _value(b, o, em.get(FIELD["childLodDist"])),
-                })
+                }
+                # Match a typed record start exactly, without renumbering or reordering the legacy rows.
+                ordinal = ordinals.get(((k * entity_size) << 20) | block_number) if ordinals else None
+                if ordinal is not None and entity["complete"]:
+                    entity.update(map_name=map_name, entity_index=ordinal)
+                    if parents and entity["parent_instance"] == -1 and entity["parent_index"] >= 0:
+                        slot = _value(b, o, em[PARENT_MAP_SLOT])
+                        if slot is not None and 0 <= slot < len(parents):
+                            entity["parent_map_name"] = f"{parents[slot]:08x}"
+                collect.append(entity)
     row.update({
         "kind": "map",
         "entity_size": entity_size,
@@ -543,6 +602,7 @@ class EntityRows:
 
     FIELDS = ("position", "rotation", "scale_xy", "scale_z", "lod_level", "parent_index", "num_children",
               "lod_dist", "child_lod_dist")
+    placement_ids = True
 
     def __init__(self, handle):
         self.handle = handle
@@ -558,6 +618,9 @@ class EntityRows:
             row["key"] = f"{entity['archetype_key']:016x}"
         for k in self.FIELDS:
             row[k] = entity.get(k)
+        for k in ("map_name", "entity_index", "parent_map_name"):
+            if k in entity:
+                row[k] = entity[k]
         self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         self.written += 1
 
@@ -567,6 +630,7 @@ class _Both:
 
     def __init__(self, *sinks):
         self.sinks = [x for x in sinks if x is not None]
+        self.placement_ids = any(getattr(x, "placement_ids", False) for x in self.sinks)
 
     def append(self, entity):
         for x in self.sinks:

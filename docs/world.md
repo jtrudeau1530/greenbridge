@@ -464,6 +464,16 @@ output is aggregate (one row per resource). `--entities-out` adds a local-only J
 complete entity (archetype hash and key, position, stored rotation, scales, LOD fields), the input of
 `world_build.py --placements` below.
 
+For a complete placement uniquely referenced by the map root, `map_name` is the source map's 32-bit name
+hash (eight lowercase hex digits) and `entity_index` is its zero-based ordinal in the authored `entities`
+array. Other classes may occupy slots in that array. The JSONL keeps its physical record order.
+For the ordinary terrain case (`parentInstance == -1`, a nonnegative `parent_index` and a valid signed
+map selector), `parent_map_name` holds the selected map hash in the same format. Match
+`(parent_map_name, parent_index)` to a unique `(map_name, entity_index)` across the input maps.
+These fields are optional. Older exports, unavailable references and unsupported parent forms can lack
+the corresponding keys. A missing or ambiguous target stays unresolved, including when a scan covers only
+part of the map set.
+
 `tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
 `0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
 with 98.32% stream coverage; the exactness condition and byte accounting are in
