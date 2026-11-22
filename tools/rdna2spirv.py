@@ -224,6 +224,7 @@ class Gen:
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
         self.ever_mask = set()         # SGPRs that held a lane mask anywhere in the shader (conservative)
         self.cur_masks = {}
+        self.cur_ins = None
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
         self.write_all_lanes = False
         self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
@@ -1005,6 +1006,22 @@ class Gen:
         self.emit(f"OpStore %active {self.tmp_bool_nz(mask_u)}")
         self.uses_active = True
 
+    def vcc_half_keeps_mask(self):
+        """Whether the current wave64 vcc_lo / vcc_hi write keeps VCC as a lane mask (put_mask on that half) rather
+        than replacing it with plain scalar data (s_buffer_load_dword vcc_lo, scalar ALU, non-mask constant, ...)."""
+        if "vcc" not in self.cur_masks:
+            return False
+        if self.cur_ins is None:
+            return True
+        st = dict(self.cur_masks)
+        for x in self.cur_ins["args"][1:]:
+            if x.get("k") == "sgpr" and x.get("n", 1) == 1:
+                r = x["r"]
+                if r not in st and self.sgpr_imm.get(r) in (0, 0xFFFFFFFF):
+                    st[r] = lane_masks.EITHER
+        lane_masks.step(st, self.cur_ins)
+        return st.get("vcc") in lane_masks.MASK_KINDS
+
     def dst(self, a, val, *, eager=False):
         if a.get("sdwa_dst") and a["k"] == "vgpr":
             val = self.sdwa_dst(a, val)
@@ -1043,7 +1060,7 @@ class Gen:
             self.emit(f"OpStore {p} {r}")
         elif a["k"] == "sgpr" and a.get("n", 1) == 1:
             self.store_reg(a["k"], a["r"], val)
-        elif self.wave64 and a["k"] == "special" and a["t"] in ("vcc_lo", "vcc_hi") and "vcc" in self.cur_masks:
+        elif self.wave64 and a["k"] == "special" and a["t"] in ("vcc_lo", "vcc_hi") and self.vcc_half_keeps_mask():
             # One half of a wave64 VCC lane mask (VCC_LO = VCC[31:0], VCC_HI = VCC[63:32]): the other half's lanes
             # keep their bit, as for exec_lo / exec_hi. %vcc_hi still gets the word for a later read as data.
             self.put_mask(a, val, a["t"][-2:])
@@ -4229,6 +4246,7 @@ class Gen:
         under sext()) before the op and its neg/abs, and a VGPR result is placed at dst_sel with dst_unused
         deciding the other bits (PAD = zero, SEXT = sign-extend, PRESERVE = keep the old bits). VOPC has no
         dst_sel; v_cmpx (GFX10) has no written destination operand."""
+        self.cur_ins = ins
         self.cur_masks = self.lane_masks.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
