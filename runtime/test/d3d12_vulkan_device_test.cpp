@@ -980,6 +980,78 @@ int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts)
     return mismatches;
 }
 
+// D3D12_FEATURE_SHADER_MODEL and D3D12_FEATURE_ROOT_SIGNATURE must give the host PC runtime's HRESULT, with the
+// highest supported value clamped to what the layer can honour (DXIL 1.0, root signature 1.1). Returns the number
+// of mismatches, or -1 when the host has no D3D12 device.
+int compare_feature_support(ID3D12Device* ours) {
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                    reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                              : nullptr;
+    Ref<ID3D12Device> host;
+    if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return -1;
+    int mismatches = 0;
+    const auto report = [&](const char* what, UINT request, HRESULT got_hr, UINT got, HRESULT want_hr, UINT want) {
+        if (got_hr == want_hr && (FAILED(got_hr) || got == want)) return;
+        if (mismatches++ < 8)
+            std::fprintf(stderr, "%s request 0x%02x: ours hr=0x%08lX value 0x%02x; host hr=0x%08lX value 0x%02x\n",
+                         what, request, static_cast<unsigned long>(got_hr), got,
+                         static_cast<unsigned long>(want_hr), want);
+    };
+
+    // 5.1 upwards: D3D12's own baseline, which every SDK names, then 6.0-6.9 by number (only 6.0 is guaranteed to be
+    // named by every SDK that has the query at all). And only values the runtime defines go to the host: it crashed
+    // the process on an undefined one (0x5f, and once on 0), so the layer's refusal of an undefined value is checked
+    // in main.
+    const D3D_SHADER_MODEL models[] = {
+        D3D_SHADER_MODEL_5_1, D3D_SHADER_MODEL_6_0, static_cast<D3D_SHADER_MODEL>(0x61),
+        static_cast<D3D_SHADER_MODEL>(0x62),
+        static_cast<D3D_SHADER_MODEL>(0x63), static_cast<D3D_SHADER_MODEL>(0x64),
+        static_cast<D3D_SHADER_MODEL>(0x65), static_cast<D3D_SHADER_MODEL>(0x66),
+        static_cast<D3D_SHADER_MODEL>(0x67), static_cast<D3D_SHADER_MODEL>(0x68),
+        static_cast<D3D_SHADER_MODEL>(0x69)};
+    for (const D3D_SHADER_MODEL model : models) {
+        D3D12_FEATURE_DATA_SHADER_MODEL ours_data{model}, host_data{model};
+        const HRESULT ours_hr =
+            ours->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &ours_data, sizeof(ours_data));
+        const HRESULT host_hr =
+            host->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &host_data, sizeof(host_data));
+        const UINT want = std::min<UINT>(static_cast<UINT>(host_data.HighestShaderModel),
+                                         static_cast<UINT>(D3D_SHADER_MODEL_6_0));
+        report("shader model", static_cast<UINT>(model), ours_hr,
+               static_cast<UINT>(ours_data.HighestShaderModel), host_hr, want);
+    }
+
+    // 0x3 is 1.2 by number: SDKs without the 1.2 headers do not name it (runtime/CMakeLists.txt probes for that).
+    const D3D_ROOT_SIGNATURE_VERSION versions[] = {D3D_ROOT_SIGNATURE_VERSION_1_0, D3D_ROOT_SIGNATURE_VERSION_1_1,
+                                                   static_cast<D3D_ROOT_SIGNATURE_VERSION>(0x3)};
+    for (const D3D_ROOT_SIGNATURE_VERSION version : versions) {
+        D3D12_FEATURE_DATA_ROOT_SIGNATURE ours_data{version}, host_data{version};
+        const HRESULT ours_hr =
+            ours->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &ours_data, sizeof(ours_data));
+        const HRESULT host_hr =
+            host->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &host_data, sizeof(host_data));
+        const UINT want = std::min<UINT>(static_cast<UINT>(host_data.HighestVersion),
+                                         static_cast<UINT>(D3D_ROOT_SIGNATURE_VERSION_1_1));
+        report("root signature", static_cast<UINT>(version), ours_hr,
+               static_cast<UINT>(ours_data.HighestVersion), host_hr, want);
+    }
+
+    // A wrong DataSize is refused by both, in both queries.
+    {
+        D3D12_FEATURE_DATA_SHADER_MODEL ours_data{D3D_SHADER_MODEL_6_0};
+        D3D12_FEATURE_DATA_ROOT_SIGNATURE ours_root{D3D_ROOT_SIGNATURE_VERSION_1_1};
+        if (SUCCEEDED(ours->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &ours_data, sizeof(ours_data) - 1)))
+            ++mismatches;
+        if (SUCCEEDED(ours->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &ours_root, sizeof(ours_root) - 1)))
+            ++mismatches;
+        if (SUCCEEDED(ours->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, nullptr, sizeof(ours_data))))
+            ++mismatches;
+        if (SUCCEEDED(ours->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, nullptr, sizeof(ours_root))))
+            ++mismatches;
+    }
+    return mismatches;
+}
 
 }  // namespace
 
@@ -1123,6 +1195,45 @@ int main() {
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
         EXPECT(footprint_mismatches <= 0);
+
+        // Shader model and root signature (D3D-86): the answers are only useful if the game can rely on them, so
+        // pin both the ceiling and the refusal cases rather than just comparing with the host.
+        {
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))));
+            EXPECT(model.HighestShaderModel == D3D_SHADER_MODEL_6_0);
+            // 5.1 is D3D12's baseline and the host answers it, so a caller asking for the minimum must get it back.
+            D3D12_FEATURE_DATA_SHADER_MODEL baseline{D3D_SHADER_MODEL_5_1};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &baseline, sizeof(baseline))));
+            EXPECT(baseline.HighestShaderModel == D3D_SHADER_MODEL_5_1);
+            D3D12_FEATURE_DATA_SHADER_MODEL above{static_cast<D3D_SHADER_MODEL>(0x69)};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &above, sizeof(above))));
+            EXPECT(above.HighestShaderModel == D3D_SHADER_MODEL_6_0);  // clamped to what the layer accepts
+            D3D12_FEATURE_DATA_SHADER_MODEL below{static_cast<D3D_SHADER_MODEL>(0)};
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &below, sizeof(below))));
+
+            D3D12_FEATURE_DATA_ROOT_SIGNATURE signature{D3D_ROOT_SIGNATURE_VERSION_1_1};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &signature, sizeof(signature))));
+            EXPECT(signature.HighestVersion == D3D_ROOT_SIGNATURE_VERSION_1_1);
+            D3D12_FEATURE_DATA_ROOT_SIGNATURE newer{static_cast<D3D_ROOT_SIGNATURE_VERSION>(0x3)};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &newer, sizeof(newer))));
+            EXPECT(newer.HighestVersion == D3D_ROOT_SIGNATURE_VERSION_1_1);
+            D3D12_FEATURE_DATA_ROOT_SIGNATURE undefined{static_cast<D3D_ROOT_SIGNATURE_VERSION>(0)};
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &undefined, sizeof(undefined))));
+            // A wrong DataSize and a null buffer are refused for both queries.
+            D3D12_FEATURE_DATA_SHADER_MODEL short_model{D3D_SHADER_MODEL_6_0};
+            D3D12_FEATURE_DATA_ROOT_SIGNATURE short_signature{D3D_ROOT_SIGNATURE_VERSION_1_1};
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &short_model,
+                                                      sizeof(short_model) - 1)));
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &short_signature,
+                                                      sizeof(short_signature) - 1)));
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, nullptr, sizeof(short_model))));
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, nullptr, sizeof(short_signature))));
+        }
+        const int feature_mismatches = compare_feature_support(device.p);
+        if (feature_mismatches < 0)
+            std::printf("CheckFeatureSupport: no host D3D12 device to compare with, skipped\n");
+        EXPECT(feature_mismatches <= 0);
         const int allocation_mismatches = compare_allocation_info(device.p);
         if (allocation_mismatches < 0)
             std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");

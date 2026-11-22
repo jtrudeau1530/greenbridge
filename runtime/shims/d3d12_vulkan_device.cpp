@@ -33,6 +33,14 @@ namespace {
 constexpr UINT kDescriptorSize = 32;
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 
+// The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
+// game's shaders arrive as SPIR-V from the offline translator, and the only DXIL path (the BVH builder) is lowered
+// to standard DXIL, whose baseline is 6.0. Answering the driver's own maximum would tell the game it can hand this
+// layer shaders it has no front end for, which section 4.1 of docs/d3d12_vulkan.md calls worse than a false
+// "unsupported" at boot. Raise these when a front end for the higher version lands.
+constexpr D3D_SHADER_MODEL kHighestShaderModel = D3D_SHADER_MODEL_6_0;
+constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+
 void log_once(const char* what, int value) {
     static std::mutex mutex;
     static std::set<std::pair<std::string, int>> seen;
@@ -2020,6 +2028,25 @@ public:
             if (result == VK_SUCCESS && (image_properties.sampleCounts & samples))
                 levels->NumQualityLevels = 1;
             return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_SHADER_MODEL: {
+            if (size != sizeof(D3D12_FEATURE_DATA_SHADER_MODEL)) return E_INVALIDARG;
+            auto* model = static_cast<D3D12_FEATURE_DATA_SHADER_MODEL*>(data);
+            // Measured against the host PC runtime: a request above the supported model is clamped down to it, 5.1
+            // is echoed because it is D3D12's own baseline (WARP and the RTX 5070 both answer it with S_OK), and a
+            // value below it is refused with E_INVALIDARG (0x5f crashed the host, so the test does not probe it).
+            // Refuse the same way instead of echoing an unrepresentable value back.
+            if (model->HighestShaderModel < D3D_SHADER_MODEL_5_1) return E_INVALIDARG;
+            if (model->HighestShaderModel > kHighestShaderModel) model->HighestShaderModel = kHighestShaderModel;
+            return S_OK;
+        }
+        case D3D12_FEATURE_ROOT_SIGNATURE: {
+            if (size != sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE)) return E_INVALIDARG;
+            auto* root = static_cast<D3D12_FEATURE_DATA_ROOT_SIGNATURE*>(data);
+            if (root->HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_0) return E_INVALIDARG;
+            if (root->HighestVersion > kHighestRootSignatureVersion)
+                root->HighestVersion = kHighestRootSignatureVersion;
+            return S_OK;
         }
         default:
             // Not answered yet. The log above lists every query; answers are added as the trace asks for them.
