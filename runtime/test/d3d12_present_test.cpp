@@ -1,9 +1,10 @@
 // Milestone M0 (docs/d3d12_vulkan.md section 6): a window shows a stable clear colour for 60 frames, through the
 // Vulkan-backed device behind the Xbox-ABI proxy, with no Vulkan validation errors. Each frame resets the list,
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
-// The window is then resized, which recreates the swapchain and scales the blit. Last, the colour on screen is read
-// back with GDI when the window is in front and the display is in SDR (skipped otherwise, e.g. in HDR
-// or on a locked desktop). No shaders or game data.
+// The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
+// back (the presenter's capture) and must hold the clear colour at the swapchain's size. Last, the colour on screen
+// is read back with GDI when the window is in front, the display is in SDR and GDI can read the screen (skipped
+// otherwise, e.g. in HDR, on a locked desktop or under Wine's macOS driver). No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -284,6 +285,7 @@ int main() {
         rt::d3d12::set_device_outer(inner, device.p);
         auto presenter = rt::d3d12::create_window_presenter(inner, window);
         EXPECT(presenter);
+        EXPECT(presenter->enable_capture());  // every presented frame is copied back, for the colour checks
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -323,6 +325,28 @@ int main() {
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         ID3D12CommandList* lists[] = {list.p};
         UINT64 signalled = 0;
+        // The last presented frame as the swapchain holds it: the whole image is the cleared colour at the size the
+        // presenter reports. This reads the image the presentation engine was given, so it holds wherever the screen
+        // itself cannot be read back.
+        const auto presented_image_is_clear_colour = [&]() -> bool {
+            std::vector<std::uint8_t> pixels;
+            VkExtent2D size{};
+            VkFormat format = VK_FORMAT_UNDEFINED;
+            if (!presenter->read_back(pixels, &size, &format)) return false;
+            const VkExtent2D current = presenter->extent();
+            if (size.width != current.width || size.height != current.height) return false;
+            const bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+            for (std::size_t i = 0; i < pixels.size(); i += 4) {
+                const int r = pixels[i + (bgra ? 2 : 0)], g = pixels[i + 1], b = pixels[i + (bgra ? 0 : 2)];
+                if (std::abs(r - 51) > 1 || std::abs(g - 153) > 1 || std::abs(b - 230) > 1) {
+                    const std::size_t texel = i / 4;
+                    std::fprintf(stderr, "presented image %ux%u: %d,%d,%d at %zu,%zu (cleared to 51,153,230)\n",
+                                 size.width, size.height, r, g, b, texel % size.width, texel / size.width);
+                    return false;
+                }
+            }
+            return true;
+        };
         // `arm` runs just before the present, so an injection it sets up hits the presenter, not the list's work.
         const auto frame = [&](UINT sync_interval, const std::function<void()>& arm = {}) -> bool {
             pump();
@@ -355,6 +379,7 @@ int main() {
         EXPECT(presenter->presented() == 60 - driver::out_of_date);
         const VkExtent2D first = presenter->extent();
         EXPECT(first.width == width && first.height == height);
+        EXPECT(presented_image_is_clear_colour());
 
         // A resize recreates the swapchain; the 320x240 back buffer is scaled to the new size. Unsynchronised
         // presents (sync interval 0) switch the present mode on the way.
@@ -362,8 +387,14 @@ int main() {
         for (int i = 0; i < 10; ++i) EXPECT(frame(i < 5 ? 1 : 0));
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
         EXPECT(presenter->presented() == 70 - driver::out_of_date);
+        EXPECT(presented_image_is_clear_colour());  // the 320x240 back buffer scaled to the whole 400x300 image
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
         const unsigned real_out_of_date = driver::out_of_date;
+
+        // Three of the failures below make the runtime log "[rt] d3d12: present failed"; say so first, so the log is
+        // not read as a fault.
+        std::fprintf(stderr, "injecting presenter failures: the next three \"present failed\" lines (VkResult "
+                             "-1000001004 twice, then -1) are expected\n");
 
         // Failures injected by the driver double (VictorJulianiR's review of the presenter):
         // 1. Present statuses: OUT_OF_DATE was not shown, so it is not counted; SUBOPTIMAL was, so it is.
@@ -414,13 +445,17 @@ int main() {
         EXPECT(frame(1));
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
         driver::report_undefined_extent = false;
+        EXPECT(presented_image_is_clear_colour());
 
         std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
                     "released and retried, a failed blit submission recovered, undefined surface extent resolved "
                     "(%u real out-of-date presents)\n",
                     real_out_of_date);
 
-        // What reached the screen: the centre of the client area, if the window is in front.
+        // What reached the screen: the centre of the client area, if the window is in front. This needs GDI to read
+        // the screen, which not every window system gives it: under Wine's macOS driver the screen DC reads nothing
+        // (GetPixel returns CLR_INVALID even for a pixel GDI itself painted), so there the swapchain checks above are
+        // what confirms the colour.
         Sleep(200);
         pump();
         if (GetForegroundWindow() == window && !IsIconic(window)) {
@@ -434,11 +469,15 @@ int main() {
                 HDC screen = GetDC(nullptr);
                 const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
                 ReleaseDC(nullptr, screen);
-                const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
-                std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
-                EXPECT(pixel != CLR_INVALID);
-                EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
-                screen_checked = true;
+                if (pixel == CLR_INVALID) {
+                    std::printf("GDI cannot read the screen here (GetPixel on the screen DC returns CLR_INVALID): "
+                                "on-screen colour check skipped, the colour was checked in the presented images\n");
+                } else {
+                    const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
+                    std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
+                    EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
+                    screen_checked = true;
+                }
             }
         } else {
             std::printf("the window is not in front: on-screen colour check skipped\n");
@@ -454,6 +493,6 @@ int main() {
         return 1;
     }
     std::printf("M0: 70 frames cleared and presented through the Xbox-ABI proxy on Vulkan, swapchain recreated on "
-                "resize%s\n", screen_checked ? ", colour confirmed on screen" : "");
+                "resize, colour confirmed in the presented images%s\n", screen_checked ? " and on screen" : "");
     return 0;
 }
