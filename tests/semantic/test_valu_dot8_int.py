@@ -1048,5 +1048,78 @@ class TestValuDot8IntBoundaryExtremes(unittest.TestCase):
         self.assertEqual(res_sat, UINT32_MAX)
 
 
+# ---------------------------------------------------------------------------
+# Negative Controls, Syntax Rejection, and Mutation Detection Tests
+# ---------------------------------------------------------------------------
+
+class TestValuDot8IntNegativeControls(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection unit tests."""
+
+    def test_rejection_of_sgpr_as_valu_destination(self) -> None:
+        interp = Dot8IntScalarInterpreter()
+        with self.assertRaises(ValueError):
+            interp.execute_asm(["v_dot8_u32_u4 s0, v1, v2, v3"])
+
+    def test_rejection_of_out_of_bounds_registers(self) -> None:
+        interp = Dot8IntScalarInterpreter()
+        with self.assertRaises(IndexError):
+            interp.rf.read_operand(ASTOperand(kind=OperandKind.VGPR, reg_num=256))
+        with self.assertRaises(IndexError):
+            interp.rf.read_operand(ASTOperand(kind=OperandKind.SGPR, reg_num=106))
+
+    def test_rejection_of_unrecognized_opcode(self) -> None:
+        with self.assertRaises(NotImplementedError):
+            parse_instruction("v_dot8_unknown_op v0, v1, v2, v3")
+
+    def test_rejection_of_malformed_instruction_syntax(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_instruction("v_dot8_u32_u4 v0, v1")
+        with self.assertRaises(ValueError):
+            parse_instruction("")
+
+    def test_rejection_of_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_mutation_bit_flip_sensitivity(self) -> None:
+        s0 = pack_u4(1, 2, 3, 4, 5, 6, 7, 8)
+        s1 = pack_u4(1, 1, 1, 1, 1, 1, 1, 1)
+        acc = 100
+        baseline = ref_dot8_u32_u4(s0, s1, acc)
+
+        for bit_pos in range(32):
+            s0_mutated = s0 ^ (1 << bit_pos)
+            mutated_res = ref_dot8_u32_u4(s0_mutated, s1, acc)
+            self.assertNotEqual(
+                mutated_res,
+                baseline,
+                f"Bit flip at bit {bit_pos} failed to perturb output",
+            )
+
+    def test_mutation_nibble_order_divergence(self) -> None:
+        s0 = pack_u4(1, 5, 1, 1, 1, 1, 1, 1)
+        s1 = pack_u4(2, 4, 1, 1, 1, 1, 1, 1)
+        base_dot = ref_dot8_u32_u4(s0, s1, 0)
+
+        # Swap nibble 0 and nibble 1 in s0
+        s0_swapped = pack_u4(5, 1, 1, 1, 1, 1, 1, 1)
+        mutated_dot = ref_dot8_u32_u4(s0_swapped, s1, 0)
+        self.assertNotEqual(base_dot, mutated_dot)
+
+    def test_mutation_signedness_divergence_detection(self) -> None:
+        s0 = pack_i4(-1, -2, -3, -4, -1, -2, -3, -4)
+        s1 = pack_i4(1, 1, 1, 1, 1, 1, 1, 1)
+
+        signed_res = ref_dot8_i32_i4(s0, s1, 0)
+        unsigned_res = ref_dot8_u32_u4(s0, s1, 0)
+
+        self.assertEqual(signed_res, (-20) & MASK32)
+        # Unsigned: 15*2 + 14*2 + 13*2 + 12*2 = 30 + 28 + 26 + 24 = 108
+        self.assertEqual(unsigned_res, 108)
+        self.assertNotEqual(signed_res, unsigned_res)
+
+
 if __name__ == "__main__":
     unittest.main()
