@@ -750,7 +750,13 @@ public:
         *out = static_cast<IDXGIAdapter*>(adapter);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND hwnd, UINT) override { assoc_hwnd_ = hwnd; return S_OK; }
+    HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND hwnd, UINT flags) override {
+        // Host-measured: only the three documented bits are accepted; any other bit is DXGI_ERROR_INVALID_CALL.
+        constexpr UINT known = DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_PRINT_SCREEN;
+        if (flags & ~known) return DXGI_ERROR_INVALID_CALL;
+        assoc_hwnd_ = hwnd;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetWindowAssociation(HWND* hwnd) override {
         if (!hwnd) return E_INVALIDARG;
         *hwnd = assoc_hwnd_;
