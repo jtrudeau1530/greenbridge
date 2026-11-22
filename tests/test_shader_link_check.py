@@ -427,6 +427,23 @@ class CommandLineTest(unittest.TestCase):
                 self.assertIn("shader_link_check: error:", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
+    def test_corpus_style_names_are_accepted_and_paths_are_not(self):
+        # make_game's corpus names (shader_carve stems) contain "~", "!", "&", "(", a leading "." and more: 21,043 of
+        # 26,503 on a 1.0.2.1 copy failed the old [a-zA-Z0-9_.-] rule. Only names that leave --shader-dir fail.
+        for stem in ("VS~1", "pixel!2&x", "a(b)c", "x y", "_~-.ok", ".dotted"):
+            with self.subTest(stem=stem):
+                (self.directory / (stem + ".spv")).write_bytes(self.vs.read_bytes())
+                self.write_manifest({"name": "n", "vs": stem, "ps": "pixel"})
+                result = self.run_batch()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for stem in ("../vertex", "..", ".", "sub/vertex", "sub\\vertex", "C:vertex", "a|b", "a\x00b",
+                     " vertex", ""):
+            with self.subTest(stem=stem):
+                self.write_manifest({"name": "n", "vs": stem, "ps": "pixel"})
+                result = self.run_batch()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("expected a shader name without directories", result.stderr)
+
     def test_report_preserves_inputs(self):
         original = self.vs.read_bytes()
         result = self.command("check", "--vs", self.vs, "--ps", self.ps, "--report", self.vs)
