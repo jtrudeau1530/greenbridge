@@ -18,3 +18,4 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Polski (Polish) (`pl-PL`) | [`pl-PL/quickstart.md`](pl-PL/quickstart.md) | `c0ac5fd6` | `@Dom-in` |
 | Türkçe (`tr`) | [`tr/quickstart.md`](tr/quickstart.md) | `f85582e` | `@emirhan-karaca` |
 | Русский (`ru`) | [`ru/quickstart.md`](ru/quickstart.md) | `a0acd33` | `@DmitryBykov-ISPO` |
+| 日本語 (`ja`) | [`ja/quickstart.md`](ja/quickstart.md) | `003e781` | `@bingll123` |
