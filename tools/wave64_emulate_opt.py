@@ -45,7 +45,7 @@ BRANCHES = frozenset({
 _SCC_IMPLICIT_READS = frozenset({
     "s_cbranch_scc0", "s_cbranch_scc1",
     "s_cselect_b32", "s_cselect_b64",
-    "s_cmov_b32", "s_cmov_b64",
+    "s_cmov_b32", "s_cmov_b64", "s_cmovk_i32",
     "s_addc_u32", "s_subb_u32",
 })
 
@@ -258,7 +258,7 @@ def _scalar_rw(ins):
         rd |= 1 << _BIT_VCC
     if reads_scc(ins):
         rd |= 1 << _BIT_SCC
-    if op.startswith(("ds_", "s_sendmsg", "v_interp")):
+    if op.startswith(("ds_", "s_sendmsg", "v_interp", "v_movrel", "v_swaprel")):
         rd |= 1 << _BIT_M0
     if op == "s_cmov_b32" or op == "s_cmov_b64":
         # Conditional move preserves destination when SCC == 0, so it also reads destination.

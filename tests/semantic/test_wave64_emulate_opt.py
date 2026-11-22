@@ -971,6 +971,90 @@ class LocalExecFoldTests(unittest.TestCase):
         spv2, _ = _translate_encoded("cs_neg_vcc_scc", insns_vcc_scc, (64, 1, 1), emulate=True)
         self.assertGreaterEqual(spv2.count("OpAtomicOr"), 2)  # branch vote + scc_from_mask vote
 
+    def test_s_cmovk_i32_keeps_scc_live_and_blocks_execz_fold(self):
+        # 1) s_cmovk_i32 implicitly reads SCC: s_and_saveexec_b64 must keep its cross-half SCC vote.
+        insns_vote = [
+            ("s_mov_b32 s14, 222", 4),
+            ("v_cmp_eq_u32_e64 s[10:11], 50, v0", 8),
+            ("s_and_saveexec_b64 s[12:13], s[10:11]", 4),
+            ("s_cmovk_i32 s14, 111", 4),
+            ("s_mov_b64 exec, -1", 4),
+            ("v_mov_b32_e32 v5, s14", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v5, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv1, _ = _translate_encoded("cs_cmovk_scc_live", insns_vote, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv1.count("OpAtomicOr"), 1)
+        mem1, _ = run_emulated_workgroup(spv1, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem1[lane * 4], 111, f"lane {lane}")
+
+        # 2) Region writing SCC when s_cmovk_i32 reads SCC after join MUST NOT fold (64 & 128 threads).
+        insns_fold = [
+            ("s_mov_b32 s14, 222", 4),
+            ("s_cmp_eq_u32 s14, 222", 4),
+            ("v_cmp_lt_u32_e64 s[6:7], 40, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 2", 4),
+            ("s_cmp_eq_u32 s14, 0", 4),
+            ("v_add_nc_u32_e32 v4, 1, v0", 4),
+            ("s_mov_b64 exec, -1", 4),
+            ("s_cmovk_i32 s14, 111", 4),
+            ("v_mov_b32_e32 v5, s14", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v5, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        for lx in (64, 128):
+            spv2, _ = _translate_encoded(f"cs_cmovk_no_fold_{lx}", insns_fold, (lx, 1, 1), emulate=True)
+            self.assertGreaterEqual(spv2.count("OpAtomicOr"), 1)
+            mem2, _ = run_emulated_workgroup(spv2, (lx, 1, 1), push_constants=VSHARP + [0] * 28)
+            for lane in range(lx):
+                self.assertEqual(mem2[lane * 4], 222, f"lx={lx} lane={lane}")
+
+        # 3) Every opcode in tools/rdna2spirv.py that emits `OpLoad %uint %scc` must satisfy reads_scc().
+        src_path = os.path.join(os.path.dirname(os.path.dirname(HERE)), "tools", "rdna2spirv.py")
+        with open(src_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        scc_ops = set()
+        for i, line in enumerate(lines):
+            if "OpLoad %uint %scc" not in line:
+                continue
+            for j in range(i, max(-1, i - 25), -1):
+                m_ops = re.findall(r'"(s_[a-z0-9_]+)"', lines[j])
+                if m_ops and ("elif op" in lines[j] or "if op" in lines[j]):
+                    scc_ops.update(m_ops)
+                    break
+        self.assertGreaterEqual(len(scc_ops), 8)
+        for op in sorted(scc_ops):
+            self.assertTrue(
+                wave64_emulate_opt.reads_scc({"op": op, "args": []}),
+                f"{op} loads %scc in rdna2spirv.py but reads_scc() returned False",
+            )
+
+    def test_m0_implicit_read_in_v_movrel_blocks_execz_fold(self):
+        # Region writes m0 and post-join v_movrels_b32 reads m0 implicitly -> MUST NOT fold.
+        insns = [
+            ("v_mov_b32_e32 v4, 10", 4),
+            ("v_mov_b32_e32 v5, 77", 4),
+            ("s_mov_b32 m0, 0", 4),
+            ("v_cmp_lt_u32_e64 s[6:7], 40, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 1", 4),
+            ("s_mov_b32 m0, 1", 4),
+            ("s_mov_b64 exec, -1", 4),
+            ("v_movrels_b32_e32 v6, v4", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v6, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, _ = _translate_encoded("cs_m0_vmovrel_no_fold", insns, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv.count("OpAtomicOr"), 1)
+        mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem[lane * 4], 77, f"lane {lane}: wave ran region so m0=1 -> v5=77 everywhere")
+
 
 if __name__ == "__main__":
     unittest.main()
