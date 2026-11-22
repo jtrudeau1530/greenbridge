@@ -32,6 +32,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIEN
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST
+from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -860,6 +861,13 @@ def run_suite(a, work: str) -> int:
             want = [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4, 0x9E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE]
             ok, detail = judge_cs_dump(rc, msg, want, wave64=False, partial=False, emulated=False, hexwords=True)
             results.append((name, ok, detail))
+        elif name == "cs_heap_init":
+            # vk_compute_test copies VKC_HEAP_INIT's file into the heap; the shader copies its words at 0x100 to 0.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **heap_init_env()))
+            words = dump_words(msg)
+            vals = words[:len(HEAP_INIT_EXPECTED)] if words else []
+            results.append((name, rc == 0 and vals == HEAP_INIT_EXPECTED,
+                            " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_user_sgprs":
             # vk_compute_test seeds s4..s7 from VKC_SGPRS; the shader stores them back.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **USER_SGPRS_ENV))
