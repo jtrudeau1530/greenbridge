@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -345,11 +346,13 @@ RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids
 
 RuntimeObject& system_object();   // XSystemImpl, defined after the XSystem functions it serves
 RuntimeObject& package_object();  // XPackageImpl, after the XPackage functions
+RuntimeObject& game_object();     // XGameImpl, after XPackageImpl
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object(), &package_object()})
+        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object(), &package_object(),
+                                 &game_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
     }
     char cls[40], iid[40];
@@ -729,16 +732,23 @@ HRESULT STDMETHODCALLTYPE pkg_identifier(void*, size_t size, char* buffer) {
 bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess(); }
 // The locales the package declares: <Resources><Resource Language="xx-YY"/> in MicrosoftGame.Config, read from
 // the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
-std::vector<std::string> package_locales() {
-    std::vector<std::string> out;
-    // Wide on purpose: a game folder outside the ANSI code page (e.g. C:\Users\Łukasz) must reach the file intact.
+// The package's MicrosoftGame.Config as text, from the game folder (LEONIDA_GAME_DIR, else --game-dir); empty when
+// there is no folder or no config. Wide on purpose: a game folder named outside the ANSI code page must reach the file
+// intact.
+std::string package_config() {
     wchar_t env[MAX_PATH] = {};
     const DWORD n = GetEnvironmentVariableW(L"LEONIDA_GAME_DIR", env, MAX_PATH);
     const std::filesystem::path dir = (n > 0 && n < MAX_PATH) ? std::filesystem::path(env) : rt::fs::game_dir();
-    if (dir.empty()) return out;
+    if (dir.empty()) return {};
     std::ifstream f(dir / L"MicrosoftGame.Config", std::ios::binary);
-    if (!f) return out;
-    const std::string xml{std::istreambuf_iterator<char>(f), {}};
+    if (!f) return {};
+    return std::string{std::istreambuf_iterator<char>(f), {}};
+}
+
+std::vector<std::string> package_locales() {
+    std::vector<std::string> out;
+    const std::string xml = package_config();
+    if (xml.empty()) return out;
     for (size_t at = 0; (at = xml.find("<Resource", at)) != std::string::npos; ++at) {
         if (xml.compare(at, 10, "<Resources") == 0) continue;
         const size_t end = xml.find('>', at);
@@ -842,6 +852,87 @@ static_assert(std::size(kPackageVtable) == 41, "IUnknown + IXPackageImpl's 32 + 
 
 RuntimeObject& package_object() {
     static RuntimeObject object{kPackageVtable, &kPackageClass, kPackageIids};
+    return object;
+}
+
+// ---- XGameImpl (asked for as IXGameImpl3), offline ----
+//
+// IXGameImpl3 : IXGameImpl2 : IXGameImpl (xgameruntime include/xgame.idl); the class id is IXGameImpl's. Three
+// methods after IUnknown: 3 XGameGetXboxTitleId (IXGameImpl), 4 XLaunchNewGame (IXGameImpl2), 5 XLaunchRestartOnCrash
+// (IXGameImpl3). A retail Gen9 title asks QueryApiImpl for this class (Freminet/ScarlettX's README, observed on
+// Concept Destruction); the executable here is not available yet, so its own requests are unmeasured.
+
+constexpr GUID kGameClass = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+constexpr GUID kGame2 = {0x50849859, 0x0ad8, 0x4f81, {0x80, 0xe4, 0x5b, 0xc7, 0x86, 0x26, 0xf8, 0x52}};
+constexpr GUID kGame3 = {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
+const GUID* const kGameIids[] = {&kGame2, &kGame3, nullptr};
+
+// The title id MicrosoftGame.Config declares (<TitleId>, eight hex digits), or false when there is none or it is not
+// hex. The first <TitleId> element counts; surrounding whitespace is allowed.
+bool package_title_id(uint32_t& out) {
+    const std::string xml = package_config();
+    const size_t open = xml.find("<TitleId>");
+    if (open == std::string::npos) return false;
+    const size_t begin = xml.find_first_not_of(" \t\r\n", open + 9);
+    const size_t close = xml.find("</TitleId>", open);
+    if (begin == std::string::npos || close == std::string::npos || begin >= close) return false;
+    size_t end = close;
+    while (end > begin && std::isspace(static_cast<unsigned char>(xml[end - 1]))) --end;
+    if (end - begin == 0 || end - begin > 8) return false;
+    uint32_t value = 0;
+    for (size_t i = begin; i < end; ++i) {
+        const char c = xml[i];
+        const int digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                        : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (digit < 0) return false;
+        value = value << 4 | static_cast<uint32_t>(digit);
+    }
+    out = value;
+    return true;
+}
+
+// HRESULT XGameGetXboxTitleId(uint32_t* titleId): the package's title id. Without a config that declares one there
+// is no title id to give (E_FAIL), rather than a made-up one.
+HRESULT STDMETHODCALLTYPE game_get_title_id(void*, uint32_t* title_id) {
+    if (!title_id) return E_INVALIDARG;
+    uint32_t id = 0;
+    if (!package_title_id(id)) {
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] xgameruntime: XGameGetXboxTitleId: no <TitleId> in MicrosoftGame.Config\n");
+        return E_FAIL;
+    }
+    *title_id = id;
+    return S_OK;
+}
+
+// void XLaunchNewGame(const char* exePath, const char* args, XUserHandle defaultUser): on the console this ends the
+// title and starts another. Offline there is no other title to start; the call is logged and returns.
+void STDMETHODCALLTYPE game_launch_new(void*, const char* exe_path, const char* args, void*) {
+    std::fprintf(stderr, "[rt] xgameruntime: XLaunchNewGame(\"%s\", \"%s\") ignored offline\n",
+                 exe_path ? exe_path : "", args ? args : "");
+}
+
+// HRESULT XLaunchRestartOnCrash(const char* args, uint32_t reserved): asks the console to restart the title after a
+// crash. Nothing restarts the process here; it succeeds with nothing registered.
+HRESULT STDMETHODCALLTYPE game_restart_on_crash(void*, const char*, uint32_t) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XLaunchRestartOnCrash: no restart is registered offline\n");
+    return S_OK;
+}
+
+const void* const kGameVtable[] = {
+    reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
+    reinterpret_cast<const void*>(&object_release),
+    reinterpret_cast<const void*>(&game_get_title_id),      // 3 XGameGetXboxTitleId (IXGameImpl)
+    reinterpret_cast<const void*>(&game_launch_new),        // 4 XLaunchNewGame (IXGameImpl2, void)
+    reinterpret_cast<const void*>(&game_restart_on_crash),  // 5 XLaunchRestartOnCrash (IXGameImpl3)
+};
+static_assert(std::size(kGameVtable) == 6, "IUnknown + IXGameImpl3's 3 methods");
+
+RuntimeObject& game_object() {
+    static RuntimeObject object{kGameVtable, &kGameClass, kGameIids};
     return object;
 }
 
