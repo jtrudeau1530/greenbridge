@@ -44,6 +44,11 @@ WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact o
 # (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
+# --texel-offset-fallback: image_sample*_o without VK_KHR_maintenance8. The run-time texel offset is folded into the
+# coordinate (coordinate + offset / size of the sampled mip level) instead of the SPIR-V Offset operand, which needs
+# maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
+# coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
+TEXEL_OFFSET_FALLBACK = False
 
 # GFX10 buffer format codes (Mesa src/amd/registers/gfx10-rsrc.json, enum GFX10_FORMAT).
 import json as _json  # noqa: E402
@@ -5418,7 +5423,8 @@ class Gen:
                 else:
                     off = self.tmp()
                     self.emit(f"{off} = OpCompositeConstruct {'%v3int' if n_off == 3 else '%v2int'} {' '.join(parts)}")
-                self.uses_img_offset = True
+                if not TEXEL_OFFSET_FALLBACK:
+                    self.uses_img_offset = True
             minlod = None
             clamp = kind == "_d_cl"        # _d plus a min-LOD clamp, read after the gradients
             if clamp:
@@ -5467,6 +5473,12 @@ class Gen:
             res = self.tmp()
             if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz"):
                 raise Unsupported(op)
+            implicit = kind in ("", "_b") and self.stage == "ps"
+            grads_fb = None
+            if off is not None and TEXEL_OFFSET_FALLBACK:
+                uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit,
+                                                      f[ncoord] if kind == "_l" and len(f) > ncoord else None, bias)
+                off = None
 
             def opnd(mask, args):
                 """Image operands with the texel offset appended (Offset = 0x10 sorts after Lod/Bias)."""
@@ -5478,6 +5490,8 @@ class Gen:
                     self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad|MinLod {grads[0]} {grads[1]} {minlod}")
                 else:
                     self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads[0]} {grads[1]}")
+            elif grads_fb is not None:
+                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads_fb[0]} {grads_fb[1]}")
             elif kind == "":
                 self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('', '')}" if self.stage == "ps" else
                           f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', '%f0')}")
@@ -5853,6 +5867,85 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
         self.emit(f"{v} = OpLoad %float {p}")
         return v
+
+    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias):
+        """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
+
+        The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
+        for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), floored and clamped to the image's
+        levels. Texel offsets apply before wrapping and clamping, and an integer offset commutes with them, so the
+        shift is exact for any address mode at that level. Only a trilinear blend of two levels differs: the
+        coarser level moves by offset / 2 of its texels instead of offset. Implicit samples become Grad samples with
+        the derivatives of the original coordinate (scaled by 2^bias for _b): the LOD and anisotropy are those of the
+        unshifted sample, even when the offset changes from pixel to pixel."""
+        self.uses_query = True
+        ci = lambda v: self.as_int(self.cu(v))
+        lv, lvm = self.tmp(), self.tmp()
+        self.emit(f"{lv} = OpImageQueryLevels %int {img}")
+        self.emit(f"{lvm} = OpISub %int {lv} {ci(1)}")
+        spatial = n_off                                   # 1D: 1, 2D / 2D array: 2, 3D: 3 (array layer excluded)
+        vf = {1: "%float", 2: "%v2float", 3: "%v3float"}[spatial]
+        vi = {1: "%int", 2: "%v2int", 3: "%v3int"}[spatial]
+        uvs = uv
+        if ncoord > spatial:                              # 2D array: the spatial part of (u, v, layer)
+            uvs = self.tmp()
+            self.emit(f"{uvs} = OpVectorShuffle %v2float {uv} {uv} 0 1")
+        level_f = None
+        if kind == "_l":
+            level_f = lod if lod is not None else "%f0"
+        elif implicit:
+            q, qx = self.tmp(), self.tmp()
+            self.emit(f"{q} = OpImageQueryLod %v2float {si} {uvs}")
+            self.emit(f"{qx} = OpCompositeExtract %float {q} 0")
+            level_f = qx
+            if kind == "_b" and bias is not None:
+                qb = self.tmp()
+                self.emit(f"{qb} = OpFAdd %float {qx} {bias}")
+                level_f = qb
+        if level_f is None:
+            level = ci(0)
+        else:
+            fl, li, lo = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{fl} = OpExtInst %float %glsl Floor {level_f}")
+            self.emit(f"{li} = OpConvertFToS %int {fl}")
+            self.emit(f"{lo} = OpExtInst %int %glsl SClamp {li} {ci(0)} {lvm}")
+            level = lo
+        # Size of that level: 1D int, 2D v2int, 2D array / 3D v3int (array: width, height, layers).
+        qtype = "%int" if ncoord == 1 else "%v3int" if ncoord == 3 else "%v2int"
+        sz = self.tmp()
+        self.emit(f"{sz} = OpImageQuerySizeLod {qtype} {img} {level}")
+        if qtype == "%v3int" and spatial == 2:
+            szs = self.tmp()
+            self.emit(f"{szs} = OpVectorShuffle %v2int {sz} {sz} 0 1")
+            sz = szs
+        szf, offf, sh, uvn = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{szf} = OpConvertSToF {vf} {sz}")
+        self.emit(f"{offf} = OpConvertSToF {vf} {off}")
+        self.emit(f"{sh} = OpFDiv {vf} {offf} {szf}")
+        self.emit(f"{uvn} = OpFAdd {vf} {uvs} {sh}")
+        out = uvn
+        if ncoord > spatial:
+            layer, full = self.tmp(), self.tmp()
+            self.emit(f"{layer} = OpCompositeExtract %float {uv} 2")
+            self.emit(f"{full} = OpCompositeConstruct %v3float {uvn} {layer}")
+            out = full
+        grads = None
+        if implicit:
+            dx, dy = self.tmp(), self.tmp()
+            self.emit(f"{dx} = OpDPdx {vf} {uvs}")
+            self.emit(f"{dy} = OpDPdy {vf} {uvs}")
+            if kind == "_b" and bias is not None:
+                e, ev, sdx, sdy = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{e} = OpExtInst %float %glsl Exp2 {bias}")
+                if spatial == 1:
+                    self.emit(f"{sdx} = OpFMul %float {dx} {e}")
+                    self.emit(f"{sdy} = OpFMul %float {dy} {e}")
+                else:
+                    self.emit(f"{sdx} = OpVectorTimesScalar {vf} {dx} {e}")
+                    self.emit(f"{sdy} = OpVectorTimesScalar {vf} {dy} {e}")
+                dx, dy = sdx, sdy
+            grads = (dx, dy)
+        return out, grads
 
     def as_int(self, u):
         i = self.tmp()
@@ -8169,11 +8262,15 @@ def main():
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
                          "VK_KHR_fragment_shader_barycentric (e.g. NVIDIA Pascal)")
+    ap.add_argument("--texel-offset-fallback", action="store_true",
+                    help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
+                         "the coordinate instead of the Offset operand")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK
+    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
     BARY_FALLBACK = a.bary_fallback
+    TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     if a.merge:
         import glob as _gl, json as _js
         merged = {}
