@@ -101,10 +101,10 @@ form decodes exactly 24,000. An oversized `--pre-skip` is clamped to the stream 
 falls below it.
 
 The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and `+0x0C` is the
-per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams). The
-exporter uses `+0x0C` only when it agrees with `+0` (`frames * channels == samples`) and otherwise falls back to
-`+0 / channels`, so a malformed block cannot silently truncate audio. It never scales either count by the rate
-field, because scaling a 32 kHz stream by 48000/32000 leaves padding untrimmed.
+per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams, 0.5% of
+the 1.6M-stream corpus). The exporter uses `+0x0C` only when it agrees with `+0` (`frames * channels == samples`)
+and otherwise falls back to `+0 / channels`, so a malformed block cannot silently truncate audio. It never scales
+either count by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
