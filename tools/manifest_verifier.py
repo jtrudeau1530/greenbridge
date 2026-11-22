@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from typing import Callable, Optional, TextIO
@@ -138,11 +139,13 @@ def load_manifest(path: str) -> dict[str, dict]:
                 raise ManifestError(f"{path}: entry {rel!r} missing 'sha256' string")
             if size is not None and not (isinstance(size, int) and not isinstance(size, bool) and size >= 0):
                 raise ManifestError(f"{path}: entry {rel!r} has invalid integer 'size'")
-            entries[rel] = {"size": size, "sha256": digest.lower()}
         elif isinstance(info, str):
-            entries[rel] = {"size": None, "sha256": info.lower()}
+            size, digest = None, info
         else:
             raise ManifestError(f"{path}: entry {rel!r} must be an object or digest string")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+            raise ManifestError(f"{path}: entry {rel!r} needs a SHA-256 digest of 64 hexadecimal characters")
+        entries[rel] = {"size": size, "sha256": digest.lower()}
     return entries
 
 
