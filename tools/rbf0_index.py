@@ -236,7 +236,7 @@ def join_resource(rows, index, read, check_gap=True):
     j = index + 1
     while j < len(rows) and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES:
         nxt = rows[j]
-        if nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
+        if rows[j - 1]["size"] != MAX_CHUNK or nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
             break
         if check_gap and nxt["offset"] > rows[j - 1]["offset"] + rows[j - 1]["stored"] + 16:
             break
