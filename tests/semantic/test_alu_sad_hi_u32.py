@@ -43,6 +43,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import spirv_mini_interp as si  # noqa: E402
+import spirv_wave_interp as sw  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -83,6 +84,36 @@ def ref_sad_full_64(s0: int, s1: int, s2: int) -> tuple[int, int, int]:
     lo = sum64 & MASK32
     hi = (sum64 >> 32) & MASK32
     return lo, hi, sum64
+
+
+def ref_sad_accumulate_64(
+    pairs: list[tuple[int, int]],
+    init_lo: int = 0,
+    init_hi: int = 0,
+) -> tuple[int, int]:
+    """Multi-precision 64-bit SAD accumulator combining v_sad_u32 and v_sad_hi_u32.
+
+    Returns (acc_lo, acc_hi).
+    """
+    acc_lo = u32(init_lo)
+    acc_hi = u32(init_hi)
+    for s0, s1 in pairs:
+        carry = ref_sad_hi_u32(s0, s1, acc_lo)
+        acc_lo = ref_sad_u32(s0, s1, acc_lo)
+        acc_hi = u32(acc_hi + carry)
+    return acc_lo, acc_hi
+
+
+def ref_block_sad_64(
+    block_a: list[int],
+    block_b: list[int],
+    init_lo: int = 0,
+    init_hi: int = 0,
+) -> tuple[int, int]:
+    """Compute 64-bit SAD between two equal-length arrays of 32-bit unsigned words."""
+    if len(block_a) != len(block_b):
+        raise ValueError(f"Block lengths must match: {len(block_a)} != {len(block_b)}")
+    return ref_sad_accumulate_64(list(zip(block_a, block_b)), init_lo, init_hi)
 
 
 class SadHiValuInterpreter:
@@ -202,6 +233,25 @@ class SadHiValuInterpreter:
             dst_idx = int(dst_token[1:])
             val = self.parse_operand(operands[1], 0)
             self.set_sgpr(dst_idx, val)
+
+        elif opcode in ("s_and_b32", "s_or_b32", "s_and_b64", "s_or_b64", "s_mov_b64"):
+            dst_token = operands[0].lower()
+            if dst_token == "exec":
+                if opcode == "s_mov_b64":
+                    val = int(operands[1], 16) if operands[1].lower().startswith("0x") else int(operands[1])
+                    self.exec_mask = val & ((1 << self.num_lanes) - 1)
+                elif opcode == "s_and_b32":
+                    val = self.parse_operand(operands[2] if len(operands) > 2 else operands[1], 0)
+                    self.exec_mask &= val
+                elif opcode == "s_or_b32":
+                    val = self.parse_operand(operands[2] if len(operands) > 2 else operands[1], 0)
+                    self.exec_mask |= val
+                elif opcode == "s_and_b64":
+                    val = int(operands[2], 16) if operands[2].lower().startswith("0x") else int(operands[2])
+                    self.exec_mask &= val
+                elif opcode == "s_or_b64":
+                    val = int(operands[2], 16) if operands[2].lower().startswith("0x") else int(operands[2])
+                    self.exec_mask |= val
 
         elif opcode in ("v_sad_hi_u32", "v_sad_u32"):
             if any(opt.lower() == "clamp" for opt in operands):
@@ -421,6 +471,254 @@ class TestSadHiSpirvLowering(unittest.TestCase):
                 spv_lo, spv_hi = run_spirv_sad_hi(s0, s1, s2)
                 self.assertEqual(spv_lo, ref_sad_u32(s0, s1, s2))
                 self.assertEqual(spv_hi, ref_sad_hi_u32(s0, s1, s2))
+
+
+class TestMultiPrecision64BitReconstruction(unittest.TestCase):
+    """Verifies multi-precision 64-bit SAD reconstruction and block matching."""
+
+    def test_exact_64bit_reconstruction_invariant(self):
+        # (v_sad_hi_u32 << 32) | v_sad_u32 == |s0 - s1| + s2
+        rng = random.Random(0x42_5AD_64)
+        for _ in range(500):
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            s2 = rng.getrandbits(32)
+            lo, hi, full = ref_sad_full_64(s0, s1, s2)
+            reconstructed = (hi << 32) | lo
+            self.assertEqual(reconstructed, full)
+            self.assertEqual(reconstructed, ref_abs_diff_u32(s0, s1) + s2)
+
+    def test_block_matching_4_words(self):
+        # 128-bit block matching (4 x 32-bit dwords)
+        block_a = [0x10000000, 0x90000000, 0xFFFFFFFF, 0x00000001]
+        block_b = [0x00000001, 0x10000000, 0x00000000, 0xFFFFFFFF]
+        # Differences:
+        # |0x10000000 - 1| = 0x0FFFFFFF
+        # |0x90000000 - 0x10000000| = 0x80000000
+        # |0xFFFFFFFF - 0| = 0xFFFFFFFF
+        # |1 - 0xFFFFFFFF| = 0xFFFFFFFE
+        # Expected sum:
+        expected_full = (0x0FFFFFFF + 0x80000000 + 0xFFFFFFFF + 0xFFFFFFFE)
+        expected_lo = expected_full & MASK32
+        expected_hi = expected_full >> 32
+
+        acc_lo, acc_hi = ref_block_sad_64(block_a, block_b)
+        self.assertEqual(acc_lo, expected_lo)
+        self.assertEqual(acc_hi, expected_hi)
+        self.assertEqual((acc_hi << 32) | acc_lo, expected_full)
+
+    def test_block_matching_with_initial_accumulator(self):
+        # Accumulating onto an existing large 64-bit counter near 2^32 boundary
+        init_lo = 0xFFFFFFFF
+        init_hi = 0x00000005
+        pairs = [(0xFFFFFFFF, 0x00000000), (0x00000002, 0x00000000)]
+        # step 1: diff = 0xFFFFFFFF. add to init_lo -> 0xFFFFFFFF + 0xFFFFFFFF = 0x1FFFFFFFE
+        #         new_lo = 0xFFFFFFFE, carry = 1 -> new_hi = 6
+        # step 2: diff = 2. add to 0xFFFFFFFE -> 0x100000000
+        #         new_lo = 0, carry = 1 -> new_hi = 7
+        acc_lo, acc_hi = ref_sad_accumulate_64(pairs, init_lo, init_hi)
+        self.assertEqual(acc_lo, 0)
+        self.assertEqual(acc_hi, 7)
+        expected_full = (init_hi << 32) | init_lo
+        for a, b in pairs:
+            expected_full += ref_abs_diff_u32(a, b)
+        self.assertEqual((acc_hi << 32) | acc_lo, expected_full)
+
+    def test_block_matching_in_interpreter(self):
+        # Test simulated block matching using VALU instruction sequences
+        interp = SadHiValuInterpreter(num_lanes=1)
+        # We accumulate 3 differences into (v_hi:v_lo) = (v1:v0)
+        # Pair 1: S0=0xFFFFFFFF, S1=0
+        # Pair 2: S0=0x80000000, S1=0
+        # Pair 3: S0=0x80000000, S1=0
+        prog = [
+            "v_mov_b32 v0, 0",  # acc_lo
+            "v_mov_b32 v1, 0",  # acc_hi
+            # Pair 1: |0xFFFFFFFF - 0| + acc_lo
+            "v_sad_hi_u32 v2, 0xFFFFFFFF, 0, v0",  # carry out
+            "v_sad_u32 v0, 0xFFFFFFFF, 0, v0",     # new acc_lo
+            "v_add_u32 v1, v1, v2",                # acc_hi += carry
+            # Pair 2: |0x80000000 - 0| + acc_lo
+            "v_sad_hi_u32 v2, 0x80000000, 0, v0",
+            "v_sad_u32 v0, 0x80000000, 0, v0",
+            "v_add_u32 v1, v1, v2",
+            # Pair 3: |0x80000000 - 0| + acc_lo
+            "v_sad_hi_u32 v2, 0x80000000, 0, v0",
+            "v_sad_u32 v0, 0x80000000, 0, v0",
+            "v_add_u32 v1, v1, v2",
+        ]
+        interp.run_program(prog)
+        res_lo = interp.get_vgpr(0, 0)
+        res_hi = interp.get_vgpr(0, 1)
+
+        expected_sum = 0xFFFFFFFF + 0x80000000 + 0x80000000
+        self.assertEqual(res_lo, expected_sum & MASK32)
+        self.assertEqual(res_hi, expected_sum >> 32)
+        self.assertEqual(res_hi, 1)
+
+
+class TestSimdExecutionAndDivergence(unittest.TestCase):
+    """Verifies SIMD lane execution and divergence under EXEC masks for Wave32 and Wave64."""
+
+    def test_wave32_full_divergence(self):
+        # 32 lanes where even lanes generate a carry (hi = 1) and odd lanes do not (hi = 0)
+        interp = SadHiValuInterpreter(num_lanes=32)
+        for lane in range(32):
+            if lane % 2 == 0:
+                # Even lane: diff=0xFFFFFFFF, s2=1 -> carry = 1
+                interp.set_vgpr(lane, 1, 0xFFFFFFFF)
+                interp.set_vgpr(lane, 2, 0x00000000)
+                interp.set_vgpr(lane, 3, 0x00000001)
+            else:
+                # Odd lane: diff=10, s2=5 -> carry = 0
+                interp.set_vgpr(lane, 1, 10)
+                interp.set_vgpr(lane, 2, 0)
+                interp.set_vgpr(lane, 3, 5)
+
+        interp.run_program([
+            "v_sad_hi_u32 v0, v1, v2, v3",
+            "v_sad_u32 v4, v1, v2, v3",
+        ])
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(interp.get_vgpr(lane, 0), 1, f"Lane {lane} expected carry 1")
+                self.assertEqual(interp.get_vgpr(lane, 4), 0, f"Lane {lane} expected sum 0")
+            else:
+                self.assertEqual(interp.get_vgpr(lane, 0), 0, f"Lane {lane} expected carry 0")
+                self.assertEqual(interp.get_vgpr(lane, 4), 15, f"Lane {lane} expected sum 15")
+
+    def test_wave32_inactive_lanes_preserve_destination(self):
+        interp = SadHiValuInterpreter(num_lanes=32)
+        # Pre-initialize destination v0 with sentinel pattern
+        for lane in range(32):
+            interp.set_vgpr(lane, 0, 0xCAFE0000 | lane)
+            interp.set_vgpr(lane, 1, 0xFFFFFFFF)
+            interp.set_vgpr(lane, 2, 0)
+            interp.set_vgpr(lane, 3, 1)
+
+        # Set EXEC to only active for lanes 0..15 (mask 0x0000FFFF)
+        interp.run_program([
+            "s_mov_b32 exec, 0x0000FFFF",
+            "v_sad_hi_u32 v0, v1, v2, v3",
+        ])
+
+        for lane in range(32):
+            if lane < 16:
+                # Active: updated with carry = 1
+                self.assertEqual(interp.get_vgpr(lane, 0), 1)
+            else:
+                # Inactive: untouched sentinel preserved
+                self.assertEqual(interp.get_vgpr(lane, 0), 0xCAFE0000 | lane)
+
+    def test_wave64_divergence_and_masking(self):
+        interp = SadHiValuInterpreter(num_lanes=64)
+        for lane in range(64):
+            interp.set_vgpr(lane, 0, 0xBEEF0000 | lane)
+            interp.set_vgpr(lane, 1, 0xFFFFFFFF)
+            interp.set_vgpr(lane, 2, 0)
+            interp.set_vgpr(lane, 3, 1)
+
+        # Active only upper half: lanes 32..63 (0xFFFFFFFF00000000)
+        interp.run_program([
+            "s_mov_b64 exec, 0xFFFFFFFF00000000",
+            "v_sad_hi_u32 v0, v1, v2, v3",
+        ])
+
+        for lane in range(64):
+            if lane >= 32:
+                self.assertEqual(interp.get_vgpr(lane, 0), 1)
+            else:
+                self.assertEqual(interp.get_vgpr(lane, 0), 0xBEEF0000 | lane)
+
+
+class TestSpirvWaveExecution(unittest.TestCase):
+    """Verifies SIMD wave execution with spirv_wave_interp."""
+
+    WAVE_SHADER_SRC = """OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %lane %out
+OpDecorate %lane BuiltIn SubgroupLocalInvocationId
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%bool = OpTypeBool
+%v4uint = OpTypeVector %uint 4
+%pin = OpTypePointer Input %uint
+%pout = OpTypePointer Output %v4uint
+%struct_u32_u32 = OpTypeStruct %uint %uint
+%lane = OpVariable %pin Input
+%out = OpVariable %pout Output
+%glsl = OpExtInstImport "GLSL.std.450"
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c16 = OpConstant %uint 16
+%c_max = OpConstant %uint 4294967295
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%l = OpLoad %uint %lane
+%cond = OpULessThan %bool %l %c16
+OpSelectionMerge %merge None
+OpBranchConditional %cond %then %else
+%then = OpLabel
+%diff_then = OpISub %uint %c_max %l
+%ac_then = OpIAddCarry %struct_u32_u32 %diff_then %c1
+%sum_then = OpCompositeExtract %uint %ac_then 0
+%cry_then = OpCompositeExtract %uint %ac_then 1
+OpBranch %merge
+%else = OpLabel
+%ac_else = OpIAddCarry %struct_u32_u32 %l %c_max
+%sum_else = OpCompositeExtract %uint %ac_else 0
+%cry_else = OpCompositeExtract %uint %ac_else 1
+OpBranch %merge
+%merge = OpLabel
+%sum_phi = OpPhi %uint %sum_then %then %sum_else %else
+%cry_phi = OpPhi %uint %cry_then %then %cry_else %else
+%res = OpCompositeConstruct %v4uint %sum_phi %cry_phi %l %c0
+OpStore %out %res
+OpReturn
+OpFunctionEnd
+"""
+
+    def test_spirv_wave32(self):
+        res = sw.run_wave(self.WAVE_SHADER_SRC, wave=32)
+        outputs = res["outputs"]
+        self.assertEqual(len(outputs), 32)
+        for lane in range(32):
+            out = outputs[lane]["%out"]
+            sum_val, carry_val, lane_id, _ = out
+            self.assertEqual(lane_id, lane)
+            if lane < 16:
+                expected_diff = (0xFFFFFFFF - lane) & MASK32
+                expected_carry = 1 if (expected_diff + 1) > 0xFFFFFFFF else 0
+                expected_sum = (expected_diff + 1) & MASK32
+                self.assertEqual(carry_val, expected_carry)
+                self.assertEqual(sum_val, expected_sum)
+            else:
+                expected_carry = 1  # lane >= 16 + 0xFFFFFFFF > 0xFFFFFFFF
+                expected_sum = (lane + 0xFFFFFFFF) & MASK32
+                self.assertEqual(carry_val, expected_carry)
+                self.assertEqual(sum_val, expected_sum)
+
+    def test_spirv_wave64(self):
+        res = sw.run_wave(self.WAVE_SHADER_SRC, wave=64)
+        outputs = res["outputs"]
+        self.assertEqual(len(outputs), 64)
+        for lane in range(64):
+            out = outputs[lane]["%out"]
+            sum_val, carry_val, lane_id, _ = out
+            self.assertEqual(lane_id, lane)
+            if lane < 16:
+                expected_diff = (0xFFFFFFFF - lane) & MASK32
+                expected_carry = 1 if (expected_diff + 1) > 0xFFFFFFFF else 0
+                expected_sum = (expected_diff + 1) & MASK32
+                self.assertEqual(carry_val, expected_carry)
+                self.assertEqual(sum_val, expected_sum)
+            else:
+                expected_carry = 1
+                expected_sum = (lane + 0xFFFFFFFF) & MASK32
+                self.assertEqual(carry_val, expected_carry)
+                self.assertEqual(sum_val, expected_sum)
 
 
 if __name__ == "__main__":
