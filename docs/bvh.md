@@ -111,9 +111,10 @@ The `flags` word has version `6` in its low 16 bits. It also sets `0x80000000` (
 bottom-level, offline, dehydrated BVH, not a ready-to-traverse runtime tree.
 
 The name "BVH4" is the builder's own: `XboxBvh4Header`, `ConstructBVH4`, `RefitBVH4`, `PT_ConstructBVH4` and
-`totalSizeIn64BNodes` appear in `XboxBvhBuilder.dll`. The measured field at `0x104` is a count of 64-byte units
-whose product plus `0x140` lands exactly on the end pointer in 271,627/271,627 complete streams. That agrees with
-the builder's naming.
+`totalSizeIn64BNodes` appear in `XboxBvhBuilder.dll`. The measured field at `0x104` is a count of 64-byte nodes
+that does not include the 64-byte header: a structure is `64 * (totalSizeIn64BNodes + 1)` bytes, which lands exactly on
+the end pointer in 271,627/271,627 complete streams (RT-151; the field was read as the whole size before). That agrees
+with the builder's naming.
 
 #### Node pointers and the runtime node records
 
@@ -465,7 +466,7 @@ names its BLASes by address, which a clone keeps. The size comes from the source
 a copy can follow a build in the same command list, and it is bounded by the destination resource. A build is
 already exactly its layout's size, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
 `EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
-`totalSizeIn64BNodes * 64`, and compaction saves nothing. Serialization, deserialization and the tools-visualization
+`64 * (totalSizeIn64BNodes + 1)`, and compaction saves nothing. Serialization, deserialization and the tools-visualization
 mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
 as before.
 
