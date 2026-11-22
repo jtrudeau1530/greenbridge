@@ -90,6 +90,7 @@ if(WIN32)
     src/main.cpp
     src/pe_loader.cpp
     shims/registry.cpp
+    shims/file_system.cpp
     shims/xmem.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
@@ -195,6 +196,17 @@ if(WIN32)
   target_compile_options(process_cmdline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
+
+  # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
+  add_executable(file_system_test
+    test/file_system_test.cpp
+    shims/file_system.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(file_system_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(file_system_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(file_system_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(file_system_test PRIVATE /OPT:NOREF)
 
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
@@ -548,6 +560,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
+  endif()
+  if(WIN32 AND TARGET file_system_test)
+    add_test(NAME file_system COMMAND file_system_test)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
