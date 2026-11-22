@@ -18,6 +18,11 @@ fragments, while world fragments do have them; see
 Source resource: `ambient_femalebody_upper_nohead.#ft` in `packs.rpf`, stream offset
 `0x45449F70` (stored 17,434 bytes, inflated 42,384 bytes).
 
+This stream is the **name table**, not the skeleton fragment. `tools/anim_glb.py --skeleton` takes a
+fragment offset; on 1.0.2.1 the sibling `ambient_femalebody_head.#ft` at `0x45417010` exports the
+596-joint skeleton with a 5.13e-6 bind error, while passing `0x45449F70` fails with
+`page directory: not a system pointer`.
+
 | Range | Contents |
 |---|---|
 | `0x0008..0x7FF8` | 4,095-slot hash table, 8 bytes per slot: `u32 joaat32(name)`, `u32 boneIndex` |
@@ -225,6 +230,9 @@ python -I tools/anim_glb.py <package>\packs.rpf <work>\walk.glb --skeleton <frag
 python -I tools/anim_glb.py <package>\packs.rpf --coverage --skeleton <fragment offset> `
     --anim <package>\anim.rpf --jobs 8 --report <work>\coverage.json
 ```
+
+On 1.0.2.1, `--skeleton 0x45417010` names the `ambient_femalebody_head.#ft` fragment;
+`0x45449F70` in the section above is the name-table stream, not a fragment.
 
 Offsets are zlib stream offsets (as `tools/skin_streams.py` and `rpf9dump` report them). The
 output is a standard glTF 2.0 file; Blender and the three.js editor play its animations. What
@@ -445,7 +453,7 @@ table, not a unique `mandy` drawable.
 Steps 1-4 were measured with local tools that are not part of this repository; a reader can
 reproduce them with a standard zlib/RPF9 reader:
 
-1. Inflate the `.#ft` stream at `0x45449F70`; parse the 4,095-slot hash table and the
+1. Inflate the `.#ft` **name-table** stream at `0x45449F70`; parse the 4,095-slot hash table and the
    NUL-separated names; verify `joaat32` lowercased.
 2. Inflate the following 131,072-byte graphics page at `0x4544F010`; parse the records at
    `0x110 + 0x50*i`: rotation at +0x00, translation at +0x10, hash at +0x1C, parent at +0x46
