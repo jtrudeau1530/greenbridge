@@ -1159,5 +1159,141 @@ class TestBufferAtomicSubBoundaryExtremes(unittest.TestCase):
             addr += 4
 
 
+class TestBufferAtomicSubNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_negative_and_out_of_range_registers(self) -> None:
+        # Negative register index
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+
+        # Register index out of bounds
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+
+        # Invalid count
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 0, count=3)
+
+        # Register group exceeding file boundary
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 254, count=4)
+
+        # Instruction with non-VGPR vdata
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB,
+                vdata=Register(RegKind.SGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+        # Instruction with invalid srsrc count
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=1),
+                soffset=0,
+            )
+
+        # Instruction with VGPR soffset
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=Register(RegKind.VGPR, 2, count=1),
+            )
+
+    def test_syntax_rejection_invalid_modifiers(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+
+    def test_syntax_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+    def test_mutation_rejection_addition_instead_of_subtraction(self) -> None:
+        # Simulated mutant: performs addition instead of subtraction
+        def mutant_add(old: int, sub: int) -> int:
+            return (old + sub) & MASK32
+
+        mem = BufferMemory(256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        mem.write_u32(0, 100)
+        sub_val = 25
+
+        correct_ret, _ = ref_buffer_atomic_sub(mem, desc, soffset=0, vaddr=0, sub_val=sub_val, glc=False)
+        correct_mem = mem.read_u32(0)
+        self.assertEqual(correct_mem, 75)
+
+        mutant_mem = mutant_add(100, sub_val)
+        self.assertNotEqual(mutant_mem, correct_mem)
+        self.assertEqual(mutant_mem, 125)
+
+    def test_mutation_rejection_oob_bound_check_omission(self) -> None:
+        # Simulated mutant: checks effective_offset >= num_records instead of effective_offset + 4 > num_records
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        mem = BufferMemory(256)
+
+        # At offset 98, offset + 4 = 102 > 100 -> must be OOB
+        ret, in_bounds = ref_buffer_atomic_sub(mem, desc, soffset=0, vaddr=98, sub_val=1, glc=True)
+        self.assertFalse(in_bounds)
+
+        # Flawed check mutant: 98 < 100 would falsely classify as in-bounds
+        mutant_in_bounds = (98 < desc.num_records)
+        self.assertNotEqual(mutant_in_bounds, in_bounds)
+
+    def test_mutation_rejection_exec_mask_ignored(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        simd.set_buffer_descriptor(4, desc)
+        simd.set_exec_mask(0)  # All inactive
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SUB,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        simd.mem.write_u32(0, 500)
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 0, 10)
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 1, 0)
+
+        results = simd.step(inst)
+        # Inactive lane must return (None, False)
+        self.assertIsNone(results[0][0])
+        self.assertFalse(results[0][1])
+        # Memory must not be modified
+        self.assertEqual(simd.mem.read_u32(0), 500)
+
+    def test_mutation_rejection_glc_post_op_instead_of_pre_op(self) -> None:
+        mem = BufferMemory(256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        mem.write_u32(0, 100)
+        sub_val = 25
+
+        ret, in_bounds = ref_buffer_atomic_sub(mem, desc, soffset=0, vaddr=0, sub_val=sub_val, glc=True)
+        self.assertTrue(in_bounds)
+        # Pre-op value must be returned (100)
+        self.assertEqual(ret, 100)
+        new_val = mem.read_u32(0)
+        self.assertEqual(new_val, 75)
+        # Mutant returning new_val would return 75, not 100
+        self.assertNotEqual(ret, new_val)
+
+
 if __name__ == "__main__":
     unittest.main()
