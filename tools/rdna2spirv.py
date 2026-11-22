@@ -4803,8 +4803,9 @@ class Gen:
             # result half 1 from op_sel_hi[i] (defaults [0,..] and [1,..]); each half is computed on its own and
             # wraps to 16 bits. clamp (add/sub/mad) saturates the half to its type's range; the exact value fits in
             # 32 bits (0xFFFF * 0xFFFF + 0xFFFF < 2^32, and the i16 forms within int32). neg_lo/neg_hi are float-only.
-            # A constant operand reads as its low 16 bits; its high half under op_sel is not measured for integer
-            # ops (for f16 constants it reads +0.0, see src_h), so that form is rejected rather than guessed.
+            # Constant operands are treated as 32-bit dwords: op_sel=0 selects bits [15:0], op_sel=1 selects [31:16]
+            # (measured on gfx1036). Positive inlines zero-extend, negative inlines sign-extend, 32-bit literals
+            # retain their full dword; OpBitField*Extract at 16*sl[i] lowers this directly.
             def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
                 return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
@@ -4817,9 +4818,6 @@ class Gen:
             clamp = "clamp" in mods
             if clamp and kind not in ("add", "sub", "mad"):
                 raise Unsupported(op + " clamp")
-            for i in range(ns):
-                if a[1 + i]["k"] not in ("vgpr", "sgpr") and (sel[i] or selhi[i]):
-                    raise Unsupported(op + " high half of a constant")
             srcs = [self.src_u(t) for t in a[1:1 + ns]]
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
             halves = []
