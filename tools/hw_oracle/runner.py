@@ -136,8 +136,8 @@ def build_command(kind, cc, src, out, workdir):
     installer = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                              "Microsoft Visual Studio", "Installer")
     script = os.path.join(workdir, "build_hw_oracle.cmd")
-    # UTF-8 with chcp 65001 (as scripts/build_runtime.ps1 does): the checkout, %TEMP% and Visual Studio paths in
-    # here reach cl intact when one has a character outside ASCII (C:\Users\<a name like that>), on any code page.
+    # Written as UTF-8, with chcp 65001 so cmd.exe reads it as UTF-8 on any console code page: the checkout, %TEMP%
+    # and Visual Studio paths in here reach cl intact when one has a character outside ASCII (a user name, say).
     with open(script, "w", encoding="utf-8", newline="\n") as f:
         f.write(f'@echo off\r\nchcp 65001 >nul\r\nset "PATH={installer};%PATH%"\r\ncall "{cc}" >nul || exit /b 1\r\n'
                 + subprocess.list2cmdline(cl) + "\r\n")
