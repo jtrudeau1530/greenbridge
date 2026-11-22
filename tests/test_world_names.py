@@ -279,6 +279,22 @@ class CliTest(unittest.TestCase):
             self.assertEqual(names, {WN.joaat_hex(name): [name]
                                      for name in ("A&B", "Cell&Prop", "Cell&Prop.rpf")})
 
+    def test_resolve_rejects_a_malformed_dictionary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            out = os.path.join(tmp, "report.json")
+            for field, data in (("names", [1]), ("derived", {"00000000": "name"}),
+                                ("names", {"00000000": [42]})):
+                with self.subTest(field=field, data=data):
+                    with open(dictionary, "w", encoding="utf-8") as handle:
+                        json.dump({"format": 1, field: data}, handle)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertNotEqual(WN.main(["resolve", "--dict", dictionary, "--out", out]), 0)
+                    self.assertIn(dictionary, err.getvalue())
+                    self.assertIn(field, err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
     def test_resolve_rejects_unrecognized_map_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             dictionary = os.path.join(tmp, "names.json")

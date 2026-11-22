@@ -372,12 +372,17 @@ class NameDictionary:
         out = cls()
         if not isinstance(data, dict) or data.get("format") != 1:
             raise ValueError("not a world_names dictionary (format 1)")
-        for key, names in (data.get("names") or {}).items():
-            for name in (names if isinstance(names, list) else ()):
-                out.add(name, source="dictionary")
-        for key, names in (data.get("derived") or {}).items():
-            for name in (names if isinstance(names, list) else ()):
-                out.add(name, derived=True, source="dictionary_derived")
+        for field, derived, source in (("names", False, "dictionary"),
+                                       ("derived", True, "dictionary_derived")):
+            table = data.get(field, {})
+            if not isinstance(table, dict):
+                raise ValueError(f"dictionary {field!r} must be a hash-to-names object")
+            for names in table.values():
+                if not isinstance(names, list):
+                    raise ValueError(f"dictionary {field!r} entries must be lists of names")
+                for name in names:
+                    if not out.add(name, derived=derived, source=source):
+                        raise ValueError(f"dictionary {field!r} has an invalid name")
         return out
 
 
@@ -555,7 +560,10 @@ def _build(args) -> int:
 
 
 def _resolve(args) -> int:
-    dictionary = NameDictionary.from_json(_load_json(args.dict))
+    try:
+        dictionary = NameDictionary.from_json(_load_json(args.dict))
+    except ValueError as exc:
+        raise ValueError(f"{args.dict}: {exc}") from None
     report = {"dictionary": dictionary.counts(), "maps": {}, "archetypes": {}}
     maps = collections.Counter()
     for path in args.maps:
