@@ -72,6 +72,14 @@ FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPrese
 # in push-constant dwords 36..37 (the block grows from 144 to 152 bytes). The slot layout is mesh_compute_layout();
 # the index records it as "mesh_compute". tools/mesh_compute_vs.py writes the vertex shader that draws the slots.
 MESH_COMPUTE = False
+# --pc-tail-ubo: for devices with 128 bytes of push constants, Vulkan's minimum (AMD's Windows driver on RDNA2 iGPUs,
+# some Intel Arc drivers; D3D-14's push_constants_need_fallback). The push-constant block keeps s0..s31 (128 bytes).
+# The tail that follows them by default (dwords 32..35: heap base, code base; 36..37: the --mesh-compute output
+# address) moves, in the same order and at the same relative offsets, to a uniform block at set PC_TAIL_SET, binding
+# PC_TAIL_BINDING. It is declared only when the shader reads it; the index records it as "pc_tail", and
+# "push_constant_bytes" is 128. Set 1 is unused otherwise, so set 0's update-after-bind table is unchanged.
+PC_TAIL_UBO = False
+PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 # --f16-interp-fallback: *_f16 interps without PerVertexKHR, for devices that have VK_KHR_fragment_shader_barycentric
 # but can't use its per-vertex inputs (MoltenVK: SPIRV-Cross has no MSL form of PerVertexKHR). Every VS and mesh
 # `exp paramN` also exports the channel's two f16 halves decoded to f32, low halves at f16_half_location(N, 0) and high
@@ -85,6 +93,15 @@ MESH_COMPUTE = False
 # can use there.
 F16_HALVES = False
 F16_HALF_TOP = 29
+
+
+def pc_tail_chain(name, member, c):
+    """`name` = pointer to push-constant tail member `member`, numbered as in %UserData (1-2 heap base, 3-4 code base,
+    5-6 --mesh-compute output address): a member of the push-constant block by default, member - 1 of the uniform
+    block %pc_tail with --pc-tail-ubo. `c` maps an integer to its constant's id."""
+    if PC_TAIL_UBO:
+        return f"{name} = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail {c(member - 1)}"
+    return f"{name} = OpAccessChain %_ptr_PC_uint %user_data {c(member)}"
 
 
 def f16_half_location(n, half):
@@ -103,12 +120,15 @@ def mesh_compute_layout(maxv, maxp, clip_count, cull_count, params):
     stride = 16 * (1 + clip_vec4 + cull_vec4 + len(params))
     vertices = 16
     primitives = vertices + maxv * stride
-    return {"slot_bytes": primitives + maxp * 16, "vertices": vertices, "vertex_stride": stride,
-            "primitives": primitives, "primitive_stride": 16, "max_vertices": maxv, "max_primitives": maxp,
-            "clip_count": clip_count, "clip_offset": 16, "cull_count": cull_count,
-            "cull_offset": 16 * (1 + clip_vec4),
-            "params": {n: 16 * (1 + clip_vec4 + cull_vec4 + k) for k, n in enumerate(params)},
-            "push_constant_bytes": 4 * USER_SGPRS + 24, "address_dwords": [USER_SGPRS + 4, USER_SGPRS + 5]}
+    lay = {"slot_bytes": primitives + maxp * 16, "vertices": vertices, "vertex_stride": stride,
+           "primitives": primitives, "primitive_stride": 16, "max_vertices": maxv, "max_primitives": maxp,
+           "clip_count": clip_count, "clip_offset": 16, "cull_count": cull_count,
+           "cull_offset": 16 * (1 + clip_vec4),
+           "params": {n: 16 * (1 + clip_vec4 + cull_vec4 + k) for k, n in enumerate(params)},
+           "push_constant_bytes": 4 * USER_SGPRS + 24, "address_dwords": [USER_SGPRS + 4, USER_SGPRS + 5]}
+    if PC_TAIL_UBO:     # the address is dwords 4..5 of the --pc-tail-ubo block, not a push constant
+        lay.update(push_constant_bytes=4 * USER_SGPRS, address_dwords=None, pc_tail_address_dwords=[4, 5])
+    return lay
 
 # GFX10 buffer format codes (Mesa src/amd/registers/gfx10-rsrc.json, enum GFX10_FORMAT).
 import json as _json  # noqa: E402
@@ -246,6 +266,7 @@ class Gen:
         self.uses_storage3d = False
         self.uses_heap = False
         self.uses_codebase = False
+        self.uses_pc_tail = False       # --pc-tail-ubo and the shader reads the tail (set in assemble)
         self.uses_long = False
         self.vertex_inputs = []    # (D3D input register, component type 1=uint 2=sint 3=float) for fetch-calling VS
         self.vertex_signature = []   # full ISG1: (register, mask, system value, component type) for PSO lookup
@@ -9974,9 +9995,9 @@ def mesh_compute_epilogue(gen):
          f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
          f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
          "%mli = OpLoad %uint %local_index",
-         # Slot base = output address (push-constant dwords 36..37) + linear workgroup index * slot bytes.
-         f"%moa_lo_p = OpAccessChain %_ptr_PC_uint %user_data {c(5)}",
-         f"%moa_hi_p = OpAccessChain %_ptr_PC_uint %user_data {c(6)}",
+         # Slot base = output address (push-constant dwords 36..37, or --pc-tail-ubo dwords 4..5) + linear
+         # workgroup index * slot bytes.
+         pc_tail_chain("%moa_lo_p", 5, c), pc_tail_chain("%moa_hi_p", 6, c),
          "%moa_lo = OpLoad %uint %moa_lo_p", "%moa_hi = OpLoad %uint %moa_hi_p",
          "%moa_l64 = OpUConvert %ulong %moa_lo", "%moa_h64 = OpUConvert %ulong %moa_hi",
          "%moa_sh = OpShiftLeftLogical %ulong %moa_h64 %c64_32", "%moa = OpBitwiseOr %ulong %moa_sh %moa_l64",
@@ -10078,6 +10099,8 @@ def assemble(gen):
                                              gen.cull_count if gen.uses_cull else 0, gen.ms_params)
         # Built here, before any constant is emitted, so every constant it asks for gets declared.
         gen.msc_epilogue = mesh_compute_epilogue(gen)
+    # --pc-tail-ubo: the uniform block exists only when the shader reads the tail (after the epilogue, which reads it).
+    gen.uses_pc_tail = PC_TAIL_UBO and (gen.uses_heap or gen.uses_codebase or msc)
     if gen.emulate:
         # No subgroup operation is left (x_round does them through %x_buf), so none of their capabilities.
         if any("OpGroupNonUniform" in l or "%sg_lane" in l for b in gen.blocks + list(gen.x_segs.values()) for l in b):
@@ -10133,7 +10156,7 @@ def assemble(gen):
             iface += ["%out_layer"]
         if gen.uses_viewport:
             iface += ["%out_viewport"]
-    iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"]
+    iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"] + (["%pc_tail"] if gen.uses_pc_tail else [])
     bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex)
     # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
@@ -10394,19 +10417,24 @@ def assemble(gen):
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
     gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" for n in gen.outputs]
-    # Push constants: s0..s31 user data, then the 64-bit host address of the Xbox GPU VA window (heap base).
+    # Push constants: s0..s31 user data, then the tail: the 64-bit host address of the Xbox GPU VA window (heap
+    # base), the code base and, with --mesh-compute, the output address. --pc-tail-ubo moves the tail to %pc_tail.
+    tail = ["%uint"] * (6 if msc else 4)
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
-              "%UserData = OpTypeStruct %arr_ud %uint %uint %uint %uint" + (" %uint %uint" if msc else ""),
+              " ".join(["%UserData = OpTypeStruct %arr_ud"] + ([] if PC_TAIL_UBO else tail)),
               "%_ptr_PC_UserData = OpTypePointer PushConstant %UserData",
               "%_ptr_PC_uint = OpTypePointer PushConstant %uint"]
-    dec += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %UserData Block", "OpMemberDecorate %UserData 0 Offset 0",
-            f"OpMemberDecorate %UserData 1 Offset {4 * USER_SGPRS}",
-            f"OpMemberDecorate %UserData 2 Offset {4 * USER_SGPRS + 4}",
-            f"OpMemberDecorate %UserData 3 Offset {4 * USER_SGPRS + 8}",
-            f"OpMemberDecorate %UserData 4 Offset {4 * USER_SGPRS + 12}"] + (
-            [f"OpMemberDecorate %UserData 5 Offset {4 * USER_SGPRS + 16}",
-             f"OpMemberDecorate %UserData 6 Offset {4 * USER_SGPRS + 20}"] if msc else [])
+    dec += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %UserData Block", "OpMemberDecorate %UserData 0 Offset 0"]
+    if not PC_TAIL_UBO:
+        dec += [f"OpMemberDecorate %UserData {k + 1} Offset {4 * USER_SGPRS + 4 * k}" for k in range(len(tail))]
     gvars += ["%user_data = OpVariable %_ptr_PC_UserData PushConstant"]
+    if gen.uses_pc_tail:
+        types += [" ".join(["%PcTail = OpTypeStruct"] + tail),
+                  "%_ptr_Uniform_PcTail = OpTypePointer Uniform %PcTail",
+                  "%_ptr_Uniform_uint_tail = OpTypePointer Uniform %uint"]
+        dec += ["OpDecorate %PcTail Block"] + [f"OpMemberDecorate %PcTail {k} Offset {4 * k}" for k in range(len(tail))]
+        dec += [f"OpDecorate %pc_tail DescriptorSet {PC_TAIL_SET}", f"OpDecorate %pc_tail Binding {PC_TAIL_BINDING}"]
+        gvars += ["%pc_tail = OpVariable %_ptr_Uniform_PcTail Uniform"]
     if gen.uses_fhalf:
         types += ["%fhalf_g = OpConstant %float 0.5"]
     if gen.uses_f64:
@@ -10629,11 +10657,9 @@ def assemble(gen):
     if gen.uses_heap:
         gen.consts.setdefault(1, "%c1")
         gen.consts.setdefault(2, "%c2")
-        fn += ["%ud_base_lo_p = OpAccessChain %_ptr_PC_uint %user_data %c1",
-               "%ud_base_hi_p = OpAccessChain %_ptr_PC_uint %user_data %c2"]
+        fn += [pc_tail_chain("%ud_base_lo_p", 1, gen.cu), pc_tail_chain("%ud_base_hi_p", 2, gen.cu)]
     if gen.uses_codebase:
-        fn += ["%ud_code_lo_p = OpAccessChain %_ptr_PC_uint %user_data %c3",
-               "%ud_code_hi_p = OpAccessChain %_ptr_PC_uint %user_data %c4"]
+        fn += [pc_tail_chain("%ud_code_lo_p", 3, gen.cu), pc_tail_chain("%ud_code_hi_p", 4, gen.cu)]
     for i in range(USER_SGPRS):
         fn += [f"%ud{i}p = OpAccessChain %_ptr_PC_uint %user_data %c0 {gen.cu(i)}",
                f"%ud{i} = OpLoad %uint %ud{i}p",
@@ -12388,7 +12414,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     the full ISG1 vertex-input signature) for PSO lookup and corpus auditing."""
     caps = sorted(set(re.findall(r"OpCapability (\w+)", asm)))
     exts = sorted(set(re.findall(r'OpExtension "([^"]+)"', asm)))
-    binds = sorted({int(b) for b in re.findall(r"OpDecorate %\w+ Binding (\d+)", asm)})
+    # Set 0 only: --pc-tail-ubo's %pc_tail is in set 1 and recorded as "pc_tail".
+    binds = sorted({int(b) for b in re.findall(r"OpDecorate %(?!pc_tail\b)\w+ Binding (\d+)", asm)})
     feats = {"FragmentBarycentricKHR": "fragmentShaderBarycentric",
              "FragmentShaderPixelInterlockEXT": "fragmentShaderPixelInterlock",
              "MeshShadingEXT": "meshShader", "Geometry": "geometryShader", "Float64": "shaderFloat64",
@@ -12441,6 +12468,12 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         lay["params"] = {str(k): v for k, v in lay["params"].items()}
         m["mesh_compute"] = lay
         m["push_constant_bytes"] = lay["push_constant_bytes"]
+    if PC_TAIL_UBO:
+        # --pc-tail-ubo: s0..s31 alone in push constants; the tail, if the shader reads it, in a uniform block.
+        m["push_constant_bytes"] = 4 * USER_SGPRS
+        if g.uses_pc_tail:
+            m["pc_tail"] = {"set": PC_TAIL_SET, "binding": PC_TAIL_BINDING,
+                            "bytes": 24 if getattr(g, "msc_layout", None) else 16}
     if g.ms:
         m["local_size"] = list(g.ms["size"])
         m["max_vertices"], m["max_primitives"] = g.ms["maxv"], g.ms["maxp"]
@@ -12740,9 +12773,15 @@ def main():
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
                          "need, or the shader is refused (Unsupported). The device's own maxComputeSharedMemorySize "
                          "(32768 on some drivers) is checked by the runtime against lds_bytes in index.json")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="keep only s0..s31 (128 bytes) in push constants and read the heap base, code base and "
+                         "--mesh-compute output address from a uniform block at set 1, binding 0 (metadata: pc_tail), "
+                         "for devices whose maxPushConstantsSize is below 144")
     a = ap.parse_args()
     MAX_SHARED_BYTES = a.max_shared_memory
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global PC_TAIL_UBO
+    PC_TAIL_UBO = a.pc_tail_ubo
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     global FLOAT_CONTROLS
