@@ -371,13 +371,18 @@ vtable pointer of a public object.
 - **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
   with `IID_ID3D12PipelineState`. The DLL's own messages name it `DeserializeComputePipelineStateX`. Its desc is the
   root signature at `+0x00`, then pointer and size pairs for the shader's `FSPX` entries: kind 0 at `+0x08`, kind 1
-  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy used to
-  forward it to the PC method at the same index; it now refuses it (`E_NOTIMPL`). When it fails, the DLL takes
-  slot 62; its message for that failure calls the fallback "NewBE".
+  at `+0x18`, a copy of the kind-6 program at `+0x28` with its exact size at `+0x30`, and kind 7 at `+0x38`
+  ([fspx.md](fspx.md)). The proxy used to forward it to the PC method at the same index; it now refuses it
+  (`E_NOTIMPL`). When it fails, the DLL takes slot 62; its message for that failure calls the fallback "NewBE". The
+  Vulkan device's `CreateComputePipelineState` takes the bare kind-6 program from `+0x28` and finds its translated
+  module by `fspx_code_sha256` ([fspx.md](fspx.md), "Build and run-time lookup"), so a mapping of the description onto
+  that call (#1714) resolves; the mapping itself is not on `main`.
 - **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
   runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
   `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
-  PC device stops.
+  PC device stops. The Vulkan device (`LEONIDA_D3D12=vulkan`) takes the container: it hashes the kind-6 bytes of the
+  `ACCC` part and creates the pipeline from the translated module, for the programs the build translated; others,
+  and a malformed `FSPX` directory, are refused with `E_INVALIDARG`.
 - **Pipeline slot 11 sizes the compute scratch.** After either path succeeds (slot 67 jumps to `0x5833`), the DLL
   calls the new pipeline's slot 11 as `(0, 0, &obj)` (`0x586d`); the public `ID3D12PipelineState` ends at slot 8, so
   this is a console-only method. On success it reads a dword through `obj`'s slot 3 (`0x5881`), multiplies it by
@@ -391,8 +396,9 @@ vtable pointer of a public object.
 - The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
   and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
   inside `XBCH` ([design.md](design.md)). `FSPX` is a directory around an uncompressed RDNA2 program and its
-  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 13 of the 29 today. The 13 that
-  use `v_dot4` instructions are not translated yet ([fspx.md](fspx.md)).
+  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 13 of the 29 today, and
+  `make_game.py`'s `shaders` stage does both for the package's DLL. The 13 that use `v_dot4` instructions are not
+  translated yet ([fspx.md](fspx.md)).
 
 **Command list.** The console list is **not** the PC order past `ResourceBarrier`. Each row is backed by the
 argument shape at the call and, where marked "run", by the call seen in the run. Rows marked "inferred" fit the

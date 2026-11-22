@@ -50,6 +50,11 @@ The pipeline function (RVA 0x4aa0, read from the DLL) accepts either a bare `FSP
 | +0x28, +0x30 | the copied kind 6, its size |
 | +0x38, +0x40 | kind 7 pointer, size |
 
+The size at `+0x30` is kind 6's own size, not the rounded allocation: the DLL rounds it into a separate register for
+`XMemAlloc` and stores the original, which is also the copy's length (read from the DLL's code with `objdump`, `0x5649` to
+`0x56d5`). So
+the bytes at `+0x28` with that size are exactly kind 6, and their SHA-256 is the key below.
+
 The DLL's own messages name that call `DeserializeComputePipelineStateX` and the path "ACO". When the call fails,
 the message says it falls back to "NewBE", and the DLL sets the environment variable `FFX_FSR4_XBOX_ACO_ACTIVE` to
 `0`. Its next pipeline call is slot 62 (measured in #864), so "NewBE" is inferred to be that path, the one a PC
@@ -103,6 +108,38 @@ compute shader.
   the program's prologue.
 - **Not read by the translator,** which does not read the game's FSSM binding table either. The programs load their
   descriptors with `s_load` and `s_buffer_load`, as the game's shaders do; that this is all they need is inferred.
+
+## Build and run-time lookup
+
+**Build.** `make_game.py`'s `shaders` stage, after the game's own shaders, runs `tools/fspx_unpack.py --disasm` on
+the package's `amd_fidelityfx_upscaler_xbox.dll` into `<work>/shaders/fspx/` and `tools/rdna2spirv.py` on that
+disassembly into `<work>/shaders/spirv/fspx/`, with the same `--wave64-emulate` and fallback flags. Each index entry
+of a program without an FSSM blob gets `fspx_code_sha256`, the SHA-256 of `fspx/<name>.code`: the whole kind-6
+entry, prologue and padding included (`tools/shader_meta.py`). The step is redone as a whole when the DLL, the
+unpacking or translating tools, `llvm-mc`, the wave64 mode or the flags change (`fspx_build.json`, written last); it
+never makes the game's shaders translate again. A package without the DLL skips it.
+
+**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when it
+is there, `<dir>/fspx/index.json`, whose entries are named `fspx/<name>`. A missing or unreadable `fspx/index.json`
+leaves the main index loaded. Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
+`compute_program()` decides what a compute PSO's bytecode is looked up by:
+
+| Bytecode | Key | Who passes it |
+|---|---|---|
+| `FSSM` blob, bare or in a `DXIL` part | `fssm_sha256` of the blob | the game (unchanged) |
+| `DXBC` container whose `ACCC` part is an FSPX payload | `fspx_code_sha256` of its kind-6 bytes | the DLL, slot 62 |
+| bare FSPX payload | `fspx_code_sha256` of its kind-6 bytes | the DLL's pipeline function accepts one (none measured at a slot) |
+| bare kind-6 program: 4-byte multiple, at least 36 bytes, the prologue's words 0, 3 and 6 with bits 31..16 = `0xD580` | `fspx_code_sha256` of the bytes as they are | the slot-67 description at `+0x28`, size at `+0x30` |
+| anything else | none: `E_INVALIDARG`, as before | |
+
+The payload is parsed with the DLL reader's rules above (sizes and offsets checked in 64-bit arithmetic against the
+clamped total), so a malformed directory, or one without kind 0 or kind 6, gives no program and `E_INVALIDARG`. The
+pipeline's code base, which a translated shader reads its embedded constants through, is the kind-6 bytes: the
+translator's code offsets are into `fspx/<name>.code`.
+
+Not done here: mapping slot 67's description onto `CreateComputePipelineState` (#1714), the console-only pipeline
+slot 11 the DLL calls after either path ([d3d12_command_objects.md](d3d12_command_objects.md) §3.5a), and using
+kind 0 at run time beyond what the translated module already carries (its thread-group size and `RSRC2`).
 
 ## Translation status
 

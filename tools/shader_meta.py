@@ -614,12 +614,30 @@ def fssm_sha256_file(disasm_path, name):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def fspx_code_sha256_file(disasm_path, name):
+    """SHA-256 hex digest of <disasm_dir>/../fspx/<name>.code, the kind-6 program tools/fspx_unpack.py writes for an
+    FSPX shader without an FSSM blob, or None. The run time computes the same key from the bytes a compute PSO gets
+    (docs/fspx.md, "Run-time lookup")."""
+    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    if os.path.isfile(os.path.join(parent, "fssm", name + ".fssm")):
+        return None
+    code = os.path.join(parent, "fspx", name + ".code")
+    if not os.path.isfile(code):
+        return None
+    with open(code, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     """Collect all build-time runtime metadata for one translated shader."""
     meta = {}
     digest = fssm_sha256_file(disasm_path, name)
     if digest is not None:
         meta["fssm_sha256"] = digest
+    else:
+        code_digest = fspx_code_sha256_file(disasm_path, name)
+        if code_digest is not None:
+            meta["fspx_code_sha256"] = code_digest
 
     dxbc_info = {}
     parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))

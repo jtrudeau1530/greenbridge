@@ -1255,6 +1255,14 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute COMMAND d3d12_compute_test)
       set_tests_properties(d3d12_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # Compute PSOs from FSPX programs (docs/fspx.md): an ACCC container at slot 62 and a bare kind-6 program.
+      add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_CS})
+      target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_fspx_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+      target_compile_options(d3d12_fspx_compute_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_fspx_compute COMMAND d3d12_fspx_compute_test)
+      set_tests_properties(d3d12_fspx_compute PROPERTIES SKIP_RETURN_CODE 77)
       # Milestone M1: a VS+PS pipeline and indexed draws, shaders written to the same contract.
       set(LEONIDA_TEST_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw.spv)
       set(LEONIDA_TEST_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_draw.spv)

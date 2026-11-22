@@ -892,6 +892,14 @@ and any validation error fails them.
   - the index has an entry with set-0 bindings for the same program ahead of the binding-free one, and the PSO
     must take the binding-free one;
   - a device that reports 128 bytes of push constants refuses the PSO.
+- `d3d12_fspx_compute_test`: the FidelityFX DLL's two ways of passing an FSPX program, with synthetic programs
+  ([fspx.md](fspx.md), "Build and run-time lookup"). A PSO through slot 62 from a `DXBC` container whose `ACCC` part
+  is an FSPX payload, and one through `CreateComputePipelineState` from a bare kind-6 program, as the slot-67
+  description carries it. Both are found by `fspx_code_sha256` in `<shaders>/fspx/index.json` and dispatched once with
+  `cs_user_data.comp`, which adds dword 1 of its code base: each must read its own kind-6 program. Ten inputs are
+  refused with `E_INVALIDARG`: an untranslated program, bare and in a container; kind-6 entries that end past the
+  payload, start inside the directory, wrap 32 bits, are too large or are empty; a container without `ACCC`; bytes
+  without the prologue; and the program with four bytes appended.
 - `d3d12_draw_test`: milestone M1, through the proxy.
   - **Pipeline:** a VS+PS PSO found by FSSM hash. The input layout is POSITION then COLOR, while the VS has them in
     the opposite register order, so a match by position would fail.
@@ -2737,7 +2745,12 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     Device slot 67 is a console-only compute-pipeline call, `DeserializeComputePipelineStateX` in the DLL's own
     messages, not the PC method at that index; the proxy now refuses it. The dispatch stops where the PC runtime
     refuses the DLL's compute code at slot 62: the DLL's shaders carry an `ACCC` part instead of DXIL, an `FSPX`
-    payload with an RDNA2 program ([fspx.md](fspx.md)).
+    payload with an RDNA2 program ([fspx.md](fspx.md)). The Vulkan device takes both forms at
+    `CreateComputePipelineState`: the `ACCC` container slot 62 gets, and the bare kind-6 program the slot-67
+    description carries at `+0x28`. It finds the translated module by `fspx_code_sha256`, the SHA-256 of the kind-6
+    bytes, in `<shaders>/fspx/index.json`, which `make_game.py` writes ([fspx.md](fspx.md), "Build and run-time
+    lookup"; `d3d12_fspx_compute_test`). Not done: mapping slot 67 onto that call (#1714) and the console-only
+    pipeline slot 11 the DLL calls afterwards.
   - Its `throw 1` reaches the caller. Before #965 the throw carried an image base of 0, because `_CxxThrowException`
     did not know manually mapped images; with #965 it carries the DLL's base, and the DLL still does not catch it on
     that path (measured with `fsr_dispatch_test` and `LEONIDA_FSR_NO_STANDIN=1`).
