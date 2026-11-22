@@ -331,7 +331,7 @@ class Gen:
             # wave32 (or plain data): vcc_hi is an ordinary SGPR.
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint {'%vcc' if (self.wave64 and 'vcc' in self.cur_masks) else '%vcc_hi'}")
-        elif k == "special" and a["t"] == "scc":
+        elif k == "special" and a["t"] in ("scc", "src_scc"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %scc")
         elif k == "special" and a["t"] == "src_pops_exiting_wave_id":
@@ -2072,8 +2072,8 @@ class Gen:
             inst -= 0x1000            # the raw 12-bit field from a tool that prints it unsigned: same offset
         if not -0x800 <= inst <= 0x7FF:
             raise Unsupported(f"{op} offset:{inst}")     # not a 12-bit value: don't guess an address
-        if saddr["k"] == "sgpr" and saddr.get("n") == 2:
-            lo, hi = self.load_reg("sgpr", saddr["r"]), self.load_reg("sgpr", saddr["r"] + 1)
+        if (saddr["k"] == "sgpr" and saddr.get("n") == 2) or (saddr["k"] == "slist" and len(saddr["r"]) == 2):
+            lo, hi = self.sgpr_words(saddr, 2)
             voff = self.load_reg("vgpr", vaddr["r"])
             l64, h64, sh, base, v64, va = (self.tmp() for _ in range(6))
             self.emit(f"{l64} = OpUConvert %ulong {lo}")
@@ -2291,10 +2291,14 @@ class Gen:
         when swizzled, selected at run time for a run-time word1), for buf_dword_ptr."""
         vaddr, rsrc = a[1], a[2]
         soff = a[3] if len(a) > 3 else {"k": "imm", "v": 0}
-        if rsrc["k"] != "sgpr" or rsrc.get("n") != 4:
+        if (rsrc["k"] == "sgpr" and rsrc.get("n") == 4):
+            lit3, lit1 = self.sgpr_imm.get(rsrc["r"] + 3), self.sgpr_imm.get(rsrc["r"] + 1)
+        elif rsrc["k"] == "slist" and len(rsrc["r"]) == 4:
+            lit3 = self.sgpr_imm.get(rsrc["r"][3]) if isinstance(rsrc["r"][3], int) else None
+            lit1 = self.sgpr_imm.get(rsrc["r"][1]) if isinstance(rsrc["r"][1], int) else None
+        else:
             raise Unsupported("buffer V#")
-        lit3, lit1 = self.sgpr_imm.get(rsrc["r"] + 3), self.sgpr_imm.get(rsrc["r"] + 1)
-        d0, d1, d2, d3 = (self.load_reg("sgpr", rsrc["r"] + i) for i in (0, 1, 2, 3))
+        d0, d1, d2, d3 = self.sgpr_words(rsrc, 4)
         hi, stride = self.tmp(), self.tmp()
         self.emit(f"{hi} = OpBitwiseAnd %uint {d1} {self.cu(0xFFFF)}")
         self.emit(f"{stride} = OpBitFieldUExtract %uint {d1} {self.cu(16)} {self.cu(14)}")
@@ -7416,23 +7420,42 @@ class Gen:
         x8), an s_buffer_load immediate with bit 20 set or a negative one (kept as the 32-bit value, as before)."""
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         d, base = a[0], a[1]
-        # A single dword may also land in vcc_lo / m0 / vcc_hi (seen: s_buffer_load_dword vcc_lo, ...).
+        # A single dword may also land in vcc_lo / m0 / vcc_hi (seen: s_buffer_load_dword vcc_lo, ...), and a wide
+        # load may target an LLVM VCCTuple list ending in vcc_lo,vcc_hi (seen in 6 FSPX shaders: s[100..105]+vcc).
         single_special = (n == 1 and d["k"] == "special" and d["t"] in ("vcc_lo", "vcc", "m0", "vcc_hi")) or \
             (n == 2 and d["k"] == "special" and d["t"] == "vcc")
-        if (d["k"] != "sgpr" and not single_special) or base["k"] != "sgpr":
+        slist_dst = d["k"] == "slist" and len(d["r"]) == n
+        base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
+                      else list(base["r"]) if base["k"] == "slist" else None)
+        if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
+
+        def load_slot(slot):
+            if isinstance(slot, int):
+                return self.load_reg("sgpr", slot)
+            t = self.tmp()
+            self.emit(f"{t} = OpLoad %uint {'%vcc' if slot == 'vcc_lo' else '%vcc_hi'}")
+            return t
+
+        def store_slot(slot, val):
+            if isinstance(slot, int):
+                self.store_reg("sgpr", slot, val)
+            else:
+                self.emit(f"OpStore {'%vcc' if slot == 'vcc_lo' else '%vcc_hi'} {val}")
+
         sbuf = op.startswith("s_buffer")
-        lo, hi = self.load_reg("sgpr", base["r"]), self.load_reg("sgpr", base["r"] + 1)
+        if sbuf:
+            if len(base_slots) != 4:
+                raise Unsupported("s_buffer_load without V#")
+        else:
+            if len(base_slots) != 2:
+                raise Unsupported("s_load without 64-bit pointer")
+        lo, hi = load_slot(base_slots[0]), load_slot(base_slots[1])
         word1 = hi
         if sbuf:
-            if base.get("n") != 4:
-                raise Unsupported("s_buffer_load without V#")
             m = self.tmp()
             self.emit(f"{m} = OpBitwiseAnd %uint {hi} {self.cu(0xFFFF)}")
             hi = m
-        else:
-            if base.get("n") != 2:
-                raise Unsupported("s_load without 64-bit pointer")
         off = a[2] if len(a) > 2 else {"k": "imm", "v": 0}
         inst = [m.split(":", 1)[1] for m in mods if m.startswith("offset:")]
         if len(a) > 3 or len(inst) > 1 or (inst and off["k"] == "imm"):
@@ -7489,15 +7512,15 @@ class Gen:
         lim_val = None
         if sbuf:
             # limit = NUM_RECORDS * stride, or NUM_RECORDS when stride is 0 (bytes, 64-bit so the product can't wrap)
-            lit1 = self.sgpr_imm.get(base["r"] + 1)
-            lit2 = self.sgpr_imm.get(base["r"] + 2)
+            lit1 = self.sgpr_imm.get(base_slots[1]) if isinstance(base_slots[1], int) else None
+            lit2 = self.sgpr_imm.get(base_slots[2]) if isinstance(base_slots[2], int) else None
             if lit1 is not None and lit2 is not None:
                 stride = (lit1 >> 16) & 0x3FFF
                 lim_val = lit2 if stride == 0 else lit2 * stride
                 lim = self.cl(lim_val)
             else:
                 stride, nr64, st64, prod, raw, lim = (self.tmp() for _ in range(6))
-                nr = self.load_reg("sgpr", base["r"] + 2)
+                nr = load_slot(base_slots[2])
                 self.emit(f"{stride} = OpBitFieldUExtract %uint {word1} {self.cu(16)} {self.cu(14)}")
                 self.emit(f"{nr64} = OpUConvert %ulong {nr}")
                 self.emit(f"{st64} = OpUConvert %ulong {stride}")
@@ -7539,6 +7562,8 @@ class Gen:
                     self.emit(f"OpStore {'%vcc' if i == 0 else '%vcc_hi'} {v}")
                 else:
                     self.dst(d, v)
+            elif slist_dst:
+                store_slot(d["r"][i], v)
             else:
                 self.store_reg("sgpr", d["r"] + i, v)
 
@@ -7762,6 +7787,11 @@ class Gen:
         ones, which are two calls, s_load results, v_readlane/v_readfirstlane results and the spare slots lane
         masks are parked in) and cleared when a basic block starts. Only lookups made at the block's top level
         are remembered, see desc_cache_ok. Returns the bindless index (a uint id)."""
+        if a["k"] == "slist" and len(a["r"]) >= n:
+            words = self.sgpr_words(a, n)
+            if n < 8:
+                words = words + [self.cu(0xFFFFFFFF)] * (8 - n)
+            return self.desc_lookup(words)
         if a["k"] != "sgpr" or a.get("n", 1) < n:
             raise Unsupported("descriptor operand")
         key = (a["r"], n)
@@ -7777,10 +7807,24 @@ class Gen:
             self.desc_cache[key] = idx
         return idx
 
+    def sgpr_word(self, a, i):
+        if a["k"] == "sgpr":
+            return self.load_reg("sgpr", a["r"] + i)
+        if a["k"] == "slist":
+            slot = a["r"][i]
+            if isinstance(slot, int):
+                return self.load_reg("sgpr", slot)
+            t = self.tmp()
+            self.emit(f"{t} = OpLoad %uint {'%vcc' if slot == 'vcc_lo' else '%vcc_hi'}")
+            return t
+        raise Unsupported("descriptor operand")
+
     def sgpr_words(self, a, n):
-        if a["k"] != "sgpr" or a.get("n", 1) < n:
-            raise Unsupported("descriptor operand")
-        return [self.load_reg("sgpr", a["r"] + i) for i in range(n)]
+        if a["k"] == "sgpr" and a.get("n", 1) >= n:
+            return [self.load_reg("sgpr", a["r"] + i) for i in range(n)]
+        if a["k"] == "slist" and len(a["r"]) >= n:
+            return [self.sgpr_word(a, i) for i in range(n)]
+        raise Unsupported("descriptor operand")
 
     def addr_regs(self, a):
         """Image address operand: contiguous v[x:y] or an NSA list."""
@@ -7888,7 +7932,7 @@ class Gen:
                 self.image_load_coherent(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img_idx, dmask, vdata, d16)
                 return
             if dim in self.STORE_DIMS:
-                self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, img_idx,
+                self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, img_idx,
                                       dmask, vdata, self.cu(0), d16)
                 return
             res = self.tmp()
@@ -7994,7 +8038,7 @@ class Gen:
                     self.emit(f"{result} = OpCompositeConstruct {ty} {' '.join(taps)}")
                     return result
 
-                self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
+                self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
                                       0xf, vdata, d16, gather_mip)
                 self.uses_fhalf = True
                 return
@@ -8021,7 +8065,7 @@ class Gen:
                 if dim == "dim:SQ_RSRC_IMG_2D":
                     self.uses_int_sampler = True
                     # dmask selects one texture channel; all four taps are written.
-                    self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
+                    self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
                                           0xf, vdata, d16, gather)
                     return
                 res = gather(img, 0, "%v4float")
@@ -8115,7 +8159,7 @@ class Gen:
                     return result
 
                 self.uses_int_sampler = True
-                self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
+                self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
                                       dmask, vdata, d16, sample)
                 return
             res = self.tmp()
@@ -8384,7 +8428,7 @@ class Gen:
         vals = [self.load_reg("vgpr", next(regs)) if dmask >> c & 1 else self.cu(0) for c in range(4)]
         coords = [self.as_int(c) for c in raw[:nc]]
         idx = self.desc_lookup_sgpr(a[2], 8)
-        t1 = self.load_reg("sgpr", a[2]["r"] + 1)
+        t1 = self.sgpr_word(a[2], 1)
         self.uses_store_views.add(di)
         for w in [16] + sum(self.int_format_masks(), []):      # constants used by assemble's format masks
             self.cu(w)
@@ -8465,17 +8509,33 @@ class Gen:
                     self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
                     out += 1
             return
-        if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query)) or "a16" in mods
+        is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap"
+        if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))
+                or ("a16" in mods and not is_atomic)
                 or ("d16" in mods and op != "image_load_mip")):
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
         idx = self.desc_lookup_sgpr(a[2], 8)
+
+        def atomic_coords(nc):
+            raw = [self.load_reg("vgpr", r) for r in addr]
+            if "a16" in mods:
+                # 16-bit packed unsigned coordinates: two per VGPR, low half first (same as image_store).
+                halves = []
+                for c in raw:
+                    lo, hi = self.tmp(), self.tmp()
+                    self.emit(f"{lo} = OpBitwiseAnd %uint {c} {self.cu(0xFFFF)}")
+                    self.emit(f"{hi} = OpShiftRightLogical %uint {c} {self.cu(16)}")
+                    halves += [lo, hi]
+                raw = halves
+            if len(raw) < nc:
+                raise Unsupported(op + " coords")
+            return [self.as_int(c) for c in raw[:nc]]
+
         if is3d_atomic:
             # 3D r32ui storage image atomics (binding 7).
             self.uses_storage3d = True
-            coords = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
-            if len(coords) < 3:
-                raise Unsupported(op + " coords")
+            coords = atomic_coords(3)
             iv, ip, tp, old, safe = (self.tmp() for _ in range(5))
             self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg3 %simages3d {idx}")
@@ -8507,7 +8567,7 @@ class Gen:
         if op in self.IMG_ATOMICS or op == "image_atomic_cmpswap":
             # Storage image (2D r32ui). Atomics: vdata holds the operand; with 'glc' the pre-op value comes back.
             self.uses_storage = True
-            coords = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:2]]
+            coords = atomic_coords(2)
             iv = self.tmp()
             self.emit(f"{iv} = OpCompositeConstruct %v2int {coords[0]} {coords[1]}")
             ip = self.tmp()
@@ -8591,7 +8651,7 @@ class Gen:
         xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
         iv = self.tmp()
         self.emit(f"{iv} = OpCompositeConstruct %v2int {xs[0]} {xs[1]}")
-        self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, idx, dmask, vdata, xs[2], d16="d16" in mods)
+        self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, dmask, vdata, xs[2], d16="d16" in mods)
 
 
     def interp_pair_src(self, op, a, ins):

@@ -82,6 +82,8 @@ def _imm_u32(a):
 def _sgpr_regs(a):
     if a["k"] == "sgpr":
         return list(range(a["r"], a["r"] + a.get("n", 1)))
+    if a["k"] == "slist":
+        return [r for r in a["r"] if isinstance(r, int)]
     return []
 
 
