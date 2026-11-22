@@ -8559,27 +8559,23 @@ class Gen:
         if op == "image_load_mip" and "glc" in mods:
             # A coherent read of one mip: image_load_coherent reads a storage view, which has one level.
             raise Unsupported("image_load_mip glc")
-        if op == "image_load_mip" and dim == "dim:SQ_RSRC_IMG_3D" and "d16" not in mods and "a16" not in mods:
+        if op == "image_load_mip" and dim == "dim:SQ_RSRC_IMG_3D" and "a16" not in mods:
             # x, y, z, mip from a 3D sampled image (binding 6)
+            if "d16" in mods and ("tfe" in mods or "lwe" in mods):
+                raise Unsupported("image_load_mip d16 status")
             vdata, addr = a[0], self.addr_regs(a[1])
             if len(addr) < 4:
                 raise Unsupported("image_load_mip coords")
             idx = self.desc_lookup_sgpr(a[2], 8)
             self.uses_tex_3d = True
-            ip, img, iv, res = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            ip, img, iv = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_img3 %images_3d {idx}")
             self.emit(f"{img} = OpLoad %img3d {ip}")
             xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:4]]
             self.emit(f"{iv} = OpCompositeConstruct %v3int {xs[0]} {xs[1]} {xs[2]}")
-            self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {xs[3]}")
             dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
-            dmask, out = int(dm.split(":")[1], 0), 0
-            for c in range(4):
-                if dmask >> c & 1:
-                    comp = self.tmp()
-                    self.emit(f"{comp} = OpCompositeExtract %float {res} {c}")
-                    self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
-                    out += 1
+            self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, int(dm.split(":")[1], 0),
+                                  vdata, xs[3], d16="d16" in mods)
             return
         is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap"
         if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))

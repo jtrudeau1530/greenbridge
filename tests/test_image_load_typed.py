@@ -86,6 +86,15 @@ class Module:
             out.append((rid, chain[1], self.defs[load[0]][1]))
         return out
 
+    def integer_coord_vgpr(self, operand):
+        op, cast = self.defs[operand]
+        assert op == "OpBitcast", op
+        op, load = self.defs[cast[1]]
+        assert op == "OpLoad", op
+        op, ptr = self.defs[load[1]]
+        assert (op, ptr[1]) == ("OpAccessChain", "%vgpr"), (op, ptr)
+        return self.value(ptr[2], 0, 0)
+
     def value(self, x, word1, index):
         """Evaluate the uint/bool id x given the T#'s word 1 and the bindless index of the lookup."""
         if x in ("%true", "%false"):
@@ -141,6 +150,24 @@ def format_class(fmt):
 
 
 class LoadOnlyShaders(unittest.TestCase):
+    def test_volume_mip_fetch_uses_xyz_level_and_descriptor_type(self):
+        for dst, modifier in (("v[0:1]", ""), ("v0", " d16")):
+            with self.subTest(modifier=modifier):
+                m = Module(translate([f"image_load_mip {dst}, v[4:7], s[0:7] "
+                                      f"dmask:0x9 dim:SQ_RSRC_IMG_3D unorm{modifier}"]))
+                fetches = m.fetches()
+                self.assertEqual({image[0] for _, _, image in fetches}, {"%float", "%uint", "%int"})
+                for rid, var, image in fetches:
+                    self.assertEqual((m.binding[var], image[1]), (6, "3D"))
+                    _, _, xyz, mask, lod = m.defs[rid][1]
+                    self.assertEqual(mask, "Lod")
+                    op, coords = m.defs[xyz]
+                    self.assertEqual((op, coords[0]), ("OpCompositeConstruct", "%v3int"))
+                    self.assertEqual([m.integer_coord_vgpr(v) for v in [*coords[1:], lod]], [4, 5, 6, 7])
+                for fmt, kind in ((75, "uint"), (76, "sint"), (77, "float")):  # RGBA32 formats
+                    self.assertEqual(m.branch(fmt << 20, 1), kind)
+                    self.assertEqual(m.branch(fmt << 20, 0), "float")
+
     def test_2d_explicit_mip_reaches_every_typed_fetch(self):
         m = Module(translate(["image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D",
                               "s_waitcnt vmcnt(0)"]))
@@ -150,13 +177,7 @@ class LoadOnlyShaders(unittest.TestCase):
             self.assertEqual(m.binding[var], 0)
             operands = m.defs[rid][1]
             self.assertEqual(operands[-2], "Lod")
-            op, cast = m.defs[operands[-1]]
-            self.assertEqual(op, "OpBitcast")
-            op, load = m.defs[cast[1]]
-            self.assertEqual(op, "OpLoad")
-            op, source = m.defs[load[1]]
-            self.assertEqual((op, source[1]), ("OpAccessChain", "%vgpr"))
-            self.assertEqual(m.value(source[2], 0, 0), 6)
+            self.assertEqual(m.integer_coord_vgpr(operands[-1]), 6)
 
     def test_2d_explicit_mip_d16_packs_only_selected_components(self):
         listing = ["image_load_mip v0, v[4:6], s[0:7] dmask:0x9 dim:SQ_RSRC_IMG_2D d16",
