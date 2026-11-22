@@ -1,0 +1,267 @@
+"""Tests for scripts/run_wine_tests.py: path mapping, per-test statuses and the job's exit code.
+
+    python -I tests/test_run_wine_tests.py
+
+No Wine and no game data: `wine` is the Python interpreter and every "build artifact" is a tiny script that exits
+with a chosen code, so the runner's own logic is what is under test.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import run_wine_tests as rwt  # noqa: E402
+
+WINDOWS_ROOT = "D:/win/root"
+
+
+def test_entry(name, command, properties=None):
+    entry = {"name": name}
+    if command is not None:
+        entry["command"] = command
+    if properties:
+        entry["properties"] = [{"name": k, "value": v} for k, v in properties.items()]
+    return entry
+
+
+class PathMappingTest(unittest.TestCase):
+    def test_paths_under_the_windows_checkout_are_mapped(self):
+        self.assertEqual(rwt.map_path("D:/win/root", WINDOWS_ROOT, "/repo"), "/repo")
+        self.assertEqual(rwt.map_path("D:\\win\\root\\runtime\\build", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "runtime", "build"))
+        self.assertEqual(rwt.map_path("d:/WIN/root/a/b.exe", WINDOWS_ROOT, "/repo"), os.path.join("/repo", "a", "b.exe"))
+        self.assertEqual(rwt.map_path("D:/win/root/", WINDOWS_ROOT, "/repo"), "/repo")
+
+    def test_paths_outside_the_checkout_are_not_mapped(self):
+        for path in ("D:/win/root2/a.exe", "C:/Windows/system32/cmd.exe", "/usr/bin/cmake", ""):
+            with self.subTest(path=path):
+                self.assertIsNone(rwt.map_path(path, WINDOWS_ROOT, "/repo"))
+
+    def test_wine_path_uses_the_z_drive(self):
+        self.assertEqual(rwt.wine_path("/tmp/x y"), "Z:" + os.path.abspath("/tmp/x y").replace("/", "\\"))
+
+    def test_properties_are_flattened(self):
+        self.assertEqual(rwt.properties(test_entry("t", ["x"], {"SKIP_RETURN_CODE": "77", "WILL_FAIL": "1"})),
+                         {"SKIP_RETURN_CODE": "77", "WILL_FAIL": "1"})
+        self.assertEqual(rwt.properties({"name": "t"}), {})
+
+    def test_ctest_booleans_are_not_python_truthiness(self):
+        for value in ("1", "ON", "true", "yes", " 1 "):
+            with self.subTest(value=value):
+                self.assertTrue(rwt.truthy(value))
+        for value in ("0", "", None, "false", "no"):
+            with self.subTest(value=value):
+                self.assertFalse(rwt.truthy(value))
+
+
+class RunTestTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.artifact = self.root / "artifact"
+        self.artifact.mkdir()
+        self.args = argparse.Namespace(windows_root=WINDOWS_ROOT, root=str(self.root), timeout=10.0)
+        self.wine = [sys.executable]
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def program(self, name, body):
+        path = self.artifact / name
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    def exiting(self, code, name=None):
+        return self.program(name or f"exit{code}.py", f"import sys\nsys.exit({code})\n")
+
+    def command_for(self, exe, *args):
+        """The same program as ctest would list it: a path in the Windows checkout."""
+        parts = Path(exe).relative_to(self.root).parts
+        return [WINDOWS_ROOT + "/" + "/".join(parts), *args]
+
+    def run_entry(self, entry):
+        return rwt.run_test(entry, self.args, self.wine)
+
+    def test_a_passing_test(self):
+        status, detail = self.run_entry(test_entry("ok", self.command_for(self.exiting(0))))
+        self.assertEqual(status, "pass")
+        self.assertIn("exit 0", detail)
+
+    def test_a_failing_test_reports_the_exit_code(self):
+        status, detail = self.run_entry(test_entry("bad", self.command_for(self.exiting(3))))
+        self.assertEqual(status, "fail")
+        self.assertIn("exit 3", detail)
+
+    def test_a_test_without_a_command_fails(self):
+        status, detail = self.run_entry(test_entry("unbuilt", None))
+        self.assertEqual(status, "fail")
+        self.assertIn("no command", detail)
+
+    def test_a_test_that_runs_a_runner_program_is_skipped(self):
+        status, detail = self.run_entry(test_entry("python-test", ["/usr/bin/cmake", "-P", "x.cmake"]))
+        self.assertEqual(status, "skip")
+        self.assertIn("not a program from the build", detail)
+
+    def test_a_missing_executable_fails(self):
+        status, detail = self.run_entry(test_entry("gone", [WINDOWS_ROOT + "/artifact/gone.py"]))
+        self.assertEqual(status, "fail")
+        self.assertIn("not in the artifact", detail)
+
+    def test_will_fail_inverts_the_exit_code(self):
+        exe = self.exiting(2)
+        status, _ = self.run_entry(test_entry("expected", self.command_for(exe), {"WILL_FAIL": "1"}))
+        self.assertEqual(status, "pass")
+
+    def test_will_fail_zero_does_not_invert_the_exit_code(self):
+        # A JSON property value is a string; "0" must stay false.
+        status, detail = self.run_entry(test_entry("normal", self.command_for(self.exiting(0)), {"WILL_FAIL": "0"}))
+        self.assertEqual(status, "pass", detail)
+
+    def test_the_skip_return_code_is_a_skip(self):
+        status, detail = self.run_entry(
+            test_entry("skipped", self.command_for(self.exiting(77)), {"SKIP_RETURN_CODE": "77"}))
+        self.assertEqual(status, "skip")
+        self.assertIn("exit 77", detail)
+
+    def test_a_timeout_is_reported_without_hanging(self):
+        slow = self.program("slow.py", "import time\ntime.sleep(5)\n")
+        self.args.timeout = 0.2
+        status, detail = self.run_entry(test_entry("slow", self.command_for(slow)))
+        self.assertEqual(status, "fail")
+        self.assertIn("timed out after 0.2 s", detail)
+
+    def test_an_unstartable_wine_fails_the_test_instead_of_aborting_the_run(self):
+        status, detail = rwt.run_test(test_entry("ok", self.command_for(self.exiting(0))), self.args,
+                                      ["definitely-not-a-real-wine-xyz"])
+        self.assertEqual(status, "fail")
+        self.assertIn("could not start", detail)
+
+    def test_arguments_and_working_directory_are_mapped(self):
+        report = self.root / "report.json"
+        script = self.program("report.py", (
+            "import json, os, sys\n"
+            "json.dump({'argv': sys.argv[1:], 'cwd': os.getcwd()}, open(os.environ['REPORT_PATH'], 'w'))\n"))
+        (self.artifact / "sub").mkdir()
+        entry = test_entry("mapped", self.command_for(script, WINDOWS_ROOT + "/artifact/data.bin", "--flag"),
+                           {"WORKING_DIRECTORY": WINDOWS_ROOT + "/artifact/sub"})
+        with mock.patch.dict(os.environ, {"REPORT_PATH": str(report)}):
+            status, detail = self.run_entry(entry)
+        self.assertEqual(status, "pass", detail)
+        seen = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(len(seen["argv"]), 2)
+        self.assertTrue(seen["argv"][0].startswith("Z:"), seen["argv"][0])
+        self.assertTrue(seen["argv"][0].endswith("data.bin"), seen["argv"][0])
+        self.assertEqual(seen["argv"][1], "--flag")
+        self.assertEqual(os.path.normcase(os.path.realpath(seen["cwd"])),
+                         os.path.normcase(os.path.realpath(self.artifact / "sub")))
+
+
+class MainTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.artifact = self.root / "artifact"
+        self.artifact.mkdir()
+        for name, code in (("ok.py", 0), ("bad.py", 1)):
+            (self.artifact / name).write_text(f"import sys\nsys.exit({code})\n", encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def list_tests(self, entries):
+        path = self.root / "ctest.json"
+        path.write_text(json.dumps({"tests": entries}), encoding="utf-8")
+        return str(path)
+
+    def command(self, name):
+        return [WINDOWS_ROOT + "/artifact/" + name]
+
+    def run_main(self, entries, *extra, stderr=False):
+        listing = self.list_tests(entries)
+        argv = ["run_wine_tests.py", "--tests", listing, "--windows-root", WINDOWS_ROOT,
+                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/"), *extra]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = rwt.main()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_required_test_that_passes_exits_zero(self):
+        code, out, _ = self.run_main([test_entry("ok", self.command("ok.py"))], "--require", "ok")
+        self.assertEqual(code, 0)
+        self.assertIn("1 passed, 0 failed, 0 skipped under Wine (1 tests)", out)
+
+    def test_a_required_test_that_fails_exits_one(self):
+        code, out, _ = self.run_main([test_entry("bad", self.command("bad.py"))], "--require", "bad")
+        self.assertEqual(code, 1)
+        self.assertIn("required tests that did not pass: bad", out)
+
+    def test_a_required_test_that_is_not_listed_exits_one(self):
+        code, out, _ = self.run_main([test_entry("ok", self.command("ok.py"))], "--require", "absent")
+        self.assertEqual(code, 1)
+        self.assertIn("required test not listed", out)
+
+    def test_unrequired_failures_are_reported_but_do_not_fail_the_job(self):
+        code, out, _ = self.run_main([test_entry("bad", self.command("bad.py"))])
+        self.assertEqual(code, 0)
+        self.assertIn("[FAIL] bad", out)
+
+    def test_the_summary_table_is_appended(self):
+        summary = self.root / "summary.md"
+        code, _, _ = self.run_main([test_entry("ok", self.command("ok.py")), test_entry("bad", self.command("bad.py"))],
+                                   "--summary", str(summary), "--label", "Wine 11", "--require", "ok")
+        self.assertEqual(code, 0)
+        text = summary.read_text(encoding="utf-8")
+        self.assertIn("### Windows tests under Wine 11", text)
+        self.assertIn("| `ok` | pass | yes |", text)
+        self.assertIn("| `bad` | fail |  |", text)
+
+    def test_a_file_that_is_not_json_is_one_error_line(self):
+        listing = self.root / "notes.txt"
+        listing.write_text("this is not ctest output\n", encoding="utf-8")
+        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
+                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = rwt.main()
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: cannot read", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_json_that_is_not_ctest_output_is_one_error_line(self):
+        code, _, err = self.run_main_json([{"name": "t"}])
+        self.assertEqual(code, 2)
+        self.assertIn("not the output of ctest", err)
+
+    def run_main_json(self, document):
+        listing = self.root / "wrong.json"
+        listing.write_text(json.dumps(document), encoding="utf-8")
+        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
+                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = rwt.main()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_bad_timeout_is_refused_by_argparse(self):
+        for text in ("0", "-1", "abc"):
+            with self.subTest(text=text):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    rwt.positive_seconds(text)
+        self.assertEqual(rwt.positive_seconds("0.5"), 0.5)
+
+
+if __name__ == "__main__":
+    unittest.main()
