@@ -724,8 +724,115 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), ((lane + 10) << 16) | 777)
 
 
+
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, (400 << 16) | 100)  # v0 = [400, 100]
+        state.set_vgpr(1, (200 << 16) | 300)  # v1 = [200, 300]
+        # v0 = pack(v0[15:0], v1[15:0]) -> low half 100, high half 300
+        instr = VPackB32I16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            op_sel=(0, 0),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = (300 << 16) | 100
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+        # v1 untouched
+        self.assertEqual(state.get_vgpr(1), (200 << 16) | 300)
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, (200 << 16) | 300)  # v0 = [200, 300]
+        state.set_vgpr(1, (400 << 16) | 100)  # v1 = [400, 100]
+        # v0 = pack(v1[15:0], v0[31:16]) -> low half 100, high half 200
+        instr = VPackB32I16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            op_sel=(0, 1),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = (200 << 16) | 100
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+        # v1 untouched
+        self.assertEqual(state.get_vgpr(1), (400 << 16) | 100)
+
+    def test_dst_alias_both_srcs_in_place_swap(self) -> None:
+        state = ScalarMachineState()
+        original = (400 << 16) | 100  # high: 400, low: 100
+        state.set_vgpr(0, original)
+        # In-place swap halves of v0: low gets v0[31:16] (400), high gets v0[15:0] (100)
+        instr = VPackB32I16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            op_sel=(1, 0),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = (100 << 16) | 400
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+
+    def test_dst_alias_both_srcs_duplicate_half(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(3, (400 << 16) | 100)
+        # Duplicate low half into both channels
+        instr_lo = VPackB32I16Instruction(
+            dst=Reg(3, RegType.VGPR),
+            src0=VOP3Operand(Reg(3, RegType.VGPR)),
+            src1=VOP3Operand(Reg(3, RegType.VGPR)),
+            op_sel=(0, 0),
+        )
+        res_lo = self.scalar_interp.step(instr_lo, state)
+        self.assertEqual(res_lo, (100 << 16) | 100)
+
+        # Duplicate high half into both channels
+        state.set_vgpr(3, (400 << 16) | 100)
+        instr_hi = VPackB32I16Instruction(
+            dst=Reg(3, RegType.VGPR),
+            src0=VOP3Operand(Reg(3, RegType.VGPR)),
+            src1=VOP3Operand(Reg(3, RegType.VGPR)),
+            op_sel=(1, 1),
+        )
+        res_hi = self.scalar_interp.step(instr_hi, state)
+        self.assertEqual(res_hi, (400 << 16) | 400)
+
+    def test_simd_multi_lane_aliased_swap(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, ((lane + 0x100) << 16) | (lane & 0xFFFF))
+
+        # Each lane swaps its own v0 halves in place
+        instr = VPackB32I16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            op_sel=(1, 0),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            expected = ((lane & 0xFFFF) << 16) | ((lane + 0x100) & 0xFFFF)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
