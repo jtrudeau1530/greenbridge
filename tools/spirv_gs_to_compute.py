@@ -297,10 +297,13 @@ def rewrite(text):
     return "\n".join(out) + "\n", public
 
 
+USAGE = "\n".join(__doc__.strip().splitlines()[-2:])
+
+
 def main(argv):
     args = argv[1:]
     if args and args[0] in ("-h", "--help"):
-        print("usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]")
+        print(USAGE)
         return 0
     lay_path = None
     if "--layout" in args:
@@ -308,7 +311,7 @@ def main(argv):
         lay_path = args[i + 1]
         del args[i:i + 2]
     if len(args) != 2:
-        print("usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")

@@ -137,5 +137,8 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
 
 
 def test_help_is_a_clean_exit_zero(capsys):
-    assert gsc.main(["spirv_gs_to_compute.py", "--help"]) == 0
-    assert "usage: spirv_gs_to_compute.py" in capsys.readouterr().out
+    for flag in ("-h", "--help"):
+        assert gsc.main(["spirv_gs_to_compute.py", flag]) == 0
+        out = capsys.readouterr().out
+        assert "spirv_gs_to_compute.py in.spv out.spv" in out
+        assert "SPIRV-Tools" in out

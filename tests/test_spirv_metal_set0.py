@@ -59,6 +59,6 @@ def test_rewrite_sizes_arrays_and_spaces_bindings():
 
 
 def test_help_is_a_clean_exit_zero(capsys):
-    assert m.main(["spirv_metal_set0.py", "--help"]) == 0
-    out = capsys.readouterr().out
-    assert "Usage: spirv_metal_set0.py" in out
+    for flag in ("-h", "--help"):
+        assert m.main(["spirv_metal_set0.py", flag]) == 0
+        assert "Usage: spirv_metal_set0.py" in capsys.readouterr().out
