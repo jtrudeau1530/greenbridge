@@ -5,6 +5,7 @@ oracle it compares with is right, so a mismatch is the translator's and not the 
 """
 import json
 import os
+from pathlib import Path
 import random
 import signal
 import struct
@@ -187,6 +188,30 @@ def test_unsupported_device_skips_with_the_harness_reason(monkeypatch, tmp_path,
         monkeypatch, tmp_path, 77, "device: X\nunsupported: need 144 push constant bytes, device has 128\n")
     assert result is None
     assert "SKIP (unsupported: need 144 push constant bytes, device has 128)" in capsys.readouterr().out
+
+
+def test_rejected_fragment_translation_is_reported_before_the_harness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    build = tmp_path / "build"
+    build.mkdir()
+    harness = build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))
+    harness.touch()
+    monkeypatch.setattr(imf, "assemble", lambda *_args: None)
+
+    def run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if cmd[0] == str(harness):
+            return subprocess.CompletedProcess(cmd, 77, "unsupported: no Vulkan 1.2 device", "")
+        out = work / "spirv"
+        out.mkdir()
+        (out / "vs_ids.spv").touch()
+        return subprocess.CompletedProcess(cmd, 0, "2 shaders: 1 translated, 1 pass spirv-val\n  1 s_trap", "")
+
+    monkeypatch.setattr(imf.subprocess, "run", run)
+    with pytest.raises(SystemExit, match=r"(?s)ps_image_load\.spv.*s_trap"):
+        imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(work), str(build), False, False)
 
 
 def test_unsupported_without_a_reason_line_still_skips(monkeypatch, tmp_path, capsys):
