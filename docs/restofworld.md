@@ -571,13 +571,38 @@ levels: 200 streams, 187 blocks), each class matches the face normals only under
 Bit 31 is set on 48,046 of the 60,600 sampled core_restofworld vertices (79.3%). Model axis order is the one
 `+0x6C` gives for positions; the other five axis orders and sign flips of the decoded vector score 0.27 to
 0.36 there. Some core_restofworld blocks score lower under the matching decode than levels blocks do; this
-check does not say why. Not decoded: bits 20-30 of the 10-bit form (they vary
-within 142 of 143 blocks) and bytes 2-3 of the 8-bit form.
+check does not say why.
+
+**The rest of the `0x21` word is the tangent frame.** The same mesh shaders go on to build a tangent.
+With bit 31 set, bits 20-29 are an angle, `v * 2pi/1023 - pi` (`v_fma_f32` by 2pi/1023 and -pi, then
+`v_sin_f32`/`v_cos_f32`), that turns a basis made from the normal alone (`s` = sign of z,
+`a = 1/(s + z)`, `b1 = (s x^2 a - 1, s x y a, s x)`, `b2 = (x y a, y^2 a - s, y)`), giving
+`tangent = b1 cos - b2 sin`. With bit 31 clear, bits 16-22 and 23-29 are a 7-bit octahedral tangent
+(`v_bfe_u32 ..., 16, 7` and `23, 7`, each `v / 63.5 - 1`). Bit 30 (`v_lshrrev_b32 30` then `& 1`) is the
+bitangent sign. Of the 6,254 mesh shaders with the bit-31 branch, 5,196 read bits 20-29, 5,191 read the
+two 7-bit fields and 528 read bit 30. `tangent_0x21` in `tools/vertex_types.py` is that decode.
+
+The tool checks it against the first `0x28` stream (texture coordinates): per sampled triangle it projects
+`dP/du` into each vertex's tangent plane and counts tangents within `cos > 0.8` of it ("along u"), the same
+tangent turned by a random angle about the normal (chance level), and, of the along-u vertices, how often
+bit 30 matches the side of `dP/dv` that `cross(normal, tangent)` points to:
+
+| Archive sample | Form | Vertices checked | Along u | Random angle | Bit 30 = bitangent side |
+| --- | --- | --- | --- | --- | --- |
+| levels (187 blocks) | 10-bit | 59,448 | 98.0% | 23.2% | 99.4% |
+| levels | 8-bit | 411 | 83.2% | 22.6% | 98.8% |
+| core_restofworld (143 blocks) | 10-bit | 52,153 | 86.3% | 22.3% | 97.8% |
+| core_restofworld | 8-bit | 6,992 | 56.4% | 15.8% | 92.6% |
+
+Bit 30 set means `cross(normal, tangent)` runs along `+v`. The shaders turn a set bit 30 into the factor
+`-1.0` (`v_cndmask_b32 ..., 1.0, -1.0`), so their bitangent is that factor times their own cross product;
+which operand order they use was not traced here. The 8-bit form in core_restofworld fits least;
+this check does not say why.
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
-core graphics blocks, final-slot widths remain unresolved, and of the component types the non-normal
-bits of `0x21` (see above). The stride check
+core graphics blocks, final-slot widths remain unresolved (`0x21`, the last unread component type,
+is decoded above). The stride check
 also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
 "Unread" in the tables above is not a claim that those bytes are empty: in
 `story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and

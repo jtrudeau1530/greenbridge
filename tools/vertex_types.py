@@ -207,6 +207,78 @@ def normal_0x21(w):
     return _oct((w & 255) / 127.5 - 1, ((w >> 8) & 255) / 127.5 - 1)
 
 
+def tangent_0x21(w):
+    """(unit tangent, bitangent sign) from one tag-0x21 u32, decoded as the mesh shaders decode it.
+
+    Bit 31 set: bits 20-29 are an angle, v * 2pi / 1023 - pi, that turns a basis built from the normal alone
+    (b1 = (s*x*x*a - 1, s*x*y*a, s*x), b2 = (x*y*a, y*y*a - s, y), s = sign(z) with z = 0 as +1, a = 1 / (s + z));
+    tangent = b1 * cos(angle) - b2 * sin(angle).
+    Bit 31 clear: octahedral tangent, x = bits 16-22, y = bits 23-29, each unorm7 remapped by v / 63.5 - 1.
+    Bit 30 is the bitangent sign: 1 when cross(normal, tangent) runs along +v of the texture coordinates
+    (docs/restofworld.md), returned as +1 or -1. The shaders themselves turn a set bit 30 into the factor -1.0
+    (`v_cndmask_b32 ..., 1.0, -1.0`); the sign here is the measured side, not that factor.
+    Returns (None, sign) when a vector cannot be built."""
+    sign = 1 if (w >> 30) & 1 else -1
+    if not w >> 31:
+        return _oct(((w >> 16) & 127) / 63.5 - 1, ((w >> 23) & 127) / 63.5 - 1), sign
+    n = normal_0x21(w)
+    if n is None:
+        return None, sign
+    x, y, z = n
+    s = 1.0 if z >= 0 else -1.0
+    a = 1.0 / (s + z)
+    ang = ((w >> 20) & 1023) * (2 * math.pi / 1023) - math.pi
+    c, sn = math.cos(ang), math.sin(ang)
+    b1 = (s * x * x * a - 1, s * x * y * a, s * x)
+    b2 = (x * y * a, y * y * a - s, y)
+    return _norm(*(b1[i] * c - b2[i] * sn for i in range(3))), sign
+
+
+def tangent_checks(words, uvs, mpos, tris):
+    """Counts for the tag-0x21 tangent against the texture-coordinate gradients of each triangle.
+
+    words: the 0x21 u32 per vertex; uvs: (u, v) per vertex; mpos: model-space positions; tris: triangles.
+    For each vertex of a triangle with a usable UV mapping, dP/du is projected into the vertex's tangent plane.
+    Keys per form (10 = bit 31 set, 8 = clear): checked, along_u (cos(tangent, dP/du) > 0.8), rotated_along_u
+    (the same tangent turned by a seeded random angle about the normal, the chance level), and of the along_u
+    vertices, sign_agree (bit 30 matches the side of dP/dv that cross(normal, tangent) is on)."""
+    out = {}
+    rng = random.Random(0)
+    for a, b, c in tris:
+        e1 = [mpos[b][i] - mpos[a][i] for i in range(3)]
+        e2 = [mpos[c][i] - mpos[a][i] for i in range(3)]
+        du1, dv1 = uvs[b][0] - uvs[a][0], uvs[b][1] - uvs[a][1]
+        du2, dv2 = uvs[c][0] - uvs[a][0], uvs[c][1] - uvs[a][1]
+        det = du1 * dv2 - du2 * dv1
+        if abs(det) < 1e-12:
+            continue
+        dpdu = _norm(*((e1[i] * dv2 - e2[i] * dv1) / det for i in range(3)))
+        dpdv = _norm(*((e2[i] * du1 - e1[i] * du2) / det for i in range(3)))
+        if dpdu is None or dpdv is None:
+            continue
+        for v in (a, b, c):
+            w = words[v]
+            n = normal_0x21(w)
+            t, sign = tangent_0x21(w)
+            if n is None or t is None:
+                continue
+            d = sum(dpdu[i] * n[i] for i in range(3))
+            pu = _norm(*(dpdu[i] - d * n[i] for i in range(3)))
+            if pu is None:
+                continue
+            form = "10" if w >> 31 else "8"
+            add(out, f"tangent{form}_checked")
+            cu = sum(t[i] * pu[i] for i in range(3))
+            bt = (n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0])
+            th = rng.uniform(0, 2 * math.pi)
+            rt = [t[i] * math.cos(th) + bt[i] * math.sin(th) for i in range(3)]
+            add(out, f"tangent{form}_rotated_along_u", int(sum(rt[i] * pu[i] for i in range(3)) > 0.8))
+            if cu > 0.8:
+                add(out, f"tangent{form}_along_u")
+                add(out, f"tangent{form}_sign_agree", int((sum(bt[i] * dpdv[i] for i in range(3)) > 0) == (sign > 0)))
+    return out
+
+
 def _s8(b):
     return max((b - 256 if b > 127 else b) / 127.0, -1.0)
 
@@ -396,6 +468,16 @@ def measure_block(data, at, T, rng, found=None):
                         good += abs(nv[0] * fn[0] + nv[1] * fn[1] + nv[2] * fn[2]) > 0.8
                 if tot:
                     tt.setdefault(f"facenormal_{name}", []).append(good / tot)
+    # tag 0x21 tangent: against the first 0x28 (texture coordinate) stream of the block, if it has one
+    s21 = [(i, off) for i, (tag, off) in sorted(slots.items()) if tag == 0x21 and i]
+    s28 = [off for i, (tag, off) in sorted(slots.items()) if tag == 0x28 and i]
+    if s21 and s28:
+        words = struct.unpack_from(f"<{n}I", data, at + s21[0][1])
+        raw = struct.unpack_from(f"<{2 * n}h", data, at + s28[0])
+        uvs = [(raw[2 * v], raw[2 * v + 1]) for v in range(n)]
+        tt = T["tags"][f"slot{s21[0][0]}:21"]
+        for key, val in tangent_checks(words, uvs, mpos, stris).items():
+            add(tt, key, val)
     return n
 
 
