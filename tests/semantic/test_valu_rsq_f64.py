@@ -1359,5 +1359,151 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(oracle_v_rsq_f64(NEG_ZERO, clamp=True), ONE_F64)
 
 
+# ============================================================================
+# Section 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ============================================================================
+
+def mutant_omit_sqrt(src_bits: int, **kwargs: bool) -> int:
+    """Mutant 1: computes 1.0 / x instead of 1.0 / sqrt(x)."""
+    val = bits_to_f64(src_bits)
+    if val <= 0.0:
+        return CANONICAL_QNAN
+    return f64_to_bits(1.0 / val)
+
+
+def mutant_ignore_negative_nan(src_bits: int, **kwargs: bool) -> int:
+    """Mutant 2: calculates root of absolute value instead of NaN for negative inputs."""
+    s = src_bits & MASK64
+    val = abs(bits_to_f64(s))
+    if val == 0.0:
+        return POS_INF
+    return f64_to_bits(1.0 / math.sqrt(val))
+
+
+def mutant_zero_to_zero(src_bits: int, **kwargs: bool) -> int:
+    """Mutant 3: returns +0.0 instead of +Infinity on zero inputs."""
+    if is_zero(src_bits):
+        return POS_ZERO
+    return oracle_v_rsq_f64(src_bits, **kwargs)
+
+
+def mutant_omit_clamp(src_bits: int, **kwargs: bool) -> int:
+    """Mutant 4: fails to clamp values > 1.0 to 1.0."""
+    return oracle_v_rsq_f64(src_bits, clamp=False)
+
+
+def mutant_invert_sign(src_bits: int, **kwargs: bool) -> int:
+    """Mutant 5: negates the output sign."""
+    res = oracle_v_rsq_f64(src_bits, **kwargs)
+    return res ^ SIGN_MASK
+
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_vgpr_index(self) -> None:
+        """Register pairs with indices > 254 must be rejected with ValueError."""
+        with self.assertRaises(ValueError):
+            RegPair(255, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegPair(300, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegPair(-1, RegType.VGPR)
+
+    def test_syntax_rejection_invalid_sgpr_index(self) -> None:
+        """SGPR pairs with indices > 104 must be rejected with ValueError."""
+        with self.assertRaises(ValueError):
+            RegPair(105, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            RegPair(-5, RegType.SGPR)
+
+    def test_syntax_rejection_invalid_literal_range(self) -> None:
+        """Literal values outside 64-bit unsigned bounds must be rejected."""
+        with self.assertRaises(ValueError):
+            Literal64(-1)
+        with self.assertRaises(ValueError):
+            Literal64(1 << 64)
+
+    def test_syntax_rejection_invalid_destination_type(self) -> None:
+        """VALU instruction destination cannot be SGPR or literal."""
+        with self.assertRaises(ValueError):
+            VRSQF64Instruction(
+                dst=RegPair(0, RegType.SGPR),
+                src0=VOP3Operand.from_vgpr(2),
+            )
+
+    def test_syntax_rejection_invalid_vop3_operand_spec(self) -> None:
+        """VOP3Operand must specify exactly one of reg_pair or literal."""
+        with self.assertRaises(ValueError):
+            VOP3Operand(reg_pair=None, literal=None)
+        with self.assertRaises(ValueError):
+            VOP3Operand(
+                reg_pair=RegPair(0, RegType.VGPR),
+                literal=Literal64(0),
+            )
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        """SIMDState must only accept 32 or 64 lanes."""
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=48)
+
+    def test_mutation_detection_omit_sqrt(self) -> None:
+        """Verify that omitting square root is detected."""
+        golden = oracle_v_rsq_f64(FOUR_F64)  # 0.5
+        mutant = mutant_omit_sqrt(FOUR_F64)   # 0.25
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_ignore_negative_nan(self) -> None:
+        """Verify that failing to produce NaN on negative input is detected."""
+        golden = oracle_v_rsq_f64(NEG_FOUR_F64)
+        mutant = mutant_ignore_negative_nan(NEG_FOUR_F64)
+        self.assertEqual(golden, CANONICAL_QNAN)
+        self.assertNotEqual(mutant, CANONICAL_QNAN)
+
+    def test_mutation_detection_zero_to_zero(self) -> None:
+        """Verify that zero returning 0 instead of Infinity is detected."""
+        golden = oracle_v_rsq_f64(POS_ZERO)
+        mutant = mutant_zero_to_zero(POS_ZERO)
+        self.assertEqual(golden, POS_INF)
+        self.assertEqual(mutant, POS_ZERO)
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_omit_clamp(self) -> None:
+        """Verify that omitting clamp saturation is detected."""
+        golden = oracle_v_rsq_f64(QUARTER_F64, clamp=True)  # 1.0
+        mutant = mutant_omit_clamp(QUARTER_F64, clamp=True)  # 2.0
+        self.assertEqual(golden, ONE_F64)
+        self.assertEqual(mutant, TWO_F64)
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_invert_sign(self) -> None:
+        """Verify that inverted output sign is detected."""
+        golden = oracle_v_rsq_f64(FOUR_F64)
+        mutant = mutant_invert_sign(FOUR_F64)
+        self.assertEqual(golden, HALF_F64)
+        self.assertEqual(mutant, HALF_F64 | SIGN_MASK)
+
+    def test_mathematical_property_rsq_squared_identity(self) -> None:
+        """Mathematical identity: (rsq(x))^2 == 1.0 / x for positive floats."""
+        test_values = [0.1, 0.5, 1.0, 2.0, 3.5, 7.8, 10.0, 42.0, 100.0, 1024.0]
+        for val in test_values:
+            bits = f64_to_bits(val)
+            rsq_val = bits_to_f64(oracle_v_rsq_f64(bits))
+            reconstructed_inv = rsq_val * rsq_val
+            expected_inv = 1.0 / val
+            rel_error = abs(reconstructed_inv - expected_inv) / expected_inv
+            self.assertLess(rel_error, 1e-14)
+
+    def test_mathematical_scaling_property(self) -> None:
+        """Scaling identity: rsq(4 * x) == 0.5 * rsq(x)."""
+        test_values = [0.05, 0.25, 1.0, 4.0, 9.0, 25.0, 100.0]
+        for val in test_values:
+            rsq_x = bits_to_f64(oracle_v_rsq_f64(f64_to_bits(val)))
+            rsq_4x = bits_to_f64(oracle_v_rsq_f64(f64_to_bits(4.0 * val)))
+            self.assertAlmostEqual(rsq_4x, 0.5 * rsq_x, places=14)
+
+
 if __name__ == "__main__":
     unittest.main()
