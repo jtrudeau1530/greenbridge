@@ -2088,30 +2088,40 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     const auto fail = [&](const char* what) {
         if (mismatches++ < 32) std::fprintf(stderr, "CheckFeatureSupport options: %s\n", what);
     };
-    const auto query_ours = [&](auto tag_feature, auto& out) -> bool {
-        using T = std::remove_reference_t<decltype(out)>;
-        const char* name = tag_feature.first;
-        const D3D12_FEATURE feature = tag_feature.second;
-        if (ours->CheckFeatureSupport(feature, nullptr, sizeof(T)) != E_INVALIDARG) {
+    const auto query_ours_raw = [&](const char* name, D3D12_FEATURE feature, const void* init, void* out,
+                                      size_t sz) -> bool {
+        if (ours->CheckFeatureSupport(feature, nullptr, UINT(sz)) != E_INVALIDARG) {
             std::fprintf(stderr, "%s: expected E_INVALIDARG for nullptr\n", name);
             ++mismatches;
             return false;
         }
-        std::vector<std::uint8_t> scratch(sizeof(T) + 1, 0xAA);
-        for (UINT bad_size : {0u, UINT(sizeof(T) - 1), UINT(sizeof(T) + 1)}) {
+        std::vector<std::uint8_t> scratch(sz + 1, 0xAA);
+        if (init) std::memcpy(scratch.data(), init, sz);
+        for (UINT bad_size : {0u, UINT(sz - 1), UINT(sz + 1)}) {
             if (ours->CheckFeatureSupport(feature, scratch.data(), bad_size) != E_INVALIDARG) {
                 std::fprintf(stderr, "%s: expected E_INVALIDARG for size %u\n", name, bad_size);
                 ++mismatches;
                 return false;
             }
         }
-        std::memset(&out, 0xAA, sizeof(out));
-        if (FAILED(ours->CheckFeatureSupport(feature, &out, sizeof(out)))) {
+        if (init)
+            std::memcpy(out, init, sz);
+        else
+            std::memset(out, 0xAA, sz);
+        if (FAILED(ours->CheckFeatureSupport(feature, out, UINT(sz)))) {
             std::fprintf(stderr, "%s: CheckFeatureSupport failed on Vulkan device\n", name);
             ++mismatches;
             return false;
         }
         return true;
+    };
+    const auto query_ours = [&](auto tag_feature, auto& out) -> bool {
+        using T = std::remove_reference_t<decltype(out)>;
+        return query_ours_raw(tag_feature.first, tag_feature.second, nullptr, &out, sizeof(T));
+    };
+    const auto query_ours_input = [&](auto tag_feature, const auto& init, auto& out) -> bool {
+        using T = std::remove_reference_t<decltype(out)>;
+        return query_ours_raw(tag_feature.first, tag_feature.second, &init, &out, sizeof(T));
     };
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2{};
@@ -2145,6 +2155,41 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     query_ours(std::pair{"OPTIONS19", D3D12_FEATURE_D3D12_OPTIONS19}, o19);
     query_ours(std::pair{"OPTIONS20", D3D12_FEATURE_D3D12_OPTIONS20}, o20);
     query_ours(std::pair{"OPTIONS21", D3D12_FEATURE_D3D12_OPTIONS21}, o21);
+
+    D3D12_FEATURE_DATA_SHADER_CACHE shader_cache{};
+    D3D12_FEATURE_DATA_EXISTING_HEAPS existing_heaps{};
+    D3D12_FEATURE_DATA_CROSS_NODE cross_node{};
+    D3D12_FEATURE_DATA_DISPLAYABLE displayable{};
+    D3D12_FEATURE_DATA_PREDICATION predication{};
+    D3D12_FEATURE_DATA_APPLICATION_SPECIFIC_DRIVER_STATE driver_state{};
+    D3D12_FEATURE_DATA_BYTECODE_BYPASS_HASH_SUPPORTED bypass_hash{};
+    D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT prot_support{};
+    D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT prot_count{};
+    D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES prot_types{};
+    D3D12_FEATURE_DATA_SERIALIZATION serialization{};
+    D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY queue_priority{};
+
+    query_ours(std::pair{"SHADER_CACHE", D3D12_FEATURE_SHADER_CACHE}, shader_cache);
+    query_ours(std::pair{"EXISTING_HEAPS", D3D12_FEATURE_EXISTING_HEAPS}, existing_heaps);
+    query_ours(std::pair{"CROSS_NODE", D3D12_FEATURE_CROSS_NODE}, cross_node);
+    query_ours(std::pair{"DISPLAYABLE", D3D12_FEATURE_DISPLAYABLE}, displayable);
+    query_ours(std::pair{"PREDICATION", D3D12_FEATURE_PREDICATION}, predication);
+    query_ours(std::pair{"APPLICATION_SPECIFIC_DRIVER_STATE", D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE},
+               driver_state);
+    query_ours(std::pair{"BYTECODE_BYPASS_HASH_SUPPORTED", D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED}, bypass_hash);
+    query_ours_input(std::pair{"PROTECTED_RESOURCE_SESSION_SUPPORT", D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT},
+                     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT{0, {}}, prot_support);
+    query_ours_input(
+        std::pair{"PROTECTED_RESOURCE_SESSION_TYPE_COUNT", D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPE_COUNT},
+        D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT{0, 0}, prot_count);
+    query_ours_input(std::pair{"PROTECTED_RESOURCE_SESSION_TYPES", D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPES},
+                     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES{0, 0, nullptr}, prot_types);
+    query_ours_input(std::pair{"SERIALIZATION", D3D12_FEATURE_SERIALIZATION}, D3D12_FEATURE_DATA_SERIALIZATION{0, {}},
+                     serialization);
+    query_ours_input(std::pair{"COMMAND_QUEUE_PRIORITY", D3D12_FEATURE_COMMAND_QUEUE_PRIORITY},
+                     D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY{D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                               D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, FALSE},
+                     queue_priority);
 
     std::uint32_t unknown_feature = 0;
     if (ours->CheckFeatureSupport(static_cast<D3D12_FEATURE>(9999), &unknown_feature, sizeof(unknown_feature)) !=
@@ -2216,6 +2261,99 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         }
     }
 
+    if (shader_cache.SupportFlags != D3D12_SHADER_CACHE_SUPPORT_NONE) fail("SHADER_CACHE unexpected support");
+    if (existing_heaps.Supported) fail("EXISTING_HEAPS unexpected support");
+    if (cross_node.SharingTier != D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED || cross_node.AtomicShaderInstructions)
+        fail("CROSS_NODE unexpected support");
+    if (displayable.DisplayableTexture ||
+        displayable.SharedResourceCompatibilityTier != D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0)
+        fail("DISPLAYABLE unexpected support");
+    if (predication.Supported != (info.conditional_rendering ? TRUE : FALSE))
+        fail("PREDICATION did not match conditional_rendering");
+    if (driver_state.Supported) fail("APPLICATION_SPECIFIC_DRIVER_STATE unexpected support");
+    if (bypass_hash.Supported) fail("BYTECODE_BYPASS_HASH_SUPPORTED unexpected support");
+    if (prot_support.Support != D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE || prot_count.Count != 0)
+        fail("PROTECTED_RESOURCE_SESSION unexpected support");
+    if (serialization.HeapSerializationTier != D3D12_HEAP_SERIALIZATION_TIER_0)
+        fail("SERIALIZATION unexpected tier");
+
+    // NodeIndex > 0, non-zero protected type count, and zeroed meta-command queries must return E_INVALIDARG.
+    {
+        D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT ps1{
+            1, D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_SUPPORTED};
+        D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT ptc1{1, 99};
+        GUID dummy_guid{};
+        D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES pt_n1{1, 0, nullptr};
+        D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES pt_c1{0, 1, &dummy_guid};
+        D3D12_FEATURE_DATA_SERIALIZATION ser1{1, D3D12_HEAP_SERIALIZATION_TIER_0};
+        D3D12_FEATURE_DATA_QUERY_META_COMMAND meta{};
+        if (ours->CheckFeatureSupport(D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT, &ps1, sizeof(ps1)) !=
+                E_INVALIDARG ||
+            ps1.Support != D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE)
+            fail("PROTECTED_RESOURCE_SESSION_SUPPORT NodeIndex=1 not rejected");
+        if (ours->CheckFeatureSupport(D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPE_COUNT, &ptc1, sizeof(ptc1)) !=
+            E_INVALIDARG)
+            fail("PROTECTED_RESOURCE_SESSION_TYPE_COUNT NodeIndex=1 not rejected");
+        if (ours->CheckFeatureSupport(D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPES, &pt_n1, sizeof(pt_n1)) !=
+                E_INVALIDARG ||
+            ours->CheckFeatureSupport(D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPES, &pt_c1, sizeof(pt_c1)) !=
+                E_INVALIDARG)
+            fail("PROTECTED_RESOURCE_SESSION_TYPES invalid node/count not rejected");
+        if (ours->CheckFeatureSupport(D3D12_FEATURE_SERIALIZATION, &ser1, sizeof(ser1)) != E_INVALIDARG)
+            fail("SERIALIZATION NodeIndex=1 not rejected");
+        if (ours->CheckFeatureSupport(D3D12_FEATURE_QUERY_META_COMMAND, &meta, sizeof(meta)) != E_INVALIDARG ||
+            ours->CheckFeatureSupport(D3D12_FEATURE_QUERY_META_COMMAND, nullptr, sizeof(meta)) != E_INVALIDARG ||
+            ours->CheckFeatureSupport(D3D12_FEATURE_QUERY_META_COMMAND, &meta, sizeof(meta) - 1) != E_INVALIDARG)
+            fail("QUERY_META_COMMAND not rejected");
+    }
+
+    // COMMAND_QUEUE_PRIORITY matrix + invalid type/priority validation.
+    for (D3D12_COMMAND_LIST_TYPE type :
+         {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+          D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
+          D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE}) {
+        for (UINT prio :
+             {UINT(D3D12_COMMAND_QUEUE_PRIORITY_NORMAL), UINT(D3D12_COMMAND_QUEUE_PRIORITY_HIGH),
+              UINT(D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME)}) {
+            D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY q{type, prio, FALSE};
+            const bool expect_ok = (type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                                    type == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
+                                    type == D3D12_COMMAND_LIST_TYPE_COPY) &&
+                                   (prio == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ||
+                                    prio == D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
+            if (ours->CheckFeatureSupport(D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, &q, sizeof(q)) != S_OK ||
+                q.PriorityForTypeIsSupported != (expect_ok ? TRUE : FALSE))
+                fail("COMMAND_QUEUE_PRIORITY answer mismatch");
+        }
+    }
+    {
+        D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY bad_type{static_cast<D3D12_COMMAND_LIST_TYPE>(99),
+                                                           D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, TRUE};
+        D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY bad_prio{D3D12_COMMAND_LIST_TYPE_DIRECT, 50u, TRUE};
+        if (ours->CheckFeatureSupport(D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, &bad_type, sizeof(bad_type)) !=
+                E_INVALIDARG ||
+            bad_type.PriorityForTypeIsSupported != FALSE ||
+            ours->CheckFeatureSupport(D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, &bad_prio, sizeof(bad_prio)) !=
+                E_INVALIDARG ||
+            bad_prio.PriorityForTypeIsSupported != FALSE)
+            fail("COMMAND_QUEUE_PRIORITY invalid type/priority not rejected");
+    }
+
+    // Verify D3D12_FEATURE_PREDICATION follows conditional_rendering when disabled on a device without SetPredication.
+    if (info.conditional_rendering) {
+        rt::d3d12::VulkanDeviceInfo no_pred_info = info;
+        no_pred_info.conditional_rendering = false;
+        Ref<ID3D12Device> no_pred;
+        if (FAILED(rt::d3d12::create_vulkan_device(no_pred_info, IID_PPV_ARGS(&no_pred.p)))) {
+            fail("failed to create conditional_rendering=false device");
+        } else {
+            D3D12_FEATURE_DATA_PREDICATION pred_off{TRUE};
+            if (FAILED(no_pred->CheckFeatureSupport(D3D12_FEATURE_PREDICATION, &pred_off, sizeof(pred_off))) ||
+                pred_off.Supported != FALSE)
+                fail("PREDICATION did not become FALSE when conditional_rendering is off");
+        }
+    }
+
     Ref<ID3D12Device> host;
     std::string adapter_name;
     if (!create_host_device_for_physical(info.instance, info.physical, info.get_instance_proc, host, adapter_name)) {
@@ -2234,15 +2372,20 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         if (mismatches++ < 32)
             std::fprintf(stderr, "%s.%s: ours tier %d exceeds host %d\n", feature, field, a, b);
     };
-    const auto compare_host = [&](const char* name, D3D12_FEATURE feature, const auto& ours_val, auto&& verify) {
+    const auto compare_host_input = [&](const char* name, D3D12_FEATURE feature, const auto& ours_val,
+                                        const auto& host_init, auto&& verify) {
         using T = std::remove_cv_t<std::remove_reference_t<decltype(ours_val)>>;
-        T host_val{};
+        T host_val = host_init;
         if (FAILED(host->CheckFeatureSupport(feature, &host_val, sizeof(host_val)))) {
             ++host_skipped;
             return;
         }
         ++host_compared;
         verify(name, ours_val, host_val);
+    };
+    const auto compare_host = [&](const char* name, D3D12_FEATURE feature, const auto& ours_val, auto&& verify) {
+        using T = std::remove_cv_t<std::remove_reference_t<decltype(ours_val)>>;
+        compare_host_input(name, feature, ours_val, T{}, verify);
     };
 
     compare_host("OPTIONS2", D3D12_FEATURE_D3D12_OPTIONS2, o2,
@@ -2400,6 +2543,76 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                      check_bool(n, "ExtendedCommandInfoSupported", a.ExtendedCommandInfoSupported,
                                 b.ExtendedCommandInfoSupported);
                  });
+
+    compare_host("SHADER_CACHE", D3D12_FEATURE_SHADER_CACHE, shader_cache,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     if ((UINT(a.SupportFlags) & ~UINT(b.SupportFlags)) != 0 && mismatches++ < 32)
+                         std::fprintf(stderr, "%s.SupportFlags: ours 0x%x not subset of host 0x%x\n", n,
+                                      UINT(a.SupportFlags), UINT(b.SupportFlags));
+                 });
+    compare_host("EXISTING_HEAPS", D3D12_FEATURE_EXISTING_HEAPS, existing_heaps,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "Supported", a.Supported, b.Supported);
+                 });
+    compare_host("CROSS_NODE", D3D12_FEATURE_CROSS_NODE, cross_node,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_tier(n, "SharingTier", int(a.SharingTier), int(b.SharingTier));
+                     check_bool(n, "AtomicShaderInstructions", a.AtomicShaderInstructions, b.AtomicShaderInstructions);
+                 });
+    compare_host("DISPLAYABLE", D3D12_FEATURE_DISPLAYABLE, displayable,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "DisplayableTexture", a.DisplayableTexture, b.DisplayableTexture);
+                     check_tier(n, "SharedResourceCompatibilityTier", int(a.SharedResourceCompatibilityTier),
+                                int(b.SharedResourceCompatibilityTier));
+                 });
+    compare_host("PREDICATION", D3D12_FEATURE_PREDICATION, predication,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "Supported", a.Supported, b.Supported);
+                 });
+    compare_host("APPLICATION_SPECIFIC_DRIVER_STATE", D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE, driver_state,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "Supported", a.Supported, b.Supported);
+                 });
+    compare_host("BYTECODE_BYPASS_HASH_SUPPORTED", D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED, bypass_hash,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "Supported", a.Supported, b.Supported);
+                 });
+    compare_host_input("PROTECTED_RESOURCE_SESSION_SUPPORT", D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT,
+                       prot_support, D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT{0, {}},
+                       [&](const char* n, const auto& a, const auto& b) {
+                           if ((UINT(a.Support) & ~UINT(b.Support)) != 0 && mismatches++ < 32)
+                               std::fprintf(stderr, "%s.Support: ours 0x%x not subset of host 0x%x\n", n, UINT(a.Support),
+                                            UINT(b.Support));
+                       });
+    compare_host_input("PROTECTED_RESOURCE_SESSION_TYPE_COUNT", D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPE_COUNT,
+                       prot_count, D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT{0, 0},
+                       [&](const char* n, const auto& a, const auto& b) {
+                           if (a.Count > b.Count && mismatches++ < 32)
+                               std::fprintf(stderr, "%s.Count: ours %u > host %u\n", n, a.Count, b.Count);
+                       });
+    compare_host_input("SERIALIZATION", D3D12_FEATURE_SERIALIZATION, serialization, D3D12_FEATURE_DATA_SERIALIZATION{0, {}},
+                       [&](const char* n, const auto& a, const auto& b) {
+                           check_tier(n, "HeapSerializationTier", int(a.HeapSerializationTier),
+                                      int(b.HeapSerializationTier));
+                       });
+    for (D3D12_COMMAND_LIST_TYPE type :
+         {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+          D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
+          D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE}) {
+        for (UINT prio :
+             {UINT(D3D12_COMMAND_QUEUE_PRIORITY_NORMAL), UINT(D3D12_COMMAND_QUEUE_PRIORITY_HIGH),
+              UINT(D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME)}) {
+            D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY ours_q{type, prio, FALSE};
+            if (SUCCEEDED(ours->CheckFeatureSupport(D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, &ours_q, sizeof(ours_q)))) {
+                compare_host_input("COMMAND_QUEUE_PRIORITY", D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, ours_q,
+                                   D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY{type, prio, FALSE},
+                                   [&](const char* n, const auto& a, const auto& b) {
+                                       check_bool(n, "PriorityForTypeIsSupported", a.PriorityForTypeIsSupported,
+                                                  b.PriorityForTypeIsSupported);
+                                   });
+            }
+        }
+    }
 
     std::printf("CheckFeatureSupport options (%s): %u feature queries compared (%u host-unsupported skipped), "
                 "MSAA64KB=%d, NoOutputsSamples=0x%x, MaxViewHeap=%u, %d mismatches\n",
