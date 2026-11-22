@@ -413,6 +413,63 @@ class ScalarInterpreter:
 
 
 # -----------------------------------------------------------------------------
+# SIMD Multi-Lane Divergence and EXEC Masking Model
+# -----------------------------------------------------------------------------
+
+@dataclass
+class SIMDState:
+    """Architectural SIMD wavefront state for Wave32 or Wave64."""
+    wave_size: int = 32
+    exec_mask: int = MASK32
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def __post_init__(self) -> None:
+        if self.wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {self.wave_size}, must be 32 or 64")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.wave_size)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        """Return True if specified lane is active under current EXEC mask."""
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_vgpr(self, lane: int, index: int) -> int:
+        return self.vgprs[lane][index] & MASK32
+
+    def set_vgpr(self, lane: int, index: int, value: int) -> None:
+        self.vgprs[lane][index] = value & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, value: int) -> None:
+        self.sgprs[index] = value & MASK32
+
+
+class SIMDInterpreter:
+    """SIMD wavefront interpreter supporting Wave32/Wave64 and EXEC masking."""
+
+    def __init__(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+
+    def step(self, instr: VPkFmaClampF16Instruction, state: SIMDState) -> List[Optional[int]]:
+        """Execute instruction across all lanes subject to EXEC mask."""
+        results: List[Optional[int]] = [None] * state.wave_size
+
+        for lane in range(state.wave_size):
+            if state.is_lane_active(lane):
+                lane_state = ScalarState(
+                    vgprs=state.vgprs[lane],
+                    sgprs=state.sgprs,
+                )
+                res = self.scalar_interp.step(instr, lane_state)
+                results[lane] = res
+
+        return results
+
+
+# -----------------------------------------------------------------------------
 # Unit Tests
 # -----------------------------------------------------------------------------
 
@@ -600,6 +657,78 @@ class TestScalarInstructionInterpreter(unittest.TestCase):
         self.interp.step(instr, self.state)
         self.assertEqual(self.state.get_vgpr(10), 0x12345678)
         self.assertEqual(self.state.get_sgpr(5), 0x87654321)
+
+
+class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.simd_interp = SIMDInterpreter()
+
+    def test_wave32_full_execution_divergence(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0xFFFFFFFF)
+        for lane in range(32):
+            val0 = 0.01 * (lane + 1)
+            val1 = 0.5
+            val2 = 0.1
+            state.set_vgpr(lane, 1, pack_f16x2(f16_to_u16(val0), f16_to_u16(val0 * 2.0)))
+            state.set_vgpr(lane, 2, pack_f16x2(f16_to_u16(val1), f16_to_u16(val1)))
+            state.set_vgpr(lane, 3, pack_f16x2(f16_to_u16(val2), f16_to_u16(val2)))
+
+        instr = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+            src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+
+        for lane in range(32):
+            res = state.get_vgpr(lane, 0)
+            res_lo, res_hi = unpack_f16x2(res)
+            expected_lo = (0.01 * (lane + 1)) * 0.5 + 0.1
+            expected_hi = (0.02 * (lane + 1)) * 0.5 + 0.1
+            self.assertAlmostEqual(u16_to_f16(res_lo), expected_lo, places=3)
+            self.assertAlmostEqual(u16_to_f16(res_hi), expected_hi, places=3)
+
+    def test_wave64_exec_mask_gating_preserves_inactive_lanes(self) -> None:
+        state = SIMDState(wave_size=64, exec_mask=0x5555555555555555)  # Even lanes active
+        for lane in range(64):
+            state.set_vgpr(lane, 0, OLD_VGPR_SENTINEL)
+            state.set_vgpr(lane, 1, pack_f16x2(f16_to_u16(0.5), f16_to_u16(0.25)))
+            state.set_vgpr(lane, 2, pack_f16x2(f16_to_u16(0.5), f16_to_u16(2.0)))
+            state.set_vgpr(lane, 3, pack_f16x2(f16_to_u16(0.25), f16_to_u16(0.125)))
+
+        instr = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+            src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+
+        expected_active = pack_f16x2(f16_to_u16(0.50), f16_to_u16(0.625))
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(state.get_vgpr(lane, 0), expected_active)
+            else:
+                self.assertEqual(state.get_vgpr(lane, 0), OLD_VGPR_SENTINEL)
+
+    def test_zero_exec_mask_no_modification(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0x00000000)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, OLD_VGPR_SENTINEL)
+
+        instr = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(inline_val=1.0),
+            src1=VOP3POperand(inline_val=1.0),
+            src2=VOP3POperand(inline_val=1.0),
+        )
+        self.simd_interp.step(instr, state)
+
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr(lane, 0), OLD_VGPR_SENTINEL)
 
 
 if __name__ == "__main__":
