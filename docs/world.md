@@ -447,6 +447,39 @@ disc; `RotationIdx` is 0 to 72; `ScaleZ` equals `Scale` in 52,021,564 and `Scale
 `ScaleZ` is its own value, not ambient occlusion. `OrientToTerrain` is 1.0 in all 208,239 lists, `IsSLODList`
 is set in 5,802, and `lodLevel` is ORPHAN_HD in 205,181 and SLOD1 in 3,058.
 
+## Deformable snow and mud (`CSnowTrackData`)
+
+The tracks left in snow, mud and similar ground are configured by one
+`CSnowTrackData` XML document in `common.rpf` (see [gamedata.md](gamedata.md) for how it is carved). Counts
+only; no values or names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `CommonDeepSurfaceParams/Item` | 16 | `Name`, `DebugColor`, `PhysicsMaterials`, and three parameter blocks: `HeightMapGenerationParams` (14 fields: depth, berm, noise, viscosity, lifetime, fade, blur, `POMScale`, plus `SupportPropFlatten` on 2), `TerrainRenderParams` (height, bump-map and displacement blend, normal scale), `PathRegenAndFlattenParams` (berm height, trail width, vegetation and explosion flattening) |
+| `.../PhysicsMaterials/Item` | 24 | one material name each; 0 to 6 per surface (0 on 6 surfaces, 1 on 5) |
+| `MudParams` | 1 | 23 fields: soak and puddle-fill ramps, puddle scale/ripple/slope/mask/specular, mip bias, POM and height-map puddle scale, two tint colours |
+| `TrackTypeData/Item` | 9 | `Name`, `Type` (3 distinct, used 5, 2 and 2 times), 17 numeric fields (sphere and berm scale, depth offset and bias, trail width/V-scale/depth/velocity ranges, grass flattening on land and in water), and three texture names: trail, print, mud displacement |
+| `SnowNormalMapName` | 1 | one texture name |
+| `GlobalDeepSurfaceParams` | 1 | tessellation-mask mip bias, deformation and parallax world-space widths, path-segment cull distance and time |
+| `TrailmapParams` | 1 | width and side offsets, and water-push sphere and trail strengths |
+
+So the system is a world-space height map stamped by moving spheres and trails, rendered with tessellation,
+parallax occlusion mapping and a normal map, with a separate mud/puddle layer; that is the reading of the field
+names, and the values were not tested in a renderer.
+
+Cross-checks:
+
+- **Physics materials.** The 24 names are distinct. `MaterialDataList`, the material table, survives only from
+  the middle of the document (its first block is in the unread region of `common.rpf`); 13 of the 24 names occur
+  in the retained part. The other 11 may be in the lost part, so no name is shown to be missing.
+- **Textures.** The 9 distinct texture names (8 track textures and the snow normal map) match no archive entry
+  name and no texture-dictionary item name or its joaat hash in the local catalog (118,925 named items). The
+  catalog is incomplete for names, so this does not show the textures are absent.
+
+Not measured here (hypothesis): which surfaces the 16 entries are (their names suggest snow, mud and sand
+variants), how `Type` selects a track type for peds, animals and vehicles, and the size of the deformation map
+(`DeformationWorldSpaceWidth` is the obvious input).
+
 ## No-sharing rule
 
 Everything here is aggregate. Do not commit archives, carved streams, extracted models/textures, entity
