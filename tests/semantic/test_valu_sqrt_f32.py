@@ -112,3 +112,21 @@ class TestValuSqrtF32SIMDAndPrecision(unittest.TestCase):
             expected = math.sqrt(val)
             diff = abs(got - expected)
             self.assertLessEqual(diff, 1e-6 * expected)
+
+
+class TestValuSqrtF32NegativeAndZeros(unittest.TestCase):
+    def test_negative_operand_nan(self):
+        for val in (-1.0, -4.0, -100.0, -0.1):
+            vbits = f32_bits(f32(val))
+            got_bits = run_sqrt(vbits)
+            self.assertTrue(is_f32_nan_bits(got_bits))
+
+    def test_zero_signs(self):
+        pzero_bits = f32_bits(0.0)
+        nzero_bits = f32_bits(float("-0.0"))
+        self.assertEqual(run_sqrt(pzero_bits), 0x00000000)
+        self.assertEqual(run_sqrt(nzero_bits), 0x80000000)
+
+    def test_negative_controls(self):
+        got_bits = run_sqrt(0xFF800000)
+        self.assertTrue(is_f32_nan_bits(got_bits))
