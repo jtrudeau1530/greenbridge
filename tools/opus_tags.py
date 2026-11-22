@@ -113,7 +113,7 @@ def load_dialogue(path):
 def comments(name, line, langs):
     out = [("TITLE", name)]
     if line:
-        texts = [(lang, clean(line.get(f"text_{lang}", ""))) for lang in langs]
+        texts = [(lang, clean(line.get(f"text_{lang}") or "")) for lang in langs]
         texts = [(lang, t) for lang, t in texts if t]
         main = dict(texts).get("en") or (texts[0][1] if texts else "")
         out += [("LABEL", line.get("label", "")), ("SPEAKER", line.get("speaker", "")), ("SUBTITLE", main)]
