@@ -397,6 +397,107 @@ class ScalarVALUInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+class SIMDWaveState:
+    """Represents the execution state of an AMD RDNA2 wavefront (Wave32 or Wave64)."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: int | None = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"wave_size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.exec_mask_mask: int = MASK32 if wave_size == 32 else MASK64
+        self.exec_mask: int = self.exec_mask_mask if exec_mask is None else (exec_mask & self.exec_mask_mask)
+        # 256 VGPRs per lane
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(wave_size)]
+        # 106 shared SGPRs
+        self.sgprs: List[int] = [0] * 106
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size - 1}]")
+        return bool((self.exec_mask >> lane) & 1)
+
+    def read_lane(self, lane: int, op: Operand) -> int | Tuple[int, ...]:
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            return op.literal_value
+        if op.reg_type == RegType.VGPR:
+            if op.count == 1:
+                return self.vgprs[lane][op.index] & MASK32
+            return tuple(self.vgprs[lane][op.index + i] & MASK32 for i in range(op.count))
+        if op.reg_type == RegType.SGPR:
+            if op.count == 1:
+                return self.sgprs[op.index] & MASK32
+            return tuple(self.sgprs[op.index + i] & MASK32 for i in range(op.count))
+        raise ValueError(f"Unknown operand type: {op.reg_type}")
+
+    def read_lane_u64(self, lane: int, op: Operand) -> int:
+        words = self.read_lane(lane, op)
+        assert isinstance(words, tuple) and len(words) == 2
+        return (words[1] << 32) | words[0]
+
+    def write_lane(self, lane: int, op: Operand, value: int | Sequence[int]) -> None:
+        if op.reg_type != RegType.VGPR:
+            raise TypeError("VALU SIMD write must target VGPRs")
+        if op.count == 1:
+            assert isinstance(value, int)
+            self.vgprs[lane][op.index] = u32(value)
+        else:
+            assert isinstance(value, (list, tuple)) and len(value) == op.count
+            for i in range(op.count):
+                self.vgprs[lane][op.index + i] = u32(value[i])
+
+
+class SIMDVALUInterpreter:
+    """SIMD wavefront instruction interpreter honoring 32/64-bit EXEC masking."""
+
+    def __init__(self, wave: SIMDWaveState) -> None:
+        self.wave: SIMDWaveState = wave
+
+    def step(self, instr: SadInstruction) -> List[int | Tuple[int, ...] | None]:
+        results: List[int | Tuple[int, ...] | None] = []
+        for lane in range(self.wave.wave_size):
+            if not self.wave.is_lane_active(lane):
+                results.append(None)
+                continue
+
+            if isinstance(instr, VSadU32Instruction):
+                s0 = self.wave.read_lane(lane, instr.src0)
+                s1 = self.wave.read_lane(lane, instr.src1)
+                s2 = self.wave.read_lane(lane, instr.src2)
+                assert isinstance(s0, int) and isinstance(s1, int) and isinstance(s2, int)
+                res = ref_sad_u32(s0, s1, s2, clamp=instr.clamp)
+                self.wave.write_lane(lane, instr.dst, res)
+                results.append(res)
+            elif isinstance(instr, VSadHiU32Instruction):
+                s0 = self.wave.read_lane(lane, instr.src0)
+                s1 = self.wave.read_lane(lane, instr.src1)
+                s2 = self.wave.read_lane(lane, instr.src2)
+                assert isinstance(s0, int) and isinstance(s1, int) and isinstance(s2, int)
+                res = ref_sad_hi_u32(s0, s1, s2)
+                self.wave.write_lane(lane, instr.dst, res)
+                results.append(res)
+            elif isinstance(instr, VMqsadU32Instruction):
+                s0_64 = self.wave.read_lane_u64(lane, instr.src0)
+                s1_32 = self.wave.read_lane(lane, instr.src1)
+                s2_128 = self.wave.read_lane(lane, instr.src2)
+                assert isinstance(s1_32, int)
+                assert isinstance(s2_128, tuple) and len(s2_128) == 4
+                res_quad = ref_mqsad_u32(s0_64, s1_32, s2_128, masked=instr.masked)
+                self.wave.write_lane(lane, instr.dst, res_quad)
+                results.append(res_quad)
+            else:
+                raise TypeError(f"Unsupported instruction AST: {type(instr)}")
+        return results
+
+    def run_program(self, instructions: Sequence[SadInstruction]) -> None:
+        for instr in instructions:
+            self.step(instr)
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -616,7 +717,6 @@ class TestValuSadU32ScalarInterpreter(unittest.TestCase):
             src1=Operand.sgpr(5),
             src2=Operand.literal(20),
         )
-        # |100 - 40| + 20 = 80
         res = self.interp.step(instr)
         self.assertEqual(res, 80)
         self.assertEqual(self.rf.vgprs[0], 80)
@@ -636,14 +736,9 @@ class TestValuSadU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.rf.vgprs[0], 1)
 
     def test_64bit_sad_synthesis_program(self) -> None:
-        # Program:
-        #   v_sad_u32 v0, v2, v3, v4
-        #   v_sad_hi_u32 v1, v2, v3, v4
-        # Input: |v2 - v3| + v4
         self.rf.vgprs[2] = 0x8000_0000
         self.rf.vgprs[3] = 0
         self.rf.vgprs[4] = 0x8000_0005
-        # |0x80000000 - 0| + 0x80000005 = 0x100000005 -> hi=1, lo=5
         prog = [
             VSadU32Instruction(Operand.vgpr(0), Operand.vgpr(2), Operand.vgpr(3), Operand.vgpr(4)),
             VSadHiU32Instruction(Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3), Operand.vgpr(4)),
@@ -655,12 +750,9 @@ class TestValuSadU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res_64, 0x1_0000_0005)
 
     def test_scalar_mqsad_u32_execution(self) -> None:
-        # v[4:5] = 64-bit source
         self.rf.vgprs[4] = 0x0403_0201
         self.rf.vgprs[5] = 0x0807_0605
-        # v6 = template 32-bit
         self.rf.vgprs[6] = 0x0403_0201
-        # v[8:11] = accumulators
         self.rf.vgprs[8] = 100
         self.rf.vgprs[9] = 200
         self.rf.vgprs[10] = 300
@@ -679,6 +771,102 @@ class TestValuSadU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.rf.vgprs[1], 204)
         self.assertEqual(self.rf.vgprs[2], 308)
         self.assertEqual(self.rf.vgprs[3], 412)
+
+
+class TestValuSadU32SIMDMultiLane(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_lanes_active(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDVALUInterpreter(wave)
+        for lane in range(32):
+            wave.vgprs[lane][1] = 10 * (lane + 1)
+            wave.vgprs[lane][2] = 5 * (lane + 1)
+            wave.vgprs[lane][3] = 100
+
+        instr = VSadU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        results = interp.step(instr)
+        for lane in range(32):
+            expected = abs(10 * (lane + 1) - 5 * (lane + 1)) + 100
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(wave.vgprs[lane][0], expected)
+
+    def test_wave32_divergent_mask_preserves_inactive_lanes(self) -> None:
+        # Alternating mask: lanes 0, 2, 4... active (0x55555555)
+        mask = 0x5555_5555
+        wave = SIMDWaveState(wave_size=32, exec_mask=mask)
+        interp = SIMDVALUInterpreter(wave)
+
+        for lane in range(32):
+            wave.vgprs[lane][0] = 0xCAFE_0000 + lane  # initial dst value
+            wave.vgprs[lane][1] = 20
+            wave.vgprs[lane][2] = 10
+            wave.vgprs[lane][3] = 50
+
+        instr = VSadU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        results = interp.step(instr)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], 60)
+                self.assertEqual(wave.vgprs[lane][0], 60)
+            else:
+                self.assertIsNone(results[lane])
+                # Inactive lane must retain original value!
+                self.assertEqual(wave.vgprs[lane][0], 0xCAFE_0000 + lane)
+
+    def test_wave32_all_inactive_lanes(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0)
+        interp = SIMDVALUInterpreter(wave)
+        for lane in range(32):
+            wave.vgprs[lane][0] = 0xDEAD_BEEF
+        instr = VSadU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(1),
+            src1=Operand.literal(2),
+            src2=Operand.literal(3),
+        )
+        results = interp.step(instr)
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], 0xDEAD_BEEF)
+
+    def test_wave64_multi_lane_divergence(self) -> None:
+        mask64 = 0x0123_4567_89AB_CDEF
+        wave = SIMDWaveState(wave_size=64, exec_mask=mask64)
+        interp = SIMDVALUInterpreter(wave)
+
+        for lane in range(64):
+            wave.vgprs[lane][0] = 0x1111 * (lane + 1)
+            wave.vgprs[lane][1] = lane * 100
+            wave.vgprs[lane][2] = 500
+            wave.vgprs[lane][3] = 1000
+
+        instr = VSadU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        results = interp.step(instr)
+        for lane in range(64):
+            is_active = bool((mask64 >> lane) & 1)
+            if is_active:
+                expected = ref_sad_u32(lane * 100, 500, 1000)
+                self.assertEqual(results[lane], expected)
+                self.assertEqual(wave.vgprs[lane][0], expected)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(wave.vgprs[lane][0], 0x1111 * (lane + 1))
 
 
 if __name__ == "__main__":
