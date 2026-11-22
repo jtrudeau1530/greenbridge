@@ -1113,6 +1113,24 @@ adds `heap_base` to the truncated 48-bit value, which is a wild address: the dra
 behind a descriptor) must therefore be an arena range, whatever the allocator happens to do, upload and readback heaps included. Until the layer does that, the
 translated-draw test fetches from a DEFAULT-heap buffer and does not draw from the upload buffer.
 
+**Measured (static, `XboxBvhBuilder.dll`): the BVH builder only takes destination addresses below 2^40.** Its
+validation function at `0xc8f0` loads `DestAccelerationStructureData` (the first field of the build description it
+reaches through `[rcx+0x68]`) and checks it twice:
+
+| Check | Instruction | On failure |
+|---|---|---|
+| 256-byte alignment | `test r8b,r8b` | message "…must be 256-byte aligned…" |
+| below 2^40 | `cmp r8,10000000000h` / `jae` | message "…can not have more than 40b of address set" |
+
+On a failed check it prints its message through `OutputDebugStringW` after a "D3D12 XDXR Error: " prefix, and then
+throws `E_INVALIDARG`: a C++ exception out of the DLL, not an `HRESULT` return.
+- The alignment rule is the public `D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT`.
+- The 40-bit rule has no PC counterpart.
+
+Arena VAs (at most 4095 MiB, so 32-bit) pass. A VA biased from outside the arena does not: the negative upload-heap
+VAs above are at or above 2^40 as unsigned values. That is one more reason for the rule above that every buffer
+a console client can address is an arena range, whichever heap it comes from.
+
 Why not give each buffer its own BDA and set `heap_base = 0`? Because many shaders truncate descriptor-table
 pointers to 32 bits, and host BDAs are not guaranteed to be below 4 GB. The arena keeps console VAs low and stable.
 
