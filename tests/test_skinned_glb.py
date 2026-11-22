@@ -196,6 +196,35 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(stats["source_weight_sum_min"], 255)
         self.assertEqual(stats["source_weight_sum_max"], 255)
 
+    def test_normalized_byte_uvs_have_aligned_output_rows(self) -> None:
+        from anim_glb import pack_glb
+
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        source_path = os.path.join(component, "model.glb")
+        source, source_bin = skinned_glb.read_glb(source_path)
+        uv_index = source["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_0"]
+        uv_accessor = source["accessors"][uv_index]
+        uv_view = source["bufferViews"][uv_accessor["bufferView"]]
+        uv_accessor.update(componentType=5121, normalized=True)
+        uv_view.update(byteStride=4, byteLength=12)
+        offset = uv_view["byteOffset"]
+        rows = bytes((0, 255, 0, 0, 64, 128, 0, 0, 255, 0, 0, 0))
+        source_bin = source_bin[:offset] + rows + source_bin[offset + len(rows):]
+        with open(source_path, "wb") as handle:
+            handle.write(pack_glb(source, source_bin))
+
+        payload, _ = skinned_glb.build_skinned_glb(skeleton, [component])
+        gltf, binary = skinned_glb.read_glb(self._write(payload))
+        index = gltf["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_0"]
+        accessor = gltf["accessors"][index]
+        view = gltf["bufferViews"][accessor["bufferView"]]
+        self.assertEqual((accessor["componentType"], accessor["normalized"]), (5121, True))
+        self.assertEqual((view.get("byteStride"), view["byteLength"]), (4, 12))
+        start = view["byteOffset"]
+        self.assertEqual(binary[start:start + view["byteLength"]], rows)
+        self.assertEqual(_accessor(gltf, binary, index)[0], bytes((0, 255, 64, 128, 255, 0)))
+
     def test_weight_sums_are_one(self):
         gltf, binary, _stats = self._build()
         primitive = gltf["meshes"][0]["primitives"][0]

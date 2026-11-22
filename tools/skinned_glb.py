@@ -628,21 +628,32 @@ class _GlbBuilder:
         self.views: list[dict] = []
         self.accessors: list[dict] = []
 
-    def view(self, payload: bytes, target: int | None = None) -> int:
+    def view(self, payload: bytes, target: int | None = None, *, stride: int | None = None) -> int:
         self.bin.extend(b"\x00" * ((-len(self.bin)) % 4))
         offset = len(self.bin)
         self.bin.extend(payload)
         entry = {"buffer": 0, "byteOffset": offset, "byteLength": len(payload)}
         if target is not None:
             entry["target"] = target
+        if stride is not None:
+            entry["byteStride"] = stride
         self.views.append(entry)
         return len(self.views) - 1
 
     def accessor(self, payload: bytes, component_type: int, kind: str, count: int,
                  target: int | None, *, normalized: bool = False,
                  minimum: list[float] | None = None, maximum: list[float] | None = None) -> int:
+        stride = None
+        if target == ARRAY_BUFFER:
+            element_size = COMPONENT_SIZES[component_type] * TYPE_COMPONENTS[kind]
+            padding = bytes((-element_size) % 4)
+            if padding:
+                # Accessors are read as tightly packed bytes, but glTF vertex rows must align to four bytes.
+                payload = b"".join(payload[i:i + element_size] + padding
+                                   for i in range(0, len(payload), element_size))
+                stride = element_size + len(padding)
         entry = {
-            "bufferView": self.view(payload, target),
+            "bufferView": self.view(payload, target, stride=stride),
             "componentType": component_type,
             "count": count,
             "type": kind,
