@@ -859,7 +859,7 @@ def run_suite(a, work: str) -> int:
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in ("cs_imgload", "cs_imgload_d16"):
-            rc, msg = run_cmd([vk_store, spv, "load"])
+            rc, msg = run_cmd([vk_store, spv, "load-d16" if name == "cs_imgload_d16" else "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)

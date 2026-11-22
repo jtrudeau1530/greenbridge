@@ -5344,16 +5344,7 @@ class Gen:
                 raise Unsupported(op + " clamp")
             halves = []
             for src in a[1:3]:
-                x, h = self.src_u(src), self.tmp()
-                if op == "v_cvt_pk_u16_u32":
-                    self.emit(f"{h} = OpExtInst %uint %glsl UMin {x} {self.cu(0xFFFF)}")
-                else:
-                    xi, c, cu_ = self.as_int(x), self.tmp(), self.tmp()
-                    self.emit(f"{c} = OpExtInst %int %glsl SClamp {xi} {self.as_int(self.cu(0xFFFF8000))} "
-                              f"{self.as_int(self.cu(0x7FFF))}")
-                    self.emit(f"{cu_} = OpBitcast %uint {c}")
-                    self.emit(f"{h} = OpBitwiseAnd %uint {cu_} {self.cu(0xFFFF)}")
-                halves.append(h)
+                halves.append(self.saturate_int16(self.src_u(src), signed=(op == "v_cvt_pk_i16_i32")))
             sh, r = self.tmp(), self.tmp()
             self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
@@ -6379,6 +6370,19 @@ class Gen:
             flags.append(nz)
         return flags
 
+    def saturate_int16(self, bits: str, signed: bool) -> str:
+        """Return the saturated integer as 16 bits in the low half of a uint."""
+        half = self.tmp()
+        if signed:
+            value, clamped, raw = self.as_int(bits), self.tmp(), self.tmp()
+            self.emit(f"{clamped} = OpExtInst %int %glsl SClamp {value} {self.as_int(self.cu(0xFFFF8000))} "
+                      f"{self.as_int(self.cu(0x7FFF))}")
+            self.emit(f"{raw} = OpBitcast %uint {clamped}")
+            self.emit(f"{half} = OpBitwiseAnd %uint {raw} {self.cu(0xFFFF)}")
+        else:
+            self.emit(f"{half} = OpExtInst %uint %glsl UMin {bits} {self.cu(0xFFFF)}")
+        return half
+
     def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, lod, d16=False):
         def fetch(image, _cls, ty):
             res = self.tmp()
@@ -6402,29 +6406,28 @@ class Gen:
         self.emit(f"{use_s} = OpLogicalAnd %bool {is_s} {hit}")
         L = {k: self.tmp() + "_" + k for k in ("s", "rest", "e2", "u", "f", "e3")}
 
-        def write(v4u, f16=False):
+        def write(v4u, numeric_class):
             xs = []
             for c in range(4):
                 if dmask >> c & 1:
                     x = self.tmp()
                     self.emit(f"{x} = OpCompositeExtract %uint {v4u} {c}")
+                    if d16 and numeric_class:
+                        x = self.saturate_int16(x, signed=(numeric_class == 2))
                     xs.append(x)
             if not d16:
                 for k, x in enumerate(xs):
                     self.dst({"k": "vgpr", "r": vdata["r"] + k, "n": 1}, x)
                 return
-            # d16: two 16-bit results per VGPR, low half first: f16 (RTE) for the float view, the low 16 bits for
-            # integer views. shortcut: integers are truncated; AMD may saturate them (Mesa nir
-            # integer_dest_saturates, unverified), so values past 16 bits may differ; clamp once a GPU shows it.
+            # D16 packs saturated integer or RTE floating-point halves, low half first.
             for i in range(0, len(xs), 2):
                 pair = xs[i:i + 2] + [self.cu(0)] * (2 - len(xs[i:i + 2]))
-                if f16:
+                if numeric_class == 0:
                     w = self.pack_f16_pair_int(self.tof(pair[0]), self.tof(pair[1]))
                 else:
-                    lo, hi, w = self.tmp(), self.tmp(), self.tmp()
-                    self.emit(f"{lo} = OpBitwiseAnd %uint {pair[0]} {self.cu(0xFFFF)}")
+                    hi, w = self.tmp(), self.tmp()
                     self.emit(f"{hi} = OpShiftLeftLogical %uint {pair[1]} {self.cu(16)}")
-                    self.emit(f"{w} = OpBitwiseOr %uint {lo} {hi}")
+                    self.emit(f"{w} = OpBitwiseOr %uint {pair[0]} {hi}")
                 self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, w)
 
         def read_integer(cls, ty):
@@ -6433,7 +6436,7 @@ class Gen:
             self.emit(f"{im} = OpLoad %itximg{cls}_{di} {ip}")
             r = read(im, cls, ty)
             self.emit(f"{b} = OpBitcast %v4uint_st {r}")
-            write(b)
+            write(b, cls)
 
         self.emit(f"OpSelectionMerge {L['e2']} None")
         self.emit(f"OpBranchConditional {use_s} {L['s']} {L['rest']}")
@@ -6450,7 +6453,7 @@ class Gen:
         res = read(img, 0, "%v4float")
         b = self.tmp()
         self.emit(f"{b} = OpBitcast %v4uint_st {res}")
-        write(b, f16=True)
+        write(b, 0)
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['e3']} = OpLabel")
         self.emit(f"OpBranch {L['e2']}")
