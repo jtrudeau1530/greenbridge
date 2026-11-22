@@ -74,6 +74,8 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin: 
   <h3>Trend</h3>
   <div class="card"><svg id="trend" width="100%" height="220" role="img" aria-label="Metrics per snapshot"></svg>
     <div class="note">One point per snapshot. A hollow point means the metric's formula changed there; the line is broken because the values on either side are not comparable.</div></div>
+  <h3 id="mergedH" hidden>Latest merges into main</h3>
+  <div class="card" id="merged" hidden></div>
   <h3 id="mineH" hidden>Your claims and pull requests</h3>
   <div class="card" id="mine" hidden></div>
   <h3>Sources</h3>
@@ -112,6 +114,8 @@ const state = { statuses: new Set(), search: "" };
   if (t) add("Unit tests on current code", `${fmt(t.numerator)}/${fmt(t.denominator)}`);
   const c = (SNAP.github || {}).coordination;
   if (c) add(`Coordination #${c.issue}`, Object.entries(c.sizes).map(([k, v]) => `${k}: ${v}`).join(" · "));
+  const pm = SNAP.metrics.find((m) => m.id === "merged.prs"), last = ((SNAP.github || {}).merged_latest || [])[0];
+  if (pm) add("Merged into main", `${fmt(pm.numerator)} merged · ${fmt(pm.denominator - pm.numerator)} open` + (last ? ` · latest #${last.number} ${when(last.merged_at)}` : ""));
 })();
 
 // ------------------------------------------------------------------ legend / filters
@@ -265,7 +269,7 @@ function openDetail(c) {
     el("div", {}, el("span", { class: "sw", style: `background:var(--${c.status})` }), " ", el("b", {}, META[c.status][0]), " — " + META[c.status][1]),
     el("h2", { class: "mono", style: "font-size:14px;word-break:break-all" }, c.name), el("div", { class: "note mono" }, c.id),
     el("p", {}, c.detail || ""), el("table", {}, el("tbody", {}, el("tr", {}, el("th", {}, "group"), el("td", {}, c.group)),
-      ...rows.map(([k, v]) => el("tr", {}, el("th", {}, k.replace(/_/g, " ")), el("td", { class: "mono", style: "word-break:break-all" }, typeof v === "object" ? JSON.stringify(v) : String(v)))))));
+      ...rows.map(([k, v]) => el("tr", {}, el("th", {}, k.replace(/_/g, " ")), el("td", { class: "mono", style: "word-break:break-all" }, k === "url" && /^https:\/\/github\.com\//.test(v) ? el("a", { href: v, target: "_blank", rel: "noopener" }, v) : k === "number" && c.panel === "merged" && SNAP.github && SNAP.github.repo ? el("a", { href: `https://github.com/${SNAP.github.repo}/pull/${v}`, target: "_blank", rel: "noopener" }, `#${v}`) : typeof v === "object" ? JSON.stringify(v) : String(v)))))));
   a.classList.add("open"); a.focus();
 }
 function closeDetail() { document.getElementById("detail").classList.remove("open"); }
@@ -285,6 +289,14 @@ function tables() {
   for (const s of SNAP.sources) sb.append(el("tr", {}, el("td", { class: "mono" }, s.id), el("td", {}, el("span", { class: "sw", style: `background:var(--${s.status === "ok" ? "verified" : s.status === "skipped" ? "unknown" : "partial"})` }), " " + s.status),
     el("td", { class: "mono" }, s.records ?? ""), el("td", { class: "mono" }, s.path || ""), el("td", {}, s.note || "")));
   document.getElementById("notes").textContent = (SNAP.notes || []).join(" · ");
+  const latest = (SNAP.github || {}).merged_latest;
+  if (latest && latest.length) {
+    document.getElementById("mergedH").hidden = false; const box = document.getElementById("merged"); box.hidden = false;
+    const repo = SNAP.github.repo;
+    box.append(el("div", { class: "note" }, "Each merged pull request counts as IMPLEMENTED in the panel above; the newest first."), el("table", {}, el("tbody", {},
+      ...latest.map((p) => el("tr", {}, el("td", { class: "mono" }, el("a", { href: `https://github.com/${repo}/pull/${p.number}`, target: "_blank", rel: "noopener" }, `#${p.number}`)),
+        el("td", { class: "mono" }, when(p.merged_at)), el("td", { class: "mono" }, (p.items || []).join(", ")), el("td", {}, p.title))))));
+  }
   const mine = (SNAP.github || {}).mine;
   if (mine) {
     document.getElementById("mineH").hidden = false; const box = document.getElementById("mine"); box.hidden = false;

@@ -24,22 +24,29 @@ Each source is optional. A missing one is listed under "Sources" on the page; it
 | Translator contract | the contract table in [design.md](design.md#translator-status-and-runtime-contract), each row classified by how it says it was confirmed | contract row |
 | Runtime imports | the measured tables in [runtime_imports.md](runtime_imports.md) | import |
 | Shader corpus | `--work <work>`: counts per stage from `<work>/shaders/dxbc/index.json` and `<work>/shaders/spirv/index.json` | shaders, aggregated per stage |
-| D3D12 layer | `--github`: the `D3D-` table of [#313](https://github.com/ItsNotRexed/Leonida/issues/313), read through `gh` | item |
+| Pull requests into main | `--github`: every pull request into `main` of the main repository (`--repo`, default `ItsNotRexed/Leonida`), grouped by the item ID its title names (`D3D-86: …`, `… (SHADER-339)`) | pull request |
+| D3D12 layer | `--github`: the `D3D-` table of [#313](https://github.com/ItsNotRexed/Leonida/issues/313), read through `gh` and checked against the merged and open pull requests | item |
 | CI on main | `--github`: the latest completed run of each workflow on `main` | workflow |
+
+Every run with `--github` reads the pull requests again, so a merge into `main` shows up on the next run as
+IMPLEMENTED, even before a tracking table (such as #313's PR column) is edited. A pull request closed without merging is
+left out. The page also lists the 30 latest merges, and the trend chart follows the share of pull requests merged and
+of item IDs with a merged pull request. `gh pr list` reads at most 5000 per state; the Sources table says when that
+limit is reached.
 
 With `--github --login <account>` the page also lists that account's claims in the coordination issue (and the issue
 it continues) and its pull requests. Nothing is posted: every `gh` call is a read.
 
 ## How a status is decided
 
-| Status | Unit tests and CTest | Contract row | Import | D3D- item |
-|---|---|---|---|---|
-| VERIFIED | passed, and nothing it depends on changed since | names a GPU check and leaves nothing open | image with 0 unimplemented imports | — |
-| IMPLEMENTED | — | confirmed by an LLVM/Mesa reference, a corpus count or a CPU test, not a GPU | bound to a shim, the host or a module | merged on `main` |
-| PARTIAL | passed before a change to the test, `tools/`, `scripts/` or `make_game.py` (CTest: before the last commit touching `runtime/`) | waits for a GPU measurement, or names a GPU check with an item still open | — | pull request open |
-| FAILED | failed on its last run | — | — | — |
-| MISSING | — | — | unimplemented | unclaimed |
-| UNKNOWN | skipped, or git can't tell what changed | states no confirmation method | — | claimed, no code yet |
+| Status | Unit tests and CTest | Contract row | Import | Pull request | D3D- item |
+|---|---|---|---|---|---|
+| VERIFIED | passed, and nothing it depends on changed since | names a GPU check and leaves nothing open | image with 0 unimplemented imports | — | — |
+| IMPLEMENTED | — | confirmed by an LLVM/Mesa reference, a corpus count or a CPU test, not a GPU | bound to a shim, the host or a module | merged into `main` | a PR merged into `main` and none open |
+| PARTIAL | passed before a change to the test, `tools/`, `scripts/` or `make_game.py` (CTest: before the last commit touching `runtime/`) | waits for a GPU measurement, or names a GPU check with an item still open | — | open | pull request open |
+| FAILED | failed on its last run | — | — | — | — |
+| MISSING | — | — | unimplemented | — | unclaimed |
+| UNKNOWN | skipped, or git can't tell what changed | states no confirmation method | — | — | claimed, no code yet |
 
 The contract classification reads the row's own words; the matched words are shown in each cell's details, so a
 wrong class is visible and the rule list in the tool (`CONFIRMATION`) can be corrected.

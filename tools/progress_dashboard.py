@@ -17,7 +17,8 @@ Sources, each optional and reported as missing rather than counted as zero when 
     contract        the translator contract table in docs/design.md, by how each row says it was confirmed
     imports         the measured import tables in docs/runtime_imports.md
     corpus          --work: counts per stage from <work>/shaders/dxbc/index.json and <work>/shaders/spirv/index.json
-    github          --github, read-only through `gh`: latest CI runs on main, the D3D- table of #313, the
+    github          --github, read-only through `gh`: every pull request into main (merged = implemented, open =
+                    partial), latest CI runs on main, the D3D- table of #313 checked against those merges, the
                     coordination issue's section sizes and, with --login, that account's claims and pull requests
 
 No game data leaves the inputs: the page and the JSON carry counts, pass/fail, error classes and the project's
@@ -662,17 +663,76 @@ def gh_json(args, timeout=60):
         return None
 
 
-def d3d_state(owner, pr, status_text):
+def d3d_state(owner, pr, status_text, merged_prs=None, open_prs=None):
+    """State of one D3D- row. With the repository's merged and open pull-request numbers, a PR the table still shows
+    as open but already merged counts as merged, and one closed without merging is dropped; without them the
+    table's own words decide."""
     refs = re.findall(r"#(\d+)((?:\s+(?:merged|closed|on main))?)", pr)
-    open_prs = [r for r, suffix in refs if not suffix.strip()]
-    merged = [r for r, suffix in refs if "merged" in suffix or "on main" in suffix]
-    if open_prs or "PR open" in status_text or "draft" in status_text.lower():
+    said_merged = {int(r) for r, suffix in refs if "merged" in suffix or "on main" in suffix}
+    bare = [int(r) for r, suffix in refs if not suffix.strip()]
+    text_open = "PR open" in status_text or "draft" in status_text.lower()
+    if merged_prs is not None and open_prs is not None:
+        merged = said_merged | {r for r in bare if r in merged_prs}
+        still_open = [r for r in bare if r in open_prs]
+        text_open = text_open and not refs
+    else:
+        merged, still_open = said_merged, bare
+    if still_open or text_open:
         return "partial", "pull request open"
     if merged:
         return "implemented", "merged on main"
     if owner and owner not in ("—", "-", ""):
         return "unknown", "claimed, no code yet"
     return "missing", "unclaimed"
+
+
+PR_LIMIT = 5000
+ITEM_ID = re.compile(r"\b([A-Z][A-Z0-9]{0,9})-(\d+)\b")
+NOT_ITEMS = {"SHA", "UTF", "IEEE", "ISO", "RFC", "CRC", "CVE", "MD", "BC", "X", "R", "G", "B"}
+
+
+def item_ids(title):
+    """Coordination item IDs named in a pull-request title ("D3D-86: ...", "... (SHADER-339)"), in order, once each.
+    A prefix ending in a digit (D3D12-, OPTIONS2-) or a known non-item word (SHA-256, UTF-8) is not an item."""
+    out = []
+    for prefix, num in ITEM_ID.findall(title or ""):
+        if prefix in NOT_ITEMS or prefix[-1].isdigit():
+            continue
+        if f"{prefix}-{num}" not in out:
+            out.append(f"{prefix}-{num}")
+    return out
+
+
+def collect_pulls(col, repo, merged, open_prs, limit=PR_LIMIT):
+    """Every pull request into main: merged is IMPLEMENTED, open is PARTIAL; closed without merging is left out.
+    Grouped by the item family its title names (D3D, SHADER, BUILD, ...)."""
+    col.panel("merged", f"Pull requests into main ({repo}): merged = implemented", "pull requests")
+    note = f"{len(merged)} merged, {len(open_prs)} open"
+    if len(merged) >= limit or len(open_prs) >= limit:
+        note += f"; the {limit}-PR limit was reached, older pull requests are not counted"
+    col.source("github_prs", None, "ok", len(merged) + len(open_prs), note=note)
+    items_merged, items_any = set(), set()
+    for p, status in [(p, "implemented") for p in merged] + [(p, "partial") for p in open_prs]:
+        ids = item_ids(p.get("title"))
+        items_any.update(ids)
+        if status == "implemented":
+            items_merged.update(ids)
+        group = (ids[0].split("-")[0] + " items") if ids else "no item ID"
+        if status == "implemented":
+            detail = f"merged on main {p.get('mergedAt') or ''}".strip()
+        else:
+            detail = "pull request open" + (" (draft)" if p.get("isDraft") else "")
+        col.add(f"pr.{p['number']}", "merged", group, f"#{p['number']} {p.get('title') or ''}"[:120], status, detail=detail,
+                number=p["number"], items=ids, merged_at=p.get("mergedAt") if status == "implemented" else None,
+                author=(p.get("author") or {}).get("login"))
+    col.metric("merged.prs", "merged", "Pull requests into main that are merged", len(merged), len(merged) + len(open_prs),
+               "pull requests merged into main / merged + open (closed without merging are left out)")
+    if items_any:
+        col.metric("merged.items", "merged", "Coordination items with a merged pull request", len(items_merged), len(items_any),
+                   "item IDs (D3D-, SHADER-, BUILD-, ...) named by a merged PR title / item IDs named by a merged or open PR title")
+    latest = sorted(merged, key=lambda p: p.get("mergedAt") or "", reverse=True)[:30]
+    return [{"number": p["number"], "title": (p.get("title") or "")[:120], "merged_at": p.get("mergedAt"),
+             "items": item_ids(p.get("title")), "author": (p.get("author") or {}).get("login")} for p in latest]
 
 
 def collect_github(col, repo, login):
@@ -682,6 +742,18 @@ def collect_github(col, repo, login):
         col.source("github", None, "missing", note="gh is not installed")
         return {}
     summary = {"repo": repo}
+    # every pull request into main, so a merge shows up on the next run even before a tracking table is edited
+    merged = gh_json(["pr", "list", "-R", repo, "--state", "merged", "--base", "main", "--limit", str(PR_LIMIT),
+                      "--json", "number,title,mergedAt,author"], timeout=300)
+    open_prs = gh_json(["pr", "list", "-R", repo, "--state", "open", "--base", "main", "--limit", str(PR_LIMIT),
+                        "--json", "number,title,isDraft,author"], timeout=300)
+    merged_set = open_set = None
+    if merged is None or open_prs is None:
+        col.panel("merged", f"Pull requests into main ({repo}): merged = implemented", "pull requests")
+        col.source("github_prs", None, "invalid", note="gh pr list failed (not logged in?)")
+    else:
+        summary["merged_latest"] = collect_pulls(col, repo, merged, open_prs)
+        merged_set, open_set = {p["number"] for p in merged}, {p["number"] for p in open_prs}
     runs = gh_json(["run", "list", "-R", repo, "--branch", "main", "--limit", "40",
                     "--json", "workflowName,conclusion,status,headSha,createdAt,url"])
     if runs is None:
@@ -714,14 +786,16 @@ def collect_github(col, repo, login):
                 if not plain(row[0]).startswith("D3D-") or len(row) < len(h):
                     continue
                 owner, pr, st = plain(row[h.index("owner")]), plain(row[h.index("pr")]), plain(row[h.index("status")]) if "status" in h else ""
-                status, why = d3d_state(owner, pr, st)
+                status, why = d3d_state(owner, pr, st, merged_set, open_set)
                 merged += status == "implemented"
                 n += 1
                 col.add(f"d3d.{plain(row[0])}", "d3d12", why, f"{plain(row[0])} {plain(row[1])}"[:120], status,
                         detail=(st or why)[:200], owner=owner, prs=pr[:120])
         col.source("github_313", None, "ok", n, note=f"issue updated {issue.get('updatedAt')}")
         if n:
-            col.metric("d3d12.merged", "d3d12", "D3D- items merged on main", merged, n, "items whose PR column says merged and no PR is open / items")
+            col.metric("d3d12.merged", "d3d12", "D3D- items merged on main", merged, n,
+                       "items with a PR merged into main (the PR column's word, or the repository's merged list) and no PR "
+                       "still open / items")
     coord = gh_json(["issue", "list", "-R", repo, "--state", "open", "--search", "Coordinating who works on what in:title",
                      "--json", "number,title,updatedAt"])
     if coord:
@@ -774,10 +848,10 @@ def build(args, out_dir):
     collect_corpus(col, args.work)
     gh = collect_github(col, args.repo, args.login) if args.github else {}
     if not args.github:
-        col.source("github", None, "skipped", note="pass --github to read CI, #313 and the coordination issue")
+        col.source("github", None, "skipped", note="pass --github to read pull requests into main, CI, #313 and the coordination issue")
     snap = {
         "schema": SCHEMA, "generated_at": iso(now_utc()), "git": g,
-        "panels": [col.panels[k] for k in ("tests", "runtime", "gpu", "contract", "imports", "corpus", "d3d12", "ci") if k in col.panels],
+        "panels": [col.panels[k] for k in ("tests", "runtime", "gpu", "contract", "imports", "corpus", "merged", "d3d12", "ci") if k in col.panels],
         "counts": counts_by_panel(col.components), "components": col.components, "metrics": col.metrics,
         "sources": col.sources, "notes": col.notes, "github": gh,
     }
@@ -823,7 +897,7 @@ def main(argv=None):
     ap.add_argument("--junit", nargs="*", metavar="FILE", help="CTest --output-junit or pytest --junitxml files")
     ap.add_argument("--gpu-log", nargs="*", metavar="FILE[=LABEL]",
                     help="saved output of runtime/test/shaders/check.py; LABEL names the GPU, driver and OS")
-    ap.add_argument("--github", action="store_true", help="read CI runs, #313 and the coordination issue through gh")
+    ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs, #313 and the coordination issue through gh")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
     args = ap.parse_args(argv)

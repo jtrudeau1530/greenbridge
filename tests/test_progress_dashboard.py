@@ -148,6 +148,41 @@ class Github(unittest.TestCase):
         self.assertEqual(pd.d3d_state("@a", "—", "")[0], "unknown")
         self.assertEqual(pd.d3d_state("—", "—", "")[0], "missing")
 
+    def test_d3d_states_follow_the_merged_list(self):
+        merged, open_prs = {819, 831, 291}, {900}
+        # the table still lists #819 without "merged", but it merged: the item is implemented
+        self.assertEqual(pd.d3d_state("@a", "#291 merged, #819", "PR open", merged, open_prs)[0], "implemented")
+        self.assertEqual(pd.d3d_state("@a", "#819, #900", "", merged, open_prs)[0], "partial")
+        # a bare reference that is neither merged nor open was closed without merging: it does not count
+        self.assertEqual(pd.d3d_state("@a", "#777", "", merged, open_prs)[0], "unknown")
+        self.assertEqual(pd.d3d_state("@a", "—", "PR open", merged, open_prs)[0], "partial")
+
+    def test_item_ids(self):
+        self.assertEqual(pd.item_ids("D3D-86: answer D3D12_OPTIONS1 in CheckFeatureSupport"), ["D3D-86"])
+        self.assertEqual(pd.item_ids("pknorm_probe: NaN gives 0 (SHADER-339)"), ["SHADER-339"])
+        self.assertEqual(pd.item_ids("Docs/Tests: SHADER-4 and SHADER-4 again, TEST-9"), ["SHADER-4", "TEST-9"])
+        self.assertEqual(pd.item_ids("hash with SHA-256, write UTF-8, read OPTIONS2-1 and D3D12-3"), [])
+        self.assertEqual(pd.item_ids(None), [])
+
+    def test_merged_pull_requests_are_implemented(self):
+        merged = [{"number": 10, "title": "D3D-1: a", "mergedAt": "2026-11-22T10:00:00Z", "author": {"login": "x"}},
+                  {"number": 12, "title": "docs: b", "mergedAt": "2026-11-22T12:00:00Z", "author": {"login": "y"}}]
+        open_prs = [{"number": 13, "title": "D3D-2: c", "isDraft": True, "author": {"login": "z"}}]
+        col = pd.Collector()
+        latest = pd.collect_pulls(col, "o/r", merged, open_prs)
+        got = {c["number"]: (c["status"], c["group"]) for c in col.components}
+        self.assertEqual(got, {10: ("implemented", "D3D items"), 12: ("implemented", "no item ID"), 13: ("partial", "D3D items")})
+        self.assertEqual([p["number"] for p in latest], [12, 10])          # newest merge first
+        m = {m["id"]: (m["numerator"], m["denominator"]) for m in col.metrics}
+        self.assertEqual(m["merged.prs"], (2, 3))
+        self.assertEqual(m["merged.items"], (1, 2))
+        self.assertNotIn("merged_at", next(c for c in col.components if c["number"] == 13))
+
+    def test_pull_request_limit_is_reported(self):
+        col = pd.Collector()
+        pd.collect_pulls(col, "o/r", [{"number": 1, "title": "a", "mergedAt": "x"}], [], limit=1)
+        self.assertIn("limit was reached", col.sources[0]["note"])
+
 
 class Corpus(unittest.TestCase):
     def test_counts_only_never_names(self):
