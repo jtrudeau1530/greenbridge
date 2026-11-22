@@ -3492,7 +3492,10 @@ public:
             log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        // Global realtime priority needs SeIncreaseBasePriorityPrivilege enabled in the token; without it, this answer.
+        // Global realtime priority needs SeIncreaseBasePriorityPrivilege enabled in the effective token, as on the
+        // Windows D3D12 runtime; without it, this answer. Vulkan queue priorities (and VK_KHR_global_priority) are
+        // fixed at vkCreateDevice time before CreateCommandQueue is called, so a privileged request leases from the
+        // device's pre-created VkQueue pool like D3D12_COMMAND_QUEUE_PRIORITY_HIGH and logs the approximation once.
         if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME && !has_global_realtime_privilege()) {
             log_once("CreateCommandQueue refused (global realtime priority), type", desc->Type);
             return d3d12_trace::result(method, DXGI_ERROR_ACCESS_DENIED);
@@ -3501,6 +3504,9 @@ public:
         *out = nullptr;
         if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
             desc->Type != D3D12_COMMAND_LIST_TYPE_COPY) return d3d12_trace::result(method, E_INVALIDARG);
+        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME)
+            log_once("CreateCommandQueue: global realtime priority runs on a standard-priority Vulkan queue, type",
+                     desc->Type);
         // Caller-owned devices that only provide the legacy queue cannot acquire more handles from their VkDevice.
         if (state_.info.command_queues.empty())
             return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
@@ -6465,9 +6471,13 @@ bool has_global_realtime_privilege() {
     const int override_state = g_global_realtime_privilege_override.load(std::memory_order_relaxed);
     if (override_state >= 0) return override_state != 0;
     HANDLE token = nullptr;
-    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) &&
-        !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-        return false;
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
+        // Fall back to the process token only when the thread is not impersonating (ERROR_NO_TOKEN); fail closed on
+        // ERROR_CANT_OPEN_ANONYMOUS or any other thread-token error so an impersonated caller cannot inherit the
+        // process token's privilege.
+        if (GetLastError() != ERROR_NO_TOKEN || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+            return false;
+    }
     LUID luid{};
     BOOL enabled = FALSE;
     if (LookupPrivilegeValueW(nullptr, L"SeIncreaseBasePriorityPrivilege", &luid)) {

@@ -2294,16 +2294,6 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         Ref<ID3D12Device10> newer;
         return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
     };
-    const auto not_elevated = [](ID3D12Device*) {
-        HANDLE token = nullptr;
-        TOKEN_ELEVATION elevation{};
-        DWORD size = 0;
-        const bool elevated = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
-                              GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
-                              elevation.TokenIsElevated;
-        if (token) CloseHandle(token);
-        return !elevated;
-    };
     static const Case cases[] = {
         // CreateCommittedResource: arguments.
         // A null D3D12_HEAP_PROPERTIES faults in the host runtime, so it is not compared.
@@ -2963,7 +2953,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command queue: global realtime priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME});
-         }, +not_elevated},
+         }},
         {"command queue: compute", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COMPUTE}); }},
         {"command queue: copy", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COPY}); }},
         {"command queue: high priority", [](ID3D12Device* d) {
@@ -3622,8 +3612,40 @@ int main() {
             granted_q.reset();
             rt::d3d12::set_global_realtime_privilege_override_for_test(-1);
 
+            Ref<ID3D12Device> host;
+            create_host_device(host);
+            if (host.p) EXPECT(command_queue(device.p, rt_desc) == command_queue(host.p, rt_desc));
+
+            // SecurityAnonymous thread impersonation (OpenThreadToken fails with ERROR_CANT_OPEN_ANONYMOUS, not
+            // ERROR_NO_TOKEN) must fail closed instead of falling back to the process token, matching the host runtime.
+            const auto check_security_anonymous_impersonation = [&]() -> int {
+                HANDLE proc_token = nullptr;
+                if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &proc_token)) return 0;
+                HANDLE anon_imp = nullptr;
+                if (DuplicateTokenEx(proc_token, MAXIMUM_ALLOWED, nullptr, SecurityAnonymous, TokenImpersonation,
+                                     &anon_imp)) {
+                    if (SetThreadToken(nullptr, anon_imp)) {
+                        struct RevertImpersonation {
+                            ~RevertImpersonation() { RevertToSelf(); }
+                        } revert_impersonation;
+                        HANDLE opened = nullptr;
+                        EXPECT(!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &opened));
+                        EXPECT(GetLastError() == ERROR_CANT_OPEN_ANONYMOUS);
+                        if (opened) CloseHandle(opened);
+                        EXPECT(!rt::d3d12::has_global_realtime_privilege());
+                        EXPECT(command_queue(device.p, rt_desc) == DXGI_ERROR_ACCESS_DENIED);
+                        if (host.p) EXPECT(command_queue(host.p, rt_desc) == DXGI_ERROR_ACCESS_DENIED);
+                    }
+                    CloseHandle(anon_imp);
+                }
+                CloseHandle(proc_token);
+                return 0;
+            };
+            if (check_security_anonymous_impersonation() != 0) return 1;
+
             // When the process token holds SeIncreaseBasePriorityPrivilege (e.g. an elevated session), toggle the
-            // real token privilege and verify both states against the host D3D12 runtime.
+            // real token privilege and verify both states (plus SecurityAnonymous impersonation while the process
+            // token has the privilege enabled) against the host D3D12 runtime.
             HANDLE token = nullptr;
             LUID luid{};
             if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
@@ -3637,9 +3659,11 @@ int main() {
                         GetLastError() == ERROR_SUCCESS) {
                         EXPECT(rt::d3d12::has_global_realtime_privilege());
                         EXPECT(command_queue(device.p, rt_desc) == S_OK);
-                        Ref<ID3D12Device> host;
-                        if (create_host_device(host)) {
-                            EXPECT(command_queue(host.p, rt_desc) == S_OK);
+                        if (host.p) EXPECT(command_queue(host.p, rt_desc) == S_OK);
+                        if (check_security_anonymous_impersonation() != 0) {
+                            AdjustTokenPrivileges(token, FALSE, &prev, 0, nullptr, nullptr);
+                            CloseHandle(token);
+                            return 1;
                         }
                         tp.Privileges[0].Attributes = 0;
                         if (AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
