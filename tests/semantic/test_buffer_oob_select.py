@@ -222,6 +222,36 @@ class OobSelect(unittest.TestCase):
                 want = {BASE + addr + 4 * k: 0x11111111 * (k + 1) for k in range(4)} if ok else {}
                 self.assertEqual(dict(memory), want, ("store", mode, stride, nr, idx, off, runtime))
 
+    def test_loads_literal_v_sharp_from_s_mov_b64(self):
+        # s_mov_b64 s[6:7], imm folds word3 (OOB_SELECT mode) without run-time extraction.
+        for mode in range(4):
+            with self.subTest(mode=mode):
+                w3 = 0x01000FAC | (mode << 28)
+                val64 = (w3 << 32) | 0x10
+                lines = [f"s_mov_b64 s[4:5], {BASE:#x}", f"s_mov_b64 s[6:7], {val64:#x}",
+                         "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                         "buffer_store_dword v2, off, s[0:3], 0"]
+                spv = self.translate(lines)
+                self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, f"mode {mode} did not fold from s_mov_b64")
+
+    def test_loads_literal_v_sharp_from_s_movk_i32(self):
+        # s_movk_i32 s7, imm sets word3 for modes where word3 fits in 16 bits sign-extended.
+        lines = [f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0", "s_mov_b32 s6, 16",
+                 "s_movk_i32 s7, 0x3000",
+                 "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                 "buffer_store_dword v2, off, s[0:3], 0"]
+        spv = self.translate(lines)
+        self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_movk_i32 did not fold into literal V#")
+
+    def test_loads_literal_v_sharp_from_sgpr_copy(self):
+        # Copy propagation: s_mov_b32 / s_mov_b64 from a constant SGPR preserves sgpr_imm.
+        w3 = 0x31000FAC
+        lines = [f"s_mov_b32 s8, {w3:#x}", "s_mov_b32 s7, s8",
+                 f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0", "s_mov_b32 s6, 16",
+                 "buffer_load_dword v2, off, s[4:7], 0", "s_waitcnt vmcnt(0)",
+                 "buffer_store_dword v2, off, s[0:3], 0"]
+        spv = self.translate(lines)
+        self.assertEqual(len(MODE_EXTRACT.findall(spv)), 1, "s_mov_b32 copy did not fold into literal V#")
 
 if __name__ == "__main__":
     unittest.main()
