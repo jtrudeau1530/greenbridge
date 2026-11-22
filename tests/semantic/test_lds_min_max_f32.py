@@ -1200,5 +1200,104 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(flags.bank_conflicts, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Exhaustive semantic tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_signed_zeros_all_permutations(self) -> None:
+        permutations = [
+            (POS_ZERO, NEG_ZERO, NEG_ZERO, POS_ZERO),
+            (NEG_ZERO, POS_ZERO, NEG_ZERO, POS_ZERO),
+            (POS_ZERO, POS_ZERO, POS_ZERO, POS_ZERO),
+            (NEG_ZERO, NEG_ZERO, NEG_ZERO, NEG_ZERO),
+        ]
+        for a, b, exp_min, exp_max in permutations:
+            with self.subTest(a=hex(a), b=hex(b)):
+                # Test via scalar interpreter
+                # LDS dword 0 starts at 'a'
+                self.lds.write_dword(0, a)
+                self.state.set_vgpr(VGPR(1), 0)
+                self.state.set_vgpr(VGPR(2), b)
+                self.interp.execute(self.state, DSMinMaxInstruction(DSOpcode.DS_MIN_F32, VGPR(1), VGPR(2)))
+                self.assertEqual(self.lds.read_dword(0), exp_min)
+
+                self.lds.write_dword(0, a)
+                self.interp.execute(self.state, DSMinMaxInstruction(DSOpcode.DS_MAX_F32, VGPR(1), VGPR(2)))
+                self.assertEqual(self.lds.read_dword(0), exp_max)
+
+    def test_infinities_against_extremes(self) -> None:
+        # -inf < -FLT_MAX < ... < +FLT_MAX < +inf
+        pairs = [
+            (POS_INF, FLT_MAX, FLT_MAX, POS_INF),
+            (NEG_INF, NEG_FLT_MAX, NEG_INF, NEG_FLT_MAX),
+            (NEG_INF, POS_INF, NEG_INF, POS_INF),
+            (POS_INF, POS_INF, POS_INF, POS_INF),
+            (NEG_INF, NEG_INF, NEG_INF, NEG_INF),
+        ]
+        for a, b, exp_min, exp_max in pairs:
+            with self.subTest(a=hex(a), b=hex(b)):
+                self.assertEqual(oracle_min_f32(a, b), exp_min)
+                self.assertEqual(oracle_max_f32(a, b), exp_max)
+
+    def test_subnormal_precision_preservation(self) -> None:
+        # Subnormals are strictly ordered and never flushed to zero
+        subnormals = [
+            (SUBNORM_MIN, POS_ZERO, POS_ZERO, SUBNORM_MIN),
+            (NEG_SUBNORM_MIN, NEG_ZERO, NEG_SUBNORM_MIN, NEG_ZERO),
+            (SUBNORM_MIN, SUBNORM_MAX, SUBNORM_MIN, SUBNORM_MAX),
+            (NEG_SUBNORM_MAX, NEG_SUBNORM_MIN, NEG_SUBNORM_MAX, NEG_SUBNORM_MIN),
+        ]
+        for a, b, exp_min, exp_max in subnormals:
+            with self.subTest(a=hex(a), b=hex(b)):
+                self.assertEqual(oracle_min_f32(a, b), exp_min)
+                self.assertEqual(oracle_max_f32(a, b), exp_max)
+
+    def test_nan_suppression_exhaustive(self) -> None:
+        nan_variants = [
+            CANONICAL_QNAN,
+            QNAN_PAYLOAD_A,
+            QNAN_PAYLOAD_B,
+            SNAN_PAYLOAD_A,
+            SNAN_PAYLOAD_B,
+        ]
+        valid_floats = [
+            POS_ZERO,
+            NEG_ZERO,
+            ONE_F32,
+            NEG_ONE_F32,
+            FLT_MIN,
+            FLT_MAX,
+            NEG_FLT_MAX,
+            SUBNORM_MIN,
+            SUBNORM_MAX,
+            POS_INF,
+            NEG_INF,
+        ]
+        for nan_val in nan_variants:
+            for num in valid_floats:
+                # min(nan, num) == num and min(num, nan) == num
+                self.assertEqual(oracle_min_f32(nan_val, num), num)
+                self.assertEqual(oracle_min_f32(num, nan_val), num)
+                # max(nan, num) == num and max(num, nan) == num
+                self.assertEqual(oracle_max_f32(nan_val, num), num)
+                self.assertEqual(oracle_max_f32(num, nan_val), num)
+
+    def test_dual_nans_quieting(self) -> None:
+        # Two NaNs produce a quiet NaN
+        nan1 = SNAN_PAYLOAD_A
+        nan2 = SNAN_PAYLOAD_B
+        res_min = oracle_min_f32(nan1, nan2)
+        res_max = oracle_max_f32(nan1, nan2)
+
+        self.assertTrue(is_nan(res_min))
+        self.assertTrue(is_qnan(res_min))
+        self.assertTrue(is_nan(res_max))
+        self.assertTrue(is_qnan(res_max))
+
+
 if __name__ == "__main__":
     unittest.main()
