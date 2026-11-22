@@ -1315,9 +1315,8 @@ def run_suite(a, work: str) -> int:
                     problem = ij_computed_problem(list(struct.iter_unpack("<4I", source.read())))
                 ok, detail = not problem, problem or "computed I/J pair words and v/2 within 1e-6"
             elif name == "ps_mandelbrot":
-                with open(raw, "rb") as source:
-                    px = list(struct.iter_unpack("<4I", source.read()))
-                problem = mandelbrot_problem(px)
+                px = read_raw_u32(raw) if os.path.isfile(raw) else []
+                problem = frame_problem(px) or mandelbrot_problem(px)
                 ok, detail = not problem, problem or f"{len(px)}/{len(px)} iteration counts match the float32 model"
             else:
                 ok, detail = False, "no checker defined"
