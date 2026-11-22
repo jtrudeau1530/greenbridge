@@ -942,8 +942,83 @@ class TestValuRcpF16SIMD(unittest.TestCase):
             self.assertEqual(results[lane], 0x12345678)
 
 
+
+class TestValuRcpF16RegisterAliasing(unittest.TestCase):
+    def setUp(self):
+        self.interp = ScalarVALUInterpreter()
+
+    def test_in_place_self_aliasing_low_half(self):
+        # Set v0: high half = 0x5A5A, low half = TWO_F16 (2.0)
+        self.interp.set_vgpr_u32(0, (0x5A5A << 16) | TWO_F16)
+        res = self.interp.execute_asm("v_rcp_f16 v0.l, v0.l")
+        # Low half should be HALF_F16 (0.5), high half preserved as 0x5A5A
+        self.assertEqual(res & MASK16, HALF_F16)
+        self.assertEqual(res >> 16, 0x5A5A)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (0x5A5A << 16) | HALF_F16)
+
+    def test_in_place_self_aliasing_high_half(self):
+        # Set v0: high half = FOUR_F16 (4.0), low half = 0xA5A5
+        self.interp.set_vgpr_u32(0, (FOUR_F16 << 16) | 0xA5A5)
+        res = self.interp.execute_asm("v_rcp_f16 v0.h, v0.h")
+        # High half should be QUARTER_F16 (0.25), low half preserved as 0xA5A5
+        self.assertEqual(res >> 16, QUARTER_F16)
+        self.assertEqual(res & MASK16, 0xA5A5)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (QUARTER_F16 << 16) | 0xA5A5)
+
+    def test_cross_halfword_aliasing(self):
+        # Read low, write high: v0.h = 1 / v0.l
+        self.interp.set_vgpr_u32(0, (0x1111 << 16) | TWO_F16)
+        res1 = self.interp.execute_asm("v_rcp_f16 v0.h, v0.l")
+        self.assertEqual(res1 >> 16, HALF_F16)
+        self.assertEqual(res1 & MASK16, TWO_F16)
+
+        # Read high, write low: v0.l = 1 / v0.h
+        self.interp.set_vgpr_u32(1, (FOUR_F16 << 16) | 0x2222)
+        res2 = self.interp.execute_asm("v_rcp_f16 v1.l, v1.h")
+        self.assertEqual(res2 & MASK16, QUARTER_F16)
+        self.assertEqual(res2 >> 16, FOUR_F16)
+
+    def test_packed_f16_pipeline(self):
+        # Pack two f16s into v0: low=FOUR_F16 (4.0), high=TWO_F16 (2.0)
+        self.interp.set_vgpr_u32(0, (TWO_F16 << 16) | FOUR_F16)
+        self.interp.set_vgpr_u32(1, 0)
+
+        # Compute reciprocal of low half into v1.l
+        self.interp.execute_asm("v_rcp_f16 v1.l, v0.l")
+        # Compute reciprocal of high half into v1.h
+        res = self.interp.execute_asm("v_rcp_f16 v1.h, v0.h")
+
+        # v1 should now contain: low=QUARTER_F16, high=HALF_F16
+        self.assertEqual(res & MASK16, QUARTER_F16)
+        self.assertEqual(res >> 16, HALF_F16)
+
+    def test_chained_involution_reciprocals(self):
+        # 1 / (1 / x) == x for powers of 2
+        orig = FOUR_F16
+        self.interp.set_vgpr_u32(5, (0xBEEF << 16) | orig)
+        for i in range(10):
+            res = self.interp.execute_asm("v_rcp_f16 v5.l, v5.l")
+            expected = QUARTER_F16 if (i % 2 == 0) else FOUR_F16
+            self.assertEqual(res & MASK16, expected)
+            self.assertEqual(res >> 16, 0xBEEF)
+
+    def test_simd_aliasing_and_lane_isolation(self):
+        simd = SIMDVALUInterpreter(wave_size=32)
+        # Each lane has in-place self update v0 = 1 / v0
+        for lane in range(32):
+            val = TWO_F16 if (lane % 2 == 0) else FOUR_F16
+            simd.set_vgpr_u32(0, lane, (0x7777 << 16) | val)
+
+        results = simd.execute_asm("v_rcp_f16 v0.l, v0.l")
+        for lane in range(32):
+            expected = HALF_F16 if (lane % 2 == 0) else QUARTER_F16
+            self.assertEqual(results[lane] & MASK16, expected)
+            self.assertEqual(results[lane] >> 16, 0x7777)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
