@@ -90,6 +90,7 @@ D3D12 = [
     "[d3d12-trace] #6 MapTiles refused",
     "[d3d12-trace] #7 CreateRootSignature called",
     "[d3d12-trace] #8 SetMarker ignored",
+    "d3d12_test.exe : [d3d12-trace] #9 ID3D12CommandQueue::ExecuteCommandLists called",
 ]
 
 
@@ -169,7 +170,7 @@ class BootTraceTests(unittest.TestCase):
     def test_d3d12_summary(self):
         self.write_lines(self.d3d12, D3D12)
         trace = bt.parse_d3d12(self.d3d12)
-        self.assertEqual(trace["calls"], 8)
+        self.assertEqual(trace["calls"], 9)
         self.assertEqual(trace["ignored_lines"], 1)
         self.assertEqual(
             trace["outcomes"],
@@ -178,7 +179,7 @@ class BootTraceTests(unittest.TestCase):
                 "failed": 1,
                 "unsupported": 2,
                 "refused": 1,
-                "called": 1,
+                "called": 2,
                 "ignored": 1,
             },
         )
@@ -192,10 +193,15 @@ class BootTraceTests(unittest.TestCase):
                 "MapTiles",
                 "CreateRootSignature",
                 "SetMarker",
+                "ID3D12CommandQueue::ExecuteCommandLists",
             ],
         )
         self.assertEqual(
             trace["first"]["D3D12XboxCreateDevice"], {"seq": 1, "outcome": "ok"}
+        )
+        self.assertEqual(
+            trace["first"]["ID3D12CommandQueue::ExecuteCommandLists"],
+            {"seq": 9, "outcome": "called"},
         )
         self.assertEqual(trace["failed"], [{"seq": 2, "method": "CreateCommandQueue"}])
         self.assertEqual(
@@ -206,13 +212,30 @@ class BootTraceTests(unittest.TestCase):
             ],
         )
         self.assertEqual(trace["refused"], [{"seq": 6, "method": "MapTiles"}])
-        self.assertEqual(trace["last_seq"], 8)
+        self.assertEqual(trace["last_seq"], 9)
+
+    def test_powershell_error_record_prefix_keeps_the_first_call(self):
+        self.write_lines(
+            self.d3d12,
+            [
+                "d3d12_test.exe : [d3d12-trace] #1 ID3D12GraphicsCommandList::SetPipelineState called",
+                "At line:1 char:1",
+                "+ & '.\\d3d12_test.exe' --trace-d3d12 2> log",
+            ],
+        )
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["calls"], 1)
+        self.assertEqual(
+            trace["first"]["ID3D12GraphicsCommandList::SetPipelineState"],
+            {"seq": 1, "outcome": "called"},
+        )
 
     def test_d3d12_text_report_names_refused_and_spaced_methods(self):
         self.write_lines(self.d3d12, D3D12)
         text = bt.format_text(bt.summarize(None, bt.parse_d3d12(self.d3d12)), 10)
         self.assertIn("refused: #6 MapTiles", text)
         self.assertIn("#5 SetMarker/BeginEvent with unknown metadata", text)
+        self.assertIn("ID3D12CommandQueue::ExecuteCommandLists", text)
         self.assertIn("[rt] diagnostics are not summarized", text)
 
     def test_json_cli(self):
@@ -225,7 +248,7 @@ class BootTraceTests(unittest.TestCase):
             )
         data = json.loads(out.getvalue())
         self.assertEqual(data["startup"]["pid"], 123)
-        self.assertEqual(data["d3d12"]["calls"], 8)
+        self.assertEqual(data["d3d12"]["calls"], 9)
 
     def test_missing_and_empty_files_are_errors(self):
         err = io.StringIO()

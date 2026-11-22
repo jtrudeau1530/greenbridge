@@ -7,7 +7,9 @@ triage needs: modules, unimplemented calls and their callers, DllMain/TLS result
 the D3D12 calls by outcome and the first call per method.
 
 The method field can contain spaces (`SetMarker/BeginEvent with unknown metadata`), so the parser takes the
-outcome as the last field instead of assuming a single-word method.
+outcome as the last field instead of assuming a single-word method. PowerShell 5.1 wraps the first stderr line of
+a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a `<name> : ` prefix before the
+tag is accepted too; without it the first call of the run would be lost.
 
 Usage:
     python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
@@ -27,7 +29,7 @@ import json
 import re
 import sys
 
-D3D12_LINE = re.compile(r"^\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
 
 
 class TraceError(ValueError):

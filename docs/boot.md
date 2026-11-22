@@ -42,7 +42,8 @@ python -I tools\boot_trace.py $trace --d3d12 $log
 
 Windows PowerShell 5.1 writes `2>` as UTF-16LE; the tool names that file instead of parsing it. Use
 `2>&1 | Out-File -Encoding utf8 $log` there, or PowerShell 7, which defaults to UTF-8. The tool strips the BOM that
-5.1 writes with `utf8`.
+5.1 writes with `utf8`, and accepts the `program.exe : ` prefix 5.1 puts in front of the first stderr line when it
+turns it into an error record, so that call is not lost. `cmd /c` writes the lines unchanged.
 
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 
