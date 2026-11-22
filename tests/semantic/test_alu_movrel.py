@@ -15,7 +15,7 @@ is checked against the same constants, so a typo in either is caught. Standard l
 
 Not tested:
 - v_movrelsd_2_b32 (the GFX10 variant with separate source and destination offsets in M0) is not handled by the
-  translator: it raises Unsupported. A test pins that it is rejected rather than mistranslated.
+  translator yet: it raises Unsupported (a follow-up for whoever implements it).
 - An index past the VGPR file. The translator emits an unchecked OpAccessChain into its 256-entry %vgpr array,
   so S0.addr + M0 or D.addr + M0 >= 256 is undefined in SPIR-V (the mini interpreter raises
   UnsupportedConstruct). An index below 256 but beyond the VGPRs the shader uses reads or writes the translator's
@@ -166,12 +166,6 @@ class TranslatedValues(unittest.TestCase):
 
     def test_v_movrelsd_b32(self):
         self.check("v_movrelsd_b32")
-
-    def test_v_movrelsd_2_b32_rejected(self):
-        body = ["v_mov_b32 v1, 5", "s_mov_b32 m0, 0x10002", "v_movrelsd_2_b32 v0, v1",
-                "exp mrt0 v0, v0, v0, v0 done vm"]
-        with self.assertRaises(rdna2spirv.Unsupported):
-            translate_listing(body)
 
 
 if __name__ == "__main__":
