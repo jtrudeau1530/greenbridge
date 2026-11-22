@@ -3217,6 +3217,20 @@ class Gen:
                 r, carry = r2, cc
             self.dst(a[0], r)
             self.emit(f"OpStore %scc {carry}")
+        elif op in ("s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32"):
+            # D = (S0 << N) + S1. SCC = unsigned overflow of the sum taken in 64 bits (RDNA ISA pseudocode:
+            # tmp = (64'U(S0) << N) + 64'U(S1); SCC = tmp >= 2^32), so bits shifted out of S0 count as a carry too.
+            n = int(op[6])
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            sh, out, s, r, c, ovf = (self.tmp() for _ in range(6))
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {x} {self.cu(n)}")
+            self.emit(f"{out} = OpShiftRightLogical %uint {x} {self.cu(32 - n)}")
+            self.emit(f"{s} = OpIAddCarry %umul {sh} {y}")
+            self.emit(f"{r} = OpCompositeExtract %uint {s} 0")
+            self.emit(f"{c} = OpCompositeExtract %uint {s} 1")
+            self.emit(f"{ovf} = OpBitwiseOr %uint {out} {c}")
+            self.dst(a[0], r)
+            self.scc_nonzero(ovf)
         elif op == "s_getpc_b64":
             # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
