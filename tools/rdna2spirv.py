@@ -8703,6 +8703,94 @@ class Gen:
                     self.emit(f"{r_hi} = OpCompositeExtract %uint {mv2} 1")
                 self.dst({"k": "vgpr", "r": d["r"], "n": 1}, r_lo)
                 self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
+        elif op == "v_div_fixup_f32":
+            # IEEE-754 single-precision division fixup: D = div_fixup_f32(S0=quotient, S1=denom, S2=numer).
+            # Measured natively on RDNA2 (gfx1036, wave32 & wave64, 256 triples across 4 MODEs + modifier matrix)
+            # under the game's inferred MODE (IEEE=0, denorm32=0, DX10_CLAMP=1):
+            #   - VOP3 abs (clear bit 31) then neg (flip bit 31) apply bitwise to S0/S1/S2 before classification
+            #     (including on NaN payloads).
+            #   - S1 and S2 subnormals flush to signed zero (exp == 0); S0 subnormals are preserved.
+            #   - Priority order (highest first):
+            #       1. NaN(S2) -> S2 (unchanged under IEEE=0)
+            #       2. NaN(S1) -> S1 (unchanged under IEEE=0)
+            #       3. (zero(S1) && zero(S2)) || (inf(S1) && inf(S2)) -> 0xFFC00000 (-qNaN)
+            #       4. zero(S2) || inf(S1) -> sign_out (+-0.0)
+            #       5. zero(S1) || inf(S2) -> sign_out | 0x7F800000 (+-inf)
+            #       6. exp(S2) - exp(S1) <= -151 -> sign_out (+-0.0; pure biased-exponent diff, beats NaN(S0))
+            #       7. NaN(S0) -> sign_out | 0x7F800000 (+-inf)
+            #       8. otherwise -> copysign(S0, sign_out)
+            #   - Output modifiers: mul:2/mul:4/div:2 then clamp (DX10_CLAMP=1 maps NaN to +0.0 before [0, 1]).
+            if len(a) != 4:
+                raise Unsupported(op + " operands")
+            bad = [m for m in mods if m not in ("clamp", "mul:2", "mul:4", "div:2")]
+            if bad:
+                raise Unsupported(f"{op} modifier {bad[0]}")
+
+            def _raw_f32_bits(arg):
+                u_val = self.src_u({k: v for k, v in arg.items() if k not in ("abs", "neg")})
+                if arg.get("abs"):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpBitwiseAnd %uint {u_val} {self.cu(0x7FFFFFFF)}")
+                    u_val = t
+                if arg.get("neg"):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpBitwiseXor %uint {u_val} {self.cu(0x80000000)}")
+                    u_val = t
+                return u_val
+
+            def _emit(expr):
+                t = self.tmp()
+                self.emit(f"{t} = {expr}")
+                return t
+
+            s0, s1, s2 = (_raw_f32_bits(arg) for arg in a[1:4])
+            sign_xor = _emit(f"OpBitwiseXor %uint {s1} {s2}")
+            sign_out = _emit(f"OpBitwiseAnd %uint {sign_xor} {self.cu(0x80000000)}")
+            abs0 = _emit(f"OpBitwiseAnd %uint {s0} {self.cu(0x7FFFFFFF)}")
+            abs1 = _emit(f"OpBitwiseAnd %uint {s1} {self.cu(0x7FFFFFFF)}")
+            abs2 = _emit(f"OpBitwiseAnd %uint {s2} {self.cu(0x7FFFFFFF)}")
+            c_inf = self.cu(0x7F800000)
+            c_min_norm = self.cu(0x00800000)
+            nan0 = _emit(f"OpUGreaterThan %bool {abs0} {c_inf}")
+            nan1 = _emit(f"OpUGreaterThan %bool {abs1} {c_inf}")
+            nan2 = _emit(f"OpUGreaterThan %bool {abs2} {c_inf}")
+            inf1 = _emit(f"OpIEqual %bool {abs1} {c_inf}")
+            inf2 = _emit(f"OpIEqual %bool {abs2} {c_inf}")
+            zero1 = _emit(f"OpULessThan %bool {abs1} {c_min_norm}")
+            zero2 = _emit(f"OpULessThan %bool {abs2} {c_min_norm}")
+            e1 = _emit(f"OpShiftRightLogical %uint {abs1} {self.cu(23)}")
+            e2 = _emit(f"OpShiftRightLogical %uint {abs2} {self.cu(23)}")
+            e1_ge_e2 = _emit(f"OpUGreaterThanEqual %bool {e1} {e2}")
+            ediff = _emit(f"OpISub %uint {e1} {e2}")
+            ediff_ge_151 = _emit(f"OpUGreaterThanEqual %bool {ediff} {self.cu(151)}")
+            exp_uf = _emit(f"OpLogicalAnd %bool {e1_ge_e2} {ediff_ge_151}")
+            signed_inf = _emit(f"OpBitwiseOr %uint {sign_out} {c_inf}")
+            signed_s0 = _emit(f"OpBitwiseOr %uint {sign_out} {abs0}")
+            both_zero = _emit(f"OpLogicalAnd %bool {zero1} {zero2}")
+            both_inf = _emit(f"OpLogicalAnd %bool {inf1} {inf2}")
+            indet = _emit(f"OpLogicalOr %bool {both_zero} {both_inf}")
+            to_zero = _emit(f"OpLogicalOr %bool {zero2} {inf1}")
+            to_inf = _emit(f"OpLogicalOr %bool {zero1} {inf2}")
+            r = _emit(f"OpSelect %uint {nan0} {signed_inf} {signed_s0}")
+            r = _emit(f"OpSelect %uint {exp_uf} {sign_out} {r}")
+            r = _emit(f"OpSelect %uint {to_inf} {signed_inf} {r}")
+            r = _emit(f"OpSelect %uint {to_zero} {sign_out} {r}")
+            r = _emit(f"OpSelect %uint {indet} {self.cu(0xFFC00000)} {r}")
+            r = _emit(f"OpSelect %uint {nan1} {s1} {r}")
+            r = _emit(f"OpSelect %uint {nan2} {s2} {r}")
+            has_omod = any(m in ("mul:2", "mul:4", "div:2") for m in mods)
+            has_clamp = "clamp" in mods
+            if has_omod or has_clamp:
+                f = self.tof(r)
+                for m in mods:
+                    if m in ("mul:2", "mul:4", "div:2"):
+                        f = _emit(f"OpFMul %float {f} {self.fconst({'mul:2': 2.0, 'mul:4': 4.0, 'div:2': 0.5}[m])}")
+                if has_clamp:
+                    is_nan = _emit(f"OpIsNan %bool {f}")
+                    safe = _emit(f"OpSelect %float {is_nan} %f0 {f}")
+                    f = _emit(f"OpExtInst %float %glsl FClamp {safe} %f0 %f1")
+                r = self.tou(f)
+            self.dst(a[0], r)
         elif op in ("v_cvt_f32_u32", "v_cvt_f32_i32"):
             x = self.src_u(a[1])
             r = self.tmp()
