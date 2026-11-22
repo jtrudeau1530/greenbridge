@@ -192,6 +192,44 @@ class Modes(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("unknown mode 'emulat'", r.stderr)
 
+    def test_emulate_with_wave32_is_a_usage_error(self):
+        # emulate runs a wave64 program as two 32-lane halves, so --wave 32 selects nothing to run: it used to print
+        # a bare `summary:` and exit 0. The refusal comes before the missing-harness check, so no build is needed.
+        r = subprocess.run([sys.executable, "-I", TOOL, "--wave", "32", "--modes", "emulate", "--programs", "1",
+                            "--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--modes emulate needs wave64 programs", r.stderr)
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_wave64_native_without_w64_native_is_a_usage_error(self):
+        # A wave64 program runs natively only when --w64-native asks for the cross-half approximation; without it the
+        # selection was empty and the run ended after a bare `summary:` with exit 0.
+        r = subprocess.run([sys.executable, "-I", TOOL, "--wave", "64", "--modes", "native", "--programs", "1",
+                            "--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--w64-native", r.stderr)
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_wave64_native_with_w64_native_reaches_the_harness_check(self):
+        # Not a usage error any more: the run gets as far as looking for vk_compute_test.
+        r = subprocess.run([sys.executable, "-I", TOOL, "--wave", "64", "--modes", "native", "--programs", "1",
+                            "--w64-native", "--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("vk_compute_test not found", r.stderr)
+
+    def test_wave64_and_both_still_accept_emulate(self):
+        for wave in ("64", "both"):
+            with self.subTest(wave=wave):
+                r = subprocess.run([sys.executable, "-I", TOOL, "--wave", wave, "--modes", "emulate", "--self-test"],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("self-test OK", r.stdout)
+
 
 class Counts(unittest.TestCase):
     """--programs and --ops cannot be below 1: a run of no programs ended in a bare `summary:` with no lines and exit

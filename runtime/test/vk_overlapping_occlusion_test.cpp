@@ -197,6 +197,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     dst.buffer = d.buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapping);
     dst.buffer_offset = binding_offset;
     dst.size = size - binding_offset;
+    dst.host_readable = true;  // ResolveQueryData writes results that the CPU reads below.
     EXPECT(dst.buffer && mapping);
     std::memset(mapping, 0xcd, size);
     context.add_resource(dst_id, dst);

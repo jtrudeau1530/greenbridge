@@ -25,8 +25,13 @@ import re
 import stat
 import struct
 import sys
+import tempfile
 import time
 import zlib
+
+# -I keeps the script directory off sys.path; add it back so file_mode's helpers are importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -279,18 +284,32 @@ def summarise(rows, span, zero, unread):
 
 
 def write_output(path, rows, summary):
-    """Write CSV or JSON from the file extension."""
+    """Write CSV or JSON by staging it next to `path`, then atomically replacing `path` once closed.
+
+    The stage lives in a private TemporaryDirectory under the destination's parent, so os.replace
+    only ever renames within one filesystem. A late failure closes the stage and leaves any prior
+    report byte-for-byte intact. The destination is resolved first, so a report path that is a
+    symlink is published through to its target the way open(..., "w") did before.
+    """
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".json":
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"summary": summary, "files": rows}, f, indent=1)
-        return
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(COLUMNS)
-        for r in rows:
-            w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
-                        for i, c in enumerate(COLUMNS)])
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest)
+    with tempfile.TemporaryDirectory(dir=parent) as staging:
+        staged = os.path.join(staging, "story_index" + ext)
+        if ext == ".json":
+            with open(staged, "w", encoding="utf-8") as f:
+                json.dump({"summary": summary, "files": rows}, f, indent=1)
+        else:
+            with open(staged, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(COLUMNS)
+                for r in rows:
+                    w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
+                                for i, c in enumerate(COLUMNS)])
+        # os.replace hands the destination the staged file's bits; give them the destination's mode
+        # (an existing report's, or what open() would have made for a new file) so perms are stable.
+        os.chmod(staged, published_mode(dest))
+        os.replace(staged, dest)
 
 
 def byte_count(text):
