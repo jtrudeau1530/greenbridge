@@ -531,9 +531,10 @@ side inwards:
 A typed single-sampled 3D texture can use a default SRV or an explicit `TEXTURE3D` SRV of the same format.
 An `R8G8B8A8_TYPELESS` volume supports explicit `R8G8B8A8_UNORM` and `R8G8B8A8_UNORM_SRGB` SRVs.
 The sRGB view decodes RGB and preserves linear alpha. A typeless volume requires an explicit typed view.
-The T# records the base depth and the view's mip range. Binding 6 holds the 3D Vulkan view, which has one
-array layer. `d3d12_descriptor_test` checks samples at four W coordinates through two views of the same
-volume. A nonzero `ResourceMinLODClamp` on a 3D view is logged and leaves a null descriptor.
+The T# records the base depth, the view's mip range and `ResourceMinLODClamp`. Binding 6 holds the 3D Vulkan view,
+which has one array layer. `d3d12_descriptor_test` checks samples at four W coordinates through two views of the same
+volume, plus minimum-LOD clamped views (inside the mip range via `VK_EXT_image_view_min_lod`, at or below
+`MostDetailedMip`, and above the last mip).
 
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
@@ -1079,7 +1080,8 @@ The layer's descriptor model:
   handles to views for the rendering scope. RTV/DSV descriptors are never shader-visible.
 - View creation maps `D3D12_SRV_DIMENSION`/`D3D12_UAV_DIMENSION` to `VkImageViewType`, the mip and layer ranges,
   sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. Single-layer 1D textures have default and
-  explicit shader-resource views on sampled binding 5. Single-sampled 1D, 2D and 2D-array colour SRVs apply the T# minimum LOD in resource mip coordinates. A clamp inside the exposed mip range uses
+  explicit shader-resource views on sampled binding 5. Single-sampled 1D, 2D, 2D-array, cube and 3D colour SRVs apply
+  the T# minimum LOD in resource mip coordinates. A clamp inside the exposed mip range uses
   `VK_EXT_image_view_min_lod`. Vulkan allows the image-view minimum to be rounded down to an integer.
   With nearest mip filtering, the UHD 770 and Arrow Lake Xe-LPG returned mip 0 for a 2D minimum of 0.75.
   The Xe-LPG also returned mip 1 for a 2D-array minimum of 1.75. RTX and Radeon returned mips 1 and 2.

@@ -718,7 +718,8 @@ struct DeviceState {
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         const bool supports_lod_clamp = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_2d ||
-                                        image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube;
+                                        image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube ||
+                                        image.type == g::ImageType::image_3d;
         if (!storage && supports_lod_clamp && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
             clamp.minLod = g::image_min_lod(words);
@@ -2496,10 +2497,6 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
                                                                D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     if (desc.Dimension != dimension || (line && desc.DepthOrArraySize != 1) || msaa != (desc.SampleDesc.Count > 1)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
-        return false;
-    }
-    if (volume && view.min_lod != 0) {
-        log_once("volume SRV requires a zero ResourceMinLODClamp; format", int(desc.Format));
         return false;
     }
     if (msaa) {
