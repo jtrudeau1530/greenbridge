@@ -426,11 +426,20 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
   that lane is on"): gfx1150 returns 0 when the source lane is off in EXEC, as `ds_bpermute` does. The model now
   says that.
 - **Negative controls.** `--perturb NAME` judges the hardware against a deliberately wrong model (mismatches must
-  appear); `--negative-control` re-judges the words of the run with all 15 (`max_i32` unsigned, `min_u32` signed,
+  appear); `--negative-control` re-judges the words of the run with all 16 (`max_i32` unsigned, `min_u32` signed,
   swapped `cmpst`, zero-extended `i8`/`i16`, d16 reads clearing the other half, `b16_d16_hi` shift, swapped
   `write2`, `st64` unit, bpermute reading off lanes or crossing the wave64 halves, reversed quad permute, swapped
-  swizzle or/xor, permute writing no zero) and exits 1 if one goes unnoticed. `--minimize` drops ops while a
-  program still differs, `--keep DIR` writes the native kernel of each mismatch, `--only I,J` runs chosen indices.
+  swizzle or/xor, permute writing no zero, permute lowest source winning a collision) and exits 1 if one goes
+  unnoticed. `--minimize` drops ops while a program still differs, `--keep DIR` writes the native kernel of each
+  mismatch, `--only I,J` runs chosen indices.
+
+RDNA2 `ds_permute_b32` verification (`FUZZ-10`, `SHADER-133`): raw kernels on an AMD Radeon RX 6800 (`gfx1030`, wave32
+and wave64) confirm that only active lanes send, the highest active source lane wins a collision, active destination
+lanes nobody targets read `0`, inactive destinations keep their old values, and the two 32-lane halves stay separate
+in wave64. On an AMD Radeon RX 6700 XT (`gfx1031`, RADV Mesa 26.3.1), 3,600 translator runs with colliding
+`ds_permute_b32` multipliers (`mul` in `0..63`, seeds 1–3, 300 programs × wave32/wave64 native and `--emulate`)
+matched the model bit for bit (`0` mismatches), and inverting the collision winner or zero-fill rules produced
+mismatches in `39` and `56` of `200` seed-1 programs.
 
 Results on a Radeon 880M (gfx1150, RDNA3.5, driver 26.11.2, AMD clang 23.0.0git), `--oracle hw`:
 
