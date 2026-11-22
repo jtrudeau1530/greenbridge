@@ -334,6 +334,103 @@ class SymbolicExpr:
         return self
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class RegisterFile:
+    """Architectural register file containing 256 VGPRs and 106 SGPRs (32-bit dwords)."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read_vgpr(self, reg_index: int) -> int:
+        return self.vgprs[reg_index] & 0xFFFFFFFF
+
+    def write_vgpr(self, reg_index: int, value: int) -> None:
+        self.vgprs[reg_index] = value & 0xFFFFFFFF
+
+    def read_vgpr_half(self, reg_index: int, half: HalfwordSelect) -> int:
+        dword = self.read_vgpr(reg_index)
+        if half == HalfwordSelect.LOW_16:
+            return dword & 0xFFFF
+        return (dword >> 16) & 0xFFFF
+
+    def write_vgpr_half(self, reg_index: int, half: HalfwordSelect, value_16: int) -> None:
+        current = self.read_vgpr(reg_index)
+        val = value_16 & 0xFFFF
+        if half == HalfwordSelect.LOW_16:
+            updated = (current & 0xFFFF0000) | val
+        else:
+            updated = (current & 0x0000FFFF) | (val << 16)
+        self.write_vgpr(reg_index, updated)
+
+    def read_sgpr_half(self, reg_index: int, half: HalfwordSelect) -> int:
+        dword = self.sgprs[reg_index] & 0xFFFFFFFF
+        if half == HalfwordSelect.LOW_16:
+            return dword & 0xFFFF
+        return (dword >> 16) & 0xFFFF
+
+    def write_sgpr_half(self, reg_index: int, half: HalfwordSelect, value_16: int) -> None:
+        current = self.sgprs[reg_index] & 0xFFFFFFFF
+        val = value_16 & 0xFFFF
+        if half == HalfwordSelect.LOW_16:
+            updated = (current & 0xFFFF0000) | val
+        else:
+            updated = (current & 0x0000FFFF) | (val << 16)
+        self.sgprs[reg_index] = updated
+
+    def read_operand_16(self, op: ASTOperand) -> int:
+        op.validate()
+        if op.op_type == OperandType.VGPR:
+            raw = self.read_vgpr_half(op.reg_index, op.half)
+        elif op.op_type == OperandType.SGPR:
+            raw = self.read_sgpr_half(op.reg_index, op.half)
+        elif op.op_type in (OperandType.INLINE_CONST, OperandType.LITERAL_CONST):
+            raw = (op.literal_val or 0) & 0xFFFF
+        else:
+            raw = 0
+        return raw
+
+
+class ScalarInterpreter:
+    """Deterministic scalar cycle-accurate execution engine for v_rsq_f16."""
+
+    def __init__(self, rf: Optional[RegisterFile] = None) -> None:
+        self.rf: RegisterFile = rf if rf is not None else RegisterFile()
+        self.trace_log: List[str] = []
+        self.cycle_count: int = 0
+
+    def step(self, instr: ASTRsqF16) -> int:
+        instr.validate()
+        raw_src = self.rf.read_operand_16(instr.src0)
+        res_16 = oracle_v_rsq_f16(
+            raw_src,
+            abs_mod=instr.src0.abs_mod,
+            neg_mod=instr.src0.neg_mod,
+            clamp=instr.clamp,
+            omod=instr.omod,
+            ftz=instr.ftz,
+        )
+
+        # Write result to destination VGPR halfword while preserving untouched halfword
+        self.rf.write_vgpr_half(instr.dst.reg_index, instr.dst.half, res_16)
+
+        # Update trace log & cycle count (transcendental/reciprocal VALU instructions = 4 cycles)
+        self.cycle_count += 4
+        trace_msg = (
+            f"[Cycle {self.cycle_count:04d}] {instr.to_assembly()} => "
+            f"dst=v{instr.dst.reg_index}.{('l' if instr.dst.half == HalfwordSelect.LOW_16 else 'h')} = {res_16:#06x}"
+        )
+        self.trace_log.append(trace_msg)
+        return res_16
+
+
+# ---------------------------------------------------------------------------
+# Unit Test Suites
+# ---------------------------------------------------------------------------
+
 class TestReferenceOracleRSQF16(unittest.TestCase):
     """Unit tests verifying the mathematical reference oracle for v_rsq_f16."""
 
@@ -450,6 +547,56 @@ class TestSymbolicASTRsqF16(unittest.TestCase):
         # neg(neg(z)) -> z
         e3 = SymbolicExpr("neg", (SymbolicExpr("neg", ("z",)),))
         self.assertEqual(e3.simplify(), "z")
+
+
+class TestScalarInterpreterRSQF16(unittest.TestCase):
+    """Unit tests verifying deterministic scalar execution of v_rsq_f16."""
+
+    def test_scalar_execution_vgpr_low_and_high(self) -> None:
+        interp = ScalarInterpreter()
+        # Set v1 = [low=4.0 (0x4400), high=16.0 (0x4C00)]
+        interp.rf.write_vgpr(1, (H_SIXTEEN << 16) | H_FOUR)
+
+        # v2.l = v_rsq_f16 v1.l (rsq(4.0) = 0.5 -> 0x3800)
+        dst_l = ASTOperand(op_type=OperandType.VGPR, reg_index=2, half=HalfwordSelect.LOW_16)
+        src_l = ASTOperand(op_type=OperandType.VGPR, reg_index=1, half=HalfwordSelect.LOW_16)
+        interp.step(ASTRsqF16(dst=dst_l, src0=src_l))
+        self.assertEqual(interp.rf.read_vgpr_half(2, HalfwordSelect.LOW_16), H_HALF)
+        self.assertEqual(interp.rf.read_vgpr_half(2, HalfwordSelect.HIGH_16), 0)
+
+        # v2.h = v_rsq_f16 v1.h (rsq(16.0) = 0.25 -> 0x3400)
+        dst_h = ASTOperand(op_type=OperandType.VGPR, reg_index=2, half=HalfwordSelect.HIGH_16)
+        src_h = ASTOperand(op_type=OperandType.VGPR, reg_index=1, half=HalfwordSelect.HIGH_16)
+        interp.step(ASTRsqF16(dst=dst_h, src0=src_h))
+        self.assertEqual(interp.rf.read_vgpr_half(2, HalfwordSelect.HIGH_16), H_QUARTER)
+        # Verify low half remained intact!
+        self.assertEqual(interp.rf.read_vgpr_half(2, HalfwordSelect.LOW_16), H_HALF)
+
+    def test_scalar_execution_sgpr_source(self) -> None:
+        interp = ScalarInterpreter()
+        interp.rf.write_sgpr_half(4, HalfwordSelect.LOW_16, H_QUARTER)  # 0.25
+
+        # v0.l = v_rsq_f16 s4.l (rsq(0.25) = 2.0)
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=0, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.SGPR, reg_index=4, half=HalfwordSelect.LOW_16)
+        interp.step(ASTRsqF16(dst=dst, src0=src))
+        self.assertEqual(interp.rf.read_vgpr_half(0, HalfwordSelect.LOW_16), H_TWO)
+
+    def test_scalar_execution_literal_constant(self) -> None:
+        interp = ScalarInterpreter()
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=10, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.LITERAL_CONST, literal_val=H_0P0625)  # 0.0625 -> 4.0
+        interp.step(ASTRsqF16(dst=dst, src0=src))
+        self.assertEqual(interp.rf.read_vgpr_half(10, HalfwordSelect.LOW_16), H_FOUR)
+
+    def test_cycle_count_and_trace_logging(self) -> None:
+        interp = ScalarInterpreter()
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=0, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.LITERAL_CONST, literal_val=H_ONE)
+        interp.step(ASTRsqF16(dst=dst, src0=src))
+        self.assertEqual(interp.cycle_count, 4)
+        self.assertEqual(len(interp.trace_log), 1)
+        self.assertIn("v_rsq_f16", interp.trace_log[0])
 
 
 if __name__ == "__main__":
