@@ -8,7 +8,8 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
 
-if(WIN32)
+option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
+if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # The d3d12_xs shim and its tests use version 1.2 root signatures (D3D12_ROOT_SIGNATURE_DESC2), which the Windows
   # SDK declares from 10.0.26100 on. Stop here with the fix instead of failing halfway through the build.
   include(CheckCXXSourceCompiles)
@@ -277,7 +278,7 @@ if(WIN32)
     endif()
   endif()
 
-else()
+elseif(NOT WIN32)
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
 endif()
 
@@ -295,15 +296,14 @@ if(BUILD_TESTING)
   add_executable(vulkan_device_filter_test test/vulkan_device_filter_test.cpp)
   target_include_directories(vulkan_device_filter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
-  if(WIN32)
+  if(TARGET gta6rt)
     # Compile-time ABI checks (D3D12/XMem structure sizes, alignments and member offsets against the Windows SDK).
     # The file existed but no target built it, so none of its static_asserts ever ran.
     add_executable(runtime_types_test test/test_runtime_types.cpp)
     target_include_directories(runtime_types_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/shims)
     add_test(NAME runtime_types COMMAND runtime_types_test)
-  endif()
-  if(WIN32)
+
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
       test/loader_test.cpp
@@ -514,7 +514,7 @@ if(BUILD_TESTING)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
   # Reads all 26,503 containers and modules: about 9 minutes from a hard disk.
   set_tests_properties(shader_library_corpus PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
-  if(WIN32)
+  if(TARGET gta6rt)
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_decode_test
       test/bink_decode_test.cpp
@@ -595,7 +595,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET gameinput_test)
     add_test(NAME gameinput COMMAND gameinput_test)
-  elseif(WIN32)
+  elseif(TARGET gta6rt)
     # Built without SDL3: listed as "Not Run (Disabled)" so it is visible that the shim was not tested.
     add_test(NAME gameinput COMMAND ${CMAKE_COMMAND} -E echo "built without SDL3")
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
@@ -637,7 +637,7 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-if(WIN32)
+if(TARGET gta6rt_d3d12_xs_rootsig)
 option(LEONIDA_D3D12_SHIM_TESTS "Build the standalone D3D12 root-signature shim test" OFF)
 if(LEONIDA_D3D12_SHIM_TESTS)
   enable_testing()
@@ -840,7 +840,7 @@ if(TARGET Vulkan::Headers)
   # runtime/cmake/clang-cl-xwin.cmake) has no such prompt, so it is handed the header CMake finds.
   set(_stubs_header)
   set(_stubs_header_ok TRUE)
-  if(WIN32 AND CMAKE_CROSSCOMPILING)
+  if(TARGET gta6rt AND CMAKE_CROSSCOMPILING)
     find_file(LEONIDA_D3D12_HEADER d3d12.h)
     if(LEONIDA_D3D12_HEADER)
       set(_stubs_header --header "${LEONIDA_D3D12_HEADER}")
@@ -849,7 +849,7 @@ if(TARGET Vulkan::Headers)
       message(STATUS "d3d12.h not found (set CMAKE_INCLUDE_PATH): the D3D12 COM objects are not built")
     endif()
   endif()
-  if(WIN32 AND Python3_FOUND AND _stubs_header_ok)
+  if(TARGET gta6rt AND Python3_FOUND AND _stubs_header_ok)
     set(LEONIDA_STUBS ${CMAKE_CURRENT_BINARY_DIR}/generated/d3d12_stubs.h)
     add_custom_command(
       OUTPUT ${LEONIDA_STUBS}
@@ -1519,8 +1519,8 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(fsr_dispatch_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(fsr_dispatch_test PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
-  else()
-    message(STATUS "Python 3, Windows or d3d12.h missing: the D3D12 COM objects and d3d12_com_test are not built")
+  elseif(TARGET gta6rt)
+    message(STATUS "Python 3 or d3d12.h missing: the D3D12 COM objects and d3d12_com_test are not built")
   endif()
 
   # Needs only the Vulkan headers, not a GPU.
