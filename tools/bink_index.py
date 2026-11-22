@@ -329,7 +329,12 @@ def main(argv=None):
     skip_report = None
     if a.out and os.path.isfile(a.out):
         skip_report = a.out
-    rows, summary = scan_target(a.target, skip_report)
+    try:
+        rows, summary = scan_target(a.target, skip_report)
+    except OSError as error:
+        path = error.filename or a.target
+        print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+        return 2
     probe = False
     if a.probe:
         ffprobe = shutil.which("ffprobe")

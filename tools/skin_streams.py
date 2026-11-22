@@ -480,7 +480,11 @@ def main(argv=None):
                 return 2
     report, t0 = {}, time.time()
     for path in a.inputs:
-        stats = scan_archive(path, a.sample, lambda text: print(text, flush=True))
+        try:
+            stats = scan_archive(path, a.sample, lambda text: print(text, flush=True))
+        except OSError as error:
+            print(f"error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+            return 2
         report[path] = stats
         print(f"{os.path.basename(path)}: {stats['resources']} resources, {stats['meshes']} skin meshes, "
               f"{stats['vertices']} vertices ({time.time() - t0:.0f}s)")
