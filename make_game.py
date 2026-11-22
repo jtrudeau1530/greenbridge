@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -186,9 +187,59 @@ def load_version(game: str) -> dict:
         if not mismatches:
             return version
         reports.append(f"  {version['title']} {version['version']}\n    " + "\n    ".join(mismatches))
+    notes = "".join(f"\n{container_message(p, h)}" for p, h in containers_in(game))
     fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
          "MicrosoftGame.Config and the .rpf archives.\nSupported:\n"
-         + "\n".join(reports or ["  No version manifests found."]))
+         + "\n".join(reports or ["  No version manifests found."]) + notes)
+
+
+# ---------------------------------------------------------------- packaged containers
+# The store keeps the game as one packaged container (.xvc), an XVD file whose contents are encrypted. Nothing here
+# reads keys or decrypts (docs/design.md, "Ground rules"), so the build can't use it. Pointed at one, or at a folder
+# that only holds one, the build reads the plain 4 KiB header to say what it is instead of "not found".
+# Offsets are from the start of the file: xvdtool's XvdHeader + 0x200, the signature in front of it.
+XVD_MAGIC = b"msft-xvd"
+XVD_HEADER_SIZE = 0x1000
+XVD_ENCRYPTION_DISABLED = 0x2          # VolumeFlags bit
+CONTAINER_SUFFIXES = (".xvc", ".msixvc", ".xvd")
+
+
+def xvd_header(path: str):
+    """The few XVD header fields the build reports, or None when the file isn't an XVD. Reads 4 KiB, nothing else."""
+    try:
+        with open(path, "rb") as f:
+            b = f.read(XVD_HEADER_SIZE)
+    except OSError:
+        return None
+    if len(b) < XVD_HEADER_SIZE or b[0x200:0x208] != XVD_MAGIC:
+        return None
+    flags, = struct.unpack_from("<I", b, 0x208)
+    content_type, = struct.unpack_from("<I", b, 0x284)
+    xvc_data_length, = struct.unpack_from("<I", b, 0x290)
+    version = struct.unpack_from("<4H", b, 0x3BC)        # stored lowest part first: 1,2,0,1 is 1.0.2.1
+    return {"kind": "XVC" if xvc_data_length else "XVD",
+            "encrypted": not flags & XVD_ENCRYPTION_DISABLED,
+            "content_type": content_type,
+            "version": ".".join(str(p) for p in reversed(version))}
+
+
+def container_message(path: str, h: dict) -> str:
+    """Why the build can't use a packaged container, and what to give it instead."""
+    state = "Its files are encrypted inside it" if h["encrypted"] else "Its files are packed inside it"
+    return (f"{path} is a packaged {h['kind']} container (package version {h['version']}), not a game folder. "
+            f"{state}, and this project doesn't read keys, decrypt or unpack containers, so the build can't use "
+            "it. Give --game the folder that holds MicrosoftGame.Config and the .rpf archives.")
+
+
+def containers_in(folder: str) -> list:
+    """(path, header) for each packaged container directly in folder; only files with a container suffix are read."""
+    try:
+        with os.scandir(folder) as it:
+            names = sorted(e.path for e in it if e.name.lower().endswith(CONTAINER_SUFFIXES)
+                           and e.is_file(follow_symlinks=False))
+    except OSError:
+        return []
+    return [(p, h) for p in names if (h := xvd_header(p))]
 
 
 # Windows known-folder IDs (KnownFolders.h): Downloads, Desktop, Documents. OneDrive's Known Folder Move puts
@@ -228,10 +279,12 @@ def known_folders() -> list:
     return found
 
 
-def find_dumps() -> list:
+def find_dumps(containers: list | None = None) -> list:
     """Folders on this PC that hold a supported version: Downloads, Desktop, Documents (under the home folder and
     where Windows really keeps them), the home folder and the top of each drive, up to two folder levels down.
-    Only folder names and a few file sizes are read."""
+    Only folder names and a few file sizes are read. With a containers list, also appends (path, header) for each
+    packaged container (.xvc/.msixvc/.xvd) in the folders searched, which the build can't use: only the 4 KiB header
+    of a file with that suffix is read."""
     home = os.path.expanduser("~")
     roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + known_folders() + [home]
     if os.name == "nt":
@@ -241,7 +294,7 @@ def find_dumps() -> list:
         roots += ["/mnt", "/media"]
     skip = {"windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
             "system volume information", "node_modules", ".git"}
-    visited_depths, found = {}, {}
+    visited_depths, found, seen_containers = {}, {}, set()
 
     def visit(d: str, depth: int) -> None:
         try:
@@ -262,10 +315,23 @@ def find_dumps() -> list:
             return
         try:
             with os.scandir(d) as it:
-                subs = [e.path for e in it if e.is_dir(follow_symlinks=False)
-                        and e.name.lower() not in skip and not e.name.startswith((".", "$"))]
+                entries = list(it)
         except OSError:
             return
+        subs = []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if e.name.lower() not in skip and not e.name.startswith((".", "$")):
+                        subs.append(e.path)
+                elif containers is not None and e.name.lower().endswith(CONTAINER_SUFFIXES) \
+                        and e.is_file(follow_symlinks=False):
+                    key = os.path.normcase(os.path.realpath(e.path))
+                    if key not in seen_containers and (h := xvd_header(e.path)):
+                        seen_containers.add(key)
+                        containers.append((e.path, h))
+            except OSError:
+                continue
         for s in subs:
             visit(s, depth - 1)
 
@@ -297,8 +363,10 @@ def pick_game() -> str:
             if v:
                 log(f"chose {v['title']} {v['version']} in {d}")
                 return d
+            notes = "".join(f"\n\n{container_message(p, h)}" for p, h in containers_in(d))
             messagebox.showwarning("Leonida", "That folder isn't a supported version of the game. Choose the "
-                                   "folder that holds MicrosoftGame.Config and the .rpf archives.", parent=root)
+                                   "folder that holds MicrosoftGame.Config and the .rpf archives." + notes,
+                                   parent=root)
     finally:
         root.destroy()
 
@@ -306,7 +374,8 @@ def pick_game() -> str:
 def choose_game() -> str:
     """No --game given: find the dump, or ask for it."""
     log("looking for your game files...")
-    found = find_dumps()
+    containers = []
+    found = find_dumps(containers)
     interactive = sys.stdin is not None and sys.stdin.isatty()
     if len(found) == 1:
         log(f"found {found[0][1]['title']} {found[0][1]['version']} in {found[0][0]}")
@@ -323,10 +392,11 @@ def choose_game() -> str:
                 fail("No copy chosen: choose one with --game.")
             if pick.isdigit() and 1 <= int(pick) <= len(found):
                 return found[int(pick) - 1][0]
+    notes = "".join(f"\n{container_message(p, h)}" for p, h in containers)
     if not interactive:
-        fail("Your game files weren't found. Give the folder with --game.")
+        fail("Your game files weren't found. Give the folder with --game." + notes)
     print("Your game files weren't found automatically. Paste the folder that holds MicrosoftGame.Config "
-          "and the .rpf archives.")
+          "and the .rpf archives." + notes)
     while True:
         try:
             d = input("Game folder: ").strip().strip('"')
@@ -334,6 +404,10 @@ def choose_game() -> str:
             fail("No folder given. Give the folder with --game.")
         if d and match_version(d):
             return d
+        h = xvd_header(d) if d and os.path.isfile(d) else None
+        pasted = [(d, h)] if h else containers_in(d) if d else []
+        for p, ph in pasted:
+            print(f"  {container_message(p, ph)}")
         print("  That folder isn't a supported version of the game. Try again.")
 
 
@@ -589,7 +663,8 @@ def ensure_submodule() -> None:
 
 def check(game: str, full: bool) -> dict:
     if not os.path.isdir(game):
-        fail(f"Game folder not found: {game}")
+        h = xvd_header(game) if os.path.isfile(game) else None
+        fail(container_message(game, h) if h else f"Game folder not found: {game}")
     v = load_version(game)
     log(f"check: {v['title']} {v['version']}, {len(v['files'])} files")
     bad = 0
@@ -1538,10 +1613,14 @@ def main() -> int:
         ap.error("--pick and --game both choose the game folder: give one")
     below_normal()
     if a.find:
-        found = find_dumps()
+        containers = []
+        found = find_dumps(containers)
         for d, v in found:
             print(f"{d}  ({v['title']} {v['version']})")
         print(f"{len(found)} found")
+        for p, h in containers:
+            print(f"not usable: {p}  (packaged {h['kind']} container, package version {h['version']}; "
+                  "the build needs the folder that holds MicrosoftGame.Config)")
         return 0
     game = os.path.abspath(a.game or (pick_game() if a.pick else choose_game()))
     v = check(game, a.full_check)
