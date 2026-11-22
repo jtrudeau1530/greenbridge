@@ -5,6 +5,8 @@
 Every byte here is built by the test: a synthetic drawable system page, a synthetic graphics page and a
 synthetic RPF9-style archive made of page-aligned zlib streams. No game file, value or name is used.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "skin_streams.py")
@@ -425,6 +428,19 @@ class TestCli(unittest.TestCase):
                     self.assertEqual(r.returncode, 2, r.stderr)
                     self.assertIn("--sample must be at least 1", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
+
+    def test_unreadable_archive_reports_its_path_without_writing_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            out = os.path.join(tmp, "report.json")
+            stderr = io.StringIO()
+            error = PermissionError(13, "input is locked", path)
+            with (mock.patch.object(ss, "open", create=True, side_effect=error),
+                  contextlib.redirect_stderr(stderr)):
+                self.assertEqual(ss.main([path, "--json", out]), 2)
+            self.assertEqual(stderr.getvalue().splitlines(),
+                             [f"error: cannot read {path}: input is locked"])
+            self.assertFalse(os.path.exists(out))
 
     def test_missing_or_directory_input_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
