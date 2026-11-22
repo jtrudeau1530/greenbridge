@@ -51,8 +51,20 @@ using AsyncCompleteFn = void(__stdcall*)(XAsyncBlock*, HRESULT, size_t);
 using AsyncResultSizeFn = HRESULT(__stdcall*)(XAsyncBlock*, size_t*);
 using AsyncResultFn = HRESULT(__stdcall*)(XAsyncBlock*, const void*, size_t, void*, size_t*);
 
+struct XSystemAnalyticsInfo {
+    char osVersion[128];
+    char hostingOsVersion[128];
+    char family[64];
+    char form[64];
+};
+
+using AnalyticsInfoFn = HRESULT(__stdcall*)(XSystemAnalyticsInfo*);
+using PackagePathFn = HRESULT(__stdcall*)(size_t, char*);
+using PackagedProcessFn = bool(__stdcall*)();
+
 const char* const kNames[] = {
     "XGameRuntimeInitialize", "XGameRuntimeUninitialize", "XSystemGetDeviceType", "XSystemGetConsoleId",
+    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackagePath", "XPackageIsPackagedProcess",
     "XTaskQueueCreate", "XTaskQueueCreateComposite", "XTaskQueueGetPort", "XTaskQueueDuplicateHandle",
     "XTaskQueueCloseHandle", "XTaskQueueTerminate", "XTaskQueueDispatch", "XTaskQueueSubmitCallback",
     "XTaskQueueSubmitDelayedCallback", "XTaskQueueRegisterWaiter", "XTaskQueueUnregisterWaiter",
@@ -228,6 +240,32 @@ int main() {
           "XSystemGetConsoleId rejects a buffer smaller than XSystemConsoleIdBytes");
     check(console_id(sizeof(id), id, &used) == S_OK && used == 39 && std::strlen(id) == 38,
           "XSystemGetConsoleId fills 39 bytes (38 characters and the terminator)");
+
+    auto analytics_info = get<AnalyticsInfoFn>("XSystemGetAnalyticsInfo");
+    check(analytics_info(nullptr) == E_INVALIDARG, "XSystemGetAnalyticsInfo rejects null pointer");
+    XSystemAnalyticsInfo info{};
+    check(analytics_info(&info) == S_OK && std::strcmp(info.family, "Xbox") == 0 &&
+              std::strcmp(info.osVersion, "10.0.22000.0") == 0 && std::strcmp(info.form, "Anaconda") == 0,
+          "XSystemGetAnalyticsInfo populates Xbox Anaconda analytics info");
+
+    auto package_path = get<PackagePathFn>("XPackageGetCurrentProcessPackagePath");
+    check(package_path(0, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackagePath rejects null pointer and size 0");
+    char pkg_path[MAX_PATH] = {};
+    check(package_path(0, pkg_path) == E_INVALIDARG, "XPackageGetCurrentProcessPackagePath rejects size 0 with buffer");
+    check(package_path(10, nullptr) == E_INVALIDARG, "XPackageGetCurrentProcessPackagePath rejects null pointer with size");
+
+    SetEnvironmentVariableA("LEONIDA_GAME_DIR", "C:\\LeonidaGameDir");
+    check(package_path(5, pkg_path) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "XPackageGetCurrentProcessPackagePath rejects insufficient buffer");
+    check(package_path(sizeof(pkg_path), pkg_path) == S_OK && std::strcmp(pkg_path, "C:\\LeonidaGameDir") == 0,
+          "XPackageGetCurrentProcessPackagePath returns configured game directory");
+    SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+
+    auto is_packaged = get<PackagedProcessFn>("XPackageIsPackagedProcess");
+    check(is_packaged() == true, "XPackageIsPackagedProcess returns true by default");
+    SetEnvironmentVariableA("LEONIDA_PACKAGED", "0");
+    check(is_packaged() == false, "XPackageIsPackagedProcess respects LEONIDA_PACKAGED=0 override");
+    SetEnvironmentVariableA("LEONIDA_PACKAGED", nullptr);
 
     // Work on the thread pool, completions dispatched by the "game loop" on this thread.
     auto create = get<QueueCreateFn>("XTaskQueueCreate");

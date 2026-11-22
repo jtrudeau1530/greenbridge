@@ -156,6 +156,74 @@ uint64_t __stdcall XSystemGetAppMemoryUsage() {
     return 0;
 }
 
+// XSystemAnalyticsInfo: hardware and OS version telemetry requested during engine startup.
+struct XSystemAnalyticsInfo {
+    char osVersion[128];
+    char hostingOsVersion[128];
+    char family[64];
+    char form[64];
+};
+
+// HRESULT XSystemGetAnalyticsInfo(XSystemAnalyticsInfo* info).
+HRESULT __stdcall XSystemGetAnalyticsInfo(XSystemAnalyticsInfo* info) {
+    if (!info) return E_INVALIDARG;
+    std::memset(info, 0, sizeof(*info));
+    std::strncpy(info->osVersion, "10.0.22000.0", sizeof(info->osVersion) - 1);
+    std::strncpy(info->hostingOsVersion, "10.0.22000.0", sizeof(info->hostingOsVersion) - 1);
+    std::strncpy(info->family, "Xbox", sizeof(info->family) - 1);
+
+    const uint32_t dt = XSystemGetDeviceType();
+    if (dt == static_cast<uint32_t>(XSystemDeviceType::XboxScarlettLockhart)) {
+        std::strncpy(info->form, "Lockhart", sizeof(info->form) - 1);
+    } else {
+        std::strncpy(info->form, "Anaconda", sizeof(info->form) - 1);
+    }
+    return S_OK;
+}
+
+// ---- XPackage ----
+
+// HRESULT XPackageGetCurrentProcessPackagePath(size_t pathSize, char* path).
+// Retrieves the path of the installed package for the current process.
+// Reads LEONIDA_GAME_DIR when set, otherwise falls back to the current module's directory.
+HRESULT __stdcall XPackageGetCurrentProcessPackagePath(size_t pathSize, char* path) {
+    if (!path || pathSize == 0) return E_INVALIDARG;
+
+    char buf[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) {
+        const DWORD mod_len = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+        if (mod_len > 0 && mod_len < sizeof(buf)) {
+            char* slash = std::strrchr(buf, '\\');
+            char* fslash = std::strrchr(buf, '/');
+            char* last = slash > fslash ? slash : fslash;
+            if (last) {
+                *last = '\0';
+            } else {
+                std::strcpy(buf, ".");
+            }
+        } else {
+            std::strcpy(buf, ".");
+        }
+    }
+
+    const size_t len = std::strlen(buf);
+    if (pathSize < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, buf, len + 1);
+    return S_OK;
+}
+
+// bool XPackageIsPackagedProcess().
+// Returns true on Xbox Series console. LEONIDA_PACKAGED=0 overrides it.
+bool __stdcall XPackageIsPackagedProcess() {
+    char s[16];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGED", s, sizeof(s));
+    if (n > 0 && n < sizeof(s)) {
+        if (std::atoi(s) == 0) return false;
+    }
+    return true;
+}
+
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}
 
 }  // namespace
@@ -173,6 +241,9 @@ SHIM_TABLE(xgameruntime,
     XGR(XSystemGetConsoleId),
     XGR(XSystemGetAppMemoryUsageLimit),
     XGR(XSystemGetAppMemoryUsage),
+    XGR(XSystemGetAnalyticsInfo),
+    XGR(XPackageGetCurrentProcessPackagePath),
+    XGR(XPackageIsPackagedProcess),
     // XTaskQueue (third_party/xtaskqueue)
     XGR(XTaskQueueCreate),
     XGR(XTaskQueueCreateComposite),
