@@ -1089,6 +1089,34 @@ What the hardware answered where the model does not judge (gfx1150; the RDNA2 ru
   payload bits and the quiet bit set (not the canonical `0x7e00` the model writes; payload not judged, quietness is).
   `v_cvt_f32_f16` keeps the f16 payload shifted left by 13 and does not quiet it (the model agrees).
 
+### f32 misc ops and float compares (`tools/fmisc_diff.py`)
+
+`tools/f32_fuzz.py` generates the f32 arithmetic. `tools/fmisc_diff.py` covers the f32 ops it leaves out:
+`v_fract_f32`, `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_ldexp_f32`, `v_cvt_u32_f32`, `v_cvt_i32_f32`,
+`v_cvt_off_f32_i4` and `v_fmamk_f32`. It also covers the 16 `v_cmp_*_f32` conditions (e32 into VCC, e64 into an SGPR
+mask or VCC) and `v_cmp_class_f32` e64, each read back with `v_cndmask_b32_e64`. Programs use VOP3 `neg`/`abs`,
+`mul:2`/`mul:4`/`div:2` and `clamp`, with VGPR, SGPR, inline-constant and literal sources within the constant-bus
+limits. It runs one lane through `tests/semantic/spirv_mini_interp.py` against its own exact-rational ISA model, with
+the shrinking, skips and exit codes of `salu_diff.py`. Any NaN matches any NaN. It does not judge denormal operands
+or results, a computed NaN read as an integer, the clamp of a NaN or an output modifier that gives a zero: those
+programs are counted as skips with the reason.
+
+`--oracle hw` runs the kernels under the MODE inferred for the game's shaders (IEEE off, f32 denormals flushed). With
+the assembler's compute default (IEEE on) the hardware ignores `omod`: `v_fract_f32_e64 v4, -v16 mul:2` with v16 = 0.5
+gives 0.5. On an RDNA2 iGPU (gfx1036), 1,800 programs gave 1,563 judged and 0 mismatches, so the model's rules hold
+there. Those rules cover the `0x3f7fffff` cap of `v_fract_f32`, `fract(-0) = +0`, `frexp` of ±inf/NaN/±0, `ldexp`
+overflow and underflow, saturating conversions, one rounding in `v_fmamk_f32`, unordered compares and the class bits.
+Modifiers do not change whether a signalling NaN is signalling: `v_cmp_class_f32` with `-v`, `|v|` or `-|v|` on
+`0x7f800001` still sets bit 0. The translator applies those modifiers with `OpFNegate`/`FAbs`, and in the
+interpreter that quiets the NaN. That form is left out unless `--known` (`class-snan-mods`, posted as a finding).
+`v_cmp_class_f32` without modifiers and `v_cvt_f32_ubyteN` are in `f32_fuzz.py`.
+
+```
+python -I tools/fmisc_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/fmisc_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_fmisc_diff.py
+```
+
 
 ### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
 
