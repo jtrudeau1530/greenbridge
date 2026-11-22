@@ -68,13 +68,15 @@ class ReadBeforeWriteTests(unittest.TestCase):
         self.assertEqual(read_v, {0, 1})
 
     def test_nsa_vlist_and_vcctuple_slist_operands(self):
-        # NSA image_sample reads every VGPR in [v0, v3]; VCCTuple slist writes s100..s105 and reads s2..s3.
+        # NSA image_sample reads every VGPR in [v0, v3]; VCCTuple slist writes s100..s105 and reads s2..s3
+        # as well as unwritten slist sources [s12, s13, s14, s15].
         insns = parse([
             "\ts_load_dwordx8 [s100, s101, s102, s103, s104, s105, vcc_lo, vcc_hi], s[2:3], 0x0",
+            "\ts_buffer_load_dword s20, [s12, s13, s14, s15], 0x0",
             "\timage_sample v[4:7], [v0, v3], [s100, s101, s102, s103, s104, s105, vcc_lo, vcc_hi], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
         ])
         read_s, read_v = V.read_before_write(insns)
-        self.assertEqual(read_s, {2, 3, 8, 9, 10, 11})
+        self.assertEqual(read_s, {2, 3, 8, 9, 10, 11, 12, 13, 14, 15})
         self.assertEqual(read_v, {0, 3})
 
     def test_tbuffer_and_scalar_stores_have_no_destination(self):
@@ -104,30 +106,66 @@ class ReadBeforeWriteTests(unittest.TestCase):
         self.assertEqual(read_v, {0, 1, 2, 3, 5})
 
     def test_ds_non_returning_vs_returning_ops(self):
-        # Non-returning ds_add_u32 / ds_store_b32 do not write args[0]; ds_add_rtn_u32 and ds_read_b32 do.
+        # Non-returning ds_add_u32 / ds_store_b32 / ds_gws_init do not write args[0];
+        # ds_add_rtn_u32, ds_read_b32, ds_ordered_count, ds_swizzle/permute/bpermute, and ds_append/consume do.
         insns = parse([
             "\tds_add_u32 v0, v1",
             "\tds_store_b32 v2, v3",
+            "\tds_gws_init v14 gds",
+            "\tds_ordered_count v5, v1 offset:772 gds",
             "\tds_add_rtn_u32 v4, v0, v1",
-            "\tds_read_b32 v5, v4",
-            "\tv_add_nc_u32_e32 v6, v4, v5",
+            "\tds_read_b32 v6, v4",
+            "\tds_swizzle_b32 v7, v5 offset:0x0",
+            "\tds_permute_b32 v8, v6, v7",
+            "\tds_bpermute_b32 v9, v7, v8",
+            "\tds_append v10 gds",
+            "\tds_consume v11 gds",
+            "\tv_add_nc_u32_e32 v12, v5, v10",
+            "\tv_add_nc_u32_e32 v13, v9, v11",
         ])
         read_s, read_v = V.read_before_write(insns)
         self.assertEqual(read_s, set())
-        self.assertEqual(read_v, {0, 1, 2, 3})
+        self.assertEqual(read_v, {0, 1, 2, 3, 14})
+
+    def test_flat_and_image_atomics_with_and_without_glc(self):
+        # Non-glc flat/image atomics write no destination; glc flat_atomic writes vdst without reading it;
+        # glc image_atomic reads and writes vdata at args[0].
+        insns = parse([
+            "\tflat_atomic_add v[0:1], v2",
+            "\timage_atomic_add v3, v4, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D",
+            "\tflat_atomic_add v5, v[0:1], v2 glc",
+            "\timage_atomic_add v6, v5, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D glc",
+            "\tv_add_nc_u32_e32 v7, v5, v6",
+        ])
+        read_s, read_v = V.read_before_write(insns)
+        self.assertEqual(read_s, {0, 1, 2, 3, 4, 5, 6, 7})
+        self.assertEqual(read_v, {0, 1, 2, 3, 4, 6})
 
     def test_sgpr_rmw_and_dot_accumulate_and_v_swap(self):
         insns = parse([
             "\ts_addk_i32 s4, 16",
             "\ts_bitset1_b32 s5, 3",
+            "\tv_fmac_f32_e32 v10, v11, v12",
+            "\tv_mac_f32_e32 v13, v11, v12",
+            "\tv_dot2c_f32_f16 v14, v11, v12",
             "\tv_dot4c_i32_i8 v1, v2, v3",
-            "\tv_mov_b32_e32 v6, 0",
+            "\tv_dot8c_i32_i4 v15, v2, v3",
+            "\tv_writelane_b32 v16, s4, 0",
             "\tv_swap_b32 v6, v7",
             "\tv_mov_b32_e32 v8, v7",
         ])
         read_s, read_v = V.read_before_write(insns)
         self.assertEqual(read_s, {4, 5})
-        self.assertEqual(read_v, {1, 2, 3, 7})
+        self.assertEqual(read_v, {1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16})
+
+    def test_vcc_carry_out_forms(self):
+        insns = parse([
+            "\tv_add_co_u32_e32 v1, vcc_lo, v0, v2",
+            "\tv_add_co_ci_u32_e32 v3, vcc_lo, v1, v4, vcc_lo",
+        ])
+        read_s, read_v = V.read_before_write(insns)
+        self.assertEqual(read_s, set())
+        self.assertEqual(read_v, {0, 2, 4})
 
     def test_survey_counts_nsa_vertex_and_instance_ids(self):
         # End-to-end check: a VS that reads v0 and v3 only through an NSA vlist lands in the v0+v3 family.

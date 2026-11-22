@@ -30,9 +30,9 @@ from shader_meta import SGPR_RMW  # noqa: E402
 
 NO_DEST_OPS = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe", "s_branch", "s_cbranch", "s_waitcnt", "s_barrier",
                "s_nop", "s_endpgm", "s_sendmsg", "s_sleep", "exp", "buffer_store", "tbuffer_store", "global_store",
-               "flat_store", "scratch_store", "s_store", "s_buffer_store", "image_store", "ds_write", "ds_store")
+               "flat_store", "scratch_store", "s_store", "s_buffer_store", "image_store", "ds_write")
 DUAL_DST_VALU = ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")
-DS_RETURNING = ("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append")
+DS_RETURNING = ("ds_read", "ds_bpermute", "ds_permute", "ds_swizzle", "ds_consume", "ds_append", "ds_ordered_count")
 PRIM_EXPORT = re.compile(r"^\s*exp\s+prim\b", re.M)
 POS0_EXPORT = re.compile(r"^\s*exp\s+pos0\b", re.M)
 PARAM_EXPORT = re.compile(r"^\s*exp\s+param\d+\b", re.M)
