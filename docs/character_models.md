@@ -15,6 +15,10 @@ No game data is reproduced here.
 The current exporter writes every fragment as a **25-vertex bounds cube** with `Embedded: null`
 (2,865 of 2,865). Fragment child drawables are not walked, so a part that exists only as a
 fragment child is not in the OBJ/GLB output even though its parent fragment is.
+The current exporter writes every fragment as a **flat 25-vertex / 32-triangle bounds grid** (a 5x5
+grid at z=0, `Min`/`Max` z = 0) with `Embedded: null` (2,865 of 2,865). Fragment child drawables
+are not walked, so a part that exists only as a fragment child is not in the OBJ/GLB output even
+though its parent fragment is.
 
 ## Lucia records
 
@@ -34,12 +38,15 @@ The decoded export used by the previews contains 13 parts:
 | legacy head | `cs_lucia_legacyheadcs_fr1_001_regular_ws00_full.#dr` | 592 | 1,028 | `0x707771F769AA3542` |
 | jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | `0xF5073AA039BB3CED` |
 | crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | `0x46E8FA9436E9D43C` |
+| jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | none (normal map only) |
+| crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | none (normal map only) |
 | bikini top | `brabikini_fr1_012_regular_ws00_full.#dr` | 6,547 | 5,697 | `0xDF3615ADFB1F4787` |
 | undies | `undiesgstring_fr1_002_slim_hw_full.#dr` | 961 | 913 | `0xCFD339832A9C724A` |
 
 Two caveats that matter for any render:
 
 - **`body` is not a base body.** The only Lucia full-body record in `packs.rpf` is the
+- **`body` is not a base body.** The only `lucia`-named full-body record in `packs.rpf` is the
   `cs_lucia_legacypedcs` clothed legacy ped. The decoded part is 1,748 vertices / 1,816
   triangles, and the manifest lists 874- and 640-vertex rows of the same drawable. Do not present
   it as Lucia's hero body.
@@ -74,6 +81,8 @@ component table.
 | `jacket` | 327 | `jacketbiker`, `jacketdenim`, `jacketblazer`, `jackettrack`, … |
 | `uppr` | 17 | all `slod_uppr_*` super-LOD crowd parts |
 | `lowr` | 21 | all `slod_lowr_*` super-LOD crowd parts |
+| `uppr` | 17 | 14 are `slod_uppr_*`; 3 are `char_bipedbounds_female_armor…_uppr_l/r.#ft` |
+| `lowr` | 21 | 17 are `slod_lowr_*`; 4 are `char_bipedbounds_female_armor…_lowr_l/r.#ft` |
 | `jbib` | 0 | the GTA V slot code is not a name token here |
 | `hands` | 8 | the singular `hand_` appears in 35 names |
 | `feet` | 26 | bare feet plus creature variants |
@@ -94,6 +103,9 @@ scanned TTPF pools. The head has no texture reference at all.
 
 - **Fragment children.** All 2,865 fragments export as the 25-vertex bounds cube described above.
   A shared body that is only a child drawable would be invisible to the current export.
+- **Fragment children.** All 2,865 fragments export as the flat 25-vertex / 32-triangle bounds
+  grid described above. A shared body that is only a child drawable would be invisible to the
+  current export.
 - **A ped-variation table.** `common.rpf` contains `CPedVariationBodyTypeManager`
   (`0x226000`) and `CPedComponentSetManager` (`0x228000`), but neither maps a component variation
   index to a drawable plus texture. The first is height and body-shape presets
@@ -103,6 +115,11 @@ scanned TTPF pools. The head has no texture reference at all.
   all characters, 241 of 329 hair rows are 3-vertex placeholders, but 68 have more than 100
   vertices, so real hair geometry does exist for some characters. A static export of Lucia is bald
   by design, not by a missing decode.
+- **Lucia's hair.** The `packs.rpf` manifest lists three `player_story000_00` hair drawables, and
+  the decoded export resolves ten unique hair names; all of them are 3-vertex / 1-triangle
+  placeholders. Across all characters, 241 of 329 hair rows are 3-vertex placeholders, but 68
+  have more than 100 vertices, so real hair geometry does exist for some characters. A static
+  export of Lucia is bald by design, not by a missing decode.
 - **`levels.rpf` names.** The archive has not been name-enumerated in this workspace; the negative
   for a Lucia body is scoped to the named `packs.rpf` records above.
 - **Bind pose and full skinning.** The delivered GLBs use identity inverse-bind matrices and do
@@ -122,6 +139,16 @@ print(len(items), len(names))
 print(sum(n.lower().endswith(".#ft") for n in names), "fragments")
 print([n for n in names if "lucia" in n.lower()])
 PY
+```
+
+```python
+import json
+
+items = json.load(open(r"<outdir>/packs/models/manifest.json", encoding="utf-8"))["Items"]
+names = sorted({i["Name"] for i in items})
+print(len(items), len(names))
+print(sum(1 for i in items if i.get("IsFragment")), "fragments")
+print([n for n in names if "lucia" in n.lower()])
 ```
 
 The fragment and skinning fields are in the same manifest; the skeleton measurements are in

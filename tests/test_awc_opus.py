@@ -461,6 +461,24 @@ class ExportBankTest(unittest.TestCase):
         self.assertEqual(pages[-1]["granule"], 1920)
 
 
+class DuplicateIdTest(unittest.TestCase):
+    """Two streams in one bank can share a 29-bit id; the second used to overwrite the first's file."""
+
+    def test_streams_with_the_same_id_both_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dup.awc")
+            fmt = format_block(2, 48000, 0x00, 1)
+            with open(path, "wb") as f:
+                f.write(build_bank([(0x123, fmt, struct.pack("<hh", 1, 2)),
+                                    (0x123, fmt, struct.pack("<hh", 3, 4))]))
+            counts = awc.export_bank(path, os.path.join(tmp, "out"))
+            od = os.path.join(tmp, "out", "dup")
+            self.assertEqual(counts["pcm"], 2)
+            self.assertEqual(sorted(os.listdir(od)), ["00000123.wav", "00000123~2.wav"])
+            self.assertNotEqual(read_wav(os.path.join(od, "00000123.wav")),
+                                read_wav(os.path.join(od, "00000123~2.wav")))
+
+
 class StreamedMusicTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

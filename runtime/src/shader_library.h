@@ -9,8 +9,9 @@
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
 #include <array>
-#include <charconv>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -381,15 +382,17 @@ private:
         if (literal("true")) return out.kind = Json::Kind::boolean, out.boolean = true, true;
         if (literal("false")) return out.kind = Json::Kind::boolean, out.boolean = false, true;
         if (literal("null")) return out.kind = Json::Kind::null, true;
-        // Numbers through from_chars, which reports malformed or out-of-range text instead of throwing.
+        // Numbers through strtod: Apple's libc++ does not provide the floating-point from_chars overload. The
+        // token is already limited to JSON number characters, and the end check requires all of it to be consumed.
         const std::size_t start = pos_;
         while (pos_ < text_.size() && std::strchr("+-0123456789.eE", text_[pos_])) ++pos_;
         if (pos_ == start) return false;
         out.kind = Json::Kind::number;
-        const char* first = text_.data() + start;
-        const char* last = text_.data() + pos_;
-        const auto [end, error] = std::from_chars(first, last, out.number);
-        return error == std::errc{} && end == last;
+        const std::string token(text_.substr(start, pos_ - start));
+        char* end = nullptr;
+        errno = 0;
+        out.number = std::strtod(token.c_str(), &end);
+        return errno != ERANGE && end == token.c_str() + token.size();
     }
 
     static int hex_digit(char c) {

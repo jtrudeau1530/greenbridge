@@ -128,6 +128,30 @@ class PixelChecks(unittest.TestCase):
         self.assertIs(ok, True)
         self.assertIn("4096/4096", detail)
 
+    def test_vcmpx_forms_narrow_fragment_subgroup_skip(self):
+        import check
+        self.assertIs(rgt.vcmpx_forms_narrow_skip, check.vcmpx_forms_narrow_skip)
+        # Intel 8..32 cannot pin fragment (#1318); skip before judging the constant mrt0 words (TEST-205).
+        skip = check.vcmpx_forms_narrow_skip("device: Intel UHD 770 (subgroup 8..32)\nok 64x64\n")
+        self.assertIsInstance(skip, check.Skip)
+        self.assertIn("8..32", str(skip))
+        self.assertIn("needs 32", str(skip))
+
+        # Fixed 32-wide devices still run the const check.
+        self.assertIsNone(check.vcmpx_forms_narrow_skip("device: NVIDIA (subgroup 32..32)\nok 64x64\n"))
+        # AMD 32..64 can pin to 32 (min is already 32).
+        self.assertIsNone(check.vcmpx_forms_narrow_skip("device: AMD (subgroup 32..64)\nok 64x64\n"))
+
+        # max < 32: skip like the other wave32 pixel tests.
+        skip = check.vcmpx_forms_narrow_skip("device: Mesa llvmpipe (subgroup 8..8)\nok 64x64\n")
+        self.assertIsInstance(skip, check.Skip)
+        self.assertIn("narrower than 32", str(skip))
+
+        # Missing width line: skip rather than false-fail.
+        skip = check.vcmpx_forms_narrow_skip("device: unknown\nok 64x64\n")
+        self.assertIsInstance(skip, check.Skip)
+        self.assertIn("no subgroup width", str(skip))
+
 
 if __name__ == "__main__":
     unittest.main()

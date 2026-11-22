@@ -625,7 +625,7 @@ python -I tools/anim_clips.py <package>\pack\story000\story000.rpf <work>\story0
 - None of the 1,350 model names occurs in the 8,020 animation paths collected here, and none occurs in the
   `RBF0` rig metadata either. The sampled clip hash `0x25ed0554e58ba1fc` and the recurring `0x98e1750c` are
   absent from all manifest names and integer/string values. A real cross-check needs the full model export
-  (350,248 models per `docs/design.md`) and the rig table.
+  (350,251 models per `docs/design.md`) and the rig table.
 - `common.rpf` is the readable metadata layer. It carved to 781 streams, 710 of them XML-ish. Strict keyword
   occurrences: `clip` 734, `anim` 1,131, `motion` 237, `gesture` 2, `bone` 428 (214 `<Bones>` open/close
   pairs), `ped_` 1,308, `blend` 40; `facial`, `ycd` and `skeleton` 0. The tags include `<AnimData>`,
@@ -692,7 +692,7 @@ above are measured. Treat those two labels as hypotheses until a decoder reads a
 6. **Keep the compression boundary explicit.** Outer RPF9 zlib is understood. Do not add a zlib pass inside a
    page without evidence; the sampled pages had no valid nested stream.
 7. **Re-run the model cross-check with the full export.** The current 1,350-model data.rpf manifest has bone
-   bindings but no bone names or hashes. The full 350,248-model export plus the `RBF0` rig table is needed to
+   bindings but no bone names or hashes. The full 350,251-model export plus the `RBF0` rig table is needed to
    match skeletons to models.
 
 ## Reproduction

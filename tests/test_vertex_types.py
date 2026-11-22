@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import pathlib
 import random
 import struct
 import subprocess
@@ -289,6 +290,53 @@ class ArchiveTests(unittest.TestCase):
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
             self.assertIn('"blocks"', r.stdout)
+
+
+class Rpf9ValidationTests(unittest.TestCase):
+    """RPF9 archive header validation in iter_blocks (contract shared with rpf9_names.scan_archive)."""
+
+    @staticmethod
+    def _run(args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+
+    def test_invalid_headers_are_errors(self):
+        cases = [
+            ("empty", b""),
+            ("short header", b"RPF9"),
+            ("wrong magic", b"XRP9" + struct.pack("<I", 16) + b"\0" * 8),
+            ("data start before the header", b"RPF9" + struct.pack("<I", 0) + b"\0" * 8),
+            ("data start inside the header", b"RPF9" + struct.pack("<I", 4) + b"\0" * 8),
+            ("data start past the end", b"RPF9" + struct.pack("<I", 0x7FFFFFFF) + b"\0" * 8),
+        ]
+        for name, data in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = pathlib.Path(tmp)
+                    path = root / "bad.rpf"
+                    path.write_bytes(data)
+                    out = root / "out.json"
+                    out.write_text('{"sentinel": true}', encoding="utf-8")
+                    r = self._run([str(path), "--json", str(out)])
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertEqual(r.stdout, "")
+                    self.assertIn(path.name, r.stderr)
+                    self.assertIn("RPF9", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(out.read_text(encoding="utf-8"), '{"sentinel": true}')
+
+    def test_valid_header_only_and_reversed_magic(self):
+        cases = [
+            ("header only", b"RPF9" + struct.pack("<I", 8), 0),
+            ("reversed magic", b"9FPR" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(block()), 1),
+        ]
+        for name, data, streams in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = pathlib.Path(tmp) / "ok.rpf"
+                    path.write_bytes(data)
+                    r = self._run([str(path)])
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(json.loads(r.stdout)["streams"], streams)
 
 
 if __name__ == "__main__":

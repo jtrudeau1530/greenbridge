@@ -180,9 +180,9 @@ def kind_of(d):
     return None
 
 
-def read(p):
+def read(p, n=-1):
     with open(p, 'rb') as f:
-        return f.read()
+        return f.read(n)
 
 
 def info_file(p, indent=''):
@@ -367,7 +367,7 @@ def save_slot(folder):
     found = []
     for name in sorted(os.listdir(folder)):
         fp = os.path.join(folder, name)
-        if os.path.isfile(fp) and name not in ('chives.json', 'chives.dat') and kind_of(read(fp)[:8]) in ('ASAV', 'JSAV'):
+        if os.path.isfile(fp) and name not in ('chives.json', 'chives.dat') and kind_of(read(fp, 8)) in ('ASAV', 'JSAV'):
             found.append(name)
     if not found:
         raise SystemExit(f'{folder}: no ASAV/JSAV payload found')

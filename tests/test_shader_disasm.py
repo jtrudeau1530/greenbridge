@@ -208,6 +208,18 @@ class DisasmInputTest(unittest.TestCase):
         self.assertIn("is not a file or folder", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_an_out_that_is_a_file_is_an_error(self):
+        self.write("one.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("keep")
+        p = self.run_tool(self.src, "--out", out)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("cannot create the output folder", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep")
+
 
 if __name__ == "__main__":
     unittest.main()

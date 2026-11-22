@@ -75,12 +75,13 @@ def not_found_message(build, missing):
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
+COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64")
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -108,6 +109,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # integer ops with CPU-only checks until now (derivations in cs_w32_int_ext.asm)
             ("cs_w32_int_ext", [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050]),
             # 64-bit scalar data ops and v_mad_u64_u32 (derivations in cs_w32_salu64.asm)
+            # more ops with CPU-only checks until now (derivations in cs_w32_misc_ext.asm)
+            # ops merged on 2026-11-22 with CPU-only checks (derivations in cs_w32_new_ops.asm)
+            ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
+            ("cs_w32_misc_ext", [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
@@ -144,7 +149,9 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           # V# OOB_SELECT 0..3 (literal and run-time V#s), the RDNA2 rules of docs/buffer_bounds.md, derived in the .asm header
           ("cs_oob_select", [0x5eed000c, 0, 0x5eed0014, 0, 0x5eed0018, 0xeeeeeeee, 0, 0]),
           # the end of an access decides (a start check, Mesa's GFX10 column, reads more); x4 loads and stores per dword, typed all or nothing
-          ("cs_oob_tail", [0, 0, 0x5eed0010, 0, 0xbeef0000, 0xeeeeeeee, 0, 0x5eed0010])]
+          ("cs_oob_tail", [0, 0, 0x5eed0010, 0, 0xbeef0000, 0xeeeeeeee, 0, 0x5eed0010]),
+          # swizzled MUBUF addressing (RDNA2 ISA 8.1.5) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
+          ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed0028, 0, 0xbeef0000, 0xbeef0001])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
@@ -281,7 +288,7 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
-                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high"))
+                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
 PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
                 "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
@@ -294,6 +301,37 @@ MIP_TEST_PASSES = {
     TEXTURE_MIP_TEST: ((TEXTURE_MIP_TEST, "c00000"), ("ps_texture_sample", "c00000")),
     GATHER_LOD_TEST: ((GATHER_LOD_TEST, "40000"), (GATHER_LOD_TEST, "1000c0")),
 }
+
+# TEST-184: vk_store_test "words" fills the r32 uint image with 100 + i, the r32 sint image with -2i (texel
+# i = 8y + x) and the r32 uint volume with 200 + i (texel i = 16z + 4y + x), and prints the three after the dispatch.
+# Per fixture: the words it changes, {word index: value}, in the uint image, the sint image and the volume, as
+# derived in the .asm header. Every other word must still hold its fill.
+STORE_IMAGES = ("uint", "sint", "volume")
+STORE_FILL = (lambda i: 100 + i, lambda i: -2 * i & 0xFFFFFFFF, lambda i: 200 + i)
+STORE_WORDS = {
+    # 2D image atomics: the texel afterwards (uint image) and the data register afterwards (sint image) of cases
+    # 0..15, then the texel 64 threads each added 1 to
+    "cs_imgatomic": (dict(enumerate([0x54, 0xFFFFFF9D, 0x06, 0xF067, 0x97, 0xFFFFFFF0, 0x6A, 0x6B,
+                                     0xC8, 0x6D, 0x05, 0xFFFFFFF0, 0x70, 0xC0FFEE, 0x72, 0x7A, 0xB4])),
+                     dict(enumerate([*range(100, 115), 7])), {}),
+    # 3D image atomics: the data register afterwards (sint image) and the six texels afterwards (volume)
+    "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
+                       {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
+    # image_get_resinfo on a 16x4 image with five levels: (width, height, depth, levels) of levels 0, 1 and 3, then
+    # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone
+    "cs_resinfo": ({**dict(enumerate([16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD])), 16: 2, 17: 5, 18: 5},
+                   {}, {}),
+}
+# TEST-184: image_get_lod on vk_texture_test's textures. Per fixture, its draws: S# word 1 (MIN_LOD [11:0], MAX_LOD
+# [23:12], 4.8 fixed point), whether the two-mip texture is drawn, and mrt0, as derived in the .asm header:
+# ps_get_lod = (clamped LOD, calculated LOD, calculated LOD at 4u, clamped LOD at 4u) on the two-mip texture,
+# ps_get_lod_array = (clamped, calculated LOD at 32u, clamped, calculated LOD) on the one-level 2D array.
+# A device may keep as few as four fraction bits of LOD (Vulkan's smallest mipmapPrecisionBits), hence the tolerance.
+GET_LOD_TESTS = {
+    "ps_get_lod": (("c00000", True, (1.0, 1.0, 3.0, 1.0)), ("40000", True, (0.0, 1.0, 3.0, 0.0))),
+    "ps_get_lod_array": (("c00000", False, (0.0, 2.0, 0.0, -3.0)),),
+}
+GET_LOD_TOLERANCE = 1 / 16
 
 
 # Windows error codes for a program the system refuses to start, and who refused it.
@@ -516,6 +554,24 @@ def bitmask_perm_narrow_skip(out, px):
     width = max(lanes) + 1
     if lo <= width < 32 and width & (width - 1) == 0 and lanes == set(range(width)):
         return Skip(f"SKIP (fragment subgroup ran at {width} lanes on {lo}..{hi} device; needs 32)")
+    return None
+
+
+def vcmpx_forms_narrow_skip(out):
+    """A Skip when ps_vcmpx_forms cannot be judged at 32-lane EXEC (TEST-205 / #618).
+
+    The shader packs v_cmpx EXEC results into constant mrt0 words and does not write lane IDs, so unlike
+    bitmask_perm_narrow_skip the width cannot be read back from the frame. On devices with minSubgroupSize < 32,
+    requiredSubgroupSizeStages typically omits FRAGMENT (#1318), so vk_harness cannot pin the stage and the
+    driver runs it narrower (Intel UHD 770: 4096/4096 mismatches, last word looking like a lane mask)."""
+    m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
+    if not m:
+        return Skip("SKIP (vk_harness reported no subgroup width)")
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if hi < 32:
+        return Skip(f"SKIP (subgroup {hi} is narrower than 32 lanes)")
+    if lo < 32:
+        return Skip(f"SKIP (fragment subgroup may run narrower than 32 on {lo}..{hi} device; needs 32)")
     return None
 
 
@@ -849,6 +905,74 @@ def texoff_test(tools, spirv, name):
         return texoff_problem(raw.read_bytes(), out)[0]
 
 
+def store_words(name):
+    """The 64 words STORE_WORDS[name] expects in each of STORE_IMAGES: its changes over the tool's fill."""
+    return tuple([changed.get(i, fill(i)) for i in range(64)] for changed, fill in zip(STORE_WORDS[name], STORE_FILL))
+
+
+def store_words_problem(output, name):
+    """Judge what vk_store_test printed in "words" mode: "" when every image holds store_words(name)."""
+    for image, want in zip(STORE_IMAGES, store_words(name)):
+        m = re.search(rf"^{image} words:((?: 0x[0-9a-f]{{8}}){{64}})$", output, re.MULTILINE)
+        if not m:
+            return f"vk_store_test printed no {image} words"
+        got = [int(word, 16) for word in m.group(1).split()]
+        bad = [i for i in range(64) if got[i] != want[i]]
+        if bad:
+            i = bad[0]
+            return (f"{len(bad)} of 64 {image} words differ; first word {i}: got {got[i]:#010x}, "
+                    f"expected {want[i]:#010x}")
+    return ""
+
+
+def store_words_test(tools, spirv, name):
+    """A STORE_WORDS fixture through vk_store_test's "words" mode (it binds the images and prints them)."""
+    shader = os.path.join(spirv, name + ".spv")
+    if not os.path.isfile(shader):
+        return f"missing {name}.spv"
+    code, out = run(os.path.join(tools, "vk_store_test" + EXE), shader, "words")
+    if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature its images need
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    return store_words_problem(out, name) if code == 0 else failure(code, out, 3)
+
+
+def get_lod_problem(data, want):
+    """Judge one image_get_lod frame: "" when all 4096 RGBA32F pixels are within GET_LOD_TOLERANCE of `want`."""
+    if len(data) != 64 * 64 * 16:
+        return f"expected 4096 RGBA32F pixels, got {len(data)} bytes"
+    bad, first = 0, ""
+    for i, pixel in enumerate(struct.iter_unpack("<4f", data)):
+        if not all(abs(got - expected) <= GET_LOD_TOLERANCE for got, expected in zip(pixel, want)):   # a NaN too
+            if not bad:
+                first = f"first at ({i % 64},{i // 64}): got {pixel}"
+            bad += 1
+    return f"{bad} of 4096 pixels differ from {want}; {first}" if bad else ""
+
+
+def get_lod_test(tools, spirv, name):
+    """A GET_LOD_TESTS fixture on vk_texture_test (it binds the textures and the sampler), once per draw."""
+    tool = os.path.join(tools, "vk_texture_test" + EXE)
+    shaders = [os.path.join(spirv, shader + ".spv") for shader in ("vs_ids", name)]
+    for path in (tool, *shaders):
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    with tempfile.TemporaryDirectory(prefix="leonida-lod-") as tmp:
+        for limits, two_mip, want in GET_LOD_TESTS[name]:
+            raw = Path(tmp) / f"lod_{limits}.raw"
+            code, out = run(tool, *shaders, raw, "0", "92", limits, "14500000", "0",
+                            *(["--two-mip"] if two_mip else []))
+            if code == UNSUPPORTED:   # vk_texture_test: e.g. fewer push constant bytes than the texture tests need
+                m = re.search(r"unsupported: .*", out)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"S# word 1 {limits}: {failure(code, out, 3)}"
+            problem = get_lod_problem(raw.read_bytes(), want)
+            if problem:
+                return f"S# word 1 {limits}: {problem}"
+    return ""
+
+
 def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -> str:
     width = 64
     if len(data) != width**2 * 16:
@@ -895,6 +1019,19 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
     return ""
 
 
+def ij_computed_problem(px):
+    """ps_ij_computed.asm: (snapped 0.5, zeroed pair 0.0, v/2 from (i, j/2), 0.5 control) per pixel; "" when right.
+    Shared with scripts/run_gpu_tests.py."""
+    n = len(px)
+    if not n:
+        return "no pixels"
+    w = int(n ** 0.5)
+    f32 = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]      # noqa: E731
+    wrong = sum((a != 0x3F000000 or b != 0 or d != 0x3F000000) for a, b, _, d in px)
+    err = max(abs(f32(c) - (i // w + 0.5) / (2 * w)) for i, (_, _, c, _) in enumerate(px))
+    return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the computed-pair words, v/2 off by {err:.3g}"
+
+
 def interp_f16_high_problem(px):
     """ps_interp_f16_high (drawn with vs_f16_pack or ms_f16_pack): low halves of mrt0.xyz = f16 of u, v, u at the
     pixel centre, read from both halves of packed channels, and mrt0.w = the f32 v. "" when every pixel is close."""
@@ -931,8 +1068,8 @@ def pixel_test(tools, spirv, name):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit"):
         return texoff_test(tools, spirv, name)
-    if name == "ps_interp_f16_high" and BARY_FALLBACK:
-        return Skip("SKIP (per-vertex f16 interpolants need VK_KHR_fragment_shader_barycentric)")
+    if name in ("ps_interp_f16_high", "ps_ij_computed") and BARY_FALLBACK:
+        return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")
     fmt = "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
     px, out = pixels(tools, spirv, name, fmt, PIXEL_VERTEX.get(name, "vs_ids"))
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
@@ -948,6 +1085,9 @@ def pixel_test(tools, spirv, name):
             return Skip(f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)")
     if skip := wide_pixel_skip(name, out):
         return skip
+    if name == "ps_vcmpx_forms":
+        if skip := vcmpx_forms_narrow_skip(out):
+            return skip
     if not px:
         return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
     n = len(px)
@@ -968,6 +1108,8 @@ def pixel_test(tools, spirv, name):
         return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the first vertex's value, uv off by {err:.3g}"
     if name == "ps_interp_f16_high":
         return interp_f16_high_problem(px)
+    if name == "ps_ij_computed":
+        return ij_computed_problem(px)
     if name == "ps_bitmask_perm":
         if skip := bitmask_perm_narrow_skip(out, px):
             return skip
@@ -1060,6 +1202,10 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
+        results.append((name, store_words_test(tools, spirv, name)))
+    for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array
+        results.append((name, get_lod_test(tools, spirv, name)))
     for name in CLIP_TESTS:
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:

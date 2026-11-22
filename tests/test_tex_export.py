@@ -338,3 +338,134 @@ def test_main_rejects_a_limit_below_one(tmp_path, monkeypatch, capsys, value):
     assert e.value.code == 2
     assert "--limit" in capsys.readouterr().err
     assert not out.exists()
+
+
+# ---- --png ----
+
+def read_png(path):
+    """(width, height, RGBA bytes) of a PNG as encode_png writes it: 8-bit RGBA, filter 0 on every row."""
+    import zlib
+    with open(path, "rb") as f:
+        b = f.read()
+    assert b[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, idat, ihdr = 8, b"", None
+    while pos < len(b):
+        n, kind = struct.unpack_from(">I4s", b, pos)
+        body = b[pos + 8:pos + 8 + n]
+        if kind == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + n
+    w, h, depth, ctype, _, _, interlace = ihdr
+    assert (depth, ctype, interlace) == (8, 6, 0)
+    raw = zlib.decompress(idat)
+    stride = 1 + w * 4
+    assert len(raw) == h * stride
+    assert all(raw[y * stride] == 0 for y in range(h))
+    return w, h, b"".join(raw[y * stride + 1:(y + 1) * stride] for y in range(h))
+
+
+def png_main(tmp_path, monkeypatch, capsys, textures, carve, *flags):
+    index = tmp_path / "textures_index.json"
+    index.write_text(json.dumps(textures), encoding="utf-8")
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), carve, str(out), *flags])
+    code = T.main()
+    return out, code, capsys.readouterr().out
+
+
+def tree(out):
+    return sorted(os.path.relpath(os.path.join(r, f), out) for r, _, fs in os.walk(out) for f in fs)
+
+
+def test_main_accepts_png(tmp_path, monkeypatch):
+    # the usage line documented --png, but argparse stopped with "unrecognized arguments"
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), str(tmp_path), str(tmp_path / "out"), "--png"])
+    assert T.main() is None
+
+
+def test_png_is_written_beside_the_dds_with_the_texels(eq, tmp_path, monkeypatch, capsys):
+    carve, expected = build_case(eq, tmp_path, 28, top_first=True)
+    t = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
+    assert code is None
+    stem = f"{0xABC:012x}_3_64x64_R8G8B8A8_UNORM"
+    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{stem}.dds", f"x.rpf{os.sep}{stem}.png"]
+    w, h, rgba = read_png(out / "x.rpf" / (stem + ".png"))
+    assert (w, h) == (64, 64)
+    assert rgba == expected  # RGBA8 texels pass through unchanged (the gradient sets alpha to 255)
+    log = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert log[0]["export"]["png"] == "written"
+    assert text.splitlines() == ["1 textures: {'ok:first': 1} -> " + str(out), "png: {'written': 1}"]
+
+
+def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):
+    carve, expected = build_case(eq, tmp_path, 10, top_first=True)  # R16G16B16A16_FLOAT: dds_png has no decoder
+    t = texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2)
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
+    assert code is None  # main() returns None, so the process exits 0
+    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R16G16B16A16_FLOAT.dds"]
+    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R16G16B16A16_FLOAT.dds").read_bytes()[148:] == expected
+    assert json.loads((out / "export_log.json").read_text(encoding="utf-8"))[0]["export"]["png"] == "unsupported"
+    assert text.splitlines()[1:] == ["png: {'unsupported': 1}"]
+
+
+def test_mixed_run_counts_each_kind(eq, tmp_path, monkeypatch, capsys):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    eq(8)
+    with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
+        write_blob(carve, "x.rpf", 0x2000, f.read() * 2)  # enough bytes for the 8 bpe texture too
+    textures = [texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2),
+                texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2, gpu=0x2000),
+                texture(9999, "X", 4, 4, 1, gpu=0x3000)]
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, textures, carve, "--png")
+    assert text.splitlines()[1] == "png: {'written': 1, 'unsupported': 1}"
+    assert len([f for f in tree(out) if f.endswith(".png")]) == 1
+
+
+def test_png_module_is_not_imported_without_the_flag(eq, tmp_path, monkeypatch, capsys):
+    monkeypatch.delitem(sys.modules, "dds_png", raising=False)
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    png_main(tmp_path, monkeypatch, capsys, [texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)], carve)
+    assert "dds_png" not in sys.modules
+    with open(T.__file__, encoding="utf-8") as f:
+        assert not [line for line in f if line.startswith(("import dds_png", "from dds_png"))]
+
+
+def test_without_png_nothing_changes(eq, tmp_path, monkeypatch, capsys):
+    carve, expected = build_case(eq, tmp_path, 28, top_first=True)
+    t = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve)
+    stem = f"{0xABC:012x}_3_64x64_R8G8B8A8_UNORM"
+    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{stem}.dds"]
+    assert text == f"1 textures: {{'ok:first': 1}} -> {out}\n"
+    log = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert set(log[0]["export"]) == {"file", "place", "score", "heuristic"}
+
+
+def test_failed_png_write_keeps_the_texture_ok_and_is_counted(eq, tmp_path, monkeypatch, capsys):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    stem = f"{0xABC:012x}_3_64x64_R8G8B8A8_UNORM"
+    blocked = tmp_path / "out" / "x.rpf" / (stem + ".png")
+    blocked.mkdir(parents=True)  # a directory at the PNG's path makes the write fail
+    t = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
+    assert code is None
+    assert (out / "x.rpf" / (stem + ".dds")).is_file() and blocked.is_dir()
+    entry = json.loads((out / "export_log.json").read_text(encoding="utf-8"))[0]["export"]
+    assert entry["png"].startswith("error:")
+    lines = text.splitlines()
+    assert lines[0].startswith("1 textures: {'ok:first': 1}")
+    assert lines[1] == "png: {'" + entry["png"] + "': 1}"
+
+
+def test_stale_export_entry_is_not_counted(eq, tmp_path, monkeypatch, capsys):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    stale = {"file": "old.dds", "place": "first", "score": 1.0, "png": "written"}
+    t = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2, gpu=0x5000, export=stale)  # blob 0x5000 does not exist
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
+    assert text.splitlines()[0].startswith("1 textures: {'error:FileNotFoundError': 1}")
+    assert text.splitlines()[1] == "png: {}"

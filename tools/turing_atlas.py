@@ -214,6 +214,9 @@ def main():
     ap = argparse.ArgumentParser(description="Turing bring-up atlas (no game data).")
     ap.add_argument("--out", default=None, help="write JSON atlas to FILE (default: stdout)")
     a = ap.parse_args()
+    if a.out and os.path.isdir(a.out):
+        print(f"turing_atlas: error: --out is a folder, not a file: {a.out}", file=sys.stderr)
+        return 2
     cases = validate_cases()
     atlas = {"tool": "turing_atlas", "gpu": None, "features": vulkan_matrix(),
              "cases": cases}
