@@ -228,9 +228,32 @@ What is implemented (all of it testable without the game):
     | a castable-format list | `E_INVALIDARG`: a list needs `RelaxedFormatCastingSupported`, and the layer does not answer `D3D12_OPTIONS12`. A device without relaxed casting refuses every list (ezwinxdlmao's probe on a Radeon 680M, in #156). With it, the RTX 4090 accepts same-size casts and refuses other sizes and any list on a buffer |
     | `CreateCommandQueue1`'s creator ID | ignored |
 
-    `CreatePlacedResource1/2` and `CreateHeap1` wait for #286's base methods. `CreateSampler2` builds on
-    `CreateSampler` and comes separately, since its border-colour and non-normalized-coordinate flags need their
-    own measured answers.
+    `CreatePlacedResource1/2` and `CreateHeap1` wait for #286's base methods.
+  - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
+    `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` reads the union as integers. `(0,0,0,0)`, `(0,0,0,1)` and `(1,1,1,1)`
+    take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types:
+    the hardware reads them by the image's format, which is why radv gives `VK_BORDER_COLOR_INT_*` and `_FLOAT_*`
+    the same `SQ_TEX_BORDER_COLOR`. Any other colour is a table colour, still transparent black like
+    `CreateSampler`'s custom colours. That includes the bits of `1.0f`, which as integers are not white.
+    `D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES` sets `FORCE_UNNORMALIZED` (word 0, bit 15) and changes nothing
+    else; `vulkan_sampler` makes it `unnormalizedCoordinates`. The layer answers `D3D12_OPTIONS17` with
+    `NonNormalizedCoordinateSamplersSupported` (core Vulkan, with the same restrictions) and no
+    `ManualWriteTrackingResourceSupported`. That is what the RTX 4090 and WARP report, so what the PC runtime does
+    when the feature is unreported was not measured here.
+
+    A description the PC runtime refuses leaves the slot as it was. The runtime itself does this, without the
+    debug layer, on the RTX 4090 (driver 621.14) and on WARP; the debug layer's message names the rule.
+    `d3d12_sampler2_test` compares each row with the host runtime live:
+
+    | `CreateSampler2` input | Answer |
+    |---|---|
+    | a null description | the slot is left as it was |
+    | a flag other than the two | the slot is left as it was |
+    | non-normalized, with MIN ≠ MAG, a linear MIP filter, anisotropy or comparison | the slot is left as it was; `MINIMUM`/`MAXIMUM` filters are accepted |
+    | non-normalized, with `AddressU` or `AddressV` not `CLAMP`/`BORDER` | the slot is left as it was; `AddressW` is free, as in Vulkan |
+    | non-normalized, with `MinLOD`, `MaxLOD` or `MipLODBias` not 0 | the slot is left as it was; `-0` is 0 |
+    | non-normalized, a point filter with `MaxAnisotropy` or `ComparisonFunc` set | written; both are ignored (the debug layer warns about `ComparisonFunc`) |
+    | both flags | written |
 
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
 
@@ -358,6 +381,13 @@ and any validation error fails them.
   one; protected sessions and castable lists are checked on the layer alone. `GetCopyableFootprints1` must match
   `GetCopyableFootprints` field by field, including the failure answer. A texture from `CreateCommittedResource3`
   is uploaded, copied back and compared on a queue from `CreateCommandQueue1`.
+- `d3d12_sampler2_test`: `CreateSampler2` against `CreateSampler`, on the slots' bytes. It checks:
+  - 10 descriptions without flags, which must be byte for byte the same;
+  - 6 UINT and float-bit border colours against their float equivalents;
+  - 3 non-normalized samplers, which must be `CreateSampler`'s S# with `FORCE_UNNORMALIZED` set;
+  - the `D3D12_OPTIONS17` answer;
+  - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when
+    there is one.
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
