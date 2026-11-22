@@ -505,6 +505,7 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/library_loader.cpp
       shims/registry.cpp
+      shims/xmem.cpp
     )
     target_include_directories(dll_thread_calls_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -513,6 +514,7 @@ if(BUILD_TESTING)
     target_compile_definitions(dll_thread_calls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dll_thread_calls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_link_options(dll_thread_calls_test PRIVATE /OPT:NOREF)
+    target_link_libraries(dll_thread_calls_test PRIVATE psapi)
     add_dependencies(dll_thread_calls_test dll_thread_calls)
     add_test(NAME dll_thread_calls
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
