@@ -442,8 +442,8 @@ What is implemented (all of it testable without the game):
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it, as it does
   `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
 - **Presentation** (`leonida::VulkanPresenter` in `runtime/src/vulkan_present.h`, which
-  `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part every
-  present front end needs; which of DXGI or `PresentX` the game uses is still open (question 6). It takes a back
+  `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part the
+  `PresentX` front end uses; which of DXGI or `PresentX` the game uses is still open (question 6). It takes a back
   buffer, an ordinary texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image,
   scaling when the window size differs. The blit goes on the same `VkQueue` after the application's work, so the
   frame contains everything submitted before the present. Details:
@@ -2075,11 +2075,13 @@ That import must be shimmed. The shim provides:
   toggles borderless/fullscreen; `GetFrameStatistics` is a stub.
 - `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
 
-**What exists.** The back end of this path is `leonida::VulkanPresenter` (section 3.2): surface, swapchain,
-blit, present, resize. The DXGI shim's `Present` (`runtime/shims/dxgi_com.cpp`) and `PresentX`
-(`runtime/shims/xbox_present.cpp`) are both implemented over it. `GetBuffer(i)` therefore does not need to wrap
-swapchain images: the buffers can be ordinary committed textures, blitted at present time, which also frees the
-game's buffer count and format from the surface's.
+**What exists.** The DXGI shim's `Present` (`runtime/shims/dxgi_com.cpp`) has its own surface, swapchain and
+blit (`leonida::VulkanSwapchain`, `runtime/shims/dxgi_swapchain.h`); `PresentX` (`runtime/shims/xbox_present.cpp`)
+is implemented over `leonida::VulkanPresenter` (section 3.2) instead. `PresentX` takes ordinary committed
+textures and blits them at present time, which frees the game's buffer count and format from the surface's. The
+DXGI shim's `GetBuffer(i)` returns the swapchain images themselves, and switches to offscreen images blitted at
+present only when the requested size or format differs from the surface's (`runtime/shims/dxgi_swapchain.h`); its
+buffer count is the swapchain's image count.
 
 **PresentX and frame events (GDKX).** Public Microsoft samples present on Xbox without a DXGI swapchain. Facts
 below come from MIT/zlib-licensed code and docs, read directly; none is from the game or the SDK. Sources:
