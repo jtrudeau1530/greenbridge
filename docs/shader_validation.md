@@ -741,6 +741,22 @@ denormal, 2,810 other not judged. The four MODE settings read back in the kernel
 `0x3c0`, so the float mode of the kernel descriptor reaches the hardware through that launcher as well.
 `--negative-control` catches all six wrong models there (3 to 25 mismatches each).
 
+The same seeds through the Windows HIP launcher (`hw_oracle.c`) on the integrated GPU of a Ryzen 7 9800X3D (gfx1036;
+Windows 10 22H2, AMD driver 32.0.13036.4, `amdhip64_6.dll`, AMD clang 23.0.0git from rocm-sdk-core 10.0.0, main at
+41f44826) give the same counts in every column: 38,858 programs, **28,671 match, 0 mismatch, 56 known deviation**
+(all `omod_neg_zero`), 4,224 skipped, 3,097 denormal, 2,810 other. `--negative-control` again catches all six (3 to
+25 mismatches). Two launchers on two machines and two operating systems agree on the hardware words.
+
+`v_rcp_iflag_f32` (SHADER-136; added to the rcp / rsq / sqrt / exp / log family after the run above, so it is not in
+its counts) on the same gfx1036 through the Windows launcher, `--ops v_rcp_iflag_f32 --programs 1000 --probes 24`,
+seeds 1 to 6: 6,552 programs, **5,971 match, 0 mismatch, 35 known deviation** (`omod_neg_zero`), 279 denormal, 267
+other. It shares `v_rcp_f32`'s model, and the clamp and omod bits behave as on the other ops (summed over the six
+seeds, per MODE setting flush / keep / no_dx10 / ieee): clamp makes a -0 result +0 in every mode (98 each) and a NaN
+result +0 except with DX10_CLAMP off, where the NaN passes (169); omod is applied with IEEE off, including with f32
+denormals kept (461 each; like the other transcendental ops), and ignored with IEEE on (461); a -0 result becomes +0
+under omod (35 each, none with IEEE on); a signalling NaN passes unchanged with IEEE off and is quieted with IEEE on
+(59); denormal operands read as zero and denormal results flush in every mode.
+
 What the hardware answered where the model does not judge (gfx1150; the RDNA2 run above agrees where it is cited):
 
 - **No model error found.** The model was right wherever it had an answer, in 30,577 programs; the min/max/med3
