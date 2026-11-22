@@ -259,6 +259,11 @@ def effect_lights(meta, eo):
     return out
 
 
+def _local_light_position(light: dict, offset: list[float]) -> list[float]:
+    position = light.get("position120", light.get("posn", (0.0, 0.0, 0.0)))
+    return [position[i] + offset[i] for i in range(3)]
+
+
 def quat_rotate(q, v):
     """Rotate v by the unit quaternion q = (x, y, z, w)."""
     x, y, z, w = q
@@ -527,7 +532,7 @@ def inspect_resource(data, lights_out=False):
                 t = _entity_transform(meta, oo)
                 if lights_out and t["position"] and t["rotation"]:
                     for L in lights:
-                        local = [off[k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
+                        local = _local_light_position(L, off)
                         p, d = place(local, L.get("direction"), t["position"], t["rotation"],
                                      t["scaleXY"] or 1.0, t["scaleZ"] or 1.0)
                         world.append(_light_row(p, d, L, "entity", t["archetypeName"]))
@@ -685,7 +690,7 @@ def summarize(total, entities=None, lights_out=None):
                     placed["archetype_lights_placed"] += len(ls)
                     if out is not None and e.get("position") and e.get("rotation"):
                         for L in ls:
-                            local = [L["offset"][k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
+                            local = _local_light_position(L, L["offset"])
                             p, d = place(local, L.get("direction"), e["position"], e["rotation"],
                                          e.get("scale_xy") or 1.0, e.get("scale_z") or 1.0)
                             out.write(json.dumps(_light_row(p, d, L, "archetype", a),

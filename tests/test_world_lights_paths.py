@@ -92,14 +92,15 @@ def light(pos, kind=2, direction=(0.0, -1.0, 0.0), time=0xFFFFFF, colour=b"\xff\
     return d
 
 
-def light_resource(archetype=0xA1B2C3D4):
+def light_resource(archetype=0xA1B2C3D4, *, posn_only: bool = False):
     """An archetype resource: one archetype with a light effect holding two lights (one per list)."""
     r = Resource()
     arch_members = [(M["name"], 0x00, 0x4A), (M["bbMin"], 0x04, 0x32), (M["bbMax"], 0x10, 0x32),
                     (M["extensions"], 0x20, 0x52)]
     r.struct(T.ARCHETYPE, 0x30, arch_members)
     r.struct(T.LIGHT_EXT, EXT_SIZE, EXT_MEMBERS)
-    r.struct(T.LIGHT, LIGHT_SIZE, LIGHT_MEMBERS)
+    light_members = [m for m in LIGHT_MEMBERS if not posn_only or m[0] != M["position120"]]
+    r.struct(T.LIGHT, LIGHT_SIZE, light_members)
     # blocks: 1 archetype, 2 pointer list, 3 effect, 4 lights
     arch = bytearray(0x30)
     struct.pack_into("<I3f3f", arch, 0, archetype, -1.0, -1.0, 0.0, 1.0, 1.0, 3.0)
@@ -115,7 +116,7 @@ def light_resource(archetype=0xA1B2C3D4):
     return r.build()
 
 
-def map_resource():
+def map_resource(*, posn_only: bool = False):
     """A map resource with one entity that owns a light effect (one light, offset 1 m up)."""
     r = Resource()
     ent_members = [(M["position"], 0x00, 0x32), (M["rotation"], 0x10, 0x34), (M["scaleXY"], 0x20, 0x21),
@@ -123,7 +124,8 @@ def map_resource():
     r.struct(T.ENTITY, 0x40, ent_members)
     r.struct(T.MAPDATA, 0x10, [(M["name"], 0x00, 0x4A)])
     r.struct(T.LIGHT_EXT, EXT_SIZE, EXT_MEMBERS)
-    r.struct(T.LIGHT, LIGHT_SIZE, LIGHT_MEMBERS)
+    light_members = [m for m in LIGHT_MEMBERS if not posn_only or m[0] != M["position120"]]
+    r.struct(T.LIGHT, LIGHT_SIZE, light_members)
     ent = bytearray(0x40)
     s = math.sqrt(0.5)
     struct.pack_into("<3f", ent, 0x00, 100.0, 200.0, 10.0)
@@ -134,8 +136,10 @@ def map_resource():
     eff = bytearray(EXT_SIZE)
     struct.pack_into("<I3f", eff, 0, 0, 0.0, 0.0, 1.0)
     struct.pack_into("<QHH", eff, 0x10, pool(5), 1, 1)
+    posn = (1.0, 0.0, 0.0) if posn_only else (0.0, 0.0, 0.0)
+    placed_light = light((1.0, 0.0, 0.0), direction=(1.0, 0.0, 0.0), posn=posn)
     for h, data in ((T.ENTITY, ent), (T.MAPDATA, bytes(0x10)), (7, struct.pack("<Q", pool(4))),
-                    (T.LIGHT_EXT, eff), (T.LIGHT, light((1.0, 0.0, 0.0), direction=(1.0, 0.0, 0.0)))):
+                    (T.LIGHT_EXT, eff), (T.LIGHT, placed_light)):
         r.block(h, data)
     return r.build()
 
@@ -353,6 +357,21 @@ class ScanTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_lights_out_uses_posn_when_position120_is_absent(self) -> None:
+        archive = os.path.join(self.tmp.name, "posn-only.rpf")
+        write_rpf(archive, [light_resource(posn_only=True), map_resource(posn_only=True)])
+        output = os.path.join(self.tmp.name, "posn-only.jsonl")
+        summary = os.path.join(self.tmp.name, "posn-only-summary.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(T.main([archive, "--entities", self.entities, "--out", summary,
+                                     "--lights-out", output]), 0)
+        with open(output, encoding="utf-8") as handle:
+            placements = [json.loads(line) for line in handle]
+        self.assertEqual([row["position"] for row in placements if row["owner"] == "entity"],
+                         [[100.0, 198.0, 13.0]])
+        self.assertEqual([row["position"] for row in placements if row["owner"] == "archetype"],
+                         [[0.0, 0.0, 0.0], [0.0, 0.1, 0.0], [50.0, 0.0, 0.0], [50.0, 0.1, 0.0]])
 
     def test_scan_and_summary(self):
         total = T.scan(self.rpf)
