@@ -72,11 +72,15 @@ def _clean_zero(v: float) -> float:
 def _normalize3(nx: float, ny: float, nz: float) -> tuple[float, float, float]:
     if not (math.isfinite(nx) and math.isfinite(ny) and math.isfinite(nz)):
         return (0.0, 1.0, 0.0)
-    length = math.sqrt(nx * nx + ny * ny + nz * nz)
-    if length <= 0.0 or not math.isfinite(length):
+    length = math.hypot(nx, ny, nz)
+    if length == 0.0:
         return (0.0, 1.0, 0.0)
-    inv = 1.0 / length
-    return (_clean_zero(nx * inv), _clean_zero(ny * inv), _clean_zero(nz * inv))
+    if length < sys.float_info.min or not math.isfinite(length):
+        # Scaling first keeps an unrepresentable or subnormal length from changing the direction.
+        scale = max(abs(nx), abs(ny), abs(nz))
+        nx, ny, nz = nx / scale, ny / scale, nz / scale
+        length = math.hypot(nx, ny, nz)
+    return (_clean_zero(nx / length), _clean_zero(ny / length), _clean_zero(nz / length))
 
 
 def _compute_smooth_normals(
@@ -242,7 +246,7 @@ def parse_obj(
     # Preserve order of appearance for (group_index, material_name) primitives.
     builders: dict[tuple[int, str], dict] = {}
 
-    for raw_line in text.splitlines():
+    for raw_line in text.removeprefix("\ufeff").splitlines():
         line = raw_line.strip()
         if not line or line[0] == "#":
             continue

@@ -19,7 +19,7 @@ FIXTURE_DIR = os.path.join(HERE, "fixtures", "disasm")
 SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail",  # SMEM / raw MUBUF bounds measured on RDNA2
            "ps_fnan_med3", "ps_fnan_fract",    # float NaN / fract rows measured on RDNA2 hardware
            "ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_ops5", "ps_ops6", "ps_ops7", "ps_ops8",
-           "ps_legacy_mul", "ps_vcc_x2", "ps_vcmpx_forms", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_fmt_sint32", "cs_w64x_readlane",
+           "ps_legacy_mul", "ps_vcc_x2", "ps_vcmpx_forms", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_fmt_sint32", "cs_fmt_int_narrow", "cs_w64x_readlane",
            "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
            "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
            "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2", "ps_outmods_f16",
@@ -30,6 +30,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            # TEST-175: GPU fixtures for the docs/design.md rules that were checked on the CPU only
            "ps_cmp_nlg", "ps_cvt_off", "ps_fmac_f16_mods", "ps_vop3_const_mods", "ps_interp_f32_mods", "ps_interp_mov_mods",
            "ps_f16_pack_mods",          # v_pack_b32_f16 neg/abs (SHADER-260)
+           "ps_sdwa_f16_const",         # SDWA src_sel on an f16 inline constant (measured on gfx1036)
            "cs_w64x_andn2_exec",   # s_andn2_saveexec_b64 / s_andn2_wrexec_b64 (test_andn2_exec_b64.py)
            "cs_w64x_saveexec_b64",   # s_and/s_or/s_andn2_saveexec_b64, s_andn2_wrexec_b64 (test_saveexec_b64.py)
            "ps_valu16_mad", "ps_valu16_subrev",   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16

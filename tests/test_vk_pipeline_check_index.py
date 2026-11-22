@@ -19,7 +19,8 @@ def find_binary():
     if env:
         return Path(env) if Path(env).is_file() else None
     build = ROOT / "runtime" / "build"
-    for p in (build / "linux" / "vk_pipeline_check", build / "vk_pipeline_check", build / "Release" / "vk_pipeline_check.exe"):
+    for p in (build / "linux" / "vk_pipeline_check", build / "vk_pipeline_check", build / "vk_pipeline_check.exe",
+              build / "Release" / "vk_pipeline_check.exe"):
         if p.is_file():
             return p
     return None
@@ -38,22 +39,32 @@ class IndexTest(unittest.TestCase):
                 Path(d, "index.json").write_text(index_text, encoding="utf-8")
             return subprocess.run([str(self.exe), d], capture_output=True, text=True, timeout=60)
 
-    def assert_index_error(self, r):
+    def assert_index_error(self, r, text):
         self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn("cannot use", r.stderr)
+        self.assertIn(text, r.stderr)
         self.assertIn("index.json", r.stderr)
 
     def test_missing_index_is_an_error(self):
-        self.assert_index_error(self.run_tool(None))
+        self.assert_index_error(self.run_tool(None), "cannot read")
 
+    # Malformed input keeps the "malformed JSON" wording (open PR #1735 asserts it).
     def test_empty_index_is_an_error(self):
-        self.assert_index_error(self.run_tool(""))
+        self.assert_index_error(self.run_tool(""), "malformed JSON")
 
     def test_whitespace_only_index_is_an_error(self):
-        self.assert_index_error(self.run_tool(" \n\t \n"))
+        self.assert_index_error(self.run_tool(" \n\t \n"), "malformed JSON")
 
     def test_malformed_index_is_still_an_error(self):
-        self.assert_index_error(self.run_tool('{"a": '))
+        self.assert_index_error(self.run_tool('{"a": '), "malformed JSON")
+
+    def test_trailing_bytes_after_the_object_are_an_error(self):
+        self.assert_index_error(self.run_tool("{}garbage"), "malformed JSON")
+        self.assert_index_error(self.run_tool("{} {}"), "malformed JSON")
+
+    def test_trailing_whitespace_after_the_object_is_fine(self):
+        r = self.run_tool("{}\n\n \t")
+        self.assertNotIn("malformed JSON", r.stderr)
+        self.assertIn("0 shaders in index", r.stderr)
 
     def test_valid_empty_object_is_an_empty_corpus(self):
         r = self.run_tool("{}")
