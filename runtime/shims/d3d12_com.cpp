@@ -300,7 +300,7 @@ public:
     // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.
     void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buffer, UINT64 offset, D3D12_PREDICATION_OP op) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPredication");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         check(list_.set_predication({resource_id(buffer), offset, u(op)}));
     }
 
@@ -373,18 +373,28 @@ public:
                                count, rects);
     }
 
+    // As the host's Close reports it: compute and copy lists hold timestamps only (not even pipeline statistics on
+    // compute), and bundles no queries at all.
+    bool query_allowed(D3D12_QUERY_TYPE type) const {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) return true;
+        return type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE && type == D3D12_QUERY_TYPE_TIMESTAMP;
+    }
+
     // Queries (docs/d3d12_vulkan.md section 4.6). Heap types, index ranges and the destination buffer are checked
     // at ExecuteCommandLists, when the heap and the buffer are known.
     void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
+        if (!query_allowed(type)) return check(false);
         check(list_.begin_query({query_heap_id(heap), u(type), index}));
     }
 
     void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
+        if (!query_allowed(type)) return check(false);
         check(list_.end_query({query_heap_id(heap), u(type), index}));
     }
 
     void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT first, UINT count,
                                             ID3D12Resource* dst, UINT64 offset) override {
+        if (!query_allowed(type)) return check(false);
         check(list_.resolve_queries({query_heap_id(heap), u(type), first, count, resource_id(dst), offset}));
     }
 
@@ -704,6 +714,11 @@ public:
                 d3d12_trace::record(method, "failed");
                 return;
             }
+            if (!timestamps_fit(*list)) {
+                last_result_ = leonida::ReplayResult::invalid_query;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
             recorded.push_back(&list->commands());
         }
         last_result_ = queue_.execute(recorded);
@@ -711,6 +726,19 @@ public:
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
                          name(last_result_));
+    }
+
+    // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.
+    bool timestamps_fit(const GraphicsCommandList& list) {
+        namespace h = leonida::d3d12_query_heap;
+        const auto other = list.type() == D3D12_COMMAND_LIST_TYPE_COPY ? h::timestamp : h::copy_queue_timestamp;
+        for (const auto& command : list.commands().commands()) {
+            const auto range = leonida::query_range(command);
+            if (range.count && range.type == leonida::d3d12_query::timestamp &&
+                context_.query_heap_type(range.heap) == other)
+                return false;
+        }
+        return true;
     }
 
     // Reserved resources are fully backed at creation (docs/d3d12_vulkan.md section 4.2), so tile mappings are not
