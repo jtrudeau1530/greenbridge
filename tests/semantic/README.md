@@ -34,7 +34,7 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_alu_movrel.py` runs hand-written listings for `v_movrels_b32`, `v_movreld_b32` and `v_movrelsd_b32`
   (10 cases): sentinels in v1..v8, M0 set by `s_mov_b32`, then the indexed register and its neighbours are
   exported, so a write must land only in `VGPR[D.addr + M0]`. A plain-Python register-file model checks the
-  hand-written constants. `v_movrelsd_2_b32` is not handled by the translator yet.
+  hand-written constants. `v_movrelsd_2_b32` is covered by `test_alu_movrelsd_2.py`.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
