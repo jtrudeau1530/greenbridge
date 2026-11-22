@@ -715,25 +715,30 @@ s_endpgm
 def test_float_controls_declared(stage, make_shader):
     """Every module declares SignedZeroInfNanPreserve for 32-bit floats, so the driver keeps NaN, inf and -0 as
     RDNA2 computes them (AMD folded x != x to false and turned -0 products into +0 without it; see
-    runtime/test/shaders/cs_signed_zero_nan.asm), and its index entry names the property the runtime checks."""
+    runtime/test/shaders/cs_signed_zero_nan.asm), and DenormPreserve for 16-bit floats, so it keeps an f16 denormal
+    instead of flushing it (NVIDIA read the 0x0040 of ps_sdwa_f16_const's `src0_sel:BYTE_1` as +0 without it,
+    SHADER-526). Its index entry names the device properties the runtime checks."""
     body = FLOAT_CONTROLS_CS if stage == "cs" else program("v_mul_f32 v1, v0, v0")
     shader = make_shader(body, name=f"{stage}_float_controls")
     spv = shader.translate()
     shader.validate(spv)
     assert "OpCapability SignedZeroInfNanPreserve" in spv
     assert "OpExecutionMode %main SignedZeroInfNanPreserve 32" in spv
+    assert "OpCapability DenormPreserve" in spv
+    assert "OpExecutionMode %main DenormPreserve 16" in spv
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
-    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32"]
+    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16"]
 
 
 def test_no_float_controls_leaves_them_out(make_shader, monkeypatch):
-    """--no-float-controls (FLOAT_CONTROLS = False), for a driver without the property: no capability, no
+    """--no-float-controls (FLOAT_CONTROLS = False), for a driver without the properties: no capability, no
     execution mode, no index entry, and the module still validates."""
     monkeypatch.setattr(rdna2spirv, "FLOAT_CONTROLS", False)
     shader = make_shader(FLOAT_CONTROLS_CS, name="cs_no_float_controls")
     spv = shader.translate()
     shader.validate(spv)
     assert "SignedZeroInfNanPreserve" not in spv
+    assert "DenormPreserve" not in spv
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
     assert "float_controls" not in meta
 

@@ -1514,8 +1514,9 @@ def main() -> int:
                          "32-wide GPUs: NVIDIA, Intel). auto (default) turns it on unless vulkaninfo shows that "
                          "every GPU has 64-wide subgroups")
     ap.add_argument("--no-float-controls", action="store_true",
-                    help="translate without SignedZeroInfNanPreserve (Depends on: #664), for devices whose "
-                         "vk_pipeline_check skips a shader without shaderSignedZeroInfNanPreserveFloat32")
+                    help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
+                         "devices whose vk_pipeline_check skips a shader without "
+                         "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "
