@@ -167,6 +167,16 @@ class ReflectTest(unittest.TestCase):
         with self.assertRaisesRegex(spv.InterfaceError, "extends beyond its Location"):
             shader.reflect()
 
+    def test_rejects_64_bit_vec2_at_component_2(self):
+        shader = output(width=64, components=2, component=2)
+        with self.assertRaisesRegex(spv.InterfaceError, "Component 0"):
+            shader.reflect()
+
+    def test_allows_64_bit_scalar_at_component_2(self):
+        shader = output(width=64, components=1, component=2)
+        used = list(shader.reflect().outputs[0].varyings[0].occupied())
+        self.assertEqual(used, [spv.Address(0, 2), spv.Address(0, 3)])
+
     def test_rejects_unbounded_expansion(self):
         shader = output(array_count=spv.MAX_EXPANDED_LOCATIONS + 1)
         with self.assertRaisesRegex(spv.InterfaceError, "too many interface locations"):
