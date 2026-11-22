@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "saves.py")
@@ -361,6 +362,20 @@ class ImportTest(unittest.TestCase):
             write(os.path.join(empty, "readme.txt"), b"nothing here")
             with self.assertRaises(SystemExit):
                 quiet(saves.import_saves, [empty, "--out", os.path.join(tmp, "o")])
+
+    def test_discovery_reads_at_most_eight_bytes_per_candidate(self):
+        # save_slot probes each candidate with eight bytes, then reads only the chosen payload in full.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "story")
+            jsav, _, _ = make_jsav()
+            write(os.path.join(folder, "SLOT0"), jsav)
+            write(os.path.join(folder, "notes.txt"), b"just text" * 1000)
+            with mock.patch.object(saves, "read", wraps=saves.read) as reader:
+                quiet(saves.save_slot, folder)
+        payload = os.path.join(folder, "SLOT0")
+        other = os.path.join(folder, "notes.txt")
+        self.assertEqual(reader.call_args_list,
+                         [mock.call(payload, 8), mock.call(other, 8), mock.call(payload)])
 
 
 class MalformedJsavTest(unittest.TestCase):
