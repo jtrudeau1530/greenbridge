@@ -249,6 +249,16 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(report["exports"], ["Alpha", "#12"])
             self.assertEqual(report["export_count"], 2)
 
+    def test_named_exports_require_a_populated_address_table_slot(self) -> None:
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                data = bytearray(with_exports([0x1000, 0, FORWARDER, 0x1010],
+                                              {0: "Alpha", 1: "Empty", 2: "Forwarded", 4: "Outside"},
+                                              is64=is64))
+                # The bytes after AddressOfFunctions are not part of its declared four slots.
+                place(data, EXPORT_FUNCS + 16, struct.pack("<I", 0x1020))
+                self.assertEqual(self.exports_of(bytes(data)), ["Alpha", "Forwarded", "#13"])
+
     def test_unused_slots_in_a_table_without_names(self):
         data = with_exports([0, 0x1000, 0, 0x1010, 0], {})
         self.assertEqual(self.exports_of(data), ["#11", "#13"])
