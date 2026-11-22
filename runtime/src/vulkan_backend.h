@@ -11,6 +11,7 @@
 #include "binary_occlusion_spirv.h"
 #include "occlusion_sum_spirv.h"
 #include "vulkan_depth24.h"
+#include "vulkan_scratch.h"
 #include "vulkan_replay.h"
 
 #include <algorithm>
@@ -895,6 +896,14 @@ public:
         };
     }
 
+    // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
+    // `allocate`. Without this such a copy is refused as unsupported.
+    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
+        std::unique_lock lock(resource_mutex_);
+        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
+        if (!scratch_->loaded()) scratch_.reset();
+    }
+
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
     // set keeps its upload pending in the second case, because the copy never reached the GPU.
     void set_bindless_commit(std::function<void(bool)> commit) {
@@ -1009,6 +1018,7 @@ private:
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
+    std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
@@ -1115,6 +1125,7 @@ public:
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
+            if (context_.scratch_) context_.scratch_->forget(progress_);
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -1147,6 +1158,14 @@ public:
                 if (active && d24) d24->retire(progress, 0);
             }
         } depth24_guard{context_.depth24_.get(), progress_, false};
+        struct ScratchGuard {  // the same for the copy scratch
+            ScratchBuffers* scratch = nullptr;
+            VkSemaphore progress = VK_NULL_HANDLE;
+            bool active = false;
+            ~ScratchGuard() {
+                if (active && scratch) scratch->retire(progress, 0);
+            }
+        } scratch_guard{context_.scratch_.get(), progress_, false};
         bindless_commit = context_.bindless_commit_;
         std::vector<PreparedList> prepared(lists.size());
         ReplayFunctions replay = context_.replay_;
@@ -1181,6 +1200,17 @@ public:
                     context_.predicated_copier_->emit(cb, jobs);
                 };
             }
+        }
+        if (context_.scratch_) {
+            replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
+                                                                        VkDeviceSize& offset) {
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!scratch_guard.active) {
+                    context_.scratch_->collect();
+                    scratch_guard.active = true;
+                }
+                return context_.scratch_->get(bytes, buffer, offset);
+            };
         }
         if (context_.depth24_) {
             replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
@@ -1265,6 +1295,10 @@ public:
                 context_.depth24_->retire(progress_, 0);
                 depth24_guard.active = false;
             }
+            if (scratch_guard.active) {
+                context_.scratch_->retire(progress_, 0);
+                scratch_guard.active = false;
+            }
             tracker_lock.unlock();
             if (bindless_commit) bindless_commit(submitted);
             return ReplayResult::unsupported;
@@ -1324,6 +1358,10 @@ public:
         if (depth24_guard.active) {
             context_.depth24_->retire(progress_, submitted ? submitted_ : 0);
             depth24_guard.active = false;
+        }
+        if (scratch_guard.active) {
+            context_.scratch_->retire(progress_, submitted ? submitted_ : 0);
+            scratch_guard.active = false;
         }
         tracker_lock.unlock();
         if (bindless_commit) bindless_commit(submitted);

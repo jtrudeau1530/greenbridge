@@ -180,6 +180,13 @@ What is implemented (all of it testable without the game):
   conservative compatibility measure, not evidence that the Vulkan specification requires this dependency.
   `d3d12_stencil_copy_test` checks D24S8/D32S8 across mip/layer counts and odd dimensions against WARP (CTest)
   or `LEONIDA_HOST_ADAPTER` (manual runs), plus the deterministic upload pattern for both planes and sources.
+  **Depth ↔ colour copies** (`CopyResource` / `CopyTextureRegion` between `D32_FLOAT` and `R32_FLOAT/UINT/SINT`,
+  or `D16_UNORM` and `R16_FLOAT/UNORM`, single-sampled, single-plane depth) copy the bits as the PC runtime does.
+  `vkCmdCopyImage` refuses mismatched aspects, so each region goes image → scratch buffer → image
+  (`src/vulkan_scratch.h`: device-local chunks kept until the submission completes, on every GPU). Not covered:
+  depth with stencil (two planes), a D24 stored as D32, and multisampled textures; they are still refused. A float
+  written into a `D32_SFLOAT` image outside [0, 1] is undefined in Vulkan without `VK_EXT_depth_range_unrestricted`,
+  where D3D12 keeps the bits; `d3d12_copy_xfmt_test` uses values in [0, 1).
   **D24_UNORM_S8_UINT without a native D24** (the Radeon 880M, AMD hardware generally, RADV): the layer stores
   `D32_SFLOAT_S8_UINT` and makes it behave as D24 (`src/depth24.h`, `src/vulkan_depth24.h`). A footprint
   of the depth plane holds 24-bit UNORM words (bits 0-23; the top byte is unspecified, the PC runtime reads it as
