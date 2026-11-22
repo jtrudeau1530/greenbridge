@@ -451,6 +451,253 @@ OpFunctionEnd
         self.assertEqual(final_lds[2], 14)
 
 
+class TestSpirvAtomicSubReturning(unittest.TestCase):
+    """Executes SPIR-V compute kernels exercising returning ds_sub_rtn_u32 operations."""
+
+    def test_ds_sub_rtn_u32_returning_semantic(self):
+        # ds_sub_rtn_u32: updates LDS[target] AND returns the prior value
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c7 = OpConstant %uint 7
+%c50 = OpConstant %uint 50
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c7
+%old = OpAtomicISub %uint %ptr %c2 %c0 %c50
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        initial_val = 0x12345678
+        final_lds, lane_out = interp.run(seed_lds={7: initial_val})
+        # Return value must be the OLD (prior) value
+        self.assertEqual(lane_out[0]["%out"], initial_val)
+        # Memory must reflect the subtraction
+        self.assertEqual(final_lds[7], (initial_val - 50) & MASK)
+
+    def test_chained_atomic_subtractions_same_slot(self):
+        # Multiple sequential returning subtractions decrement and return sequentially
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c4_slot = OpConstant %uint 4
+%c10 = OpConstant %uint 10
+%c20 = OpConstant %uint 20
+%c30 = OpConstant %uint 30
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c4_slot
+%r1 = OpAtomicISub %uint %ptr %c2 %c0 %c10
+%r2 = OpAtomicISub %uint %ptr %c2 %c0 %c20
+%r3 = OpAtomicISub %uint %ptr %c2 %c0 %c30
+OpStore %out %r3
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        final_lds, lane_out = interp.run(seed_lds={4: 100})
+        # r1 got 100 (lds became 90)
+        # r2 got 90 (lds became 70)
+        # r3 got 70 (lds became 40)
+        self.assertEqual(lane_out[0]["%out"], 70)
+        self.assertEqual(final_lds[4], 40)
+
+
+class TestWorkgroupMultiLaneAtomics(unittest.TestCase):
+    """Verifies multi-invocation workgroup coordination and atomic ticket reduction."""
+
+    def test_multi_lane_shared_counter_reduction(self):
+        # 8 invocations in a workgroup each atomically decrement 5 from LDS[0]
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 8 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%c5 = OpConstant %uint 5
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%ticket = OpAtomicISub %uint %ptr %c2 %c0 %c5
+OpStore %out %ticket
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        final_lds, lane_outs = interp.run(num_invocations=8, seed_lds={0: 100})
+        # 100 - (8 lanes * 5) = 60
+        self.assertEqual(final_lds[0], 60)
+        # Each lane receives a unique prior value in {100, 95, 90, ..., 65}
+        tickets = [o["%out"] for o in lane_outs]
+        self.assertEqual(len(tickets), 8)
+        self.assertEqual(sorted(tickets), [65, 70, 75, 80, 85, 90, 95, 100])
+
+    def test_multi_lane_atomic_stack_pop_indices(self):
+        # 32 lanes (a full wave) allocate unique stack indices by popping LDS[0]
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%idx = OpAtomicISub %uint %ptr %c2 %c0 %c1
+OpStore %out %idx
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        seed_start = 100
+        final_lds, lane_outs = interp.run(num_invocations=32, seed_lds={0: seed_start})
+        self.assertEqual(final_lds[0], seed_start - 32)
+        slots = [o["%out"] for o in lane_outs]
+        self.assertEqual(len(set(slots)), 32)
+        self.assertEqual(sorted(slots), list(range(seed_start - 31, seed_start + 1)))
+
+    def test_multi_lane_divergence_under_exec_mask(self):
+        # 8 lanes with alternating active/inactive mask (0b01010101 = 0x55)
+        # Active lanes decrement by 10; inactive lanes skip the atomic operation.
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 8 1 1
+%uint = OpTypeInt 32 0
+%bool = OpTypeBool
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%c10 = OpConstant %uint 10
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %exec_active %do_atomic %merge
+%do_atomic = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%val = OpAtomicISub %uint %ptr %c2 %c0 %c10
+OpStore %out %val
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        # Even lanes (0, 2, 4, 6) are active; odd lanes (1, 3, 5, 7) are inactive
+        # exec_mask = 0b01010101 = 0x55
+        final_lds, lane_outs = interp.run(num_invocations=8, seed_lds={0: 100}, exec_mask=0x55)
+        # 4 active lanes * 10 = 40 decremented; LDS[0] becomes 100 - 40 = 60
+        self.assertEqual(final_lds[0], 60)
+        # Active lanes should receive the tickets
+        active_tickets = [lane_outs[i]["%out"] for i in (0, 2, 4, 6)]
+        self.assertEqual(len(set(active_tickets)), 4)
+        self.assertEqual(sorted(active_tickets), [70, 80, 90, 100])
+        # Inactive lanes did not store into %out, so %out is 0
+        for i in (1, 3, 5, 7):
+            self.assertEqual(lane_outs[i]["%out"], 0)
+
+    def test_all_lanes_inactive_exec_mask(self):
+        # When exec_mask is 0 (all lanes inactive), LDS is completely unchanged
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 16 1 1
+%uint = OpTypeInt 32 0
+%bool = OpTypeBool
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%c5 = OpConstant %uint 5
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpSelectionMerge %merge None
+OpBranchConditional %exec_active %do_atomic %merge
+%do_atomic = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%val = OpAtomicISub %uint %ptr %c2 %c0 %c5
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicSubInterp(spvasm)
+        final_lds, _ = interp.run(num_invocations=16, seed_lds={0: 250}, exec_mask=0)
+        self.assertEqual(final_lds[0], 250)
+
+
 class TestTranslatorSubIntegration(unittest.TestCase):
     """Verifies that tools/rdna2spirv.py emits conforming SPIR-V for ds_sub_u32."""
 
@@ -515,6 +762,21 @@ class TestTranslatorSubIntegration(unittest.TestCase):
         self.assertIn("%c2 %c0 %v_1", emitted_str)
         # Non-returning form must NOT call dst()
         self.assertEqual(len(gen.stored_dsts), 0)
+
+    def test_ds_sub_rtn_u32_returning_emission(self):
+        gen = self._make_mock_gen(stage="cs")
+        # ds_sub_rtn_u32 v5, v0, v1, offset:12 (args: dst=v5, addr=v0, data=v1)
+        gen.lds_op("ds_sub_rtn_u32", [{"r": 5}, {"r": 0}, {"r": 1}], ["offset:12"])
+        self.assertTrue(gen.uses_lds)
+        emitted_str = "\n".join(gen.emitted)
+
+        self.assertIn("OpAtomicISub %uint", emitted_str)
+        self.assertIn("%c2 %c0 %v_1", emitted_str)
+        # Returning form MUST store old value into destination v5
+        self.assertEqual(len(gen.stored_dsts), 1)
+        dest_reg, val_id = gen.stored_dsts[0]
+        self.assertEqual(dest_reg["r"], 5)
+        self.assertTrue(val_id.startswith("%t"))
 
 
 if __name__ == "__main__":
