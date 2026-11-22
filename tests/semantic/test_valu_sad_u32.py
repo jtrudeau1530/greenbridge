@@ -869,5 +869,111 @@ class TestValuSadU32SIMDMultiLane(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 0x1111 * (lane + 1))
 
 
+class TestValuSadU32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing, in-place operand preservation, and multi-dword hazards."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter(self.rf)
+
+    def test_alias_dst_src0(self) -> None:
+        self.rf.vgprs[0] = 50
+        self.rf.vgprs[1] = 20
+        self.rf.vgprs[2] = 10
+        instr = VSadU32Instruction(Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 40)
+        self.assertEqual(self.rf.vgprs[0], 40)
+        self.assertEqual(self.rf.vgprs[1], 20)
+        self.assertEqual(self.rf.vgprs[2], 10)
+
+    def test_alias_dst_src1(self) -> None:
+        self.rf.vgprs[0] = 30
+        self.rf.vgprs[1] = 80
+        self.rf.vgprs[2] = 5
+        instr = VSadU32Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(0), Operand.vgpr(2))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 55)
+        self.assertEqual(self.rf.vgprs[0], 55)
+
+    def test_alias_dst_src2(self) -> None:
+        self.rf.vgprs[0] = 100
+        self.rf.vgprs[1] = 40
+        self.rf.vgprs[2] = 90
+        instr = VSadU32Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 150)
+        self.assertEqual(self.rf.vgprs[0], 150)
+
+    def test_alias_all_same_register(self) -> None:
+        self.rf.vgprs[0] = 0x1234_5678
+        instr = VSadU32Instruction(Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x1234_5678)
+        self.assertEqual(self.rf.vgprs[0], 0x1234_5678)
+
+    def test_alias_sad_hi_dst_src2(self) -> None:
+        self.rf.vgprs[0] = MASK32
+        self.rf.vgprs[1] = 0
+        self.rf.vgprs[2] = 2
+        instr = VSadHiU32Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 1)
+        self.assertEqual(self.rf.vgprs[0], 1)
+
+    def test_mqsad_in_place_accumulator_aliasing(self) -> None:
+        self.rf.vgprs[0] = 10
+        self.rf.vgprs[1] = 20
+        self.rf.vgprs[2] = 30
+        self.rf.vgprs[3] = 40
+
+        self.rf.vgprs[4] = 0x0403_0201
+        self.rf.vgprs[5] = 0x0807_0605
+        self.rf.vgprs[6] = 0x0403_0201
+
+        instr = VMqsadU32Instruction(
+            dst=Operand.vgpr(0, count=4),
+            src0=Operand.vgpr(4, count=2),
+            src1=Operand.vgpr(6, count=1),
+            src2=Operand.vgpr(0, count=4),
+            masked=False,
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, (10, 24, 38, 52))
+        self.assertEqual(self.rf.vgprs[0], 10)
+        self.assertEqual(self.rf.vgprs[1], 24)
+        self.assertEqual(self.rf.vgprs[2], 38)
+        self.assertEqual(self.rf.vgprs[3], 52)
+
+    def test_mqsad_overlapping_source_and_destination(self) -> None:
+        self.rf.vgprs[1] = 0x0403_0201
+        self.rf.vgprs[2] = 0x0807_0605
+        self.rf.vgprs[3] = 0x1111_1111
+        self.rf.vgprs[4] = 0x2222_2222
+        self.rf.vgprs[5] = 0x3333_3333
+
+        self.rf.vgprs[6] = 0x0403_0201
+
+        self.rf.vgprs[8] = 100
+        self.rf.vgprs[9] = 200
+        self.rf.vgprs[10] = 300
+        self.rf.vgprs[11] = 400
+
+        instr = VMqsadU32Instruction(
+            dst=Operand.vgpr(2, count=4),
+            src0=Operand.vgpr(1, count=2),
+            src1=Operand.vgpr(6, count=1),
+            src2=Operand.vgpr(8, count=4),
+            masked=False,
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, (100, 204, 308, 412))
+        self.assertEqual(self.rf.vgprs[2], 100)
+        self.assertEqual(self.rf.vgprs[3], 204)
+        self.assertEqual(self.rf.vgprs[4], 308)
+        self.assertEqual(self.rf.vgprs[5], 412)
+        self.assertEqual(self.rf.vgprs[1], 0x0403_0201)
+
+
 if __name__ == "__main__":
     unittest.main()
