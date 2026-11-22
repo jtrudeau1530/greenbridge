@@ -1014,6 +1014,30 @@ def translator_digest() -> str:
     return h.hexdigest()
 
 
+def _stop_procs(procs: list) -> None:
+    """Terminate and reap any child processes still running after an interrupted or failed launch."""
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+    for p in procs:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
+            pass
+
+
 def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
               fallbacks: tuple[str, ...] = ()) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
@@ -1049,10 +1073,16 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
     # --no-asm: keep only the .spv modules; the .spvasm text would add ~35 GB for the corpus
-    procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm",
-                               *extra])
-             for i in todo]
-    bad = [f"shard {i} exited with {r}" for i, r in zip(todo, [p.wait() for p in procs]) if r != 0]
+    procs = []
+    try:
+        for i in todo:
+            procs.append(subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv,
+                                           "--shard", f"{i}/{jobs}", "--no-asm", *extra]))
+        codes = [p.wait() for p in procs]
+    except BaseException:
+        _stop_procs(procs)
+        raise
+    bad = [f"shard {i} exited with {r}" for i, r in zip(todo, codes) if r != 0]
     if bad:
         fail("rdna2spirv.py: " + ", ".join(bad))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
