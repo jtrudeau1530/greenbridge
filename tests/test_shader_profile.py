@@ -528,6 +528,29 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertEqual(summary["cs"]["sgpr_mean"], 8.5)
         self.assertEqual(P.register_summary({}), {})
 
+    def test_same_output_path_identity(self):
+        a = os.path.join(self.disasm_dir, "a.json")
+        self.assertTrue(P.same_output_path(a, a))
+        b = os.path.join(self.disasm_dir, "b.json")
+        self.assertFalse(P.same_output_path(a, b))
+
+    def test_cli_refuses_output_overwriting_input_shader(self):
+        tool = os.path.join(ROOT, "tools", "shader_profile.py")
+        shader_file = os.path.join(self.disasm_dir, "ps_001.s")
+        original_content = "\tv_mov_b32 v0, 1.0\n\ts_endpgm\n"
+        with open(shader_file, "w", encoding="utf-8") as f:
+            f.write(original_content)
+
+        res = subprocess.run(
+            [sys.executable, "-I", tool, self.disasm_dir, "--out", shader_file],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("ERROR: output would overwrite input shader", res.stderr)
+        with open(shader_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), original_content)
+
 
 if __name__ == "__main__":
     unittest.main()

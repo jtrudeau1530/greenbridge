@@ -948,9 +948,10 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
-    if (!out) return E_POINTER;
-    *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
+    if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
     if (!riid) return E_POINTER;
+    // No output: a capability check, answered by the device (S_FALSE, as on the PC).
+    if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
     void* created = nullptr;
     HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);

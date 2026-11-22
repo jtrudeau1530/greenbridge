@@ -35,6 +35,7 @@ import stat
 import struct
 import sys
 import tempfile
+import unicodedata
 import zlib
 from contextlib import contextmanager
 
@@ -592,9 +593,32 @@ def _resolve_report_path(path):
     return os.path.join(os.path.realpath(path), *reversed(missing))
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `out/R.json` and `out/r.json` would pass as two
+    reports and the second write would replace the first."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
 def _pending_path_key(path):
     path = os.path.normcase(_resolve_report_path(path))
     if os.name != "nt":
+        if _case_insensitive_volume(path):
+            # APFS and HFS+ also treat composed and decomposed accents as one name.
+            path = unicodedata.normalize("NFD", path.casefold())
         return path
 
     # Drive and UNC paths can also be spelled using the extended-length prefix.

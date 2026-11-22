@@ -181,6 +181,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     destination.buffer = dst;
     destination.buffer_offset = binding_offset;
     destination.size = bytes - binding_offset;
+    destination.host_readable = true;  // ResolveQueryData writes results that the CPU reads below.
     context.add_resource(destination_id, destination);
 
     ResourceBinding misaligned = destination;
