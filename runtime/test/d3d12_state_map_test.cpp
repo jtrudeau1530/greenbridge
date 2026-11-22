@@ -227,6 +227,48 @@ int main() {
     CHECK(!(vulkan_access(s::predication, false).access & VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT));
     CHECK(!(vulkan_access(s::copy_dest, false, true).stages & VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT));
 
+    // Primitive topology: a D3D12_PRIMITIVE_TOPOLOGY value maps to a VkPrimitiveTopology, and strip topologies are
+    // the ones a primitive-restart index cuts. A wrong map draws the wrong primitive; a wrong strip classification
+    // restarts (or fails to restart) an indexed strip. The D3D12 values are the public D3D_PRIMITIVE_TOPOLOGY enum.
+    {
+        using detail::strip_topology;
+        using detail::vulkan_topology;
+#ifdef _WIN32
+        static_assert(D3D_PRIMITIVE_TOPOLOGY_POINTLIST == 1 && D3D_PRIMITIVE_TOPOLOGY_LINELIST == 2 &&
+                          D3D_PRIMITIVE_TOPOLOGY_LINESTRIP == 3 && D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST == 4 &&
+                          D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP == 5 && D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ == 10 &&
+                          D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ == 11 && D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ == 12 &&
+                          D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ == 13,
+                      "D3D_PRIMITIVE_TOPOLOGY values the topology map is keyed on");
+#endif
+        struct TopoCase {
+            std::uint32_t d3d;
+            VkPrimitiveTopology vk;
+            bool strip;
+        };
+        static constexpr TopoCase topos[] = {
+            {1, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, false},                      // POINTLIST
+            {2, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false},                      // LINELIST
+            {3, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true},                      // LINESTRIP
+            {5, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, true},                  // TRIANGLESTRIP
+            {10, VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY, false},      // LINELIST_ADJ
+            {11, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY, true},      // LINESTRIP_ADJ
+            {12, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY, false},  // TRIANGLELIST_ADJ
+            {13, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY, true},  // TRIANGLESTRIP_ADJ
+        };
+        for (const auto& t : topos) {
+            CHECK(vulkan_topology(t.d3d) == t.vk);
+            CHECK(strip_topology(t.vk) == t.strip);
+        }
+        // TRIANGLELIST (4), UNDEFINED (0) and any unmapped value fall back to the triangle list, which is not a strip.
+        CHECK(vulkan_topology(4) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        CHECK(vulkan_topology(0) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        CHECK(vulkan_topology(99) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        CHECK(!strip_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST));
+        CHECK(!strip_topology(VK_PRIMITIVE_TOPOLOGY_LINE_LIST));
+        CHECK(!strip_topology(VK_PRIMITIVE_TOPOLOGY_POINT_LIST));
+    }
+
     // Subresource indices: mip + layer * mips + plane * mips * layers.
     VkImageSubresourceRange range{};
     ResourceBinding color{};
