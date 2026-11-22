@@ -6234,6 +6234,160 @@ class Gen:
             self.emit(f"{hi} = OpExtInst %uint %glsl {s}Max {x} {y}")
             self.emit(f"{r} = OpExtInst %uint %glsl {s}Clamp {z} {lo} {hi}")
             self.dst(a[0], r)
+        elif op in ("v_div_fixup_f16", "v_div_fixup_f64"):
+            # Final IEEE-754 special-case fixup for division (RDNA2 ISA VOP3, S0=quot, S1=denom, S2=num):
+            # sign_out = sign(S1) ^ sign(S2); NaN(S2) -> quiet(S2); NaN(S1) -> quiet(S1);
+            # (0/0 or inf/inf) -> -qNaN; (x/inf or 0/y) -> +-0; (x/0 or inf/y or NaN(S0)) -> +-inf;
+            # otherwise copysign(S0, sign_out). Computed bit-exact on integer words; Float64 is only needed
+            # when VOP3 output modifiers (omod/clamp) are present on v_div_fixup_f64.
+            has_omod = any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods)
+            if op == "v_div_fixup_f16":
+                sel, dhi = self.opsel_bits(mods, 3)
+                def h16(sv, hi_half):
+                    u = self.src_h(sv)
+                    if hi_half:
+                        t = self.tmp()
+                        self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+                        u = t
+                    x = self.tmp()
+                    self.emit(f"{x} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                    if sv.get("abs"):
+                        t = self.tmp()
+                        self.emit(f"{t} = OpBitwiseAnd %uint {x} {self.cu(0x7FFF)}")
+                        x = t
+                    if sv.get("neg"):
+                        t = self.tmp()
+                        self.emit(f"{t} = OpBitwiseXor %uint {x} {self.cu(0x8000)}")
+                        x = t
+                    return x
+                s0, s1, s2 = (h16(a[i + 1], sel[i]) for i in range(3))
+                def cls16(w):
+                    mag, iz, iinf, inan = (self.tmp() for _ in range(4))
+                    self.emit(f"{mag} = OpBitwiseAnd %uint {w} {self.cu(0x7FFF)}")
+                    self.emit(f"{iz} = OpIEqual %bool {mag} {self.cu(0)}")
+                    self.emit(f"{iinf} = OpIEqual %bool {mag} {self.cu(0x7C00)}")
+                    self.emit(f"{inan} = OpUGreaterThan %bool {mag} {self.cu(0x7C00)}")
+                    return mag, iz, iinf, inan
+                m0, _, _, nan0 = cls16(s0)
+                _, z1, inf1, nan1 = cls16(s1)
+                _, z2, inf2, nan2 = cls16(s2)
+                sx, sgn, qs2, qs1, inf_out, norm_out = (self.tmp() for _ in range(6))
+                self.emit(f"{sx} = OpBitwiseXor %uint {s1} {s2}")
+                self.emit(f"{sgn} = OpBitwiseAnd %uint {sx} {self.cu(0x8000)}")
+                self.emit(f"{qs2} = OpBitwiseOr %uint {s2} {self.cu(0x0200)}")
+                self.emit(f"{qs1} = OpBitwiseOr %uint {s1} {self.cu(0x0200)}")
+                self.emit(f"{inf_out} = OpBitwiseOr %uint {sgn} {self.cu(0x7C00)}")
+                self.emit(f"{norm_out} = OpBitwiseOr %uint {sgn} {m0}")
+                b_zz, b_ii, b_ind, b_zero, b_inf1, b_inf = (self.tmp() for _ in range(6))
+                self.emit(f"{b_zz} = OpLogicalAnd %bool {z1} {z2}")
+                self.emit(f"{b_ii} = OpLogicalAnd %bool {inf1} {inf2}")
+                self.emit(f"{b_ind} = OpLogicalOr %bool {b_zz} {b_ii}")
+                self.emit(f"{b_zero} = OpLogicalOr %bool {inf1} {z2}")
+                self.emit(f"{b_inf1} = OpLogicalOr %bool {z1} {inf2}")
+                self.emit(f"{b_inf} = OpLogicalOr %bool {b_inf1} {nan0}")
+                r1, r2, r3, r4, r5 = (self.tmp() for _ in range(5))
+                self.emit(f"{r1} = OpSelect %uint {b_inf} {inf_out} {norm_out}")
+                self.emit(f"{r2} = OpSelect %uint {b_zero} {sgn} {r1}")
+                self.emit(f"{r3} = OpSelect %uint {b_ind} {self.cu(0xFE00)} {r2}")
+                self.emit(f"{r4} = OpSelect %uint {nan1} {qs1} {r3}")
+                self.emit(f"{r5} = OpSelect %uint {nan2} {qs2} {r4}")
+                if has_omod:
+                    v2f, fv = self.tmp(), self.tmp()
+                    self.emit(f"{v2f} = OpExtInst %v2float %glsl UnpackHalf2x16 {r5}")
+                    self.emit(f"{fv} = OpCompositeExtract %float {v2f} 0")
+                    self.f16_out(a[0], self.clamp_mods(fv, mods), dhi)
+                elif not dhi:
+                    self.write_lo16(a[0], r5)
+                else:
+                    if a[0]["k"] != "vgpr":
+                        raise Unsupported("op_sel destination")
+                    old, keep, sh16, v = (self.tmp() for _ in range(4))
+                    self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                    self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                    self.emit(f"{sh16} = OpShiftLeftLogical %uint {r5} {self.cu(16)}")
+                    self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                    self.dst(a[0], v)
+            else:
+                d = a[0]
+                if d["k"] != "vgpr" or d.get("n") != 2:
+                    raise Unsupported(op + " destination")
+                def d64_words(sv):
+                    if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                        lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+                    elif sv["k"] in ("imm", "fimm"):
+                        bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
+                                if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+                        lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+                    else:
+                        raise Unsupported(op + " operand")
+                    if sv.get("abs"):
+                        t = self.tmp()
+                        self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+                        hi = t
+                    if sv.get("neg"):
+                        t = self.tmp()
+                        self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+                        hi = t
+                    return lo, hi
+                (lo0, hi0), (lo1, hi1), (lo2, hi2) = (d64_words(a[i]) for i in (1, 2, 3))
+                def cls64(lo, hi):
+                    mag, orz, iz, exp_all, loz, iinf, man_hi, man_or, man_nz, inan = (self.tmp() for _ in range(10))
+                    self.emit(f"{mag} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+                    self.emit(f"{orz} = OpBitwiseOr %uint {mag} {lo}")
+                    self.emit(f"{iz} = OpIEqual %bool {orz} {self.cu(0)}")
+                    self.emit(f"{exp_all} = OpIEqual %bool {mag} {self.cu(0x7FF00000)}")
+                    self.emit(f"{loz} = OpIEqual %bool {lo} {self.cu(0)}")
+                    self.emit(f"{iinf} = OpLogicalAnd %bool {exp_all} {loz}")
+                    self.emit(f"{man_hi} = OpBitwiseAnd %uint {mag} {self.cu(0x7FF00000)}")
+                    exp_max = self.tmp()
+                    self.emit(f"{exp_max} = OpIEqual %bool {man_hi} {self.cu(0x7FF00000)}")
+                    frac_hi = self.tmp()
+                    self.emit(f"{frac_hi} = OpBitwiseAnd %uint {hi} {self.cu(0x000FFFFF)}")
+                    self.emit(f"{man_or} = OpBitwiseOr %uint {frac_hi} {lo}")
+                    self.emit(f"{man_nz} = OpINotEqual %bool {man_or} {self.cu(0)}")
+                    self.emit(f"{inan} = OpLogicalAnd %bool {exp_max} {man_nz}")
+                    return mag, iz, iinf, inan
+                m0, _, _, nan0 = cls64(lo0, hi0)
+                _, z1, inf1, nan1 = cls64(lo1, hi1)
+                _, z2, inf2, nan2 = cls64(lo2, hi2)
+                sx, sgn, qhi2, qhi1, inf_hi, norm_hi = (self.tmp() for _ in range(6))
+                self.emit(f"{sx} = OpBitwiseXor %uint {hi1} {hi2}")
+                self.emit(f"{sgn} = OpBitwiseAnd %uint {sx} {self.cu(0x80000000)}")
+                self.emit(f"{qhi2} = OpBitwiseOr %uint {hi2} {self.cu(0x00080000)}")
+                self.emit(f"{qhi1} = OpBitwiseOr %uint {hi1} {self.cu(0x00080000)}")
+                self.emit(f"{inf_hi} = OpBitwiseOr %uint {sgn} {self.cu(0x7FF00000)}")
+                self.emit(f"{norm_hi} = OpBitwiseOr %uint {sgn} {m0}")
+                b_zz, b_ii, b_ind, b_zero, b_inf1, b_inf = (self.tmp() for _ in range(6))
+                self.emit(f"{b_zz} = OpLogicalAnd %bool {z1} {z2}")
+                self.emit(f"{b_ii} = OpLogicalAnd %bool {inf1} {inf2}")
+                self.emit(f"{b_ind} = OpLogicalOr %bool {b_zz} {b_ii}")
+                self.emit(f"{b_zero} = OpLogicalOr %bool {inf1} {z2}")
+                self.emit(f"{b_inf1} = OpLogicalOr %bool {z1} {inf2}")
+                self.emit(f"{b_inf} = OpLogicalOr %bool {b_inf1} {nan0}")
+                z0 = self.cu(0)
+                h1, l1, h2, l2, h3, l3, h4, l4, r_hi, r_lo = (self.tmp() for _ in range(10))
+                self.emit(f"{h1} = OpSelect %uint {b_inf} {inf_hi} {norm_hi}")
+                self.emit(f"{l1} = OpSelect %uint {b_inf} {z0} {lo0}")
+                self.emit(f"{h2} = OpSelect %uint {b_zero} {sgn} {h1}")
+                self.emit(f"{l2} = OpSelect %uint {b_zero} {z0} {l1}")
+                self.emit(f"{h3} = OpSelect %uint {b_ind} {self.cu(0xFFF80000)} {h2}")
+                self.emit(f"{l3} = OpSelect %uint {b_ind} {z0} {l2}")
+                self.emit(f"{h4} = OpSelect %uint {nan1} {qhi1} {h3}")
+                self.emit(f"{l4} = OpSelect %uint {nan1} {lo1} {l3}")
+                self.emit(f"{r_hi} = OpSelect %uint {nan2} {qhi2} {h4}")
+                self.emit(f"{r_lo} = OpSelect %uint {nan2} {lo2} {l4}")
+                if has_omod:
+                    self.uses_f64 = True
+                    v2, dv, mv2 = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {r_lo} {r_hi}")
+                    self.emit(f"{dv} = OpBitcast %double {v2}")
+                    dv = self.clamp_mods_f64(dv, mods)
+                    self.emit(f"{mv2} = OpBitcast %v2uint_d {dv}")
+                    r_lo, r_hi = self.tmp(), self.tmp()
+                    self.emit(f"{r_lo} = OpCompositeExtract %uint {mv2} 0")
+                    self.emit(f"{r_hi} = OpCompositeExtract %uint {mv2} 1")
+                self.dst({"k": "vgpr", "r": d["r"], "n": 1}, r_lo)
+                self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
         elif op.startswith("s_load_dword") or op.startswith("s_buffer_load_dword"):
             self.scalar_load(op, a, ins["mods"])
         elif op in ("s_lshl_b64", "s_lshr_b64", "s_ashr_i64"):
