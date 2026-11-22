@@ -4494,7 +4494,7 @@ public:
             case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: size += sizeof(D3D12_VERTEX_BUFFER_VIEW); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: size += sizeof(D3D12_INDEX_BUFFER_VIEW); break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: size += UINT64{4} * arg.Constant.Num32BitValuesToSet; break;
-            case D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT: size += 4; break;
+            case compat::kIndirectArgumentIncrementingConstant: size += 4; break;
             case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
             case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
             case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS); break;
@@ -6007,20 +6007,20 @@ public:
             opts->ComputeOnlyCustomHeapSupported = FALSE;
             return d3d12_trace::result(method, S_OK);
         }
-        case D3D12_FEATURE_D3D12_OPTIONS20: {
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS20)) return d3d12_trace::result(method, E_INVALIDARG);
-            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS20*>(data);
+        case compat::kFeatureOptions20: {
+            if (size != sizeof(compat::FeatureDataOptions20)) return d3d12_trace::result(method, E_INVALIDARG);
+            auto* opts = static_cast<compat::FeatureDataOptions20*>(data);
             *opts = {};
             opts->ComputeOnlyWriteWatchSupported = FALSE;
-            opts->RecreateAtTier = D3D12_RECREATE_AT_TIER_NOT_SUPPORTED;
+            opts->RecreateAtTier = compat::kRecreateAtTierNotSupported;
             return d3d12_trace::result(method, S_OK);
         }
-        case D3D12_FEATURE_D3D12_OPTIONS21: {
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21)) return d3d12_trace::result(method, E_INVALIDARG);
-            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS21*>(data);
+        case compat::kFeatureOptions21: {
+            if (size != sizeof(compat::FeatureDataOptions21)) return d3d12_trace::result(method, E_INVALIDARG);
+            auto* opts = static_cast<compat::FeatureDataOptions21*>(data);
             *opts = {};
-            opts->WorkGraphsTier = D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
-            opts->ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
+            opts->WorkGraphsTier = compat::kWorkGraphsTierNotSupported;
+            opts->ExecuteIndirectTier = compat::kExecuteIndirectTier1_0;
             opts->SampleCmpGradientAndBiasSupported = FALSE;
             opts->ExtendedCommandInfoSupported = FALSE;
             return d3d12_trace::result(method, S_OK);
@@ -6443,8 +6443,8 @@ public:
         case D3D12_FEATURE_QUERY_META_COMMAND:
             // EnumerateMetaCommands reports 0 meta-commands, so any query is rejected (as on host D3D12).
             return d3d12_trace::result(method, E_INVALIDARG);
-        case D3D12_FEATURE_PREDICATION:
-            return write_supported_feature<D3D12_FEATURE_DATA_PREDICATION>(
+        case compat::kFeaturePredication:
+            return write_supported_feature<compat::FeatureSupportFlag>(
                 method, data, size, state_.info.conditional_rendering ? TRUE : FALSE);
         case compat::kFeatureApplicationSpecificDriverState:
             return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);

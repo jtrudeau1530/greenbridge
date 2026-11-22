@@ -2231,8 +2231,8 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS18 o18{};
     D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19{};
-    D3D12_FEATURE_DATA_D3D12_OPTIONS20 o20{};
-    D3D12_FEATURE_DATA_D3D12_OPTIONS21 o21{};
+    rt::d3d12::compat::FeatureDataOptions20 o20{};
+    rt::d3d12::compat::FeatureDataOptions21 o21{};
 
     query_ours(std::pair{"OPTIONS2", D3D12_FEATURE_D3D12_OPTIONS2}, o2);
     query_ours(std::pair{"OPTIONS3", D3D12_FEATURE_D3D12_OPTIONS3}, o3);
@@ -2247,14 +2247,14 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     query_ours(std::pair{"OPTIONS16", D3D12_FEATURE_D3D12_OPTIONS16}, o16);
     query_ours(std::pair{"OPTIONS18", D3D12_FEATURE_D3D12_OPTIONS18}, o18);
     query_ours(std::pair{"OPTIONS19", D3D12_FEATURE_D3D12_OPTIONS19}, o19);
-    query_ours(std::pair{"OPTIONS20", D3D12_FEATURE_D3D12_OPTIONS20}, o20);
-    query_ours(std::pair{"OPTIONS21", D3D12_FEATURE_D3D12_OPTIONS21}, o21);
+    query_ours(std::pair{"OPTIONS20", rt::d3d12::compat::kFeatureOptions20}, o20);
+    query_ours(std::pair{"OPTIONS21", rt::d3d12::compat::kFeatureOptions21}, o21);
 
     D3D12_FEATURE_DATA_SHADER_CACHE shader_cache{};
     D3D12_FEATURE_DATA_EXISTING_HEAPS existing_heaps{};
     D3D12_FEATURE_DATA_CROSS_NODE cross_node{};
     D3D12_FEATURE_DATA_DISPLAYABLE displayable{};
-    D3D12_FEATURE_DATA_PREDICATION predication{};
+    rt::d3d12::compat::FeatureSupportFlag predication{};
     rt::d3d12::compat::FeatureSupportFlag driver_state{};
     rt::d3d12::compat::FeatureSupportFlag bypass_hash{};
     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT prot_support{};
@@ -2267,7 +2267,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     query_ours(std::pair{"EXISTING_HEAPS", D3D12_FEATURE_EXISTING_HEAPS}, existing_heaps);
     query_ours(std::pair{"CROSS_NODE", D3D12_FEATURE_CROSS_NODE}, cross_node);
     query_ours(std::pair{"DISPLAYABLE", D3D12_FEATURE_DISPLAYABLE}, displayable);
-    query_ours(std::pair{"PREDICATION", D3D12_FEATURE_PREDICATION}, predication);
+    query_ours(std::pair{"PREDICATION", rt::d3d12::compat::kFeaturePredication}, predication);
     query_ours(std::pair{"APPLICATION_SPECIFIC_DRIVER_STATE",
                          rt::d3d12::compat::kFeatureApplicationSpecificDriverState},
                driver_state);
@@ -2336,11 +2336,11 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o19.MaxViewDescriptorHeapSize != D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2 ||
         o19.ComputeOnlyCustomHeapSupported)
         fail("OPTIONS19 mismatch");
-    if (o20.ComputeOnlyWriteWatchSupported || o20.RecreateAtTier != D3D12_RECREATE_AT_TIER_NOT_SUPPORTED)
+    if (o20.ComputeOnlyWriteWatchSupported || o20.RecreateAtTier != rt::d3d12::compat::kRecreateAtTierNotSupported)
         fail("OPTIONS20 unexpected support");
-    if (o21.WorkGraphsTier != D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED ||
-        o21.ExecuteIndirectTier != D3D12_EXECUTE_INDIRECT_TIER_1_0 || o21.SampleCmpGradientAndBiasSupported ||
-        o21.ExtendedCommandInfoSupported)
+    if (o21.WorkGraphsTier != rt::d3d12::compat::kWorkGraphsTierNotSupported ||
+        o21.ExecuteIndirectTier != rt::d3d12::compat::kExecuteIndirectTier1_0 ||
+        o21.SampleCmpGradientAndBiasSupported || o21.ExtendedCommandInfoSupported)
         fail("OPTIONS21 unexpected support");
 
     // Verify OPTIONS19.AnisoFilterWithPointMipSupported follows VulkanDeviceInfo::sampler_anisotropy.
@@ -2443,8 +2443,9 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         if (FAILED(rt::d3d12::create_vulkan_device(no_pred_info, IID_PPV_ARGS(&no_pred.p)))) {
             fail("failed to create conditional_rendering=false device");
         } else {
-            D3D12_FEATURE_DATA_PREDICATION pred_off{TRUE};
-            if (FAILED(no_pred->CheckFeatureSupport(D3D12_FEATURE_PREDICATION, &pred_off, sizeof(pred_off))) ||
+            rt::d3d12::compat::FeatureSupportFlag pred_off{TRUE};
+            if (FAILED(no_pred->CheckFeatureSupport(rt::d3d12::compat::kFeaturePredication, &pred_off,
+                                                    sizeof(pred_off))) ||
                 pred_off.Supported != FALSE)
                 fail("PREDICATION did not become FALSE when conditional_rendering is off");
         }
@@ -2624,13 +2625,13 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                      check_bool(n, "ComputeOnlyCustomHeapSupported", a.ComputeOnlyCustomHeapSupported,
                                 b.ComputeOnlyCustomHeapSupported);
                  });
-    compare_host("OPTIONS20", D3D12_FEATURE_D3D12_OPTIONS20, o20,
+    compare_host("OPTIONS20", rt::d3d12::compat::kFeatureOptions20, o20,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "ComputeOnlyWriteWatchSupported", a.ComputeOnlyWriteWatchSupported,
                                 b.ComputeOnlyWriteWatchSupported);
                      check_tier(n, "RecreateAtTier", int(a.RecreateAtTier), int(b.RecreateAtTier));
                  });
-    compare_host("OPTIONS21", D3D12_FEATURE_D3D12_OPTIONS21, o21,
+    compare_host("OPTIONS21", rt::d3d12::compat::kFeatureOptions21, o21,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_tier(n, "WorkGraphsTier", int(a.WorkGraphsTier), int(b.WorkGraphsTier));
                      check_tier(n, "ExecuteIndirectTier", int(a.ExecuteIndirectTier), int(b.ExecuteIndirectTier));
@@ -2661,7 +2662,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                      check_tier(n, "SharedResourceCompatibilityTier", int(a.SharedResourceCompatibilityTier),
                                 int(b.SharedResourceCompatibilityTier));
                  });
-    compare_host("PREDICATION", D3D12_FEATURE_PREDICATION, predication,
+    compare_host("PREDICATION", rt::d3d12::compat::kFeaturePredication, predication,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "Supported", a.Supported, b.Supported);
                  });
