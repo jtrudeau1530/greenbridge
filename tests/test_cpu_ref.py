@@ -493,7 +493,7 @@ class CpuRefTest(unittest.TestCase):
         r = self.execute("""
             v_mov_b32 v0, 0x00ff0001
             v_not_b32 v1, v0
-            v_bfrev_b32 v2, 0x80000001
+            v_bfrev_b32 v2, 0x12345678
             v_ffbl_b32 v3, 0x00010100
             v_ffbh_u32 v4, 0x00010000
             v_ffbh_i32 v5, 0xfffffff0
@@ -522,7 +522,7 @@ class CpuRefTest(unittest.TestCase):
             s_endpgm
         """)
         self.assertEqual(self.vgpr(r, 1), 0xFF00FFFE)
-        self.assertEqual(self.vgpr(r, 2), 0x80000001)
+        self.assertEqual(self.vgpr(r, 2), 0x1E6A2C48)
         self.assertEqual(self.vgpr(r, 3), 8)
         self.assertEqual(self.vgpr(r, 4), 15)
         self.assertEqual(self.vgpr(r, 5), 28)
