@@ -26,6 +26,17 @@ This page collects the setup steps and the problems testers have run into so far
   `valu_fuzz.py --family mem` and `lds_fuzz.py`, but rejects `op_sel` on the 16-bit integer VOP3 forms that
   `valu_fuzz.py --family f16` generates (`v_ashrrev_i16_e64 ... op_sel:[0,0,0]`: "not a valid operand"), so no f16
   program assembles. 23.1.6 assembles them.
+
+  On Windows, ROCm 7.2's bundled `llvm-mc.exe` reports LLVM 21.0.0git. It assembled the TEST-71 memory and
+  LDS programs but rejected the 16-bit shift used by the f16 generator. To check an assembler directly in
+  PowerShell, set `$env:LLVM_MC` to the path of its executable and run:
+
+  ```powershell
+  'v_lshlrev_b16_e64 v34, v27, v27 op_sel:[0,1,1]' | & $env:LLVM_MC -triple=amdgcn--amdpal -mcpu=gfx1013 -show-encoding
+  ```
+
+  If it reports `not a valid operand`, point `LLVM_MC` at a build that accepts this instruction. The Windows
+  conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
   - Windows: Visual Studio 2022 with "Desktop development with C++", the Windows SDK 10.0.26100 or newer, and the
