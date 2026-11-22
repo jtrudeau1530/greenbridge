@@ -1506,6 +1506,15 @@ int compare_feature_support(ID3D12Device* ours) {
 
 // Same-adapter host D3D12 device matched by VkPhysicalDeviceIDProperties (LUID first, then PCI IDs), falling back
 // to the default adapter. False if the host has no D3D12 device.
+// D3D11.3 spec 3.2.3.8's ideal FLOAT -> SRGB encoding of c in [0, 1], before scaling to the format's maximum.
+double ideal_srgb(double c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055; }
+
+// Both bytes within 0.6 ULP (on the integer side) of the ideal value: the tolerance spec 3.2.3.6 (FLOAT -> UNORM)
+// and 3.2.3.8 (FLOAT -> SRGB) permit, so two drivers may give the codes either side of a near-tie.
+bool within_06_ulp(std::uint8_t a, std::uint8_t b, double ideal) {
+    return std::abs(double(a) - ideal) <= 0.6 && std::abs(double(b) - ideal) <= 0.6;
+}
+
 bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physical,
                                      PFN_vkGetInstanceProcAddr instance_proc, Ref<ID3D12Device>& host,
                                      std::string& adapter_name) {
@@ -4853,6 +4862,15 @@ int main() {
             EXPECT(words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == 0);
         }
 
+        // The tolerance host_side applies, pinned here so every GPU checks it: its accept side only runs where the
+        // host rounds differently (Intel's SRGB clear), so a change to it would otherwise stay green elsewhere.
+        // One code either side of a near-tie is accepted; two codes, or a code past 0.6 ULP, are not.
+        EXPECT(within_06_ulp(187, 188, ideal_srgb(0.5) * 255.0) && within_06_ulp(127, 128, 127.5));
+        EXPECT(!within_06_ulp(186, 188, ideal_srgb(0.5) * 255.0) && !within_06_ulp(126, 128, 127.5));
+        EXPECT(!within_06_ulp(224, 225, ideal_srgb(0.75) * 255.0) &&
+               !within_06_ulp(136, 137, ideal_srgb(0.25) * 255.0));
+        EXPECT(!within_06_ulp(254, 255, 255.0));
+
         // The host PC runtime's bytes and refusals: the default adapter when it can cast, WARP otherwise.
         bool compared = false;
         const char* source = "no host";
@@ -4871,12 +4889,8 @@ int main() {
             // 0.6 ULP. On the layer's own adapter (same LUID) the comparison stays exact; against another adapter
             // or WARP a byte may differ when both sides are within 0.6 ULP of the ideal value.
             const FLOAT clear_value[4] = {0.25f, 0.5f, 0.75f, 1.0f};  // placed_cast_scenario's clear colour
-            const auto ideal_srgb = [](double c) {  // 3.2.3.8's ideal FLOAT -> SRGB, before scaling to 255
-                return c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055;
-            };
             const auto within_tolerance = [&](std::uint8_t ours_byte, std::uint8_t host_byte, double ideal) {
-                return !same_adapter && std::abs(double(ours_byte) - ideal) <= 0.6 &&
-                       std::abs(double(host_byte) - ideal) <= 0.6;
+                return !same_adapter && within_06_ulp(ours_byte, host_byte, ideal);
             };
             unsigned plain_within = 0, srgb_within = 0;
             for (UINT row = 0; row < 4; ++row)
