@@ -5054,6 +5054,15 @@ class Gen:
         self._scan = (body, len(body), open_)
         return not open_
 
+    def store_gather_taps(self, first_vgpr: int, taps: list[str], d16: bool) -> None:
+        """Write four taps in gather order, two per destination VGPR for d16."""
+        if d16:
+            words = [self.pack_f16_pair_int(taps[0], taps[1]), self.pack_f16_pair_int(taps[2], taps[3])]
+        else:
+            words = [self.tou(tap) for tap in taps]
+        for i, word in enumerate(words):
+            self.dst({"k": "vgpr", "r": first_vgpr + i, "n": 1}, word)
+
     # SQ_IMG_SAMP_WORD0 address modes (Mesa src/amd/registers/gfx10-rsrc.json: CLAMP_X = bits [2:0], CLAMP_Y = [5:3];
     # values: SQ_TEX_* in Mesa's gfx6.json, as RADV's radv_tex_wrap maps VkSamplerAddressMode onto them): 0 wrap, 1 mirror, 2 clamp last texel, 3 mirror once last texel,
     # 4 clamp half border, 5 mirror once half border, 6 clamp border, 7 mirror once border.
@@ -5302,7 +5311,7 @@ class Gen:
                 # the 2x2 footprint at mip round(lod) (clamped to the mip range) in gather order
                 # (u0,v1) (u1,v1) (u1,v0) (u0,v0). Each texel coordinate goes through the S#'s own address mode
                 # (CLAMP_X/CLAMP_Y, see gather_addr_modes / gather_addr).
-                if bin(dmask).count("1") != 1 or ncoord != 2 or len(f) < 3 or d16:
+                if bin(dmask).count("1") != 1 or ncoord != 2 or len(f) < 3:
                     raise Unsupported("image_gather4_l form")
                 modes = self.gather_addr_modes(a[3])
                 self.uses_query = True
@@ -5348,8 +5357,7 @@ class Gen:
                     self.emit(f"{tx} = OpImageFetch %v4float {img} {cc} Lod {mc}")
                     self.emit(f"{comp} = OpCompositeExtract %float {tx} {ch}")
                     comps.append(comp)
-                for i, comp in enumerate(comps):
-                    self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
+                self.store_gather_taps(vdata["r"], comps, d16)
                 self.uses_fhalf = True
                 return
             if op == "image_gather4_lz":
@@ -5370,13 +5378,7 @@ class Gen:
                     comp = self.tmp()
                     self.emit(f"{comp} = OpCompositeExtract %float {res} {c}")
                     comps.append(comp)
-                if d16:
-                    for i in range(0, 4, 2):
-                        p = self.pack_f16_pair_int(comps[i], comps[i + 1])
-                        self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, p)
-                else:
-                    for i, comp in enumerate(comps):
-                        self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
+                self.store_gather_taps(vdata["r"], comps, d16)
                 return
             kind = op[len("image_sample"):]          # '', '_lz', '_l', '_b', '_c_lz', '_d', '_d_cl' (+ '_o')
             off = None
