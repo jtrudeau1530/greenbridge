@@ -22,7 +22,8 @@ Meshlet group (first u32 has bit 31 set):
     +4   u32  triangle count T
     +8   u32  vertex reference count V
     +12  K * 16-byte meshlet records:
-         u32 w0: bits 0-6 = vertices - 1, bits 7-13 = triangles - 1, bits 14-31 not decoded
+         u32 w0: bits 0-6 = vertices - 1, bits 7-13 = triangles - 1, bits 14-15 zero, bits 16-31 = the
+                 meshlet's bounding-sphere radius around the w2/w3 centre, as an f16 (measured on `42 40` geometry)
          u32 w1: low u16 = first vertex reference, high u16 = first triangle (running sums)
          u32 w2, w3: bits 0-11 and 12-23 of w2 and bits 0-11 of w3 are the meshlet's centre in x, y and z as
                      12-bit steps of 1/16 m around 2047, (field - 2047) / 16 (measured on `42 40` geometry; the
@@ -233,14 +234,22 @@ def meshlet_centre(w2, w3):
     return ((w2 & 0xFFF) - 2047) / 16, (((w2 >> 12) & 0xFFF) - 2047) / 16, ((w3 & 0xFFF) - 2047) / 16
 
 
+def meshlet_radius(w0):
+    """The bounding-sphere radius in a meshlet record's word 0 (bits 16-31, an f16), in metres."""
+    return struct.unpack("<e", struct.pack("<H", w0 >> 16))[0]
+
+
 def centre_agreement(data, group, positions):
-    """Compare each meshlet's stored centre with the centre of its vertices' box. Counts axes whose difference
-    rounds to 0 or to at most one 1/16 m step."""
+    """Compare each meshlet's stored centre with the centre of its vertices' box (axes whose difference rounds to 0
+    or to at most one 1/16 m step), and its stored radius with the farthest vertex from the stored centre (covers it,
+    covers it once the centre's rounding of at most sqrt(3)/32 m is allowed for, and is at most 1.25 times it plus
+    that rounding)."""
     at, k = group["offset"], group["meshlets"]
     rec_at = at + 12
     refs_at = rec_at + 16 * k + 4 * group["triangles"]
     refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, refs_at)
-    out = {"meshlets": k, "default_words": 0, "axes": 3 * k, "axes_exact": 0, "axes_within_step": 0}
+    out = {"meshlets": k, "default_words": 0, "axes": 3 * k, "axes_exact": 0, "axes_within_step": 0,
+           "radius_covers": 0, "radius_covers_within_rounding": 0, "radius_tight": 0}
     for m in range(k):
         w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
         out["default_words"] += w2 == 0x007FF7FF and w3 == 0x7FF
@@ -253,6 +262,11 @@ def centre_agreement(data, group, positions):
             step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) * 16)
             out["axes_exact"] += step == 0
             out["axes_within_step"] += abs(step) <= 1
+        radius, far = meshlet_radius(w0), max(math.dist(p, stored) for p in pts)
+        slack = math.sqrt(3) / 32
+        out["radius_covers"] += radius >= far * (1 - 2 ** -11)
+        out["radius_covers_within_rounding"] += radius + slack >= far
+        out["radius_tight"] += radius <= 1.25 * far + slack
     return out
 
 

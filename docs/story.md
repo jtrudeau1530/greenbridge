@@ -300,13 +300,25 @@ correlation 0.997 (x), 0.997 (y) and 0.983 (z) over 387 blocks. Readings that ar
 The earlier test on `63 30` blocks found no correlation, and the reason is that their records hardly vary: the
 groups matched to a `63 30` block keep the default words in 2,417 of 2,452 meshlets.
 
+**Word 0 bits 16-31 hold the meshlet's bounding-sphere radius, as an f16**, measured around the stored centre. Bits
+14-15 are clear in all 61,170 records of the first 400 streams. Against the radius from the box centre, the
+correlation is 0.999 on those streams. `--centres` checks the radius against the farthest vertex from the stored
+centre, three ways: it covers that vertex; it covers it once the centre's rounding of up to √3/32 m is allowed for;
+and it is tight, at most 1.25 × that distance plus the rounding:
+
+| Archive | Meshlets | Covers | Covers within rounding | Tight |
+|---|---:|---:|---:|---:|
+| `shared_minigame000.rpf` | 142,613 | 135,929 (95.3%) | 138,994 (97.5%) | 142,518 (99.9%) |
+| `core_restofworld.rpf` | 4,899 | 4,771 (97.4%) | 4,895 (99.9%) | 4,883 (99.7%) |
+
+So the record carries a culling sphere (centre plus radius) for each meshlet.
+
 The other bits are not decoded:
 - **w3 bits 12-31** are non-zero in 24% of the `42 40` meshlets of the first 400 streams (14,594 of 61,156), and
   bits 12-13 are clear in every one of them. They follow how closely the meshlet's face normals agree (r ≈ 0.7 with the smallest dot product to the mean normal), which
   suggests a normal cone.
 - **w2 bits 24-31** are 0 or 16. 16 is set on 1,225 of 61,156 meshlets of the first 400 streams, nearly always
   together with non-zero w3 bits 12-31.
-- **w0 bits 14-31** are not decoded either; bits 14-15 are clear in all 61,170 records of those streams.
 
 **Slots 11 and 18 are tangents.** Their type-7 words are unit vectors in the same 10:10:10 unorm, perpendicular to the vertex's stored normal. Bits 30-31 are always 3 or 0, which fits the bitangent sign +1 or −1. Over the minigame archive (`--normals`, counts only):
 - 7,520,441 tangent words, 7,435,001 (98.9%) of them within |dot| < 0.05 of perpendicular;
@@ -320,7 +332,7 @@ The other bits are not decoded:
 - 69.4% of 699,618 shared edges have neighbouring faces within ~25°, and 0.37% are opposed;
 - 10,555 of 14,697 centre axes (71.8%) are in the same 1/16 m step, and 87.6% within one.
 
-Still open: the +0x5C word, meshlet record bits 14-31 of word 0 and the cone-like bits above, the type-1 normal's
+Still open: the +0x5C word, the cone-like meshlet record bits above, the type-1 normal's
 bits 20-31, and what the `42 40` colour and UV slots hold beyond rpf9-explorer's reading.
 
 ### `story000_script.rpf`, full

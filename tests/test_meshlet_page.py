@@ -471,6 +471,25 @@ class MeshletCentreTests(unittest.TestCase):
         self.assertEqual((checks["centres_4240_axes_exact"], checks["centres_4240_axes_within_step"]), (1, 2))
         self.assertNotIn("centres_4240_meshlets", mp.summarise_page(data, "p")["checks"])
 
+    def test_meshlet_radius(self):
+        self.assertEqual(mp.meshlet_radius(0x3C00 << 16 | 0x1FFF), 1.0)
+        self.assertEqual(mp.meshlet_radius(0x4D00 << 16), 20.0)
+        self.assertEqual(mp.meshlet_radius(0x7F), 0.0)
+
+    def test_radius_agreement(self):
+        data = bytearray(self.grid_page((0, 0, 0)))
+        blk, grp = mp.parse_page(bytes(data))
+        pos = mp.positions_4240(bytes(data), blk)
+        centre = mp.meshlet_centre(*struct.unpack_from("<2I", data, grp["offset"] + 12 + 8))
+        far = max(math.dist(p, centre) for p in pos)
+        rec = grp["offset"] + 12
+        w0 = struct.unpack_from("<I", data, rec)[0] & 0xFFFF
+        for radius, want in ((far * 1.01, (1, 1, 1)), (far * 0.99, (0, 1, 1)), (far * 2 + 1, (1, 1, 0))):
+            struct.pack_into("<I", data, rec, w0 | struct.unpack("<H", struct.pack("<e", radius))[0] << 16)
+            c = mp.summarise_page(bytes(data), "p", centres=True)["checks"]
+            self.assertEqual((c["centres_4240_radius_covers"], c["centres_4240_radius_covers_within_rounding"],
+                              c["centres_4240_radius_tight"]), want, radius)
+
     def test_cli_centres(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "p.bin")
