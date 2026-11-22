@@ -439,6 +439,18 @@ The FSR DLL never writes this form.
 **Byte `+0x143` is console-runtime state:** the BVH builder reads it at 31 sites and the FSR DLL at one (all `cmp
 byte ptr [reg+143h]`), but neither DLL writes it. Every store into `+0x140`..`+0x143` in either DLL is a byte store to
 `+0x140` or `+0x141`, and no wider store reaches `+0x143`. A replacement list can leave it 0.
+**The root-argument header word** is the root parameter's table entry `table[root]` (`+0x344 + 4·root`), adjusted
+only for root constants:
+
+- **Several 32-bit constants at once:** `table[root] + (count − 1) << 16`, then `count` dwords. Examples:
+  `+ 0x120000` for 19 constants (`0x14e3b`), `+ 0x70000` for 8 (`0x1d324`), `+ 0x30000` for 4.
+- **One constant at a non-zero offset:** `table[root] + 4 · destOffset`. At `0x19fca` the builder adds `0xc` and its
+  vtable fallback is slot 37 `(2, value, 3)`; at `0x1a346` it adds `0x14` and the fallback is `(2, value, 5)`.
+- **Otherwise the entry is written unchanged:** one constant at offset 0, a descriptor table (then 4 bytes), a root
+  CBV/SRV/UAV (then the full 8-byte GPU address, e.g. `0x19fff`).
+
+No site combines both adjustments. Before writing, every reader tests the entry against `0xC0000000` (98 sites in the
+builder, 7 in the FSR DLL), and sets the flag byte at `+0x140` only when both of those bits are clear.
 It sets a flag byte at `+0x140`, stores a flag at `+0x141` from the
 pipeline, and copies 32 bytes of the pipeline object (from its `+0x10`) to `+0x544`. These are the fields
 section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x544`).
