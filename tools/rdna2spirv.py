@@ -2959,6 +2959,62 @@ class Gen:
             self.emit(f"{old} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {self.src_u(src)} {self.src_u(cmp_)}")
             if d is not None:
                 self.dst(d, old)
+        elif name in ("ds_inc_u32", "ds_dec_u32", "ds_rsub_u32", "ds_min_f32", "ds_max_f32"):
+            # RDNA2 ISA 32-bit DS atomics via Workgroup-scope OpAtomicCompareExchange CAS loop:
+            #   ds_inc_u32:  M = (M >= DATA) ? 0 : M + 1          (unsigned compare)
+            #   ds_dec_u32:  M = (M == 0 || M > DATA) ? DATA : M - 1  (unsigned compare)
+            #   ds_rsub_u32: M = DATA - M                         (32-bit wrapping)
+            #   ds_min_f32 / ds_max_f32: GLSL.std.450 NMin / NMax (no shader float atomic extension needed)
+            if len(a) != (3 if rtn else 2):
+                raise Unsupported(op + " operands")
+            d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
+            if dat["k"] != "vgpr" or dat.get("n", 1) != 1 or \
+                    (d is not None and (d["k"] != "vgpr" or d.get("n", 1) != 1)):
+                raise Unsupported(op + " operands")
+            p = self.lds_ptr(self.src_u(ad), off)
+            val = self.src_u(dat)
+            val_f = None
+            if name in ("ds_min_f32", "ds_max_f32"):
+                val_f = self.tmp()
+                self.emit(f"{val_f} = OpBitcast %float {val}")
+            lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
+            init = self.tmp()
+            self.emit(f"{init} = OpLoad %uint {p}")
+            self.emit(f"OpBranch {lbl_hdr}")
+            self.emit(f"{lbl_hdr} = OpLabel")
+            cur, got = self.tmp(), self.tmp()
+            self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
+            if name == "ds_inc_u32":
+                wrap, step, new_u = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{wrap} = OpUGreaterThanEqual %bool {cur} {val}")
+                self.emit(f"{step} = OpIAdd %uint {cur} {self.cu(1)}")
+                self.emit(f"{new_u} = OpSelect %uint {wrap} {self.cu(0)} {step}")
+            elif name == "ds_dec_u32":
+                is_z, gt, wrap, step, new_u = (self.tmp() for _ in range(5))
+                self.emit(f"{is_z} = OpIEqual %bool {cur} {self.cu(0)}")
+                self.emit(f"{gt} = OpUGreaterThan %bool {cur} {val}")
+                self.emit(f"{wrap} = OpLogicalOr %bool {is_z} {gt}")
+                self.emit(f"{step} = OpISub %uint {cur} {self.cu(1)}")
+                self.emit(f"{new_u} = OpSelect %uint {wrap} {val} {step}")
+            elif name == "ds_rsub_u32":
+                new_u = self.tmp()
+                self.emit(f"{new_u} = OpISub %uint {val} {cur}")
+            else:
+                cur_f, new_f, new_u = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{cur_f} = OpBitcast %float {cur}")
+                glsl_op = "NMin" if name == "ds_min_f32" else "NMax"
+                self.emit(f"{new_f} = OpExtInst %float %glsl {glsl_op} {cur_f} {val_f}")
+                self.emit(f"{new_u} = OpBitcast %uint {new_f}")
+            done = self.tmp()
+            self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new_u} {cur}")
+            self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+            self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+            self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+            self.emit(f"{lbl_cont} = OpLabel")
+            self.emit(f"OpBranch {lbl_hdr}")
+            self.emit(f"{lbl_exit} = OpLabel")
+            if d is not None:
+                self.dst(d, cur)
         else:
             raise Unsupported(op)
         self.emit(f"OpBranch {lbl_end}")
