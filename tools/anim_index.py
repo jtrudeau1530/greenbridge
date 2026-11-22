@@ -478,6 +478,9 @@ def main():
     a = ap.parse_args()
     try:
         if os.path.isdir(a.source):
+            if a.start is not None or a.limit is not None:
+                print("--start and --limit are only supported for archive files", file=sys.stderr)
+                return 2
             rows, summary = scan_dir(a.source)
         else:
             def progress(n, pos, end):
