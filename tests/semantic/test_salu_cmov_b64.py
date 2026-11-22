@@ -1,7 +1,9 @@
-"""Semantic tests for RDNA2 s_cmov_b64 on 64-bit scalar *data* pairs.
+from __future__ import annotations
 
-Rule: D[63:0] = SCC ? S0[63:0] : D[63:0]; SCC is read, not written (RDNA2 ISA SOP1,
-LLVM AMDGPU SOPInstructions.td `S_CMOV_B64 : SOP1_64` under `Uses = [SCC]`).
+"""Semantic tests for RDNA2 s_cmov_b64 and s_cselect_b64 on 64-bit scalar *data* pairs.
+
+Rule (s_cmov_b64): D[63:0] = SCC ? S0[63:0] : D[63:0]; SCC read, not written (RDNA2 ISA SOP1).
+Rule (s_cselect_b64): D[63:0] = SCC ? S0[63:0] : S1[63:0]; SCC read, not written (RDNA2 ISA SOP2).
 
 Only plain data is supported. A lane-mask register holds one lane's bit in this
 translator, so selecting it as 64-bit data would silently read back a per-lane
@@ -81,6 +83,11 @@ def export_pair_lines(reg):
 
 def ref_cmov64(old, src, scc):
     return (src if scc else old) & MASK64
+
+
+def ref_cselect_b64(s0: int, s1: int, scc: int) -> int:
+    """Reference oracle for RDNA2 s_cselect_b64: D = SCC ? S0 : S1 (64-bit scalar data)."""
+    return (s0 if scc else s1) & MASK64
 
 
 class DataPairTests(unittest.TestCase):
@@ -241,6 +248,88 @@ class RejectionTests(unittest.TestCase):
                 full = [line, "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]
                 with self.assertRaisesRegex(rdna2spirv.Unsupported, re.escape(self.DEST)):
                     translate_ps(full)
+
+
+class ScalarCselectB64OracleTests(unittest.TestCase):
+    def test_distinct_dword_data_pairs(self):
+        pairs = [
+            (0x55667788_11223344, 0xDDEEFF00_99AABBCC),
+            (0x12345678_9ABCDEF0, 0xFEDCBA98_76543210),
+            (0x00000002_80000001, 0x80000000_7FFFFFFE),
+            (0x01020304_05060708, 0x11223344_55667788),
+        ]
+        for a64, b64 in pairs:
+            for scc in (0, 1):
+                with self.subTest(a=hex(a64), b=hex(b64), scc=scc):
+                    want = ref_cselect_b64(a64, b64, scc)
+                    words = run_ps(
+                        load_pair_lines(4, a64)
+                        + load_pair_lines(6, b64)
+                        + [scc_line(scc), "s_cselect_b64 s[2:3], s[4:5], s[6:7]"]
+                        + export_pair_lines(2)
+                        + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                    )
+                    self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_edge_and_boundary_patterns(self):
+        patterns = [
+            (0, 0xFFFFFFFF_FFFFFFFF),
+            (0xFFFFFFFF_FFFFFFFF, 0),
+            (0x80000000_00000000, 0x7FFFFFFF_FFFFFFFF),
+            (0x00000000_00000001, 0x80000000_00000000),
+            (0xAAAAAAAAAAAAAAAA, 0x5555555555555555),
+            (0x00000000_FFFFFFFF, 0xFFFFFFFF_00000000),
+        ]
+        for a64, b64 in patterns:
+            for scc in (0, 1):
+                with self.subTest(a=hex(a64), b=hex(b64), scc=scc):
+                    want = ref_cselect_b64(a64, b64, scc)
+                    words = run_ps(
+                        load_pair_lines(4, a64)
+                        + load_pair_lines(6, b64)
+                        + [scc_line(scc), "s_cselect_b64 s[2:3], s[4:5], s[6:7]"]
+                        + export_pair_lines(2)
+                        + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                    )
+                    self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_immediate_operand_forms(self):
+        cases = [
+            ("42", "-2", 42, 0xFFFFFFFF_FFFFFFFE),
+            ("0x10", "0x80000000", 0x10, 0x00000000_80000000),
+            ("-16", "64", 0xFFFFFFFF_FFFFFFF0, 64),
+            ("0x12345678", "0", 0x12345678, 0),
+            ("0", "-1", 0, 0xFFFFFFFF_FFFFFFFF),
+            ("-1", "0", 0xFFFFFFFF_FFFFFFFF, 0),
+            ("null", "0x55", 0, 0x55),
+            ("0xAA", "null", 0xAA, 0),
+        ]
+        for s0_asm, s1_asm, s0_val, s1_val in cases:
+            for scc in (0, 1):
+                with self.subTest(s0=s0_asm, s1=s1_asm, scc=scc):
+                    want = ref_cselect_b64(s0_val, s1_val, scc)
+                    words = run_ps(
+                        [scc_line(scc), f"s_cselect_b64 s[2:3], {s0_asm}, {s1_asm}"]
+                        + export_pair_lines(2)
+                        + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                    )
+                    self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_oracle_dwords_fidelity(self):
+        a64 = 0xBBBBBBBB_AAAAAAAA
+        b64 = 0xDDDDDDDD_CCCCCCCC
+        for scc in (0, 1):
+            with self.subTest(scc=scc):
+                want = ref_cselect_b64(a64, b64, scc)
+                words = run_ps(
+                    load_pair_lines(4, a64)
+                    + load_pair_lines(6, b64)
+                    + [scc_line(scc), "s_cselect_b64 s[2:3], s[4:5], s[6:7]"]
+                    + export_pair_lines(2)
+                    + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                )
+                self.assertEqual(words[0], want & MASK32)
+                self.assertEqual(words[1], (want >> 32) & MASK32)
 
 
 if __name__ == "__main__":
