@@ -754,11 +754,11 @@ class SyntheticPoolTest(unittest.TestCase):
         path with no pool is an error, not an all-zero scan with exit code 0."""
         import io
         from contextlib import redirect_stderr, redirect_stdout
-        ttdb = os.path.join(self.tmp.name, "game", "data", "ttdb", "props")
+        ttdb = os.path.join(self.tmp.name, "game [v1]", "data", "ttdb", "props")   # [..] is not a glob here
         os.makedirs(ttdb)
         build_pool(os.path.join(ttdb, "a.ttpf"))
         out = os.path.join(self.tmp.name, "scan.json")
-        for folder in (os.path.join(self.tmp.name, "game"), os.path.dirname(ttdb), ttdb):
+        for folder in (os.path.join(self.tmp.name, "game [v1]"), os.path.dirname(ttdb), ttdb):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(ttpf.main(["scan", folder, "--json", out]), 0, folder)
             with open(out, encoding="utf-8") as f:

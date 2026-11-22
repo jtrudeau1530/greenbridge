@@ -902,11 +902,12 @@ def find_pools(arg):
     itself or one pack, every .ttpf below it. A file is taken as a pool."""
     if os.path.isfile(arg):
         return [arg]
-    pools = sorted(glob.glob(os.path.join(arg, "data", "ttdb", "**", "*.ttpf"), recursive=True))
-    pools += sorted(glob.glob(os.path.join(arg, "pack", "*", "data", "ttdb", "**", "*.ttpf"),
+    root = glob.escape(arg)   # a folder like "Game [v1]" is a path, not a glob pattern
+    pools = sorted(glob.glob(os.path.join(root, "data", "ttdb", "**", "*.ttpf"), recursive=True))
+    pools += sorted(glob.glob(os.path.join(root, "pack", "*", "data", "ttdb", "**", "*.ttpf"),
                                 recursive=True))
     if not pools:
-        pools = sorted(glob.glob(os.path.join(arg, "**", "*.ttpf"), recursive=True))
+        pools = sorted(glob.glob(os.path.join(root, "**", "*.ttpf"), recursive=True))
     return pools
 
 
