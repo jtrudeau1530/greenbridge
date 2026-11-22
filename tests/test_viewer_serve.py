@@ -46,6 +46,33 @@ class HostAllowedTest(unittest.TestCase):
         # Browsers always send Host; a missing one is a local tool, not a web page.
         self.assertTrue(serve.host_allowed(None))
 
+    def test_well_formed_edge_cases_are_allowed(self):
+        for host in (" localhost ", "localhost:80 ", "localhost.:8765", "127.0.0.1.", "127.0.0.1:65535", "localhost:0",
+                     "[::1]:0", "[::1]:00080"):
+            with self.subTest(host=host):
+                self.assertTrue(serve.host_allowed(host))
+
+    def test_malformed_ports_are_refused(self):
+        # Each of these used to be allowed: the port after the colon was never looked at.
+        for host in ("localhost:", "localhost:abc", "localhost:-1", "localhost:+80", "localhost: 80",
+                     "localhost:8 0", "localhost:65536", "localhost:99999", "localhost:123456",
+                     "localhost:８０", "127.0.0.1:0x50", "localhost:80.", "localhost:" + "9" * 5000):
+            with self.subTest(host=host[:40]):
+                self.assertFalse(serve.host_allowed(host))
+
+    def test_malformed_ipv6_literals_are_refused(self):
+        # The first seven used to be allowed: everything after "]" was ignored.
+        for host in ("[::1]junk", "[::1]x:8765", "[::1].", "[::1]]", "[::1]:", "[::1]:abc", "[::1]:8765:1",
+                     "[::1", "::1]", "[[::1]", "[]", "[]:8765", "[::1%25eth0]", "[0:0:0:0:0:0:0:1]x"):
+            with self.subTest(host=host):
+                self.assertFalse(serve.host_allowed(host))
+
+    def test_other_malformed_hosts_are_refused(self):
+        for host in (":8765", ":", "localhost..", "localhost..:8765", "127.0.0.1:80:80", "localhost:8765:1",
+                     "localhost\t:8765", "local host", "localhost\x00"):
+            with self.subTest(host=host):
+                self.assertFalse(serve.host_allowed(host))
+
 
 class SafeWorldPathTest(unittest.TestCase):
     """safe_world_path resolves /world/... inside the world folder or refuses it."""
@@ -110,11 +137,13 @@ class SafeWorldPathTest(unittest.TestCase):
         self.assertIsNone(self.resolve("/world/escape.bin"))
 
 
-def raw_request(port, target, host="127.0.0.1", method="GET"):
-    """Send a request without letting a client library normalise the target path."""
+def raw_request(port, target, host="127.0.0.1", method="GET", extra_headers=()):
+    """Send a request without letting a client library normalise the target path or merge headers.
+    `extra_headers` are raw "Name: value" lines sent after Host, e.g. a second Host field."""
     lines = [f"{method} {target} HTTP/1.1"]
     if host is not None:
         lines.append(f"Host: {host}")
+    lines += list(extra_headers)
     lines += ["Connection: close", "", ""]
     with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
         sock.sendall("\r\n".join(lines).encode("latin-1"))
@@ -191,6 +220,36 @@ class HandlerTest(unittest.TestCase):
                 status, head, _ = raw_request(self.port, target, host="evil.example:8765")
                 self.assertEqual(status, 403)
                 self.assertIn("cache-control: no-store", head.lower())
+
+    def test_duplicate_host_headers_get_400(self):
+        # headers.get("Host") returned only the first field, so a loopback Host followed by a foreign one was served.
+        loopback = f"127.0.0.1:{self.port}"
+        cases = {
+            "loopback then foreign": (loopback, ["Host: evil.example"]),
+            "foreign then loopback": ("evil.example", [f"Host: {loopback}"]),
+            "the same loopback twice": (loopback, [f"Host: {loopback}"]),
+            "a lowercase second field": (loopback, ["host: evil.example"]),
+            "an empty second field": (loopback, ["Host:"]),
+            "three fields": (loopback, [f"Host: localhost:{self.port}", "Host: [::1]"]),
+        }
+        for method in ("GET", "HEAD"):
+            for target in ("/world/ok.bin", "/index.html"):
+                for label, (host, extra) in cases.items():
+                    with self.subTest(method=method, target=target, case=label):
+                        status, head, body = raw_request(self.port, target, host=host, method=method,
+                                                         extra_headers=extra)
+                        self.assertEqual(status, 400)
+                        self.assertIn("cache-control: no-store", head.lower())
+                        self.assertNotIn(b"world-bytes", body)
+                        self.assertNotIn(b"<title>viewer</title>", body)
+
+    def test_a_malformed_host_gets_403(self):
+        for host in (f"127.0.0.1:{self.port}junk", "localhost:abc", f"[::1]evil.example:{self.port}",
+                     "localhost:" + "9" * 5000):
+            with self.subTest(host=host[:40]):
+                status, _, body = raw_request(self.port, "/world/ok.bin", host=host)
+                self.assertEqual(status, 403)
+                self.assertNotIn(b"world-bytes", body)
 
     def test_traversal_attempts_get_403(self):
         for target in ("/world/../secret.txt", "/world/%2e%2e/secret.txt",
