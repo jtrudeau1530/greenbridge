@@ -24,6 +24,13 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _make_parent(path: str) -> None:
+    """Create the folder a report lives in: the run is over by the time the summary is written."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def norm(path: str) -> str:
     return path.replace("\\", "/").rstrip("/")
 
@@ -183,13 +190,18 @@ def main() -> int:
         print("required tests that did not pass: " + ", ".join(failed_required))
 
     if args.summary:
-        with open(args.summary, "a", encoding="utf-8") as f:
-            f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
-            f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
-            f.write("| Test | Result | Required |\n|---|---|---|\n")
-            for name, status in results.items():
-                f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
-            f.write("\n")
+        try:
+            _make_parent(args.summary)
+            with open(args.summary, "a", encoding="utf-8") as f:
+                f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
+                f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
+                f.write("| Test | Result | Required |\n|---|---|---|\n")
+                for name, status in results.items():
+                    f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write the summary {args.summary}: {e.strerror or e}", file=sys.stderr)
+            return 1
     return 1 if failed_required else 0
 
 
