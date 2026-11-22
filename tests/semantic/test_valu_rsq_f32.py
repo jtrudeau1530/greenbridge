@@ -27,10 +27,12 @@ Python 3.9+ compatible (from __future__ import annotations).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import math
 import struct
 import unittest
-from typing import Tuple
+from typing import List, Optional, Tuple, Union
 
 MASK32: int = 0xFFFF_FFFF
 SIGN_MASK_F32: int = 0x8000_0000
@@ -272,6 +274,194 @@ class TestF32ModelAndOracle(unittest.TestCase):
         self.assertEqual(sign, 0)
         self.assertEqual(exp, 129)
         self.assertEqual(frac, 0)
+
+
+# ============================================================================
+# Section 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ============================================================================
+
+class RegType(Enum):
+    """Architectural register file identifier."""
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class RegRef:
+    """A single 32-bit vector or scalar register (v[d] or s[s])."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of valid range [0, 255]")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of valid range [0, 105]")
+        else:
+            raise ValueError(f"Invalid register type for RegRef: {self.reg_type}")
+
+    def __str__(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """A 32-bit immediate constant bit pattern."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= MASK32):
+            raise ValueError(f"Literal32 bits {hex(self.bits)} out of range [0, 2^32-1]")
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal32:
+        return cls(f32_to_bits(val))
+
+    def to_float(self) -> float:
+        return bits_to_f32(self.bits)
+
+    def __str__(self) -> str:
+        return f"0x{self.bits:08x}"
+
+
+@dataclass(frozen=True)
+class VOP1Operand:
+    """A VOP1/VOP3 source operand with optional input modifiers (abs and neg)."""
+    reg: Optional[RegRef] = None
+    literal: Optional[Literal32] = None
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def __post_init__(self) -> None:
+        if (self.reg is None) == (self.literal is None):
+            raise ValueError("VOP1Operand must specify exactly one of reg or literal")
+
+    @classmethod
+    def from_vgpr(cls, index: int, abs_mod: bool = False, neg_mod: bool = False) -> VOP1Operand:
+        return cls(reg=RegRef(index, RegType.VGPR), abs_mod=abs_mod, neg_mod=neg_mod)
+
+    @classmethod
+    def from_sgpr(cls, index: int, abs_mod: bool = False, neg_mod: bool = False) -> VOP1Operand:
+        return cls(reg=RegRef(index, RegType.SGPR), abs_mod=abs_mod, neg_mod=neg_mod)
+
+    @classmethod
+    def from_lit(cls, bits: int, abs_mod: bool = False, neg_mod: bool = False) -> VOP1Operand:
+        return cls(literal=Literal32(bits), abs_mod=abs_mod, neg_mod=neg_mod)
+
+    def __str__(self) -> str:
+        core = str(self.reg) if self.reg is not None else str(self.literal)
+        if self.abs_mod:
+            core = f"|{core}|"
+        if self.neg_mod:
+            core = f"-{core}"
+        return core
+
+
+@dataclass(frozen=True)
+class VRSQF32Instruction:
+    """Symbolic AST node for RDNA2 VALU v_rsq_f32 instruction."""
+    dst: RegRef
+    src0: VOP1Operand
+    clamp: bool = False
+    flush_denorms: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise ValueError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+
+    def disasm(self) -> str:
+        """Render GCN/RDNA assembly representation."""
+        res = f"v_rsq_f32 {self.dst}, {self.src0}"
+        if self.clamp:
+            res += " clamp"
+        return res
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_ref_creation_and_bounds(self) -> None:
+        """Test register reference construction, indexing, and boundary validation."""
+        v = RegRef(0, RegType.VGPR)
+        self.assertEqual(v.index, 0)
+        self.assertEqual(str(v), "v0")
+
+        s = RegRef(10, RegType.SGPR)
+        self.assertEqual(s.index, 10)
+        self.assertEqual(str(s), "s10")
+
+        # Boundary checks
+        RegRef(255, RegType.VGPR)
+        RegRef(105, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            RegRef(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegRef(106, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            RegRef(-1, RegType.VGPR)
+
+    def test_literal32_creation(self) -> None:
+        """Test 32-bit immediate literal operand."""
+        lit = Literal32(ONE_F32)
+        self.assertEqual(lit.to_float(), 1.0)
+        self.assertEqual(str(lit), "0x3f800000")
+
+        lit2 = Literal32.from_float(4.0)
+        self.assertEqual(lit2.bits, FOUR_F32)
+
+        with self.assertRaises(ValueError):
+            Literal32(-1)
+        with self.assertRaises(ValueError):
+            Literal32(1 << 32)
+
+    def test_vop1_operand_formatting(self) -> None:
+        """Test formatting of VOP1/VOP3 operands with input modifiers."""
+        op_plain = VOP1Operand.from_vgpr(4)
+        self.assertEqual(str(op_plain), "v4")
+
+        op_abs = VOP1Operand.from_vgpr(4, abs_mod=True)
+        self.assertEqual(str(op_abs), "|v4|")
+
+        op_neg = VOP1Operand.from_vgpr(4, neg_mod=True)
+        self.assertEqual(str(op_neg), "-v4")
+
+        op_neg_abs = VOP1Operand.from_vgpr(4, abs_mod=True, neg_mod=True)
+        self.assertEqual(str(op_neg_abs), "-|v4|")
+
+        op_sgpr = VOP1Operand.from_sgpr(0)
+        self.assertEqual(str(op_sgpr), "s0")
+
+        op_lit = VOP1Operand.from_lit(ONE_F32)
+        self.assertEqual(str(op_lit), "0x3f800000")
+
+        with self.assertRaises(ValueError):
+            VOP1Operand(reg=None, literal=None)
+
+    def test_instruction_disasm(self) -> None:
+        """Test disassembly output of VRSQF32Instruction."""
+        instr_basic = VRSQF32Instruction(
+            dst=RegRef(0, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(2),
+        )
+        self.assertEqual(instr_basic.disasm(), "v_rsq_f32 v0, v2")
+
+        instr_mod = VRSQF32Instruction(
+            dst=RegRef(4, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(6, abs_mod=True, neg_mod=True),
+            clamp=True,
+        )
+        self.assertEqual(instr_mod.disasm(), "v_rsq_f32 v4, -|v6| clamp")
+
+        # Destination must be VGPR
+        with self.assertRaises(ValueError):
+            VRSQF32Instruction(
+                dst=RegRef(0, RegType.SGPR),
+                src0=VOP1Operand.from_vgpr(2),
+            )
 
 
 if __name__ == "__main__":
