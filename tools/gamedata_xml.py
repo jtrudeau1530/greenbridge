@@ -15,7 +15,9 @@ separates rootless fragments, tail-only documents and malformed documents.
 Only schema names, element/attribute names and reference tokens are written. Element text, attribute values,
 ``type``/``content`` values and entry paths are not. For a carve directory a row is identified by offset; an
 individual file is identified by the basename that was passed. The output is a local work product: it must not
-be committed or attached to an issue. The test fixtures are synthetic and contain no game data.
+be committed or attached to an issue. Report paths are refused before the scan when they alias an input: a
+nested XML in directory mode, or a carve ``index.json`` or stream. The test fixtures are synthetic and contain
+no game data.
 """
 import argparse
 import csv
@@ -431,6 +433,27 @@ def xml_files(directory: str):
                 yield os.path.join(base, name)
 
 
+def input_files(targets: list):
+    """Yield every file the scan will read, so a report path cannot overwrite one.
+
+    Directory mode reads every nested ``*.xml``; carve mode reads ``index.json`` and the
+    ``<offset>.bin``/``<offset>.bk2`` stream files next to it. A report path only has to match
+    one of these, not the target argument itself.
+    """
+    for target in targets:
+        if os.path.isdir(target):
+            if os.path.isfile(os.path.join(target, "index.json")):
+                yield os.path.join(target, "index.json")
+                with os.scandir(target) as entries:
+                    for entry in entries:
+                        if entry.is_file() and entry.name.lower().endswith((".bin", ".bk2")):
+                            yield entry.path
+            else:
+                yield from xml_files(target)
+        elif os.path.isfile(target):
+            yield target
+
+
 def document_mode(targets: list) -> str:
     for target in targets:
         if os.path.isdir(target) and os.path.isfile(os.path.join(target, "index.json")):
@@ -601,8 +624,7 @@ def main() -> int:
             continue
         if os.path.isdir(path):
             parser.error(f"{flag} is a directory: {path}")
-        for target in args.targets:
-            source = os.path.join(target, "index.json") if os.path.isdir(target) else target
+        for source in input_files(args.targets):
             if same_report_path(path, source):
                 parser.error(f"{flag} would overwrite the input {source}")
 
