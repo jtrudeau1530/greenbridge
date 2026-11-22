@@ -632,7 +632,8 @@ def _walk_volumes(b, vol, dc, stats):
         return vol is None
     if vol is None or dc % 2 != 0 or vol + 96 * dc > len(b):
         return False
-    vstats = stats["volumes"]
+    flags = Counter()
+    vertex_counts = Counter()
     for p in range(dc // 2):
         o0 = vol + (2 * p) * 96
         o1 = o0 + 96
@@ -649,11 +650,14 @@ def _walk_volumes(b, vol, dc, stats):
             return False
         if not (_zero(b, o1 + 0x16 + 4 * vc1, o1 + 0x56) and _zero(b, o1 + 0x5A, o1 + 0x60)):
             return False
-        vstats["pairs"] += 1
-        vstats["flags"][f0] += 1
-        vstats["flags"][f1] += 1
-        vstats["vertex_counts"][vc0] += 1
-        vstats["vertex_counts"][vc1] += 1
+        flags[f0] += 1
+        flags[f1] += 1
+        vertex_counts[vc0] += 1
+        vertex_counts[vc1] += 1
+    vstats = stats["volumes"]
+    vstats["pairs"] += dc // 2
+    vstats["flags"].update(flags)
+    vstats["vertex_counts"].update(vertex_counts)
     return True
 
 

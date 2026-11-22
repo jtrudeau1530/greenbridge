@@ -542,6 +542,17 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(cn["polygons_chain"]["fail"], 1)
         self.assertEqual(cn["quadtree_valid"]["fail"], 1)
 
+        # A malformed second volume pair must not partially increment navmesh.volumes counters.
+        tile = bytearray(build_navmesh(n_volumes=4)[0])
+        vstart = nd.offset_of(struct.unpack_from("<Q", tile, 0xB8)[0])
+        tile[vstart + 3 * 96 + 0x14] = 7
+        st = nd.new_stats()["navmesh"]
+        _, chk = nd.decode_navmesh(bytes(tile), 1, st, True)
+        self.assertFalse(chk["volumes_valid"])
+        self.assertEqual(st["volumes"]["pairs"], 0)
+        self.assertEqual(dict(st["volumes"]["flags"]), {})
+        self.assertEqual(dict(st["volumes"]["vertex_counts"]), {})
+
         cg = doc["checks"]["grid"]
         self.assertEqual(cg["control_bytes"]["fail"], 1)
         self.assertEqual(cg["occupied_equals_entries"]["fail"], 2)
