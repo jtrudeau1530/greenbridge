@@ -313,16 +313,8 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
 
 // The host PC runtime's D3D12 device to compare answers with: the default adapter, or the one LEONIDA_HOST_ADAPTER
 // names ("warp", or part of an adapter's name); false if there is none.
-// Under Wine there is none to compare with either: its d3d12.dll (vkd3d) lays out depth-stencil formats in one plane,
-// rejects R9G9B9E5 and BC footprints and accepts descriptions Microsoft's runtime refuses, so it is no reference.
+// Under Wine there is none (copycmp::create_host).
 bool create_host_device(Ref<ID3D12Device>& host) {
-    static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
-    if (wine) {
-        static bool said = false;
-        if (!said) std::printf("host D3D12 is Wine's, not Microsoft's: comparisons with the host are skipped\n");
-        said = true;
-        return false;
-    }
     copycmp::Ptr<ID3D12Device> device;
     std::string name;
     if (!copycmp::create_host(device, name)) return false;
@@ -1115,6 +1107,7 @@ int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts)
 // highest supported value clamped to what the layer can honour (DXIL 1.0, root signature 1.1). Returns the number
 // of mismatches, or -1 when the host has no D3D12 device.
 int compare_feature_support(ID3D12Device* ours) {
+    if (copycmp::host_is_wine()) return -1;
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
                                     reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
@@ -1221,6 +1214,7 @@ int compare_feature_support(ID3D12Device* ours) {
 bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physical,
                                      PFN_vkGetInstanceProcAddr instance_proc, Ref<ID3D12Device>& host,
                                      std::string& adapter_name) {
+    if (copycmp::host_is_wine()) return false;
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
                                     reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))

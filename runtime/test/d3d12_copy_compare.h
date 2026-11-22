@@ -38,8 +38,21 @@ struct Ptr {
     T* operator->() const { return p; }
 };
 
+// True under Wine, where there is no host to compare with: the comparisons take Microsoft's d3d12.dll as the
+// reference, and Wine's (vkd3d) lays out depth-stencil formats in one plane, rejects R9G9B9E5 and BC footprints,
+// accepts descriptions Microsoft's runtime refuses and answers shader model 5.1. Its device also shares the process's
+// Vulkan with ours (winevulkan asserted in vkBindBufferMemory). Says so once.
+inline bool host_is_wine() {
+    static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    static bool said = false;
+    if (wine && !said) std::printf("host D3D12 is Wine's, not Microsoft's: comparisons with the host are skipped\n");
+    said = true;
+    return wine;
+}
+
 // An explicit adapter LUID takes precedence over LEONIDA_HOST_ADAPTER for same-adapter comparisons.
 inline bool try_create_host(Ptr<ID3D12Device>& host, std::string& name, const LUID* luid = nullptr) {
+    if (host_is_wine()) return false;
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!d3d12 || !dxgi) return false;

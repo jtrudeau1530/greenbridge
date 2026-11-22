@@ -780,7 +780,10 @@ std::string written_images_blocked() {
     }
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto each = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed) / probes;
-    if (each > slow)
+    // Under Wine there is no such software, and its file I/O alone can average over 25 ms on a CI runner (38 and
+    // 40 ms seen in the wine job): the refusals and contents above are still checked, the time isn't.
+    const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    if (each > slow && !wine)
         return "writing and reading one back took " + std::to_string(each.count()) + " ms on average (over " +
                std::to_string(slow.count()) + " ms means each is being scanned)";
     return {};
