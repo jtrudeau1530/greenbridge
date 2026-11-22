@@ -128,8 +128,9 @@ Current limits, by design:
   the caller's to run.
 - Every thread started after `load()` gets its own copy of the TLS template, from
   `gta6rt_tls_host.dll`'s `DLL_THREAD_ATTACH`, and gives it back at `DLL_THREAD_DETACH`, also when the
-  thread outlives its `Loader`. Once `initialise()` has run the module, those events also run its TLS
-  callbacks, with the thread's copy already in place. A thread that existed before `load()` gets nothing:
+  thread outlives its `Loader`. From `initialise()` until `~Loader` starts the process detach, those
+  events also run the module's TLS callbacks, with the thread's copy already in place. A thread that
+  existed before `load()` gets nothing:
   call `install_tls_for_thread()` before mapped code runs on it and `uninstall_tls_for_thread()` before it
   exits. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
   called `load()`.
