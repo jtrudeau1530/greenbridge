@@ -465,6 +465,25 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         res = self.run_carve(missing, self.out)
         self.assertNotEqual(res.returncode, 0)
 
+    def test_bad_inputs_are_usage_errors_and_leave_no_output_folder(self):
+        empty = os.path.join(self.dir, "empty.rpf")
+        open(empty, "wb").close()
+        cases = ((os.path.join(self.dir, "missing.rpf"), "is not a file"),
+                 (self.dir, "is not a file"),
+                 (empty, "is empty"))
+        for archive, message in cases:
+            res = self.run_carve(archive, self.out)
+            self.assertEqual(res.returncode, 2, res.stderr)
+            self.assertIn(message, res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertFalse(os.path.exists(self.out))
+
+    def test_no_arguments_is_a_usage_error(self):
+        res = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("required", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

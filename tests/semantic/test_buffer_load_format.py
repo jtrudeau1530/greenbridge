@@ -109,6 +109,31 @@ class SubDwordElements(unittest.TestCase):
                 self.assertEqual(load_format(FMT_F16, off, 1)[0], f16_word(half))
 
 
+class CrossingDwordBoundary(unittest.TestCase):
+    """An element that starts mid-dword must read the following dwords, not re-read dword 0.
+
+    #234 left this open: `need` used to be ceil(size/4), so a 4-byte format at byte 3
+    (or an 8-byte format at byte 6) took its tail from the first dword. MEMORY is
+    0x11223344, 0xDEADBEEF, 0xCAFEF00D, 0x0BADC0DE at 0x1000..0x100C.
+    """
+
+    def test_uint8x4_at_byte_3(self):
+        # Bytes at 0x1003..0x1006: 0x11, 0xEF, 0xBE, 0xAD.
+        self.assertEqual(load_format(FMT_UINT8X4, 3), (0x11, 0xEF, 0xBE, 0xAD))
+
+    def test_uint8x4_at_byte_1(self):
+        # Bytes at 0x1001..0x1004: 0x33, 0x22, 0x11, 0xEF.
+        self.assertEqual(load_format(FMT_UINT8X4, 1), (0x33, 0x22, 0x11, 0xEF))
+
+    def test_uint16x2_at_byte_2(self):
+        # 4-byte element at 0x1002: 0x1122, then 0xBEEF (low half of the next dword).
+        self.assertEqual(load_format(FMT_UINT16X2, 2, 2)[:2], (0x1122, 0xBEEF))
+
+    def test_uint16x4_at_byte_6(self):
+        # 8-byte element at 0x1006: 0xDEAD, 0xF00D, 0xCAFE, 0xC0DE.
+        self.assertEqual(load_format(FMT_UINT16X4, 6), (0xDEAD, 0xF00D, 0xCAFE, 0xC0DE))
+
+
 class InterpreterConversions(unittest.TestCase):
     """The ops the format decode needs from spirv_mini_interp: integer to float and GLSL FMin/FMax."""
 

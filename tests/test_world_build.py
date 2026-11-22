@@ -1299,6 +1299,40 @@ class WorldBuildTest(unittest.TestCase):
                     if not existing_output:
                         self.assertFalse(os.path.exists(output))
 
+    def test_malformed_optional_material_arrays_match_missing_fields(self):
+        cases = (
+            ("MeshShaders", 7),
+            ("MeshShaders", "0"),
+            ("MeshShaders", {"0": 0}),
+            ("Embedded", True),
+            ("Materials", 7),
+            ("Materials", {"0": {}}),
+            ("Textures", 1.5),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            path = _write_synthetic_assets(assets)["models_manifest_path"]
+            with open(path, encoding="utf-8") as f:
+                original = f.read()
+
+            def build(manifest):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f)
+                result = world_build.build_world(assets, output)
+                self.assertEqual(result["stats"]["models"], 2)
+                return self._output_snapshot(output)
+
+            for field, malformed in cases:
+                with self.subTest(field=field, malformed=malformed):
+                    manifest = json.loads(original)
+                    record = manifest["Items"][0]
+                    if field == "Textures":
+                        record = record["Materials"][0]
+                    del record[field]
+                    expected = build(manifest)
+                    record[field] = malformed
+                    self.assertEqual(build(manifest), expected)
+
     def test_limit_zero_explicitly_replaces_world_with_empty_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")

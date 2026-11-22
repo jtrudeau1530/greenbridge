@@ -513,6 +513,11 @@ def main():
     ap.add_argument("--all-strings", action="store_true", help="write every readable string to JSON (game data)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .csv or .json file")
+    folder = os.path.dirname(os.path.abspath(a.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
     limit = None if a.all_strings else a.strings
     try:
         if os.path.isdir(a.source):
@@ -524,6 +529,8 @@ def main():
             rows, records, summary = scan_rpf(a.source, a.start, a.limit, progress, string_limit=limit)
     except ValueError as e:
         sys.exit(f"{a.source}: {e}")
+    except OSError as e:
+        sys.exit(f"{a.source}: {e.strerror or e}")
     write_output(a.out, records, summary, all_strings=a.all_strings)
     if not a.quiet:
         s = summary["rbf0"]

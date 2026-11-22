@@ -49,6 +49,10 @@ def asm_mattr(path):
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
+def shader_source(name):
+    return "vs_clip" if name in CLIP_CASES else name
+
+
 def clip_container():
     # One OSG1 element: stream 0, SV_ClipDistance0.xy, float, logical register 2.
     name = b"SV_ClipDistance\0"
@@ -62,7 +66,7 @@ def translate_tests(work, names):
     disasm.mkdir()
     fssm.mkdir()
     for n in names:
-        asm_path = os.path.join(HERE, ("vs_clip" if n in CLIP_CASES else n) + ".asm")
+        asm_path = os.path.join(HERE, shader_source(n) + ".asm")
         raw = Path(asm_path).read_text(encoding="utf-8")
         mattr = asm_mattr(asm_path)
         cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]

@@ -360,6 +360,11 @@ def main():
                     help="skip a stream that inflates above this many bytes (default: 512 MiB)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+    if os.path.isdir(args.out):
+        ap.error(f"{args.out} is a folder, not a .csv or .json file")
+    folder = os.path.dirname(os.path.abspath(args.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
     try:
         if os.path.isdir(args.source):
             rows, summary = scan_dir(args.source)
@@ -367,6 +372,8 @@ def main():
             rows, summary = scan_rpf(args.source, args.start, args.limit, args.max_inflate)
     except ValueError as e:
         sys.exit(f"{args.source}: {e}")
+    except OSError as e:
+        sys.exit(f"{args.source}: {e.strerror or e}")
     write_output(args.out, rows, summary)
     if not args.quiet:
         print(json.dumps({k: summary[k] for k in

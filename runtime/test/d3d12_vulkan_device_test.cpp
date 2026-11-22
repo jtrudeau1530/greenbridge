@@ -2,14 +2,15 @@
 // the proxy the way the game will call it: device methods (forwarded slots), descriptor heaps from slot 14 with
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue and a fence. Results are read back through D3D12 itself
-// (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints and GetResourceAllocationInfo are
-// compared with the host PC runtime's.
-// No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation
-// error fails the test.
+// (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo and
+// GetResourceTiling are compared with the host PC runtime's. WriteToSubresource/ReadFromSubresource run on
+// devices of their own, once per copy path. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run
+// under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -115,6 +116,193 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     barrier.Transition.StateBefore = before;
     barrier.Transition.StateAfter = after;
     return barrier;
+}
+
+std::uint8_t texel_byte(UINT x, UINT y, UINT z, UINT i) { return std::uint8_t(x * 31 + y * 7 + z * 61 + i * 3 + 1); }
+
+// WriteToSubresource/ReadFromSubresource on `device`. Textures in a CPU-visible custom heap copy on the host when the
+// device has VK_EXT_host_image_copy, through a staging submit when it doesn't; main runs this once per path. Covers
+// zero-filled first reads, boxes with pitches unlike the texture's, a mip, a volume, BC1 blocks, a default-heap
+// texture (always staged), the rejected calls, and both directions between the CPU copies and GPU copies.
+int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
+    const D3D12_HEAP_PROPERTIES cpu_heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0};
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto create = [&](const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC& desc,
+                            D3D12_RESOURCE_STATES state, Ref<ID3D12Resource>& out) {
+        return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&out.p));
+    };
+    unsigned bad = 0;
+    const auto expect_bytes = [&](const char* what, UINT x, UINT y, UINT z, const std::uint8_t* got,
+                                  const std::array<std::uint8_t, 4>& want) {
+        if (std::memcmp(got, want.data(), 4) == 0) return;
+        if (bad++ < 8)
+            std::fprintf(stderr, "%s, %s (%u,%u,%u): got %02x %02x %02x %02x, want %02x %02x %02x %02x\n", path, what,
+                         x, y, z, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+    };
+    const auto texel = [](UINT x, UINT y, UINT z) {
+        return std::array<std::uint8_t, 4>{texel_byte(x, y, z, 0), texel_byte(x, y, z, 1), texel_byte(x, y, z, 2),
+                                           texel_byte(x, y, z, 3)};
+    };
+    constexpr std::array<std::uint8_t, 4> zero{};
+
+    Ref<ID3D12Resource> tex, vol, bc1, gpu_only, buffer, upload, readback;
+    EXPECT(SUCCEEDED(create(cpu_heap, texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 2),
+                            D3D12_RESOURCE_STATE_COMMON, tex)));
+    D3D12_RESOURCE_DESC volume = texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 4);
+    volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    EXPECT(SUCCEEDED(create(cpu_heap, volume, D3D12_RESOURCE_STATE_COMMON, vol)));
+    if (bc)
+        EXPECT(SUCCEEDED(create(cpu_heap, texture_desc(8, 8, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_COMMON, bc1)));
+    EXPECT(SUCCEEDED(create(default_heap, texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_SOURCE, gpu_only)));
+    EXPECT(SUCCEEDED(create(cpu_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_COMMON, buffer)));
+    EXPECT(SUCCEEDED(create(upload_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_GENERIC_READ, upload)));
+    EXPECT(SUCCEEDED(create(readback_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_COPY_DEST, readback)));
+
+    // A texture in a CPU-visible heap maps only without a pointer; a default-heap texture not at all.
+    void* pointer = nullptr;
+    EXPECT(tex->Map(0, nullptr, nullptr) == S_OK);
+    EXPECT(tex->Map(1, nullptr, nullptr) == S_OK);
+    EXPECT(tex->Map(0, nullptr, &pointer) == E_INVALIDARG);
+    EXPECT(tex->Map(2, nullptr, nullptr) == E_INVALIDARG);
+    EXPECT(gpu_only->Map(0, nullptr, nullptr) == E_INVALIDARG);
+    tex->Unmap(1, nullptr);
+
+    // A new texture reads back zero-filled.
+    std::vector<std::uint8_t> got(1024, 0xcd);
+    EXPECT(SUCCEEDED(tex->ReadFromSubresource(got.data(), 32, 0, 0, nullptr)));
+    for (UINT y = 0; y < 8; ++y)
+        for (UINT x = 0; x < 8; ++x) expect_bytes("new texture", x, y, 0, &got[y * 32 + x * 4], zero);
+
+    // A 5x4 box from rows 100 bytes apart, read back whole at a 40-byte pitch.
+    std::vector<std::uint8_t> src(1024, 0);
+    const D3D12_BOX box{2, 1, 0, 7, 5, 1};
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 5; ++x) std::memcpy(&src[y * 100 + x * 4], texel(x + 2, y + 1, 0).data(), 4);
+    EXPECT(SUCCEEDED(tex->WriteToSubresource(0, &box, src.data(), 100, 0)));
+    std::fill(got.begin(), got.end(), std::uint8_t(0xcd));
+    EXPECT(SUCCEEDED(tex->ReadFromSubresource(got.data(), 40, 0, 0, nullptr)));
+    for (UINT y = 0; y < 8; ++y)
+        for (UINT x = 0; x < 8; ++x) {
+            const bool inside = x >= 2 && x < 7 && y >= 1 && y < 5;
+            expect_bytes("boxed write", x, y, 0, &got[y * 40 + x * 4], inside ? texel(x, y, 0) : zero);
+        }
+
+    // Mip 1 (4x4) written whole, read back as a box.
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) std::memcpy(&src[y * 16 + x * 4], texel(x, y, 1).data(), 4);
+    EXPECT(SUCCEEDED(tex->WriteToSubresource(1, nullptr, src.data(), 16, 0)));
+    const D3D12_BOX mip_box{1, 1, 0, 3, 4, 1};
+    std::fill(got.begin(), got.end(), std::uint8_t(0xcd));
+    EXPECT(SUCCEEDED(tex->ReadFromSubresource(got.data(), 8, 0, 1, &mip_box)));
+    for (UINT y = 0; y < 3; ++y)
+        for (UINT x = 0; x < 2; ++x) expect_bytes("mip 1", x + 1, y + 1, 1, &got[y * 8 + x * 4], texel(x + 1, y + 1, 1));
+
+    // A volume: three slices of a 3x4 box, rows 12 and slices 64 bytes apart; read back whole at other pitches.
+    std::fill(src.begin(), src.end(), std::uint8_t(0));
+    const D3D12_BOX volume_box{1, 0, 1, 4, 4, 4};
+    for (UINT z = 0; z < 3; ++z)
+        for (UINT y = 0; y < 4; ++y)
+            for (UINT x = 0; x < 3; ++x) std::memcpy(&src[z * 64 + y * 12 + x * 4], texel(x + 1, y, z + 1).data(), 4);
+    EXPECT(SUCCEEDED(vol->WriteToSubresource(0, &volume_box, src.data(), 12, 64)));
+    std::fill(got.begin(), got.end(), std::uint8_t(0xcd));
+    EXPECT(SUCCEEDED(vol->ReadFromSubresource(got.data(), 20, 96, 0, nullptr)));
+    for (UINT z = 0; z < 4; ++z)
+        for (UINT y = 0; y < 4; ++y)
+            for (UINT x = 0; x < 4; ++x)
+                expect_bytes("volume", x, y, z, &got[z * 96 + y * 20 + x * 4], x >= 1 && z >= 1 ? texel(x, y, z) : zero);
+
+    // BC1: 2x2 blocks of 8 bytes written whole, then one block replaced through a box.
+    if (bc1.p) {
+        std::uint8_t blocks[32];
+        for (UINT i = 0; i < 32; ++i) blocks[i] = std::uint8_t(0x40 + i);
+        EXPECT(SUCCEEDED(bc1->WriteToSubresource(0, nullptr, blocks, 16, 0)));
+        const D3D12_BOX corner{4, 4, 0, 8, 8, 1};
+        const std::uint8_t replaced[8] = {0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7};
+        EXPECT(SUCCEEDED(bc1->WriteToSubresource(0, &corner, replaced, 8, 0)));
+        std::memcpy(blocks + 24, replaced, 8);
+        std::uint8_t back[64] = {};
+        EXPECT(SUCCEEDED(bc1->ReadFromSubresource(back, 32, 0, 0, nullptr)));
+        for (UINT row = 0; row < 2; ++row)
+            if (std::memcmp(back + row * 32, blocks + row * 16, 16) != 0 && bad++ < 8)
+                std::fprintf(stderr, "%s, BC1 block row %u differs\n", path, row);
+        const D3D12_BOX cut{2, 0, 0, 8, 4, 1};  // starts inside a block
+        EXPECT(bc1->WriteToSubresource(0, &cut, blocks, 16, 0) == E_INVALIDARG);
+    }
+
+    // Calls D3D12 rejects.
+    const D3D12_BOX outside{0, 0, 0, 9, 1, 1}, empty{2, 2, 0, 2, 3, 1};
+    EXPECT(tex->WriteToSubresource(0, &outside, src.data(), 100, 0) == E_INVALIDARG);
+    EXPECT(tex->WriteToSubresource(0, &empty, src.data(), 100, 0) == E_INVALIDARG);
+    EXPECT(tex->WriteToSubresource(2, nullptr, src.data(), 100, 0) == E_INVALIDARG);  // 2 mips, 1 layer
+    EXPECT(tex->WriteToSubresource(0, nullptr, nullptr, 32, 0) == E_INVALIDARG);
+    EXPECT(tex->ReadFromSubresource(nullptr, 32, 0, 0, nullptr) == E_INVALIDARG);
+    EXPECT(tex->WriteToSubresource(0, nullptr, src.data(), 16, 0) == E_INVALIDARG);  // 32-byte rows 16 apart
+    EXPECT(vol->WriteToSubresource(0, nullptr, src.data(), 16, 32) == E_INVALIDARG);  // 64-byte slices 32 apart
+    EXPECT(buffer->WriteToSubresource(0, nullptr, src.data(), 16, 0) == E_INVALIDARG);
+
+    // A default-heap texture: D3D12 wants a CPU-visible heap, but the copy still works (and is logged).
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) std::memcpy(&src[y * 16 + x * 4], texel(x, y, 7).data(), 4);
+    EXPECT(SUCCEEDED(gpu_only->WriteToSubresource(0, nullptr, src.data(), 16, 0)));
+
+    // GPU copies see the CPU's writes (mip 1, the default-heap texture), and the CPU sees a GPU copy's (a 4x4
+    // upload into the bottom left of mip 0, which is in COMMON and promoted).
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    std::uint8_t* up = nullptr;
+    std::uint8_t* down = nullptr;
+    EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&down))));
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT square{0, {DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 256}};
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) std::memcpy(up + y * 256 + x * 4, texel(x, y + 4, 0).data(), 4);
+    std::memset(down, 0xcd, 4096);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT second = square;
+    second.Offset = 2048;
+    {
+        const auto dst = subresource(tex.p, 0);
+        const auto in = footprint(upload.p, square);
+        list->CopyTextureRegion(&dst, 0, 4, 0, &in, nullptr);
+        const auto out = footprint(readback.p, square);
+        const auto mip1 = subresource(tex.p, 1);
+        list->CopyTextureRegion(&out, 0, 0, 0, &mip1, nullptr);
+        const auto out2 = footprint(readback.p, second);
+        const auto staged = subresource(gpu_only.p, 0);
+        list->CopyTextureRegion(&out2, 0, 0, 0, &staged, nullptr);
+    }
+    EXPECT(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) {
+            expect_bytes("GPU copy of mip 1", x, y, 1, down + y * 256 + x * 4, texel(x, y, 1));
+            expect_bytes("GPU copy of the default-heap texture", x, y, 7, down + 2048 + y * 256 + x * 4, texel(x, y, 7));
+        }
+    const D3D12_BOX bottom_left{0, 4, 0, 4, 8, 1};
+    std::fill(got.begin(), got.end(), std::uint8_t(0xcd));
+    EXPECT(SUCCEEDED(tex->ReadFromSubresource(got.data(), 16, 0, 0, &bottom_left)));
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) expect_bytes("CPU read of a GPU upload", x, y + 4, 0, &got[y * 16 + x * 4], texel(x, y + 4, 0));
+    upload->Unmap(0, nullptr);
+    readback->Unmap(0, nullptr);
+    EXPECT(!bad);
+    std::printf("WriteToSubresource/ReadFromSubresource (%s): boxes, pitches, a mip, a volume%s, rejected calls and "
+                "GPU copies both ways matched\n", path, bc1.p ? ", BC1" : "");
+    return 0;
 }
 
 // The host PC runtime's D3D12 device on the default adapter, to compare answers with; false if there is none.
@@ -304,6 +492,366 @@ int compare_allocation_info(ID3D12Device* ours) {
     return mismatches;
 }
 
+D3D12_RESOURCE_DESC reserved_desc(D3D12_RESOURCE_DIMENSION dimension, UINT64 width, UINT height, UINT16 depth,
+                                  UINT16 mips, DXGI_FORMAT format) {
+    D3D12_RESOURCE_DESC desc = dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                                   ? buffer_desc(width)
+                                   : texture_desc(UINT(width), height, format, D3D12_RESOURCE_FLAG_NONE, mips, depth);
+    desc.Dimension = dimension;
+    if (dimension != D3D12_RESOURCE_DIMENSION_BUFFER) desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    return desc;
+}
+
+// GetResourceTiling against the PC runtime, for the same reserved resources. What D3D12 defines must match: the
+// tile shape, the standard and packed mip counts, every standard mip's tile counts and its start within its array
+// slice, the start of slice 0's packed tiles, and the number of standard tiles. How many tiles the packed mips
+// take is the driver's choice (src/resource_tiling.h), and with it the slice size and the total. A layout the host
+// refuses is skipped (drivers differ in what they accept); one the host accepts and ours refuses is a mismatch.
+// Returns the number of mismatches, or -1 without a host D3D12 device with tiled resources or with every layout
+// skipped.
+int compare_tiling(ID3D12Device* ours) {
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                    reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                              : nullptr;
+    Ref<ID3D12Device> host;
+    if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return -1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+        options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED)
+        return -1;
+    const bool volumes = options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_3;
+    const auto B = D3D12_RESOURCE_DIMENSION_BUFFER, T2 = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+               T3 = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const D3D12_RESOURCE_DESC cases[] = {
+        reserved_desc(B, 200000, 1, 1, 1, DXGI_FORMAT_UNKNOWN),
+        reserved_desc(T2, 1024, 1024, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM),
+        reserved_desc(T2, 1000, 300, 3, 0, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+        reserved_desc(T2, 512, 512, 1, 0, DXGI_FORMAT_R8_UNORM),
+        reserved_desc(T2, 512, 512, 1, 0, DXGI_FORMAT_R16_FLOAT),
+        reserved_desc(T2, 512, 512, 1, 0, DXGI_FORMAT_R16G16B16A16_FLOAT),
+        reserved_desc(T2, 512, 512, 2, 0, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        reserved_desc(T2, 2048, 2048, 1, 0, DXGI_FORMAT_BC1_UNORM),
+        reserved_desc(T2, 2048, 1024, 2, 0, DXGI_FORMAT_BC7_UNORM),
+        reserved_desc(T2, 1000, 600, 1, 0, DXGI_FORMAT_BC3_UNORM),
+        reserved_desc(T2, 128, 128, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM),
+        reserved_desc(T2, 100, 100, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM),
+        reserved_desc(T2, 4096, 64, 1, 0, DXGI_FORMAT_B8G8R8A8_UNORM),
+        reserved_desc(T2, 1024, 1024, 4, 3, DXGI_FORMAT_R32_FLOAT),
+        reserved_desc(T3, 256, 256, 64, 0, DXGI_FORMAT_R8G8B8A8_UNORM),
+        reserved_desc(T3, 128, 128, 128, 0, DXGI_FORMAT_R8_UNORM),
+        reserved_desc(T3, 64, 64, 64, 0, DXGI_FORMAT_R16G16B16A16_FLOAT),
+        reserved_desc(T3, 64, 64, 64, 0, DXGI_FORMAT_R32G32B32A32_FLOAT),
+    };
+    struct Tiling {
+        UINT total = 0, count = 64;
+        D3D12_PACKED_MIP_INFO packed{};
+        D3D12_TILE_SHAPE shape{};
+        D3D12_SUBRESOURCE_TILING subresources[64]{};
+    };
+    int mismatches = 0, compared = 0;
+    const auto report = [&](int index, const char* what, UINT a, UINT b) {
+        if (mismatches++ < 24) std::fprintf(stderr, "tiling case %d %s: ours %u host %u\n", index, what, a, b);
+    };
+    for (int index = 0; index < int(std::size(cases)); ++index) {
+        const D3D12_RESOURCE_DESC& desc = cases[index];
+        if (desc.Dimension == T3 && !volumes) continue;
+        Ref<ID3D12Resource> a, b;
+        const HRESULT ours_hr =
+            ours->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a.p));
+        const HRESULT host_hr =
+            host->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&b.p));
+        if (FAILED(host_hr)) {
+            // Which reserved resources a PC driver accepts varies: an RTX 3090 on driver 616.56 refuses texture
+            // arrays whose mips reach the packed tail (cases 2, 6 and 8, at tier 3), an RTX 5070 on 621.01 accepts
+            // them. The console is the reference for what the layer accepts, not the host, so there is nothing to
+            // compare here.
+            std::printf("GetResourceTiling case %d: the host runtime refuses it (0x%08lx), skipped\n", index,
+                        static_cast<unsigned long>(host_hr));
+            continue;
+        }
+        if (FAILED(ours_hr)) {
+            report(index, "creation refused by ours, accepted by the host (HRESULT low word)", ours_hr & 0xffff, 0);
+            continue;
+        }
+        ++compared;
+        Tiling x, y;
+        ours->GetResourceTiling(a.p, &x.total, &x.packed, &x.shape, &x.count, 0, x.subresources);
+        host->GetResourceTiling(b.p, &y.total, &y.packed, &y.shape, &y.count, 0, y.subresources);
+        if (x.shape.WidthInTexels != y.shape.WidthInTexels) report(index, "tile width", x.shape.WidthInTexels, y.shape.WidthInTexels);
+        if (x.shape.HeightInTexels != y.shape.HeightInTexels) report(index, "tile height", x.shape.HeightInTexels, y.shape.HeightInTexels);
+        if (x.shape.DepthInTexels != y.shape.DepthInTexels) report(index, "tile depth", x.shape.DepthInTexels, y.shape.DepthInTexels);
+        if (x.packed.NumStandardMips != y.packed.NumStandardMips) report(index, "standard mips", x.packed.NumStandardMips, y.packed.NumStandardMips);
+        if (x.packed.NumPackedMips != y.packed.NumPackedMips) report(index, "packed mips", x.packed.NumPackedMips, y.packed.NumPackedMips);
+        if (x.packed.StartTileIndexInOverallResource != y.packed.StartTileIndexInOverallResource)
+            report(index, "packed start", x.packed.StartTileIndexInOverallResource, y.packed.StartTileIndexInOverallResource);
+        if (x.count != y.count) {
+            report(index, "subresource count", x.count, y.count);
+            continue;
+        }
+        const UINT layers = desc.Dimension == T2 ? desc.DepthOrArraySize : 1;
+        const UINT mips = x.count / layers;
+        const UINT slice_x = x.total / layers, slice_y = y.total / layers;
+        if (slice_x - x.packed.NumTilesForPackedMips != slice_y - y.packed.NumTilesForPackedMips)
+            report(index, "standard tiles per slice", slice_x - x.packed.NumTilesForPackedMips,
+                   slice_y - y.packed.NumTilesForPackedMips);
+        if (y.packed.NumPackedMips && !x.packed.NumTilesForPackedMips) report(index, "packed tiles", 0, y.packed.NumTilesForPackedMips);
+        for (UINT i = 0; i < x.count; ++i) {
+            const auto &s = x.subresources[i], &t = y.subresources[i];
+            const UINT layer = i / mips;
+            if (desc.Dimension != B && i % mips >= y.packed.NumStandardMips) {
+                // Packed: no tiles of its own. (On slices after the first the PC runtime writes a tile index here,
+                // not the D3D12_PACKED_TILE its documentation gives; ours follows the documentation.)
+                if (s.WidthInTiles || s.HeightInTiles || s.DepthInTiles || s.StartTileIndexInOverallResource != D3D12_PACKED_TILE)
+                    report(index, "packed subresource", i, 0);
+                continue;
+            }
+            if (s.WidthInTiles != t.WidthInTiles || s.HeightInTiles != t.HeightInTiles || s.DepthInTiles != t.DepthInTiles ||
+                s.StartTileIndexInOverallResource - layer * slice_x != t.StartTileIndexInOverallResource - layer * slice_y)
+                report(index, "standard subresource", i, 0);
+        }
+    }
+    return compared ? mismatches : -1;
+}
+
+
+enum class ResolveScenario { full, rectangle, null_rectangle };
+
+const char* resolve_scenario_name(ResolveScenario scenario) {
+    switch (scenario) {
+    case ResolveScenario::full: return "ResolveSubresource";
+    case ResolveScenario::rectangle: return "ResolveSubresourceRegion(rect)";
+    case ResolveScenario::null_rectangle: return "ResolveSubresourceRegion(null rect)";
+    }
+    return "unknown";
+}
+
+UINT resolve_pixel_size(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return 4;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+    default: return 0;
+    }
+}
+
+// Runs one deterministic resolve on either the host D3D12 device or the Vulkan-backed proxy and returns only
+// packed texel bytes (row-pitch padding is discarded). The source/destination are cleared to solid colours so
+// every format and sample count exercises the resolve path without requiring a shader or game data.
+bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, ResolveScenario scenario,
+                     std::vector<std::uint8_t>& pixels) {
+#define RESOLVE_CHECK(condition) do { \
+    if (!(condition)) { \
+        std::fprintf(stderr, "resolve capture failed at line %d: %s (format %d, samples %u, %s)\n", \
+                     __LINE__, #condition, int(format), samples, resolve_scenario_name(scenario)); \
+        return false; \
+    } \
+} while (false)
+
+    const bool proxy = rt::d3d12_xs::is_device_proxy(device);
+    const UINT src_width = 8, src_height = 8;
+    const UINT dst_width = scenario == ResolveScenario::full ? src_width : 12;
+    const UINT dst_height = scenario == ResolveScenario::full ? src_height : 10;
+    const UINT pixel_size = resolve_pixel_size(format);
+    RESOLVE_CHECK(pixel_size != 0);
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC src_desc =
+        texture_desc(src_width, src_height, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    src_desc.SampleDesc.Count = samples;
+    D3D12_RESOURCE_DESC dst_desc =
+        texture_desc(dst_width, dst_height, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+
+    Ref<ID3D12Resource> src, dst, readback;
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &src_desc,
+                                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                             IID_PPV_ARGS(&src.p))));
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &dst_desc,
+                                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                             IID_PPV_ARGS(&dst.p))));
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    Ref<ID3D12DescriptorHeap> rtv_heap;
+    RESOLVE_CHECK(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
+    D3D12_CPU_DESCRIPTOR_HANDLE src_rtv{}, dst_rtv{};
+    if (proxy) {
+        const std::uint64_t start =
+            reinterpret_cast<XboxHeapHandleFn>(slot(rtv_heap.p, 9))(rtv_heap.p);
+        const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        RESOLVE_CHECK(start != 0 && increment >= sizeof(leonida::TargetView));
+        src_rtv = {SIZE_T(start)};
+        dst_rtv = {SIZE_T(start + increment)};
+    } else {
+        src_rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        dst_rtv = {src_rtv.ptr + device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+    }
+    D3D12_RENDER_TARGET_VIEW_DESC msaa_view{};
+    msaa_view.Format = format;
+    msaa_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+    device->CreateRenderTargetView(src.p, &msaa_view, src_rtv);
+    device->CreateRenderTargetView(dst.p, nullptr, dst_rtv);
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12GraphicsCommandList7> list7;
+    Ref<ID3D12Fence> fence;
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                       IID_PPV_ARGS(&list.p))));
+    RESOLVE_CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list7.p))));
+    RESOLVE_CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+    UINT64 cursor = 0;
+    const auto readback_layout = place(device, dst.p, 0, cursor);
+    RESOLVE_CHECK(cursor != 0 && readback_layout.Footprint.RowPitch >= dst_width * pixel_size);
+    const D3D12_RESOURCE_DESC readback_desc = buffer_desc(cursor);
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE,
+                                                             &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                             nullptr, IID_PPV_ARGS(&readback.p))));
+
+    const FLOAT green[4] = {0, 1, 0, 1};
+    const FLOAT red[4] = {1, 0, 0, 1};
+    // Use a rectangle even for the full source: multisampled images are cleared as rendering attachments,
+    // not with vkCmdClearColorImage (which is for single-sample transfer clears).
+    const D3D12_RECT full_source{0, 0, LONG(src_width), LONG(src_height)};
+    list->ClearRenderTargetView(src_rtv, green, 1, &full_source);
+    list->ClearRenderTargetView(dst_rtv, red, 0, nullptr);
+    const D3D12_RESOURCE_BARRIER before_resolve[] = {
+        transition(src.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+        transition(dst.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST)};
+    list->ResourceBarrier(2, before_resolve);
+    if (scenario == ResolveScenario::full) {
+        list->ResolveSubresource(dst.p, 0, src.p, 0, format);
+    } else {
+        D3D12_RECT rectangle{2, 1, 6, 5};
+        list7->ResolveSubresourceRegion(dst.p, 0, 3, 2, src.p, 0,
+                                        scenario == ResolveScenario::rectangle ? &rectangle : nullptr,
+                                        format, D3D12_RESOLVE_MODE_AVERAGE);
+    }
+    const auto to_copy = transition(dst.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &to_copy);
+    const auto readback_location = footprint(readback.p, readback_layout);
+    const auto resolved_location = subresource(dst.p, 0);
+    list->CopyTextureRegion(&readback_location, 0, 0, 0, &resolved_location, nullptr);
+    RESOLVE_CHECK(list->Close() == S_OK);
+
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    if (proxy)
+        RESOLVE_CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    RESOLVE_CHECK(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+
+    D3D12_RANGE read_range{0, SIZE_T(cursor)};
+    std::uint8_t* mapped = nullptr;
+    RESOLVE_CHECK(SUCCEEDED(readback->Map(0, &read_range, reinterpret_cast<void**>(&mapped))) && mapped);
+    pixels.resize(size_t(dst_width) * dst_height * pixel_size);
+    for (UINT row = 0; row < dst_height; ++row)
+        std::memcpy(pixels.data() + size_t(row) * dst_width * pixel_size,
+                    mapped + readback_layout.Offset + size_t(row) * readback_layout.Footprint.RowPitch,
+                    size_t(dst_width) * pixel_size);
+    const D3D12_RANGE written{0, 0};
+    readback->Unmap(0, &written);
+#undef RESOLVE_CHECK
+    return true;
+}
+
+// Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
+// sample count and region form. A host-unsupported combination is a deliberate skip; a mismatch in advertised
+// support or in the resulting pixels is a failure.
+int compare_resolves(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+
+    constexpr DXGI_FORMAT formats[] = {
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R32G32B32A32_FLOAT,
+    };
+    constexpr UINT sample_counts[] = {2, 4, 8, 16};
+    constexpr UINT required =
+        UINT(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) | UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) |
+        UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
+    constexpr ResolveScenario scenarios[] = {
+        ResolveScenario::full, ResolveScenario::rectangle, ResolveScenario::null_rectangle};
+    int mismatches = 0;
+    unsigned compared = 0, matched = 0, skipped = 0;
+
+    for (DXGI_FORMAT format : formats) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT host_format{format}, our_format{format};
+        const HRESULT host_format_hr =
+            host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &host_format, sizeof(host_format));
+        const HRESULT our_format_hr =
+            ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &our_format, sizeof(our_format));
+        if (FAILED(host_format_hr) || (UINT(host_format.Support1) & required) != required) {
+            std::printf("resolve format %d: host does not advertise multisample colour resolve, skipped\n", int(format));
+            ++skipped;
+            continue;
+        }
+        if (FAILED(our_format_hr) || (UINT(our_format.Support1) & required) != required) {
+            std::fprintf(stderr, "resolve format %d: Vulkan device does not match host multisample format support\n",
+                         int(format));
+            ++mismatches;
+            continue;
+        }
+
+        for (UINT samples : sample_counts) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS host_levels{};
+            host_levels.Format = format;
+            host_levels.SampleCount = samples;
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS our_levels = host_levels;
+            const HRESULT host_hr = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                               &host_levels, sizeof(host_levels));
+            const HRESULT our_hr = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                              &our_levels, sizeof(our_levels));
+            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0) {
+                ++skipped;
+                continue;
+            }
+            if (FAILED(our_hr) || our_levels.NumQualityLevels == 0) {
+                std::fprintf(stderr, "resolve format %d samples %u: Vulkan reports unsupported, host supports it\n",
+                             int(format), samples);
+                ++mismatches;
+                continue;
+            }
+
+            for (ResolveScenario scenario : scenarios) {
+                std::vector<std::uint8_t> host_pixels, our_pixels;
+                if (!capture_resolve(host.p, format, samples, scenario, host_pixels) ||
+                    !capture_resolve(ours, format, samples, scenario, our_pixels)) {
+                    ++mismatches;
+                    continue;
+                }
+                ++compared;
+                if (host_pixels != our_pixels) {
+                    std::fprintf(stderr, "resolve mismatch: format %d samples %u %s (host %zu bytes, Vulkan %zu)\n",
+                                 int(format), samples, resolve_scenario_name(scenario),
+                                 host_pixels.size(), our_pixels.size());
+                    ++mismatches;
+                } else {
+                    ++matched;
+                }
+            }
+        }
+    }
+    std::printf("Resolve comparison: %u compared, %u matched, %u unsupported format/sample combinations skipped, "
+                "%d mismatches\n", compared, matched, skipped, mismatches);
+    if (compared == 0) {
+        std::fprintf(stderr, "Resolve comparison: no common supported format/sample combination was exercised\n");
+        ++mismatches;
+    }
+    return mismatches;
+}
+
+
 }  // namespace
 
 int main() {
@@ -377,7 +925,10 @@ int main() {
         // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
         EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);
         EXPECT(rt::d3d12::device_max_push_constants_size(inner) == rt::d3d12::device_max_push_constants_size(device.p));
-        EXPECT(!rt::d3d12::device_push_constants_need_fallback(device.p));
+        // The test GPU may have either answer (Intel Arc and a Radeon 680M on driver 22.40.84.06 report 128 bytes);
+        // the device must flag the fallback exactly when the 144-byte block does not fit.
+        EXPECT(rt::d3d12::device_push_constants_need_fallback(device.p) ==
+               (rt::d3d12::device_max_push_constants_size(device.p) < 144));
 
         // Simulated fallback path when maxPushConstantsSize < 144 bytes:
         {
@@ -402,6 +953,16 @@ int main() {
         if (allocation_mismatches < 0)
             std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
         EXPECT(allocation_mismatches <= 0);
+        const int tiling_mismatches = compare_tiling(device.p);
+        if (tiling_mismatches < 0)
+            std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
+                        "skipped\n");
+        EXPECT(tiling_mismatches <= 0);
+
+        const int resolve_mismatches = compare_resolves(device.p);
+        if (resolve_mismatches < 0)
+            std::printf("Resolve comparison: no host D3D12 device to compare with, skipped\n");
+        EXPECT(resolve_mismatches <= 0);
 
         // Command objects; their GetDevice is the proxy, never the inner device.
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -418,6 +979,69 @@ int main() {
         {
             Ref<ID3D12Device> parent;
             EXPECT(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
+        }
+        // Residency and power (D3D-33): no-ops on Vulkan that still check their arguments, through the proxy's
+        // forwarded slots. EnqueueMakeResident must signal its fence, or a queue waiting on it would hang.
+        {
+            Ref<ID3D12Fence> residency;
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&residency.p))));
+            ID3D12Pageable* const pageables[] = {fence.p, allocator.p};
+            EXPECT(device->MakeResident(2, pageables) == S_OK);
+            EXPECT(device->MakeResident(0, nullptr) == S_OK);
+            EXPECT(device->MakeResident(1, nullptr) == E_INVALIDARG);
+            EXPECT(device->Evict(2, pageables) == S_OK);
+            EXPECT(device->Evict(0, nullptr) == S_OK);
+            EXPECT(device->Evict(1, nullptr) == E_INVALIDARG);
+            EXPECT(device->SetStablePowerState(TRUE) == S_OK);
+            EXPECT(device->SetStablePowerState(FALSE) == S_OK);
+
+            Ref<ID3D12Device1> device1;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
+            const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_MAXIMUM,
+                                                           D3D12_RESIDENCY_PRIORITY(D3D12_RESIDENCY_PRIORITY_LOW + 5)};
+            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == S_OK);
+            EXPECT(device1->SetResidencyPriority(0, nullptr, nullptr) == S_OK);
+            EXPECT(device1->SetResidencyPriority(1, pageables, nullptr) == E_INVALIDARG);
+            EXPECT(device1->SetResidencyPriority(1, nullptr, priorities) == E_INVALIDARG);
+
+            Ref<ID3D12Device3> device3;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device3.p))));
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, pageables, residency.p, 7) == S_OK);
+            EXPECT(residency->GetCompletedValue() == 7);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p, 9) ==
+                   S_OK);
+            EXPECT(residency->GetCompletedValue() == 9);
+            // Refused calls leave the fence alone.
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == E_INVALIDARG);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) ==
+                   E_INVALIDARG);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) ==
+                   E_INVALIDARG);
+            EXPECT(residency->GetCompletedValue() == 9);
+            // The GPU sees the signal: a queue waits on it, then signals past it.
+            EXPECT(SUCCEEDED(queue->Wait(residency.p, 9)));
+            EXPECT(SUCCEEDED(queue->Signal(residency.p, 10)));
+            EXPECT(SUCCEEDED(residency->SetEventOnCompletion(10, nullptr)) && residency->GetCompletedValue() == 10);
+
+            Ref<ID3D12Device6> device6;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device6.p))));
+            const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            EXPECT(done);
+            BOOL further = TRUE;
+            const HRESULT background = device6->SetBackgroundProcessingMode(
+                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK, D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS,
+                done, &further);
+            const DWORD signalled = WaitForSingleObject(done, 0);
+            CloseHandle(done);
+            EXPECT(background == S_OK && signalled == WAIT_OBJECT_0 && further == FALSE);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                                                        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr) == S_OK);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE(4),
+                                                        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr) ==
+                   E_INVALIDARG);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                                                        D3D12_MEASUREMENTS_ACTION(4), nullptr, nullptr) ==
+                   E_INVALIDARG);
         }
         {
             Ref<ID3D12Device4> device4;
@@ -864,6 +1488,131 @@ int main() {
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
         }
 
+        // Reserved resources (docs/d3d12_vulkan.md section 4.2): fully backed at creation, so they copy like
+        // committed ones and their first use reads zero; D3D12's description rules hold; tile-mapping calls are
+        // accepted and change nothing.
+        {
+            const auto B = D3D12_RESOURCE_DIMENSION_BUFFER, T2 = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            Ref<ID3D12Resource> tiled, tiled_buffer, xbox_tiled, refused;
+            const D3D12_RESOURCE_DESC tiled_desc = reserved_desc(T2, size, size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+            EXPECT(SUCCEEDED(device->CreateReservedResource(&tiled_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                            IID_PPV_ARGS(&tiled.p))));
+            EXPECT(tiled->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+            D3D12_HEAP_PROPERTIES reserved_heap{};
+            EXPECT(tiled->GetHeapProperties(&reserved_heap, nullptr) == E_INVALIDARG);  // no heap of its own
+            EXPECT(device->CreateReservedResource(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  __uuidof(ID3D12Resource), nullptr) == S_FALSE);
+            const auto refuses = [&](D3D12_RESOURCE_DESC desc) {
+                const HRESULT hr = device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                  IID_PPV_ARGS(&refused.p));
+                return hr == E_INVALIDARG && !refused.p;
+            };
+            auto bad = tiled_desc;
+            bad.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;  // textures need a 64 KiB swizzle layout
+            EXPECT(refuses(bad));
+            bad.Layout = D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;  // StandardSwizzle64KBSupported is FALSE
+            EXPECT(refuses(bad));
+            EXPECT(refuses(reserved_desc(T2, 64, 64, 1, 1, DXGI_FORMAT_R32G32B32_FLOAT)));  // 12-byte texels: no tiles
+            bad = reserved_desc(B, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN);
+            bad.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;  // buffers are ROW_MAJOR
+            EXPECT(refuses(bad));
+            const D3D12_RESOURCE_DESC tiled_buffer_desc = reserved_desc(B, 2 * 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN);
+            EXPECT(SUCCEEDED(device->CreateReservedResource(&tiled_buffer_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&tiled_buffer.p))));
+            auto xbox_desc = tiled_desc;
+            xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);  // the Xbox tiled layout word
+            EXPECT(SUCCEEDED(device->CreateReservedResource(&xbox_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&xbox_tiled.p))));
+            {
+                Ref<ID3D12Device4> device4;
+                Ref<ID3D12Device10> device10;
+                Ref<ID3D12Resource> one, two;
+                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
+                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                  nullptr, IID_PPV_ARGS(&one.p))));
+                EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
+                                                                   nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
+                UINT tiles = 0;
+                device->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
+                EXPECT(tiles == 1);  // 8x8 RGBA8: one packed tile
+            }
+
+            // Tiling: a resource that is not reserved has none, as on the PC runtime; a first index past the end
+            // returns no subresources.
+            UINT total = 7, count = 4;
+            D3D12_PACKED_MIP_INFO packed{1, 1, 1, 1};
+            D3D12_TILE_SHAPE shape{1, 1, 1};
+            D3D12_SUBRESOURCE_TILING tilings[4]{};
+            device->GetResourceTiling(upload.p, &total, &packed, &shape, &count, 0, tilings);
+            EXPECT(total == 0 && count == 0 && shape.WidthInTexels == 0 && packed.NumStandardMips == 0 &&
+                   packed.NumTilesForPackedMips == 0);
+            count = 4;
+            device->GetResourceTiling(tiled_buffer.p, &total, &packed, &shape, &count, 0, tilings);
+            EXPECT(total == 2 && count == 1 && shape.WidthInTexels == 65536 && tilings[0].WidthInTiles == 2);
+            count = 4;
+            device->GetResourceTiling(tiled_buffer.p, nullptr, nullptr, nullptr, &count, 1, tilings);
+            EXPECT(count == 0);
+
+            // Mapping calls: accepted, logged once, and the resources keep their memory.
+            D3D12_TILED_RESOURCE_COORDINATE origin{};
+            D3D12_TILE_REGION_SIZE one_tile{1, FALSE, 0, 0, 0};
+            const D3D12_TILE_RANGE_FLAGS unmap = D3D12_TILE_RANGE_FLAG_NULL;
+            queue->UpdateTileMappings(tiled.p, 1, &origin, &one_tile, nullptr, 1, &unmap, nullptr, nullptr,
+                                      D3D12_TILE_MAPPING_FLAG_NONE);
+            queue->CopyTileMappings(tiled_buffer.p, &origin, tiled_buffer.p, &origin, &one_tile,
+                                    D3D12_TILE_MAPPING_FLAG_NONE);
+
+            // Upload a pattern into the reserved texture and bytes into the reserved buffer, read both back, and
+            // read the never-written Xbox-layout texture, which is zero.
+            UINT64 tiled_up_cursor = 0;
+            const auto tiled_up = place(device.p, tiled.p, 0, tiled_up_cursor);
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col)
+                    std::memcpy(up + tiled_up.Offset + row * tiled_up.Footprint.RowPitch + col * 4,
+                                pattern(col, row).data(), 4);
+            const UINT64 tiled_bytes_up = (tiled_up_cursor + 255) / 256 * 256;
+            for (UINT i = 0; i < 256; ++i) up[tiled_bytes_up + i] = std::uint8_t(0x5a ^ i);
+            UINT64 tiled_down_cursor = 0;
+            const auto tiled_down = place(device.p, tiled.p, 0, tiled_down_cursor);
+            const auto xbox_down = place(device.p, xbox_tiled.p, 0, tiled_down_cursor);
+            const UINT64 tiled_bytes_down = (tiled_down_cursor + 255) / 256 * 256;
+            std::memset(down, 0xcd, 65536);
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            {
+                const auto dst = subresource(tiled.p, 0);
+                const auto src = footprint(upload.p, tiled_up);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            barrier = transition(tiled.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            barrier = transition(xbox_tiled.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            for (const auto& [resource, placed] : {std::pair{tiled.p, tiled_down}, std::pair{xbox_tiled.p, xbox_down}}) {
+                const auto dst = footprint(readback.p, placed);
+                const auto src = subresource(resource, 0);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            list->CopyBufferRegion(tiled_buffer.p, 65536 + 4096, upload.p, tiled_bytes_up, 256);  // into the second tile
+            barrier = transition(tiled_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            list->CopyBufferRegion(readback.p, tiled_bytes_down, tiled_buffer.p, 65536 + 4096, 256);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 9)) && SUCCEEDED(fence->SetEventOnCompletion(9, nullptr)));
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col) {
+                    report("reserved texel", row * size + col,
+                           down + tiled_down.Offset + row * tiled_down.Footprint.RowPitch + col * 4,
+                           pattern(col, row).data(), 4);
+                    report("unwritten reserved texel", row * size + col,
+                           down + xbox_down.Offset + row * xbox_down.Footprint.RowPitch + col * 4, zero, 4);
+                }
+            report("reserved buffer", 0, down + tiled_bytes_down, up + tiled_bytes_up, 256);
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
@@ -878,6 +1627,27 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }  // the device is released here, before the Vulkan device it runs on
     EXPECT(!mismatches);
+
+    // CPU texture copies, once per path. A second D3D12 device on the same Vulkan device, told the extension is
+    // off, takes the staging path even on a GPU that has host image copy.
+    for (const bool host : {true, false}) {
+        if (host && !d.host_image_copy) {
+            std::printf("WriteToSubresource/ReadFromSubresource (host image copy): no VK_EXT_host_image_copy, "
+                        "skipped\n");
+            continue;
+        }
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = d.instance_proc;
+        info.instance = d.instance;
+        info.physical = d.physical;
+        info.device = d.device;
+        info.queue = d.queue;
+        info.queue_family = d.family;
+        info.host_image_copy = host;
+        Ref<ID3D12Device> device;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
+        EXPECT(cpu_copies(device.p, d.bc, host ? "host image copy" : "staging copy") == 0);
+    }
 
     // The path D3D12XboxCreateDevice takes with LEONIDA_D3D12=vulkan: a device on its own Vulkan instance.
     {
@@ -897,6 +1667,6 @@ int main() {
         return 1;
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
-                "BC copies, a resolve, and GetCopyableFootprints all matched\n");
+                "BC copies, a resolve, reserved resources, and GetCopyableFootprints and GetResourceTiling all matched\n");
     return 0;
 }

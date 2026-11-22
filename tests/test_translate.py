@@ -72,7 +72,7 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sad_u8 v0, v1, v1, v1"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
 
@@ -157,6 +157,24 @@ def test_mesh_without_psv0_is_rejected(make_shader):
         shader = make_shader(f.read(), "ms_tri")                   # empty DXBC
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
+
+
+def test_wave32_readlane_writelane_mask_31(make_shader):
+    """SHADER-52: wave32 lane select is & 31; wave64 keeps & 63."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w32_lane_wrap.asm"), encoding="utf-8") as f:
+        w32 = make_shader(f.read(), name="cs_w32_lane_wrap", cs_header=(0x8088, (32, 1, 1)))
+    w32_spv = w32.translate()
+    w32.validate(w32_spv)
+    assert "OpBitwiseAnd %uint" in w32_spv and "%c1f" in w32_spv  # 31
+    # Every readlane/writelane mask in this wave32 program is 31, never 63.
+    assert not re.search(r"OpBitwiseAnd %uint %\w+ %c3f\b", w32_spv)
+    assert rdna2spirv.translate.last_gen.wave64 is False
+
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w64x_readlane.asm"), encoding="utf-8") as f:
+        w64 = make_shader(f.read(), name="cs_w64x_readlane")
+    w64_spv = w64.translate()
+    assert rdna2spirv.translate.last_gen.wave64 is True
+    assert re.search(r"OpBitwiseAnd %uint %\w+ %c3f\b", w64_spv)  # 63
 
 
 @pytest.mark.parametrize("threads", [96, 128], ids=["96-threads", "128-threads"])
@@ -680,3 +698,16 @@ def test_wave64_emulate_reuses_a_mask_exchange(make_shader, monkeypatch):
         cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_cmp_gt_u32_e64 s[6:7], 40, v1\ns_and_b32 s5, s5, s7\n"
         "v_mbcnt_hi_u32_b32 v3, s5, v3\n")
     assert (same, rewritten, same_exec, new_exec, pair, half) == (2, 4, 2, 4, 2, 4)
+
+
+def test_mesh_s3_wave_id_emits_local_index_shift_and_bfe(make_shader):
+    """Mesh shader prologue initializes s3[27:24] from LocalInvocationIndex >> 6 and s_bfe_u32 extracts it."""
+    path = os.path.join(ROOT, "runtime", "test", "shaders", "ms_wave_info_s3.asm")
+    with open(path, encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_wave_info_s3", dxbc=SAMPLE_DXBC["ms_wave_info_s3"])
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "%wave = OpShiftRightLogical %uint %lidx %c6" in asm
+    assert "%mwi = OpShiftLeftLogical %uint %wave %c18" in asm
+    assert "OpStore %s3p %mwi" in asm
+    assert "OpBitFieldUExtract %uint" in asm

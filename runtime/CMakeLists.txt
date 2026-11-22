@@ -276,6 +276,9 @@ if(BUILD_TESTING)
     )
   endif()
 
+  if(WIN32 AND TARGET root_sig_test)
+    add_test(NAME root_sig_test COMMAND root_sig_test)
+  endif()
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
   endif()
@@ -284,6 +287,8 @@ if(BUILD_TESTING)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
+  add_executable(resource_tiling_test test/resource_tiling_test.cpp)
+  add_test(NAME resource_tiling COMMAND resource_tiling_test)
   add_executable(descriptor_table_test test/descriptor_table_test.cpp)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
   if(WIN32)
@@ -301,6 +306,38 @@ if(BUILD_TESTING)
     target_link_libraries(bink_decode_test PRIVATE psapi)
     add_dependencies(bink_decode_test gta6rt_tls_host)
     add_test(NAME bink_decode COMMAND bink_decode_test)
+
+    # Optional: skips unless LEONIDA_GAME_DIR is set. Drives the package's FSR DLL on the Xbox-ABI device proxy.
+    if(D3D12_LIBRARY AND DXGI_LIBRARY)
+      add_executable(fsr_dispatch_test
+        test/fsr_dispatch_test.cpp
+        src/pe_loader.cpp
+        shims/registry.cpp
+        shims/xmem.cpp
+        shims/d3d12_xs.cpp
+        shims/d3d12_xs_device.cpp
+      )
+      target_compile_definitions(fsr_dispatch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+      target_compile_options(fsr_dispatch_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      target_link_options(fsr_dispatch_test PRIVATE /OPT:NOREF)
+      target_link_libraries(fsr_dispatch_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY} psapi)
+      add_test(NAME fsr_dispatch COMMAND fsr_dispatch_test)
+
+      # Optional: skips unless LEONIDA_GAME_DIR is set. Constructs the package's XboxBvhBuilder on the device proxy.
+      add_executable(bvh_builder_test
+        test/bvh_builder_test.cpp
+        src/pe_loader.cpp
+        shims/registry.cpp
+        shims/xmem.cpp
+        shims/d3d12_xs.cpp
+        shims/d3d12_xs_device.cpp
+      )
+      target_compile_definitions(bvh_builder_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+      target_compile_options(bvh_builder_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      target_link_options(bvh_builder_test PRIVATE /OPT:NOREF)
+      target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY} psapi)
+      add_test(NAME bvh_builder COMMAND bvh_builder_test)
+    endif()
 
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE_AUDIO are set.
     add_executable(bink_audio_test
@@ -356,9 +393,21 @@ if(LEONIDA_D3D12_SHIM_TESTS)
 endif()
 endif()
 
-# GPU test and pipeline tools load Vulkan at run time.
+# GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
 find_package(Vulkan QUIET)
-if(Vulkan_FOUND)
+if(NOT TARGET Vulkan::Headers)
+  find_path(Vulkan_INCLUDE_DIR
+    NAMES vulkan/vulkan.h
+    HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{VULKAN_SDK}/include"
+  )
+  if(Vulkan_INCLUDE_DIR AND EXISTS "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.h")
+    add_library(Vulkan::Headers INTERFACE IMPORTED)
+    set_target_properties(Vulkan::Headers PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${Vulkan_INCLUDE_DIR}"
+    )
+  endif()
+endif()
+if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test)
     add_executable(${tool} test/${tool}.cpp)
@@ -431,15 +480,26 @@ if(Vulkan_FOUND)
     endif()
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
-    add_executable(d3d12_uint_clear_test test/d3d12_uint_clear_test.cpp)
-    target_link_libraries(d3d12_uint_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
-    target_compile_definitions(d3d12_uint_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(d3d12_uint_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
+    target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_clear_test PRIVATE /W4 /permissive- /utf-8)
+
+    # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)
+    target_link_libraries(d3d12_typeless_rtv_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_typeless_rtv_test PRIVATE /W4 /permissive- /utf-8)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
+    endif()
+    # bvh_builder_test can put the package's XboxBvhBuilder on this device too (LEONIDA_BVH_DEVICE=vulkan).
+    if(TARGET bvh_builder_test)
+      target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(bvh_builder_test PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
   else()
     message(STATUS "Python 3 or Windows missing: the D3D12 COM objects and d3d12_com_test are not built")
@@ -447,6 +507,12 @@ if(Vulkan_FOUND)
 
   # Needs only the Vulkan headers, not a GPU.
   if(BUILD_TESTING)
+    add_executable(typeless_rtv_test test/typeless_rtv_test.cpp)
+    target_link_libraries(typeless_rtv_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME typeless_rtv COMMAND typeless_rtv_test)
     add_executable(clear_color_test test/clear_color_test.cpp)
     target_link_libraries(clear_color_test PRIVATE Vulkan::Headers)
     if(WIN32)
@@ -465,6 +531,6 @@ if(Vulkan_FOUND)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
 else()
-  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
+  message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
                  "gfx10_descriptors_test are not built")
 endif()

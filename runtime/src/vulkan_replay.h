@@ -17,7 +17,8 @@
 // Requirements on the device and images:
 // - a queue with graphics support (the stage masks use ALL_GRAPHICS);
 // - images cleared without rectangles have TRANSFER_DST usage; images cleared with rectangles have attachment usage
-//   and image_view must return views for them (dynamicRendering, Vulkan 1.3);
+//   and image_view must return views for them (dynamicRendering, Vulkan 1.3); reinterpreted whole-view clears
+//   use the same attachment path because vkCmdClearColorImage has no view-format argument;
 // - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3).
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
@@ -58,6 +59,7 @@ struct ResourceBinding {
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
+    bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
 };
 
 struct VulkanAccess {
@@ -360,7 +362,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return {1, 1};
     switch (format) {
     case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_R32G32B32A32_SINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
     case VK_FORMAT_R32G32_SFLOAT: return {8, 1};
@@ -368,12 +371,15 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_SNORM:
     case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R8G8B8A8_SINT:
     case VK_FORMAT_B8G8R8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_R16G16_SFLOAT:
     case VK_FORMAT_R32_SFLOAT:
     case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SINT:
     case VK_FORMAT_D32_SFLOAT:
     case VK_FORMAT_D32_SFLOAT_S8_UINT:  // depth aspect
     case VK_FORMAT_D24_UNORM_S8_UINT: return {4, 1};
@@ -560,6 +566,10 @@ struct ReplayFunctions {
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
+    // VK_EXT_conditional_rendering: SetPredication. The predicate buffer must have been created with
+    // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
+    PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
+    PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -572,6 +582,7 @@ enum class ReplayResult {
     invalid_subresource,
     invalid_clear,
     invalid_copy,
+    invalid_predication,
     unsupported
 };
 
@@ -581,6 +592,7 @@ struct Prepared {
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
+    VkFormat clear_format = VK_FORMAT_UNDEFINED; // The RTV format, without changing the resource binding.
     std::vector<VkClearRect> rects;   // rectangle clears, clipped to the mip
     bool skip = false;                // every rectangle was empty
     ResourceBinding source;                   // copies: the source resource
@@ -595,26 +607,69 @@ struct Prepared {
 // the device, Windows D3D12 (WARP and AMD) clamps to the component range and truncates fractions. Vulkan
 // instead interprets the matching union member as an integer already; copying float bits changes the value.
 inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
-    std::uint32_t maximum = 0;
+    // Integer formats convert the float numerically: NaN maps to zero, negatives clamp to the low end, positive
+    // overflow to the high end, and fractions truncate toward zero. Unsigned uses uint32, signed uses int32.
+    std::uint32_t unsigned_maximum = 0;
+    std::int64_t signed_minimum = 0, signed_maximum = 0;
+    bool is_signed = false;
     switch (format) {
-    case VK_FORMAT_R8G8B8A8_UINT: maximum = 255; break;
+    case VK_FORMAT_R8G8B8A8_UINT: unsigned_maximum = 255; break;
     case VK_FORMAT_R32_UINT:
-    case VK_FORMAT_R32G32B32A32_UINT: maximum = std::numeric_limits<std::uint32_t>::max(); break;
+    case VK_FORMAT_R32G32B32A32_UINT: unsigned_maximum = std::numeric_limits<std::uint32_t>::max(); break;
+    case VK_FORMAT_R8G8B8A8_SINT: signed_minimum = -128; signed_maximum = 127; is_signed = true; break;
+    case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+        signed_minimum = std::numeric_limits<std::int32_t>::min();
+        signed_maximum = std::numeric_limits<std::int32_t>::max();
+        is_signed = true;
+        break;
     default: break;
     }
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
-        if (!maximum) {
+        if (is_signed) {
+            const double v = double(input[i]);
+            std::int32_t out;
+            if (v != v) {
+                out = 0;  // NaN
+            } else if (v <= double(signed_minimum)) {
+                out = static_cast<std::int32_t>(signed_minimum);
+            } else if (v >= double(signed_maximum)) {
+                out = static_cast<std::int32_t>(signed_maximum);
+            } else {
+                out = static_cast<std::int32_t>(v);  // truncates toward zero
+            }
+            value.int32[i] = out;
+        } else if (!unsigned_maximum) {
             value.float32[i] = input[i];
         } else if (!(input[i] > 0.0f)) {
             value.uint32[i] = 0; // NaN, negative values and either zero; no out-of-range float-to-int cast.
-        } else if (double(input[i]) >= double(maximum)) {
-            value.uint32[i] = maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
+        } else if (double(input[i]) >= double(unsigned_maximum)) {
+            value.uint32[i] = unsigned_maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
         } else {
             value.uint32[i] = static_cast<std::uint32_t>(input[i]);
         }
     }
     return value;
+}
+
+// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format.
+inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
+    if (target.format == ColorViewFormat::resource)
+        return resource.rgba8_typeless ? VK_FORMAT_UNDEFINED : resource.format;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    switch (target.format) {
+    case ColorViewFormat::rgba8_unorm: format = VK_FORMAT_R8G8B8A8_UNORM; break;
+    case ColorViewFormat::rgba8_srgb: format = VK_FORMAT_R8G8B8A8_SRGB; break;
+    case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+    if (!resource.rgba8_typeless) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
+    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.mip_levels != 1 || resource.array_layers != 1 ||
+        resource.volume || resource.depth != 1 || resource.samples != 1 ||
+        target.mip || target.first_layer || target.layer_count != 1)
+        return VK_FORMAT_UNDEFINED;
+    return format;
 }
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
@@ -936,6 +991,10 @@ class PreparedList {
 public:
     const CommandList* list = nullptr;
     std::vector<detail::Prepared> commands;
+    // Copies and resolves recorded while a predicate was set. D3D12 skips them when the predicate says so, but
+    // Vulkan's conditional rendering does not cover transfer commands, so they run unconditionally
+    // (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
+    std::size_t unpredicated_copies = 0;
 };
 
 // Resolves and checks every command. Nothing is written to a command buffer.
@@ -948,6 +1007,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.commands.assign(commands.size(), {});
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
+    const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
+    // While a predicate is set, a whole-view clear is replayed as one rectangle over the view: vkCmdClearColorImage
+    // and vkCmdClearDepthStencilImage ignore conditional rendering, vkCmdClearAttachments does not.
+    bool predicated = false;
+    constexpr Rect whole_view{0, 0, INT32_MAX, INT32_MAX};
+    const auto clear_rects = [&](std::span<const Rect> rects) {
+        return predicated && rects.empty() ? std::span<const Rect>(&whole_view, 1) : rects;
+    };
+    out.unpredicated_copies = 0;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -967,7 +1035,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             VkImageSubresourceRange range = p.range;
             range.aspectMask = view_aspects;
-            p.view = vk.image_view(p.binding, range);
+            ResourceBinding view_binding = p.binding;
+            if (p.clear_format != VK_FORMAT_UNDEFINED) view_binding.format = p.clear_format;
+            p.view = vk.image_view(view_binding, range);
             return p.view ? ReplayResult::success : ReplayResult::unsupported;
         };
 
@@ -993,8 +1063,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
                 return ReplayResult::invalid_subresource;
-            if (const auto r = rect_view(color_clear->rects, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
-                return r;
+            p.clear_format = detail::color_view_format(p.binding, color_clear->target);
+            // Older ownerless replay callers omit the resource format for float-only clears. Preserve
+            // that path; an explicit format or a typeless resource must still resolve a concrete RTV.
+            if (p.clear_format == VK_FORMAT_UNDEFINED &&
+                (p.binding.rgba8_typeless || color_clear->target.format != ColorViewFormat::resource))
+                return ReplayResult::invalid_clear;
+            if (p.clear_format != p.binding.format && color_clear->rects.empty()) {
+                // vkCmdClearColorImage has no view-format parameter. Reinterpreted whole-view clears need
+                // an attachment view too, including sRGB conversion and UINT numeric interpretation.
+                const auto extent = detail::mip_extent(p.binding, color_clear->target.mip);
+                const Rect full{0, 0, std::int32_t(extent.width), std::int32_t(extent.height)};
+                if (const auto r = rect_view(std::span<const Rect>(&full, 1), color_clear->target,
+                                            VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
+            } else if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
+                       r != ReplayResult::success) return r;
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
@@ -1005,11 +1088,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
                 return ReplayResult::invalid_subresource;
-            if (const auto r = rect_view(depth_clear->rects, depth_clear->target, p.binding.aspects); r != ReplayResult::success)
+            if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
+                r != ReplayResult::success)
                 return r;
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
+            if (predicated) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
@@ -1029,11 +1114,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (result != ReplayResult::success) return result;
         } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
             if (!vk.resolve_image) return ReplayResult::unsupported;
+            if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
             if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
+        } else if (const auto* predication = std::get_if<Predication>(&command)) {
+            predicated = predication->buffer != 0;
+            if (!predicated) continue;
+            if (!conditional) return ReplayResult::unsupported;
+            if (!bind(predication->buffer)) return ReplayResult::unresolved_resource;
+            // Vulkan reads one 32-bit word at a 4-byte aligned offset; D3D12's value is 64 bits at an 8-byte
+            // aligned one, so its low word is read (docs/d3d12_vulkan.md section 4.7).
+            if (!p.binding.buffer || !detail::within(predication->offset, 4, p.binding.size))
+                return ReplayResult::invalid_predication;
         }
     }
     return ReplayResult::success;
@@ -1045,10 +1140,27 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const auto commands = prepared.list->commands();
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
+    bool conditional_rendering = false;  // inside vkCmdBeginConditionalRenderingEXT
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (const auto* predication = std::get_if<Predication>(&command)) {
+            // Conditional rendering cannot nest, so a new predicate ends the previous one first.
+            if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
+            conditional_rendering = predication->buffer != 0;
+            if (conditional_rendering) {
+                VkConditionalRenderingBeginInfoEXT begin{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+                begin.buffer = p.binding.buffer;
+                begin.offset = predication->offset;
+                // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
+                begin.flags = predication->op == d3d12_predication::not_equal_zero
+                                  ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT
+                                  : 0;
+                vk.begin_conditional_rendering(command_buffer, &begin);
+            }
+            continue;
+        }
         const ResourceId id = std::visit(
             [](const auto& c) -> ResourceId {
                 using T = std::decay_t<decltype(c)>;
@@ -1145,7 +1257,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            const VkClearColorValue color = detail::render_target_clear_color(p.binding.format, color_clear->color);
+            const VkClearColorValue color = detail::render_target_clear_color(p.clear_format, color_clear->color);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
@@ -1248,6 +1360,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
         }
     }
+    // Predication does not carry over to the next command list.
+    if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.
