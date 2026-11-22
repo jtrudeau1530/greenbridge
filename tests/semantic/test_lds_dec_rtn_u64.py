@@ -964,5 +964,114 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(state.lds.read_qword(target_addr), 3)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation for ds_dec_rtn_u64."""
+
+    def test_alias_vdst_with_vdata0_preserves_bound_snapshot_u64(self) -> None:
+        # vdst = v[2:3], vaddr = v1, vdata0 = v[2:3]
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(capacity_qwords=1024)
+
+        target_qword = 10
+        target_byte = target_qword * 8
+        state.lds.write_qword(target_byte, 0)  # old_val = 0 -> wraps to bound
+
+        state.set_vgpr(1, target_byte)
+        orig_bound = 0x1122_3344_5566_7788
+        state.set_vgpr64(RegPair(2), orig_bound)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(2),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        old_val, new_mem = interp.step(instr, state)
+        self.assertEqual(old_val, 0)
+        self.assertEqual(new_mem, orig_bound)
+        # v[2:3] overwritten with old_val (0)
+        self.assertEqual(state.get_vgpr64(RegPair(2)), 0)
+        # Memory receives orig_bound
+        self.assertEqual(state.lds.read_qword(target_byte), orig_bound)
+        # Address register preserved
+        self.assertEqual(state.get_vgpr(1), target_byte)
+
+    def test_alias_vaddr_with_low_register_of_vdst_u64(self) -> None:
+        # vdst = v[2:3], vaddr = v2, vdata0 = v[4:5]
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(capacity_qwords=1024)
+
+        target_byte = 128  # qword 16
+        state.lds.write_qword(target_byte, 0x5555_6666_7777_8888)
+
+        state.set_vgpr(2, target_byte)  # vaddr
+        state.set_vgpr64(RegPair(4), 0xFFFF_FFFF_FFFF_FFFF)  # bound
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(2),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(4),
+            offset=0,
+        )
+
+        old_val, new_mem = interp.step(instr, state)
+        self.assertEqual(old_val, 0x5555_6666_7777_8888)
+        self.assertEqual(new_mem, 0x5555_6666_7777_8887)
+        # v[2:3] overwritten with old_val
+        self.assertEqual(state.get_vgpr64(RegPair(2)), 0x5555_6666_7777_8888)
+        # Memory updated
+        self.assertEqual(state.lds.read_qword(target_byte), 0x5555_6666_7777_8887)
+
+    def test_alias_vaddr_with_low_register_of_vdata0_u64(self) -> None:
+        # vdst = v[4:5], vaddr = v2, vdata0 = v[2:3]
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(capacity_qwords=1024)
+
+        # Let v[2:3] = 64 (lo = 64, hi = 0)
+        state.set_vgpr64(RegPair(2), 64)
+        target_byte = 64
+        state.lds.write_qword(target_byte, 10)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        old_val, new_mem = interp.step(instr, state)
+        self.assertEqual(old_val, 10)
+        self.assertEqual(new_mem, 9)
+        self.assertEqual(state.get_vgpr64(RegPair(4)), 10)
+        self.assertEqual(state.lds.read_qword(target_byte), 9)
+        # v[2:3] operand preserved
+        self.assertEqual(state.get_vgpr64(RegPair(2)), 64)
+
+    def test_repeated_in_place_swap_ping_pong_u64(self) -> None:
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(capacity_qwords=1024)
+
+        target_byte = 80
+        bound = 3
+        state.lds.write_qword(target_byte, bound)
+        state.set_vgpr(1, target_byte)
+        state.set_vgpr64(RegPair(2), bound)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+        )
+
+        # 3 -> 2 -> 1 -> 0 -> 3
+        for expected_old, expected_new in [(3, 2), (2, 1), (1, 0), (0, 3)]:
+            old_val, new_mem = interp.step(instr, state)
+            self.assertEqual(old_val, expected_old)
+            self.assertEqual(new_mem, expected_new)
+            self.assertEqual(state.get_vgpr64(RegPair(4)), expected_old)
+            self.assertEqual(state.lds.read_qword(target_byte), expected_new)
+
+
 if __name__ == "__main__":
     unittest.main()
