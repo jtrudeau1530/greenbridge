@@ -32,6 +32,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -395,27 +396,36 @@ int main(int argc, char** argv) {
     bool cache_feedback = false;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
-        auto val = [&] { return i + 1 < argc ? std::string(argv[++i]) : std::string("0"); };
-        if (a == "--jobs") jobs = std::max(1u, uint32_t(std::stoul(val())));
-        else if (a == "--start") start = std::stoull(val());
-        else if (a == "--count") count = std::stoull(val());
-        else if (a == "--slow") slow = std::stod(val());
-        else if (a == "--stage") stage_filter = val();
+        auto value = [&]() -> std::string_view {
+            if (i + 1 == argc || std::string_view(argv[i + 1]).starts_with("--")) return {};
+            return argv[++i];
+        };
+        auto number = [&](auto& dest) {
+            const auto text = value();
+            if (text.empty()) return false;
+            const auto end = text.data() + text.size();
+            const auto [ptr, ec] = std::from_chars(text.data(), end, dest);
+            return ec == std::errc{} && ptr == end;
+        };
+        bool valid = true;
+        if (a == "--jobs") {
+            valid = number(jobs);
+            jobs = std::max(1u, jobs);
+        } else if (a == "--start") valid = number(start);
+        else if (a == "--count") valid = number(count);
+        else if (a == "--slow") valid = number(slow) && std::isfinite(slow) && slow >= 0.0;
+        else if (a == "--stage") valid = !(stage_filter = value()).empty();
         else if (a == "--compute-only") stage_filter = "cs";
         else if (a == "--graphics-only") stage_filter = "graphics";
-        else if (a == "--max-bytes") max_bytes = std::stoull(val());
-        else if (a == "--large-module-bytes") {
-            const std::string_view value = i + 1 < argc ? argv[++i] : "";
-            const auto end = value.data() + value.size();
-            const auto [ptr, ec] = std::from_chars(value.data(), end, large_module_bytes);
-            if (ec != std::errc{} || ptr != end) {
-                std::fprintf(stderr, "--large-module-bytes requires a non-negative byte count\n");
-                return 2;
-            }
-        }
-        else if (a == "--stats") stats_path = val();
+        else if (a == "--max-bytes") valid = number(max_bytes);
+        else if (a == "--large-module-bytes") valid = number(large_module_bytes);
+        else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--cache-feedback") cache_feedback = true;
         else cache_path = a;
+        if (!valid) {
+            std::fprintf(stderr, "%s requires a valid value\n", a.c_str());
+            return 2;
+        }
     }
     if (stage_filter != "all" && stage_filter != "cs" && stage_filter != "graphics") {
         std::fprintf(stderr, "unknown --stage '%s' (expected: all, cs, graphics)\n", stage_filter.c_str());
