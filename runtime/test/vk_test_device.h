@@ -252,7 +252,8 @@ public:
                                                   conditional_rendering ? &enable_conditional : nullptr};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
-        // shaderDrawParameters: the translator's zero-based VS ids (PR 436) read BaseVertex and BaseInstance.
+        // shaderDrawParameters, where available: translated vertex shaders will read BaseVertex and BaseInstance once PR 436
+        // (zero-based VS ids) is in; harmless before.
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
         enable11.shaderDrawParameters = features11.shaderDrawParameters;
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};

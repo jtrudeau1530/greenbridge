@@ -652,8 +652,9 @@ and any validation error fails them.
     `R32G32B32A32_FLOAT` target. Every value is a short binary fraction, so the comparison is bit for bit: 4064 of 4096
     pixels are exact, and the 32 whose centres lie on the triangle's long edge are counted apart.
   - **Zero-based ids:** all draws use `StartVertexLocation` 0 and `StartInstanceLocation` 0, so `v0` is the same with
-    and without the translator's zero-based VS ids (#436). The test device enables `shaderDrawParameters` for it. A
-    non-zero base would differ (hardware: zero-based, the base in an SGPR), so the test avoids one.
+    and without the translator's zero-based VS ids (#436, not in this tree: with its translator change applied the
+    result was identical, checked on both GPUs). Both devices enable `shaderDrawParameters` where supported, which
+    #436's shaders need. A non-zero base would differ (hardware: zero-based, the base in an SGPR), so the test avoids one.
 - `d3d12_method_variants_test`: each variant against the method it wraps, on the device directly (the proxy's
   slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 12 creation cases (buffers on the
   three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every
@@ -783,10 +784,11 @@ copies or scans them. This relies on the game not using the raw VA for anything 
 **Measured (D3D-53, `d3d12_translated_draw_test`):** the bias works for 64-bit root arguments (`d3d12_compute_test`: a root
 CBV and a table slot that point at an upload buffer) but **not for a V#**. A V#'s base field is 48 bits
 (dword0 and dword1[15:0]), and an upload buffer's console VA, its device address minus `heap_base`, is negative on both test
-GPUs (`0xffffffffffce0000` on the AMD Radeon 880M, `0xffffffffffedc000` on the RTX 5070 Laptop). The shader
+GPUs (`0xffffffffffce0000` on the AMD Radeon 880M, `0xffffffffffedc000` on the RTX 5070 Laptop; the buffer's device
+address lay below the arena's, an allocation-order fact of these runs, so it is not guaranteed either way). The shader
 adds `heap_base` to the truncated 48-bit value, which is a wild address: the draw faults and the whole queue submission is lost
 (the clear that came before it is lost as well). Any resource a game can put in a V# (a vertex, constant or structured buffer
-behind a descriptor) must therefore be an arena range, upload and readback heaps included. Until the layer does that, the
+behind a descriptor) must therefore be an arena range, whatever the allocator happens to do, upload and readback heaps included. Until the layer does that, the
 translated-draw test fetches from a DEFAULT-heap buffer and does not draw from the upload buffer.
 
 Why not give each buffer its own BDA and set `heap_base = 0`? Because many shaders truncate descriptor-table

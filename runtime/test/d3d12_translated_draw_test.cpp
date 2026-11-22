@@ -16,7 +16,8 @@
 //   - interpolation of param0 and the mrt0 export into a R32G32B32A32_FLOAT render target, read back through
 //     CopyTextureRegion and compared bit for bit.
 // All draws use StartVertexLocation 0 and StartInstanceLocation 0, so the result is the same with and without the
-// translator's zero-based VS ids (PR 436: v0 = VertexIndex - BaseVertex); the test never relies on either.
+// translator's zero-based VS ids (PR 436: v0 = VertexIndex - BaseVertex), which is not in this tree: with 436's
+// translator change applied the result was identical (checked on both GPUs); the test never relies on either.
 // Expected pixels (64x64, clip y up, so rows run top to bottom; the quadrants are 32x32):
 //   clear               (0.5, 0.125, 0.25, 0.5)
 //   draw 1, top left    quad, colour (0.25, 0.5, 0.75, 1), offset (0, 0),   bias 0     -> (0.125, 1.0,   0.75,  1)
@@ -25,12 +26,13 @@
 //                                                                                      -> (0.75,  0.25,  0.75,  1)
 //   top right           not drawn: the clear colour
 // The triangle's long edge passes exactly through the centres of the pixels with row - col == 32 (32 of them); the
-// fill rule decides those, so they are counted apart and may be the triangle's colour or the clear colour. Every
+// top-left rule leaves them uncovered (a right edge), so they must be the clear colour; they are counted apart. Every
 // other pixel (4064 of 4096) is compared exactly. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/gfx10_descriptors.h"
 #include "../src/shader_library.h"
 
 #include <array>
@@ -64,11 +66,17 @@ using Pixel = std::array<float, 4>;
 constexpr UINT size = 64;
 constexpr UINT pitch = size * sizeof(Pixel);  // 1024, a multiple of 256
 
-// GFX10 buffer resource (V#) for 32-bit float data: stride 32, `records` records, format 32_32_32_32_FLOAT (77),
-// destination select X, Y, Z, W, resource level 1, raw out-of-range checking.
+// A V# for the vertex records: stride 32, `records` records, format 32_32_32_32_FLOAT, identity swizzle. The
+// out-of-range mode is structured (an index checked against num_records), which is what the hardware does with an
+// idxen fetch; raw mode would check the byte offset against num_records and return 0 past the first record.
 std::array<std::uint32_t, 4> make_vsharp(std::uint64_t base, std::uint32_t records) {
-    return {std::uint32_t(base), std::uint32_t(base >> 32) & 0xffffu | (32u << 16), records,
-            0xfacu | (77u << 12) | (1u << 24) | (3u << 28)};
+    leonida::gfx10::Buffer buffer;
+    buffer.address = base;
+    buffer.stride = 32;
+    buffer.num_records = records;
+    buffer.format = 77;  // GFX10_FORMAT_32_32_32_32_FLOAT
+    buffer.oob_select = leonida::gfx10::OobSelect::structured;
+    return leonida::gfx10::encode(buffer);
 }
 
 }  // namespace
@@ -321,7 +329,8 @@ int main() {
                              got[2], got[3], (*want)[0], (*want)[1], (*want)[2], (*want)[3]);
         }
     }
-    EXPECT(edge == 32 && edge_triangle + edge_clear <= edge);
+    // The long edge is a right edge of the triangle, which the top-left rule leaves uncovered: all 32 are the clear colour.
+    EXPECT(edge == 32 && edge_triangle + edge_clear == edge && edge_triangle == 0);
     EXPECT(!mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
