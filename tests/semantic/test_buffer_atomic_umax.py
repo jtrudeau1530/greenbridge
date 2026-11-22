@@ -1169,5 +1169,152 @@ class TestBufferAtomicUmaxBoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.mem.read_u32(12), 0x80000000)
 
 
+class TestBufferAtomicUmaxNegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256, count=1)
+        with self.assertRaises(ValueError):
+            # SGPR 254 with count 4 exceeds 256
+            Register(RegKind.SGPR, 254, count=4)
+
+    def test_invalid_destination_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMAX,
+                vdata=Register(RegKind.SGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_descriptor_size(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMAX,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=2),
+                soffset=0,
+            )
+
+    def test_invalid_soffset_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMAX,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=Register(RegKind.VGPR, 8, count=1),
+            )
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+
+class TestBufferAtomicUmaxMutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_oob_check_omission(self) -> None:
+        # Sabotage: ignoring NUM_RECORDS bounds check
+        mem = BufferMemory(256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=32)
+
+        def mutated_atomic_umax_no_bounds(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            m.write_u32(off, max(old, val))
+            return old
+
+        # An access at offset 64 should be rejected by the oracle
+        _, in_bounds = ref_buffer_atomic_umax(mem, desc, soffset=0, vaddr=64, comp_val=10, glc=True)
+        self.assertFalse(in_bounds)
+
+        # Mutated oracle incorrectly allows it
+        with self.assertRaises(AssertionError):
+            self.assertEqual(in_bounds, True)
+
+    def test_mutation_glc_returns_post_op_value(self) -> None:
+        # Sabotage: returning new value instead of old value
+        mem = BufferMemory(256)
+        mem.write_u32(0, 100)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_atomic_umax_post_op(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            new_val = max(old, val) & MASK32
+            m.write_u32(off, new_val)
+            return new_val  # BUG: returns post-op instead of pre-op
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_atomic_umax_post_op(mem, desc, 0, 500), 100)
+
+    def test_mutation_signed_vs_unsigned_comparison_flip(self) -> None:
+        # Sabotage: signed integer max instead of unsigned integer max
+        mem = BufferMemory(256)
+        mem.write_u32(0, 0x7FFFFFFF)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_atomic_smax(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            # BUG: s32 treats 0x80000000 as -2147483648 < 0x7FFFFFFF (2147483647)
+            new_val = max(s32(old), s32(val)) & MASK32
+            m.write_u32(off, new_val)
+            return old
+
+        mutated_atomic_smax(mem, desc, 0, 0x80000000)
+        with self.assertRaises(AssertionError):
+            # Correct unsigned max should be 0x80000000, but signed bug leaves 0x7FFFFFFF
+            self.assertEqual(mem.read_u32(0), 0x80000000)
+
+    def test_mutation_min_instead_of_max(self) -> None:
+        # Sabotage: using min instead of max
+        mem = BufferMemory(256)
+        mem.write_u32(0, 100)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_atomic_umin(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            new_val = min(old, val) & MASK32
+            m.write_u32(off, new_val)
+            return old
+
+        mutated_atomic_umin(mem, desc, 0, 200)
+        with self.assertRaises(AssertionError):
+            # Memory should be 200, but bug produced 100
+            self.assertEqual(mem.read_u32(0), 200)
+
+    def test_mutation_simd_exec_leak(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        simd.set_buffer_descriptor(4, desc)
+        simd.set_exec_mask(0)  # all lanes disabled
+
+        canary = 0x99999999
+        simd.mem.write_u32(0, canary)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_UMAX,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        simd.step(inst)
+        # Memory must remain canary
+        self.assertEqual(simd.mem.read_u32(0), canary)
+
+        # Mutated unconditional write would corrupt memory
+        simd.mem.write_u32(0, 500)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.mem.read_u32(0), canary)
+
+
 if __name__ == "__main__":
     unittest.main()
