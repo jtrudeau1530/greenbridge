@@ -27,11 +27,13 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -335,6 +337,18 @@ struct StageStats {
     std::map<std::string, uint32_t> skip_reasons;
 };
 
+constexpr std::pair<size_t, size_t> shader_slice(size_t size, size_t start, size_t count) {
+    const size_t lo = std::min(start, size);
+    const size_t remaining = size - lo;
+    const size_t hi = count ? lo + std::min(count, remaining) : size;
+    return {lo, hi};
+}
+
+static_assert(shader_slice(7, 2, 3) == std::pair<size_t, size_t>{2, 5});
+static_assert(shader_slice(7, 2, 0) == std::pair<size_t, size_t>{2, 7});
+static_assert(shader_slice(7, 8, 3) == std::pair<size_t, size_t>{7, 7});
+static_assert(shader_slice(7, 2, std::numeric_limits<size_t>::max()) == std::pair<size_t, size_t>{2, 7});
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -384,7 +398,7 @@ int main(int argc, char** argv) {
         if (stage_filter == "graphics" && !is_graphics_stage(meta.stage)) continue;
         all.push_back({&name, &meta});
     }
-    const size_t lo = std::min(start, all.size()), hi = std::min(all.size(), count ? lo + count : all.size());
+    const auto [lo, hi] = shader_slice(all.size(), start, count);
     const std::vector<Item> work(all.begin() + lo, all.begin() + hi);
 
     // Scan selected shaders to request only the optional extensions they actually use.
