@@ -164,9 +164,14 @@ def write_file(path: str, data: bytes) -> None:
 
 def write_wav(path: str, pcm: bytes, rate: int, channels: int, float32: bool = False) -> None:
     bits = 32 if float32 else 16
-    hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack(
-        "<IHHIIHH", 16, 3 if float32 else 1, channels, rate, rate * channels * bits // 8, channels * bits // 8, bits) +         b"data" + struct.pack("<I", len(pcm))
-    write_file(path, hdr + pcm)
+    block_align = channels * (bits // 8)
+    fmt = struct.pack("<HHIIHH", 3 if float32 else 1, channels, rate, rate * block_align, block_align, bits)
+    fact = b""
+    if float32:
+        fmt += struct.pack("<H", 0)  # WAVEFORMATEX.cbSize
+        fact = struct.pack("<4sII", b"fact", 4, len(pcm) // block_align)
+    header = b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + fact + b"data" + struct.pack("<I", len(pcm))
+    write_file(path, b"RIFF" + struct.pack("<I", len(header) + len(pcm)) + header + pcm)
 
 
 # ---- AWC ----

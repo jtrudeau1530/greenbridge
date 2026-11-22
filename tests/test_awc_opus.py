@@ -29,26 +29,35 @@ awc = load_awc_opus()
 
 
 def read_wav(path):
-    """Fields of the canonical 44-byte-header WAV that write_wav produces."""
+    """Read the RIFF chunks so the audio can follow either PCM or float metadata."""
     with open(path, "rb") as f:
         data = f.read()
-    if data[:4] != b"RIFF" or data[8:12] != b"WAVE" or data[12:16] != b"fmt " or data[36:40] != b"data":
-        raise AssertionError("not a canonical RIFF/WAVE file")
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise AssertionError("not a RIFF/WAVE file")
     riff_size, = struct.unpack_from("<I", data, 4)
-    fmt_size, fmt, channels, rate, byte_rate, block_align, bits = struct.unpack_from("<IHHIIHH", data, 16)
-    data_size, = struct.unpack_from("<I", data, 40)
+    chunks = {}
+    offset = 12
+    while offset < len(data):
+        name, size = struct.unpack_from("<4sI", data, offset)
+        offset += 8
+        if offset + size > len(data):
+            raise AssertionError(f"truncated WAV chunk {name!r}")
+        chunks[name] = data[offset:offset + size]
+        offset += size + (size & 1)
+    fmt, channels, rate, byte_rate, block_align, bits = struct.unpack_from("<HHIIHH", chunks[b"fmt "])
     return {
         "data": data,
         "riff_size": riff_size,
-        "fmt_size": fmt_size,
+        "fmt_size": len(chunks[b"fmt "]),
+        "chunks": chunks,
         "format": fmt,
         "channels": channels,
         "rate": rate,
         "byte_rate": byte_rate,
         "block_align": block_align,
         "bits": bits,
-        "data_size": data_size,
-        "pcm": data[44:],
+        "data_size": len(chunks[b"data"]),
+        "pcm": chunks[b"data"],
     }
 
 
@@ -211,8 +220,10 @@ class WriteWavTest(unittest.TestCase):
         path = self.path("float32.wav")
         awc.write_wav(path, pcm, 44100, 2, float32=True)
         w = read_wav(path)
-        self.assertEqual(w["riff_size"], 36 + len(pcm))
-        self.assertEqual(w["fmt_size"], 16)
+        self.assertEqual(list(w["chunks"]), [b"fmt ", b"fact", b"data"])
+        self.assertEqual(w["chunks"][b"fmt "][16:], b"\x00\x00")
+        self.assertEqual(struct.unpack("<I", w["chunks"][b"fact"]), (4,))
+        self.assertEqual(w["riff_size"], len(w["data"]) - 8)
         self.assertEqual(w["format"], 3)
         self.assertEqual(w["channels"], 2)
         self.assertEqual(w["rate"], 44100)
@@ -221,7 +232,7 @@ class WriteWavTest(unittest.TestCase):
         self.assertEqual(w["bits"], 32)
         self.assertEqual(w["data_size"], len(pcm))
         self.assertEqual(w["pcm"], pcm)
-        self.assertEqual(len(w["data"]), 44 + len(pcm))
+        self.assertEqual(len(w["data"]), 58 + len(pcm))
 
 
 class OggCrcTest(unittest.TestCase):
@@ -365,6 +376,7 @@ class ExportBankTest(unittest.TestCase):
 
         with self.subTest("float32 stream -> float WAV"):
             w = read_wav(os.path.join(od, "00000002.wav"))
+            self.assertEqual(struct.unpack("<I", w["chunks"][b"fact"]), (50,))
             self.assertEqual(w["format"], 3)
             self.assertEqual(w["bits"], 32)
             self.assertEqual(w["rate"], 48000)
