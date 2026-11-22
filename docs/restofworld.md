@@ -699,6 +699,51 @@ not raw stream-start images. Measured on the 1.0.2.1 package, they live in two p
    | `pack/core_restofworld/data/ttdb/vfx/ttdb_vfx.ttpf` | 3,129,600 | 17 | `BC7_UNORM_SRGB` 5, `BC1_UNORM` 5, `BC5_UNORM` 5, `BC4_UNORM` 1, `BC3_UNORM_SRGB` 1 |
    | `pack/core_restofworld001/data/ttdb/ui/ttdb_ui.ttpf` | 38,656 | 5 | `BC7_UNORM` 3, `BC3_UNORM` 2 |
 
+### Which source the drawables' texture references reach
+
+The drawables name textures by the 64-bit texture IDs in their shader parameter records
+([textures.md](textures.md)). Measured over the 1,732 `.ydr`/`.yft`/`.ydd` entries of the two core archives in
+a local RPF9 index (all decoded; 17,208 texture references to 675 distinct IDs), against the ID tables of all 57
+`.ttpf` pools in the package and against the two sources above:
+
+| Where the ID is | Distinct IDs | References |
+|---|---:|---:|
+| a pool under `pack/core_restofworld*/data/ttdb/` | 285 | |
+| a shared pool under `data/ttdb/` | 258 | |
+| subtotal: in a pool | 543 | 6,403 |
+| a key of an embedded `pgDictionary`, or any u64 inside the 145 embedded-texture streams | 0 | 0 |
+| nowhere | 132 | 10,805 |
+
+The 144 embedded dictionaries hold 166 keys; 119 of them have a zero high half, and none equals a referenced ID
+or either 32-bit half of one. So these 64-bit IDs reach the pools only; how a drawable binds the embedded
+`0x980` textures was not traced here.
+
+The unresolved share is not spread over the materials. By shader texture slot (slots named by role where the
+material's own textures show it; the others are unnamed and listed by size):
+
+| Slot | References in a pool / nowhere | Distinct IDs in a pool / nowhere |
+|---|---:|---:|
+| colour | 1,818 / 136 | 166 / 15 |
+| normal | 1,758 / 223 | 145 / 14 |
+| specular | 1,675 / 306 | 149 / 19 |
+| a fourth material slot | 1,049 / 931 | 52 / 24 |
+| five slots with one fixed ID each | 0 / 1,463 to 1,568 each | 0 / 1 each |
+| a sixth such slot | 6 / 1,517 | 1 / 2 |
+| one slot that never resolves | 0 / 184 | 0 / 57 |
+
+The per-asset material textures resolve for about nine references in ten (colour 93%, normal 89%, specular 85%).
+Most unresolved references come from six slots that each use one fixed ID on 1,463 to 1,568 shaders: textures
+shared by the whole engine and bound at run time rather than stored with an asset (hypothesis: lookup tables,
+noise or environment maps).
+
+Pool entry formats of the 543 resolved IDs (DXGI numbers): 71/72 (BC1) 391, 98/99 (BC7) 120, 83 (BC5) 14,
+78 (BC3) 14, 80 (BC4) 3, 65 (A8) 1; 22 are 4 x 4 placeholders.
+
+Method: drawables decoded with a local RPF9 model decoder (the shader parameter layout of textures.md); pool ID
+tables read from each pool's `ETPF` section (count at +8, 16-byte records, then the sorted u64 IDs); embedded
+streams found with `tools/restofworld_index.py`'s `find_rage_textures` / `is_pg_tex_dictionary` (keys at the
+`+0x20` pointer, count at `+0x28`). Counts only; no IDs, names or texture data.
+
 ## What a future decoder needs
 
 1. The RPF9 table-of-contents key/schema for names, paths and exact entry boundaries. This project
