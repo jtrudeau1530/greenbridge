@@ -277,6 +277,47 @@ programs assemble for gfx1013.
 `--skip-op OP` (an op name) sets a known finding aside without changing the rest of the program.
 `--show SEED:INDEX:WAVE` prints a program and its model.
 
+### Wave and cross-lane ops on the GPU (`tools/crosslane_fuzz.py`, FUZZ-7)
+
+Cross-lane ops read other lanes, so like FUZZ-6 this runs on the GPU and not in the one-lane interpreter.
+Each seeded program is one compute group of a wave32 or wave64 program. Group sizes cover one full wave, two or
+three waves, and a partial last wave (20, 50, 40 or 100 threads). The program runs 24 to 28 random ops, then
+every thread stores its six data VGPRs and eight data SGPRs, so each half of a wave reports its own copy of
+every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP`.
+
+- **Instructions.** `v_readlane_b32` and `v_writelane_b32` (constant and SGPR lane selects; in wave32 also
+  selects of 32 and up), `v_readfirstlane_b32`, `v_cmp` into VCC or an SGPR mask, `v_cmpx`, `s_and_saveexec`
+  and its restore, nested up to three deep, constant EXEC halves, `s_bcnt1`/`s_bcnt0`/`s_ff1` of a mask or
+  EXEC, `v_mbcnt_lo/hi` on a mask, EXEC or plain data, `v_cndmask` on a mask, `s_and/or/xor/andn2` of masks,
+  `v_permlane16_b32` / `v_permlanex16_b32`, and forward `s_cbranch_execz/vccz/vccnz` over one to four of these.
+  With `--dpp`: a DPP16 or DPP8 src0 on `v_mov`/`v_not`/`v_add_nc_u32`/`v_xor`, with every DPP16 control,
+  `row_mask`, `bank_mask`, `bound_ctrl` and `fi`. Masks read as plain data (`v_mov_b32 v, s_mask`) belong to
+  #293 and are left out with `--no-maskdata`.
+- **Reference.** A 64-lane model in the same file, written from the ISA (rules in its docstring). Its unit
+  test, `tests/test_crosslane_fuzz.py`, needs no GPU.
+- **Defined behaviour only.** Lane selects, permlane and DPP never read a lane missing from a partial wave.
+  EXEC constants only enable lanes that exist. Every mask register is zero-initialised, as compiled code does,
+  so a branch that skips the `v_cmp` writing a mask leaves a defined mask after the join.
+- **Hypotheses are reported apart.** `v_permlane16/x16` with op_sel FI = 0 reading a lane that is off in
+  EXEC is modelled as the DPP "invalid source" case (vD kept). That isn't measured on AMD hardware, and the
+  translator always reads the lane. A program that hits it counts as `hyp_only`, not as a mismatch.
+  `--permlane-fetch-inactive` models FI = 1 instead.
+- **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
+  which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.
+- **Reports.** The thread, wave, lane and register of the first differences. `--minimize` drops ops while the
+  mismatch persists, and `--keep DIR` saves the programs. `--translator PATH` tests another checkout's
+  translator (for example an open pull request).
+
+First results on an RTX 4090 (subgroup 32, driver 621.14):
+
+- **SHADER-52 (#407).** In wave32, `v_readlane`/`v_writelane` masked the lane select with 63, not 31. 23 of
+  100 wave32 programs failed, each one minimized to a `v_writelane` with a lane select of 32 or more.
+- **Two DPP bugs in #238** (SHADER-23, posted there). Non-mov DPP ops wrote `op(old vD, src1)` in lanes that
+  should be left unwritten (invalid source without `bound_ctrl`, or a lane off in `row_mask`/`bank_mask`), and
+  DPP16 ignored `fi:1`. Each was confirmed with a hand-written program.
+- **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
+- **Open question (#374):** what hardware does for permlane with FI = 0 (see above). It needs a run on an AMD GPU.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
@@ -298,7 +339,8 @@ covers the operations most shaders use. Then add, in order:
    existing `vk_compute_test`/`vk_store_test`/`vk_texture_test` programs show the shape.
 5. **Wave operations.** Ballot, shuffles, DPP, `readlane`/`writelane`, `permlane`, `mbcnt`, and the
    wave64 split on 32-wide subgroups. These are the largest semantic gap and need a 64-lane model
-   plus a subgroup-size-aware host.
+   plus a subgroup-size-aware host. `tools/crosslane_fuzz.py` (FUZZ-7, above) is that model, run on
+   the GPU.
 6. **Pixel interpolation and exports.** Barycentrics, per-vertex inputs, compressed exports, MRT and
    depth. The existing GPU tests already pin several of these; a CPU model makes them differential.
 
@@ -320,7 +362,8 @@ The prototype and the first harness stage deliberately do not cover:
   the pixel center. The CPU model would need the same triangle and sample positions as the GPU.
 - **Wave operations.** Ballot, shuffles, DPP, permlane and cross-half wave64 behaviour need a full
   64-lane model and a GPU whose subgroup size matches the wave. On a 32-wide subgroup host, a wave64
-  program is not the same execution.
+  program is not the same execution. The one-lane interpreter still can't run them; the GPU fuzzer
+  `tools/crosslane_fuzz.py` covers them instead, with wave64 checked through `--wave64-emulate`.
 - **Memory and LDS.** Address spaces, out-of-bounds rules, atomics, ordering and barriers. These are
   modelled later, with the same "unsupported, never guessed" rule.
 - **Transcendentals and approximation.** `v_rcp_f32`, `v_rsq_f32`, `v_exp_f32`, `v_log_f32` and the
