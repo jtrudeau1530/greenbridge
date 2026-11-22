@@ -52,7 +52,9 @@ $out = Join-Path $Temp "build"
 if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     if (Test-Path $src) { Remove-Item -Recurse -Force $src }
     New-Item -ItemType Directory -Force $Temp | Out-Null
-    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse https://github.com/llvm/llvm-project $src
+    # core.longpaths: some llvm/docs paths are about 150 characters, so with a -Temp of about 100 characters the
+    # sparse checkout fails with "Filename too long" (Windows' 260-character limit). Set in the clone's config only.
+    & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse --config core.longpaths=true https://github.com/llvm/llvm-project $src
     if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
     & git -C $src sparse-checkout set llvm cmake third-party
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
