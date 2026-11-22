@@ -141,6 +141,99 @@ def ref_sqrt_clamp_f16(
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+class HalfSelect(Enum):
+    LO = 0  # bits [15:0]
+    HI = 1  # bits [31:16]
+
+
+@dataclass(frozen=True)
+class RegHalf:
+    """Represents an architectural 16-bit half-register (e.g., v0.l, v0.h, s4.l)."""
+    index: int
+    reg_type: RegType
+    half: HalfSelect = HalfSelect.LO
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        suffix = ".l" if self.half == HalfSelect.LO else ".h"
+        return f"{prefix}{self.index}{suffix}"
+
+
+@dataclass(frozen=True)
+class Literal16:
+    """Represents a 16-bit literal or inline float constant."""
+    bits: int
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal16:
+        return cls(f16_to_bits(val))
+
+    @property
+    def float_value(self) -> float:
+        return bits_to_f16(self.bits)
+
+    @property
+    def name(self) -> str:
+        if self.bits == POS_ZERO:
+            return "0.0"
+        if self.bits == NEG_ZERO:
+            return "-0.0"
+        f = self.float_value
+        if math.isnan(f):
+            return "nan"
+        if math.isinf(f):
+            return "inf" if f > 0 else "-inf"
+        return f"{f:g}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand:
+    """Typed expression operand with optional input modifiers (abs, neg)."""
+    source: Union[RegHalf, Literal16]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass(frozen=True)
+class VSqrtClampF16Instruction:
+    """Symbolic AST node representing a RDNA2 v_sqrt_clamp_f16 instruction."""
+    dst: RegHalf
+    src0: VOP3Operand
+    clamp: bool = True
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        s = f"v_sqrt_f16 {self.dst.name}, {self.src0.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -226,6 +319,69 @@ class TestSqrtClampF16ModelAndOracle(unittest.TestCase):
         # neg on 0.25: -(0.25) = -0.25 -> clamped to +0.0
         res_neg = ref_sqrt_clamp_f16(QUARTER_F16, neg0=True)
         self.assertEqual(res_neg, POS_ZERO)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reghalf_validation_and_naming(self) -> None:
+        v0_l = RegHalf(0, RegType.VGPR, HalfSelect.LO)
+        self.assertEqual(v0_l.name, "v0.l")
+        self.assertEqual(v0_l.index, 0)
+        self.assertEqual(v0_l.half, HalfSelect.LO)
+
+        v0_h = RegHalf(0, RegType.VGPR, HalfSelect.HI)
+        self.assertEqual(v0_h.name, "v0.h")
+
+        s8_l = RegHalf(8, RegType.SGPR, HalfSelect.LO)
+        self.assertEqual(s8_l.name, "s8.l")
+        s8_h = RegHalf(8, RegType.SGPR, HalfSelect.HI)
+        self.assertEqual(s8_h.name, "s8.h")
+
+        with self.assertRaises(ValueError):
+            RegHalf(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegHalf(-1, RegType.VGPR)
+
+    def test_operand_disassembly(self) -> None:
+        v = RegHalf(2, RegType.VGPR, HalfSelect.LO)
+        op_plain = VOP3Operand(v)
+        self.assertEqual(op_plain.disassemble(), "v2.l")
+
+        op_abs = VOP3Operand(v, abs_mod=True)
+        self.assertEqual(op_abs.disassemble(), "|v2.l|")
+
+        op_neg = VOP3Operand(v, neg_mod=True)
+        self.assertEqual(op_neg.disassemble(), "-v2.l")
+
+        op_neg_abs = VOP3Operand(v, abs_mod=True, neg_mod=True)
+        self.assertEqual(op_neg_abs.disassemble(), "-|v2.l|")
+
+        lit = Literal16.from_float(4.0)
+        op_lit = VOP3Operand(lit)
+        self.assertEqual(op_lit.disassemble(), "4")
+
+    def test_v_sqrt_clamp_f16_ast_construction_and_validation(self) -> None:
+        dst = RegHalf(0, RegType.VGPR, HalfSelect.LO)
+        src0 = VOP3Operand(RegHalf(2, RegType.VGPR, HalfSelect.HI), abs_mod=True)
+        instr = VSqrtClampF16Instruction(dst=dst, src0=src0, clamp=True)
+
+        self.assertEqual(instr.disassemble(), "v_sqrt_f16 v0.l, |v2.h| clamp")
+
+        # Invalid destination type (SGPR)
+        with self.assertRaises(TypeError):
+            VSqrtClampF16Instruction(dst=RegHalf(0, RegType.SGPR), src0=src0)
+
+    def test_structural_equality(self) -> None:
+        i1 = VSqrtClampF16Instruction(
+            RegHalf(0, RegType.VGPR, HalfSelect.LO),
+            VOP3Operand(RegHalf(2, RegType.VGPR, HalfSelect.HI)),
+        )
+        i2 = VSqrtClampF16Instruction(
+            RegHalf(0, RegType.VGPR, HalfSelect.LO),
+            VOP3Operand(RegHalf(2, RegType.VGPR, HalfSelect.HI)),
+        )
+        self.assertEqual(i1, i2)
 
 
 if __name__ == "__main__":
