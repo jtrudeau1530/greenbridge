@@ -90,9 +90,11 @@ LEONIDA_W64_EMULATE=1 python -I scripts/run_gpu_tests.py --build runtime/build/l
     --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --filter cs_
 ```
 
-With Mesa 25.2 (llvmpipe, LLVM 20) the first run passes 31 of 60 and skips 29, the second passes 33 of 33. The
-skips are expected: llvmpipe has 8-wide subgroups (so every wave64 test and `ps_bitmask_perm` skip without
-emulation) and no `VK_KHR_fragment_shader_barycentric` (`ps_bary`, `ps_uniform_branch`). With
+With Mesa 25.2 (llvmpipe, LLVM 20) the first run passes 52 of 88 and skips 36, the second passes 37 of 39 and
+skips 2. The skips are expected: llvmpipe has 8-wide subgroups (so every wave64 test skips without emulation, and
+the 32-lane tests `ps_bitmask_perm`, `cs_wqm_w32` and `cs_w32_lane_wrap` skip in both runs), no
+`VK_KHR_fragment_shader_barycentric` (`ps_bary`, `ps_uniform_branch`, `ps_scc_mask32`) and no
+`VK_KHR_maintenance8` (`ps_texoff`). With
 `LEONIDA_W64_EMULATE=1` the mesh tests abort inside llvmpipe's compiler ("LLVM ERROR: Cannot emit physreg copy
 instruction"), which is why the second run is limited to compute. llvmpipe is not a substitute for a result from a
 real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
