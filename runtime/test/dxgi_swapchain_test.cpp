@@ -527,13 +527,103 @@ int main() {
         return fail("ResizeBuffers should reject unsupported format DXGI_FORMAT_R32_UINT");
 
     // Measured on host DXGI (RTX 5070 and WARP): DXGI_PRESENT_TEST returns S_OK without presenting, so the back
-    // buffer index stays; a sync interval above 4 is DXGI_ERROR_INVALID_CALL and presents nothing either.
+    // buffer index and last present count stay; a sync interval above 4 is DXGI_ERROR_INVALID_CALL and presents nothing.
     {
         const UINT before = sc->GetCurrentBackBufferIndex();
+        UINT count_before = 0;
+        if (FAILED(sc->GetLastPresentCount(&count_before)) || count_before == 0)
+            return fail("GetLastPresentCount should be non-zero after earlier Presents");
         if (sc->Present(0, DXGI_PRESENT_TEST) != S_OK || sc->GetCurrentBackBufferIndex() != before)
             return fail("Present(0, DXGI_PRESENT_TEST) presented a frame");
+        UINT count_after_test = 0;
+        if (FAILED(sc->GetLastPresentCount(&count_after_test)) || count_after_test != count_before)
+            return fail("DXGI_PRESENT_TEST should not increment GetLastPresentCount");
         if (sc->Present(5, 0) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before)
             return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
+        if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
+            return fail("GetLastPresentCount(nullptr) should return E_INVALIDARG");
+    }
+
+    // SwapChain::GetParent and SetMaximumFrameLatency/GetMaximumFrameLatency.
+    {
+        IDXGIFactory4* parent = nullptr;
+        if (FAILED(sc->GetParent(IID_PPV_ARGS(&parent))) || parent != factory)
+            return fail("SwapChain::GetParent did not return the parent factory");
+        parent->Release();
+        UINT lat = 0;
+        if (FAILED(sc->GetMaximumFrameLatency(&lat)) || lat != 2)
+            return fail("Default GetMaximumFrameLatency should be 2");
+        if (sc->SetMaximumFrameLatency(0) != E_INVALIDARG || sc->SetMaximumFrameLatency(17) != E_INVALIDARG)
+            return fail("SetMaximumFrameLatency should reject 0 and > 16 with E_INVALIDARG");
+        if (FAILED(sc->SetMaximumFrameLatency(3)) || FAILED(sc->GetMaximumFrameLatency(&lat)) || lat != 3)
+            return fail("SetMaximumFrameLatency(3) round-trip failed");
+    }
+
+    // IDXGIFactory4 adapter enumeration, IDXGIAdapter3 descriptors, EnumAdapterByLuid, and QueryVideoMemoryInfo.
+    {
+        IDXGIAdapter1* adapter1 = nullptr;
+        if (FAILED(factory->EnumAdapters1(0, &adapter1)) || !adapter1)
+            return fail("EnumAdapters1(0) failed");
+        IDXGIAdapter1* missing = nullptr;
+        if (factory->EnumAdapters1(1, &missing) != DXGI_ERROR_NOT_FOUND || missing != nullptr)
+            return fail("EnumAdapters1(1) should return DXGI_ERROR_NOT_FOUND");
+
+        IDXGIAdapter* adapter0 = nullptr;
+        if (FAILED(factory->EnumAdapters(0, &adapter0)) || !adapter0)
+            return fail("EnumAdapters(0) failed");
+        adapter0->Release();
+
+        IDXGIFactory4* adapter_parent = nullptr;
+        if (FAILED(adapter1->GetParent(IID_PPV_ARGS(&adapter_parent))) || adapter_parent != factory)
+            return fail("Adapter::GetParent did not return the parent factory");
+        adapter_parent->Release();
+
+        IDXGIAdapter3* adapter3 = nullptr;
+        if (FAILED(adapter1->QueryInterface(IID_PPV_ARGS(&adapter3))) || !adapter3)
+            return fail("QueryInterface(IDXGIAdapter3) failed");
+
+        DXGI_ADAPTER_DESC desc0{};
+        DXGI_ADAPTER_DESC1 desc1{};
+        DXGI_ADAPTER_DESC2 desc2{};
+        if (FAILED(adapter3->GetDesc(&desc0)) || FAILED(adapter3->GetDesc1(&desc1)) || FAILED(adapter3->GetDesc2(&desc2)))
+            return fail("Adapter GetDesc/GetDesc1/GetDesc2 failed");
+        if (desc1.Description[0] == L'\0' || desc1.VendorId != chosen.vendorID || desc1.DeviceId != chosen.deviceID)
+            return fail("Adapter desc did not match Vulkan physical device");
+        if (desc1.DedicatedVideoMemory + desc1.SharedSystemMemory == 0)
+            return fail("Adapter reported zero total memory");
+        if (desc0.VendorId != desc1.VendorId || desc2.DeviceId != desc1.DeviceId)
+            return fail("Adapter desc mismatch between GetDesc/GetDesc1/GetDesc2");
+
+        // EnumAdapterByLuid with matching LUID succeeds; bogus LUID returns DXGI_ERROR_NOT_FOUND.
+        IDXGIAdapter3* by_luid = nullptr;
+        if (FAILED(factory->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&by_luid))) || !by_luid)
+            return fail("EnumAdapterByLuid(matching) failed");
+        by_luid->Release();
+        LUID bogus = desc1.AdapterLuid;
+        bogus.LowPart ^= 0x5a5a5a5au;
+        bogus.HighPart ^= 0x13572468;
+        if (factory->EnumAdapterByLuid(bogus, IID_PPV_ARGS(&by_luid)) != DXGI_ERROR_NOT_FOUND || by_luid != nullptr)
+            return fail("EnumAdapterByLuid(bogus) should return DXGI_ERROR_NOT_FOUND");
+
+        // QueryVideoMemoryInfo + SetVideoMemoryReservation.
+        DXGI_QUERY_VIDEO_MEMORY_INFO local_info{};
+        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info)) ||
+            local_info.Budget == 0)
+            return fail("QueryVideoMemoryInfo(LOCAL) failed or reported 0 budget");
+        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, 64u * 1024u * 1024u)))
+            return fail("SetVideoMemoryReservation(LOCAL) failed");
+        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info)) ||
+            local_info.CurrentReservation != 64u * 1024u * 1024u)
+            return fail("SetVideoMemoryReservation did not reflect in QueryVideoMemoryInfo");
+        DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info{};
+        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info)))
+            return fail("QueryVideoMemoryInfo(NON_LOCAL) failed");
+        if (adapter3->QueryVideoMemoryInfo(1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info) != E_INVALIDARG ||
+            adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, nullptr) != E_INVALIDARG)
+            return fail("QueryVideoMemoryInfo invalid args should return E_INVALIDARG");
+
+        adapter3->Release();
+        adapter1->Release();
     }
 
     // Host DXGI refuses ResizeBuffers with DXGI_ERROR_INVALID_CALL while the app still holds a back buffer,
