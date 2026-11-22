@@ -8,7 +8,6 @@ Tools are located through environment variables first, then by looking in the us
     LEONIDA_HW_ARCH     the GPU architecture to assemble for; default: what amdgpu-arch reports, else gfx1150
 Anything missing raises Unavailable, which callers turn into exit 77 ("skipped").
 """
-import glob
 import hashlib
 import os
 import shutil
@@ -55,8 +54,7 @@ def find_clang():
         if root:
             cands += [os.path.join(root, "lib", "llvm", "bin", _exe("clang")), os.path.join(root, "bin", _exe("clang"))]
     tail = os.path.join("Lib", "site-packages", "_rocm_sdk_core", "lib", "llvm", "bin", _exe("clang"))
-    for base in (os.getcwd(), REPO, os.path.dirname(REPO)):
-        cands += glob.glob(os.path.join(base, ".venv", tail)) + glob.glob(os.path.join(base, "*", ".venv", tail))
+    cands.append(os.path.join(REPO, ".venv", tail))   # only the repo root's venv, never a glob under the cwd
     for c in cands:
         if c and os.path.isfile(c) and _has_amdgcn(c):
             return c
@@ -72,7 +70,7 @@ def find_hip_dll():
         return env
     if os.name != "nt":
         raise Unavailable("the launcher targets the Windows AMD driver (amdhip64_7.dll)")
-    for n in ("amdhip64_7.dll", "amdhip64_6.dll"):
+    for n in ("amdhip64_7.dll", "amdhip64_6.dll"):   # the launcher loads whatever path this returns
         p = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", n)
         if os.path.isfile(p):
             return p
@@ -124,7 +122,7 @@ class Oracle:
             raise Unavailable("hw_oracle.c is missing")
         self.clang = find_clang()
         self.lld = _find_lld(self.clang)
-        find_hip_dll()
+        self.dll = find_hip_dll()
         self.arch = arch or detect_arch(self.clang)
         asm.family(self.arch)
         self.chunk = chunk
@@ -178,7 +176,7 @@ class Oracle:
         return co, ""
 
     def _launch(self, co, names, words=4):
-        r = subprocess.run([self.exe, co, str(words)], input="\n".join(names) + "\n", capture_output=True, text=True)
+        r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True, text=True)
         return r.returncode, r.stdout, r.stderr
 
     def run(self, programs, words=4):
@@ -205,7 +203,10 @@ class Oracle:
                 results[live[k]] = "assembler rejected: " + first.split("error:", 1)[-1].strip()
             live = [i for k, i in enumerate(live) if k not in bad]
         else:
-            return
+            # every program in the chunk was rejected: that is a broken harness (a bad prologue, the wrong
+            # architecture), not a thousand skips
+            raise RuntimeError("the assembler rejected every program in a chunk: " +
+                               (str(results[idx[0]]) if idx else "empty chunk"))
         rc, out, err = self._launch(co, names, words)
         if rc:
             raise RuntimeError(f"hw_oracle exited {rc}: {err.strip()[:300]}")

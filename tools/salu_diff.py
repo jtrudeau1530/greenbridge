@@ -111,7 +111,8 @@ def wqm(x, width):
 def bfe(src, ctl, signed):
     off, width = ctl & 31, (ctl >> 16) & 0x7F
     # A field that runs past bit 31 stops there: s_bfe_i32 sign-extends from the top bit that exists (LLVM
-    # constantFoldBFE does the same). Measured on gfx1150 hardware, 4000 random control words (--oracle hw).
+    # constantFoldBFE does for v_bfe; 5-bit width there). The s_bfe rule itself rests on the gfx1150 measurement
+    # (4000 random control words, --oracle hw); RDNA2 is unmeasured.
     width = min(width, 32 - off)
     if width == 0:
         return 0
@@ -528,7 +529,7 @@ def main(argv=None):
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--all-failures", action="store_true", help="print every failing program, not just the first")
     ap.add_argument("--bfe-any", action="store_true",
-                    help="also give s_bfe_* control words past offset + width = 32 (an open hardware question)")
+                    help="also give s_bfe_* control words past offset + width = 32 (measured on gfx1150: the field stops at bit 31; RDNA2 unmeasured)")
     ap.add_argument("--inline64", action="store_true",
                     help="also use inline constants as 64-bit sources (the translator reads them as lane masks)")
     ap.add_argument("--oracle", default="translator",

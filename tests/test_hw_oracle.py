@@ -62,6 +62,7 @@ class Filters(unittest.TestCase):
         self.assertEqual(asm.literals("s_add_u32 s4, 64, -16"), set())
         self.assertEqual(asm.literals("s_and_b32 s4, 0x100, 0x100"), {0x100})
         self.assertEqual(len(asm.literals("s_and_b32 s4, 0x100, 0x200")), 2)
+        self.assertEqual(asm.literals("s_and_b32 s4, -1000, 0xfffffc18"), {0xFFFFFC18})   # one 32-bit value
         self.assertEqual(asm.literals("s_cmpk_lt_u32 s4, 0x8000"), set())     # SIMM16, not a literal
         self.assertEqual(asm.literals("s_movk_i32 s4, 0xffff"), set())
 
@@ -105,6 +106,15 @@ class OnHardware(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.oracle.close()
+
+    def test_the_dll_override_reaches_the_launcher(self):
+        with unittest.mock.patch.dict(os.environ, {"LEONIDA_HIP_DLL": str(Path(__file__))}):   # exists, not a DLL
+            with self.assertRaises(runner.Unavailable):
+                runner.open_oracle()
+
+    def test_a_chunk_the_assembler_rejects_entirely_is_a_harness_error(self):
+        with self.assertRaises(RuntimeError):
+            self.oracle.run([["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]])
 
     def test_runs_a_program_and_reports_a_rejected_one(self):
         bad = ["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]     # two literals: the assembler refuses it

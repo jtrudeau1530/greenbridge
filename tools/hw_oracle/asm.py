@@ -40,7 +40,8 @@ def literals(line):
     if not op.startswith("s_") or op.rstrip("_") in _LITERAL_FREE or re.match(r"s_cmpk_", op):
         return set()
     toks = [t.strip() for t in rest.split(",")] if rest else []
-    return {int(t, 0) for t in toks if not t.startswith("s") and not _is_inline(t)}
+    # -1 and 0xffffffff are the same 32-bit value, so they share one literal slot
+    return {int(t, 0) & 0xFFFFFFFF for t in toks if not t.startswith("s") and not _is_inline(t)}
 
 
 def skip_reason(lines, arch):

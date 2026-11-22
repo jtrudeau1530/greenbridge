@@ -158,6 +158,7 @@ Setup on Windows, about 800 MB and no admin rights:
   `py -m venv .venv` then `.venv\Scripts\python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm-sdk-core==10.0.0"`;
   `clang.exe` ends up in `.venv\Lib\site-packages\_rocm_sdk_core\lib\llvm\bin`. A `.venv` in the working
   directory or repository is found by itself; otherwise set `LEONIDA_AMD_CLANG` to that `clang.exe`.
+- **Linux/ROCm is not supported yet:** `hw_oracle.c` is Windows-only (it loads the driver's DLL).
 - **Host C compiler.** MinGW gcc (on PATH, or `LEONIDA_HOST_CC`) builds `tools/hw_oracle/hw_oracle.c` once into the
   temp folder. By hand: `gcc -O1 tools/hw_oracle/hw_oracle.c -o hw_oracle.exe`.
 - `LEONIDA_HW_ARCH` overrides the detected architecture (`amdgpu-arch`, else `gfx1150`). GFX10 spellings
@@ -187,8 +188,9 @@ Result of the first runs (Radeon 880M, driver 26.11.2, AMD clang 23.0.0git): abo
 the pseudocode taken literally (the old reference) sign-extends from bit `width - 1` of a zero-filled value, but
 the hardware stops the field at bit 31 (`width = min(width, 32 - offset)`) and sign-extends from there. 4,000 random
 control words, including bits 23 to 31 of the control word (ignored), fit that rule exactly. The translator already
-did this (0 of 600 differ), so the reference was the one that was wrong, and it now follows the measured rule. It
-matches LLVM's `constantFoldBFE`, which suggests RDNA2 does the same, but that is not measured here.
+did this (0 of 600 differ), so the reference was the one that was wrong, and it now follows the measured rule. The
+rule rests on that gfx1150 measurement (4000 control words). LLVM's `constantFoldBFE` does the same for the VOP3
+`v_bfe` nodes, but with a 5-bit width, so it is only analogous; RDNA2 is unmeasured.
 
 Two assembler facts matter when writing edge cases:
 

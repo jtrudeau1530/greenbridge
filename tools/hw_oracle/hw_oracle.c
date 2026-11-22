@@ -1,7 +1,8 @@
 /* Hardware oracle launcher. Loads a code object with the HIP runtime that ships inside the AMD Windows driver
  * (amdhip64_7.dll; no SDK, headers or import library) and runs kernels one at a time.
  *
- *   hw_oracle <code.co> <words>      kernel names on stdin, whitespace separated
+ *   hw_oracle <code.co> <words> [hip.dll]   kernel names on stdin, whitespace separated; the DLL defaults to
+ *                                           amdhip64_7.dll (then _6) from the normal search path
  *
  * Each kernel gets one 8-byte kernarg (a pointer to a <words> dword buffer pre-filled with 0xDEAD0000) and is
  * launched as one workgroup of one thread. Output, one line per kernel:  <name> <hex word> ...
@@ -31,8 +32,14 @@ int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: hw_oracle code.co words < kernel-names\n"); return 2; }
     unsigned words = (unsigned)strtoul(argv[2], NULL, 0);
     if (words < 1 || words > 4096) { fprintf(stderr, "words must be 1..4096\n"); return 2; }
-    HMODULE h = LoadLibraryA("amdhip64_7.dll");
-    if (!h) h = LoadLibraryA("amdhip64_6.dll");
+    HMODULE h = NULL;
+    if (argc > 3) {
+        h = LoadLibraryA(argv[3]);
+        if (!h) { fprintf(stderr, "cannot load %s\n", argv[3]); return 77; }
+    } else {
+        h = LoadLibraryA("amdhip64_7.dll");
+        if (!h) h = LoadLibraryA("amdhip64_6.dll");
+    }
     if (!h) { fprintf(stderr, "no amdhip64 DLL (AMD driver not installed)\n"); return 77; }
     LOAD(hipInit) LOAD(hipGetDeviceCount) LOAD(hipDeviceGetName) LOAD(hipGetDevicePropertiesR0600) LOAD(hipModuleLoadData)
     LOAD(hipModuleGetFunction) LOAD(hipMalloc) LOAD(hipMemcpy) LOAD(hipDeviceSynchronize) LOAD(hipModuleLaunchKernel)
