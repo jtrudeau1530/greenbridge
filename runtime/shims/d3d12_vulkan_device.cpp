@@ -1298,6 +1298,10 @@ public:
         binding.size = desc_.Width;
         binding.buffer = device_.arena.buffer;
         binding.buffer_offset = va_;
+        binding.va = va_;
+        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
