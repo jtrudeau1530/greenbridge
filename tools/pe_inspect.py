@@ -69,10 +69,16 @@ class PeImage:
 
     def __init__(self, data: bytes):
         self.data = data
-        if len(data) < 0x40 or data[:2] != b"MZ":
+        if data[:2] != b"MZ":
             raise PeFormatError("no MZ header")
+        if len(data) < 0x40:
+            # The MZ signature is there; the file is just too short to carry the MS-DOS header whose dword at
+            # 0x3c holds e_lfanew. Saying "no MZ header" here would blame a signature that is present.
+            raise PeFormatError(f"file is {len(data)} bytes, shorter than the 64-byte MS-DOS header")
         self.nt = struct.unpack_from("<I", data, 0x3C)[0]
-        if self.nt + 24 > len(data) or data[self.nt:self.nt + 4] != b"PE\0\0":
+        if self.nt + 24 > len(data):
+            raise PeFormatError(f"file is {len(data)} bytes, too short to hold the PE header at 0x{self.nt:x}")
+        if data[self.nt:self.nt + 4] != b"PE\0\0":
             raise PeFormatError("no PE signature")
         (self.machine, self.section_count, self.timestamp, _symbol_table, _symbols, opt_size,
          self.characteristics) = struct.unpack_from("<HHIIIHH", data, self.nt + 4)
