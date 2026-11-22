@@ -11,7 +11,7 @@ import unittest
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_ttpf_mips import pack_etpf_record, write_rds5_pool
+from test_ttpf_mips import build_bc1_bcpack_pool, pack_etpf_record, write_rds5_pool
 
 
 def write_pool(pool):
@@ -101,6 +101,33 @@ class TtpfExportResumeTest(unittest.TestCase):
             self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
             self.assertEqual(state(), saved)
             self.assertEqual(sorted(p.name for p in folder.glob("*.dds")), [rows[1]["File"]])
+
+    def test_confirmed_bcpack_decodes_directly_and_provisional_is_a_limitation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            confirmed = root / "confirmed.ttpf"
+            _, linear, _ = build_bc1_bcpack_pool(confirmed, meta=1)
+            res = export(confirmed, root / "out_confirmed")
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            confirmed_dir = root / "out_confirmed" / confirmed.stem
+            rows = textures(confirmed_dir)
+            self.assertEqual(len(rows), 1)
+            self.assertIsNotNone(rows[0]["File"])
+            self.assertIsNone(rows[0]["Limitation"])
+            self.assertEqual((rows[0]["Mips"], rows[0]["BaseMipLevel"]), (5, 0))
+            self.assertEqual((confirmed_dir / rows[0]["File"]).read_bytes()[148:], b"".join(linear.values()))
+
+            provisional = root / "provisional.ttpf"
+            build_bc1_bcpack_pool(provisional, meta=1, ref_dists=[250] + [0] * 1023)
+            res = export(provisional, root / "out_provisional")
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            provisional_dir = root / "out_provisional" / provisional.stem
+            rows = textures(provisional_dir)
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(rows[0]["File"])
+            self.assertIn("unconfirmed", rows[0]["Limitation"].lower())
+            self.assertEqual(list(provisional_dir.glob("*.dds")), [])
 
 
 if __name__ == "__main__":

@@ -84,7 +84,17 @@ WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wr
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const")
-CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
+          ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
+          ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
+          ("cs_dpp8", [7, 6, 5, 4, 3, 2, 1, 0]),
+          ("cs_dpp_ops", [100, 10, 11, 12, 13, 14, 15, 16]),
+          ("cs_dpp_bound", [10, 10, 11, 12, 13, 14, 15, 16]),
+          ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
+          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
+WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
+WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
+CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
@@ -143,12 +153,14 @@ CVT_F32_SAT_CASES = (
     (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
     (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
-# Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
+# Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
+# on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 # LEONIDA_BARY_FALLBACK=1 (set for build.py too): a pixel shader that reads raw barycentrics was translated with
 # --bary-fallback and is drawn through its pass-through geometry shader, <name>.bary_gs.spv.
 BARY_FALLBACK = os.environ.get("LEONIDA_BARY_FALLBACK") == "1"
-W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
+W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
+              ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
               ("cs_w64x_readfirstlane", [140, 140, 163, 132, 100, 105, 133, 48]),
               ("cs_w64x_bpermute", [36, 316, 253, 218, 435, 225, 0, 442]),
@@ -194,6 +206,13 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
+              # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
+              "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
+              "ps_cvt_off": (0xbf000000, 0x3ee00000, 0xbe800000, 0x3f800000),
+              "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
+              "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
+              "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
+              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
@@ -218,7 +237,8 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
-PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack"}
+PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
+                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 GATHER_LOD_TEST = "ps_gather_sampler_lod"
@@ -258,12 +278,13 @@ def gpu_test_timeout():
     text = (os.environ.get("LEONIDA_GPU_TEST_TIMEOUT") or "").strip()
     if not text:
         return DEFAULT_GPU_TEST_TIMEOUT
+    error = f"LEONIDA_GPU_TEST_TIMEOUT must be a finite number of seconds (0 = no limit), not {text!r}"
     try:
         limit = float(text)
     except ValueError:
-        sys.exit(f"LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not {text!r}")
-    if math.isnan(limit):
-        sys.exit("LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not nan")
+        sys.exit(error)
+    if not math.isfinite(limit):
+        sys.exit(error)
     return None if limit <= 0 else limit
 
 
@@ -279,11 +300,12 @@ def run(*cmd, env=None):
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:
-        if not isinstance(e, FileNotFoundError):
-            return 1, start_failure(cmd[0], e)
-        tools = os.path.abspath(os.path.dirname(cmd[0]))
-        missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
-        sys.exit(not_found_message(tools, missing))
+        if isinstance(e, FileNotFoundError):
+            tools = os.path.abspath(os.path.dirname(cmd[0]))
+            missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
+            if missing:
+                sys.exit(not_found_message(tools, missing))
+        return 1, start_failure(cmd[0], e)
     return r.returncode, r.stdout + r.stderr
 
 
@@ -424,6 +446,22 @@ def wave32_lane_skip(out):
     return narrow_subgroup_skip(out) or unpinned_subgroup_skip(out)
 
 
+def bitmask_perm_narrow_skip(out, px):
+    """A Skip when ps_bitmask_perm ran narrower than 32 lanes on a device whose subgroup range permits it (#618).
+    Requires every lane 0..width-1 of a power-of-two width in [min, 32), so a broken v_mbcnt still fails."""
+    m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
+    if not m or len(px) != 64 * 64:
+        return None
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if lo >= 32:
+        return None
+    lanes = {p[0] for p in px}
+    width = max(lanes) + 1
+    if lo <= width < 32 and width & (width - 1) == 0 and lanes == set(range(width)):
+        return Skip(f"SKIP (fragment subgroup ran at {width} lanes on {lo}..{hi} device; needs 32)")
+    return None
+
+
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
                  env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
@@ -437,11 +475,18 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         args.append("--require-wave64")
     if needs_32_lanes:
         env = {**WAVE32_LANE_ENV, **(env or {})}
+    # Run at the wave size the translator recorded, as run_gpu_tests.py does: a wave32 test left to the device's
+    # default runs 64-wide on AMD (subgroups 32..64), and cs_barrier_loop's four waves of 32 became two.
+    sg = None if "VKC_SUBGROUP_SIZE" in (env or {}) else subgroup_size(spirv, name)
+    if sg:
+        env = {**(env or {}), "VKC_SUBGROUP_SIZE": str(sg)}
     extra = {"env": dict(os.environ, **env)} if env else {}
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args, **extra)
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
     if needs_32_lanes and (skip := wave32_lane_skip(out)):
+        return skip
+    if sg and (skip := unpinned_subgroup_skip(out)):
         return skip
     if code != 0:
         return failure(code, out, 2)
@@ -786,6 +831,8 @@ def pixel_test(tools, spirv, name):
     if name == "ps_interp_f16_high":
         return interp_f16_high_problem(px)
     if name == "ps_bitmask_perm":
+        if skip := bitmask_perm_narrow_skip(out, px):
+            return skip
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"

@@ -51,6 +51,10 @@ TRACK_TYPE_NAMES = ("bonerotation", "bonetranslation", "bonescale", "genericcont
 TRACK_TYPES = {anim_index.joaat32(n): n for n in TRACK_TYPE_NAMES}
 TRACK_FORMATS = {0: "quaternion", 2: "vector3", 4: "float"}
 
+# `.motion` axis names: joaat32 of the lower-case name, recovered by brute force over a word list
+AXIS_NAMES = {anim_index.joaat32(n): n for n in ("yawangle", "rotationz", "facingdirection", "speed", "surfaceincline",
+                                                "roll", "verticalheight", "pitch", "pitchangle", "height")}
+
 
 class DecodeError(ValueError):
     pass
@@ -144,6 +148,44 @@ def parse_animation(s, at):
     }
 
 
+def motion_times(s, at):
+    """`.motion` +0x70: one 0x28-byte entry per child, {f32 child duration, f32 duration in the blend,
+    {ptr, u16 count} curve of (child time, blend time) f32 pairs, 16 zero bytes}. -> [(duration, blend, points)]"""
+    p, n = s.array(at + 0x70)
+    out = []
+    for i in range(n if p is not None else 0):
+        e = p + 0x28 * i
+        cp, cn = s.array(e + 8)
+        points = [(s.f32(cp + 8 * j), s.f32(cp + 8 * j + 4)) for j in range(cn)] if cp is not None else []
+        out.append((s.f32(e), s.f32(e + 4), points))
+    return out
+
+
+def parameter_node(s, at, parameters):
+    """The node that places a `.motion`'s children in parameter space: the pointer at +0x138 when +0x58 is 1;
+    when +0x58 is 2, +0x120 points at a block whose +0x18 is the node. A node starts {u64 0, u32 type, u32 0}.
+    Type 3 is one sampled axis: {array of u32 name hashes, array of (u32 sample index, f32 value) sorted by
+    value, f32 min, f32 max}. Other types are not decoded. -> (type, axis or None) or None"""
+    if parameters == 1:
+        node = s.ptr(at + 0x138)
+    elif parameters == 2:
+        block = s.ptr(at + 0x120)
+        node = s.ptr(block + 0x18) if block is not None else None
+    else:
+        return None
+    if node is None or s.u64(node) != 0 or s.u32(node + 12) != 0:
+        return None
+    kind, axis = s.u32(node + 8), None
+    if kind == 3:
+        names, nn = s.array(node + 0x10)
+        samples, ns = s.array(node + 0x20)
+        if names is not None and samples is not None:
+            axis = {"names": [s.u32(names + 4 * i) for i in range(nn)],
+                    "samples": [(s.u32(samples + 8 * i), s.f32(samples + 8 * i + 4)) for i in range(ns)],
+                    "min": s.f32(node + 0x30), "max": s.f32(node + 0x34)}
+    return kind, axis
+
+
 def parse_clip(s, at):
     kind = s.u32(at + 0x20)
     if kind >= 16:  # +0x20 is a pointer: a parametric clip that refers to packs outside the dictionary
@@ -162,6 +204,11 @@ def parse_clip(s, at):
                     motion["parameters"] = s.u32(at + 0x58)
             except (DecodeError, struct.error):
                 pass
+            try:
+                motion["times"] = motion_times(s, at)
+                motion["node"] = parameter_node(s, at, motion["parameters"])
+            except (DecodeError, struct.error):
+                motion["times"], motion["node"] = None, None
             return motion
         # `.motionmatcher`: a 16-byte id at +0x28, name at +0x38
         return {"kind": "motionmatcher", "name": s.string(at + 0x38), "animations": []}
@@ -544,6 +591,49 @@ def group(m, rows):
     return out, unresolved, gaps
 
 
+def child_times(c):
+    """A `.motion`'s +0x70 entries lined up with its children (None where they don't line up)."""
+    times = c.get("times")
+    return times if times is not None and len(times) == len(c["children"]) else [None] * len(c["children"])
+
+
+def count_motion_blend(c, stats):
+    """Counts for a `.motion`'s +0x70 child times and its parameter node (no values)."""
+    times = c.get("times")
+    if times is None:
+        stats["motion_times_unreadable"] += 1
+    else:
+        stats["motion_times_one_per_child"] += len(times) == len(c["children"])
+        for duration, blend, points in times:
+            stats["motion_child_times"] += 1
+            if len(points) == 2 and points == [(0.0, 0.0), (duration, blend)] and duration == blend:
+                stats["motion_child_times_identity"] += 1
+            elif (len(points) > 2 and points[0] == (0.0, 0.0) and points[-1] == (duration, blend) and
+                  all(a[0] <= b[0] and a[1] <= b[1] for a, b in zip(points, points[1:]))):
+                stats["motion_child_times_warped"] += 1
+            else:
+                stats["motion_child_times_other"] += 1
+    node = c.get("node")
+    if node is None:
+        stats["motion_node_unreadable"] += 1
+        return
+    kind, axis = node
+    stats[f"motion_node_type:{kind}"] += 1
+    if axis is None:
+        return
+    values = [v for _i, v in axis["samples"]]
+    stats["motion_axes"] += 1
+    stats["motion_axis_samples"] += len(values)
+    stats["motion_axis_one_name"] += len(axis["names"]) == 1
+    stats["motion_axis_sorted"] += all(a <= b for a, b in zip(values, values[1:]))
+    stats["motion_axis_range_is_first_last"] += bool(values) and (axis["min"], axis["max"]) == (values[0], values[-1])
+    stats["motion_axis_indices_are_0_to_n"] += sorted(i for i, _v in axis["samples"]) == list(range(len(values)))
+    stats["motion_axis_samples_equal_children"] += len(values) == len(c["children"] or [])
+    stats[f"motion_axis_sample_count:{len(values)}"] += 1
+    for h in axis["names"]:
+        stats["motion_axis_name:" + AXIS_NAMES.get(h, f"0x{h:08x}")] += 1
+
+
 def new_stats():
     return collections.Counter()
 
@@ -592,6 +682,7 @@ def decode_resource(path, segments, budget=None):
         stats[f"motion_parameters:{c['parameters']}"] += 1
         stats["motion_children"] += len(c["children"])
         stats["motion_children_in_external_refs"] += sum(dh in external for _ch, dh in c["children"])
+        count_motion_blend(c, stats)
     stats["clip_animation_refs"] += sum(len(c["animations"]) for c in d["clips"])
     stats["packs_local"] += len(d["packs"])
     stats["packs_external"] += d["external_packs"]
@@ -623,7 +714,10 @@ def decode_resource(path, segments, budget=None):
         row["over_budget"] = True
     # for the archive-wide join in scan(); scan() removes these lists from the rows it returns
     row["_clip_hashes"] = [c["hash"] for c in d["clips"] if c["kind"] == "clip"]
+    row["_clip_durations"] = [c["duration"] for c in d["clips"] if c["kind"] == "clip"]
     row["_children"] = [ch for c in d["clips"] if c["kind"] == "motion" and c["children"] for ch in c["children"]]
+    row["_child_durations"] = [t[0] if t else None for c in d["clips"] if c["kind"] == "motion" and c["children"]
+                               for t in child_times(c)]
     row["_external"] = d["external_hashes"]
     row.update(hash=f"0x{d['hash']:08x}", name=d["name"], clips=len(d["clips"]), packs=len(d["packs"]),
                external_packs=d["external_packs"], animations=ok + failed + skipped, decoded=ok,
@@ -635,9 +729,12 @@ def join_references(rows, stats):
     """Resolve hash-only references across the archive: a root `+0x70` item with a null pointer names another
     dictionary (its joaat32 name hash), and a `.motion` child is {clip hash, dictionary hash}."""
     clips_by_dict = collections.defaultdict(set)
+    duration = {}
     for r in rows:
         if "_clip_hashes" in r:
             clips_by_dict[int(r["hash"], 16)].update(r["_clip_hashes"])
+            for h, t in zip(r["_clip_hashes"], r.get("_clip_durations", [])):
+                duration[(int(r["hash"], 16), h)] = t
     ext_seen = set()
     for r in rows:
         for h in r.pop("_external", []):
@@ -646,11 +743,15 @@ def join_references(rows, stats):
                 ext_seen.add(h)
                 stats["external_hashes_distinct"] += 1
                 stats["external_hashes_distinct_found_here"] += h in clips_by_dict
-        for ch, dh in r.pop("_children", []):
+        kids = r.pop("_children", [])
+        for (ch, dh), t in zip(kids, r.pop("_child_durations", [None] * len(kids))):
             if dh in clips_by_dict:
                 stats["motion_children_dictionary_here"] += 1
                 stats["motion_children_resolved_to_clip"] += ch in clips_by_dict[dh]
+                if ch in clips_by_dict[dh] and t is not None:
+                    stats["motion_child_duration_equals_clip"] += duration.get((dh, ch)) == t
         r.pop("_clip_hashes", None)
+        r.pop("_clip_durations", None)
 
 
 def _decode_star(args):

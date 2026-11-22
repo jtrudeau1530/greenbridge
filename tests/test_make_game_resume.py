@@ -58,7 +58,8 @@ class ResumeShardsTest(unittest.TestCase):
     def test_a_fresh_run_starts_every_shard_and_records_its_plan(self):
         self.assertEqual(self.translate(3), [0, 1, 2])
         with open(os.path.join(self.spirv, make_game.SHARD_PLAN), encoding="utf-8") as f:
-            self.assertEqual(json.load(f), {"jobs": 3, "wave64_emulate": False, "translator": "d1"})
+            self.assertEqual(json.load(f), {"jobs": 3, "wave64_emulate": False, "fallbacks": [],
+                                            "translator": "d1"})
 
     def test_a_stop_during_the_merge_only_merges_again(self):
         self.translate(3, tag="a")              # the merge is mocked, so no index.json: as if stopped there
@@ -130,7 +131,7 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
                 json.dump({"jobs": 2, "wave64_emulate": False, "translator": "d1"}, f)
             seen = {}
 
-            def fake_translate(disasm, out, jobs, emulate=False):
+            def fake_translate(disasm, out, jobs, emulate=False, fallbacks=()):
                 seen["plan"] = os.path.exists(plan)
             with mock.patch.object(make_game, "py"), mock.patch.object(make_game, "need"), \
                     mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \

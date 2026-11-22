@@ -67,8 +67,9 @@ def main():
     if bc_bpe(a.fmt) is None:
         ap.error(f"no color scorer for {a.fmt!r}; expected BC1, BC2, or BC3")
     nib, tab = load()
-    texs = [t for t in json.load(open(a.index)) if t["fmt_name"].startswith(a.fmt)
-            and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
+    with open(a.index, encoding="utf-8") as f:
+        texs = [t for t in json.load(f) if t["fmt_name"].startswith(a.fmt)
+                and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
     texs = texs[: a.n]
     cands = {}
     for tname, ents in tab.items():
