@@ -961,5 +961,89 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(borrow_out2, 0)
 
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+# IEEE 754 Binary64 architectural constants
+IEEE_F64_POS_ZERO: int = 0x0000_0000_0000_0000
+IEEE_F64_NEG_ZERO: int = 0x8000_0000_0000_0000
+IEEE_F64_POS_INF: int = 0x7FF0_0000_0000_0000
+IEEE_F64_NEG_INF: int = 0xFFF0_0000_0000_0000
+IEEE_F64_QNAN: int = 0x7FF8_0000_0000_0000
+IEEE_F64_SNAN: int = 0x7FF0_0000_0000_0001
+IEEE_F64_MIN_SUBNORMAL: int = 0x0000_0000_0000_0001
+IEEE_F64_MAX_SUBNORMAL: int = 0x000F_FFFF_FFFF_FFFF
+IEEE_F64_MIN_NORMAL: int = 0x0010_0000_0000_0000
+IEEE_F64_MAX_NORMAL: int = 0x7FEF_FFFF_FFFF_FFFF
+
+IEEE_F64_BOUNDARY_PATTERNS = [
+    ("POS_ZERO", IEEE_F64_POS_ZERO),
+    ("NEG_ZERO", IEEE_F64_NEG_ZERO),
+    ("POS_INF", IEEE_F64_POS_INF),
+    ("NEG_INF", IEEE_F64_NEG_INF),
+    ("QNAN", IEEE_F64_QNAN),
+    ("SNAN", IEEE_F64_SNAN),
+    ("MIN_SUBNORMAL", IEEE_F64_MIN_SUBNORMAL),
+    ("MAX_SUBNORMAL", IEEE_F64_MAX_SUBNORMAL),
+    ("MIN_NORMAL", IEEE_F64_MIN_NORMAL),
+    ("MAX_NORMAL", IEEE_F64_MAX_NORMAL),
+]
+
+
+class TestIEEE754BoundaryExtremesAndBitPatterns(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN bit preservation tests."""
+
+    def test_subnormal_no_flush_preservation(self) -> None:
+        """Verify subnormal bit patterns are preserved strictly without hardware denormal flushing."""
+        saved, new_exec, scc = oracle_s_orn2_saveexec_b64(IEEE_F64_MIN_SUBNORMAL, EXEC_ALL_ONES)
+        self.assertEqual(saved, EXEC_ALL_ONES)
+        self.assertEqual(new_exec, IEEE_F64_MIN_SUBNORMAL)
+        self.assertEqual(scc, SCC_SET)
+
+        saved, new_exec, scc = oracle_s_orn2_saveexec_b64(IEEE_F64_MAX_SUBNORMAL, EXEC_ALL_ONES)
+        self.assertEqual(saved, EXEC_ALL_ONES)
+        self.assertEqual(new_exec, IEEE_F64_MAX_SUBNORMAL)
+        self.assertEqual(scc, SCC_SET)
+
+    def test_nan_payload_bit_preservation(self) -> None:
+        """Verify that signaling and diagnostic NaN payloads are never modified or quietened."""
+        custom_snan = 0x7FF0_0000_DEAD_BEEF
+        saved, new_exec, scc = oracle_s_orn2_saveexec_b64(custom_snan, EXEC_ALL_ONES)
+        self.assertEqual(new_exec, custom_snan)
+        self.assertEqual(new_exec & 0xFFFF_FFFF, 0xDEAD_BEEF)
+
+    def test_signed_zero_complementation(self) -> None:
+        """Verify distinct behavior between +0.0 and -0.0 under bitwise complementation."""
+        _, new_exec_pos, scc_pos = oracle_s_orn2_saveexec_b64(0, IEEE_F64_POS_ZERO)
+        self.assertEqual(new_exec_pos, EXEC_ALL_ONES)
+        self.assertEqual(scc_pos, SCC_SET)
+
+        _, new_exec_neg, scc_neg = oracle_s_orn2_saveexec_b64(0, IEEE_F64_NEG_ZERO)
+        self.assertEqual(new_exec_neg, 0x7FFF_FFFF_FFFF_FFFF)
+        self.assertEqual(scc_neg, SCC_SET)
+        self.assertEqual((new_exec_neg >> 63) & 1, 0)
+        self.assertEqual(new_exec_neg & 0x7FFF_FFFF_FFFF_FFFF, 0x7FFF_FFFF_FFFF_FFFF)
+
+    def test_infinity_exponent_mask_interaction(self) -> None:
+        """Verify interaction between +/- infinity exponent bit patterns."""
+        _, new_exec, scc = oracle_s_orn2_saveexec_b64(0, IEEE_F64_POS_INF)
+        expected = (~IEEE_F64_POS_INF) & MASK64
+        self.assertEqual(new_exec, expected)
+        self.assertEqual((new_exec >> 52) & 0x7FF, 0)
+        self.assertEqual(scc, SCC_SET)
+
+    def test_all_ieee754_extremes_cross_product(self) -> None:
+        """Exhaustively verify 10x10 combinations of IEEE 754 boundary extremes as src0 and exec."""
+        for s0_name, s0_val in IEEE_F64_BOUNDARY_PATTERNS:
+            for ex_name, ex_val in IEEE_F64_BOUNDARY_PATTERNS:
+                with self.subTest(src0=s0_name, exec_in=ex_name):
+                    saved, new_exec, scc = oracle_s_orn2_saveexec_b64(s0_val, ex_val)
+                    self.assertEqual(saved, ex_val)
+                    expected = (s0_val | (~ex_val & MASK64)) & MASK64
+                    self.assertEqual(new_exec, expected)
+                    self.assertEqual(scc, SCC_SET if expected != 0 else SCC_CLEARED)
+
+
 if __name__ == "__main__":
     unittest.main()
