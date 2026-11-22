@@ -1,4 +1,4 @@
-// D3D-47: D24_UNORM_S8_UINT against the host PC runtime (or WARP), byte for byte. Included by
+// D24_UNORM_S8_UINT against the host PC runtime (or WARP), byte for byte. Included by
 // d3d12_vulkan_device_test.cpp after d3d12_copy_compare.h, whose Run and host selection (LEONIDA_HOST_ADAPTER) it uses.
 //
 // On a GPU without D24 the layer stores D32_SFLOAT_S8_UINT (depth24.h): a clear must leave the 24-bit value D3D's

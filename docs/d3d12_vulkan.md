@@ -169,7 +169,7 @@ What is implemented (all of it testable without the game):
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
   **D24_UNORM_S8_UINT without a native D24** (the Radeon 880M, AMD hardware generally, RADV): the layer stores
-  `D32_SFLOAT_S8_UINT` and makes it behave as D24 (`src/depth24.h`, `src/vulkan_depth24.h`, D3D-47). A footprint
+  `D32_SFLOAT_S8_UINT` and makes it behave as D24 (`src/depth24.h`, `src/vulkan_depth24.h`). A footprint
   of the depth plane holds 24-bit UNORM words (bits 0-23; the top byte is unspecified, the PC runtime reads it as
   nothing and writes 0), the stencil plane is plain bytes. An upload converts the words with a compute pass
   (`src/depth24_convert.comp`, integer arithmetic) into a scratch buffer of floats, the nearest float to
@@ -484,7 +484,7 @@ and any validation error fails them.
       runtime writes 0; the comparison ignores it. Where the layer stores D24 as D32 (see section 3.2) it writes 0.
     A PC driver's copy flushes denormal float depth to zero, so the test keeps its values normal. A
     `LEONIDA_HOST_ADAPTER` that matches no adapter fails the run instead of skipping the comparisons.
-  - D24 against the host (D3D-47, `d3d12_depth24_compare.h`, `depth24_convert_test`): the D24S8 row of the copy test
+  - D24 against the host (`d3d12_depth24_compare.h`, `depth24_convert_test`): the D24S8 row of the copy test
     above runs with random 24-bit words on every GPU, the Radeon 880M's `D32_SFLOAT_S8_UINT` fallback included
     (72 regions, byte for byte, upload, readback and copies). `d3d12_depth24_compare.h` clears 5215 depth values
     (steps, half steps and the floats around them, powers of two, random) as a whole-view clear of a 4x4 texture

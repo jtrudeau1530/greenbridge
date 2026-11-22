@@ -10,7 +10,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
-#include "d3d12_depth24_compare.h"  // D3D-47: D24 clears compared with the host runtime
+#include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
 
 #include <algorithm>
 #include <array>
@@ -1016,7 +1016,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
-        info.conditional_rendering = d.conditional_rendering;  // SetPredication (D3D-47 checks D24 copies under it)
+        info.conditional_rendering = d.conditional_rendering;  // SetPredication (the D24 tests check copies under it)
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
