@@ -6729,30 +6729,34 @@ class Gen:
             self.emit(f"{r} = OpConvertUToF %float {m}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_cvt_flr_i32_f32", "v_cvt_rpi_i32_f32"):
-            # RDNA ISA pseudocode: flr = f32_to_i32(floor(S0)), rpi = f32_to_i32(floor(S0 + 0.5)), the + 0.5 rounded
-            # in binary32 like any f32 add. f32_to_i32 saturates as v_cvt_i32_f32 does (#300): +-2^31 and beyond go to
-            # INT_MAX / INT_MIN, NaN to 0. Source neg/abs apply before the rounding.
+            # Measured natively on RDNA2 (gfx1035 & gfx1036, wave32 & wave64):
+            # - v_cvt_flr_i32_f32 = sat_i32(floor(S0)).
+            # - v_cvt_rpi_i32_f32 = sat_i32(floor(S0 + 0.5)) computed exactly without binary32 rounding of S0 + 0.5:
+            #   with f = Floor(x), frac = x - f is exact in binary32 across all normal ranges (0 for |x| >= 2^23,
+            #   and rounds to >= 0.5 iff exact x - f >= 0.5 around -0.5), so (frac >= 0.5) ? (f + 1.0) : f is exact.
+            # - Out-of-range values (|x| >= 2^31, +-inf) and NaNs all saturate by the sign bit of x (+ -> 0x7FFFFFFF,
+            #   - -> 0x80000000). Check x's bits before Floor so a driver cannot lose a NaN's sign bit.
             x = self.src_f(a[1])
+            x_bits = self.tou(x)
+            x_mag, x_neg, x_in_range, bound, safe_x_u, fl, signed, converted, result = (self.tmp() for _ in range(9))
+            self.emit(f"{x_mag} = OpBitwiseAnd %uint {x_bits} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{x_in_range} = OpULessThan %bool {x_mag} {self.cu(0x4F000000)}")  # |x| < 2^31
+            self.emit(f"{x_neg} = OpINotEqual %bool {x_bits} {x_mag}")
+            self.emit(f"{bound} = OpSelect %uint {x_neg} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+            # Guard before Floor/FSub/FToS: -2^31 (0xCF000000) takes `bound` = 0x80000000 directly.
+            self.emit(f"{safe_x_u} = OpSelect %uint {x_in_range} {x_bits} {self.cu(0)}")
+            safe_x = self.tof(safe_x_u)
+            self.emit(f"{fl} = OpExtInst %float %glsl Floor {safe_x}")
             if op == "v_cvt_rpi_i32_f32":
-                t = self.tmp()
-                self.emit(f"{t} = OpFAdd %float {x} {self.fconst(0.5)}")
-                x = t
-            fl = self.tmp()
-            self.emit(f"{fl} = OpExtInst %float %glsl Floor {x}")
-            bits = self.tou(fl)
-            magnitude, negative, not_nan, bound, in_range, saturated, safe, signed, converted, result = \
-                (self.tmp() for _ in range(10))
-            self.emit(f"{magnitude} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
-            self.emit(f"{in_range} = OpULessThan %bool {magnitude} {self.cu(0x4F000000)}")  # |x| < 2^31
-            self.emit(f"{negative} = OpINotEqual %bool {bits} {magnitude}")
-            self.emit(f"{not_nan} = OpULessThan %bool {magnitude} {self.cu(0x7F800001)}")
-            self.emit(f"{bound} = OpSelect %uint {negative} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
-            self.emit(f"{saturated} = OpSelect %uint {not_nan} {bound} {self.cu(0)}")
-            # Convert only an in-range operand: SPIR-V leaves the out-of-range conversion undefined.
-            self.emit(f"{safe} = OpSelect %uint {in_range} {bits} {self.cu(0)}")
-            self.emit(f"{signed} = OpConvertFToS %int {self.tof(safe)}")
+                frac, ge_half, fl_plus1, rounded = (self.tmp() for _ in range(4))
+                self.emit(f"{frac} = OpFSub %float {safe_x} {fl}")
+                self.emit(f"{ge_half} = OpFOrdGreaterThanEqual %bool {frac} {self.fconst(0.5)}")
+                self.emit(f"{fl_plus1} = OpFAdd %float {fl} %f1")
+                self.emit(f"{rounded} = OpSelect %float {ge_half} {fl_plus1} {fl}")
+                fl = rounded
+            self.emit(f"{signed} = OpConvertFToS %int {fl}")
             self.emit(f"{converted} = OpBitcast %uint {signed}")
-            self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
+            self.emit(f"{result} = OpSelect %uint {x_in_range} {converted} {bound}")
             self.dst(a[0], result)
         elif op in ("v_cvt_u32_f32", "v_cvt_i32_f32"):
             # Compare binary32 words before converting: the raw SPIR-V conversion
