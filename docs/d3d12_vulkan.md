@@ -248,20 +248,20 @@ What is implemented (all of it testable without the game):
   - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views;
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
-  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
-    support, format support, multisample quality levels, shader model and root signature version.
-    `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device enables BC texture compression.
-    Other queries are logged and refused until the trace shows what the game asks (question 11);
-  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS` and `OPTIONS2`–`5`, `7`, `9`, `11`, `13`–`21`), GPU virtual-address
-    support, format support and multisample quality levels. Other queries (including `OPTIONS1`/`6`/`8`/`10`/`12`, `FORMAT_INFO`, `SHADER_MODEL`, and `ROOT_SIGNATURE` left to sibling PRs) are logged and refused until the trace
-    shows what the game asks (question 11);
-    support, format support, multisample quality levels, shader model and root signature version. Other queries are
-    logged and refused until the trace shows what the game asks (question 11);
+  - `R10G10B10_XR_BIAS_A2_UNORM` maps to `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, the same packed 10:10:10:2
+    layout; the bias and scale are the application's shader work. Like the PC runtime, it accepts only a
+    single-mip, single-sample 2D texture: extra mips, multisampling and 3D are refused in creation, allocation
+    and footprints. Format support reports `TEXTURE2D` and `CAST_WITHIN_BIT_LAYOUT`, not the host's display,
+    back-buffer-cast or video-processor bits;
+  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS`, `OPTIONS1`,
+    `OPTIONS2`–`5`, `7`–`9`, `11`–`21`), GPU virtual-address support, format support, format plane counts,
+    multisample quality levels, shader model and root signature version. `D3D12_OPTIONS8` reports unaligned block
+    textures when the Vulkan logical device enables BC texture compression, and `D3D12_OPTIONS12` reports
+    `RelaxedFormatCastingSupported = TRUE`, so a committed texture accepts a castable-format list. Other queries
+    (including `OPTIONS6`/`10`) are logged and refused until the trace shows what the game asks (question 11);
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
     image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
-    support, format support, format plane counts, multisample quality levels, shader model and root signature
-    version. Other queries are logged and refused until the trace shows what the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
@@ -281,7 +281,7 @@ What is implemented (all of it testable without the game):
     | `SamplerFeedbackMipRegion` on a buffer | ignored |
     | a buffer's initial layout other than `UNDEFINED` | `E_INVALIDARG` |
     | a castable-format count with a null list | no list (`S_OK`) |
-    | a castable-format list | `E_INVALIDARG`: a list needs `RelaxedFormatCastingSupported`, and the layer does not answer `D3D12_OPTIONS12`. A device without relaxed casting refuses every list (ezwinxdlmao's probe on a Radeon 680M, in #156). With it, the RTX 4090 accepts same-size casts and refuses other sizes and any list on a buffer |
+    | a castable-format list | accepted on a texture when the formats map to Vulkan formats: the image is mutable and carries a `VkImageFormatListCreateInfo`; a buffer or an unmapped format is `E_INVALIDARG`. The list is kept on the resource, so an SRV whose format is neither the resource format nor in the list leaves a null descriptor. The resource's own format is always accepted and is added to the Vulkan format list when the D3D12 list omits it. A listed same-size cross-family cast, such as `R8G8B8A8_UINT` to `R32_UINT`, is accepted. `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE` (this layer requires Vulkan 1.3, where the format list is core) |
     | `CreateCommandQueue1`'s creator ID | ignored |
 
     `CreatePlacedResource1/2` and `CreateHeap1` wait for #286's base methods.
@@ -643,8 +643,9 @@ and any validation error fails them.
   three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every
   `CreateCommittedResource` variant, which must give the same result, description, heap properties and `Map`
   answer. It runs the edge cases in the table above and compares them with the host's PC runtime when there is
-  one; protected sessions and castable lists are checked on the layer alone. `GetCopyableFootprints1` must match
-  `GetCopyableFootprints` field by field, including the failure answer. A texture from `CreateCommittedResource3`
+  one; protected sessions are checked on the layer alone, and castable lists have their own success/refusal
+  checks. `GetCopyableFootprints1` must match `GetCopyableFootprints` field by field, including the failure
+  answer. A texture from `CreateCommittedResource3`
   is uploaded, copied back and compared on a queue from `CreateCommandQueue1`.
 - `d3d12_sampler2_test`: `CreateSampler2` against `CreateSampler`, on the slots' bytes. It checks:
   - 10 descriptions without flags, which must be byte for byte the same;
@@ -1212,8 +1213,9 @@ The trace will enumerate them.
 - Formats: a `DXGI_FORMAT` → `VkFormat` table, including sRGB and typeless variants. Typeless resources get a
   concrete image format plus `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and a `VK_KHR_image_format_list` when views cast
   within the family; unsupported casts are logged and fall back to the resource format. `CreateCommittedResource3`'s
-  castable-format lists are refused for now (section 3.2's device list). Depth/stencil, BCn and
-  packed formats map directly; any format the device rejects is a hard error with the DXGI value.
+  castable-format lists are mapped to a `VkImageFormatListCreateInfo`; buffers and unmapped formats are refused.
+  `CreatePlacedResource2` is still absent here, waiting on #286 (D3D-16). Depth/stencil, BCn and packed formats map
+  directly; any format the device rejects is a hard error with the DXGI value.
 - `Map`/`Unmap`: upload/readback buffers map their host-visible memory; default-heap resources return
   `E_INVALIDARG` as D3D12 does. A texture in a CPU-visible custom heap maps only with a null pointer (its layout is
   the driver's), as on D3D12.

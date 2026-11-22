@@ -434,7 +434,7 @@ struct DeviceState {
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
-                    VkFormat image_format, VkImageAspectFlags aspects, bool storage) {
+                    VkFormat image_format, VkImageAspectFlags aspects, bool storage, bool allow_channel_cast) {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
@@ -456,7 +456,8 @@ struct DeviceState {
         // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
         // format is 8_UINT reads it from X.
         const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
-        const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(image_format, image.format);
+        const VkFormat view_format =
+            stencil ? image_format : g::vulkan_view_format(image_format, image.format, allow_channel_cast);
         if (view_format == VK_FORMAT_UNDEFINED) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
@@ -694,6 +695,11 @@ public:
     VkImage image() const { return image_; }
     const D3D12_RESOURCE_DESC& desc() const { return desc_; }
     VkFormat format() const { return format_; }                  // of the image
+    bool has_view_format_list() const { return !view_formats_.empty(); }
+    bool allows_view_format(VkFormat format) const {
+        return view_formats_.empty() || format == format_ ||
+               std::find(view_formats_.begin(), view_formats_.end(), format) != view_formats_.end();
+    }
     VkImageAspectFlags aspects() const { return aspects_; }
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
@@ -780,13 +786,26 @@ public:
         return S_OK;
     }
 
-    HRESULT create_texture(const Format& format) {
+    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
         VkImageCreateInfo info =
             texture_create_info(desc_, format, device_.color_attachment_usable(format.format));
+        VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        if (!castable.empty()) {
+            // D3D12 always allows a view in the resource's own format, whether or not the castable list names
+            // it. Vulkan requires every view format to be in the image's format list, so add it when missing.
+            view_formats_ = castable;
+            if (std::find(view_formats_.begin(), view_formats_.end(), format.format) == view_formats_.end())
+                view_formats_.push_back(format.format);
+            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            format_list.viewFormatCount = std::uint32_t(view_formats_.size());
+            format_list.pViewFormats = view_formats_.data();
+            format_list.pNext = info.pNext;
+            info.pNext = &format_list;
+        }
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
         host_transfer_ = cpu_visible() && samples == 1 && device_.host_transfer_format(format.format);
@@ -798,7 +817,16 @@ public:
             support = device_.check_image_support(info);
         }
         if (FAILED(support)) return support;
-        if (vk.vkCreateImage(device_.info.device, &info, nullptr, &image_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
+        if (created != VK_SUCCESS) {
+            if (created == VK_ERROR_OUT_OF_HOST_MEMORY || created == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                return E_OUTOFMEMORY;
+            if (!view_formats_.empty()) {
+                log_once("castable format list refused by Vulkan; count", int(view_formats_.size()));
+                return E_INVALIDARG;
+            }
+            return E_OUTOFMEMORY;
+        }
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
         memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
@@ -1116,6 +1144,7 @@ private:
     VkMemoryPropertyFlags memory_flags_ = 0;
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
+    std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     VkImageAspectFlags aspects_ = 0;
     std::uint64_t image_address_ = 0;
     bool reserved_ = false;
@@ -1909,10 +1938,15 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         }
         named = texture_storage_format(view.format, false).format;
     }
+    if (named == VK_FORMAT_UNDEFINED || !resource.allows_view_format(named)) {
+        log_once("view format not in the resource's castable list:", int(view.format));
+        return false;
+    }
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
-    const VkFormat view_format = stencil ? resource.format()
-                                 : code  ? g::vulkan_view_format(resource.format(), code)
-                                         : VK_FORMAT_UNDEFINED;
+    const VkFormat view_format =
+        stencil ? resource.format()
+                : code ? g::vulkan_view_format(resource.format(), code, resource.has_view_format_list())
+                       : VK_FORMAT_UNDEFINED;
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
         return false;
@@ -2807,45 +2841,7 @@ public:
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                       const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommittedResource";
-        if (out) *out = nullptr;
-        if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
-        auto* resource = new Resource(state_, *desc, *heap, heap_flags);
-        resource->attach_device(identity());
-        HRESULT hr = E_NOTIMPL;
-        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0 ? resource->create_buffer() : E_INVALIDARG;
-        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                   desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
-            log_once("committed resource dimension not supported:", desc->Dimension);
-        } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
-                   (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
-            log_once("volume depth-stencil resources not supported, flags:", int(desc->Flags));
-        } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
-            hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
-        } else if (const UINT samples = desc->SampleDesc.Count;
-                   !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || desc->SampleDesc.Quality != 0 ||
-                   (samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
-                                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-                                    !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))) {
-            hr = E_INVALIDARG;  // D3D12: nonzero power-of-two sample count up to 32; MSAA needs a single-mip 2D attachment
-        } else {
-            const Format format = state_.texture_format(*desc);
-            if (format.format == VK_FORMAT_UNDEFINED) {
-                hr = E_INVALIDARG;
-            } else {
-                hr = resource->create_texture(format);
-            }
-        }
-        if (FAILED(hr)) {
-            resource->Release();
-            return d3d12_trace::result(method, hr);
-        }
-        if (!out) {  // a capability check: D3D12 allows a null output
-            resource->Release();
-            return d3d12_trace::result(method, S_FALSE);
-        }
-        return d3d12_trace::result(method, hand_out(resource, riid, out));
+        return d3d12_trace::result(method, create_committed(heap, heap_flags, desc, 0, nullptr, riid, out));
     }
 
     // Reserved (tiled) resources, for the first boot (docs/d3d12_vulkan.md section 4.2): the whole resource is
@@ -2938,7 +2934,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateCommittedResource3(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                        const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
-                                                       const D3D12_CLEAR_VALUE* clear,
+                                                       const D3D12_CLEAR_VALUE*,
                                                        ID3D12ProtectedResourceSession* session, UINT32 castable_count,
                                                        const DXGI_FORMAT* castable, REFIID riid, void** out) override {
         if (out) *out = nullptr;
@@ -2948,14 +2944,10 @@ public:
         // Enhanced barriers: a buffer has no layout, so its initial layout must be UNDEFINED.
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && layout != D3D12_BARRIER_LAYOUT_UNDEFINED)
             return E_INVALIDARG;
-        // A count with a null array is no list (as on the PC runtime). A list needs RelaxedFormatCastingSupported,
-        // which the layer does not report (D3D12_OPTIONS12 is unanswered); a device without it refuses every list.
-        if (castable_count && castable) {
-            log_once("castable formats refused (no relaxed format casting); count", int(castable_count));
-            return E_INVALIDARG;
-        }
+        // A count with a null array is no list (as on the PC runtime). The layer reports relaxed format casting, so
+        // a real list is passed through; only buffers are refused.
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
-        return CreateCommittedResource(heap, heap_flags, &base, D3D12_RESOURCE_STATE_COMMON, clear, riid, out);
+        return create_committed(heap, heap_flags, &base, castable_count, castable, riid, out);
     }
 
     // Device9. The creator ID only groups queues for tools; one creator is as good as another here.
@@ -3303,6 +3295,31 @@ public:
             *opts = {};
             opts->DynamicDepthBiasSupported = FALSE;
             opts->GPUUploadHeapSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS1: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1*>(data);
+            const DeviceState::SubgroupFacts& facts = state_.subgroup_facts();
+            *opts = {};
+            opts->WaveOps = facts.wave_ops;
+            opts->WaveLaneCountMin = facts.lane_min;
+            opts->WaveLaneCountMax = facts.lane_max;
+            // D3D12 counts every lane of the device here, and Vulkan has no such number. This is one full wave
+            // (section 4.1): a game that sizes work from it plans for less parallelism than the GPU has, not more.
+            opts->TotalLaneCount = facts.lane_max;
+            opts->ExpandedComputeResourceStates = TRUE;  // Vulkan has no resource states to expand
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS12: {
+            // Vulkan 1.3's VkImageFormatListCreateInfo gives a mutable image the same relaxed format casting that
+            // D3D12's castable-format lists describe. The layer also implements enhanced barriers (Barrier).
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS12*>(data);
+            *opts = {};
+            opts->MSPrimitivesPipelineStatisticIncludesCulledPrimitives = D3D12_TRI_STATE_UNKNOWN;
+            opts->EnhancedBarriersSupported = TRUE;
+            opts->RelaxedFormatCastingSupported = TRUE;
             return S_OK;
         }
         case D3D12_FEATURE_D3D12_OPTIONS17: {
@@ -3653,7 +3670,75 @@ private:
         if (!image_descriptor(resource, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(), storage);
+        state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(), storage,
+                          resource.has_view_format_list());
+    }
+
+    // Shared by CreateCommittedResource and CreateCommittedResource3. A castable-format list is only meaningful on
+    // textures; the layer reports RelaxedFormatCastingSupported, so each format is mapped and handed to Vulkan as a
+    // VkImageFormatListCreateInfo. A nonzero count with a null list is no list, as on the PC runtime.
+    HRESULT create_committed(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+                             const D3D12_RESOURCE_DESC* desc, UINT32 castable_count, const DXGI_FORMAT* castable,
+                             REFIID riid, void** out) {
+        if (out) *out = nullptr;
+        if (!heap || !desc) return E_INVALIDARG;
+        if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            log_once("castable formats on a buffer are invalid; count", int(castable_count));
+            return E_INVALIDARG;
+        }
+        auto* resource = new Resource(state_, *desc, *heap, heap_flags);
+        resource->attach_device(identity());
+        HRESULT hr = E_NOTIMPL;
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0 ? resource->create_buffer() : E_INVALIDARG;
+        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                   desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+            log_once("committed resource dimension not supported:", desc->Dimension);
+        } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                   (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+            log_once("volume depth-stencil resources not supported, flags:", int(desc->Flags));
+        } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
+            hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
+        } else if (const UINT samples = desc->SampleDesc.Count;
+                   !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || desc->SampleDesc.Quality != 0 ||
+                   (samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
+                                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                                    !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))) {
+            hr = E_INVALIDARG;  // D3D12: nonzero power-of-two sample count up to 32; MSAA needs a single-mip 2D attachment
+        } else {
+            hr = S_OK;
+            const Format format = state_.texture_format(*desc);
+            if (format.format == VK_FORMAT_UNDEFINED) {
+                log_once("texture format not supported yet:", desc->Format);
+                hr = E_INVALIDARG;
+            } else {
+                std::vector<VkFormat> cast_formats;
+                if (castable_count && castable) {
+                    const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+                    for (UINT32 i = 0; i < castable_count; ++i) {
+                        const Format cast = vulkan_format(castable[i], depth);
+                        if (cast.format == VK_FORMAT_UNDEFINED) {
+                            log_once("castable format not supported yet:", castable[i]);
+                            hr = E_INVALIDARG;
+                            break;
+                        }
+                        if (std::find(cast_formats.begin(), cast_formats.end(), cast.format) == cast_formats.end())
+                            cast_formats.push_back(cast.format);
+                    }
+                }
+                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+            }
+        }
+        if (FAILED(hr)) {
+            resource->Release();
+            return hr;
+        }
+        if (!out) {  // a capability check: D3D12 allows a null output
+            resource->Release();
+            return S_FALSE;
+        }
+        return hand_out(resource, riid, out);
     }
 
     // D3D12's layout rules for a reserved resource, then a committed resource on a default heap under it.

@@ -348,14 +348,21 @@ inline constexpr Swizzle format_swizzle(VkFormat format) {
 
 // The format to view an image of `image_format` in when a T# names `gfx10_format`: the image's own format when
 // the codes agree, else the format of that code with the image's channel order (the sRGB view of a UNORM image,
-// say). VK_FORMAT_UNDEFINED: the table has no such format.
-inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_t gfx10_format) {
+// say). With `allow_channel_cast`, a listed same-size cross-family cast may use the code's first Vulkan format
+// when no channel-order match exists (R8G8B8A8_UINT viewed as R32_UINT, say). VK_FORMAT_UNDEFINED: the table has
+// no such format.
+inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_t gfx10_format,
+                                             bool allow_channel_cast = false) {
     const FormatRow* image = format_row(image_format);
     if (!image) return VK_FORMAT_UNDEFINED;
     if (image->gfx10 == gfx10_format) return image_format;
-    for (const FormatRow& row : format_table)
-        if (row.gfx10 == gfx10_format && row.channels == image->channels) return row.vulkan;
-    return VK_FORMAT_UNDEFINED;
+    const FormatRow* fallback = nullptr;
+    for (const FormatRow& row : format_table) {
+        if (row.gfx10 != gfx10_format) continue;
+        if (row.channels == image->channels) return row.vulkan;
+        if (!fallback) fallback = &row;
+    }
+    return allow_channel_cast && fallback ? fallback->vulkan : VK_FORMAT_UNDEFINED;
 }
 
 // DST_SEL as the component mapping of a view whose format is `view_format`: X, Y, Z, W name the hardware's
