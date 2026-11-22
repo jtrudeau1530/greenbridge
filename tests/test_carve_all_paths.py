@@ -14,6 +14,28 @@ INDEX = {"summary": {"files": 1, "bink2_files": 0, "span": 10, "compressed_bytes
 
 @unittest.skipUnless(os.name == "nt", "PowerShell research script")
 class CarveAllGamePathTest(unittest.TestCase):
+    def test_failed_carver_stops_without_replacing_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            game, out, tools = root / "game", root / "out", root / "tools"
+            for folder in (game, out, tools):
+                folder.mkdir()
+            (game / "first.rpf").write_bytes(b"x")
+            (game / "second.rpf").write_bytes(b"xx")
+            (tools / "python.cmd").write_bytes(b"@exit /b 7\r\n")
+            coverage = out / "coverage.json"
+            coverage.write_bytes(b"[]\n")
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", str(game), "-Out", str(out)],
+                env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Carving first.rpf failed (exit 7)", result.stderr)
+            self.assertNotIn("second.rpf", result.stdout + result.stderr)
+            self.assertEqual(coverage.read_bytes(), b"[]\n")
+
     def test_relative_and_trailing_separator_game_paths_find_existing_carves(self):
         with tempfile.TemporaryDirectory() as tmp:
             game, out = Path(tmp, "game"), Path(tmp, "out")
