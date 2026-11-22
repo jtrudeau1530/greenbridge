@@ -208,7 +208,9 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_sbarrier", [605, 605, 686, 686, 3032, 3013, 3032, 3031]),         # 128-thread group
               ("cs_w64x_load_ballot_load", [43, 74, 75, 42, 42, 18, 41, 32]),
               # s_andn2_saveexec_b64 / s_andn2_wrexec_b64: EXEC = S0 & ~EXEC over both halves, D old / new EXEC, SCC
-              ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544])]
+              ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544]),
+              # s_and/s_or_saveexec_b64 (VCC and SGPR-pair sources), s_andn2_saveexec/wrexec_b64 (SGPR pair): D, EXEC, SCC
+              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]

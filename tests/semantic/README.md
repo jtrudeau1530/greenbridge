@@ -43,6 +43,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   and the population count and lowest lane of D, against the ISA's two lines written as integers. Results in the
   low half only, the high half only, both and neither are all in the table. It also runs the GPU test
   `cs_w64x_andn2_exec`.
+- `test_saveexec_b64.py` does the same for `s_and_saveexec_b64`, `s_or_saveexec_b64`, `s_andn2_saveexec_b64` and
+  `s_andn2_wrexec_b64` with S0 a compare result in VCC or in an SGPR pair (13 pairs of S0 and EXEC for each op and
+  source), and runs the GPU test `cs_w64x_saveexec_b64`.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
