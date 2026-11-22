@@ -984,6 +984,10 @@ class Gen:
         cond, ty = parts[2], parts[3]
         srcs = a[0:2] if scalar else a[-2:]
         dst = None if (scalar or exec_only) else a[0]
+        if not scalar and ty in ("f64", "i64", "u64") and cond in ("f", "tru" if ty == "f64" else "t"):
+            # The sources do not affect a constant predicate, even when a double is NaN.
+            self.write_compare_result("%false" if cond == "f" else "%true", dst, scalar, exec_only)
+            return
         if ty in ("f32", "f16"):
             if ty == "f32":
                 x, y = self.src_f(srcs[0]), self.src_f(srcs[1])
@@ -1060,7 +1064,7 @@ class Gen:
         else:
             raise Unsupported(op)
         is_float = ty in ("f32", "f16")
-        b, r = self.tmp(), self.tmp()
+        b = self.tmp()
         if cond in (("f", "tru", "o", "u") if is_float else ("f", "t")):
             # Constant compares: f is always false, t / tru always true. o (ordered) is true when neither source
             # is NaN, u (unordered) when either is.
@@ -1081,6 +1085,10 @@ class Gen:
             self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
         if scalar and ty in ("u32", "i32") and use_wave_equal:
             b = self.wave_equal(b, cond == "eq", half=wave_equal_half)
+        self.write_compare_result(b, dst, scalar, exec_only)
+
+    def write_compare_result(self, b: str, dst: dict | None, scalar: bool, exec_only: bool) -> None:
+        r = self.tmp()
         # Lane masks are all-ones/zero per invocation (one lane), SCC is 1/0. A VOPC result bit is 0 for lanes
         # that are off in EXEC (as on hardware), so wave-wide reductions of the mask (s_cbranch_vccz) are exact.
         bm = b
@@ -6293,9 +6301,9 @@ class Gen:
             self.emit(f"{rlo} = OpSelect %uint {b} {xlo} {oldlo}")
             self.emit(f"{rhi} = OpSelect %uint {b} {xhi} {oldhi}")
             self.dst64_data(a[0], rlo, rhi, op)
-        elif op.startswith("v_cmp_") and not op.startswith("v_cmp_class") and not op.endswith(("_u64", "_i64")):
+        elif op.startswith("v_cmp_") and not op.startswith("v_cmp_class"):
             self.compare(op, a, scalar=False, mods=mods)
-        elif op.startswith("v_cmpx_") and not op.startswith("v_cmpx_class") and not op.endswith(("_u64", "_i64")):
+        elif op.startswith("v_cmpx_") and not op.startswith("v_cmpx_class"):
             self.compare_x(op, a, mods=mods)
         elif op.endswith(("_saveexec_b64", "_saveexec_b32")) and op[2:].split("_saveexec")[0] in self.EXEC_LOGIC:
             # RDNA2 ISA SOP1: D = EXEC; EXEC = f(S0, EXEC); SCC = (EXEC != 0). One invocation holds its own lane's bit
