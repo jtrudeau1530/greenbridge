@@ -841,6 +841,120 @@ int main() {
         DestroyWindow(hwnd3);
     }
 
+    // CreateSwapChainForCoreWindow & Occlusion status registration
+    {
+        // 1. Parameter validation
+        IDXGISwapChain1* sc_dummy = nullptr;
+        if (factory->CreateSwapChainForCoreWindow(queue, nullptr, &scd, nullptr, &sc_dummy) != E_INVALIDARG)
+            return fail("CreateSwapChainForCoreWindow(null window) should return E_INVALIDARG");
+        if (factory->CreateSwapChainForCoreWindow(nullptr, queue, &scd, nullptr, &sc_dummy) != E_INVALIDARG)
+            return fail("CreateSwapChainForCoreWindow(null device) should return E_INVALIDARG");
+        if (factory->CreateSwapChainForCoreWindow(queue, queue, nullptr, nullptr, &sc_dummy) != E_INVALIDARG)
+            return fail("CreateSwapChainForCoreWindow(null desc) should return E_INVALIDARG");
+        if (factory->CreateSwapChainForCoreWindow(queue, queue, &scd, nullptr, nullptr) != E_POINTER)
+            return fail("CreateSwapChainForCoreWindow(null out) should return E_POINTER");
+
+        // Non-CoreWindow IUnknown
+        if (factory->CreateSwapChainForCoreWindow(queue, queue, &scd, nullptr, &sc_dummy) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChainForCoreWindow with non-CoreWindow should return DXGI_ERROR_INVALID_CALL");
+
+        // 2. Mock ICoreWindow with ICoreWindowInterop
+        static constexpr GUID kIID_ICoreWindowInterop = {
+            0x45D64A29, 0xA63E, 0x4CB6, {0xB4, 0x98, 0x57, 0x81, 0xD2, 0x98, 0xCB, 0x4F}};
+        struct MockCoreWindow final : public IUnknown {
+            HWND window_handle = nullptr;
+            std::atomic<ULONG> refs{1};
+
+            HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+                if (!out) return E_POINTER;
+                if (riid == IID_IUnknown || riid == kIID_ICoreWindowInterop) {
+                    *out = this;
+                    AddRef();
+                    return S_OK;
+                }
+                *out = nullptr;
+                return E_NOINTERFACE;
+            }
+            ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+            ULONG STDMETHODCALLTYPE Release() override {
+                ULONG r = --refs;
+                if (!r) delete this;
+                return r;
+            }
+            virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* hwnd) {
+                if (!hwnd) return E_POINTER;
+                *hwnd = window_handle;
+                return S_OK;
+            }
+            virtual HRESULT STDMETHODCALLTYPE put_MessageHandled(unsigned char) { return S_OK; }
+        };
+
+        auto* mock_cw = new MockCoreWindow();
+        // Null HWND in interop
+        if (factory->CreateSwapChainForCoreWindow(queue, mock_cw, &scd, nullptr, &sc_dummy) != DXGI_ERROR_INVALID_CALL) {
+            mock_cw->Release();
+            return fail("CreateSwapChainForCoreWindow with null HWND should return DXGI_ERROR_INVALID_CALL");
+        }
+
+        // Valid HWND in mock CoreWindow
+        HWND hwnd4 = create_test_window(160, 120);
+        if (!hwnd4) {
+            mock_cw->Release();
+            return fail("CreateWindowExW (fourth)");
+        }
+        mock_cw->window_handle = hwnd4;
+        IDXGISwapChain1* cw_sc1 = nullptr;
+        if (FAILED(factory->CreateSwapChainForCoreWindow(queue, mock_cw, &scd, nullptr, &cw_sc1)) || !cw_sc1) {
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("CreateSwapChainForCoreWindow with valid MockCoreWindow failed");
+        }
+        IDXGISwapChain3* cw_sc = nullptr;
+        if (FAILED(cw_sc1->QueryInterface(IID_PPV_ARGS(&cw_sc))) || !cw_sc) {
+            cw_sc1->Release();
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("QI IDXGISwapChain3 on CoreWindow swapchain failed");
+        }
+        cw_sc1->Release();
+        DXGI_SWAP_CHAIN_DESC1 cw_desc{};
+        if (FAILED(cw_sc->GetDesc1(&cw_desc)) || cw_desc.Width != scd.Width || cw_desc.Height != scd.Height) {
+            cw_sc->Release();
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("GetDesc1 on CoreWindow swapchain mismatch");
+        }
+        if (FAILED(cw_sc->Present(0, 0))) {
+            cw_sc->Release();
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("Present on CoreWindow swapchain failed");
+        }
+        cw_sc->Release();
+        mock_cw->Release();
+        DestroyWindow(hwnd4);
+
+        // 3. Occlusion status registration
+        DWORD cookie1 = 0, cookie2 = 0;
+        if (factory->RegisterOcclusionStatusWindow(nullptr, WM_USER, &cookie1) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterOcclusionStatusWindow(null hwnd) should return DXGI_ERROR_INVALID_CALL");
+        if (factory->RegisterOcclusionStatusWindow(hwnd, WM_USER, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterOcclusionStatusWindow(null cookie) should return DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory->RegisterOcclusionStatusWindow(hwnd, WM_USER, &cookie1)) || cookie1 == 0)
+            return fail("RegisterOcclusionStatusWindow failed");
+
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (factory->RegisterOcclusionStatusEvent(nullptr, &cookie2) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterOcclusionStatusEvent(null event) should return DXGI_ERROR_INVALID_CALL");
+        if (factory->RegisterOcclusionStatusEvent(ev, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterOcclusionStatusEvent(null cookie) should return DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory->RegisterOcclusionStatusEvent(ev, &cookie2)) || cookie2 == 0 || cookie2 == cookie1)
+            return fail("RegisterOcclusionStatusEvent failed or duplicated cookie");
+        factory->UnregisterOcclusionStatus(cookie1);
+        factory->UnregisterOcclusionStatus(cookie2);
+        CloseHandle(ev);
+    }
+
     rtv_heap->Release();
     sc->Release();
     fence->Release();
@@ -860,7 +974,7 @@ int main() {
         return 1;
     }
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
-    std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, GetBuffer+GetDesc, clear+readback, Present, "
-                "ResizeBuffers; 0 validation errors)\n");
+    std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, CreateSwapChainForCoreWindow, occlusion status, "
+                "GetBuffer+GetDesc, clear+readback, Present, ResizeBuffers; 0 validation errors)\n");
     return 0;
 }
