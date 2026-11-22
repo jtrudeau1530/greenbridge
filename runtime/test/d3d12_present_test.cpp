@@ -136,7 +136,10 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create(true));
+    if (!d.create(true)) {  // no Vulkan loader, device or presentation extensions: nothing to test (ctest: skipped)
+        std::fprintf(stderr, "d3d12_present_test: no Vulkan device with presentation, skipped\n");
+        return 77;
+    }
 
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = window_proc;
