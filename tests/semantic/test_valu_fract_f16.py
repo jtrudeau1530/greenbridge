@@ -1130,5 +1130,103 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(borrow_pos, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_positive_preservation(self) -> None:
+        for sub in (H_SUB_MIN, 0x0002, 0x0100, H_SUB_MAX):
+            with self.subTest(sub=hex(sub)):
+                res = oracle_v_fract_f16(sub)
+                self.assertEqual(res, sub)
+                self.assertTrue(is_subnormal(res))
+
+    def test_subnormal_negative_rounding_clamp(self) -> None:
+        for neg_sub in (H_NEG_SUB_MIN, 0x8002, 0x8100, H_NEG_SUB_MAX):
+            with self.subTest(neg_sub=hex(neg_sub)):
+                res = oracle_v_fract_f16(neg_sub)
+                # 1.0 - sub rounds to 1.0 in RNE, clamped by RDNA2 to NEAR_ONE_F16 (0x3BFF)
+                self.assertEqual(res, NEAR_ONE_F16)
+
+    def test_subnormal_to_normal_boundary_transition(self) -> None:
+        # Largest subnormal: 0x03FF
+        res_sub = oracle_v_fract_f16(H_SUB_MAX)
+        self.assertEqual(res_sub, H_SUB_MAX)
+        self.assertTrue(is_subnormal(res_sub))
+
+        # Smallest normal: 0x0400 (2^-14)
+        res_norm = oracle_v_fract_f16(H_NORM_MIN)
+        self.assertEqual(res_norm, H_NORM_MIN)
+        self.assertFalse(is_subnormal(res_norm))
+
+    def test_nan_signaling_to_quiet_conversion(self) -> None:
+        snan = 0x7C05  # fraction non-zero, quiet bit 9 is 0
+        self.assertTrue(is_snan(snan))
+        res = oracle_v_fract_f16(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertEqual(res, snan | QNAN_BIT)
+
+    def test_nan_payload_preservation(self) -> None:
+        payload = 0x0155
+        qnan = EXP_MASK | QNAN_BIT | payload
+        self.assertTrue(is_qnan(qnan))
+        res = oracle_v_fract_f16(qnan)
+        self.assertEqual(res, qnan)
+
+    def test_nan_with_modifiers(self) -> None:
+        qnan = CANONICAL_QNAN
+        # abs should clear sign bit
+        res_abs = oracle_v_fract_f16(qnan | SIGN_MASK, abs_mod=True)
+        self.assertEqual(res_abs & SIGN_MASK, 0)
+        self.assertTrue(is_qnan(res_abs))
+
+        # neg should toggle sign bit
+        res_neg = oracle_v_fract_f16(qnan, neg_mod=True)
+        self.assertEqual(res_neg & SIGN_MASK, SIGN_MASK)
+        self.assertTrue(is_qnan(res_neg))
+
+    def test_nan_and_inf_with_clamp(self) -> None:
+        qnan = CANONICAL_QNAN
+        self.assertEqual(oracle_v_fract_f16(qnan, clamp=True), POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(POS_INF, clamp=True), POS_ZERO)
+        self.assertEqual(oracle_v_fract_f16(NEG_INF, clamp=True), POS_ZERO)
+
+    def test_signed_zero_boundary(self) -> None:
+        # Both +0.0 and -0.0 must yield +0.0 with sign bit 0
+        res_pz = oracle_v_fract_f16(POS_ZERO)
+        self.assertEqual(res_pz, POS_ZERO)
+        self.assertEqual(res_pz & SIGN_MASK, 0)
+
+        res_nz = oracle_v_fract_f16(NEG_ZERO)
+        self.assertEqual(res_nz, POS_ZERO)
+        self.assertEqual(res_nz & SIGN_MASK, 0)
+
+    def test_exact_integer_cancellation(self) -> None:
+        integers = [
+            H_1P0, H_NEG_1P0,
+            H_2P0, H_NEG_2P0,
+            H_3P0, H_NEG_3P0,
+            H_1024, H_NEG_1024,
+            H_MAX, H_NEG_MAX,
+        ]
+        for val in integers:
+            with self.subTest(val=hex(val)):
+                res = oracle_v_fract_f16(val)
+                self.assertEqual(res, POS_ZERO)
+                self.assertEqual(res & SIGN_MASK, 0)
+
+    def test_mantissa_exhaustion_boundaries(self) -> None:
+        # 1023.5 in f16: exponent 9, all 10 fraction bits 1 -> 0x63FF
+        self.assertEqual(oracle_v_fract_f16(H_1023P5), H_0P5)
+
+        # 1024.0 in f16: exponent 10, fraction 0 -> 0x6400
+        self.assertEqual(oracle_v_fract_f16(H_1024), POS_ZERO)
+
+    def test_round_to_nearest_even_midpoint(self) -> None:
+        # In f16, 1.25 -> fract is 0.25 (exact)
+        self.assertEqual(oracle_v_fract_f16(H_1P25), H_0P25)
+        # -1.25 -> fract is 0.75 (exact)
+        self.assertEqual(oracle_v_fract_f16(H_NEG_1P25), H_0P75)
+
+
 if __name__ == "__main__":
     unittest.main()
