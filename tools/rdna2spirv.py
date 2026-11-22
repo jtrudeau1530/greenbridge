@@ -4136,13 +4136,15 @@ class Gen:
             # Packed integer dot products (RDNA2 ISA VOP3P):
             #   D = sum_{k=0..N-1} (S0.elem[k] * S1.elem[k]) + S2
             # Wrapping at 32 bits by default; VOP3P clamp saturates to [INT32_MIN, INT32_MAX] (signed) or
-            # [0, UINT32_MAX] (unsigned). RDNA2 integer dot ops have no op_sel, neg_lo/neg_hi, DPP, or SDWA forms.
-            def bits(name):
+            # [0, UINT32_MAX] (unsigned). Hardware default is op_sel:[0,0,0] and op_sel_hi:[1,1,1] (op_sel_hi[k] = 0
+            # selects the low half for lane 1 of S_k on v_dot2_*); any other op_sel/op_sel_hi, neg_lo/neg_hi,
+            # DPP/SDWA, or source neg/abs are refused.
+            def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
-                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else [0, 0, 0]
+                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
             other = [m for m in mods if m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:"))]
             if (other or ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a) or
-                    any(bits("op_sel")) or any(bits("op_sel_hi"))):
+                    bits("op_sel", [0, 0, 0]) != [0, 0, 0] or bits("op_sel_hi", [1, 1, 1]) != [1, 1, 1]):
                 raise Unsupported(op + " modifiers")
             width = 16 if "_dot2_" in op else (8 if "_dot4" in op else 4)
             signed = op.endswith(("i16", "i4"))

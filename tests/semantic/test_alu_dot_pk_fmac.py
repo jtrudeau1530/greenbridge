@@ -90,6 +90,108 @@ DOT_OPS = (
     "v_dot8_u32_u4",
 )
 
+# Hardware-measured on RDNA2 gfx1036 (Ryzen 9 7950X3D iGPU, tools/hw_oracle, @aslan2142):
+# 60 operand sets as (S0, S1, S2, D, D_clamp).
+MEASURED_DOT_GFX1036 = {
+    "v_dot4_u32_u8": [
+        (0x04030201, 0x08070605, 0x00000000, 0x00000046, 0x00000046),
+        (0x04030201, 0x08070605, 0x000003E8, 0x0000042E, 0x0000042E),
+        (0x000000FF, 0x00000002, 0x00000000, 0x000001FE, 0x000001FE),
+        (0xFF000000, 0x02000000, 0x00000000, 0x000001FE, 0x000001FE),
+        (0x00FF0000, 0x0000FF00, 0x00000000, 0x00000000, 0x00000000),
+        (0x80808080, 0x7F7F7F7F, 0x00000005, 0x0000FE05, 0x0000FE05),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x0003F804, 0x0003F804),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x0003F803, 0xFFFFFFFF),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF, 0x8003F803, 0x8003F803),
+        (0x01010101, 0x01010101, 0xFFFFFFFC, 0x00000000, 0xFFFFFFFF),
+        (0x12345678, 0x9ABCDEF0, 0x80000000, 0x8000EC18, 0x8000EC18),
+        (0x00000000, 0x12345678, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF),
+    ],
+    "v_dot2_i32_i16": [
+        (0x00020001, 0x00040003, 0x00000000, 0x0000000B, 0x0000000B),
+        (0x00020001, 0x00040003, 0x000003E8, 0x000003F3, 0x000003F3),
+        (0x0000FFFF, 0x00000002, 0x00000000, 0xFFFFFFFE, 0xFFFFFFFE),
+        (0xFFFF0000, 0x00020000, 0x00000000, 0xFFFFFFFE, 0xFFFFFFFE),
+        (0x80000000, 0x00008000, 0x00000000, 0x00000000, 0x00000000),
+        (0x80008000, 0x7FFF7FFF, 0x00000000, 0x80010000, 0x80010000),
+        (0x80008000, 0x80008000, 0x00000000, 0x80000000, 0x7FFFFFFF),
+        (0x7FFF7FFF, 0x7FFF7FFF, 0x7FFFFFFF, 0xFFFE0001, 0x7FFFFFFF),
+        (0x80008000, 0x7FFF7FFF, 0x80000000, 0x00010000, 0x80000000),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000001, 0x00000001),
+        (0x8000FFFF, 0x00017FFF, 0x00000064, 0xFFFF0065, 0xFFFF0065),
+        (0x00000000, 0x12345678, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF),
+    ],
+    "v_dot2_u32_u16": [
+        (0x00020001, 0x00040003, 0x00000000, 0x0000000B, 0x0000000B),
+        (0x00020001, 0x00040003, 0x000003E8, 0x000003F3, 0x000003F3),
+        (0x0000FFFF, 0x00000002, 0x00000000, 0x0001FFFE, 0x0001FFFE),
+        (0xFFFF0000, 0x00020000, 0x00000000, 0x0001FFFE, 0x0001FFFE),
+        (0x80000000, 0x00008000, 0x00000000, 0x00000000, 0x00000000),
+        (0x80008000, 0x80008000, 0x00000000, 0x80000000, 0x80000000),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFC0002, 0xFFFFFFFF),
+        (0xFFFF0001, 0xFFFF0001, 0x00000000, 0xFFFE0002, 0xFFFE0002),
+        (0x00010001, 0x00010001, 0xFFFFFFFF, 0x00000001, 0xFFFFFFFF),
+        (0x80008000, 0x80008000, 0x7FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+        (0x12345678, 0x9ABCDEF0, 0x80000000, 0xD64DC6B0, 0xD64DC6B0),
+        (0x00000000, 0x12345678, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF),
+    ],
+    "v_dot8_i32_i4": [
+        (0x87654321, 0x12345678, 0x00000000, 0x00000058, 0x00000058),
+        (0x76543210, 0x01234567, 0x000003E8, 0x00000420, 0x00000420),
+        (0x0000000F, 0x00000002, 0x00000000, 0xFFFFFFFE, 0xFFFFFFFE),
+        (0xF0000000, 0x20000000, 0x00000000, 0xFFFFFFFE, 0xFFFFFFFE),
+        (0x000000F0, 0x0000000F, 0x00000000, 0x00000000, 0x00000000),
+        (0x88888888, 0x88888888, 0x00000000, 0x00000200, 0x00000200),
+        (0x88888888, 0x77777777, 0x00000000, 0xFFFFFE40, 0xFFFFFE40),
+        (0x77777777, 0x77777777, 0x7FFFFFFF, 0x80000187, 0x7FFFFFFF),
+        (0x88888888, 0x77777777, 0x80000000, 0x7FFFFE40, 0x80000000),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000007, 0x00000007),
+        (0xF0F0F0F0, 0x0F0F0F0F, 0x00000000, 0x00000000, 0x00000000),
+        (0x00000000, 0x12345678, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF),
+    ],
+    "v_dot8_u32_u4": [
+        (0x87654321, 0x12345678, 0x00000000, 0x00000078, 0x00000078),
+        (0x76543210, 0x01234567, 0x000003E8, 0x00000420, 0x00000420),
+        (0x0000000F, 0x00000002, 0x00000000, 0x0000001E, 0x0000001E),
+        (0xF0000000, 0x20000000, 0x00000000, 0x0000001E, 0x0000001E),
+        (0x000000F0, 0x0000000F, 0x00000000, 0x00000000, 0x00000000),
+        (0x88888888, 0x77777777, 0x00000000, 0x000001C0, 0x000001C0),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000708, 0x00000708),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000707, 0xFFFFFFFF),
+        (0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF, 0x80000707, 0x80000707),
+        (0x11111111, 0x11111111, 0xFFFFFFF8, 0x00000000, 0xFFFFFFFF),
+        (0xF0F0F0F0, 0x0F0F0F0F, 0x00000000, 0x00000000, 0x00000000),
+        (0x00000000, 0x12345678, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF),
+    ],
+}
+
+# Hardware-measured on RDNA2 gfx1036 in default MODE (HW_REG_MODE = 0x000003C0: round-to-nearest-even,
+# f16 denormals kept, IEEE and DX10_CLAMP on), as (S0, S1, D_old, D).
+MEASURED_PK_FMAC_DEFAULT_GFX1036 = [
+    (0x3C014000, 0x3C034200, 0xBC003C00, 0x1C014700),
+    (0x3C013C01, 0x3C013C03, 0xBC02BC00, 0x00101C01),
+    (0x3C013C01, 0x3E003C01, 0x8001BC02, 0x3E010010),
+    (0x3E013C01, 0x3E013E00, 0x00008001, 0x40823E01),
+    (0xBE013E01, 0x3E013E01, 0x80000000, 0xC0824082),
+    (0x0000BE01, 0x3C003E01, 0x80008000, 0x0000C082),
+    (0x80000000, 0x3C003C00, 0x80008000, 0x80000000),
+    (0x3C008000, 0xBC003C00, 0x3C008000, 0x00008000),
+    (0x80003C00, 0x3C00BC00, 0x00003C00, 0x00000000),
+    (0x7C008000, 0x40003C00, 0x3C000000, 0x7C000000),
+    (0x7C007C00, 0xC0004000, 0x7C003C00, 0xFE007C00),
+    (0x7C007C00, 0x0000C000, 0x3C007C00, 0xFE00FE00),
+    (0x7BFF7C00, 0x40000000, 0x00003C00, 0x7C00FE00),
+    (0x7E557BFF, 0x3C004000, 0x3C000000, 0x7E557C00),
+    (0x7C017E55, 0x3C003C00, 0x3C003C00, 0x7E017E55),
+    (0x3C007C01, 0x3C003C00, 0x7D233C00, 0x7F237E01),
+    (0x04003C00, 0x38003C00, 0x00007D23, 0x02007F23),
+    (0x00010400, 0x44003800, 0x00000000, 0x00040200),
+    (0x00030001, 0x38004400, 0x00000000, 0x00020004),
+    (0x3C000003, 0x3C003800, 0x64000000, 0x64010002),
+    (0x44003C00, 0xC2003C00, 0x49006400, 0xC0006401),
+    (0x40004400, 0x4200C200, 0x3C004900, 0x4700C000),
+]
+
 
 def sext(val, width):
     mask = (1 << width) - 1
@@ -277,7 +379,36 @@ class DotAndPkFmacTests(unittest.TestCase):
                 with self.subTest(op=op, clamp=clamp):
                     self.assertEqual(got, want)
 
-    def test_sources_and_zero_opsel(self):
+    def test_measured_dot_gfx1036(self):
+        for op, rows in MEASURED_DOT_GFX1036.items():
+            cases = [(s0, s1, s2) for s0, s1, s2, _, _ in rows]
+            want_plain = [d for _, _, _, d, _ in rows]
+            want_clamp = [d_clamp for _, _, _, _, d_clamp in rows]
+            with self.subTest(op=op, clamp=False):
+                self.assertEqual(run_chunks(cases, op, clamp=False), want_plain)
+            with self.subTest(op=op, clamp=True):
+                self.assertEqual(run_chunks(cases, op, clamp=True), want_clamp)
+
+    def test_measured_pk_fmac_default_gfx1036(self):
+        # Default MODE 0x000003C0: verify both source orders (S0, S1) and (S1, S0).
+        # Non-NaN halves must match gfx1036 bit-for-bit; NaN halves must produce a quiet f16 NaN
+        # (SPIR-V UnpackHalf2x16/PackHalf2x16/Fma do not preserve NaN payload bits or sign).
+        want = [d for _, _, _, d in MEASURED_PK_FMAC_DEFAULT_GFX1036]
+        cases_ab = [(s0, s1, d_old) for s0, s1, d_old, _ in MEASURED_PK_FMAC_DEFAULT_GFX1036]
+        cases_ba = [(s1, s0, d_old) for s0, s1, d_old, _ in MEASURED_PK_FMAC_DEFAULT_GFX1036]
+        for order, cases in (("s0,s1", cases_ab), ("s1,s0", cases_ba)):
+            got = run_chunks(cases, "v_pk_fmac_f16")
+            for idx, (g, w) in enumerate(zip(got, want)):
+                for shift, half_name in ((0, "lo"), (16, "hi")):
+                    gh = (g >> shift) & 0xFFFF
+                    wh = (w >> shift) & 0xFFFF
+                    with self.subTest(order=order, idx=idx, half=half_name):
+                        if (wh & 0x7FFF) > 0x7C00:
+                            self.assertEqual(gh & 0x7E00, 0x7E00, f"expected quiet f16 NaN, got {gh:#06x}")
+                        else:
+                            self.assertEqual(gh, wh)
+
+    def test_sources_and_default_opsel(self):
         self.assertEqual(run_batch([(5, 0x00010002, 0x10), (0x00010002, 0x00030004, 10), (0, 0, 0), (0, 0, 0)],
                                    "v_dot2_i32_i16", s0_kind="imm", acc_in_s=True)[:2],
                          [ref_dot("v_dot2_i32_i16", 5, 0x00010002, 0x10),
@@ -287,17 +418,21 @@ class DotAndPkFmacTests(unittest.TestCase):
                                    "v_dot4_u32_u8", s0_kind="sgpr", acc_in_s=True)[:2],
                          [ref_dot("v_dot4_u32_u8", 0x80FF0102, 0x01020304, 0x80000010),
                           ref_dot("v_dot4_u32_u8", 0x01020304, 0x05060708, -5)])
+        # Hardware default is op_sel:[0,0,0] and op_sel_hi:[1,1,1]; writing either or both explicitly matches plain.
         lines = [
-            "s_mov_b32 s0, 0x01020304",
-            "v_mov_b32 v1, 0x01000100",
-            "v_dot4_u32_u8 v2, s0, v1, 7 op_sel:[0,0,0] op_sel_hi:[0,0,0]",   # 3*1 + 1*1 + 7 = 11
-            "v_dot8_i32_i4 v3, s0, v1, 3 op_sel:[0,0,0] op_sel_hi:[0,0,0]",   # 4*0 + ... + 3*1 + ... + 1*1 + 3 = 7
-            "exp mrt0 v2, v3, v2, v3 done vm",
+            "s_mov_b32 s0, 0x00020001",
+            "v_mov_b32 v1, 0x00040003",
+            "v_dot2_i32_i16 v2, s0, v1, 0 op_sel:[0,0,0] op_sel_hi:[1,1,1]",   # 1*3 + 2*4 = 11
+            "v_dot2_u32_u16 v3, s0, v1, 5 op_sel_hi:[1,1,1]",                  # 1*3 + 2*4 + 5 = 16
+            "s_mov_b32 s1, 0x01020304",
+            "v_mov_b32 v4, 0x01000100",
+            "v_dot4_u32_u8 v5, s1, v4, 7 op_sel:[0,0,0] op_sel_hi:[1,1,1]",    # 3*1 + 1*1 + 7 = 11
+            "v_dot8_i32_i4 v6, s1, v4, 3 op_sel:[0,0,0]",                      # 3*1 + 1*1 + 3 = 7
+            "exp mrt0 v2, v3, v5, v6 done vm",
             "s_endpgm",
         ]
-        got = mrt0_words(translate_lines("ps_dot_opsel0", lines))
-        self.assertEqual(got[0], 11)
-        self.assertEqual(got[1], 7)
+        got = mrt0_words(translate_lines("ps_dot_opsel_default", lines))
+        self.assertEqual(got, [11, 16, 11, 7])
 
     def test_pk_fmac_f16_values_and_rounding(self):
         cases = [
@@ -406,9 +541,18 @@ class DotAndPkFmacTests(unittest.TestCase):
 
     def test_rejected_forms(self):
         bad_lines = (
+            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel:[1,0,0]",
+            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel_hi:[0,0,0]",
+            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel:[0,0,0] op_sel_hi:[0,0,0]",
+            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel_hi:[0,1,1]",
+            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel_hi:[1,0,1]",
+            "v_dot2_i32_i16 v0, v1, v2, v3 op_sel_hi:[1,1,0]",
+            "v_dot2_u32_u16 v0, v1, v2, v3 op_sel_hi:[0,0,0]",
             "v_dot4_u32_u8 v0, v1, v2, v3 op_sel:[1,0,0]",
+            "v_dot4_u32_u8 v0, v1, v2, v3 op_sel_hi:[0,0,0]",
             "v_dot4_u32_u8 v0, v1, v2, v3 op_sel_hi:[0,1,0]",
             "v_dot4_u32_u8 v0, v1, v2, v3 neg_lo:[1,0,0]",
+            "v_dot2_i32_i16 v0, v1, v2, v3 neg_lo:[0,0,1] neg_hi:[0,0,1]",
             "v_dot4_u32_u8 v0, -v1, v2, v3",
             "v_dot2_i32_i16 v0, |v1|, v2, v3",
             "v_dot8_i32_i4 v0, v1, v2, v3 mul:2",
