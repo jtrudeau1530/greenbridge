@@ -8,7 +8,8 @@ from __future__ import annotations
 
 Features reference models, pairwise reduction equivalence, signed vs unsigned
 divergence on identical bit patterns, multi-lane SIMD wave execution under EXEC
-mask gating, and shader execution via rdna2spirv and spirv_mini_interp.
+mask gating, two's complement extrema boundaries, full permutation matrices,
+negative controls, and shader execution via rdna2spirv and spirv_mini_interp.
 
 Zero game data, standard library Python only, Python 3.9+ compatible.
 """
@@ -490,6 +491,126 @@ class TestAluIntMin3Max3SIMD(unittest.TestCase):
             self.assertEqual(interp.get_vgpr(5, lane), 0)           # unsigned min: 0
             self.assertEqual(interp.get_vgpr(6, lane), 0x7FFFFFFF)  # signed max: INT32_MAX
             self.assertEqual(interp.get_vgpr(7, lane), 0x80000000)  # unsigned max: 2^31
+
+
+class TestAluIntMin3Max3ExtremaPermutationsNegative(unittest.TestCase):
+    """Extrema matrices, 3! permutation invariance, and negative controls."""
+
+    def test_twos_complement_extrema_matrix(self) -> None:
+        """Verify behavior at and around two's complement and unsigned boundaries."""
+        extrema = (
+            0x80000000,  # INT32_MIN (-2147483648)
+            0x80000001,  # INT32_MIN + 1
+            0xFFFFFFFF,  # -1 as i32, UINT32_MAX as u32
+            0x00000000,  # 0
+            0x00000001,  # 1
+            0x7FFFFFFE,  # INT32_MAX - 1
+            0x7FFFFFFF,  # INT32_MAX
+        )
+        # Any triple containing 0x80000000 must have signed min = 0x80000000
+        for x in extrema:
+            for y in extrema:
+                self.assertEqual(ref_v_min3_i32(0x80000000, x, y), 0x80000000)
+
+        # Any triple containing 0x7FFFFFFF must have signed max = 0x7FFFFFFF
+        for x in extrema:
+            for y in extrema:
+                self.assertEqual(ref_v_max3_i32(0x7FFFFFFF, x, y), 0x7FFFFFFF)
+
+        # Any triple containing 0x00000000 must have unsigned min = 0
+        for x in extrema:
+            for y in extrema:
+                self.assertEqual(ref_v_min3_u32(0x00000000, x, y), 0)
+
+        # Any triple containing 0xFFFFFFFF must have unsigned max = 0xFFFFFFFF
+        for x in extrema:
+            for y in extrema:
+                self.assertEqual(ref_v_max3_u32(0xFFFFFFFF, x, y), 0xFFFFFFFF)
+
+    def test_quad_divergence_extrema_triple(self) -> None:
+        """On (0x80000000, 0x00000000, 0xFFFFFFFF), all 4 instructions yield mutually distinct results."""
+        s0, s1, s2 = 0x80000000, 0x00000000, 0xFFFFFFFF
+        res_min_i32 = ref_v_min3_i32(s0, s1, s2)
+        res_min_u32 = ref_v_min3_u32(s0, s1, s2)
+        res_max_i32 = ref_v_max3_i32(s0, s1, s2)
+        res_max_u32 = ref_v_max3_u32(s0, s1, s2)
+
+        self.assertEqual(res_min_i32, 0x80000000)
+        self.assertEqual(res_min_u32, 0x00000000)
+        self.assertEqual(res_max_i32, 0x00000000)
+        self.assertEqual(res_max_u32, 0xFFFFFFFF)
+
+        distinct_results = {res_min_i32, res_min_u32, res_max_i32, res_max_u32}
+        self.assertEqual(len(distinct_results), 3)  # Note: 0x00000000 is shared by min_u32 and max_i32
+        self.assertNotEqual(res_min_i32, res_min_u32)
+        self.assertNotEqual(res_max_i32, res_max_u32)
+        self.assertNotEqual(res_min_i32, res_max_i32)
+        self.assertNotEqual(res_min_u32, res_max_u32)
+
+    def test_permutation_invariance_all_orders(self) -> None:
+        """All 3! = 6 permutations must yield identical results across all 4 instructions."""
+        triples_to_permute = [
+            (0x80000000, 0, 0x7FFFFFFF),
+            (0xFFFFFFFF, 1, 0x80000000),
+            (0x7FFFFFFF, 0x7FFFFFFF, 0x80000000),
+            (42, 42, 42),
+            (0x12345678, 0x9ABCDEF0, 0x00000000),
+            (0x80000000, 0x80000001, 0x80000002),
+            (0xFFFFFFFD, 0xFFFFFFFE, 0xFFFFFFFF),
+            (0x55555555, 0xAAAAAAAA, 0xFFFFFFFF),
+        ]
+        for triple in triples_to_permute:
+            perms = list(itertools.permutations(triple))
+            self.assertEqual(len(perms), 6)
+            for op in OPS:
+                expected = ref(op, *triple)
+                for p in perms:
+                    with self.subTest(op=op, perm=[hex(v) for v in p]):
+                        self.assertEqual(ref(op, *p), expected)
+
+    def test_negative_controls_signed_unsigned_divergence(self) -> None:
+        """Signed vs unsigned operations must not be mistakenly interchangeable."""
+        # When negative numbers are involved, signed and unsigned min/max diverge
+        self.assertNotEqual(ref_v_min3_i32(0, 0xFFFFFFFF, 1), ref_v_min3_u32(0, 0xFFFFFFFF, 1))
+        self.assertNotEqual(ref_v_max3_i32(0, 0xFFFFFFFF, 1), ref_v_max3_u32(0, 0xFFFFFFFF, 1))
+        self.assertNotEqual(ref_v_min3_i32(0x80000000, 5, 10), ref_v_min3_u32(0x80000000, 5, 10))
+        self.assertNotEqual(ref_v_max3_i32(0x80000000, 5, 10), ref_v_max3_u32(0x80000000, 5, 10))
+
+        # min3 and max3 must not be interchangeable on non-identical inputs
+        self.assertNotEqual(ref_v_min3_i32(1, 2, 3), ref_v_max3_i32(1, 2, 3))
+        self.assertNotEqual(ref_v_min3_u32(1, 2, 3), ref_v_max3_u32(1, 2, 3))
+
+    def test_negative_controls_interpreter_fault_injection(self) -> None:
+        """Interpreter must reject invalid opcodes, register indices, and operands."""
+        interp = VectorALUInterpreter(wave_size=64)
+
+        # Invalid opcode
+        with self.assertRaises(ValueError):
+            interp.execute_instruction("v_invalid_op", 0, "v1", "v2", "v3")
+
+        # Invalid VGPR index
+        with self.assertRaises(IndexError):
+            interp.set_vgpr(-1, 0, 0)
+        with self.assertRaises(IndexError):
+            interp.set_vgpr(64, 0, 0)
+        with self.assertRaises(IndexError):
+            interp.get_vgpr(0, -1)
+        with self.assertRaises(IndexError):
+            interp.get_vgpr(0, 64)
+
+        # Invalid SGPR index
+        with self.assertRaises(IndexError):
+            interp.set_sgpr(-1, 0)
+        with self.assertRaises(IndexError):
+            interp.set_sgpr(106, 0)
+        with self.assertRaises(IndexError):
+            interp.get_sgpr(-1)
+        with self.assertRaises(IndexError):
+            interp.get_sgpr(106)
+
+        # Invalid operand string
+        with self.assertRaises(ValueError):
+            interp.resolve_src("not_a_register_or_int", 0)
 
 
 class ReferenceTests(unittest.TestCase):
