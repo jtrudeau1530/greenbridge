@@ -5,6 +5,7 @@
 // resource classes it is not (a buffer 0xC0, a texture without render-target or depth use 0x44, the rest 0x84).
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <utility>
@@ -243,6 +244,7 @@ int main() {
             descriptors.push_back({"DSV", {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, mask}});
         }
 
+        if (hostwine::host_is_wine()) return 77;  // every case is a comparison with the host
         Ref<IDXGIFactory4> factory;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
             std::fprintf(stderr, "no DXGI factory\n");

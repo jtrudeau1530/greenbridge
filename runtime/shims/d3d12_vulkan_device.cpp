@@ -18,6 +18,9 @@
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
+#include "../src/vulkan_present.h"
+
+#include <vulkan/vulkan_win32.h>
 #include "../src/vulkan_device_filter.h"
 
 #include <algorithm>
@@ -62,7 +65,19 @@ struct Format {
     bool d24_as_float = false;  // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU)
     bool d24 = false;           // a D24_UNORM_S8_UINT family format, native or stored as D32
     bool r9g9b9e5_as_r32_uint = false;  // R9G9B9E5_SHAREDEXP UAV stored as mutable R32_UINT (no E5B9G9R9 storage)
+    // A 96-bit R32G32B32 format, held in the R32G32B32A32 image `format` names (ResourceBinding::rgb96).
+    bool rgb96 = false;
 };
+
+// 96-bit textures are always RGBA32 images, even where the GPU has an RGB32 one (most have none with optimal
+// tiling): D3D12 places subresources at multiples of 512 bytes, Vulkan wants a copy's buffer offset to be a
+// multiple of the 12-byte texel (VUID-vkCmdCopyBufferToImage-dstImage-07975), so copies need the repack either
+// way (docs section 4.2).
+constexpr Format rgb96_format(VkFormat wide, bool typeless = false) {
+    Format format{wide, VK_IMAGE_ASPECT_COLOR_BIT, typeless};
+    format.rgb96 = true;
+    return format;
+}
 
 // DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. Typeless depth families
 // become depth formats when the resource allows depth-stencil.
@@ -74,6 +89,10 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R32G32B32A32_FLOAT: return {VK_FORMAT_R32G32B32A32_SFLOAT, color};
     case DXGI_FORMAT_R32G32B32A32_UINT: return {VK_FORMAT_R32G32B32A32_UINT, color};
     case DXGI_FORMAT_R32G32B32A32_SINT: return {VK_FORMAT_R32G32B32A32_SINT, color};
+    case DXGI_FORMAT_R32G32B32_TYPELESS: return rgb96_format(VK_FORMAT_R32G32B32A32_SFLOAT, true);
+    case DXGI_FORMAT_R32G32B32_FLOAT: return rgb96_format(VK_FORMAT_R32G32B32A32_SFLOAT);
+    case DXGI_FORMAT_R32G32B32_UINT: return rgb96_format(VK_FORMAT_R32G32B32A32_UINT);
+    case DXGI_FORMAT_R32G32B32_SINT: return rgb96_format(VK_FORMAT_R32G32B32A32_SINT);
     case DXGI_FORMAT_R16G16B16A16_TYPELESS: return {VK_FORMAT_R16G16B16A16_SFLOAT, color, true};
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return {VK_FORMAT_R16G16B16A16_SFLOAT, color};
     case DXGI_FORMAT_R16G16B16A16_UNORM: return {VK_FORMAT_R16G16B16A16_UNORM, color};
@@ -161,6 +180,40 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
 
 Format texture_storage_format(DXGI_FORMAT format, bool depth) {
     return vulkan_format(format == DXGI_FORMAT_A8_UNORM ? DXGI_FORMAT_R8_UNORM : format, depth);
+}
+
+// The three-channel format a view of a 96-bit texture names in its T# (GFX10_FORMAT_32_32_32_*): the format
+// whose channels the view's swizzle is taken from, so alpha reads as one whatever the image's fourth channel holds.
+VkFormat rgb96_named_format(VkFormat image_view_format) {
+    switch (image_view_format) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return VK_FORMAT_R32G32B32_SFLOAT;
+    case VK_FORMAT_R32G32B32A32_UINT: return VK_FORMAT_R32G32B32_UINT;
+    case VK_FORMAT_R32G32B32A32_SINT: return VK_FORMAT_R32G32B32_SINT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+// And back: the format of the view of the RGBA32 image that shows such a T#.
+VkFormat rgb96_view_format(VkFormat image_format, std::uint32_t gfx10_format) {
+    for (const VkFormat wide : {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT})
+        if (leonida::gfx10::format_from_vulkan(rgb96_named_format(wide)) == gfx10_format)
+            return rgb96_named_format(image_format) != VK_FORMAT_UNDEFINED ? wide : VK_FORMAT_UNDEFINED;
+    return VK_FORMAT_UNDEFINED;
+}
+
+// Bytes per texel or block as D3D12 lays the format out in a footprint.
+leonida::BlockFormat footprint_block(const Format& format, VkImageAspectFlags aspect) {
+    leonida::BlockFormat block = leonida::block_format(format.format, aspect);
+    if (format.rgb96 && block.bytes) block.bytes = leonida::rgb96_bytes;
+    return block;
+}
+
+// 96-bit textures are sampled and copied, nothing else yet: the flags creation refuses, and
+// GetResourceAllocationInfo with it. The PC runtime (WARP) refuses unordered access and depth too; it does make
+// 96-bit render targets (d3d12_rgb96_test prints both devices' answers).
+bool rgb96_refused(const D3D12_RESOURCE_DESC& desc) {
+    return vulkan_format(desc.Format, false).rgb96 &&
+           (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                          D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
 }
 
 // The full mip chain's length for a texture this size.
@@ -428,6 +481,11 @@ struct DeviceState {
                 return {VK_FORMAT_R32_UINT, VK_IMAGE_ASPECT_COLOR_BIT, false, false, false, true};
             }
         }
+        if (rgb96_refused(desc)) {
+            if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+                log_once("96-bit (R32G32B32) render targets not supported; format", desc.Format);
+            return {};
+        }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
@@ -543,7 +601,12 @@ struct DeviceState {
         // format is 8_UINT reads it from X.
         const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
         const VkFormat logical_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : image_format;
-        const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(logical_format, image.format);
+        VkFormat view_format = stencil ? image_format : g::vulkan_view_format(logical_format, image.format);
+        VkFormat channels_format = view_format;  // whose channels the T#'s swizzle selects from
+        if (view_format == VK_FORMAT_UNDEFINED) {  // a 96-bit texture's T# names RGB32; its image is RGBA32
+            view_format = rgb96_view_format(image_format, image.format);
+            channels_format = rgb96_named_format(view_format);
+        }
         if (view_format == VK_FORMAT_UNDEFINED) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
@@ -583,7 +646,7 @@ struct DeviceState {
                 view_info.pNext = &clamp;
             }
         }
-        view_info.components = g::vulkan_swizzle(swizzle, view_format);
+        view_info.components = g::vulkan_swizzle(swizzle, channels_format);
         // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
         view_info.subresourceRange = {
             VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
@@ -784,6 +847,7 @@ public:
     VkFormat format() const { return format_; }                  // of the image
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
     VkImageAspectFlags aspects() const { return aspects_; }
+    bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
     const DeviceState& device_state() const { return device_; }
@@ -871,8 +935,11 @@ public:
         VkImageCreateInfo& info = create.info;
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
-        // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert.)
-        host_transfer_ = cpu_visible() && samples == 1 && !format.d24_as_float && device_.host_transfer_format(format.format);
+        // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert. Nor would it
+        // repack a 96-bit texture's 12-byte texels.)
+        host_transfer_ = cpu_visible() && samples == 1 && !format.d24_as_float && !format.rgb96 &&
+                         device_.host_transfer_format(format.format);
+        rgb96_ = format.rgb96;
         if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
         HRESULT support = device_.check_image_support(info);
         if (support == E_INVALIDARG && host_transfer_) {
@@ -891,6 +958,7 @@ public:
         leonida::ResourceBinding binding{};
         binding.image = image_;
         binding.rgba8_typeless = desc_.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        binding.rgb96 = format.rgb96;
         binding.depth24_as_float = format.d24_as_float;
         binding.depth24 = format.d24;
         binding.format = format.format;
@@ -1028,7 +1096,7 @@ private:
         if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back || b.right > width || b.bottom > height ||
             b.back > depth)
             return false;
-        out.block = leonida::block_format(binding_.format, range.aspectMask);
+        out.block = leonida::copy_block_format(binding_, range.aspectMask);
         if (!out.block.bytes) return false;
         const std::uint32_t k = out.block.block;
         if (b.left % k || b.top % k || (b.right % k && b.right != width) || (b.bottom % k && b.bottom != height))
@@ -1230,6 +1298,7 @@ private:
     bool reserved_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
+    bool rgb96_ = false;
 };
 
 // A view of a texture as Create*View describes it, before the resource's own shape is applied.
@@ -1329,10 +1398,28 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         }
         named = texture_storage_format(view.format, false).format;
     }
+    // A 96-bit texture takes views of its own family only (and a four-channel texture none of it), and only the
+    // TYPELESS one is cast between FLOAT, UINT and SINT. Its T# names the three-channel format: the swizzle below
+    // then reads alpha as one, and bind_image views the RGBA32 image accordingly.
+    const bool rgb96 = resource.rgb96();
+    if (!stencil && !depth_plane) {
+        const bool view_rgb96 = view.format != DXGI_FORMAT_UNKNOWN ? vulkan_format(view.format, false).rgb96 : rgb96;
+        if (view_rgb96 != rgb96 ||
+            (rgb96 && desc.Format != DXGI_FORMAT_R32G32B32_TYPELESS && named != resource.format())) {
+            log_once("view format outside the texture's 96-bit family:", int(view.format));
+            return false;
+        }
+        if (rgb96) named = rgb96_named_format(named);
+    }
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
-    const VkFormat view_format = stencil ? resource.format()
-                                 : code  ? g::vulkan_view_format(resource_format, code)
-                                         : VK_FORMAT_UNDEFINED;
+    VkFormat view_format = VK_FORMAT_UNDEFINED;
+    if (stencil) {
+        view_format = resource.format();
+    } else if (code && rgb96) {
+        view_format = named;
+    } else if (code) {
+        view_format = g::vulkan_view_format(resource_format, code);
+    }
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
         return false;
@@ -1618,9 +1705,11 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
-        // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
-        // Only enable the converter when the GPU lacks native D24_UNORM_S8_UINT support.
-        if (!state_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT)) {
+        // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
+        // a 96-bit texture, which every GPU stores as RGBA32 (D3D-62): the converter is there whether or not the
+        // GPU has a native D24_UNORM_S8_UINT. It costs nothing until a copy needs it (its pipeline is made on the
+        // first job, and a queue takes the tracker lock for it only when a list has such a copy).
+        {
             std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
             if (info.physical && info.get_instance_proc) {
                 if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
@@ -1759,6 +1848,8 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    const DeviceState& state() const { return state_; }
+    IUnknown* holder() { return identity(); }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
@@ -2579,7 +2670,7 @@ public:
             }
             if (total) *total = ~0ull;
         };
-        if (!desc || !xr_bias_compatible(*desc)) return fail();
+        if (!desc || !xr_bias_compatible(*desc) || rgb96_refused(*desc)) return fail();
         const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             // The PC runtime refuses any buffer field that isn't its one valid value (all measured on WARP, Width,
@@ -2629,7 +2720,7 @@ public:
             const UINT index = first + i, plane = index / per_plane, mip = index % mips;
             const VkImageAspectFlags aspect =
                 planes == 2 ? (plane ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : format.aspects;
-            const leonida::BlockFormat block = leonida::block_format(format.format, aspect);
+            const leonida::BlockFormat block = footprint_block(format, aspect);
             if (!block.bytes) return fail();
             const UINT width = std::max<UINT>(1, UINT(desc->Width >> mip));
             const UINT height = one_d ? 1 : std::max<UINT>(1, desc->Height >> mip);
@@ -2975,8 +3066,19 @@ public:
             }
             VkFormatProperties props{};
             state_.format_properties(state_.info.physical, vk_fmt, &props);
-            const VkFormatFeatureFlags optimal = props.optimalTilingFeatures;
-            const VkFormatFeatureFlags buffer = props.bufferFeatures;
+            VkFormatFeatureFlags optimal = props.optimalTilingFeatures;
+            VkFormatFeatureFlags buffer = props.bufferFeatures;
+            if (fmt.rgb96) {
+                // Textures are RGBA32 images that are sampled and copied, nothing else yet (no render target,
+                // no unordered access: creation refuses them). Buffers hold the real 12-byte format; the PC
+                // runtime (WARP) has no typed unordered access of these formats, in buffers either.
+                optimal &= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+                VkFormatProperties narrow{};
+                state_.format_properties(state_.info.physical, rgb96_named_format(vk_fmt), &narrow);
+                buffer = narrow.bufferFeatures &
+                         ~VkFormatFeatureFlags(VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT |
+                                               VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT);
+            }
 
             D3D12_FORMAT_SUPPORT1 s1 = D3D12_FORMAT_SUPPORT1_NONE;
             D3D12_FORMAT_SUPPORT2 s2 = D3D12_FORMAT_SUPPORT2_NONE;
@@ -3084,6 +3186,10 @@ public:
             }
             if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
                 return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
+            if (format.rgb96) {  // no 96-bit render targets yet, so no multisampled ones
+                levels->NumQualityLevels = levels->SampleCount == 1 ? 1 : 0;
+                return d3d12_trace::result(method, S_OK);
+            }
 
             // Vulkan exposes one standard sample pattern per supported count, so each supported count maps to
             // one D3D12 quality level (quality index 0). Query the matching colour or depth/stencil attachment
@@ -3384,6 +3490,7 @@ private:
                                                                            : leonida::TiledKind::texture2d;
         const Format format = vulkan_format(desc.Format, false);
         if (!format.format || (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) return false;
+        if (format.rgb96) return false;  // the tile shape of a 12-byte texel is not measured
         const leonida::BlockFormat block = leonida::block_format(format.format, format.aspects);
         tiling.element_bytes = block.bytes;
         tiling.block = block.block;
@@ -3500,7 +3607,7 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
     if (!dst || !src) return false;
     const Format requested = vulkan_format(format, false);
-    if (requested.typeless || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return false;
+    if (requested.typeless || requested.rgb96 || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return false;
     if (format == DXGI_FORMAT_R32G32B32A32_UINT || format == DXGI_FORMAT_R8G8B8A8_UINT ||
         format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R16G16B16A16_UINT ||
         format == DXGI_FORMAT_R16G16B16A16_SINT || format == DXGI_FORMAT_R32G32_UINT ||
@@ -3602,6 +3709,75 @@ VkDescriptorSet bindless_set(ID3D12Device* device) {
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->layout() : VK_NULL_HANDLE;
+}
+
+WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
+    : device_(device), presenter_(std::move(presenter)) {
+    device_->AddRef();
+}
+
+WindowPresenter::~WindowPresenter() {
+    presenter_.reset();  // before the device it runs on
+    device_->Release();
+}
+
+namespace {
+HRESULT present_result(VkResult result) {
+    if (result == VK_SUCCESS) return S_OK;
+    std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
+    if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
+    if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return DXGI_ERROR_UNSUPPORTED;
+    return E_FAIL;
+}
+}  // namespace
+
+HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect) {
+    if (!back_buffer) return E_INVALIDARG;
+    const leonida::PresentRect rect = src_rect ? leonida::PresentRect{src_rect->left, src_rect->top, src_rect->right,
+                                                                       src_rect->bottom}
+                                               : leonida::PresentRect{};
+    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr));
+}
+
+HRESULT WindowPresenter::present_blank(UINT sync_interval) {
+    return present_result(presenter_->present_blank(sync_interval > 0));
+}
+
+bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
+
+void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
+
+bool WindowPresenter::read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
+    return presenter_->read_back(pixels, extent, format);
+}
+
+VkExtent2D WindowPresenter::extent() const { return presenter_->extent(); }
+std::uint64_t WindowPresenter::presented() const { return presenter_->presented(); }
+
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window) {
+    Device* d = Device::from<Device>(device);
+    if (!d || !window) return nullptr;
+    const VulkanDeviceInfo& info = d->state().info;
+    if (!info.presentation) {
+        std::fprintf(stderr, "[rt] d3d12: the Vulkan device was created without presentation support\n");
+        return nullptr;
+    }
+    const auto create_surface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+        info.get_instance_proc(info.instance, "vkCreateWin32SurfaceKHR"));
+    if (!create_surface) return nullptr;
+    VkWin32SurfaceCreateInfoKHR surface_info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    surface_info.hinstance = GetModuleHandleW(nullptr);
+    surface_info.hwnd = window;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
+    auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
+                                                                info.instance, info.physical, info.queue,
+                                                                info.queue_family, surface);  // owns the surface
+    if (!presenter->ok()) {
+        std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
+        return nullptr;
+    }
+    return std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
 }
 
 HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
@@ -3926,6 +4102,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
+    info.presentation = has_swapchain && instance_has_surface;
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

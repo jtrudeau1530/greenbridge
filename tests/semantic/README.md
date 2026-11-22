@@ -38,6 +38,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   (10 cases): sentinels in v1..v8, M0 set by `s_mov_b32`, then the indexed register and its neighbours are
   exported, so a write must land only in `VGPR[D.addr + M0]`. A plain-Python register-file model checks the
   hand-written constants. `v_movrelsd_2_b32` is covered by `test_alu_movrelsd_2.py`.
+- `test_andn2_exec_b64.py` runs `s_andn2_saveexec_b64` and `s_andn2_wrexec_b64` on all 64 lanes of a wave64
+  (12 pairs of S0 and EXEC for each): every lane stores whether the instruction left it on, and lane 0 stores SCC
+  and the population count and lowest lane of D, against the ISA's two lines written as integers. Results in the
+  low half only, the high half only, both and neither are all in the table. It also runs the GPU test
+  `cs_w64x_andn2_exec`.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);

@@ -49,11 +49,11 @@ int usage() {
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir;
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
-    std::vector<std::string> game_args;
+    std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {
-            for (++i; i < argc; ++i) game_args.push_back(std::filesystem::path(argv[i]).string());
+            for (++i; i < argc; ++i) game_args.push_back(argv[i]);
             break;
         }
         if (a == L"--dry-run") dry_run = true;
@@ -104,7 +104,7 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
         }
-        rt::process::set_command_line(image.filename().string(), game_args);
+        rt::process::set_command_line(image.filename().wstring(), game_args);
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);

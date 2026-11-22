@@ -411,8 +411,13 @@ def test_ms_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     assert "OpMemberDecorate %ms_vtx_blk 1 BuiltIn ClipDistance" in spvasm
     assert f"%ms_arr_clip = OpTypeArray %float %c{n_comp}" in spvasm
     chains = re.findall(r"OpAccessChain %_ptr_Function_float %ms_clip %c(\d+)", spvasm)
-    assert [int(x) for x in chains] == list(range(n_comp))
+    assert [int(x) for x in chains] == list(range(n_comp)) * 2   # the export writes, then the copy to the output
     assert _vgpr_to_index_map(spvasm, "%ms_clip", "%_ptr_Function_float") == {i: 10 + i for i in range(n_comp)}
+    # Copied to the mesh output one float at a time: SPIRV-Cross turns a whole-array store there into a C array
+    # assignment that Metal rejects (SHADER-155).
+    out_chains = re.findall(r"OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli %c1 %c(\d+)", spvasm)
+    assert [int(x) for x in out_chains] == list(range(n_comp))
+    assert "OpLoad %ms_arr_clip" not in spvasm
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
     assert "shaderClipDistance" in meta["features"]
     assert 1 not in meta.get("outputs", [])
@@ -765,12 +770,6 @@ def _count(text, op):
     return len(re.findall(rf"= {op} ", text))
 
 
-def _gather_address_bit_offsets(text: str) -> list[int]:
-    constants = {name: int(value) for name, value in re.findall(r"(%\w+) = OpConstant %uint (\d+)", text)}
-    fields = re.findall(r"OpBitFieldUExtract %uint %\w+ (%\w+) (%\w+)", text)
-    return [constants[offset] for offset, width in fields if constants[width] == 3]
-
-
 @pytest.mark.parametrize("mx", range(4))
 @pytest.mark.parametrize("my", range(4))
 def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
@@ -782,7 +781,7 @@ def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, ma
     assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
     assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
-    assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
+    assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
 
 
 def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
@@ -825,7 +824,7 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     shader = make_shader(_gather_l(0x12, dynamic=True))
     text = shader.translate()
     shader.validate(text)
-    assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
+    assert _count(text, "OpBitFieldUExtract") == 2          # CLAMP_X and CLAMP_Y
     assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
 
 
@@ -1139,8 +1138,7 @@ def test_gather_d16_avoids_packhalf2x16(make_shader, suffix, last_addr):
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
-    for ty in ("%v4float", "%v4uint_st", "%v4int_st"):
-        assert asm2.count(f"OpImageFetch {ty} ") == (0 if suffix == "lz" else 4)
+    assert asm2.count("OpImageFetch ") == (0 if suffix == "lz" else 4)
 
 
 def _load_mini_interp():
@@ -1293,6 +1291,31 @@ def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
     memory = {0x1000: 0}
     _load_mini_interp().run_fragment(shader.translate(), memory=memory)
     assert memory[0x1000] == 0xFFC01000
+
+
+@pytest.mark.parametrize("fmt, shifts, channels", [(56, (0, 8, 16, 24), (64, 128, 191, 255)),
+                                                (50, (0, 10, 20, 30), (256, 512, 767, 3))])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("components", [1, 4])
+@pytest.mark.parametrize("bgra", [False, True])
+def test_buffer_store_format_bgra(fmt, shifts, channels, packed, components, bgra, make_shader):
+    # gfx1036 writes the red source into the third field of the BGRA view, even for store_format_x.
+    values = (0x38003400, 0x3c003a00) if packed else (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000)
+    order = (2, 1, 0, 3) if bgra else (0, 1, 2, 3)
+    selectors = sum((4 + channel) << (3 * i) for i, channel in enumerate(order))
+    inputs = "".join(f"v_mov_b32 v{4 + i}, {value:#x}\n" for i, value in enumerate(values))
+    regs = "v4" if components == 1 else ("v[4:5]" if packed else "v[4:7]")
+    op = "buffer_store_format_" + ("d16_" if packed else "") + "xyzw"[:components]
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000000 | fmt << 12 | selectors:#x}\n" + inputs +
+           f"{op} {regs}, off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_bgra")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000: 0xdeadbeef}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    expected = sum(channels[c] << shift for c, shift in zip(order, shifts) if c < components)
+    assert memory[0x1000] == expected
 
 
 def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):

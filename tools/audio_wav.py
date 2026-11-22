@@ -380,7 +380,9 @@ def audio_digest(ffmpeg, path, *, source):
         if samples:
             cmd += ["-af", f"atrim=end_sample={samples}"]
     cmd += ["-map_metadata", "-1", "-fflags", "+bitexact", "-c:a", "pcm_s16le" if source else "copy", "-f", "wav", "-"]
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
+    # No stdin for ffmpeg here or in decode(): it reads stdin for key commands, which stops a run started in the
+    # background of a terminal and swallows input piped to the caller (such as a shell loop's file list).
+    with subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
         header = proc.stdout.read(12)
         h = hashlib.sha256(header)
         for block in iter(lambda: proc.stdout.read(1024 * 1024), b""):
@@ -404,7 +406,7 @@ def decode(ffmpeg: str, src: str, dst: str):
             if samples:
                 cmd += ["-af", f"atrim=end_sample={samples}"]
             cmd += ["-c:a", "pcm_s16le", tmp]
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
             if r.returncode != 0:
                 return False, (r.stderr.strip() or f"ffmpeg exited with {r.returncode}")
             os.replace(tmp, dst)
