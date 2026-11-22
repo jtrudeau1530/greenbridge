@@ -280,7 +280,12 @@ python -m pytest tests/test_image_fuzz.py
 ```
 
 Covered: 2D `image_load`, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, `R32G32B32A32_SFLOAT` and `R32_SFLOAT`,
-at sizes that divide the 64x64 draw (8/16/32/64), every texel read at least once. Not covered yet: `dmask`
+at sizes that divide the 64x64 draw (8/16/32/64), every texel read at least once.
+
+Devices: the harness needs `fragmentStoresAndAtomics` and both without-format storage-image features, because the
+translated `image_load` declares the uint/sint storage path even when the case reads a float format (the choice is
+made from the T# FORMAT at run time). An Intel UHD 770 (Xe-LP) lacks `shaderStorageImageReadWithoutFormat` and
+skips every case; the harness names the missing feature. Not covered yet: `dmask`
 variants, UINT/SINT formats (they read through the storage views), mips, 1D/2D-array/3D/cube,
 `image_sample`/`gather` with filters and borders, and texel offsets with `VK_KHR_maintenance8`.
 
