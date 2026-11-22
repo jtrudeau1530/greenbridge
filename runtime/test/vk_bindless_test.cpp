@@ -665,13 +665,16 @@ int main(int argc, char** argv) {
         for (std::uint32_t i = 1; i < set.image_capacity(ImageDimension::dim_1d); ++i)
             filled.push_back(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
         EXPECT(filled.front() == 1 && filled.back() == set.image_capacity(ImageDimension::dim_1d) - 1);
+        EXPECT(set.free_images(ImageDimension::dim_1d) == 0);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 0);
         set.remove_image(ImageDimension::dim_1d, 7);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 7);
         for (const std::uint32_t index : filled) set.remove_image(ImageDimension::dim_1d, index);
+        EXPECT(set.free_images(ImageDimension::dim_1d) == set.image_capacity(ImageDimension::dim_1d) - 1);
+        EXPECT(set.free_samplers() == set.sampler_capacity() - 1);
         const std::uint32_t decoy_sampler = set.add_sampler(nearest);
         const std::uint32_t sampler_index = set.add_sampler(nearest);
-        EXPECT(decoy_sampler == 1 && sampler_index == 2);
+        EXPECT(decoy_sampler == 1 && sampler_index == 2 && set.free_samplers() == set.sampler_capacity() - 3);
 
         if (atomic_mode) {
             // ps_imgatomic.asm: image_atomic_umax/umin/or on three 8x8 r32ui images and umax on a 4x4x4 one, from

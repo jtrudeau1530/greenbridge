@@ -22,7 +22,8 @@ Dictionary sources:
                     ``<key>_<N>``: wave ``_01`` speaks the first label, ``_02`` the second, and so on.
 
 Bank sources (positional; each one is reported and thresholded on its own): ``.awc`` files, directories searched
-for ``.awc`` files, or an ``audio_manifest.json`` written by ``rpf9dump audio``.
+for ``.awc`` files, or an ``audio_manifest.json`` written by ``rpf9dump audio``. Sources with the same basename
+include their parent paths in report labels so they can be selected separately with ``opus_tags.py --source``.
 
 Usage:
     python -I awc_names.py <banks> [<banks> ...] (--words FILE | --conversations PATH) [...]
@@ -265,8 +266,23 @@ def name_source(dictionary: Dictionary, bases: list, index: Index) -> tuple:
     return real, stats
 
 
-def _label(source: str) -> str:
-    return os.path.basename(os.path.normpath(source)) or source
+def source_labels(sources):
+    """Keep basename labels where possible and qualify collisions relative to their shared parent."""
+    labels = {src: os.path.basename(os.path.normpath(src)) or src for src in sources}
+    groups = collections.defaultdict(list)
+    for src, label in labels.items():
+        groups[label].append(src)
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        paths = [os.path.abspath(src) for src in group]
+        try:
+            parent = os.path.commonpath([os.path.dirname(path) for path in paths])
+        except ValueError:  # Different Windows drives have no shared parent.
+            parent = None
+        for src, path in zip(group, paths):
+            labels[src] = (os.path.relpath(path, parent) if parent else path).replace(os.sep, "/")
+    return labels
 
 
 def main(argv=None) -> int:
@@ -299,6 +315,7 @@ def main(argv=None) -> int:
           f"{len(bases)} family bases", flush=True)
 
     rows, summary = [], {}
+    labels = source_labels(a.banks)
     for source in a.banks:
         try:
             banks = load_banks(source)
@@ -307,7 +324,7 @@ def main(argv=None) -> int:
             return 2
         index = Index(banks)
         found, stats = name_source(dictionary, bases, index)
-        label = _label(source)
+        label = labels[source]
         summary[label] = stats
         for (b, i), (name, rule, _k) in sorted(found.items()):
             rows.append({"source": label, "bank": index.labels[b], "stream_id": f"{i:08x}", "name": name,

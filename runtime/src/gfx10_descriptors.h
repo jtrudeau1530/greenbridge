@@ -352,19 +352,36 @@ inline constexpr Swizzle format_swizzle(VkFormat format) {
     return row ? row->channels : identity_swizzle;
 }
 
+inline constexpr bool is_depth_stencil_format(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_D16_UNORM:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_S8_UINT:
+    case VK_FORMAT_D16_UNORM_S8_UINT:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The format to view an image of `image_format` in when a T# names `gfx10_format`: the image's own format when
 // the codes agree, else the format of that code with the image's channel order (the sRGB view of a UNORM image,
 // say). With `allow_channel_cast`, a listed same-size cross-family cast may use the code's first Vulkan format
-// when no channel-order match exists (R8G8B8A8_UINT viewed as R32_UINT, say). VK_FORMAT_UNDEFINED: the table has
-// no such format.
+// when no channel-order match exists (R8G8B8A8_UINT viewed as R32_UINT, say). Depth/stencil images are only
+// compatible with their own format in Vulkan (VUID-VkImageViewCreateInfo-image-01762 / 09594), and colour
+// images can never be viewed as depth/stencil. VK_FORMAT_UNDEFINED: no compatible format exists.
 inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_t gfx10_format,
                                              bool allow_channel_cast = false) {
     const FormatRow* image = format_row(image_format);
     if (!image) return VK_FORMAT_UNDEFINED;
     if (image->gfx10 == gfx10_format) return image_format;
+    if (is_depth_stencil_format(image_format)) return VK_FORMAT_UNDEFINED;
     const FormatRow* fallback = nullptr;
     for (const FormatRow& row : format_table) {
-        if (row.gfx10 != gfx10_format) continue;
+        if (row.gfx10 != gfx10_format || is_depth_stencil_format(row.vulkan)) continue;
         if (row.channels == image->channels) return row.vulkan;
         if (!fallback) fallback = &row;
     }

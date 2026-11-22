@@ -164,8 +164,11 @@ class ShaderPreparationTests(unittest.TestCase):
                                           "--vs", "shared", "--ps", "shared"]), 0)
             out = work / "first_light" / "out"
             manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            runtime_index = json.loads((out / "index.json").read_text(encoding="utf-8"))
             for stage, module in modules.items():
                 self.assertEqual((out / manifest["files"][stage]).read_bytes(), module)
+                self.assertEqual((out / f"{stage}.dxbc").read_bytes(), stage.encode("ascii"))
+                self.assertEqual(runtime_index[stage]["fssm_sha256"], stage + "-fixture")
                 self.assertEqual(manifest[stage]["fssm_sha256"], stage + "-fixture")
 
 
