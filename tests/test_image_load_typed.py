@@ -243,10 +243,23 @@ class TypedGatherShaders(unittest.TestCase):
                         ((raw, _),) = uses("OpBitcast", rid)
                         taps = {int(a[2]): r for r, a in uses("OpCompositeExtract", raw)}
                         self.assertEqual(set(taps), {0, 1, 2, 3})
+                        halves = []
+                        for tap in range(4):
+                            if args[0] == "%v4int_st":
+                                ((signed, _),) = uses("OpBitcast", taps[tap])
+                                ((sat, clamp),) = uses("OpExtInst", signed)
+                                self.assertEqual(clamp[2], "SClamp")
+                                ((bits, _),) = uses("OpBitcast", sat)
+                                ((half, mask),) = uses("OpBitwiseAnd", bits)
+                                self.assertEqual(m.value(mask[2], 0, 0), 0xffff)
+                            else:
+                                ((half, clamp),) = uses("OpExtInst", taps[tap])
+                                self.assertEqual(clamp[2], "UMin")
+                                self.assertEqual(m.value(clamp[4], 0, 0), 0xffff)
+                            halves.append(half)
                         for tap in (0, 2):
-                            ((lo, mask),) = uses("OpBitwiseAnd", taps[tap])
-                            ((hi, shift),) = uses("OpShiftLeftLogical", taps[tap + 1])
-                            self.assertEqual(m.value(mask[2], 0, 0), 0xffff)
+                            lo = halves[tap]
+                            ((hi, shift),) = uses("OpShiftLeftLogical", halves[tap + 1])
                             self.assertEqual(m.value(shift[2], 0, 0), 16)
                             self.assertTrue(any(hi in a for _, a in uses("OpBitwiseOr", lo)))
 
