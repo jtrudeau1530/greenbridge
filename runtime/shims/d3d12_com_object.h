@@ -11,7 +11,6 @@
 #include <cstring>
 #include <cwchar>
 #include <mutex>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -98,20 +97,17 @@ public:
         return S_OK;
     }
 
-    // The host runtime doesn't keep the name where GetPrivateData can read it (WKPDID_D3DDebugObjectNameW and the
-    // narrow key both stay missing), so the name is kept apart. A null name, which the host runtime faults on,
-    // clears it.
+    // SetName is SetPrivateData with WKPDID_D3DDebugObjectNameW and the name with its terminator, as D3D12 documents
+    // and the host runtime does: GetPrivateData reads it back (an empty name is a 2-byte entry), and the narrow
+    // WKPDID_D3DDebugObjectName is not touched. A null name, which the host runtime faults on, changes nothing.
     HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override {
-        std::lock_guard lock(data_mutex_);
-        name_.assign(name ? name : L"");
-        return S_OK;
+        if (!name) return E_INVALIDARG;
+        return SetPrivateData(kDebugObjectNameW, UINT((std::wcslen(name) + 1) * sizeof(wchar_t)), name);
     }
 
-    // The name SetName gave the object, or an empty string.
-    std::wstring debug_name() {
-        std::lock_guard lock(data_mutex_);
-        return name_;
-    }
+    // WKPDID_D3DDebugObjectNameW (d3dcommon.h), spelled out so nothing needs dxguid.lib.
+    static constexpr GUID kDebugObjectNameW{0x4cca5fd8, 0x921f, 0x42c8,
+                                            {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
 
     // The implementation behind a public interface pointer, or null when it is not a T. No reference is added.
     template<class T>
@@ -165,7 +161,6 @@ private:
     std::atomic<ULONG> refs_{1};
     std::mutex data_mutex_;
     std::vector<PrivateData> data_;
-    std::wstring name_;
 };
 
 // An ID3D12DeviceChild: holds a reference to its device, as D3D12 children do, and GetDevice returns it. When the

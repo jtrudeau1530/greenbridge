@@ -2343,8 +2343,10 @@ Games and middleware call these every frame (PIX events), so they must be cheap 
     `pDataSize` is `E_INVALIDARG`.
   - `SetPrivateData` with null data removes the entry whatever the size: `S_OK` when there was one, `S_FALSE` when
     there wasn't. Zero bytes with data keep an empty entry (`S_OK`, size 0).
-  - `SetName` is not readable through `GetPrivateData`: neither `WKPDID_D3DDebugObjectNameW` nor the narrow key is
-    set. The layer keeps the name apart (`debug_name()`). A null name, which the host runtime faults on, clears it.
+  - `SetName` is `SetPrivateData` with `WKPDID_D3DDebugObjectNameW` (`{4cca5fd8-921f-42c8-8566-70caf2a9b741}`) and
+    the name with its terminator, as D3D12 documents: `GetPrivateData` reads it back, an empty name is a 2-byte
+    entry, and the narrow `WKPDID_D3DDebugObjectName` is not touched. A null name, which the host runtime faults on,
+    changes nothing (`E_INVALIDARG`). Before #2533 the layer stored the name under a mistyped GUID.
   Names are not forwarded to `vkSetDebugUtilsObjectNameEXT` yet: one D3D12 object may own several Vulkan objects.
 
 ## 5. Producing the shader contract
