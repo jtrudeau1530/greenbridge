@@ -1103,7 +1103,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             if name in PIXEL_VERTEX:
-                if bary_fallback() and name == "ps_interp_f16_high":   # no PerVertexKHR inputs under --bary-fallback
+                # --bary-fallback alone has no PerVertexKHR inputs, so the f16 halves can't be interpolated; with
+                # --f16-interp-fallback too (on by itself without fragmentShaderBarycentric) it reads decoded halves.
+                if name == "ps_interp_f16_high" and bary_fallback() and not f16_interp_fallback():
                     results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
                     continue
                 vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
@@ -1245,7 +1247,7 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)   # VKH_MESH=1, or the --mesh-compute pass and its VS
             fs = os.path.join(spirv_dir, "ps_interp_f16_high.spv")
-            if bary_fallback():
+            if bary_fallback() and not f16_interp_fallback():
                 results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
                 continue
             rc, msg = run_cmd([vk_harness, spv, fs, raw], env=env)
