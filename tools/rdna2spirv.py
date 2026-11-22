@@ -15914,7 +15914,16 @@ def main():
         if write_asm:
             with open(sa, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
-        r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler)
+        try:
+            r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler)
+        except OSError as e:
+            # A missing spirv-as/spirv-val fails every shader the same way; report it once as a setup
+            # error (exit 2) instead of a FileNotFoundError traceback from the first one.
+            if e.filename not in ("spirv-as", "spirv-val"):
+                raise
+            print(f"ERROR: {e.filename} not found; install SPIRV-Tools (spirv-as, spirv-val) "
+                  "and put it on PATH", file=sys.stderr)
+            return 2
         if r.returncode == 0:
             valid += 1
             try:

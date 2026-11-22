@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -330,6 +330,44 @@ class ValidatedOutput(unittest.TestCase):
 
     def test_existing_single_s_file_still_translates(self):
         self.assertIn("1 pass spirv-val", self.translate())
+
+    def test_missing_assembler_is_one_setup_error(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run",
+                                  side_effect=FileNotFoundError(2, "No such file or directory", "spirv-as")), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = rdna2spirv.main()
+        message = err.getvalue()
+        self.assertEqual(code, 2, message)
+        self.assertIn("spirv-as", message)
+        self.assertIn("SPIRV-Tools", message)
+        self.assertNotIn("Traceback", message)
+        self.assertEqual(len(message.strip().splitlines()), 1, message)
+        self.assertFalse(self.module.exists())
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+
+    def test_missing_validator_does_not_publish_the_module(self):
+        def spirv_tool(cmd, **_kwargs):
+            if cmd[0] == "spirv-as":
+                Path(cmd[3]).write_bytes(b"new module")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            raise FileNotFoundError(2, "No such file or directory", "spirv-val")
+
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = rdna2spirv.main()
+        message = err.getvalue()
+        self.assertEqual(code, 2, message)
+        self.assertIn("spirv-val", message)
+        self.assertIn("SPIRV-Tools", message)
+        self.assertNotIn("Traceback", message)
+        self.assertEqual(len(message.strip().splitlines()), 1, message)
+        self.assertFalse(self.module.exists())
+        self.assertFalse(self.index.exists())
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
 
     def test_validator_rejection_does_not_publish_binary(self):
         self.assertIn("INVALID: synthetic rejection", self.translate(reject_at="spirv-val"))
