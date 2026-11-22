@@ -48,6 +48,18 @@ class SkeletonMatchTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 asm.main([packs_p, anim_p, "--out", packs_p])
             self.assertEqual(cm.exception.code, 2)
+            with self.assertRaises(SystemExit) as cm:
+                asm.main([packs_p, anim_p, "--out", os.path.join(tmp, "nodir", "rep.json")])
+            self.assertEqual(cm.exception.code, 2)
+            with self.assertRaises(SystemExit) as cm:
+                asm.main([packs_p, anim_p, "--out", tmp])
+            self.assertEqual(cm.exception.code, 2)
+            empty_p = os.path.join(tmp, "empty.rpf")
+            open(empty_p, "wb").close()
+            for bad_in in (os.path.join(tmp, "missing.rpf"), empty_p, tmp):
+                with self.subTest(bad_in=bad_in), self.assertRaises(SystemExit) as cm:
+                    asm.main([bad_in, anim_p])
+                self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

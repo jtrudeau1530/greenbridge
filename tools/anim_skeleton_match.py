@@ -89,25 +89,55 @@ def compare_sets(skel_tokens: set[str], anim_per_stream: list[set[str]]) -> dict
     }
 
 
+def _check_input(ap, label: str, path: str) -> None:
+    if not os.path.exists(path):
+        ap.error(f"{label} not found: {path}")
+    if os.path.isdir(path):
+        ap.error(f"{label} is a directory: {path}")
+    try:
+        if os.path.getsize(path) == 0:
+            ap.error(f"{label} is empty: {path}")
+    except OSError as exc:
+        ap.error(f"cannot read {label} ({path}): {exc}")
+
+
+def _check_output(ap, out_path: str, inputs: tuple[str, ...]) -> None:
+    if any(same_report_path(out_path, inp) for inp in inputs):
+        ap.error("--out must not overwrite an input archive")
+    if os.path.isdir(out_path):
+        ap.error(f"--out is a directory: {out_path}")
+    parent = os.path.dirname(os.path.abspath(out_path))
+    if not os.path.isdir(parent):
+        ap.error(f"--out parent directory does not exist: {parent}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Match anim.rpf SKEL_* bone lists against packs.rpf skeletons (ASSET-231).")
     ap.add_argument("packs", help="Path to packs.rpf")
     ap.add_argument("anim", help="Path to anim.rpf")
     ap.add_argument("--out", help="Optional JSON output path (counts only)")
     a = ap.parse_args(argv)
-    if a.out and (same_report_path(a.out, a.packs) or same_report_path(a.out, a.anim)):
-        ap.error("--out must not overwrite an input archive")
-    packs = scan_archive_skel(a.packs)
-    anim = scan_archive_skel(a.anim)
+    _check_input(ap, "packs", a.packs)
+    _check_input(ap, "anim", a.anim)
+    if a.out:
+        _check_output(ap, a.out, (a.packs, a.anim))
+    try:
+        packs = scan_archive_skel(a.packs)
+        anim = scan_archive_skel(a.anim)
+    except (OSError, ValueError) as exc:
+        ap.error(str(exc))
     summary = compare_sets(packs["tokens"], anim["per_stream"])
     summary["packs_streams"] = packs["streams"]
     summary["packs_skel_streams"] = packs["skel_streams"]
     summary["anim_streams"] = anim["streams"]
+    text = json.dumps(summary, indent=2)
+    print(text)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(summary, fh, indent=2)
-            fh.write("\n")
-    print(json.dumps(summary, indent=2))
+        try:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text + "\n")
+        except OSError as exc:
+            ap.error(f"cannot write --out ({a.out}): {exc}")
     return 0
 
 
