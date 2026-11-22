@@ -229,7 +229,7 @@ def census(root, disasm=None):
     With `disasm`, the `--disasm` folder of tools/fspx_unpack.py, each row also carries the program's reads.
     """
     rows, errors = [], []
-    for path in sorted(glob.glob(os.path.join(root, "*.dxbc"))):
+    for path in sorted(glob.glob(os.path.join(glob.escape(root), "*.dxbc"))):
         name = os.path.basename(path)[:-5]
         with open(path, "rb") as fh:
             chunks = parts(fh.read())

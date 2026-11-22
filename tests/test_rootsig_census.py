@@ -207,6 +207,17 @@ class TestCensus(unittest.TestCase):
         self.assertEqual(R.summarize(rows)["read_scan"],
                          {"programs": 1, "low_read": 0, "table_bases": {4: 1}, "whole_pairs": {6: 1}})
 
+    def test_a_folder_name_with_glob_characters_is_a_path(self):
+        # The root went into glob.glob unescaped, so "[v1]" was read as a character class and the folder came
+        # back empty; the caller saw no rows rather than a failed scan.
+        folder = os.path.join(self.tmp.name, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "sig.dxbc"), "wb") as fh:
+            fh.write(container([(b"RTS0", rts0(params=[("cbv", 0)]))]))
+        rows, errors = R.census(folder)
+        self.assertEqual(errors, [])
+        self.assertEqual([r["name"] for r in rows], ["sig"])
+
     def test_without_a_disassembly_folder_there_is_no_read_scan(self):
         self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
         rows, errors = R.census(self.tmp.name)
