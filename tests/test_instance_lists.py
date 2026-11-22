@@ -171,6 +171,44 @@ class MeasureTests(unittest.TestCase):
     def test_not_a_map_resource(self):
         self.assertFalse(il.measure(b"\0" * 0x100, b"", {}))
 
+    def test_offset_zero_grass_member_is_preserved(self):
+        structs = {
+            il.GRASS_LIST: (0x1A0, {M["InstanceList"]: (0x178, 0x52)}),
+            il.GRASS_INST: (0x10, {
+                M["Scale"]: (0x0, 0x11),
+                M["ScaleZ"]: (0x1, 0x11),
+                M["NormalX"]: (0x6, 0x11),
+                M["NormalY"]: (0x7, 0x11),
+                M["RotationIdx"]: (0xD, 0x11),
+            }),
+        }
+        gl = bytearray(0x1A0)
+        struct.pack_into("<QH", gl, 0x178, 1, 1)
+        inst = bytearray(0x10)
+        inst[0x0] = 0       # Scale at offset 0 is 0
+        inst[0x1] = 0       # ScaleZ at offset 1 is 0
+        inst[0xB] = 99      # default Scale offset (0xB) holds a non-zero value
+        inst[0xC] = 77
+        blocks = [(il.GRASS_INST, 0x10, 0x60000000)]
+        R = {}
+        il.grass_list(bytes(gl), bytes(inst), blocks, structs, bytes(gl), 0, R)
+        self.assertEqual(R["scale_zero"], 1)
+        self.assertEqual(R["scalez_equals_scale"], 1)
+
+    def test_nonzero_instmat_offset_past_buffer_counts_as_truncated_instance(self):
+        structs = {
+            il.PROP_LIST: (0x170, {M["InstanceList"]: (0x90, 0x52)}),
+            il.PROP_INST: (0x40, {M["InstMat"]: (0x20, 0x50)}),
+        }
+        pl = bytearray(0x170)
+        struct.pack_into("<QH", pl, 0x90, 1, 1)
+        # 56 bytes is >= 48, but < 0x20 + 48 (80), so InstMat at +0x20 is truncated
+        inst = b"\0" * 56
+        blocks = [(il.PROP_INST, len(inst), 0x60000000)]
+        R = {}
+        il.prop_list(bytes(pl), inst, blocks, structs, bytes(pl), 0, R)
+        self.assertEqual(R.get("instances_truncated"), 1)
+
 
 class ArchiveTests(unittest.TestCase):
     def test_end_to_end(self):
@@ -247,6 +285,38 @@ class ArchiveTests(unittest.TestCase):
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
             self.assertIn('"resources_with_lists"', r.stdout)
+
+    def test_short_or_non_rpf_archives_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = (
+                ("empty.rpf", b"", "not an RPF9 archive"),
+                ("short.rpf", b"RPF9", "not an RPF9 archive"),
+                ("bad_magic.rpf", b"NOPE" + struct.pack("<I", 8) + b"\0" * 8, "not an RPF9 archive"),
+                ("bad_start.rpf", b"RPF9" + struct.pack("<I", 4) + b"\0" * 8, "data start is outside"),
+                ("past_end.rpf", b"RPF9" + struct.pack("<I", 64) + b"\0" * 8, "data start is outside"),
+            )
+            for name, payload, expected in cases:
+                with self.subTest(name=name):
+                    bad = os.path.join(tmp, name)
+                    with open(bad, "wb") as fh:
+                        fh.write(payload)
+                    r = subprocess.run([sys.executable, "-I", TOOL, bad], capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn(expected, r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(r.stdout, "")
+
+    def test_negative_or_non_integer_start_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            for bad in ("-1", "nope"):
+                with self.subTest(start=bad):
+                    r = subprocess.run([sys.executable, "-I", TOOL, path, "--start", bad],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertNotIn("<lambda>", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(r.stdout, "")
 
 
 if __name__ == "__main__":
