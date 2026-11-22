@@ -109,11 +109,16 @@ public:
 
     // Records a bottom-level build into `dst` (layout.size bytes) using `scratch` (layout.scratch bytes). `layout`
     // must come from compute() with the sum of the geometries' triangle counts.
+    //
+    // With `update_from` set, an update (D3D12 PERFORM_UPDATE) instead: the structure at `update_from` (the
+    // destination itself, or another one, which is copied first) was built from the same topology, and is refitted
+    // to the new positions. Its tree is kept and only its boxes change, which is valid for any motion and costs no
+    // sort, though a refitted tree traverses more slowly as the geometry moves away from where it was built.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
-                     std::uint64_t dst, std::uint64_t scratch) {
+                     std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0) {
         if (!loaded_ || layout.tlas) return false;
         Push p = base(layout, dst, scratch);
-        begin(cb, layout, p);
+        if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         std::uint32_t first = 0;
         for (std::size_t g = 0; g < geometries.size(); ++g) {
             const auto& geo = geometries[g];
@@ -133,17 +138,18 @@ public:
             first += geo.triangle_count;
         }
         if (first != layout.elements) return false;
-        finish(cb, layout, p);
+        if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
         return true;
     }
 
     // Records a top-level build from `count` D3D12_RAYTRACING_INSTANCE_DESCs at `instances`.
+    // `update_from`: as for record_blas; the instances may move, and name other BLASes.
     bool record_tlas(VkCommandBuffer cb, const XdxrLayout& layout, std::uint64_t instances, std::uint64_t dst,
-                     std::uint64_t scratch, std::uint64_t bias = 0) {
+                     std::uint64_t scratch, std::uint64_t bias = 0, std::uint64_t update_from = 0) {
         if (!loaded_ || !layout.tlas) return false;
         Push p = base(layout, dst, scratch);
         p.bias = split(bias);
-        begin(cb, layout, p);
+        if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         if (layout.elements) {
             Push t = p;
             t.mode = mode_instances;
@@ -151,14 +157,14 @@ public:
             t.src0 = split(instances);
             dispatch(cb, t, t.count);
         }
-        finish(cb, layout, p);
+        if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
         return true;
     }
 
 private:
     enum : std::uint32_t {
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_level = 5, mode_header = 6,
-        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10
+        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10, mode_copy = 11
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
@@ -190,6 +196,36 @@ private:
         init.mode = mode_init;
         init.count = l.parent_entries > 3 ? l.parent_entries : 3;
         dispatch(cb, init, init.count);
+    }
+
+    // An update: the source's tree is copied unless it is the destination. Its parent table stays as it is, so there
+    // is no MODE_INIT.
+    void refit_begin(VkCommandBuffer cb, const XdxrLayout& l, const Push& p, std::uint64_t source) {
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        const std::uint64_t dst = std::uint64_t(p.dst.hi) << 32 | p.dst.lo;
+        if (source == dst) return;
+        Push c = p;
+        c.mode = mode_copy;
+        c.count = l.size / 4;
+        c.src0 = split(source);
+        dispatch(cb, c, c.count);
+    }
+
+    // Boxes bottom-up through the existing nodes, then the header (its bounds change; nothing else does).
+    void refit_finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {
+        for (std::size_t level = 0; level < l.level_counts.size(); ++level) {
+            Push n = p;
+            n.mode = mode_level;
+            n.count = l.level_counts[level];
+            n.first = l.level_first[level];
+            n.arg2 = 1;                                 // refit: read each node's children from the node
+            dispatch(cb, n, n.count);
+        }
+        Push h = p;
+        h.mode = mode_header;
+        h.count = 1;
+        h.first = l.root();
+        dispatch(cb, h, 1, false);
     }
 
     void finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {

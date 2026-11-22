@@ -740,11 +740,15 @@ def check_build(directory, rays=300, seed=1):
         return [f"no cases in {directory}"]
     problems = []
     cases = {n: _load_case(directory, n) for n in names}
-    mem = Memory()
-    for n, (desc, data) in cases.items():
-        mem.place(desc["address"], data)
     rng = random.Random(seed)
     for n, (desc, data) in cases.items():
+        # An in-place update leaves two dumps at one address (before and after): the case being checked comes first,
+        # so its own bytes answer reads there.
+        mem = Memory()
+        mem.place(desc["address"], data)
+        for other, (odesc, odata) in cases.items():
+            if other != n:
+                mem.place(odesc["address"], odata)
         errs = validate(data, expect_bottom=desc["kind"] == "blas")
         problems += [f"{n}: {e}" for e in errs]
         if desc["kind"] == "blas":
