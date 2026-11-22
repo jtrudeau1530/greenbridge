@@ -83,9 +83,11 @@ struct VulkanDeviceInfo {
     // created. bindless_partially_bound: descriptorBindingPartiallyBound is enabled as well.
     bool bindless = false;
     bool bindless_partially_bound = false;
-    // samplerAnisotropy and samplerMirrorClampToEdge enabled; without them such samplers are approximated.
+    // samplerAnisotropy, samplerMirrorClampToEdge and samplerFilterMinmax enabled; without them such samplers are
+    // approximated.
     bool sampler_anisotropy = false;
     bool sampler_mirror_clamp_to_edge = false;
+    bool sampler_filter_minmax = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
     bool calibrated_timestamps = false;
     // VK_EXT_conditional_rendering (with its conditionalRendering feature) is enabled: SetPredication works, and

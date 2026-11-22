@@ -307,6 +307,7 @@ int main() {
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
+        info.sampler_filter_minmax = d.sampler_filter_minmax;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -1854,6 +1855,101 @@ int main() {
                 }
             }
             std::printf("%s sampled: %u texels matched\n", format.name, texels);
+#endif
+        }
+
+        // Minimum/maximum filter reduction modes on a 2x2 RGBA8 texture: every sample of cs_sample.comp's 8x8 grid
+        // lands strictly between texel centres, so all four texels have positive weight under WRAP addressing.
+        {
+            D3D12_RESOURCE_DESC minmax_desc = texture_desc;
+            minmax_desc.Width = minmax_desc.Height = 2;
+            minmax_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            Ref<ID3D12Resource> minmax_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &minmax_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&minmax_texture.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT minmax_fp{};
+            device->GetCopyableFootprints(&minmax_desc, 0, 1, 49152, &minmax_fp, nullptr, nullptr, nullptr);
+            constexpr std::uint8_t minmax_texels[2][2][4] = {
+                {{16, 240, 80, 255}, {240, 16, 160, 255}},
+                {{96, 128, 240, 255}, {176, 64, 16, 255}},
+            };
+            for (UINT y = 0; y < 2; ++y)
+                for (UINT x = 0; x < 2; ++x)
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + minmax_fp.Offset + y * minmax_fp.Footprint.RowPitch +
+                                    x * 4,
+                                minmax_texels[y][x], 4);
+            device->CreateShaderResourceView(minmax_texture.p, nullptr, view_slot(null_slot));
+
+            D3D12_DESCRIPTOR_HEAP_DESC mm_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3,
+                                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            Ref<ID3D12DescriptorHeap> mm_samplers;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&mm_heap_desc, IID_PPV_ARGS(&mm_samplers.p))));
+            const auto mm_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(mm_samplers.p, 9))(mm_samplers.p);
+            const auto mm_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(mm_cpu + i * sampler_step)}; };
+            const auto mm_bytes = [&](UINT i) { return reinterpret_cast<const std::uint8_t*>(mm_cpu + i * sampler_step); };
+            constexpr D3D12_FILTER mm_filters[3] = {
+                D3D12_FILTER_MINIMUM_MIN_MAG_MIP_LINEAR,
+                D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_LINEAR,
+                D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            };
+            constexpr g::FilterMode mm_modes[3] = {g::FilterMode::minimum, g::FilterMode::maximum, g::FilterMode::blend};
+            for (UINT i = 0; i < 3; ++i) {
+                D3D12_SAMPLER_DESC sd = sampler_desc;
+                sd.Filter = mm_filters[i];
+                sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+                device->CreateSampler(&sd, mm_slot(i));
+                g::SamplerWords sw{};
+                std::memcpy(sw.data(), mm_bytes(i), sizeof(sw));
+                EXPECT(g::decode(sw).filter_mode == mm_modes[i]);
+            }
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            D3D12_TEXTURE_COPY_LOCATION to_mm{minmax_texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            to_mm.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION from_mm{upload.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            from_mm.PlacedFootprint = minmax_fp;
+            list->CopyTextureRegion(&to_mm, 0, 0, 0, &from_mm, nullptr);
+            const D3D12_RESOURCE_BARRIER mm_readable =
+                transition(minmax_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &mm_readable);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            ++packed_signal;
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
+
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+            SampleKeys mm_keys[3]{};
+            for (UINT i = 0; i < 3; ++i) {
+                std::memcpy(mm_keys[i].tsharp, view_bytes(null_slot), sizeof(mm_keys[i].tsharp));
+                std::memcpy(mm_keys[i].ssharp, mm_bytes(i), sizeof(mm_keys[i].ssharp));
+                mm_keys[i].first = i * texels;
+            }
+            std::array<std::uint8_t, 3 * bytes> mm_pixels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, mm_keys, mm_pixels.data()));
+            constexpr std::array<std::uint8_t, 4> want_min{16, 16, 16, 255};
+            constexpr std::array<std::uint8_t, 4> want_max{240, 240, 240, 255};
+            UINT min_matches = 0, max_matches = 0, blend_diff_min = 0, blend_diff_max = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                const auto* got_min = &mm_pixels[0 * bytes + i * 4];
+                const auto* got_max = &mm_pixels[1 * bytes + i * 4];
+                const auto* got_blend = &mm_pixels[2 * bytes + i * 4];
+                if (d.sampler_filter_minmax) {
+                    min_matches += std::memcmp(got_min, want_min.data(), 4) == 0;
+                    max_matches += std::memcmp(got_max, want_max.data(), 4) == 0;
+                    blend_diff_min += std::memcmp(got_blend, want_min.data(), 4) != 0;
+                    blend_diff_max += std::memcmp(got_blend, want_max.data(), 4) != 0;
+                } else {
+                    min_matches += std::memcmp(got_min, got_blend, 4) == 0;
+                    max_matches += std::memcmp(got_max, got_blend, 4) == 0;
+                }
+            }
+            std::printf("sampler reduction min/max: min %u/%u, max %u/%u (blend differed: %u/%u vs min, %u/%u vs max)\n",
+                        min_matches, texels, max_matches, texels, blend_diff_min, texels, blend_diff_max, texels);
+            EXPECT(min_matches == texels && max_matches == texels);
+            if (d.sampler_filter_minmax) EXPECT(blend_diff_min == texels && blend_diff_max == texels);
 #endif
         }
 

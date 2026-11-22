@@ -821,8 +821,17 @@ struct DeviceState {
             log_once("mirror-once sampler without samplerMirrorClampToEdge; clamped instead, mode", int(*mode));
             *mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         }
-        if (sampler.filter_mode != g::FilterMode::blend)
-            log_once("minimum/maximum filter samplers blend for now; filter mode", int(sampler.filter_mode));
+        VkSamplerReductionModeCreateInfo reduction{VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};
+        if (sampler.filter_mode != g::FilterMode::blend) {
+            if (info.sampler_filter_minmax && !sampler_info.compareEnable) {
+                reduction.reductionMode = g::vulkan_reduction_mode(sampler.filter_mode);
+                reduction.pNext = sampler_info.pNext;
+                sampler_info.pNext = &reduction;
+            } else {
+                log_once("minimum/maximum filter sampler without samplerFilterMinmax; blended instead, mode",
+                         int(sampler.filter_mode));
+            }
+        }
         if (sampler.border_color == g::BorderColor::table)
             log_once("custom sampler border colours are transparent black for now; index",
                      int(sampler.border_color_index));
@@ -5373,12 +5382,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.bindless_partially_bound = info.bindless && chosen12.descriptorBindingPartiallyBound;
     info.sampler_anisotropy = chosen_features.samplerAnisotropy;
     info.sampler_mirror_clamp_to_edge = chosen12.samplerMirrorClampToEdge;
+    info.sampler_filter_minmax = chosen12.samplerFilterMinmax;
     enable12.runtimeDescriptorArray = info.bindless;
     enable12.descriptorBindingSampledImageUpdateAfterBind = info.bindless;
     enable12.descriptorBindingStorageImageUpdateAfterBind = info.bindless;
     enable12.descriptorBindingStorageBufferUpdateAfterBind = info.bindless;
     enable12.descriptorBindingPartiallyBound = info.bindless_partially_bound;
     enable12.samplerMirrorClampToEdge = info.sampler_mirror_clamp_to_edge;
+    enable12.samplerFilterMinmax = info.sampler_filter_minmax;
     if (!info.bindless)
         std::fprintf(stderr, "[rt] d3d12: the GPU lacks a descriptor-indexing feature the bindless set needs\n");
     enable12.bufferDeviceAddress = VK_TRUE;

@@ -67,6 +67,7 @@ public:
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
+    bool sampler_filter_minmax = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
@@ -299,6 +300,8 @@ public:
         enable12.descriptorBindingStorageImageUpdateAfterBind = bindless;
         enable12.descriptorBindingStorageBufferUpdateAfterBind = bindless;
         enable12.descriptorBindingPartiallyBound = partially_bound;
+        sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
+        enable12.samplerFilterMinmax = sampler_filter_minmax;
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const float priority = 1.0f;
