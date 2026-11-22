@@ -2054,6 +2054,22 @@ The trace will enumerate them.
   row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;
   depth and stencil resolves → a `vkCmdBeginRendering` scope with a resolve attachment (section 3.2).
   Partial resolve regions to another offset need a shader or a region copy.
+  - A placed footprint must have an `Offset` that is a multiple of 512 and a `RowPitch` that is a multiple of 256
+    (`D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`, `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`). Any other is refused when it is
+    recorded, so `Close` returns `E_INVALIDARG` (`CommandList::valid(const CopyLocation&)` in
+    `runtime/src/command_list.h`; `command_list_test` has both cases). That is D3D12's rule for a device that
+    reports `UnrestrictedBufferTextureCopyPitchSupported` as `FALSE` in `D3D12_FEATURE_D3D12_OPTIONS13`, which this
+    device does on purpose (`d3d12_vulkan_device_test` fails on a `TRUE`). The PC runtime answers differently: on an
+    RTX 4090 (driver 621.14) and on WARP it reports the capability as supported, and a list with `Offset` 16 and
+    `RowPitch` 260 for an `R8G8B8A8_UNORM` footprint closes with `S_OK` (measured with a stand-alone D3D12 program,
+    Windows 11 26200). The layer cannot simply say the same: Vulkan takes a copy's buffer offset as a multiple of
+    the texel block size and its row length in texels (VUID-vkCmdCopyBufferToImage-dstImage-07975), while the
+    capability lifts D3D12's two alignments and is not documented as keeping offsets and pitches texel multiples
+    (not tested here), so a footprint that is not texel-aligned would have to be repacked through scratch memory
+    the way a 96-bit one is (section 4.2). The replay already accepts any offset and pitch that are texel multiples
+    (`prepare_texture_copy` in `runtime/src/vulkan_replay.h`; anything else is `unsupported` there), so accepting
+    those needs only the record-time check changed; reporting the capability needs the repack as well. What the
+    console's runtime reports is not measured, and no title code that depends on it has been seen.
 - `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
   executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
   `buffer_offset + (address - va)`. `VulkanContext` finds it by binary search over the buffers' VA ranges
