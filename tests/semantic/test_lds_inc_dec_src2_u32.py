@@ -570,12 +570,10 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             DSOpcode.DS_ADD_SRC2_U32,
             LDSAddressExpression(v0, offset0=0, offset1=1),
         )
-        # Setup each lane to point to distinct LDS dwords:
-        # Lane i uses base_addr = (i * 2) * 4 bytes
         for lane in range(32):
             state.set_lane_vgpr(lane, 0, (lane * 2) * 4)
-            state.lds.write_dword(lane * 2, 10)       # A
-            state.lds.write_dword(lane * 2 + 1, lane) # B
+            state.lds.write_dword(lane * 2, 10)
+            state.lds.write_dword(lane * 2 + 1, lane)
 
         self.interp.execute(instr, state)
 
@@ -601,7 +599,6 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(lane * 2), 1)
 
     def test_sparse_exec_mask_even_lanes(self) -> None:
-        # Only even lanes active
         exec_mask = 0x5555555555555555
         state = SIMDState(num_lanes=64, exec_mask=exec_mask, lds_dwords=1024)
         v0 = RegisterOperand(0, RegType.VGPR)
@@ -640,8 +637,7 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(lane * 2), 50)
 
     def test_lane_divergence_same_address_atomic_accumulate(self) -> None:
-        # 8 active lanes all target same address A = 0, with B = 1 having value 3
-        exec_mask = 0xFF  # Lanes 0..7 active
+        exec_mask = 0xFF
         state = SIMDState(num_lanes=32, exec_mask=exec_mask, lds_dwords=1024)
         v0 = RegisterOperand(0, RegType.VGPR)
         instr = DSSrc2Instruction(
@@ -650,23 +646,14 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         )
         for lane in range(32):
             state.set_lane_vgpr(lane, 0, 0)
-        state.lds.write_dword(0, 10)  # Initial A = 10
-        state.lds.write_dword(1, 3)   # Operand B = 3
+        state.lds.write_dword(0, 10)
+        state.lds.write_dword(1, 3)
 
         self.interp.execute(instr, state)
-        # 8 lanes added 3 each -> 10 + 8 * 3 = 34
         self.assertEqual(state.lds.read_dword(0), 34)
 
     def test_lane_divergence_inc_wrap_cyclic(self) -> None:
-        # 6 active lanes target same address A = 0, threshold B = 2
-        # Starts at 0
-        # lane 0: 0 -> 1
-        # lane 1: 1 -> 2
-        # lane 2: 2 >= 2 -> 0
-        # lane 3: 0 -> 1
-        # lane 4: 1 -> 2
-        # lane 5: 2 >= 2 -> 0
-        exec_mask = 0x3F  # Lanes 0..5
+        exec_mask = 0x3F
         state = SIMDState(num_lanes=32, exec_mask=exec_mask, lds_dwords=1024)
         v0 = RegisterOperand(0, RegType.VGPR)
         instr = DSSrc2Instruction(
@@ -680,6 +667,143 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
 
         self.interp.execute(instr, state)
         self.assertEqual(state.lds.read_dword(0), 0)
+
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_base_address_vgpr_preservation_scalar(self) -> None:
+        state = ScalarMachineState(lds_dwords=1024)
+        # Populate entire VGPR file with sentinel patterns
+        for reg in range(DEFAULT_NUM_VGPRS):
+            state.set_vgpr(reg, 0x12340000 | reg)
+
+        v7 = RegisterOperand(7, RegType.VGPR)
+        state.set_vgpr(7, 0x100)  # vaddr points to dword 64
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v7, offset0=0, offset1=1),
+        )
+        self.scalar_interp.execute(instr, state)
+
+        # v7 must retain 0x100 exactly
+        self.assertEqual(state.get_vgpr(7), 0x100)
+        # All other VGPRs must remain intact
+        for reg in range(DEFAULT_NUM_VGPRS):
+            if reg != 7:
+                self.assertEqual(state.get_vgpr(reg), 0x12340000 | reg)
+
+    def test_base_address_vgpr_preservation_simd(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=MASK64, lds_dwords=1024)
+        for lane in range(64):
+            for reg in range(16):
+                state.set_lane_vgpr(lane, reg, (lane << 16) | reg)
+
+        v3 = RegisterOperand(3, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_INC_SRC2_U32,
+            LDSAddressExpression(v3, offset0=0, offset1=1),
+        )
+        self.simd_interp.execute(instr, state)
+
+        for lane in range(64):
+            for reg in range(16):
+                self.assertEqual(state.get_lane_vgpr(lane, reg), (lane << 16) | reg)
+
+    def test_secondary_memory_operand_preservation(self) -> None:
+        # When A != B, verify LDS[B] is preserved exactly across all opcodes
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0x20)  # dword 8
+        state.set_lds(8, 100)    # A
+        state.set_lds(9, 25)     # B
+
+        v0 = RegisterOperand(0, RegType.VGPR)
+        for opcode in (
+            DSOpcode.DS_ADD_SRC2_U32,
+            DSOpcode.DS_SUB_SRC2_U32,
+            DSOpcode.DS_INC_SRC2_U32,
+            DSOpcode.DS_DEC_SRC2_U32,
+        ):
+            instr = DSSrc2Instruction(opcode, LDSAddressExpression(v0, offset0=0, offset1=1))
+            self.scalar_interp.execute(instr, state)
+            # Secondary operand B must NEVER be mutated
+            self.assertEqual(state.get_lds(9), 25)
+
+    def test_address_aliasing_same_cell_inc(self) -> None:
+        # Full address aliasing: offset0 == offset1 -> A == B
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_INC_SRC2_U32,
+            LDSAddressExpression(v0, offset0=2, offset1=2),
+        )
+
+        for val in (0, 1, 42, 0x7FFFFFFF, MASK32):
+            state.set_lds(2, val)
+            self.scalar_interp.execute(instr, state)
+            # Since val_a >= val_a is always True, it must reset to 0 unconditionally!
+            self.assertEqual(state.get_lds(2), 0)
+
+    def test_address_aliasing_same_cell_dec(self) -> None:
+        # When A == B:
+        # If val == 0: wraps to val_b (which is 0) -> 0
+        # If val > 0: val_a > val_b is False, val_a == 0 is False -> val_a - 1
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_DEC_SRC2_U32,
+            LDSAddressExpression(v0, offset0=5, offset1=5),
+        )
+
+        # 0 -> 0
+        state.set_lds(5, 0)
+        self.scalar_interp.execute(instr, state)
+        self.assertEqual(state.get_lds(5), 0)
+
+        # 10 -> 9
+        state.set_lds(5, 10)
+        self.scalar_interp.execute(instr, state)
+        self.assertEqual(state.get_lds(5), 9)
+
+    def test_address_aliasing_same_cell_add(self) -> None:
+        # When A == B: val_a + val_a = 2 * val_a
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=1, offset1=1),
+        )
+
+        state.set_lds(1, 21)
+        self.scalar_interp.execute(instr, state)
+        self.assertEqual(state.get_lds(1), 42)
+
+        # Overflow wrapping
+        state.set_lds(1, 0x80000000)
+        self.scalar_interp.execute(instr, state)
+        self.assertEqual(state.get_lds(1), 0)
+
+    def test_address_aliasing_same_cell_sub(self) -> None:
+        # When A == B: val_a - val_a = 0 unconditionally
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_SUB_SRC2_U32,
+            LDSAddressExpression(v0, offset0=3, offset1=3),
+        )
+
+        for val in (0, 1, 999, 0x80000000, MASK32):
+            state.set_lds(3, val)
+            self.scalar_interp.execute(instr, state)
+            self.assertEqual(state.get_lds(3), 0)
 
 
 if __name__ == "__main__":
