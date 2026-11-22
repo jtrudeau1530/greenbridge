@@ -10,11 +10,11 @@
 // What a driver chooses (D3D11.3 functional spec 5.9.2.8.5: a mip with any dimension below the tile "may or may not
 // be packed, depending on the IHV"): where the packed tail starts, and how many tiles the packed mips take. Here
 // a mip stays standard while it is wider than half the tile or taller than the tile (depth does not count), as
-// AMD's PC runtime does on RDNA2 and RDNA4 (D3D-65; the console is AMD): 47 measured layouts, see
+// AMD's PC runtime does on RDNA2 and RDNA4 (D3D-65; the console is AMD): measured on the 47 layouts of #868, see
 // resource_tiling_test. A standard mip may be smaller than a tile and then takes one tile on that axis. An NVIDIA
 // GPU packs from the first mip smaller than a tile on any axis and WARP packs nothing; the test accepts all of
 // them. The packed tail takes one tile per tile-depth slice it spans: ceil(depth of the first packed mip / tile
-// depth), so 1 for 2D, as AMD's PC runtime reports on RDNA2 and RDNA4 (83 measured layouts, see
+// depth), so 1 for 2D, as AMD's PC runtime reports on RDNA2 and RDNA4 (those 47 and 32 deeper volumes, see
 // resource_tiling_test), and never fewer than the tail's tight linear size in whole tiles. NVIDIA sometimes reports
 // one more. Applications read the numbers rather than assume them, and this layer backs reserved textures fully, so
 // any split is consistent.

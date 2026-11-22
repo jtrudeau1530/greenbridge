@@ -1810,10 +1810,10 @@ The trace will enumerate them.
     taller than the tile; depth does not count**. An earlier "every axis at most half the tile's largest side" fitted
     the first 17 but missed four tall or deep edge cases. All 47 layouts and AMD's values are in
     `runtime/test/resource_tiling_test.cpp`. AMD's packed tile count is one tile per tile-depth slice the tail spans,
-    `ceil(depth of the first packed mip / tile depth)`: 1 for every 2D layout, and for 36 further volumes whose tail
+    `ceil(depth of the first packed mip / tile depth)`: 1 for every 2D layout, and for 32 further volumes whose tail
     is deeper than a tile it steps at each tile depth (8x8x32 R8 takes 1 tile, 8x8x33 takes 2, 8x8x256 takes 8), even
-    where the bytes would fit in fewer (16x16x128 RGBA8: 8 tiles for 3 tiles of data). Those 36 are in the test too,
-    83 layouts in all, identical on both GPUs. The console is RDNA2, so the layer follows this rule (D3D-65;
+    where the bytes would fit in fewer (16x16x128 RGBA8: 8 tiles for 3 tiles of data). Those 32 are in the test too,
+    79 layouts in all, identical on both GPUs. The console is RDNA2, so the layer follows this rule (D3D-65;
     **Assumption**: that the console's runtime splits like the PC's AMD driver).
   - `UpdateTileMappings` and `CopyTileMappings` bind pages in reserved buffers to default heaps from D3D-16.
     Sequential, NULL, SKIP and single-tile reuse ranges are supported. Queue timeline waits order binding between
