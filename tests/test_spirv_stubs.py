@@ -134,5 +134,18 @@ class ShaderMetaTests(unittest.TestCase):
         self.assertIn("geometryShader", mg["features"])
 
 
+class MalformedIndexTest(unittest.TestCase):
+    def test_bad_index_json_is_one_error_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                f.write("not json")
+            tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
+            p = subprocess.run([sys.executable, "-I", tool, tmp], capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("cannot read", p.stderr)
+        self.assertIn("index.json", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
