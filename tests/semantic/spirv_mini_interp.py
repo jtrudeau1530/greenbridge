@@ -14,8 +14,9 @@ Design rules (see tests/semantic/README.md):
     Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores (and 32-bit
     atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary, so they
-    must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup
-    storage and images are rejected.
+    must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup variables (LDS) are
+    zero-initialised per invocation like Function ones, so they are only meaningful with one invocation
+    (run_workgroup does not share them between invocations); images are rejected.
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
@@ -406,7 +407,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif cls == "Input":
                 init = inputs.get(res, types.zero(pointee))
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
-            elif cls in ("Function", "Output"):
+            elif cls in ("Function", "Output", "Workgroup"):
                 if len(a) > 2:
                     init = values[a[2]]
                     var_box[res] = [list(init) if isinstance(init, list) else init]

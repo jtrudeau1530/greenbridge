@@ -208,6 +208,9 @@ struct DeviceState {
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
 
+    // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
+    UINT no_output_sample_counts = 0;
+
     // VK_EXT_host_image_copy; null unless the device enabled it and its copies accept GENERAL.
     PFN_vkCopyMemoryToImageEXT copy_memory_to_image = nullptr;
     PFN_vkCopyImageToMemoryEXT copy_image_to_memory = nullptr;
@@ -633,7 +636,16 @@ public:
         return S_OK;
     }
 
-    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
+    // D3D12 reports the placement alignment of a description that left it 0: 64 KiB, or 4 MiB for a multisampled
+    // texture. One the description asked for is kept. Measured on the PC runtime and WARP (d3d12_resource_desc_test).
+    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
+        D3D12_RESOURCE_DESC desc = desc_;
+        if (!desc.Alignment) {
+            desc.Alignment = desc.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                                       : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        }
+        return desc;
+    }
 
     // A reserved resource is a committed one underneath (docs/d3d12_vulkan.md section 4.2); it reports the layout it
     // was created with and has no heap of its own.
@@ -930,8 +942,15 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("no such plane in this texture; plane", int(view.plane));
         return false;
     }
-    if (stencil && view.format != DXGI_FORMAT_X24_TYPELESS_G8_UINT && view.format != DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) {
-        log_once("a stencil-plane view needs a stencil view format; format", int(view.format));
+    // Each stencil view format belongs to its own DXGI family only, as in D3D12: the family is the texture's DXGI
+    // format, not the Vulkan format behind it (a D24 texture may be D32_SFLOAT_S8_UINT underneath).
+    const bool stencil_format_fits =
+        (view.format == DXGI_FORMAT_X24_TYPELESS_G8_UINT &&
+         (desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT)) ||
+        (view.format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT &&
+         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT));
+    if (stencil && !stencil_format_fits) {
+        log_once("a stencil-plane view needs its texture family's stencil view format; format", int(view.format));
         return false;
     }
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -952,9 +971,14 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     // The depth plane of a depth-stencil texture, as R24_UNORM_X8_TYPELESS (D24S8) or R32_FLOAT_X8X24_TYPELESS
     // (D32S8): the texture's own depth format, whose T# code is the console's depth format (8_24_UNORM or
-    // X24_8_32_FLOAT) with the depth in R; bind_image views the depth aspect for it.
-    const bool depth_plane = (view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
-                              view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) &&
+    // X24_8_32_FLOAT) with the depth in R; bind_image views the depth aspect for it. As in D3D12, each view format
+    // belongs to its own family only: the other family's depth view leaves the slot null, whatever format backs the
+    // texture (a D24 texture may be D32_SFLOAT_S8_UINT underneath).
+    const DXGI_FORMAT family = desc.Format;
+    const bool d24_family = family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_D24_UNORM_S8_UINT;
+    const bool d32s8_family = family == DXGI_FORMAT_R32G8X24_TYPELESS || family == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    const bool depth_plane = ((view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS && d24_family) ||
+                              (view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS && d32s8_family)) &&
                              (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT);
     if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane)
         named = vulkan_format(view.format, false).format;
@@ -1084,14 +1108,21 @@ public:
                 state_.image_requirements =
                     reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirements>(get_device(info.device, name));
 
-        if (state_.info.max_push_constants_size == 0 && info.physical && info.get_instance_proc) {
+        if (info.physical && info.get_instance_proc) {
             const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
             if (get_props) {
                 VkPhysicalDeviceProperties props{};
                 get_props(info.physical, &props);
-                state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
-                state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
+                if (state_.info.max_push_constants_size == 0) {
+                    state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
+                    state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
+                }
+                constexpr VkSampleCountFlags kD3D12SampleCounts =
+                    VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT |
+                    VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT | VK_SAMPLE_COUNT_32_BIT;
+                state_.no_output_sample_counts =
+                    static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
             }
         }
 
@@ -1913,6 +1944,116 @@ public:
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
             return d3d12_trace::result(method, S_OK);
         }
+        case D3D12_FEATURE_D3D12_OPTIONS8: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS8)) return E_INVALIDARG;
+            // Vulkan BC image extents are in texels; only the transfer footprints round up to blocks.
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS8*>(data);
+            opts->UnalignedBlockTexturesSupported = state_.info.texture_compression_bc;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS2: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2*>(data);
+            *opts = {};
+            opts->DepthBoundsTestSupported = FALSE;
+            opts->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS3: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3*>(data);
+            *opts = {};
+            opts->CopyQueueTimestampQueriesSupported = FALSE;
+            // Only typeless resources set VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
+            opts->CastingFullyTypedFormatSupported = FALSE;
+            opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
+            opts->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+            opts->BarycentricsSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS4: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4*>(data);
+            *opts = {};
+            // GetResourceAllocationInfo implements D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT (64 KiB).
+            opts->MSAA64KBAlignedTextureSupported = TRUE;
+            opts->SharedResourceCompatibilityTier = D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0;
+            opts->Native16BitShaderOpsSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS5: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(data);
+            *opts = {};
+            opts->SRVOnlyTiledResourceTier3 = FALSE;
+            opts->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
+            opts->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS7: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(data);
+            *opts = {};
+            opts->MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS9: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9*>(data);
+            *opts = {};
+            opts->MeshShaderPipelineStatsSupported = FALSE;
+            opts->MeshShaderSupportsFullRangeRenderTargetArrayIndex = FALSE;
+            opts->AtomicInt64OnTypedResourceSupported = FALSE;
+            opts->AtomicInt64OnGroupSharedSupported = FALSE;
+            opts->DerivativesInMeshAndAmplificationShadersSupported = FALSE;
+            opts->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS11: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11*>(data);
+            *opts = {};
+            opts->AtomicInt64OnDescriptorHeapResourceSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS13: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS13*>(data);
+            *opts = {};
+            opts->UnrestrictedBufferTextureCopyPitchSupported = FALSE;
+            opts->UnrestrictedVertexElementAlignmentSupported = FALSE;
+            opts->InvertedViewportHeightFlipsYSupported = FALSE;
+            opts->InvertedViewportDepthFlipsZSupported = FALSE;
+            opts->TextureCopyBetweenDimensionsSupported = FALSE;
+            opts->AlphaBlendFactorSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS14: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS14)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS14*>(data);
+            *opts = {};
+            opts->AdvancedTextureOpsSupported = FALSE;
+            opts->WriteableMSAATexturesSupported = FALSE;
+            opts->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS15: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS15)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS15*>(data);
+            *opts = {};
+            opts->TriangleFanSupported = FALSE;
+            opts->DynamicIndexBufferStripCutSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS16: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS16*>(data);
+            *opts = {};
+            opts->DynamicDepthBiasSupported = FALSE;
+            opts->GPUUploadHeapSupported = FALSE;
+            return S_OK;
+        }
         case D3D12_FEATURE_D3D12_OPTIONS17: {
             // Non-normalized samplers are core Vulkan (unnormalizedCoordinates), with the restrictions
             // CreateSampler2 checks. No manual write tracking, as the RTX 4090 answers too.
@@ -1921,6 +2062,47 @@ public:
             *opts = {};
             opts->NonNormalizedCoordinateSamplersSupported = TRUE;
             return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS18: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS18)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS18*>(data);
+            *opts = {};
+            opts->RenderPassesValid = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS19: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS19)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS19*>(data);
+            *opts = {};
+            opts->MismatchingOutputDimensionsSupported = FALSE;
+            opts->SupportedSampleCountsWithNoOutputs = state_.no_output_sample_counts;
+            opts->PointSamplingAddressesNeverRoundUp = FALSE;
+            opts->RasterizerDesc2Supported = FALSE;
+            opts->NarrowQuadrilateralLinesSupported = FALSE;
+            opts->AnisoFilterWithPointMipSupported = state_.info.sampler_anisotropy ? TRUE : FALSE;
+            opts->MaxSamplerDescriptorHeapSize = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+            opts->MaxSamplerDescriptorHeapSizeWithStaticSamplers = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+            opts->MaxViewDescriptorHeapSize = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
+            opts->ComputeOnlyCustomHeapSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS20: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS20)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS20*>(data);
+            *opts = {};
+            opts->ComputeOnlyWriteWatchSupported = FALSE;
+            opts->RecreateAtTier = D3D12_RECREATE_AT_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS21: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS21*>(data);
+            *opts = {};
+            opts->WorkGraphsTier = D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
+            opts->ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
+            opts->SampleCmpGradientAndBiasSupported = FALSE;
+            opts->ExtendedCommandInfoSupported = FALSE;
+            return S_OK;
         }
         case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
             if (size != sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT)) return d3d12_trace::result(method, E_INVALIDARG);
@@ -2520,6 +2702,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enable{};
+    info.texture_compression_bc = chosen_bc;
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;

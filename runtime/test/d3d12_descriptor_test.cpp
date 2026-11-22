@@ -205,6 +205,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.texture_compression_bc = d.bc;
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
         ID3D12Device* inner = nullptr;
@@ -213,6 +214,15 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
+
+        D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8, sizeof(options8)) == S_OK);
+        EXPECT(options8.UnalignedBlockTexturesSupported == (d.bc ? TRUE : FALSE));
+        for (UINT query_size : {0u, UINT(sizeof(options8) - 1), UINT(sizeof(options8) + 1)}) {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS8 output[] = {{83}, {42}};
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, output, query_size) == E_INVALIDARG);
+            EXPECT(output[0].UnalignedBlockTexturesSupported == 83 && output[1].UnalignedBlockTexturesSupported == 42);
+        }
 
         // --- Copies. Two host-side heaps; slot i of the source holds 32 bytes of (0x10 * (i + 1) + byte index).
         {
@@ -570,13 +580,23 @@ int main() {
         // D3D-75: plane 1 of a depth-stencil texture is its stencil. The T# is 8_UINT at the texture's own address,
         // with the eight bits read as G and R, B, A as 0, 0, 1 (D3D12's X24_TYPELESS_G8_UINT / X32_..._G8X24_UINT).
         // A stencil view of a colour texture, or one in another format, is a null descriptor.
-        // Plane 0, as R24_UNORM_X8_TYPELESS or R32_FLOAT_X8X24_TYPELESS, is a depth T# of the console's depth format
-        // at the same address, the depth read as R.
-        for (const auto& [resource_format, stencil_view_format, depth_view_format, depth_vk] :
+        // Plane 0, as R24_UNORM_X8_TYPELESS or R32_FLOAT_X8X24_TYPELESS, is a depth T# of the format backing the
+        // texture at the same address, the depth read as R. A GPU without a usable D24 backs R24G8 with
+        // D32_SFLOAT_S8_UINT (the layer's depth_usable rule), so the expected code follows the backing. Each depth
+        // view format belongs to its own family only: the other one's is a null descriptor, as D3D12 refuses it.
+        VkFormatProperties d24_properties{};
+        d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+            d.physical, VK_FORMAT_D24_UNORM_S8_UINT, &d24_properties);
+        const VkFormat d24_backing =
+            (d24_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+                ? VK_FORMAT_D24_UNORM_S8_UINT
+                : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        for (const auto& [resource_format, stencil_view_format, depth_view_format, other_depth_view_format, depth_vk] :
              {std::tuple{DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT,
-                         DXGI_FORMAT_R24_UNORM_X8_TYPELESS, VK_FORMAT_D24_UNORM_S8_UINT},
+                         DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, d24_backing},
               std::tuple{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
-                         DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, VK_FORMAT_D32_SFLOAT_S8_UINT}}) {
+                         DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                         VK_FORMAT_D32_SFLOAT_S8_UINT}}) {
             D3D12_RESOURCE_DESC depth_desc = texture_desc;
             depth_desc.Format = resource_format;
             depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -607,8 +627,22 @@ int main() {
             EXPECT(depth_image.format == g::format_from_vulkan(depth_vk) && depth_image.format != 0);
             EXPECT(depth_image.address == stencil_image.address && depth_image.swizzle[0] == g::select_x);
 
+            plane_view.Format = other_depth_view_format;  // the other depth family's view format
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+
             plane_view.Format = DXGI_FORMAT_R8_UINT;  // not a stencil view format
             plane_view.Texture2D.PlaneSlice = 1;
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+
+            // The other family's stencil view format is refused too, as D3D12 refuses it: X24_TYPELESS_G8_UINT
+            // belongs to R24G8 only, X32_TYPELESS_G8X24_UINT to R32G8X24 only.
+            plane_view.Format = stencil_view_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT
+                                    ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT
+                                    : DXGI_FORMAT_X24_TYPELESS_G8_UINT;
             std::memset(view_bytes(null_slot), 0x77, step);
             device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
             EXPECT(null_at(null_slot));
@@ -662,6 +696,28 @@ int main() {
                 std::memcpy(row + x * 4, &packed_values[(x + y) % 4], 4);
         }
 
+        // OPTIONS8 applies to the top-level mip. The four BC1 blocks cover 4x4, 3x4, 4x1 and 3x1 texels.
+        constexpr UINT bc_width = 7, bc_height = 5;
+        Ref<ID3D12Resource> bc;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT bc_placed{};
+        if (options8.UnalignedBlockTexturesSupported) {
+            auto bc_desc = texture_desc;
+            bc_desc.Width = bc_width;
+            bc_desc.Height = bc_height;
+            bc_desc.Format = DXGI_FORMAT_BC1_UNORM;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &bc_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&bc.p))));
+            device->CreateShaderResourceView(bc.p, nullptr, view_slot(null_slot));
+            device->GetCopyableFootprints(&bc_desc, 0, 1, 8192, &bc_placed, nullptr, nullptr, nullptr);
+            EXPECT(bc_placed.Offset == 8192 && bc_placed.Footprint.RowPitch == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            // Endpoint 0 is RGB565 red, green, blue or white. Every two-bit selector picks that endpoint.
+            constexpr std::uint64_t blocks[2][2] = {{0xf800, 0x07e0}, {0x001f, 0xffff}};
+            for (UINT row = 0; row < 2; ++row)
+                std::memcpy(static_cast<std::uint8_t*>(mapped) + bc_placed.Offset + row * bc_placed.Footprint.RowPitch,
+                            blocks[row], sizeof(blocks[row]));
+        }
+
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
         Ref<ID3D12CommandAllocator> allocator;
@@ -687,6 +743,14 @@ int main() {
         to_texture.pResource = packed.p;
         from_upload.PlacedFootprint = packed_placed;
         list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        if (bc.p) {
+            to_texture.pResource = bc.p;
+            from_upload.PlacedFootprint = bc_placed;
+            list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+            const auto barrier =
+                transition(bc.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &barrier);
+        }
         to_texture.pResource = volume.p;
         for (UINT mip = 0; mip < 2; ++mip) {
             to_texture.SubresourceIndex = mip;
@@ -721,6 +785,23 @@ int main() {
         }
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
+        if (bc.p) {
+            SampleKeys bc_key = keys[0];
+            std::memcpy(bc_key.tsharp, view_bytes(null_slot), sizeof(bc_key.tsharp));
+            std::array<std::uint8_t, bytes> samples{};
+            EXPECT(sample_through_set(d, set0, set0_layout, {&bc_key, 1}, samples.data()));
+            constexpr std::uint8_t colors[2][2][4] = {{{255, 0, 0, 255}, {0, 255, 0, 255}},
+                                                      {{0, 0, 255, 255}, {255, 255, 255, 255}}};
+            for (UINT y = 0; y < size; ++y) {
+                for (UINT x = 0; x < size; ++x) {
+                    // cs_sample.comp samples at the centres of an 8x8 grid with nearest filtering.
+                    const UINT tex_x = (2 * x + 1) * bc_width / (2 * size);
+                    const UINT tex_y = (2 * y + 1) * bc_height / (2 * size);
+                    EXPECT(std::memcmp(samples.data() + 4 * (y * size + x), colors[tex_y / 4][tex_x / 4], 4) == 0);
+                }
+            }
+            std::printf("OPTIONS8: 64 point samples of a 7x5 BC1 top mip matched\n");
+        }
 
         SampleKeys volumes[2]{};
         std::array<std::uint8_t, 2 * bytes> volume_pixels{};
@@ -757,6 +838,7 @@ int main() {
 
         // A destroyed texture takes its views out of the set: the next ExecuteCommandLists writes that, and nothing
         // may still name the destroyed image views (the validation layer reports a set that does).
+        bc.reset();
         packed.reset();
         texture.reset();
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
@@ -783,17 +865,17 @@ int main() {
         };
         UINT64 packed_signal = 2;
         for (const auto& format : packed_formats) {
-            D3D12_RESOURCE_DESC packed_desc = texture_desc;
-            packed_desc.Format = format.dxgi;
-            Ref<ID3D12Resource> packed;
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &packed_desc,
+            D3D12_RESOURCE_DESC format_desc = texture_desc;
+            format_desc.Format = format.dxgi;
+            Ref<ID3D12Resource> format_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &format_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                             IID_PPV_ARGS(&packed.p))));
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT packed_placed{};
+                                                             IID_PPV_ARGS(&format_texture.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT format_footprint{};
             UINT64 row_size = 0;
-            device->GetCopyableFootprints(&packed_desc, 0, 1, 49152, &packed_placed, nullptr, &row_size, nullptr);
-            EXPECT(packed_placed.Footprint.Format == format.dxgi && row_size == size * 2 &&
-                   packed_placed.Footprint.RowPitch == 256);
+            device->GetCopyableFootprints(&format_desc, 0, 1, 49152, &format_footprint, nullptr, &row_size, nullptr);
+            EXPECT(format_footprint.Footprint.Format == format.dxgi && row_size == size * 2 &&
+                   format_footprint.Footprint.RowPitch == 256);
             constexpr std::uint16_t b5_words[] = {0xfc00, 0x7c00, 0x83e1, 0xc117};
             constexpr std::array<std::uint8_t, 4> b5_rgba[] = {
                 {255, 0, 0, 255}, {255, 0, 0, 0}, {0, 255, 8, 255}, {132, 66, 189, 255}
@@ -812,20 +894,20 @@ int main() {
                         word = std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
                         rgba = {std::uint8_t(r * 17), std::uint8_t(g * 17), std::uint8_t(b * 17), std::uint8_t(a * 17)};
                     }
-                    std::memcpy(static_cast<std::uint8_t*>(mapped) + packed_placed.Offset +
-                                    y * packed_placed.Footprint.RowPitch + x * 2,
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + format_footprint.Offset +
+                                    y * format_footprint.Footprint.RowPitch + x * 2,
                                 &word, 2);
                 }
             // Set 0 takes in a view at the next ExecuteCommandLists, so it is made before the upload runs.
-            device->CreateShaderResourceView(packed.p, nullptr, view_slot(null_slot));
+            device->CreateShaderResourceView(format_texture.p, nullptr, view_slot(null_slot));
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
-            D3D12_TEXTURE_COPY_LOCATION to_packed{packed.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION to_packed{format_texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
             to_packed.SubresourceIndex = 0;
             D3D12_TEXTURE_COPY_LOCATION from_packed{upload.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
-            from_packed.PlacedFootprint = packed_placed;
+            from_packed.PlacedFootprint = format_footprint;
             list->CopyTextureRegion(&to_packed, 0, 0, 0, &from_packed, nullptr);
             const D3D12_RESOURCE_BARRIER readable =
-                transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(format_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &readable);
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
