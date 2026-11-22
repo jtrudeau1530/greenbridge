@@ -414,5 +414,163 @@ class TestSimdMultiLaneVgprPairs(unittest.TestCase):
             self.assertEqual(got, ref_ashr_i64(24, val), f"Failed with count in {count_vgpr}")
 
 
+class TestSignPropagationExtremes(unittest.TestCase):
+    """Sign-propagation extremes and cross-dword transition tests."""
+
+    def test_negative_one_all_ones_invariance(self) -> None:
+        neg_one = MASK64
+        for shift in range(64):
+            self.assertEqual(ref_ashr_i64(shift, neg_one), neg_one)
+
+    def test_most_negative_int64_sign_expansion(self) -> None:
+        min_int64 = SIGN64
+        self.assertEqual(ref_ashr_i64(0, min_int64), min_int64)
+        self.assertEqual(ref_ashr_i64(1, min_int64), 0xC000000000000000)
+        self.assertEqual(ref_ashr_i64(2, min_int64), 0xE000000000000000)
+        self.assertEqual(ref_ashr_i64(3, min_int64), 0xF000000000000000)
+        self.assertEqual(ref_ashr_i64(31, min_int64), 0xFFFFFFFF00000000)
+        self.assertEqual(ref_ashr_i64(32, min_int64), 0xFFFFFFFF80000000)
+        self.assertEqual(ref_ashr_i64(33, min_int64), 0xFFFFFFFFC0000000)
+        self.assertEqual(ref_ashr_i64(62, min_int64), 0xFFFFFFFFFFFFFFFE)
+        self.assertEqual(ref_ashr_i64(63, min_int64), MASK64)
+
+        for shift in range(64):
+            expected = (MASK64 << (63 - shift)) & MASK64
+            self.assertEqual(ref_ashr_i64(shift, min_int64), expected)
+
+    def test_max_positive_int64_zero_expansion(self) -> None:
+        max_int64 = 0x7FFFFFFFFFFFFFFF
+        self.assertEqual(ref_ashr_i64(0, max_int64), max_int64)
+        self.assertEqual(ref_ashr_i64(1, max_int64), 0x3FFFFFFFFFFFFFFF)
+        self.assertEqual(ref_ashr_i64(32, max_int64), 0x000000007FFFFFFF)
+        self.assertEqual(ref_ashr_i64(62, max_int64), 1)
+        self.assertEqual(ref_ashr_i64(63, max_int64), 0)
+
+    def test_zero_expansion(self) -> None:
+        for shift in range(64):
+            self.assertEqual(ref_ashr_i64(shift, 0), 0)
+
+    def test_positive_one_drain(self) -> None:
+        self.assertEqual(ref_ashr_i64(0, 1), 1)
+        for shift in range(1, 64):
+            self.assertEqual(ref_ashr_i64(shift, 1), 0)
+
+    def test_cross_dword_transition_31_32_33(self) -> None:
+        patterns = [
+            0x8000000000000000,
+            0x7FFFFFFFFFFFFFFF,
+            0x0123456789ABCDEF,
+            0xFEDCBA9876543210,
+            0x00000000FFFFFFFF,
+            0xFFFFFFFF00000000,
+        ]
+        for val in patterns:
+            lo, hi = decompose_u64(val)
+            for shift in (31, 32, 33):
+                ref = ref_ashr_i64(shift, val)
+                elo, ehi = emulate_ashr_i64_dwords(shift, lo, hi)
+                self.assertEqual(compose_u64(elo, ehi), ref, f"Mismatch at val={hex(val)}, shift={shift}")
+
+    def test_shader_sign_propagation_extremes(self) -> None:
+        val = SIGN64
+        self.assertEqual(run_ashr_op(1, val), 0xC000000000000000)
+        self.assertEqual(run_ashr_op(31, val), 0xFFFFFFFF00000000)
+        self.assertEqual(run_ashr_op(32, val), 0xFFFFFFFF80000000)
+        self.assertEqual(run_ashr_op(63, val), MASK64)
+
+
+class TestShiftCountModulo64(unittest.TestCase):
+    """Modulo-64 shift count masking tests."""
+
+    def test_modulo_64_masking_comprehensive(self) -> None:
+        test_values = [
+            0x8000000000000000,
+            0x7FFFFFFFFFFFFFFF,
+            0xFEDCBA9876543210,
+            0x0123456789ABCDEF,
+        ]
+        base_shifts = [0, 1, 15, 31, 32, 47, 63]
+        multipliers = [1, 2, 3, 10, 100]
+
+        for val in test_values:
+            for base in base_shifts:
+                ref = ref_ashr_i64(base, val)
+                for mult in multipliers:
+                    overflowed_shift = base + 64 * mult
+                    self.assertEqual(ref_ashr_i64(overflowed_shift, val), ref)
+
+    def test_upper_bits_ignored(self) -> None:
+        val = 0x8000000000000000
+        self.assertEqual(ref_ashr_i64(0xFFFFFFFF, val), ref_ashr_i64(63, val))
+        self.assertEqual(ref_ashr_i64(0x80000000, val), ref_ashr_i64(0, val))
+        self.assertEqual(ref_ashr_i64(0x80000020, val), ref_ashr_i64(32, val))
+        self.assertEqual(ref_ashr_i64(0x12345600, val), ref_ashr_i64(0, val))
+        self.assertEqual(ref_ashr_i64(0x1234563F, val), ref_ashr_i64(63, val))
+
+    def test_shader_shift_count_modulo_64(self) -> None:
+        val = 0x8000000000000000
+        self.assertEqual(run_ashr_op(64, val), val)
+        self.assertEqual(run_ashr_op(65, val), ref_ashr_i64(1, val))
+        self.assertEqual(run_ashr_op(0x80000020, val), ref_ashr_i64(32, val))
+        self.assertEqual(run_ashr_op(0xFFFFFFFF, val), ref_ashr_i64(63, val))
+
+
+class TestNegativeControls(unittest.TestCase):
+    """Negative controls ensuring mutated semantics and missing masks fail assertions."""
+
+    def test_logical_shift_mutation_rejected(self) -> None:
+        val = 0x8000000000000000
+        shift = 1
+        arithmetic_correct = ref_ashr_i64(shift, val)
+        mutated_logical = (u64(val) >> (shift & 63)) & MASK64
+        self.assertEqual(arithmetic_correct, 0xC000000000000000)
+        self.assertEqual(mutated_logical, 0x4000000000000000)
+        self.assertNotEqual(arithmetic_correct, mutated_logical)
+
+    def test_unmasked_shift_mutation_rejected(self) -> None:
+        val = 0x8000000000000000
+        shift = 64
+        masked_correct = ref_ashr_i64(shift, val)
+        mutated_unmasked = (s64(val) >> shift) & MASK64
+        self.assertEqual(masked_correct, val)
+        self.assertEqual(mutated_unmasked, MASK64)
+        self.assertNotEqual(masked_correct, mutated_unmasked)
+
+    def test_left_shift_mutation_rejected(self) -> None:
+        val = 0x0000000000000001
+        shift = 4
+        arithmetic_correct = ref_ashr_i64(shift, val)
+        mutated_left = (s64(val) << (shift & 63)) & MASK64
+        self.assertEqual(arithmetic_correct, 0)
+        self.assertEqual(mutated_left, 0x10)
+        self.assertNotEqual(arithmetic_correct, mutated_left)
+
+    def test_independent_dword_shift_mutation_rejected(self) -> None:
+        val = 0x0000000100000000
+        shift = 1
+        correct = ref_ashr_i64(shift, val)
+        lo, hi = decompose_u64(val)
+        mutated_independent_lo = (lo >> shift) & MASK32
+        mutated_independent_hi = (hi >> shift) & MASK32
+        mutated = compose_u64(mutated_independent_lo, mutated_independent_hi)
+        self.assertEqual(correct, 0x0000000080000000)
+        self.assertEqual(mutated, 0x0000000000000000)
+        self.assertNotEqual(correct, mutated)
+
+    def test_sign_bit_inversion_mutation_rejected(self) -> None:
+        val = 0x8000000000000000
+        correct = ref_ashr_i64(1, val)
+        mutated = correct ^ SIGN64
+        self.assertNotEqual(correct, mutated)
+
+    def test_off_by_one_shift_count_mutation_rejected(self) -> None:
+        val = 0x8000000000000000
+        correct = ref_ashr_i64(4, val)
+        mutated_plus = ref_ashr_i64(5, val)
+        mutated_minus = ref_ashr_i64(3, val)
+        self.assertNotEqual(correct, mutated_plus)
+        self.assertNotEqual(correct, mutated_minus)
+
+
 if __name__ == "__main__":
     unittest.main()
