@@ -904,5 +904,117 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.sgprs[i], 0xA000 + i, f"SGPR s{i} was unexpectedly corrupted")
 
 
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Condition codes, status flags, and carry/borrow generation tests."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_scc_all_64_single_bit_positions(self) -> None:
+        """Verify SCC is 1 when exactly one bit in NEW_EXEC is set for each of the 64 bit positions."""
+        for bit_idx in range(64):
+            with self.subTest(bit_idx=bit_idx):
+                state = ScalarMachineState()
+                # We want NEW_EXEC == (1 << bit_idx)
+                # NEW_EXEC = ~(S0 ^ EXEC)
+                # If we choose EXEC = 0, NEW_EXEC = ~(S0 ^ 0) = ~S0
+                # Thus ~S0 = (1 << bit_idx) => S0 = ~(1 << bit_idx) & MASK64
+                target_bit = (1 << bit_idx)
+                s0 = (~target_bit) & MASK64
+
+                state.exec_mask = 0
+                state.set_sgpr64(0, s0)
+                state.scc = 0
+
+                instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+                saved, new_exec, scc = self.interp.step(instr, state)
+
+                self.assertEqual(saved, 0)
+                self.assertEqual(new_exec, target_bit)
+                self.assertEqual(scc, 1)
+                self.assertEqual(state.scc, 1)
+
+    def test_scc_zero_flag_state(self) -> None:
+        """Verify SCC is strictly 0 when NEW_EXEC is exactly 0."""
+        state = ScalarMachineState()
+        # EXEC = 0xFFFFFFFF0000FFFF
+        # S0 = ~EXEC => S0 ^ EXEC = MASK64 => ~(S0 ^ EXEC) = 0
+        exec_val = 0xFFFFFFFF0000FFFF
+        state.exec_mask = exec_val
+        state.set_sgpr64(0, (~exec_val) & MASK64)
+        state.scc = 1  # Verify transition from 1 to 0
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[4:5], s[0:1]")
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        self.assertEqual(saved, exec_val)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_scc_state_transitions(self) -> None:
+        """Verify all 4 state transitions of SCC: 0->0, 0->1, 1->0, 1->1."""
+        transitions = [
+            (0, 0, 0),  # init_scc=0, target_new_exec=0 -> expected_scc=0
+            (0, MASK64, 1),  # init_scc=0, target_new_exec!=0 -> expected_scc=1
+            (1, 0, 0),  # init_scc=1, target_new_exec=0 -> expected_scc=0
+            (1, 0x1, 1),  # init_scc=1, target_new_exec!=0 -> expected_scc=1
+        ]
+        for init_scc, target_exec, expected_scc in transitions:
+            with self.subTest(init_scc=init_scc, expected_scc=expected_scc):
+                state = ScalarMachineState()
+                state.exec_mask = 0
+                state.scc = init_scc
+                # S0 = ~target_exec => NEW_EXEC = ~(S0 ^ 0) = target_exec
+                state.set_sgpr64(0, (~target_exec) & MASK64)
+
+                instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+                _, new_exec, scc = self.interp.step(instr, state)
+
+                self.assertEqual(new_exec, target_exec)
+                self.assertEqual(scc, expected_scc)
+                self.assertEqual(state.scc, expected_scc)
+
+    def test_scc_consumer_cselect_b64(self) -> None:
+        """Verify interaction between s_xnor_saveexec_b64 and conditional selection (s_cselect_b64)."""
+        # Emulate: s_xnor_saveexec_b64 followed by s_cselect_b64 D, S0, S1 (D = SCC ? S0 : S1)
+        true_val = 0xAAAAAAAAAAAAAAAA
+        false_val = 0x5555555555555555
+
+        for make_nonzero in (True, False):
+            with self.subTest(make_nonzero=make_nonzero):
+                state = ScalarMachineState()
+                state.exec_mask = MASK64
+                state.set_sgpr64(0, MASK64 if make_nonzero else 0)
+
+                instr = parse_salu_instruction("s_xnor_saveexec_b64 s[4:5], s[0:1]")
+                _, new_exec, scc = self.interp.step(instr, state)
+
+                if make_nonzero:
+                    self.assertEqual(scc, 1)
+                    selected = true_val if state.scc else false_val
+                    self.assertEqual(selected, true_val)
+                else:
+                    self.assertEqual(scc, 0)
+                    selected = true_val if state.scc else false_val
+                    self.assertEqual(selected, false_val)
+
+    def test_no_carry_borrow_generation(self) -> None:
+        """Confirm bitwise logical saveexec does not emit spurious arithmetic carry/borrow."""
+        # Logical instructions in RDNA2 update only SCC as non-zero detector, not carry/borrow
+        state = ScalarMachineState()
+        # Even on maximum overflow-like bit patterns (all 1s), only SCC is affected
+        state.exec_mask = MASK64
+        state.set_sgpr64(0, MASK64)
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        _, new_exec, scc = self.interp.step(instr, state)
+
+        self.assertEqual(new_exec, MASK64)
+        self.assertEqual(scc, 1)
+        # VCC (vector carry mask) remains unchanged
+        self.assertEqual(state.vcc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
