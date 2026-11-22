@@ -59,7 +59,7 @@ EXPECTED_OPS4 = [0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00]
 EXPECTED_OPS5 = [0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00]
 EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
 EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
-EXPECTED_OPS8 = [0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F]
+EXPECTED_OPS8 = [0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
@@ -176,8 +176,9 @@ def reference_ops8():
     ffbl = (0x00010000 & -0x00010000).bit_length() - 1
     ffbh = 32 - 0x00010000.bit_length()
     xad = ((0xF0F0F0F0 ^ m) + 1) & m
+    signed_high = ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m
     return [(0x80000001 * 0xFFFFFFFF) >> 32,
-            ((_s(0xFFFFFFFE) * 0x40000000) >> 32) & m,
+            signed_high ^ 0x40000000,
             ((ffbh << 16) + (ffbl << 8) + bcnt) & m,
             (xad + 16 + m) & m]                                  # v_ffbh_u32(0) = 0xffffffff
 
