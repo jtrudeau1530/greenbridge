@@ -277,10 +277,14 @@ def place(
 ) -> tuple[list[float], list[float] | None]:
     """World position and direction of a model-space light under an entity's stored transform.
 
-    The stored quaternion is the inverse of the entity rotation (docs/world.md), so it is conjugated here.
+    Normalize and conjugate the stored quaternion to match the rotation used for placed geometry.
     """
     x, y, z, w = rotation
-    q = (-x, -y, -z, w)
+    length = math.hypot(x, y, z, w)
+    if length and math.isfinite(length):
+        q = (-x / length, -y / length, -z / length, w / length)
+    else:
+        q = (0.0, 0.0, 0.0, 1.0)
     xy = 1.0 if scale_xy is None else scale_xy
     z_scale = 1.0 if scale_z is None else scale_z
     scaled = [local[0] * xy, local[1] * xy, local[2] * z_scale]

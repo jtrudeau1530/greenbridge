@@ -289,6 +289,18 @@ class LightTest(unittest.TestCase):
             self.assertAlmostEqual(a, b, places=4)
         self.assertEqual(row["archetype"], "cafef00d")
 
+    def test_export_normalizes_the_stored_light_rotation(self) -> None:
+        resource = bytearray(map_resource())
+        meta = T.Meta(resource)
+        (entity_offset,) = meta.objects(T.ENTITY)
+        rotation_offset = meta.off(T.ENTITY, "rotation")
+        assert rotation_offset is not None
+        struct.pack_into("<4f", resource, entity_offset + rotation_offset, 0.0, 0.0, 0.5, 0.5)
+
+        (row,) = T.inspect_resource(resource, lights_out=True)["world_lights"]
+        self.assertEqual(row["position"], [100.0, 198.0, 13.0])
+        self.assertEqual(row["direction"], [0.0, -1.0, 0.0])
+
     def test_place_identity(self):
         p, d = T.place([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], [10.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], 1.0, 1.0)
         self.assertEqual(p, [11.0, 2.0, 3.0])
