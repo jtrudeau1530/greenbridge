@@ -9,7 +9,8 @@ Two complementary calibration paths are supported (and may be combined):
 1. Exact reference-pair inversion (`--ref-dds POOL:INDEX=REF.dds` or
    `--ref-pairs PAIRS.json`): algebraically inverts built-in history references
    against exact BCn reference blocks, producing **confirmed** entries
-   (`class 3` for BC6H, `ConfirmedBits` for BC7, `confirmed` for BC1-BC5).
+   (`class 3` with per-field `ConfirmedBits` for BC6H, `ConfirmedBits` for BC7,
+   `confirmed` for BC1-BC5).
 2. Pool self-calibration (from TTPF `.ttpf` files or directories): combines
    exact algebraic bitstream constraints (BC6H/BC7 anchor MSB constraints and
    BC7 Mode-1 shared p-bit parity), intra-block smoothness index voting, and
@@ -1454,6 +1455,8 @@ class Bc6hCalibrator:
     def build_document(self):
         eh = [[[0, 0, 0, 0] for _ in range(3)] for _ in range(256)]
         ih = [[0] * 16 for _ in range(256)]
+        ep_cb = [[[self.ref_ep[k][c][q][0] for q in range(4)] for c in range(3)] for k in range(256)]
+        ix_cb = [[self.ref_ix[k][p][0] for p in range(16)] for k in range(256)]
         ec = [0] * 256
         ic = [0] * 256
 
@@ -1529,6 +1532,8 @@ class Bc6hCalibrator:
             "indexHistory": ih,
             "endpointClass": ec,
             "indexClass": ic,
+            "endpointConfirmedBits": ep_cb,
+            "indexConfirmedBits": ix_cb,
         }
         stats = {
             "endpoint_confirmed": sum(1 for c in ec if c == 3),
