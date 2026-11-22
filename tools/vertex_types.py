@@ -216,14 +216,19 @@ def _qt(x, y, z, w, col):
     return (1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y))
 
 
+def _snorm10_components(word: int) -> tuple[float, float, float]:
+    channels = [(word >> shift) & 0x3FF for shift in (0, 10, 20)]
+    x, y, z = (max(-1.0, (v - 1024 if v >= 512 else v) / 511.0) for v in channels)
+    return x, y, z
+
+
 NORMAL_CANDIDATES = {
     **{f"qtan_snorm8_col{c}": (lambda c: lambda r, v: _qt(_s8(r[4 * v]), _s8(r[4 * v + 1]), _s8(r[4 * v + 2]), _s8(r[4 * v + 3]), c))(c) for c in (0, 1, 2)},
     **{f"qtan_unorm8_col{c}": (lambda c: lambda r, v: _qt(_u8(r[4 * v]), _u8(r[4 * v + 1]), _u8(r[4 * v + 2]), _u8(r[4 * v + 3]), c))(c) for c in (0, 1, 2)},
     **{f"qtan_10102_col{c}": (lambda c: lambda r, v: (lambda w: _qt(*[((w >> s) & 1023) / 511.5 - 1 for s in (0, 10, 20)], ((w >> 30) & 3) / 1.5 - 1, c))(struct.unpack_from("<I", r, 4 * v)[0]))(c) for c in (0, 1, 2)},
     "snorm8_xyz": lambda r, v: _norm(_s8(r[4 * v]), _s8(r[4 * v + 1]), _s8(r[4 * v + 2])),
     "unorm8_xyz": lambda r, v: _norm(_u8(r[4 * v]), _u8(r[4 * v + 1]), _u8(r[4 * v + 2])),
-    "snorm10_xyz": lambda r, v: _norm(*[((w - 1024 if w > 511 else w) / 511.0) for w in
-                                        (((struct.unpack_from("<I", r, 4 * v)[0]) >> s) & 1023 for s in (0, 10, 20))]),
+    "snorm10_xyz": lambda r, v: _norm(*_snorm10_components(struct.unpack_from("<I", r, 4 * v)[0])),
     "unorm10_xyz": lambda r, v: _norm(*[(w / 511.5 - 1) for w in
                                         (((struct.unpack_from("<I", r, 4 * v)[0]) >> s) & 1023 for s in (0, 10, 20))]),
     "oct_snorm8_b01": lambda r, v: _oct(_s8(r[4 * v]), _s8(r[4 * v + 1])),
@@ -361,8 +366,7 @@ def measure_block(data, at, T, rng, found=None):
                 x, y, z = (b - 256 if b > 127 else b for b in raw[4 * v:4 * v + 3])
                 unit8 += abs(math.sqrt(x * x + y * y + z * z) / 127.0 - 1) < 0.03
                 w = struct.unpack_from("<I", raw, 4 * v)[0]
-                c = [((w >> s) & 1023) for s in (0, 10, 20)]
-                c = [(x - 1024 if x > 511 else x) / 511.0 for x in c]
+                c = _snorm10_components(w)
                 unit10 += abs(math.sqrt(sum(x * x for x in c)) - 1) < 0.03
             add(tt, "unit_snorm8", unit8)
             add(tt, "unit_snorm10", unit10)
