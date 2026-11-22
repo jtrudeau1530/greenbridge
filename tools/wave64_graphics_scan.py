@@ -90,15 +90,34 @@ def scan_shader(stage, insns):
             "mask_word_source": {"exec_vcc": exec_vcc, "other": other}}
 
 
+def scanned_paths(disasm):
+    """The one enumeration the scanner and the overwrite guard share: regular files named *.s (symlinks followed)."""
+    with os.scandir(disasm) as entries:
+        return sorted(entry.path for entry in entries
+                      if entry.name.endswith(".s") and entry.is_file())
+
+
+def metadata_indexes(disasm):
+    """The carve index each scanned listing's stage_of opens (<disasm>/../index.json), deduplicated.
+
+    stage_of (rdna2spirv.py) reads os.path.dirname(os.path.dirname(os.path.realpath(path)))/index.json,
+    so --out must not overwrite any of those either; guard each distinct one for simplicity.
+    """
+    seen = set()
+    for path in scanned_paths(disasm):
+        meta = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
+        if meta not in seen:
+            seen.add(meta)
+            yield meta
+
+
 def scan_directory(disasm):
     """Aggregate selected-opcode counts over one carve disasm directory. Returns per-stage dicts; no names."""
     per_stage = {stage: {"shaders": 0, "wave64": 0, "with_selected_op": 0, "occurrences": Counter(),
                          "mask_word_source": {"exec_vcc": Counter(), "other": Counter()}}
                  for stage in GRAPHICS}
     other = {"shaders": 0, "wave64": 0}
-    with os.scandir(disasm) as entries:
-        paths = sorted(entry.path for entry in entries
-                       if entry.name.endswith(".s") and entry.is_file())
+    paths = scanned_paths(disasm)
     for path in paths:
         info = parse_file(path)
         stage = rdna2spirv.stage_of(info["name"], path)
@@ -140,11 +159,24 @@ def main(argv=None) -> int:
         out_dir = os.path.dirname(os.path.abspath(args.out))
         if not os.path.isdir(out_dir):
             ap.error(f"output directory does not exist: {out_dir}")
-        try:
-            if os.path.samefile(os.path.abspath(args.src), os.path.abspath(args.out)):
-                ap.error("output must not overwrite the source directory")
-        except (FileNotFoundError, OSError):
-            pass
+        # --out must not replace the source directory or any input the scan reads (each scanned listing,
+        # and the carve index each listing's stage_of opens), even through a hardlink or symlink alias the
+        # name check alone would miss. samefile also catches a case-only spelling on Windows and macOS's
+        # default volume, so only when the report already exists does it compare --out against each input
+        # rather than statting N listings for nothing.
+        if os.path.exists(args.out):
+            out_abs = os.path.abspath(args.out)
+            try:
+                if os.path.samefile(os.path.abspath(args.src), out_abs):
+                    ap.error("output must not overwrite the source directory")
+            except OSError:
+                pass
+            for path in [*scanned_paths(args.src), *metadata_indexes(args.src)]:
+                try:
+                    if os.path.isfile(path) and os.path.samefile(out_abs, path):
+                        ap.error(f"output must not overwrite an input it scans: {path}")
+                except OSError:
+                    pass
     report = scan_directory(args.src)
     for stage, b in report["per_stage"].items():
         occ = ", ".join("%s x%d" % (op, n) for op, n in b["occurrences"].items()) or "none"

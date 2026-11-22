@@ -177,6 +177,55 @@ class CliTests(unittest.TestCase):
                     scan.main([src, "--out", src])
             self.assertNotEqual(cm.exception.code, 0)
 
+    def test_out_overwriting_a_scanned_shader_rejected(self):
+        # --out naming a *.s file the scan reads must not overwrite it; so must a hardlink alias that is
+        # not itself a scanned listing (a .json name), which only the samefile alias check catches
+        with tempfile.TemporaryDirectory() as src:
+            name, text = PS_W64_SENSITIVE
+            target = os.path.join(src, name)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(text)
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([src, "--out", target])
+            self.assertNotEqual(cm.exception.code, 0)
+            alias = os.path.join(src, "same_file_alias.json")
+            try:
+                os.link(target, alias)  # hardlink: a different path for the same underlying scanned file
+            except OSError:
+                self.skipTest("hard links not supported on this filesystem")
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([src, "--out", alias])
+            self.assertNotEqual(cm.exception.code, 0)
+            with open(target, encoding="utf-8") as f:
+                self.assertEqual(f.read(), text)  # the rejected run left the input bytes untouched
+
+    def test_out_overwriting_the_carve_index_rejected(self):
+        # stage_of reads <disasm>/../index.json; --out must not overwrite it (or an alias of it)
+        with tempfile.TemporaryDirectory() as work:
+            disasm = os.path.join(work, "dxbc", "disasm")
+            os.makedirs(disasm)
+            index = os.path.join(work, "dxbc", "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump([{"file": "ps_0001.dxbc", "stage": "ps"}], f)
+            name, text = PS_W64_SENSITIVE
+            with open(os.path.join(disasm, "ps_0001.s"), "w", encoding="utf-8") as f:
+                f.write(text)
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([disasm, "--out", index])
+            self.assertNotEqual(cm.exception.code, 0)
+            alias = os.path.join(work, "same_index_alias.json")
+            try:
+                os.link(index, alias)  # an alias of the index, not of a scanned .s listing
+            except OSError:
+                self.skipTest("hard links not supported on this filesystem")
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([disasm, "--out", alias])
+            self.assertNotEqual(cm.exception.code, 0)
+
     def test_cli_execution_with_out_json(self):
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as outdir:
             for name, text in (PS_W64_SENSITIVE, VS_W64):
