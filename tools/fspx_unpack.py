@@ -226,6 +226,11 @@ def main(argv=None) -> int:
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
                 asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                if not asm.strip():
+                    reason = (err.strip().splitlines() or ["no output"])[0]
+                    print(f"{name}: {reason}", file=sys.stderr)
+                    bad += 1
+                    continue
                 entry["invalid_words"] = invalid
                 with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
                     f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
