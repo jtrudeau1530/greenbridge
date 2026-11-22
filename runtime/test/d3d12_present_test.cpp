@@ -136,7 +136,9 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create(true));
+    const auto device_status = d.initialize(true);
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
 
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = window_proc;
