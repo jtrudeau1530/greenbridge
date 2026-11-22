@@ -17,11 +17,13 @@ where:
 Each lane computes fused multiply-add with single rounding per IEEE 754-2008 binary16.
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from fractions import Fraction
 import math
 import struct
 import unittest
-from typing import Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 # ==============================================================================
 # IEEE 754 binary16 (Half-Precision) Architectural Constants
@@ -452,6 +454,279 @@ class TestPkFmaF16MathematicalOracle(unittest.TestCase):
         self.assertEqual(reg, reg2)
         self.assertEqual(reg.lo, f16_to_bits(1.5))
         self.assertEqual(reg.hi, f16_to_bits(-2.5))
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg32:
+    """Represents a 32-bit architectural register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit literal constant (packed f16x2 or raw bits)."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= MASK32):
+            raise ValueError(f"Literal constant {self.bits:#x} out of range [0, 0xFFFFFFFF]")
+
+    @classmethod
+    def from_floats(cls, lo: float, hi: float) -> Literal32:
+        return cls(pack_pk_f16(f16_to_bits(lo), f16_to_bits(hi)))
+
+    @classmethod
+    def from_bits(cls, lo: int, hi: int) -> Literal32:
+        return cls(pack_pk_f16(lo, hi))
+
+    @property
+    def name(self) -> str:
+        lo, hi = unpack_pk_f16(self.bits)
+        return f"[{bits_to_f16(lo):g}, {bits_to_f16(hi):g}] ({self.bits:#010x})"
+
+
+@dataclass(frozen=True)
+class VOP3POperand:
+    """Operand in a VOP3P instruction (Reg32 or Literal32)."""
+    source: Union[Reg32, Literal32]
+
+    def disassemble(self) -> str:
+        if isinstance(self.source, Reg32):
+            return self.source.name
+        return f"{self.source.bits:#010x}"
+
+
+@dataclass(frozen=True)
+class VPkFmaF16Instruction:
+    """Symbolic AST node representing a RDNA2 v_pk_fma_f16 instruction."""
+    dst: Reg32
+    src0: VOP3POperand
+    src1: VOP3POperand
+    src2: VOP3POperand
+    op_sel: Tuple[int, int, int] = (0, 0, 0)
+    op_sel_hi: Tuple[int, int, int] = (1, 1, 1)
+    neg_lo: Tuple[int, int, int] = (0, 0, 0)
+    neg_hi: Tuple[int, int, int] = (0, 0, 0)
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+        for name, tup in (
+            ("op_sel", self.op_sel),
+            ("op_sel_hi", self.op_sel_hi),
+            ("neg_lo", self.neg_lo),
+            ("neg_hi", self.neg_hi),
+        ):
+            if len(tup) != 3:
+                raise ValueError(f"{name} must have 3 elements, got {len(tup)}")
+            if any(x not in (0, 1) for x in tup):
+                raise ValueError(f"{name} elements must be 0 or 1, got {tup}")
+
+    def disassemble(self) -> str:
+        s = (
+            f"v_pk_fma_f16 {self.dst.name}, {self.src0.disassemble()}, "
+            f"{self.src1.disassemble()}, {self.src2.disassemble()}"
+        )
+        if self.op_sel != (0, 0, 0):
+            s += f" op_sel:[{self.op_sel[0]},{self.op_sel[1]},{self.op_sel[2]}]"
+        if self.op_sel_hi != (1, 1, 1):
+            s += f" op_sel_hi:[{self.op_sel_hi[0]},{self.op_sel_hi[1]},{self.op_sel_hi[2]}]"
+        if any(self.neg_lo):
+            s += f" neg_lo:[{self.neg_lo[0]},{self.neg_lo[1]},{self.neg_lo[2]}]"
+        if any(self.neg_hi):
+            s += f" neg_hi:[{self.neg_hi[0]},{self.neg_hi[1]},{self.neg_hi[2]}]"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# Typed Expressions for Symbolic Execution
+class TypedExpr:
+    """Abstract base class for typed expressions."""
+    def eval(self, env: Dict[str, int]) -> int:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class VariableExpr(TypedExpr):
+    """Named variable evaluating to an architectural register or value in env."""
+    name: str
+
+    def eval(self, env: Dict[str, int]) -> int:
+        if self.name not in env:
+            raise KeyError(f"Variable '{self.name}' not found in environment")
+        return env[self.name] & MASK32
+
+
+@dataclass(frozen=True)
+class ConstantExpr(TypedExpr):
+    """Constant 32-bit packed float literal."""
+    value: int
+
+    def eval(self, env: Dict[str, int]) -> int:
+        return self.value & MASK32
+
+
+@dataclass(frozen=True)
+class PackedF16FMAExpr(TypedExpr):
+    """Symbolic typed expression for packed f16 FMA operation."""
+    src0: TypedExpr
+    src1: TypedExpr
+    src2: TypedExpr
+    op_sel: Tuple[int, int, int] = (0, 0, 0)
+    op_sel_hi: Tuple[int, int, int] = (1, 1, 1)
+    neg_lo: Tuple[int, int, int] = (0, 0, 0)
+    neg_hi: Tuple[int, int, int] = (0, 0, 0)
+    clamp: bool = False
+
+    def eval(self, env: Dict[str, int]) -> int:
+        v0 = self.src0.eval(env)
+        v1 = self.src1.eval(env)
+        v2 = self.src2.eval(env)
+        return oracle_v_pk_fma_f16(
+            v0, v1, v2,
+            op_sel=self.op_sel,
+            op_sel_hi=self.op_sel_hi,
+            neg_lo=self.neg_lo,
+            neg_hi=self.neg_hi,
+            clamp=self.clamp,
+        )
+
+
+class TestPkFmaF16SymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg32_naming_and_bounds(self) -> None:
+        v0 = Reg32(0, RegType.VGPR)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v0.index, 0)
+
+        s255 = Reg32(255, RegType.SGPR)
+        self.assertEqual(s255.name, "s255")
+
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.SGPR)
+
+    def test_literal32_representation(self) -> None:
+        lit = Literal32.from_floats(1.0, 2.0)
+        self.assertEqual(lit.bits, pack_pk_f16(POS_ONE, POS_TWO))
+        self.assertIn("0x40003c00", lit.name)
+
+        with self.assertRaises(ValueError):
+            Literal32(-1)
+        with self.assertRaises(ValueError):
+            Literal32(0x1_0000_0000)
+
+    def test_vop3p_operand_disassembly(self) -> None:
+        op_v = VOP3POperand(Reg32(5, RegType.VGPR))
+        self.assertEqual(op_v.disassemble(), "v5")
+
+        op_s = VOP3POperand(Reg32(12, RegType.SGPR))
+        self.assertEqual(op_s.disassemble(), "s12")
+
+        op_lit = VOP3POperand(Literal32.from_floats(1.0, 1.0))
+        self.assertEqual(op_lit.disassemble(), f"{pack_pk_f16(POS_ONE, POS_ONE):#010x}")
+
+    def test_instruction_disassembly(self) -> None:
+        instr_def = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(2, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(3, RegType.VGPR)),
+        )
+        self.assertEqual(instr_def.disassemble(), "v_pk_fma_f16 v0, v1, v2, v3")
+
+        instr_mods = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(2, RegType.SGPR)),
+            src2=VOP3POperand(Literal32(0)),
+            op_sel=(1, 0, 1),
+            op_sel_hi=(0, 1, 0),
+            neg_lo=(1, 0, 0),
+            neg_hi=(0, 1, 1),
+            clamp=True,
+        )
+        dis = instr_mods.disassemble()
+        self.assertIn("op_sel:[1,0,1]", dis)
+        self.assertIn("op_sel_hi:[0,1,0]", dis)
+        self.assertIn("neg_lo:[1,0,0]", dis)
+        self.assertIn("neg_hi:[0,1,1]", dis)
+        self.assertTrue(dis.endswith("clamp"))
+
+    def test_instruction_validation(self) -> None:
+        v = VOP3POperand(Reg32(1, RegType.VGPR))
+        # Destination must be VGPR
+        with self.assertRaises(TypeError):
+            VPkFmaF16Instruction(dst=Reg32(0, RegType.SGPR), src0=v, src1=v, src2=v)
+
+        # Invalid tuple lengths
+        with self.assertRaises(ValueError):
+            VPkFmaF16Instruction(
+                dst=Reg32(0, RegType.VGPR), src0=v, src1=v, src2=v,
+                op_sel=(0, 0),  # type: ignore[arg-type]
+            )
+
+        # Invalid tuple element values
+        with self.assertRaises(ValueError):
+            VPkFmaF16Instruction(
+                dst=Reg32(0, RegType.VGPR), src0=v, src1=v, src2=v,
+                neg_lo=(0, 2, 0),
+            )
+
+    def test_structural_equality_and_immutability(self) -> None:
+        v1 = VOP3POperand(Reg32(1, RegType.VGPR))
+        v2 = VOP3POperand(Reg32(2, RegType.VGPR))
+        v3 = VOP3POperand(Reg32(3, RegType.VGPR))
+        i1 = VPkFmaF16Instruction(Reg32(0, RegType.VGPR), v1, v2, v3, clamp=True)
+        i2 = VPkFmaF16Instruction(Reg32(0, RegType.VGPR), v1, v2, v3, clamp=True)
+        self.assertEqual(i1, i2)
+        self.assertEqual(hash(i1), hash(i2))
+
+    def test_typed_expressions_evaluation(self) -> None:
+        env = {
+            "v0": pack_pk_f16(POS_ONE, POS_TWO),
+            "v1": pack_pk_f16(POS_TWO, POS_TWO),
+            "v2": pack_pk_f16(POS_HALF, POS_HALF),
+        }
+        # expr: v0 * v1 + v2
+        # lo: 1*2 + 0.5 = 2.5
+        # hi: 2*2 + 0.5 = 4.5
+        fma_expr = PackedF16FMAExpr(
+            src0=VariableExpr("v0"),
+            src1=VariableExpr("v1"),
+            src2=VariableExpr("v2"),
+        )
+        res = fma_expr.eval(env)
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, f16_to_bits(2.5))
+        self.assertEqual(hi, f16_to_bits(4.5))
+
+        # Test constant expr
+        const_expr = ConstantExpr(pack_pk_f16(POS_ONE, POS_ONE))
+        self.assertEqual(const_expr.eval(env), pack_pk_f16(POS_ONE, POS_ONE))
 
 
 if __name__ == "__main__":
