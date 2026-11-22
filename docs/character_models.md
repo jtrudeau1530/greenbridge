@@ -45,7 +45,6 @@ The decoded export used by the previews contains 13 parts:
 
 Two caveats that matter for any render:
 
-- **`body` is not a base body.** The only Lucia full-body record in `packs.rpf` is the
 - **`body` is not a base body.** The only `lucia`-named full-body record in `packs.rpf` is the
   `cs_lucia_legacypedcs` clothed legacy ped. The decoded part is 1,748 vertices / 1,816
   triangles, and the manifest lists 874- and 640-vertex rows of the same drawable. Do not present
