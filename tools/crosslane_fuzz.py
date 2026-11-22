@@ -941,6 +941,15 @@ def main():
     backends = tuple(dict.fromkeys(t.strip() for t in args.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
+    if args.wave == "32" and "emulate" in args.modes:
+        # emulate runs a wave64 program as two 32-lane halves, so a wave32-only selection has nothing to run: the run
+        # used to end after a bare `summary:` with exit 0, the same false pass #1452 fixed for a count below 1.
+        ap.error("--modes emulate needs wave64 programs: with --wave 32 nothing runs (use --wave 64 or both)")
+    if args.wave == "64" and "native" in args.modes and not args.w64_native:
+        # A wave64 program only runs natively when --w64-native asks for the documented cross-half approximation, so
+        # this combination was empty in the same silent way.
+        ap.error("--wave 64 --modes native runs nothing without --w64-native; pass it to run the documented "
+                 "cross-half approximation, or use --modes emulate")
     if "translator" in backends and not os.path.isfile(args.exe):   # before any program is generated or run
         sys.exit(f"vk_compute_test not found at {args.exe} or in its RelWithDebInfo/Release folder; build it first "
                  "(cmake --build <build dir> --target vk_compute_test) or give its path with --exe")
