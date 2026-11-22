@@ -7,8 +7,8 @@ from __future__ import annotations
 - v_max3_u32: unsigned 32-bit integer maximum: max(S0, S1, S2)
 
 Features reference models, pairwise reduction equivalence, signed vs unsigned
-divergence on identical bit patterns, and shader execution via rdna2spirv and
-spirv_mini_interp.
+divergence on identical bit patterns, multi-lane SIMD wave execution under EXEC
+mask gating, and shader execution via rdna2spirv and spirv_mini_interp.
 
 Zero game data, standard library Python only, Python 3.9+ compatible.
 """
@@ -130,6 +130,116 @@ def ref(op: str, *xs: int) -> int:
     return pick(xs, key=key) & MASK32
 
 
+class VectorALUInterpreter:
+    """Deterministic semantic interpreter for RDNA2 VALU 3-way integer min/max.
+
+    Models:
+      - Vector General Purpose Registers (VGPRs) across wave lanes.
+      - Scalar General Purpose Registers (SGPRs) uniformly broadcast to all lanes.
+      - EXEC mask write gating (inactive lanes preserve prior VGPR contents).
+      - Inline constants and register operand decoding.
+      - Both Wave64 and Wave32 execution widths.
+    """
+
+    def __init__(self, num_vgprs: int = 64, num_sgprs: int = 106, wave_size: int = 64) -> None:
+        self.num_vgprs = num_vgprs
+        self.num_sgprs = num_sgprs
+        self.wave_size = wave_size
+        self.vgprs = [[0] * wave_size for _ in range(num_vgprs)]
+        self.sgprs = [0] * num_sgprs
+        self.exec_mask = (1 << wave_size) - 1
+
+    def reset(self) -> None:
+        self.vgprs = [[0] * self.wave_size for _ in range(self.num_vgprs)]
+        self.sgprs = [0] * self.num_sgprs
+        self.exec_mask = (1 << self.wave_size) - 1
+
+    def set_vgpr(self, reg_idx: int, lane: int, val: int) -> None:
+        if not (0 <= reg_idx < self.num_vgprs):
+            raise IndexError(f"VGPR index out of range: v{reg_idx}")
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane index out of range: {lane}")
+        self.vgprs[reg_idx][lane] = val & MASK32
+
+    def get_vgpr(self, reg_idx: int, lane: int) -> int:
+        if not (0 <= reg_idx < self.num_vgprs):
+            raise IndexError(f"VGPR index out of range: v{reg_idx}")
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane index out of range: {lane}")
+        return self.vgprs[reg_idx][lane] & MASK32
+
+    def set_sgpr(self, reg_idx: int, val: int) -> None:
+        if not (0 <= reg_idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: s{reg_idx}")
+        self.sgprs[reg_idx] = val & MASK32
+
+    def get_sgpr(self, reg_idx: int) -> int:
+        if not (0 <= reg_idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: s{reg_idx}")
+        return self.sgprs[reg_idx] & MASK32
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def resolve_src(self, op: str | int, lane: int) -> int:
+        if isinstance(op, int):
+            return op & MASK32
+        op_str = op.strip().lower()
+        if op_str.startswith("v"):
+            idx = int(op_str[1:])
+            return self.get_vgpr(idx, lane)
+        if op_str.startswith("s"):
+            idx = int(op_str[1:])
+            return self.get_sgpr(idx)
+        return int(op_str, 0) & MASK32
+
+    def execute_v_min3_i32(self, dst_idx: int, src0: str | int, src1: str | int, src2: str | int) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                s2 = self.resolve_src(src2, lane)
+                self.set_vgpr(dst_idx, lane, ref_v_min3_i32(s0, s1, s2))
+
+    def execute_v_min3_u32(self, dst_idx: int, src0: str | int, src1: str | int, src2: str | int) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                s2 = self.resolve_src(src2, lane)
+                self.set_vgpr(dst_idx, lane, ref_v_min3_u32(s0, s1, s2))
+
+    def execute_v_max3_i32(self, dst_idx: int, src0: str | int, src1: str | int, src2: str | int) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                s2 = self.resolve_src(src2, lane)
+                self.set_vgpr(dst_idx, lane, ref_v_max3_i32(s0, s1, s2))
+
+    def execute_v_max3_u32(self, dst_idx: int, src0: str | int, src1: str | int, src2: str | int) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                s2 = self.resolve_src(src2, lane)
+                self.set_vgpr(dst_idx, lane, ref_v_max3_u32(s0, s1, s2))
+
+    def execute_instruction(
+        self, op: str, dst_idx: int, src0: str | int, src1: str | int, src2: str | int
+    ) -> None:
+        if op == "v_min3_i32":
+            self.execute_v_min3_i32(dst_idx, src0, src1, src2)
+        elif op == "v_min3_u32":
+            self.execute_v_min3_u32(dst_idx, src0, src1, src2)
+        elif op == "v_max3_i32":
+            self.execute_v_max3_i32(dst_idx, src0, src1, src2)
+        elif op == "v_max3_u32":
+            self.execute_v_max3_u32(dst_idx, src0, src1, src2)
+        else:
+            raise ValueError(f"Unknown instruction: {op}")
+
+
 # Triples where signed and unsigned order disagree, plus ties and ordinary values.
 TRIPLES = (
     (5, 0x80000000, 7),
@@ -246,6 +356,140 @@ class TestAluIntMin3Max3ReferenceOracle(unittest.TestCase):
         ):
             for t in TRIPLES:
                 self.assertEqual(ref(op, *t), func(*t))
+
+
+class TestAluIntMin3Max3SIMD(unittest.TestCase):
+    """Tests the stateful VectorALUInterpreter modeling multi-lane SIMD execution and EXEC gating."""
+
+    def test_wave64_simd_multi_lane_evaluation(self) -> None:
+        """Verify 64 SIMD lanes independently evaluate 3-way min/max with per-lane inputs."""
+        interp = VectorALUInterpreter(wave_size=64)
+        for lane in range(64):
+            # Lane 0..31 have negative signed numbers, 32..63 have positive numbers
+            val0 = (lane * 100 - 3200) & MASK32
+            val1 = ((63 - lane) * 150 - 4500) & MASK32
+            val2 = 0
+            interp.set_vgpr(1, lane, val0)
+            interp.set_vgpr(2, lane, val1)
+            interp.set_vgpr(3, lane, val2)
+
+        for op in OPS:
+            interp.execute_instruction(op, 0, "v1", "v2", "v3")
+            for lane in range(64):
+                v1 = interp.get_vgpr(1, lane)
+                v2 = interp.get_vgpr(2, lane)
+                v3 = interp.get_vgpr(3, lane)
+                expected = ref(op, v1, v2, v3)
+                actual = interp.get_vgpr(0, lane)
+                self.assertEqual(
+                    actual,
+                    expected,
+                    f"Mismatch in {op} lane {lane}: got {hex(actual)}, expected {hex(expected)}",
+                )
+
+    def test_wave32_scalar_broadcast_and_inline_const(self) -> None:
+        """Verify wave32 mode with SGPR scalar broadcast and inline constant operand."""
+        interp = VectorALUInterpreter(wave_size=32)
+        # s0 uniformly set to scalar threshold 50
+        interp.set_sgpr(0, 50)
+        for lane in range(32):
+            interp.set_vgpr(1, lane, lane * 5)  # 0, 5, 10, ... 155
+
+        # v_min3_u32 v0, s0, v1, 75
+        interp.execute_instruction("v_min3_u32", 0, "s0", "v1", 75)
+        for lane in range(32):
+            v1_val = lane * 5
+            expected = min(50, v1_val, 75)
+            self.assertEqual(interp.get_vgpr(0, lane), expected)
+
+        # v_max3_i32 v0, s0, v1, -20 (signed inline const)
+        interp.execute_instruction("v_max3_i32", 0, "s0", "v1", -20)
+        for lane in range(32):
+            v1_val = lane * 5
+            expected = max(50, v1_val, -20) & MASK32
+            self.assertEqual(interp.get_vgpr(0, lane), expected)
+
+    def test_exec_mask_inactive_lanes_preserved(self) -> None:
+        """EXEC mask write gating: inactive lanes must strictly preserve prior VGPR contents."""
+        interp = VectorALUInterpreter(wave_size=64)
+        sentinel = 0xDEADBEEF
+        for lane in range(64):
+            interp.set_vgpr(0, lane, sentinel)
+            interp.set_vgpr(1, lane, 10)
+            interp.set_vgpr(2, lane, 20)
+            interp.set_vgpr(3, lane, 30)
+
+        # Alternating mask: only even lanes active
+        even_mask = 0x5555555555555555
+        interp.set_exec(even_mask)
+        interp.execute_v_min3_i32(0, "v1", "v2", "v3")
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(interp.get_vgpr(0, lane), 10, f"Even active lane {lane}")
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), sentinel, f"Odd inactive lane {lane}")
+
+        # Sparse mask test
+        sparse_mask = (1 << 3) | (1 << 27) | (1 << 59)
+        interp.reset()
+        for lane in range(64):
+            interp.set_vgpr(0, lane, 0x11111111 * ((lane % 7) + 1))
+            interp.set_vgpr(1, lane, 100)
+            interp.set_vgpr(2, lane, 200)
+            interp.set_vgpr(3, lane, 300)
+
+        saved_v0 = [interp.get_vgpr(0, lane) for lane in range(64)]
+        interp.set_exec(sparse_mask)
+        interp.execute_v_max3_u32(0, "v1", "v2", "v3")
+
+        for lane in range(64):
+            if lane in (3, 27, 59):
+                self.assertEqual(interp.get_vgpr(0, lane), 300)
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), saved_v0[lane])
+
+        # Full zero mask test: nothing is modified
+        interp.set_exec(0)
+        interp.execute_v_min3_u32(0, "v1", "v2", "v3")
+        for lane in range(64):
+            if lane in (3, 27, 59):
+                self.assertEqual(interp.get_vgpr(0, lane), 300)
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), saved_v0[lane])
+
+    def test_multi_lane_signed_unsigned_divergence(self) -> None:
+        """Vector lanes simultaneously executing signed vs unsigned operations diverge per lane."""
+        interp = VectorALUInterpreter(wave_size=64)
+        for lane in range(64):
+            if lane < 32:
+                # 0xFFFFFFFF (-1 as i32, UINT32_MAX as u32), 0, 10
+                interp.set_vgpr(1, lane, 0xFFFFFFFF)
+                interp.set_vgpr(2, lane, 0)
+                interp.set_vgpr(3, lane, 10)
+            else:
+                # 0x80000000 (INT32_MIN as i32, 2^31 as u32), 0x7FFFFFFF (INT32_MAX), 0
+                interp.set_vgpr(1, lane, 0x80000000)
+                interp.set_vgpr(2, lane, 0x7FFFFFFF)
+                interp.set_vgpr(3, lane, 0)
+
+        # Test v_min3_i32 vs v_min3_u32
+        interp.execute_v_min3_i32(4, "v1", "v2", "v3")
+        interp.execute_v_min3_u32(5, "v1", "v2", "v3")
+        interp.execute_v_max3_i32(6, "v1", "v2", "v3")
+        interp.execute_v_max3_u32(7, "v1", "v2", "v3")
+
+        for lane in range(32):
+            self.assertEqual(interp.get_vgpr(4, lane), 0xFFFFFFFF)  # signed min: -1
+            self.assertEqual(interp.get_vgpr(5, lane), 0)           # unsigned min: 0
+            self.assertEqual(interp.get_vgpr(6, lane), 10)          # signed max: 10
+            self.assertEqual(interp.get_vgpr(7, lane), 0xFFFFFFFF)  # unsigned max: UINT32_MAX
+
+        for lane in range(32, 64):
+            self.assertEqual(interp.get_vgpr(4, lane), 0x80000000)  # signed min: INT32_MIN
+            self.assertEqual(interp.get_vgpr(5, lane), 0)           # unsigned min: 0
+            self.assertEqual(interp.get_vgpr(6, lane), 0x7FFFFFFF)  # signed max: INT32_MAX
+            self.assertEqual(interp.get_vgpr(7, lane), 0x80000000)  # unsigned max: 2^31
 
 
 class ReferenceTests(unittest.TestCase):
