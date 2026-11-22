@@ -758,6 +758,107 @@ class SIMDVALUInterpreter:
         return self.execute(ast)
 
 
+class TestValuFrexpF64IEEE754Boundaries(unittest.TestCase):
+    """Deep verification of IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_normalization_boundaries(self):
+        # MIN_SUBNORMAL_F64 = 2^-1074 -> mantissa 0.5, exp -1073
+        m_min = ref_frexp_mant_f64(MIN_SUBNORMAL_F64)
+        e_min = ref_frexp_exp_i32_f64(MIN_SUBNORMAL_F64)
+        self.assertEqual(bits_to_f64(m_min), 0.5)
+        self.assertEqual(s32(e_min), -1073)
+
+        # MAX_SUBNORMAL_F64 = 2^-1022 - 2^-1074 -> exp -1022
+        m_max = ref_frexp_mant_f64(MAX_SUBNORMAL_F64)
+        e_max = ref_frexp_exp_i32_f64(MAX_SUBNORMAL_F64)
+        self.assertEqual(s32(e_max), -1022)
+        # Fraction bits in mantissa should match MAX_SUBNORMAL shifted left by 1
+        expected_mant = EXP_FREXP_BITS_F64 | ((MAX_SUBNORMAL_F64 << 1) & MANT_MASK_F64)
+        self.assertEqual(m_max, expected_mant)
+
+        # Powers of 2 across subnormals
+        for p in range(52):
+            val_bits = 1 << p
+            m = ref_frexp_mant_f64(val_bits)
+            e = s32(ref_frexp_exp_i32_f64(val_bits))
+            self.assertEqual(bits_to_f64(m), 0.5)
+            self.assertEqual(e, -1073 + p)
+
+    def test_all_normal_exponent_boundaries(self):
+        # Test lower, middle, upper normal exponents
+        for exp in (1, 2, 1022, 1023, 1024, 2045, 2046):
+            word = exp << EXP_SHIFT_F64
+            m = ref_frexp_mant_f64(word)
+            e = s32(ref_frexp_exp_i32_f64(word))
+            self.assertEqual(bits_to_f64(m), 0.5)
+            self.assertEqual(e, exp - 1022)
+
+    def test_walking_fraction_bits(self):
+        for bit_idx in range(52):
+            frac = 1 << bit_idx
+            word = (1023 << EXP_SHIFT_F64) | frac
+            m = ref_frexp_mant_f64(word)
+            e = s32(ref_frexp_exp_i32_f64(word))
+            self.assertEqual(m & MANT_MASK_F64, frac)
+            self.assertEqual((m >> EXP_SHIFT_F64) & 0x7FF, 1022)
+            self.assertEqual(e, 1)
+
+    def test_signed_zero_preservation(self):
+        self.assertEqual(ref_frexp_mant_f64(POS_ZERO_F64), POS_ZERO_F64)
+        self.assertEqual(ref_frexp_mant_f64(NEG_ZERO_F64), NEG_ZERO_F64)
+        self.assertEqual(ref_frexp_exp_i32_f64(POS_ZERO_F64), 0)
+        self.assertEqual(ref_frexp_exp_i32_f64(NEG_ZERO_F64), 0)
+
+    def test_signed_infinity_preservation(self):
+        self.assertEqual(ref_frexp_mant_f64(POS_INF_F64), POS_INF_F64)
+        self.assertEqual(ref_frexp_mant_f64(NEG_INF_F64), NEG_INF_F64)
+        self.assertEqual(ref_frexp_exp_i32_f64(POS_INF_F64), 0)
+        self.assertEqual(ref_frexp_exp_i32_f64(NEG_INF_F64), 0)
+
+    def test_nan_payloads_and_quieting(self):
+        # Quiet NaN payload preserved
+        qnan_payload = QNAN_F64 | 0x0000123456789ABC
+        m_qnan = ref_frexp_mant_f64(qnan_payload)
+        self.assertTrue(is_nan_f64(m_qnan))
+        self.assertEqual(m_qnan & 0x0000123456789ABC, 0x0000123456789ABC)
+        self.assertEqual(ref_frexp_exp_i32_f64(qnan_payload), 0)
+
+        # Signaling NaN quiet bit set
+        snan_payload = SNAN_F64 | 0x0000FEDCBA987654
+        m_snan = ref_frexp_mant_f64(snan_payload)
+        self.assertTrue(is_nan_f64(m_snan))
+        self.assertFalse(is_snan_f64(m_snan), "Signaling NaN must be quieted")
+        self.assertEqual(ref_frexp_exp_i32_f64(snan_payload), 0)
+
+    def test_clamp_behavior_on_all_special_values(self):
+        # NaNs clamp to +0.0
+        self.assertEqual(ref_frexp_mant_f64(QNAN_F64, clamp=True), POS_ZERO_F64)
+        self.assertEqual(ref_frexp_mant_f64(SNAN_F64, clamp=True), POS_ZERO_F64)
+        # +inf clamps to 1.0, -inf clamps to +0.0
+        self.assertEqual(ref_frexp_mant_f64(POS_INF_F64, clamp=True), ONE_F64)
+        self.assertEqual(ref_frexp_mant_f64(NEG_INF_F64, clamp=True), POS_ZERO_F64)
+        # -0.0 clamps to +0.0
+        self.assertEqual(ref_frexp_mant_f64(NEG_ZERO_F64, clamp=True), POS_ZERO_F64)
+        # Positive mantissas in [0.5, 1.0) remain unchanged
+        self.assertEqual(bits_to_f64(ref_frexp_mant_f64(ONE_F64, clamp=True)), 0.5)
+        # Negative mantissas clamp to +0.0
+        self.assertEqual(ref_frexp_mant_f64(ONE_F64 | SIGN_MASK_F64, clamp=True), POS_ZERO_F64)
+
+    def test_omod_interactions_with_clamp(self):
+        # 0.5 * mul:4 = 2.0 -> clamped to 1.0
+        res_mul4 = ref_frexp_mant_f64(ONE_F64, clamp=True, omod="mul:4")
+        self.assertEqual(bits_to_f64(res_mul4), 1.0)
+
+        # 0.5 * mul:2 = 1.0 -> within [0.0, 1.0] -> 1.0
+        res_mul2 = ref_frexp_mant_f64(ONE_F64, clamp=True, omod="mul:2")
+        self.assertEqual(bits_to_f64(res_mul2), 1.0)
+
+        # 0.75 * div:2 = 0.375 -> within [0.0, 1.0] -> 0.375
+        f_1p5 = f64_to_bits(1.5)
+        res_div2 = ref_frexp_mant_f64(f_1p5, clamp=True, omod="div:2")
+        self.assertEqual(bits_to_f64(res_div2), 0.375)
+
+
 class TestValuFrexpF64StatusFlags(unittest.TestCase):
     """Unit tests for condition codes, status flags, and carry/borrow generation."""
 
@@ -1079,7 +1180,7 @@ class TestValuFrexpF64ScalarInterpreter(unittest.TestCase):
         ast = parse_valu_frexp_f64("v_frexp_exp_i32_f64 v0, v[2:3]")
         res = self.interp.execute(ast)
         self.assertEqual(s32(res), 3)
-        self.assertEqual(self.interp.get_vgpr_u32(0), res)
+        self.assertEqual(s32(self.interp.get_vgpr_u32(0)), 3)
 
     def test_scalar_interpreter_sgpr_sources(self):
         # Set s[0:1] = 0.5
