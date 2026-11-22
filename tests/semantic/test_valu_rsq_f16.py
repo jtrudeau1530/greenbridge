@@ -994,5 +994,92 @@ class TestIEEE754BoundaryExtremesRSQF16(unittest.TestCase):
             )
 
 
+class TestNegativeControlsAndMutationsRSQF16(unittest.TestCase):
+    """Unit tests verifying negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_operand_types(self) -> None:
+        # Destination cannot be an SGPR or literal
+        op_sgpr = ASTOperand(op_type=OperandType.SGPR, reg_index=0)
+        op_vgpr = ASTOperand(op_type=OperandType.VGPR, reg_index=1)
+        instr_bad_dst = ASTRsqF16(dst=op_sgpr, src0=op_vgpr)
+        with self.assertRaises(TypeError):
+            instr_bad_dst.validate()
+
+        # Invalid literal constant > 0xFFFF
+        op_bad_lit = ASTOperand(op_type=OperandType.LITERAL_CONST, literal_val=0x10000)
+        with self.assertRaises(ValueError):
+            op_bad_lit.validate()
+
+    def test_syntax_rejection_out_of_bounds_registers(self) -> None:
+        # VGPR > 255
+        op_oob_vgpr = ASTOperand(op_type=OperandType.VGPR, reg_index=256)
+        with self.assertRaises(ValueError):
+            op_oob_vgpr.validate()
+
+        # SGPR > 105
+        op_oob_sgpr = ASTOperand(op_type=OperandType.SGPR, reg_index=106)
+        with self.assertRaises(ValueError):
+            op_oob_sgpr.validate()
+
+    def test_syntax_rejection_invalid_output_modifiers(self) -> None:
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=0)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=1)
+        instr_bad_omod = ASTRsqF16(dst=dst, src0=src, omod="mul:8")
+        with self.assertRaises(ValueError):
+            instr_bad_omod.validate()
+
+    def test_syntax_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            Wavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            Wavefront(wave_size=128)
+
+    def test_mutation_detection_omitted_reciprocal(self) -> None:
+        # Mutant: sqrt(x) instead of 1/sqrt(x)
+        def mutant_sqrt(src: int) -> int:
+            return f16_to_bits(math.sqrt(bits_to_f16(src)))
+
+        # For x=4.0, real rsq=0.5 (0x3800), mutant produces 2.0 (0x4000)
+        self.assertNotEqual(mutant_sqrt(H_FOUR), oracle_v_rsq_f16(H_FOUR))
+
+    def test_mutation_detection_negative_abs_fallback(self) -> None:
+        # Mutant: silently takes abs of negative numbers instead of generating NaN
+        def mutant_abs_fallback(src: int) -> int:
+            return oracle_v_rsq_f16(src, abs_mod=True)
+
+        neg_val = f16_to_bits(-4.0)
+        # Correct oracle produces Canonical Quiet NaN
+        self.assertTrue(is_nan_f16(oracle_v_rsq_f16(neg_val)))
+        # Mutant produces 0.5 (not NaN)
+        self.assertFalse(is_nan_f16(mutant_abs_fallback(neg_val)))
+
+    def test_mutation_detection_missing_clamp(self) -> None:
+        # Mutant: ignores clamp modifier
+        def mutant_no_clamp(src: int, clamp: bool) -> int:
+            return oracle_v_rsq_f16(src, clamp=False)
+
+        # 0.25 -> 2.0, with clamp=True should be 1.0
+        self.assertEqual(oracle_v_rsq_f16(H_QUARTER, clamp=True), H_ONE)
+        self.assertNotEqual(mutant_no_clamp(H_QUARTER, clamp=True), H_ONE)
+
+    def test_golden_vector_parity_table(self) -> None:
+        golden_vectors = [
+            (0x0000, 0x7C00),  # +0.0 -> +inf
+            (0x8000, 0x7C00),  # -0.0 -> +inf
+            (0x7C00, 0x0000),  # +inf -> +0.0
+            (0xFC00, 0x7E00),  # -inf -> Canonical Quiet NaN
+            (0x3C00, 0x3C00),  # 1.0  -> 1.0
+            (0x4400, 0x3800),  # 4.0  -> 0.5
+            (0x4C00, 0x3400),  # 16.0 -> 0.25
+            (0x5400, 0x3000),  # 64.0 -> 0.125
+            (0x3400, 0x4000),  # 0.25 -> 2.0
+            (0x2C00, 0x4400),  # 0.0625 -> 4.0
+            (0x2400, 0x4800),  # 0.015625 -> 8.0
+        ]
+        for src, expected in golden_vectors:
+            with self.subTest(src=hex(src)):
+                self.assertEqual(oracle_v_rsq_f16(src), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
