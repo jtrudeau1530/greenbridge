@@ -724,7 +724,8 @@ int main() {
 
     const char* env_dir = std::getenv("LEONIDA_TEST_DIR");
     g_temp_dir = env_dir ? std::filesystem::path(env_dir)
-                         : std::filesystem::temp_directory_path() / "leonida_pe_bounds_test";
+                         : std::filesystem::temp_directory_path() /
+                               ("leonida_pe_bounds_test_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(g_temp_dir);
 
     try {

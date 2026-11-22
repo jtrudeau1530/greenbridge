@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
     const std::size_t chosen = leonida::vk_test::pick_device(candidates);
     VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
     if (!pd) {
-        std::fprintf(stderr, "no Vulkan physical device found\n");
+        leonida::vk_test::report_no_device();
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);

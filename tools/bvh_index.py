@@ -23,6 +23,7 @@ Usage:
 
 --start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 --max-inflate applies to every .rpf in the directory.
+Archive rows include a fill histogram only when the complete node range was kept.
 
 Exit status is 0 even when nothing is found; the summary says how many streams were read.
 """
@@ -268,7 +269,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=1 << 28):
                     unread += len(gap)
                 row = classify(head, total, kept[-HEAD:] if len(kept) >= HEAD else kept)
                 row.update(source=path, offset=s, stored=used, size=total)
-                if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= total:
+                if row["kind"] in ("bvh4", "bvh4-chunk") and row["declared_bytes"] <= len(kept):
                     body = kept[HEAD:HEAD + row["node_count"] * 64]
                     row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES if body.count(bytes([b]))}
                     row["fill"]["total"] = len(body)

@@ -175,6 +175,18 @@ if(WIN32)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
+  # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
+  add_executable(process_cmdline_test
+    test/process_cmdline_test.cpp
+    shims/process.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(process_cmdline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(process_cmdline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(process_cmdline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(process_cmdline_test PRIVATE shell32)
+
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
   add_executable(xgameruntime_test
@@ -254,6 +266,10 @@ if(BUILD_TESTING)
   # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
   add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
   add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
+  # LEONIDA_VK_DEVICE name matching (runtime/src/vulkan_device_filter.h): pure stdlib, no Vulkan instance.
+  add_executable(vulkan_device_filter_test test/vulkan_device_filter_test.cpp)
+  target_include_directories(vulkan_device_filter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
   if(WIN32)
     # Compile-time ABI checks (D3D12/XMem structure sizes, alignments and member offsets against the Windows SDK).
     # The file existed but no target built it, so none of its static_asserts ever ran.
@@ -501,6 +517,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
   endif()
+  if(WIN32 AND TARGET process_cmdline_test)
+    add_test(NAME process_cmdline COMMAND process_cmdline_test)
+  endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
   endif()
@@ -632,7 +651,7 @@ if(TARGET Vulkan::Headers)
       COMMAND "${Python3_EXECUTABLE}" -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
               ${_stubs_header}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
-              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12QueryHeap
+              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12QueryHeap ID3D12CommandSignature
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
@@ -778,6 +797,44 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(dxgi_swapchain_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_swapchain_test PRIVATE /W4 /permissive- /utf-8)
 
+    # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
+    add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)
+    target_link_libraries(d3d12_indirect_rt_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_indirect_rt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_indirect_rt_test PRIVATE /W4 /permissive- /utf-8)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_VS_TRI ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_tri.spv)
+      set(LEONIDA_TEST_FS_SOLID ${CMAKE_CURRENT_BINARY_DIR}/generated/fs_solid.spv)
+      set(LEONIDA_TEST_CS_RAYQUERY ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_rayquery.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_VS_TRI}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_VS_TRI}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_tri.vert
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_tri.vert
+        COMMENT "Compiling vs_tri.vert"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_FS_SOLID}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_FS_SOLID}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/fs_solid.frag
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/fs_solid.frag
+        COMMENT "Compiling fs_solid.frag"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_RAYQUERY}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_RAYQUERY}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_rayquery.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_rayquery.comp
+        COMMENT "Compiling cs_rayquery.comp"
+        VERBATIM)
+      target_sources(d3d12_indirect_rt_test PRIVATE
+                     ${LEONIDA_TEST_VS_TRI} ${LEONIDA_TEST_FS_SOLID} ${LEONIDA_TEST_CS_RAYQUERY})
+      target_compile_definitions(d3d12_indirect_rt_test PRIVATE
+        LEONIDA_TEST_VS_TRI_SPV="${LEONIDA_TEST_VS_TRI}"
+        LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}"
+        LEONIDA_TEST_CS_RAYQUERY_SPV="${LEONIDA_TEST_CS_RAYQUERY}")
+    endif()
+
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
@@ -822,6 +879,10 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_state_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME d3d12_state_map COMMAND d3d12_state_map_test)
+    # A buffer UAV clear writes where its resource starts in a shared VkBuffer (no GPU).
+    add_executable(replay_uav_clear_offset_test test/replay_uav_clear_offset_test.cpp)
+    target_link_libraries(replay_uav_clear_offset_test PRIVATE Vulkan::Headers)
+    add_test(NAME replay_uav_clear_offset COMMAND replay_uav_clear_offset_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)

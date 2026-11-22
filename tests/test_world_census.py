@@ -115,6 +115,76 @@ class WorldCensusTest(unittest.TestCase):
                 self.assertEqual(tiny["totals"].get(key), value)
         self.assertGreater(whole["totals"]["streams"], 0)
 
+    def test_version_4_warmup_shard_requires_a_rescan(self):
+        archive = Path(self.dir) / "sample.rpf"
+        out = Path(self.dir) / "out"
+        start, shard_size = 0x40, 0x200
+        boundary = start + shard_size
+        map_data, meta_data = TWI.make_resource(True), TWI.make_resource(False)
+        first, second = zlib.compress(map_data), zlib.compress(meta_data)
+        data = bytearray(boundary)
+        struct.pack_into("<4sI", data, 0, b"9FPR", start)
+        data[start:start + len(first)] = first
+        data.extend(second)
+        archive.write_bytes(data)
+
+        def run(*flags):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = WC.main([str(archive), "--out", str(out), "--shard-size", str(shard_size),
+                                "--jobs", "1", *flags])
+            summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+            return code, stdout.getvalue(), summary
+
+        code, _, fresh = run()
+        self.assertEqual(code, 0)
+        expected = {"streams": 2, "stored": len(first) + len(second),
+                    "inflated": len(map_data) + len(meta_data), "rejected": 0}
+        self.assertEqual({k: fresh["totals"][k] for k in expected}, expected)
+        self.assertTrue(fresh["census_exact"])
+        self.assertEqual(fresh["shards_complete"], 2)
+        maps = (out / "maps.json").read_bytes()
+
+        compatible_path, legacy_path = [Path(WC._shard_path(out, s)) for s in fresh["shards"]]
+        compatible = compatible_path.read_bytes()
+        legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+        # Format 4 counted the first shard's stream again during the second shard's warm-up.
+        legacy["format"] = 4
+        legacy["intervals"].insert(0, [start, start + len(first)])
+        legacy["stats"]["streams"] += 1
+        legacy["stats"]["stored"] += len(first)
+        legacy["stats"]["inflated"] += len(map_data)
+        legacy["stats"]["adopted"] = 1
+        legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+        stale = legacy_path.read_bytes()
+
+        code, _, partial = run("--merge-only")
+        self.assertEqual(code, 1)
+        self.assertEqual(partial["missing_ranges"], [[boundary, len(data)]])
+        self.assertEqual(partial["shards_complete"], 1)
+        self.assertFalse(partial["census_exact"])
+        self.assertEqual(partial["totals"]["streams"], 1)
+        self.assertEqual(legacy_path.read_bytes(), stale)
+
+        code, stdout, rebuilt = run("--resume")
+        self.assertEqual(code, 0)
+        self.assertIn("2 shards, 1 to scan", stdout)
+        self.assertEqual(rebuilt["totals"], fresh["totals"])
+        self.assertEqual(rebuilt["missing_ranges"], [])
+        self.assertTrue(rebuilt["census_exact"])
+        self.assertEqual((out / "maps.json").read_bytes(), maps)
+        self.assertEqual(compatible_path.read_bytes(), compatible)
+        self.assertEqual(json.loads(legacy_path.read_bytes())["format"], WC.FORMAT)
+
+        code, stdout, resumed = run("--resume")
+        self.assertEqual(code, 0)
+        self.assertIn("2 shards, 0 to scan", stdout)
+        code, _, merged = run("--merge-only")
+        self.assertEqual(code, 0)
+        for summary in (resumed, merged):
+            self.assertEqual(summary["totals"], fresh["totals"])
+            self.assertTrue(summary["census_exact"])
+
     def test_required_len_detects_split_page(self):
         blob = TWI.make_resource(True)
         self.assertEqual(WC.required_len(blob), len(blob))

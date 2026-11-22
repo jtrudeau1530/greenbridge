@@ -48,13 +48,18 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)     \
-    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)            \
-    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) \
-    X(vkCmdCopyQueryPoolResults) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout)              \
-    X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
-    X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule)    \
-    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)          \
+    X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)        \
+    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)               \
+    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp)    \
+    X(vkCmdCopyQueryPoolResults) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDrawIndirectCount)    \
+    X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatchIndirect) X(vkGetBufferDeviceAddress)                      \
+    X(vkGetAccelerationStructureBuildSizesKHR) X(vkCreateAccelerationStructureKHR)                             \
+    X(vkDestroyAccelerationStructureKHR) X(vkGetAccelerationStructureDeviceAddressKHR)                         \
+    X(vkCmdBuildAccelerationStructuresKHR)                                                                    \
+    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)                   \
+    X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)                          \
+    X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule)      \
+    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)            \
     X(vkCmdPushConstants) X(vkCmdDispatch)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
@@ -235,9 +240,10 @@ private:
 class VulkanContext {
 public:
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
+    // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
-                  bool conditional_rendering = false)
-        : device_(device), tracker_(separate_depth_stencil_layouts) {
+                  bool conditional_rendering = false, bool ray_tracing = false)
+        : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
         replay_.clear_color_image = vk.vkCmdClearColorImage;
@@ -264,6 +270,11 @@ public:
             }
             return false;
         };
+        replay_.draw_indirect = vk.vkCmdDrawIndirect;
+        replay_.draw_indexed_indirect = vk.vkCmdDrawIndexedIndirect;
+        replay_.draw_indirect_count = vk.vkCmdDrawIndirectCount;
+        replay_.draw_indexed_indirect_count = vk.vkCmdDrawIndexedIndirectCount;
+        replay_.dispatch_indirect = vk.vkCmdDispatchIndirect;
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
@@ -273,6 +284,13 @@ public:
         replay_.end_query = vk.vkCmdEndQuery;
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
+        if (ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR) {
+            replay_.build_acceleration_structures = vk.vkCmdBuildAccelerationStructuresKHR;
+            replay_.resolve_acceleration_structure = [this](std::uint64_t va) {
+                const auto it = acceleration_structures_.find(va);
+                return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
+            };
+        }
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
@@ -364,6 +382,26 @@ public:
         return resources_.find(id) != resources_.end();
     }
 
+    bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
+
+    void register_acceleration_structure(std::uint64_t va, VkAccelerationStructureKHR as) {
+        if (!va || !as) return;
+        std::lock_guard lock(mutex_);
+        acceleration_structures_[va] = as;
+    }
+
+    void unregister_acceleration_structure(std::uint64_t va) {
+        if (!va) return;
+        std::lock_guard lock(mutex_);
+        acceleration_structures_.erase(va);
+    }
+
+    VkAccelerationStructureKHR resolve_acceleration_structure(std::uint64_t va) {
+        std::lock_guard lock(mutex_);
+        const auto it = acceleration_structures_.find(va);
+        return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
+    }
+
     // `prepare` is called with the context locked, at the start of the command buffer of every
     // ExecuteCommandLists, before the lists are written: the device brings the bindless set 0 of the translated
     // shaders up to date there (vulkan_bindless.h) and records what the set needs first. When it fails, nothing
@@ -432,9 +470,11 @@ private:
 
     VkDevice device_;
     bool loaded_ = false;
+    bool ray_tracing_ = false;
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;

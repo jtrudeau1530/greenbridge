@@ -52,6 +52,22 @@ class TileProbeInputTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn("0 bytes", p.stderr)
 
+    def test_a_sample_with_no_candidate_layout_is_an_error(self):
+        # Before: an 8-byte or 4 KiB blob printed nothing, wrote no preview and exited 0.
+        tiny = os.path.join(self.tmp.name, "tiny.bin")
+        with open(tiny, "wb") as f:
+            f.write(bytes(4096))
+        preview = os.path.join(self.tmp.name, "preview.png")
+        for extra in ((), ("--out", preview)):
+            with self.subTest(extra=extra):
+                p = self.run_tool(tiny, *extra)
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertIn("no layout fits", p.stderr)
+                self.assertIn("tiny.bin", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertFalse(os.path.exists(preview), "a run with no layout writes no preview")
+
     def test_offset_inside_the_file_still_probes(self):
         p = self.run_tool(self.blob, "--offset", "0")
         self.assertEqual(p.returncode, 0, p.stderr)

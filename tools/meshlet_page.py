@@ -9,11 +9,12 @@ Vertex block (header 0x60 bytes, first u32 is 0x00003063):
     +0x5C         u32, 0x200 in every block measured.
     slot 0  tag 0x63  12 bytes/vertex  float3 position
     slot 1  tag 0x26   4 bytes/vertex  RGBA8 (absent in some blocks)
-    slot 2  tag 0x63  12 bytes/vertex  float3 normal
+    slot 2  tag 0x63  12 bytes/vertex  float3 normal (absent in some blocks)
     slot 3  tag 0x42   8 bytes/vertex  float2
     slot 4  tag 0x42   8 bytes/vertex  float2 (absent in some blocks)
-    The streams are stored in slot order 0, 2, 1, 3, 4. The vertex count is (slot 2 - slot 0) / 12; the block
-    ends 8 * count bytes after its last slot.
+    The streams are stored in slot order 0, 2, 1, 3, 4. Only slot 0 is required. The vertex count is the span
+    from slot 0 to the next stream in offset order, divided by 12; the block ends 8 * count bytes after its last
+    slot.
 
 Meshlet group (first u32 has bit 31 set):
     +0   u32  0x80000000 | meshlet count K
@@ -72,16 +73,17 @@ def parse_block(data, at):
     if words[0] != BLOCK_MAGIC:
         raise PageError(f"no block magic at +0x{at:x}")
     slots = {i: (w & 0xFF, (w >> 8) * 2) for i, w in enumerate(words[:SLOT_COUNT]) if w}
-    for need in (0, 2):
-        if need not in slots:
-            raise PageError(f"block at +0x{at:x} has no slot {need}")
+    if 0 not in slots:
+        raise PageError(f"block at +0x{at:x} has no slot 0")
     if slots[0][1] != HEADER_SIZE:
         raise PageError(f"block at +0x{at:x}: slot 0 is not at +0x60")
-    span = slots[2][1] - slots[0][1]
-    if span <= 0 or span % 12:
-        raise PageError(f"block at +0x{at:x}: slot 2 offset is not 12 * count past slot 0")
-    count = span // 12
     order = sorted(slots, key=lambda i: slots[i][1])
+    if len(order) < 2 or order[0] != 0:
+        raise PageError(f"block at +0x{at:x}: slot 0 is not followed by another stream")
+    span = slots[order[1]][1] - slots[0][1]
+    if span <= 0 or span % SLOT_STRIDE[0]:
+        raise PageError(f"block at +0x{at:x}: slot {order[1]} offset is not 12 * count past slot 0")
+    count = span // SLOT_STRIDE[0]
     for here, nxt in zip(order, order[1:]):
         stride = SLOT_STRIDE.get(here)
         if stride is None or slots[nxt][1] - slots[here][1] != stride * count:
@@ -198,15 +200,17 @@ def block_checks(data, block):
            "colour_alpha_255": 0, "colour_vertices": 0, "uv_finite": 0, "uv_vertices": 0,
            "position_low_byte_zero": 0}
     pos = struct.unpack_from(f"<{3 * n}f", data, at + slots[0])
-    nrm = struct.unpack_from(f"<{3 * n}f", data, at + slots[2])
     for v in range(n):
         p = pos[3 * v:3 * v + 3]
         if all(math.isfinite(c) for c in p):
             out["positions_finite"] += 1
             out["positions_within_300m"] += all(abs(c) <= 300 for c in p)
-        q = nrm[3 * v:3 * v + 3]
-        if all(math.isfinite(c) for c in q) and abs(math.sqrt(sum(c * c for c in q)) - 1) < 0.02:
-            out["normals_unit"] += 1
+    if 2 in slots:
+        nrm = struct.unpack_from(f"<{3 * n}f", data, at + slots[2])
+        for v in range(n):
+            q = nrm[3 * v:3 * v + 3]
+            if all(math.isfinite(c) for c in q) and abs(math.sqrt(sum(c * c for c in q)) - 1) < 0.02:
+                out["normals_unit"] += 1
     raw = data[at + slots[0]:at + slots[0] + 12 * n]
     out["position_low_byte_zero"] = sum(1 for i in range(0, len(raw), 4) if raw[i] == 0)
     if 1 in slots:

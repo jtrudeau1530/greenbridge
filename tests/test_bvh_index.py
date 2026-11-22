@@ -180,6 +180,19 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(rows[1]["node_count"], 5)
         self.assertEqual(summary[0]["inflated"], 5000 + 0x140 + 5 * 64)
 
+    def test_fill_requires_all_bvh4_node_bytes(self):
+        path = os.path.join(self.dir, "one.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf([bvh_payload(1)]))
+        rows, _ = bvh_index.scan_rpf(path, max_inflate=384)
+        self.assertEqual(rows[0]["fill"], {"81": 64, "total": 64})
+        for cap in (320, 352):
+            with self.subTest(cap=cap):
+                rows, _ = bvh_index.scan_rpf(path, max_inflate=cap)
+                self.assertEqual(rows[0]["kind"], "bvh4")
+                self.assertEqual(rows[0]["node_bytes"], 64)
+                self.assertNotIn("fill", rows[0])
+
     def test_index_outputs(self):
         path = os.path.join(self.dir, "pack.rpf")
         with open(path, "wb") as f:
