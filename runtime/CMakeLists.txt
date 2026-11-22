@@ -1999,6 +1999,33 @@ if(TARGET Vulkan::Headers)
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
+
+      # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the
+      # device it gets, mapped and run by `gta6rt --run` with LEONIDA_D3D12=vulkan: the loader, the game thread, the
+      # proxies and the Vulkan device in one process. check_tiny_frame.py reads the verdict, the binding and the
+      # call order from outside; d3d12_com_test is its probe for "no usable Vulkan device" (exit code 77).
+      add_library(d3d12_xs_stub SHARED test/fixtures/d3d12_xs_stub.cpp test/fixtures/d3d12_xs_stub.def)
+      target_compile_definitions(d3d12_xs_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(d3d12_xs_stub PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(d3d12_xs_stub PROPERTIES
+        OUTPUT_NAME d3d12_xs
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+      )
+      add_executable(tiny_frame test/fixtures/tiny_frame.cpp)
+      target_link_libraries(tiny_frame PRIVATE d3d12_xs_stub)
+      target_compile_definitions(tiny_frame PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(tiny_frame PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(tiny_frame PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      )
+      if(Python3_FOUND)
+        add_test(NAME run_tiny_frame COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
+                 "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" ${_trace_runner})
+        set_tests_properties(run_tiny_frame PROPERTIES SKIP_RETURN_CODE 77)
+      endif()
     endif()
     # bvh_builder_test can put the package's XboxBvhBuilder on this device too (LEONIDA_BVH_DEVICE=vulkan).
     if(TARGET bvh_builder_test)
