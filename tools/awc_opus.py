@@ -365,10 +365,18 @@ def main(argv=None) -> int:
         ap.error(f"{a.out} is a file, not a folder")
     if os.path.isdir(a.src):
         banks = []
-        for root, _, files in os.walk(a.src):
-            output_parent = os.path.join(a.out, os.path.relpath(root, a.src))
-            banks.extend((os.path.join(root, name), output_parent)
-                         for name in files if name.lower().endswith(".awc"))
+
+        def scan_failed(error):
+            raise error
+
+        try:
+            for root, _, files in os.walk(a.src, onerror=scan_failed):
+                output_parent = os.path.join(a.out, os.path.relpath(root, a.src))
+                banks.extend((os.path.join(root, name), output_parent)
+                             for name in files if name.lower().endswith(".awc"))
+        except OSError as error:
+            print(f"ERROR: cannot list {error.filename or a.src}: {error.strerror or error}", file=sys.stderr)
+            return 1
         banks.sort()
     else:
         banks = [(a.src, a.out)]
