@@ -716,6 +716,49 @@ if(TARGET Vulkan::Headers)
       message(STATUS "glslangValidator not found: d3d12_compute_test and d3d12_draw_test are not built")
     endif()
 
+    # M1.5 (D3D-53): a draw whose VS and PS are translator output. test/shaders/vs_m15.asm and ps_m15.asm are assembled
+    # with llvm-mc and translated by tools/rdna2spirv.py through test/shaders/build.py, which also writes the FSSM
+    # programs their index entries are keyed by. Needs llvm-mc with the AMDGPU target (LLVM_MC in the environment, as
+    # for the other shader tests, or llvm-mc on PATH or in C:/msys64/ucrt64/bin) and the Vulkan SDK's spirv-as and
+    # spirv-val; without them the test is not built.
+    if(NOT LEONIDA_LLVM_MC)
+      if(DEFINED ENV{LLVM_MC})
+        set(LEONIDA_LLVM_MC "$ENV{LLVM_MC}")
+      else()
+        find_program(LEONIDA_LLVM_MC llvm-mc HINTS "C:/msys64/ucrt64/bin")
+      endif()
+    endif()
+    find_program(LEONIDA_SPIRV_AS spirv-as HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    find_program(LEONIDA_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND LEONIDA_SPIRV_VAL)
+      set(LEONIDA_M15_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m15_shaders)
+      get_filename_component(LEONIDA_SPIRV_TOOLS_DIR ${LEONIDA_SPIRV_AS} DIRECTORY)
+      file(TO_NATIVE_PATH "${LEONIDA_SPIRV_TOOLS_DIR}" LEONIDA_SPIRV_TOOLS_NATIVE)
+      set(LEONIDA_M15_FILES ${LEONIDA_M15_DIR}/spirv/index.json ${LEONIDA_M15_DIR}/fssm/vs_m15.fssm
+                            ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_M15_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M15_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_M15_DIR} vs_m15 ps_m15
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m15.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating vs_m15 and ps_m15 for the translated draw test"
+        VERBATIM)
+      add_executable(d3d12_translated_draw_test test/d3d12_translated_draw_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_M15_FILES})
+      target_link_libraries(d3d12_translated_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_translated_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_M15_DIR="${LEONIDA_M15_DIR}")
+      target_compile_options(d3d12_translated_draw_test PRIVATE /W4 /permissive- /utf-8)
+    else()
+      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test is not built")
+    endif()
+
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
