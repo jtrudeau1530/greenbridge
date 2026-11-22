@@ -221,7 +221,7 @@ def write_all(report, out_dir):
     try:
         with open(report, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:  # ValueError: bad JSON or non-UTF-8 bytes
         raise SystemExit(f"{report}: cannot read report: {e}") from None
     if not isinstance(data, dict) or data.get("tool") != "rbf0_tree":
         raise SystemExit(f"{report}: not an rbf0_tree.py JSON report")

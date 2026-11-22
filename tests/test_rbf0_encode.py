@@ -272,6 +272,16 @@ class Cli(unittest.TestCase):
                 self.run_main(report, out_dir)
             self.assertFalse(os.path.exists(out_dir))
 
+    def test_non_utf8_report_is_one_line_error(self):
+        report = os.path.join(self.tmp.name, "binary.json")
+        with open(report, "wb") as f:
+            f.write(b"\xff\xfe{\x80")
+        out_dir = os.path.join(self.tmp.name, "out-binary")
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(report, out_dir)
+        self.assertIn("cannot read report", str(cm.exception))
+        self.assertFalse(os.path.exists(out_dir))
+
     def test_write_all_handles_non_int_offset_and_non_dict_resource(self):
         doc = rbf0_tree.parse_resource(every_record(True))
         doc["offset"] = "0x100"
