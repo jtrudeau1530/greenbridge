@@ -400,6 +400,82 @@ class SIMDWavefront:
         return self.load_vgpr_wave(dst_reg)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Isolation for v_mul_hi
+# ==============================================================================
+
+@dataclass
+class MulHiStatusFlags:
+    zero: bool = False
+    negative: bool = False
+    overflow_32: bool = False
+
+
+def compute_mul_hi_flags(opcode: Opcode, s0: int, s1: int, hi: int) -> MulHiStatusFlags:
+    flags = MulHiStatusFlags()
+    flags.zero = (hi == 0)
+    flags.negative = bool((hi & SIGN32) != 0)
+
+    if opcode == Opcode.V_MUL_HI_U32:
+        # For unsigned, product overflows 32 bits if high dword is non-zero
+        flags.overflow_32 = (hi != 0)
+    elif opcode == Opcode.V_MUL_HI_I32:
+        # For signed, product overflows 32 bits if 64-bit product doesn't fit in signed 32-bit:
+        # which means hi is not a pure sign-extension of lo.
+        lo, _ = ref_mul_pair_i32(s0, s1)
+        expected_hi = 0xFFFFFFFF if (lo & SIGN32) else 0
+        flags.overflow_32 = (hi != expected_hi)
+
+    return flags
+
+
+def ref_cmp_u32(op: str, s0: int, s1: int) -> bool:
+    u0 = s0 & MASK32
+    u1 = s1 & MASK32
+    if op in ("eq", "=="):
+        return u0 == u1
+    elif op in ("ne", "!="):
+        return u0 != u1
+    elif op in ("lt", "<"):
+        return u0 < u1
+    elif op in ("le", "<="):
+        return u0 <= u1
+    elif op in ("gt", ">"):
+        return u0 > u1
+    elif op in ("ge", ">="):
+        return u0 >= u1
+    raise ValueError(f"Unknown comparison operator: {op}")
+
+
+def ref_cmp_i32(op: str, s0: int, s1: int) -> bool:
+    i0 = to_i32(s0)
+    i1 = to_i32(s1)
+    if op in ("eq", "=="):
+        return i0 == i1
+    elif op in ("ne", "!="):
+        return i0 != i1
+    elif op in ("lt", "<"):
+        return i0 < i1
+    elif op in ("le", "<="):
+        return i0 <= i1
+    elif op in ("gt", ">"):
+        return i0 > i1
+    elif op in ("ge", ">="):
+        return i0 >= i1
+    raise ValueError(f"Unknown comparison operator: {op}")
+
+
+def generate_condition_mask(
+    op: str, is_signed: bool, s0_lanes: list[int], s1_lanes: list[int]
+) -> int:
+    mask = 0
+    fn = ref_cmp_i32 if is_signed else ref_cmp_u32
+    for lane, (s0, s1) in enumerate(zip(s0_lanes, s1_lanes)):
+        if fn(op, s0, s1):
+            mask |= (1 << lane)
+    return mask
+
+
 class TestVMulHiOracleAndModel(unittest.TestCase):
     """Test suite for reference mathematical oracle and architectural model."""
 
@@ -771,6 +847,74 @@ class TestRegisterAliasing(unittest.TestCase):
                 self.assertEqual(res[lane], expected)
             else:
                 self.assertEqual(res[lane], init_vals[lane])
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_status_flags_zero_and_negative(self) -> None:
+        # High word is 0
+        r0 = ref_mul_hi_u32(100, 200)
+        f0 = compute_mul_hi_flags(Opcode.V_MUL_HI_U32, 100, 200, r0)
+        self.assertTrue(f0.zero)
+        self.assertFalse(f0.negative)
+        self.assertFalse(f0.overflow_32)
+
+        # High word has sign bit set
+        r1 = ref_mul_hi_i32(to_u32(-10), 2)
+        f1 = compute_mul_hi_flags(Opcode.V_MUL_HI_I32, to_u32(-10), 2, r1)
+        self.assertEqual(r1, 0xFFFFFFFF)
+        self.assertFalse(f1.zero)
+        self.assertTrue(f1.negative)
+        self.assertFalse(f1.overflow_32)  # -20 fits in signed 32-bit!
+
+    def test_status_flags_overflow_32(self) -> None:
+        # Unsigned overflow 32 bits
+        r_u = ref_mul_hi_u32(0x80000000, 2)
+        f_u = compute_mul_hi_flags(Opcode.V_MUL_HI_U32, 0x80000000, 2, r_u)
+        self.assertEqual(r_u, 1)
+        self.assertTrue(f_u.overflow_32)
+
+        # Signed overflow 32 bits: 2^30 * 4 = 2^32, does not fit in signed 32-bit (overflows)
+        r_i = ref_mul_hi_i32(0x40000000, 4)
+        f_i = compute_mul_hi_flags(Opcode.V_MUL_HI_I32, 0x40000000, 4, r_i)
+        self.assertEqual(r_i, 1)
+        self.assertTrue(f_i.overflow_32)
+
+    def test_vcc_and_scc_preserved(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vcc = 0x12345678_9ABCDEF0
+        interp.scc = 1
+        interp.vgpr.set_vgpr(1, 0x80000000)
+        interp.vgpr.set_vgpr(2, 2)
+
+        interp.execute_asm("v_mul_hi_u32 v0, v1, v2")
+        self.assertEqual(interp.vcc, 0x12345678_9ABCDEF0)
+        self.assertEqual(interp.scc, 1)
+
+        sim = SIMDWavefront(wave_size=32)
+        sim.vcc = 0xCAFEBABE
+        sim.store_vgpr_wave(1, [0x80000000] * 32)
+        sim.store_vgpr_wave(2, [2] * 32)
+        sim.step_v_mul_hi(Opcode.V_MUL_HI_U32, 0, 1, 2)
+        self.assertEqual(sim.vcc, 0xCAFEBABE)
+
+    def test_condition_mask_generation(self) -> None:
+        # Generate condition mask from high-word comparisons
+        hi_words = [0, 1, 0xFFFFFFFF, 0x40000000]
+        zeros = [0, 0, 0, 0]
+
+        # Equal to zero -> lanes 0
+        mask_eq = generate_condition_mask("==", False, hi_words, zeros)
+        self.assertEqual(mask_eq, 0b0001)
+
+        # Greater than zero (unsigned) -> lanes 1, 2, 3
+        mask_gt_u = generate_condition_mask(">", False, hi_words, zeros)
+        self.assertEqual(mask_gt_u, 0b1110)
+
+        # Less than zero (signed) -> lane 2 (0xFFFFFFFF = -1)
+        mask_lt_i = generate_condition_mask("<", True, hi_words, zeros)
+        self.assertEqual(mask_lt_i, 0b0100)
 
 
 if __name__ == "__main__":
