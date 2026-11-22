@@ -218,3 +218,16 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 ```
 
 RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.
+
+### Resource descriptions
+
+`d3d12_resource_desc_test` creates the same committed and reserved resources on the Vulkan-backed device and on
+Windows D3D12 (the default adapter and WARP, whichever exist) and compares every field of `ID3D12Resource::GetDesc`:
+the `Alignment` and `MipLevels` a description left at 0 must read back as the host fills them in. A description the
+host refuses is skipped, and one only the layer refuses (1D textures today) is listed and not compared. It needs a
+Vulkan GPU and runs explicitly.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
+```
