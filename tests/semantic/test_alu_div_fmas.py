@@ -11,6 +11,7 @@ scaled FMA output flushes subnormals to signed zero before (and after) output mo
 For f64 under denorm16_64=3, subnormal inputs and outputs are preserved with single rounding.
 Both accept VOP3 input (abs/neg) and output (mul:2, mul:4, div:2, clamp) modifiers.
 """
+from fractions import Fraction
 import math
 import os
 import re
@@ -140,13 +141,30 @@ def _eval_spv_f64_mrt0(spv_text: str):
         return q & 0xFFFFFFFF, q >> 32
 
     def safe_fma(a, b, c):
-        try:
-            return math.fma(a, b, c)
-        except ValueError:
+        # Exact IEEE-754 binary64 FMA compatible with Python 3.12 (math.fma was added in 3.13).
+        if math.isnan(a) or math.isnan(b) or math.isnan(c):
             return float("nan")
+        if math.isinf(a) or math.isinf(b):
+            if a == 0.0 or b == 0.0:
+                return float("nan")
+            prod_inf = math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b))
+            if math.isinf(c) and math.copysign(1.0, c) != math.copysign(1.0, prod_inf):
+                return float("nan")
+            return prod_inf
+        if math.isinf(c):
+            return c
+        exact = Fraction(a) * Fraction(b) + Fraction(c)
+        if exact == 0:
+            prod_neg = (math.copysign(1.0, a) * math.copysign(1.0, b)) < 0.0
+            c_neg = math.copysign(1.0, c) < 0.0
+            if a * b == 0.0 and c == 0.0 and prod_neg and c_neg:
+                return -0.0
+            return 0.0
+        try:
+            r = float(exact)
         except OverflowError:
-            s = math.copysign(1.0, a) * math.copysign(1.0, b)
-            return -math.inf if s < 0 else math.inf
+            return -math.inf if exact < 0 else math.inf
+        return -0.0 if (r == 0.0 and exact < 0) else r
 
     consts, env, mem = {}, {}, {}
     in_fn = False
