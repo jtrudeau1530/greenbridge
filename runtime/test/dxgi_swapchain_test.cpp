@@ -549,6 +549,15 @@ int main() {
             return fail("SetMatrixTransform/GetMatrixTransform did not round-trip");
         if (sc->SetMatrixTransform(nullptr) != E_INVALIDARG || sc->GetMatrixTransform(nullptr) != E_INVALIDARG)
             return fail("Get/SetMatrixTransform(nullptr) should return E_INVALIDARG");
+
+        DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_ROTATE180;
+        if (FAILED(sc->GetRotation(&rotation)) || rotation != DXGI_MODE_ROTATION_IDENTITY)
+            return fail("GetRotation default should be identity");
+        if (FAILED(sc->SetRotation(DXGI_MODE_ROTATION_ROTATE90)) || FAILED(sc->GetRotation(&rotation)) ||
+            rotation != DXGI_MODE_ROTATION_ROTATE90)
+            return fail("SetRotation/GetRotation did not round-trip");
+        if (sc->GetRotation(nullptr) != E_INVALIDARG)
+            return fail("GetRotation(nullptr) should return E_INVALIDARG");
     }
 
     // Unsupported swapchain format must fail explicitly instead of silently downgrading to BGRA8.

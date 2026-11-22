@@ -290,9 +290,13 @@ public:
         *color = background_color_;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION* r) override {
-        if (r) *r = DXGI_MODE_ROTATION_IDENTITY;
+    HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION rotation) override {
+        rotation_ = rotation;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION* rotation) override {
+        if (!rotation) return E_INVALIDARG;
+        *rotation = rotation_;
         return S_OK;
     }
 
@@ -400,6 +404,7 @@ private:
     std::atomic<UINT> max_frame_latency_{2};
     DXGI_RGBA background_color_{0, 0, 0, 0};
     DXGI_MATRIX_3X2_F matrix_transform_{1, 0, 0, 1, 0, 0};
+    DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
 };
 
 struct ReservationState {
