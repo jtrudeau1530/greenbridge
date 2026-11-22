@@ -27,6 +27,7 @@ Unsigned 64-bit Integer Properties:
 """
 
 import math
+import re
 import struct
 import unittest
 from dataclasses import dataclass, field
@@ -142,6 +143,141 @@ class LDSMemory64:
         return old_val, new_val
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) 64-bit atomic opcodes."""
+    DS_MAX_RTN_U64 = "ds_max_rtn_u64"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation (scalar or contiguous multi-register)."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(f"Register index out of range for {self.reg_type.name}: {self.index}")
+        if self.count < 1 or (self.index + self.count > max_limit):
+            raise ValueError(
+                f"Contiguous register sequence exceeds {self.reg_type.name} limits: "
+                f"{self.index} + {self.count} > {max_limit}"
+            )
+
+    def __str__(self) -> str:
+        if self.count == 1:
+            return f"{self.reg_type.value}{self.index}"
+        return f"{self.reg_type.value}[{self.index}:{self.index + self.count - 1}]"
+
+
+@dataclass(frozen=True)
+class DSMaxRtnU64Instruction:
+    """Symbolic AST node representing a ds_max_rtn_u64 instruction.
+
+    Format:
+        ds_max_rtn_u64 v[dst_lo:dst_hi], vaddr, v[data_lo:data_hi] [offset:offset16]
+    """
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata0: RegisterOperand
+    offset: int = 0
+    opcode: DSOpcode = DSOpcode.DS_MAX_RTN_U64
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR or self.vdst.count != 2:
+            raise ValueError(f"vdst must be a 2-VGPR sequence (e.g. v[0:1]), got {self.vdst}")
+        if self.vaddr.reg_type != RegType.VGPR or self.vaddr.count != 1:
+            raise ValueError(f"vaddr must be a single VGPR (e.g. v2), got {self.vaddr}")
+        if self.vdata0.reg_type != RegType.VGPR or self.vdata0.count != 2:
+            raise ValueError(f"vdata0 must be a 2-VGPR sequence (e.g. v[3:4]), got {self.vdata0}")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"offset out of range [0, 65535]: {self.offset}")
+
+    def to_assembly(self) -> str:
+        """Serialize AST node to standard assembly string."""
+        asm = f"{self.opcode.value} {self.vdst}, {self.vaddr}, {self.vdata0}"
+        if self.offset != 0:
+            asm += f" offset:{self.offset}"
+        return asm
+
+    @classmethod
+    def parse(cls, asm: str) -> DSMaxRtnU64Instruction:
+        """Parse an assembly string into a DSMaxRtnU64Instruction AST node."""
+        cleaned = re.sub(r"[;#].*$", "", asm).strip()
+        if not cleaned:
+            raise ValueError("Empty assembly string")
+
+        tokens = cleaned.split()
+        if not tokens:
+            raise ValueError("Empty instruction")
+
+        op_str = tokens[0].lower()
+        if op_str != DSOpcode.DS_MAX_RTN_U64.value:
+            raise ValueError(f"Unsupported opcode '{tokens[0]}', expected '{DSOpcode.DS_MAX_RTN_U64.value}'")
+
+        rest = " ".join(tokens[1:])
+        parts = [p.strip() for p in rest.split(",") if p.strip()]
+
+        if len(parts) < 3:
+            raise ValueError(f"Insufficient operands for {op_str}: expected at least 3, got {len(parts)}")
+
+        vdst_str = parts[0]
+        vaddr_str = parts[1]
+
+        vdata_and_mods = parts[2].split()
+        vdata_str = vdata_and_mods[0]
+
+        offset_val = 0
+        mod_tokens = vdata_and_mods[1:] + parts[3:]
+        for m in mod_tokens:
+            m_lower = m.lower()
+            if m_lower.startswith("offset:"):
+                raw_offset = m[len("offset:"):]
+                try:
+                    offset_val = int(raw_offset, 0)
+                except ValueError:
+                    raise ValueError(f"Invalid integer offset value: '{raw_offset}'")
+            else:
+                raise ValueError(f"Unknown modifier or unexpected extra token: '{m}'")
+
+        def parse_vgpr(reg_s: str, expected_count: int) -> RegisterOperand:
+            reg_s = reg_s.strip()
+            # Match bracketed pair: v[0:1] or V[0:1]
+            match_pair = re.match(r"^[vV]\[(\d+):(\d+)\]$", reg_s)
+            if match_pair:
+                start_idx = int(match_pair.group(1))
+                end_idx = int(match_pair.group(2))
+                count = end_idx - start_idx + 1
+                if count != expected_count:
+                    raise ValueError(f"Expected {expected_count} registers, got {count} in '{reg_s}'")
+                return RegisterOperand(start_idx, RegType.VGPR, count=count)
+
+            # Match scalar vgpr: v0 or V0
+            match_single = re.match(r"^[vV](\d+)$", reg_s)
+            if match_single:
+                idx = int(match_single.group(1))
+                return RegisterOperand(idx, RegType.VGPR, count=expected_count)
+
+            raise ValueError(f"Invalid VGPR operand syntax: '{reg_s}'")
+
+        vdst = parse_vgpr(vdst_str, expected_count=2)
+        vaddr = parse_vgpr(vaddr_str, expected_count=1)
+        vdata0 = parse_vgpr(vdata_str, expected_count=2)
+
+        return cls(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=offset_val)
+
+
 class TestLDSMaxRtnU64OracleAndModel(unittest.TestCase):
     """Phase 1: Unit tests for unsigned 64-bit integer oracle and LDS architectural model."""
 
@@ -224,6 +360,67 @@ class TestLDSMaxRtnU64OracleAndModel(unittest.TestCase):
 
         b_lo2, b_hi2 = calc_lds_qword_banks(124)  # dword 31
         self.assertEqual((b_lo2, b_hi2), (31, 0))  # wraps around 32 banks
+
+
+class TestDSMaxRtnU64AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_operand_scalar_and_pair(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR, count=1)
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(v0.count, 1)
+
+        vpair = RegisterOperand(0, RegType.VGPR, count=2)
+        self.assertEqual(str(vpair), "v[0:1]")
+        self.assertEqual(vpair.count, 2)
+
+    def test_register_operand_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(255, RegType.VGPR, count=2)  # 255 + 2 > 256
+
+    def test_instruction_formatting(self) -> None:
+        vdst = RegisterOperand(0, RegType.VGPR, count=2)
+        vaddr = RegisterOperand(2, RegType.VGPR, count=1)
+        vdata = RegisterOperand(4, RegType.VGPR, count=2)
+
+        inst1 = DSMaxRtnU64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata)
+        self.assertEqual(inst1.to_assembly(), "ds_max_rtn_u64 v[0:1], v2, v[4:5]")
+
+        inst2 = DSMaxRtnU64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata, offset=32)
+        self.assertEqual(inst2.to_assembly(), "ds_max_rtn_u64 v[0:1], v2, v[4:5] offset:32")
+
+    def test_instruction_parsing_valid(self) -> None:
+        inst1 = DSMaxRtnU64Instruction.parse("ds_max_rtn_u64 v[0:1], v2, v[4:5]")
+        self.assertEqual(inst1.vdst.index, 0)
+        self.assertEqual(inst1.vdst.count, 2)
+        self.assertEqual(inst1.vaddr.index, 2)
+        self.assertEqual(inst1.vdata0.index, 4)
+        self.assertEqual(inst1.vdata0.count, 2)
+        self.assertEqual(inst1.offset, 0)
+
+        inst2 = DSMaxRtnU64Instruction.parse("ds_max_rtn_u64 v[10:11], v5, v[12:13] offset:64")
+        self.assertEqual(inst2.vdst.index, 10)
+        self.assertEqual(inst2.offset, 64)
+
+        # Scalar syntax promotion to pair: v0 -> v[0:1]
+        inst3 = DSMaxRtnU64Instruction.parse("ds_max_rtn_u64 v0, v2, v4 offset:0x20")
+        self.assertEqual(inst3.vdst.index, 0)
+        self.assertEqual(inst3.vdst.count, 2)
+        self.assertEqual(inst3.vdata0.index, 4)
+        self.assertEqual(inst3.vdata0.count, 2)
+        self.assertEqual(inst3.offset, 32)
+
+    def test_instruction_roundtrip(self) -> None:
+        vdst = RegisterOperand(6, RegType.VGPR, count=2)
+        vaddr = RegisterOperand(8, RegType.VGPR, count=1)
+        vdata = RegisterOperand(10, RegType.VGPR, count=2)
+        inst = DSMaxRtnU64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata, offset=128)
+        parsed = DSMaxRtnU64Instruction.parse(inst.to_assembly())
+        self.assertEqual(inst, parsed)
 
 
 if __name__ == "__main__":
