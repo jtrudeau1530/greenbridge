@@ -635,7 +635,7 @@ class Gen:
         return r
 
     def f16_out(self, d, r, hi=0):
-        """Narrow f32 ``r`` to f16 (round to nearest even, f16_bits) and write it to the low half of ``d``, or to the high half when
+        """Narrow f32 ``r`` to f16 (f16_res: nearest even, or toward zero under MODE) and write it to the low half of ``d``, or to the high half when
         ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16)."""
         lo = self.f16_res(r)
         if not hi:
