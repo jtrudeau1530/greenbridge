@@ -53,6 +53,18 @@ class PartialFailure(unittest.TestCase):
         self.assertIn("no reference output from AMD native", out)
 
 
+class HarnessError(unittest.TestCase):
+    def test_missing_binary_reports_failure(self):
+        with patch.object(bench_wave64, "build", lambda work, name, emulate, llvm_mc: "x.spv"), \
+                patch.object(bench_wave64, "segments", lambda spv: None), \
+                patch.object(bench_wave64.subprocess, "run", side_effect=FileNotFoundError(2, "No such file")), \
+                patch.object(sys, "argv", ["bench_wave64.py", "--procs", "2"]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = bench_wave64.main()
+        self.assertEqual(code, 1)
+        self.assertIn("failed or unsupported", out.getvalue())
+
+
 class ArgumentValidation(unittest.TestCase):
     def test_positive_only(self):
         for option in ("--groups", "--reps", "--procs"):
