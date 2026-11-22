@@ -357,7 +357,8 @@ class PipelineStageIsolationTest(unittest.TestCase):
             mock_shaders.assert_not_called()
             mock_assets.assert_not_called()
             mock_runtime.assert_not_called()
-            mock_pipelines.assert_called_once_with(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir))
+            mock_pipelines.assert_called_once_with(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir),
+                                                   mock.ANY)
 
 
 class StageResumptionAndStepIsolationTest(unittest.TestCase):
