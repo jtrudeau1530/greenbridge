@@ -1530,7 +1530,7 @@ class Gen:
         vd = a[0]
         if vd["k"] != "vgpr" or vd.get("n", 1) != 2:
             raise Unsupported(op + " data")
-        addr, _, in_b = self.buffer_address(a, mods, elem="fmt", fixed_fmt=62)
+        addr, _, in_b, _ = self.buffer_address(a, mods, elem="fmt", fixed_fmt=62)  # step: as buffer_atomic
         vals = [self.load_reg("vgpr", vd["r"] + w) for w in range(2)]
         cond = self.tmp()
         self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
