@@ -1,3 +1,4 @@
+#include "predicated_copy_controls.h"
 // Seed an occlusion heap with independent Vulkan draws, then resolve it through the D3D12 replay queue.
 // This exercises the real GPU query copy and normalization without needing D3D12 draw commands.
 #include "vk_test_device.h"
@@ -154,6 +155,11 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical,
                                                                                                 &memory);
     context.set_occlusion_resolve_memory(memory);
+    VkPhysicalDeviceProperties properties{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
+    context.configure_predication(d.device_proc, memory, properties.limits.maxStorageBufferRange, d.family);
+    PredicatedCopyControl copy_control;
+    EXPECT(copy_control.create(d, context, properties.limits));
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok());
     constexpr QueryHeapId query_id = 1, stats_id = 2;
@@ -164,7 +170,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     constexpr ResourceId destination_id = 3, predicate_id = 4, misaligned_id = 5;
     constexpr VkDeviceSize binding_offset = 24, range_offset = 16, result_size = sizeof(std::uint64_t);
     constexpr VkDeviceSize ordinary_offset = range_offset + (last_gap + 2) * result_size;
-    constexpr VkDeviceSize rerun_offset = ordinary_offset + 2 * result_size;
+    constexpr VkDeviceSize ordinary_zero_offset = ordinary_offset + 2 * result_size;
+    constexpr VkDeviceSize rerun_offset = ordinary_zero_offset + 2 * result_size;
     constexpr VkDeviceSize bytes = binding_offset + rerun_offset + 6 * result_size;
     void* mapped = nullptr;
     const VkBuffer dst = d.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
@@ -191,7 +198,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
         void* predicate_mapping = nullptr;
         ResourceBinding predicate{};
         predicate.size = 8;
-        predicate.buffer = d.buffer(predicate.size, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT,
+        predicate.buffer = d.buffer(predicate.size, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                     &predicate_mapping);
         EXPECT(predicate.buffer && predicate_mapping);
         std::memset(predicate_mapping, 0, predicate.size);
@@ -203,6 +210,9 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
                                    range_offset}));
     EXPECT(binary.resolve_queries({query_id, d3d12_query::occlusion, ordinary_index, 1, destination_id,
                                    ordinary_offset}));
+    // An ordinary un-ended query zeroed via vkCmdFillBuffer must also run unconditionally under a false predicate.
+    EXPECT(binary.resolve_queries({query_id, d3d12_query::occlusion, 0, 1, destination_id, ordinary_zero_offset}));
+    EXPECT(copy_control.record(binary));
     EXPECT(binary.close());
     CommandList rerun;
     EXPECT(rerun.resolve_queries({query_id, d3d12_query::binary_occlusion, first_visible + 1, 3, destination_id,
@@ -228,6 +238,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
             expected = index >= first_visible && index < last_gap ? 1 : 0;
         } else if (offset == binding_offset + ordinary_offset) {
             expected = raw;
+        } else if (offset == binding_offset + ordinary_zero_offset) {
+            expected = 0;
         } else if (offset >= rerun_begin && offset < rerun_begin + 3 * result_size) {
             expected = 1;
         }
@@ -253,6 +265,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     }
     std::printf("binary occlusion: %u visible, 3 zero, 3 repeated; ordinary result %llu; offsets and sentinels exact\n",
                 visible_count, static_cast<unsigned long long>(raw));
+    EXPECT(copy_control.check());
     return 0;
 }
 

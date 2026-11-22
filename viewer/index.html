@@ -48,6 +48,8 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // ---------- world description ----------
 // world/world.json: { "spawn": [x,y,z], "chunks": [ { "id", "url", "bounds": [minx,miny,minz,maxx,maxy,maxz] } ] }
+// A world built with world_build --lod-sets also has "lod_bands": { tier: [start, end] } (metres), and each
+// chunk names its "lod" tier and its grid "cell": [minx, minz, maxx, maxz].
 // Each chunk is a .glb in world space (Y up, metres). Validate the manifest before
 // the camera and streaming code use its coordinates and chunk identifiers.
 function manifestError(world) {
@@ -63,6 +65,14 @@ function manifestError(world) {
     const b = chunk.bounds;
     if (!isPosition(b, 6) || b[0] > b[3] || b[1] > b[4] || b[2] > b[5])
       return `chunks[${i}].bounds must contain six finite, ordered coordinates`;
+    if (chunk.lod !== undefined) {
+      const band = world.lod_bands?.[chunk.lod];
+      if (!isPosition(band, 2) || band[0] < 0 || band[0] > band[1])
+        return `chunks[${i}].lod must name a lod_bands entry with two finite, ordered distances`;
+      const c = chunk.cell;
+      if (!isPosition(c, 4) || c[0] > c[2] || c[1] > c[3])
+        return `chunks[${i}].cell must contain four finite, ordered coordinates`;
+    }
     ids.add(chunk.id);
   }
   return null;
@@ -242,6 +252,21 @@ function dist(c, p) {
   const dx = Math.max(b[0] - p.x, 0, p.x - b[3]), dy = Math.max(b[1] - p.y, 0, p.y - b[4]), dz = Math.max(b[2] - p.z, 0, p.z - b[5]);
   return Math.hypot(dx, dy, dz);
 }
+// LOD sets: every grid cell has one chunk per detail tier, and a tier is shown only while the camera's
+// horizontal distance to the cell lies in that tier's band, so one tier per cell is drawn. LOD_SLACK
+// keeps a loaded tier a little past its band so crossing an edge does not reload it every frame.
+const LOD_SLACK = 32;
+function cellDist(c, p) {
+  const r = c.cell;
+  return Math.hypot(Math.max(r[0] - p.x, 0, p.x - r[2]), Math.max(r[1] - p.z, 0, p.z - r[3]));
+}
+// The distance used to rank a chunk, and whether it should load (slack 0) or stay loaded (LOD_SLACK).
+function range(def, p) {
+  const band = def.lod !== undefined ? world.lod_bands?.[def.lod] : undefined;
+  if (!band) { const d = dist(def, p); return { d, load: d < LOAD_R, keep: d <= UNLOAD_R }; }
+  const d = cellDist(def, p);
+  return { d, load: d >= band[0] && d < band[1], keep: d >= band[0] - LOD_SLACK && d < band[1] + LOD_SLACK };
+}
 function drop(id) {
   const c = live.get(id); if (!c) return;
   live.delete(id);
@@ -279,7 +304,7 @@ async function loadChunk(entry) {
 function stream(now = performance.now()) {
   const p = camera.position;
   for (const [id, c] of live) {
-    if ((!c.obj && !c.loading) || dist(c.def, p) <= UNLOAD_R) continue;
+    if ((!c.obj && !c.loading) || range(c.def, p).keep) continue;
     drop(id);
     // A canceled retry does not erase the previous failures or spend another attempt.
     if (c.previous) live.set(id, c.previous);
@@ -291,8 +316,8 @@ function stream(now = performance.now()) {
   for (const def of world.chunks) {
     const entry = live.get(def.id);
     if (entry && (entry.obj || entry.loading || entry.attempts >= MAX_LOAD_ATTEMPTS || now < entry.retryAt)) continue;
-    const distance = dist(def, p);
-    if (distance < LOAD_R) want.push({ def, distance });
+    const { d: distance, load } = range(def, p);
+    if (load) want.push({ def, distance });
   }
   want.sort((a, b) => a.distance - b.distance);
   for (const { def } of want) {

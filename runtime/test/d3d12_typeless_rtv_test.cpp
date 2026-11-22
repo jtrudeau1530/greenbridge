@@ -2,6 +2,7 @@
 // Compare typed RTVs on one typeless RGBA8 resource against Windows D3D12/WARP.
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <algorithm>
@@ -28,8 +29,10 @@ struct Event {
 
 struct ClearOptions {
     bool automatic_mips = false;
-    int predicate = -1; // -1: disabled; otherwise the upload buffer contains this value.
+    bool predication = false;
+    std::uint64_t predicate = 0;
     D3D12_PREDICATION_OP operation = D3D12_PREDICATION_OP_EQUAL_ZERO;
+    bool overwrite_predicate = false;
 };
 
 bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT rect_format, bool partial,
@@ -111,21 +114,43 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     device->CreateRenderTargetView(image.p, &view, handle);
     view.Format = rect_format;
     device->CreateRenderTargetView(image.p, &view, other);
-    Ref<ID3D12Resource> predicate;
-    if (options.predicate >= 0) {
+    Ref<ID3D12Resource> predicate, predicate_upload;
+    if (options.predication) {
         D3D12_RESOURCE_DESC predicate_desc = buffer;
-        predicate_desc.Width = 8;
+        predicate_desc.Width = 16;
         const D3D12_HEAP_PROPERTIES upload{D3D12_HEAP_TYPE_UPLOAD};
         CHECK(SUCCEEDED(device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &predicate_desc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&predicate.p))));
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&predicate_upload.p))));
         void* mapped = nullptr;
         const D3D12_RANGE none{};
-        CHECK(SUCCEEDED(predicate->Map(0, &none, &mapped)) && mapped);
-        const UINT64 value = UINT64(options.predicate);
-        std::memcpy(mapped, &value, sizeof(value));
-        const D3D12_RANGE written{0, sizeof(value)};
-        predicate->Unmap(0, &written);
-        list->SetPredication(predicate.p, 0, options.operation);
+        CHECK(SUCCEEDED(predicate_upload->Map(0, &none, &mapped)) && mapped);
+        const UINT64 values[] = {options.predicate, options.predicate ? 0u : 1u};
+        std::memcpy(mapped, values, sizeof(values));
+        const D3D12_RANGE written{0, sizeof(values)};
+        predicate_upload->Unmap(0, &written);
+        const auto transition_predicate = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = predicate.p;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = before; barrier.Transition.StateAfter = after;
+            list->ResourceBarrier(1, &barrier);
+        };
+        if (options.overwrite_predicate) {
+            const D3D12_HEAP_PROPERTIES local{D3D12_HEAP_TYPE_DEFAULT};
+            CHECK(SUCCEEDED(device->CreateCommittedResource(&local, D3D12_HEAP_FLAG_NONE, &predicate_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&predicate.p))));
+            list->CopyBufferRegion(predicate.p, 0, predicate_upload.p, 0, 8);
+            transition_predicate(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+        }
+        list->SetPredication(predicate.p ? predicate.p : predicate_upload.p, 0, options.operation);
+        if (options.overwrite_predicate) {
+            // Choose only predicates that execute this copy on both backends. Subsequent clears must still use
+            // the captured value, even though the predicate buffer now has the opposite zero/nonzero value.
+            transition_predicate(D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(predicate.p, 0, predicate_upload.p, 8, 8);
+            transition_predicate(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+        }
     }
     list->ClearRenderTargetView(handle, full, 0, nullptr);
     if (rewrite) {
@@ -136,7 +161,7 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     const D3D12_RECT rect = array || mip_chain ? D3D12_RECT{mip == 2 ? 0 : 1, 0,
         LONG(std::max(1u, width >> mip)), LONG(std::max(1u, height >> mip))} : D3D12_RECT{1, 1, 4, 3};
     if (partial) list->ClearRenderTargetView(other, part, 1, &rect);
-    if (predicate.p) list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    if (options.predication) list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = image.p;
@@ -229,7 +254,9 @@ int main() {
         info.queue = vk.queue;
         info.queue_family = vk.family;
         info.conditional_rendering = vk.conditional_rendering;
+        info.storage_buffer_8bit = vk.storage_buffer_8bit;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        if (hostwine::host_is_wine()) return 77;  // WARP is the reference for the readbacks
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
@@ -335,12 +362,16 @@ int main() {
                         for (const auto whole : formats) {
                             for (const auto part : formats) {
                                 if (!partial && part != whole) continue; // No rectangle: one case per whole-view format.
-                                for (int predicate : {-1, 0, 1}) {
-                                    if (predicate >= 0 && !vk.conditional_rendering) continue;
+                                for (const auto predicate : {std::pair{false, UINT64_C(0)}, std::pair{true, UINT64_C(0)},
+                                     std::pair{true, UINT64_C(1)}, std::pair{true, UINT64_C(1) << 32},
+                                     std::pair{true, (UINT64_C(1) << 32) | 7}, std::pair{true, UINT64_MAX}}) {
+                                    if (predicate.first && !vk.conditional_rendering) continue;
                                     for (bool inverted : {false, true}) {
-                                        if (predicate < 0 && inverted) continue;
-                                        ClearOptions options{automatic, predicate, inverted ? D3D12_PREDICATION_OP_NOT_EQUAL_ZERO
+                                        if (!predicate.first && inverted) continue;
+                                        ClearOptions options{automatic, predicate.first, predicate.second, inverted ? D3D12_PREDICATION_OP_NOT_EQUAL_ZERO
                                                                                          : D3D12_PREDICATION_OP_EQUAL_ZERO};
+                                        options.overwrite_predicate = vk.storage_buffer_8bit && automatic && predicate.first &&
+                                            (inverted ? predicate.second == 0 : predicate.second != 0);
                                         const UINT first = array ? 1 : 0, layers = array ? 2 : 1;
                                         std::vector<unsigned char> actual, expected;
                                         if (!clear_and_read(ours.p, whole, part, partial, true, false, actual,
@@ -349,7 +380,7 @@ int main() {
                                                             mip, first, layers, array, true, options)) return 1;
                                         ++comparisons; ++regressions;
                                         if (actual.size() != expected.size()) return 1;
-                                        const bool executes = predicate < 0 || (inverted ? predicate == 0 : predicate != 0);
+                                        const bool executes = !predicate.first || (inverted ? predicate.second == 0 : predicate.second != 0);
                                         std::size_t offset = 0;
                                         for (UINT layer = 0; layer < (array ? 4u : 1u); ++layer) {
                                             for (UINT level = 0; level < 3; ++level) {
@@ -365,8 +396,8 @@ int main() {
                                                             const std::size_t i = offset + (y * w + x) * 4 + channel;
                                                             if ((!selected && (actual[i] != seed[channel] || expected[i] != seed[channel])) ||
                                                                 std::abs(int(actual[i]) - int(expected[i])) > tolerance) {
-                                                                std::fprintf(stderr, "subresource regression partial %d array %d auto %d mip %u formats %d/%d predicate %d inverted %d layer %u level %u texel %u,%u channel %u: Vulkan %u WARP %u\n",
-                                                                    int(partial), int(array), int(automatic), mip, int(whole), int(part), predicate, int(inverted), layer, level, x, y, channel,
+                                                                std::fprintf(stderr, "subresource regression partial %d array %d auto %d mip %u formats %d/%d predicate %llu inverted %d layer %u level %u texel %u,%u channel %u: Vulkan %u WARP %u\n",
+                                                                    int(partial), int(array), int(automatic), mip, int(whole), int(part), static_cast<unsigned long long>(predicate.second), int(inverted), layer, level, x, y, channel,
                                                                     unsigned(actual[i]), unsigned(expected[i]));
                                                                 return 1;
                                                             }

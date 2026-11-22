@@ -55,6 +55,32 @@ cmake --build runtime/build/linux --parallel
 
 On macOS, add `-DVulkan_INCLUDE_DIR=/opt/homebrew/include` to the first command.
 
+The test programs and `scripts/run_gpu_tests.py` should come from the same commit. Some checks tolerate an older
+binary (`unpinned_subgroup_skip`), but mixing them can report false failures in the compute tests: 28 `cs_*`
+failures on both an RTX 5070 Ti Laptop and a Radeon 610M with the `426023a` script and `48ad23f` binaries, where
+either matching pair is clean. If you cannot build locally, the `runtime-windows` artifact of the Runtime workflow
+belongs to the commit that built it; check that commit out as well.
+
+### Without a compiler: a CI-built runtime
+
+If you cannot build the test programs locally, the Runtime workflow publishes them as the `runtime-windows`
+artifact of its own commit. It holds Windows executables, so use them on Windows or under Wine as in the
+section below; GitHub expires the artifact after 7 days. Open the run for that commit under Actions ->
+Runtime, download and unzip `runtime-windows`, and pass the unzipped folder to `--build`:
+
+```sh
+python -I scripts/run_gpu_tests.py --build <unzipped runtime-windows>
+```
+
+`build.py` and `check.py` take the same folder as their second argument:
+
+```sh
+python -I runtime/test/shaders/build.py <out dir>
+python -I runtime/test/shaders/check.py <out dir> <unzipped runtime-windows>
+```
+
+The artifact belongs to the commit that built it, so run the scripts from that commit as well (see the note above).
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
@@ -75,7 +101,7 @@ python -I runtime/test/shaders/check.py <out dir> <folder with the test programs
 ## The Windows runtime on Linux, under Wine or Proton
 
 The Linux build above makes only the Vulkan programs. The loader (`gta6rt`), its shims and their tests are Windows
-programs; `runtime/cmake/clang-cl-xwin.cmake` cross-compiles them on Linux with clang-cl and lld-link (LLVM 19+: the
+programs; `runtime/cmake/clang-cl-xwin.cmake` cross-compiles them on Linux with clang-cl and lld-link (LLVM 19+, but not 22.1.7 or 22.1.8 (see Known problems): the
 MSVC STL that xwin lays out rejects older Clang; versioned names go in with `-DCMAKE_CXX_COMPILER=clang-cl-19` etc.)
 against an MSVC CRT and Windows SDK that [xwin](https://github.com/Jake-Shadle/xwin) downloads from Microsoft
 (running it means accepting Microsoft's licence), and `ctest` runs them through Wine:
@@ -90,7 +116,8 @@ WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/wind
 ```
 
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
-`make_game.py --runtime-build runtime/build/windows` takes this folder like a Windows build. CMake packages are
+`make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
+runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are
 looked up only inside the SDK folder, so a Windows SDL3 for the GameInput shim is passed as `-DSDL3_DIR=<its
 cmake folder>` (`CMAKE_PREFIX_PATH` is not searched here).
 
@@ -112,6 +139,14 @@ To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W
 `build.py` and `check.py`**: `build.py` translates with emulation only when it's set. If you set it only for
 `check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
 fails.
+
+## GPUs without mesh shaders (NVIDIA Pascal and older)
+
+Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
+runs them anyway, set `LEONIDA_MESH_COMPUTE=1` for `run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1` on a
+32-wide GPU (every mesh shader is wave64). The mesh shaders are then translated with `--mesh-compute`, dispatched as
+compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
+`bufferDeviceAddress` and `shaderInt64` instead.
 
 ## Without a GPU: Mesa llvmpipe
 
@@ -136,10 +171,12 @@ instruction"), which is why the second run is limited to compute. llvmpipe is no
 real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
 differences.
 
-## GPUs without fragment barycentrics (NVIDIA Pascal and older)
+## GPUs without fragment barycentrics (NVIDIA Volta, Pascal and older)
 
 `ps_bary`, `ps_uniform_branch` and `ps_scc_mask32` read raw barycentrics, which need
-`VK_KHR_fragment_shader_barycentric`. Where the device lacks it they're skipped; that's expected, not a failure. To
+`VK_KHR_fragment_shader_barycentric`; so do `ps_interp_f16_high` and `ms_f16_pack` (16-bit interpolants are
+`PerVertexKHR` inputs, and `--bary-fallback` cannot express them, so they skip under it). NVIDIA has it from Turing on; Volta (V100, Titan V) and older lack it, as do
+llvmpipe and some other drivers. Where the device lacks it they're skipped; that's expected, not a failure. To
 test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`** (or
 for `run_gpu_tests.py`). The shaders are then translated with `--bary-fallback` and drawn through a pass-through
 geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric fallback"), so the device needs
@@ -151,6 +188,16 @@ geometry shaders instead.
 without it they're skipped, which is expected, not a failure. To test the fallback, set `LEONIDA_TEXOFF_FALLBACK=1`
 **for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
 (`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
+
+## Fused multiply-add: GLSL Fma or OpFmaKHR
+
+`cs_fma_fused` checks that `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32` (and one `v_fma_f16`) round once, on
+operands taken from user SGPRs so the driver cannot fold them. It passes with the default translation (`--fma glsl`,
+GLSL.std.450 `Fma`) and with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
+That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable it when the device has it and exit
+77 (a SKIP) for a module that needs it on a device without it. The Vulkan specification allows a driver to split GLSL
+`Fma` into two roundings, which is why `khr` exists. Neither the AMD (26.11.2) nor the NVIDIA (617.42) driver we tried
+does, so `cs_fma_fused` passing with `glsl` is not evidence that every driver is safe.
 
 ## Choosing the GPU
 
@@ -177,7 +224,9 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | `vk_harness` doesn't compile: `VK_KHR_maintenance8` names unknown | Vulkan headers older than the SDK the code was written against | Update to current `main` (the code now builds without it), or use current Khronos Vulkan-Headers; conda-forge's package is too old |
 | `ps_bary` and `ps_uniform_branch` fail by about 0.9 | The GPU runs pixel shaders wave64 without fragment barycentrics (GCN3 and RDNA1 on RADV), or an old AMD Windows driver (22.40) | Current `main` skips them on such devices; on Windows, update the driver |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
+| On a Mac, a multiply with a zero result reads `+0` where the model wants `-0` (`v_mul_f16` and `v_pk_mul_f16` in `valu_fuzz.py --family f16`, `v_mul_f32`) | MoltenVK computes a `NoContraction` multiply as `fma(l, r, +0)`, which drops the sign. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-182, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions. To run the rest of the fuzzer clean, add `--skip-op v_mul_f16 --skip-op v_pk_mul_f16`. To see the multiplies match, use KosmicKrisp: `LEONIDA_VULKAN_LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib VK_DRIVER_FILES=<path>/kosmickrisp_mesa_icd.aarch64.json`. Or build MoltenVK with SPIRV-Cross `300681bb` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision`, and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
+| `ctest` lists `fsr_dispatch` and `bvh_builder` as failed (`Not Run`) after clang-cl hits an internal compiler error in `fsr_dispatch_test.cpp` and `bvh_builder_test.cpp` | clang-cl 22.1.8 on Fedora (Linux cross-build) and Windows, plus 22.1.7 on Windows | Use clang-cl 23.1.6 (both files compile on Windows) |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
 | `vulkaninfo` lists `Microsoft Direct3D12 (<gpu>)` next to the real GPU and the tests run on it | The Windows "OpenCL™, OpenGL® and Vulkan® Compatibility Pack" installs Mesa's Dozen, a Vulkan-on-D3D12 layer that reports `DISCRETE_GPU` like the native card | Current `main` prefers a native ICD over Microsoft's vendor (`0x1414`) in every harness; set `LEONIDA_VK_DEVICE=<part of the real GPU name>` to select explicitly. See #915. |
 | A GPU test that uses `image_load` (or lighting built from real shaders) reads zeros from its image; @Silliana saw every texel except pixel (0,0) come back zero in their own layer (#603, not reproduced here) | In this runtime the shader turns the T# words into an index through the descriptor hash table (`runtime/src/descriptor_table.h`: a miss gives index 0), and index 0 is a 1×1 image of zeros (`runtime/src/vulkan_bindless.h`), so a hand-built or zeroed T# that was never registered reads zeros even at (0,0). The translator does not compare coordinates with the T# size, and `cs_imgload.asm` only uses its T# words as a hash key | Register the descriptor through the runtime (for D3D12, create it with `CreateShaderResourceView`) so its T# hits the table, with the image's real width and height (stored as size − 1, see `runtime/src/gfx10_descriptors.h`) |

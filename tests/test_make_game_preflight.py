@@ -323,6 +323,28 @@ class ToolchainDetectionTest(PreflightTestBase):
         self.assertFalse(make_game.tool_available("   "))
         self.assertFalse(make_game.tool_available('""'))
 
+    APPDATA_ENV = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local", "APPDATA": r"C:\Users\u\AppData\Roaming"}
+
+    def test_appdata_hint_names_the_folder_llvm_mc_is_in(self):
+        with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            for cmd, var in ((r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe", "LOCALAPPDATA"),
+                             (r'"c:\users\U\appdata\roaming\llvm\llvm-mc.exe"', "APPDATA")):
+                with self.subTest(cmd=cmd):
+                    hint = make_game.appdata_hint(cmd)
+                    self.assertIn(f"LLVM_MC points into %{var}%", hint)
+                    self.assertIn(r"%USERPROFILE%\.leonida\llvm-mc", hint)
+
+    def test_appdata_hint_is_empty_outside_appdata(self):
+        with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            for cmd in ("llvm-mc", r"D:\Tools\llvm-mc\llvm-mc.exe", r"C:\Users\u\.leonida\llvm-mc\llvm-mc.exe",
+                        r"C:\Users\u\AppData\LocalLow\llvm-mc.exe", "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"):
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(make_game.appdata_hint(cmd), "")
+
+    def test_appdata_hint_is_empty_off_windows(self):
+        with mock.patch("os.name", "posix"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            self.assertEqual(make_game.appdata_hint(r"C:\Users\u\AppData\Local\llvm-mc.exe"), "")
+
     def test_need_success_returns_tool(self):
         self.assertEqual(make_game.need(sys.executable, "Install python"), sys.executable)
 
@@ -348,7 +370,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
-                # runtime is refused before any check off Windows (tests/test_make_game_platform.py)
+                # off Windows runtime checks the cross-build instead (tests/test_make_game_platform.py)
                 stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
                 make_game.preflight(stages, tmp_work, wav=True)
 
@@ -368,6 +390,19 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn("spirv-val:", err)
                 self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
+
+    def test_preflight_explains_llvm_mc_hidden_in_appdata(self):
+        env = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local",
+               "LLVM_MC": r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe"}
+        with tempfile.TemporaryDirectory() as tmp_work, \
+             mock.patch.dict(os.environ, env), \
+             mock.patch("os.name", "nt"), \
+             mock.patch("sys.version_info", (3, 12, 0)), \
+             mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+             mock.patch("make_game.tool_available", return_value=False):
+            err = self.assert_fails(make_game.preflight, ["shaders"], tmp_work,
+                                    match="llvm-mc (LLVM 21+ with the AMDGPU target)")
+        self.assertIn("LLVM_MC points into %LOCALAPPDATA%", err)
 
     def test_preflight_rejects_visual_studio_installer_without_cpp_tools(self):
         with tempfile.TemporaryDirectory() as tmp_work, \
@@ -530,13 +565,45 @@ class GameDiscoveryTest(unittest.TestCase):
             with open(os.path.join(folder, name), "wb") as file:
                 file.truncate(info["size"])
 
-    def discover(self):
-        roots = (self.home, self.desktop, self.downloads)
+    def discover(self, known=()):
+        """find_dumps() over the synthetic home folder only; `known` is what the shell reports for Downloads,
+        Desktop and Documents."""
+        roots = (self.home, self.desktop, self.downloads, *known)
         isdir = os.path.isdir
         with mock.patch("os.path.expanduser", return_value=self.home), \
              mock.patch("os.path.isdir", side_effect=lambda path: path in roots and isdir(path)), \
+             mock.patch.object(make_game, "known_folders", return_value=list(known)), \
              mock.patch.object(make_game, "versions", return_value=[self.version]):
             return make_game.find_dumps()
+
+    def test_find_searches_known_folders_moved_into_onedrive(self):
+        # OneDrive's Known Folder Move: Explorer's Desktop and Documents are ~\OneDrive\Desktop and
+        # ~\OneDrive\Documents, two levels below the home folder, so the home root alone never reaches inside them.
+        desktop = os.path.join(self.home, "OneDrive", "Desktop")
+        documents = os.path.join(self.home, "OneDrive", "Documents")
+        on_desktop = os.path.join(desktop, "GTA VI")
+        in_documents = os.path.join(documents, "Games", "GTA VI")
+        self.write_probes(on_desktop)
+        self.write_probes(in_documents)
+
+        self.assertEqual(self.discover(), [])
+        self.assertEqual(self.discover(known=(desktop, documents)),
+                         [(on_desktop, self.version), (in_documents, self.version)])
+
+    def test_find_reports_a_copy_once_when_known_folders_are_not_moved(self):
+        package = os.path.join(self.desktop, "Package")
+        self.write_probes(package)
+        self.assertEqual(self.discover(known=(self.downloads, self.desktop)), [(package, self.version)])
+
+    def test_known_folders_from_the_shell(self):
+        folders = make_game.known_folders()
+        if os.name != "nt":
+            self.assertEqual(folders, [])
+            return
+        self.assertEqual(len(folders), len(make_game.KNOWN_FOLDERS))
+        for folder in folders:
+            self.assertTrue(os.path.isabs(folder), folder)
+        self.assertEqual(make_game.known_folders(), folders)   # the shell's buffers are freed, calls repeat cleanly
 
     def test_find_searches_below_rejected_folder_with_config(self):
         outer = os.path.join(self.desktop, "Backup")

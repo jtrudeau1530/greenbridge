@@ -416,7 +416,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &sampled_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&texture.p))));
-        const auto upload_desc = buffer_desc(65536, D3D12_RESOURCE_FLAG_NONE);
+        const auto upload_desc = buffer_desc(131072, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
@@ -506,15 +506,16 @@ int main() {
             for (UINT x = 0; x < mip_size; ++x) row[x] = std::uint8_t(208 + y * mip_size + x);
         }
 
-        // Three layers with three distinct mip colours each. The test views start at layer 1 and mip 1.
+        // Three cubes with distinct colours for each face and mip. The 2D array views use layers 1 and 2.
         auto array_desc = sampled_desc;
         array_desc.Width = array_desc.Height = 4;
-        array_desc.DepthOrArraySize = 3;
+        constexpr UINT face_count = 18;
+        array_desc.DepthOrArraySize = face_count;
         Ref<ID3D12Resource> array_texture;
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &array_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&array_texture.p))));
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT array_levels[9]{};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT array_levels[face_count * 3]{};
         device->GetCopyableFootprints(&array_desc, 0, UINT(std::size(array_levels)), 49152, array_levels,
                                       nullptr, nullptr, nullptr);
         const auto array_color = [](UINT layer, UINT mip) {
@@ -541,10 +542,19 @@ int main() {
         };
         constexpr UINT first_lod_slot = 10;
         constexpr float array_clamps[] = {1.0f, 1.75f, 2.0f, 2.25f};
+        struct CubeLodView { D3D12_SRV_DIMENSION dimension; UINT first_face, faces, minimum_mip; };
+        constexpr CubeLodView cube_lods[] = {
+            {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 2},
+            {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 2},
+        };
+        constexpr UINT lod_view_count = std::size(lod_views);
+        constexpr UINT array_clamp_count = std::size(array_clamps);
+        constexpr UINT cube_lod_count = std::size(cube_lods);
         // Keep multisample views after the preceding volume and minimum-LOD views.
         enum : UINT {
-            array_lod_slot = first_lod_slot + std::size(lod_views),
-            ms_slot = array_lod_slot + std::size(array_clamps), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            array_lod_slot = first_lod_slot + lod_view_count,
+            cube_lod_slot = array_lod_slot + array_clamp_count,
+            ms_slot = cube_lod_slot + cube_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
@@ -565,6 +575,19 @@ int main() {
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2DArray = {1, 2, 1, 2, 0, array_clamps[i]};
             device->CreateShaderResourceView(array_texture.p, &srv, view_slot(array_lod_slot + i));
+        }
+
+        for (UINT i = 0; i < std::size(cube_lods); ++i) {
+            const auto& cube_lod = cube_lods[i];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = array_desc.Format;
+            srv.ViewDimension = cube_lod.dimension;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (cube_lod.dimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+                srv.TextureCube = {1, 2, float(cube_lod.minimum_mip)};
+            else
+                srv.TextureCubeArray = {1, 2, cube_lod.first_face, cube_lod.faces / 6, float(cube_lod.minimum_mip)};
+            device->CreateShaderResourceView(array_texture.p, &srv, view_slot(cube_lod_slot + i));
         }
 
         for (UINT i = 0; i < std::size(lod_views); ++i) {
@@ -703,6 +726,14 @@ int main() {
         EXPECT(rt::d3d12::register_samplers(device.p, {&literal_words, 1}) == S_OK);
         EXPECT(rt::d3d12::register_samplers(device.p, {&literal_words, 1}) == S_OK);
         EXPECT(rt::d3d12::register_samplers(nullptr, {&literal_words, 1}) == E_INVALIDARG);
+
+        // GFX10 literal S#s can encode a larger LOD bias than vkCreateSampler accepts on this device.
+        literal.lod_bias = -32.0f;
+        const auto negative_bias = g::encode(literal);
+        literal.lod_bias = 31.0f;
+        const auto positive_bias = g::encode(literal);
+        const g::SamplerWords biased_samplers[] = {negative_bias, positive_bias};
+        EXPECT(rt::d3d12::register_samplers(device.p, biased_samplers) == S_OK);
 
         // The UINT texture's view in slot 0, and three border samplers after the first: UINT (0,0,0,0) and
         // (1,1,1,1) from CreateSampler2, which the proxy does not have (the inner device does), and float white.
@@ -1256,6 +1287,22 @@ int main() {
             std::printf("literal S#s: registered %u/%u texels wrapped, unregistered %u/%u clamped\n", wrapped, texels,
                         clamped, texels);
             EXPECT(wrapped == texels && clamped == texels);
+
+            // With LOD zero requested, opposite bias extremes select the first and last mips.
+            for (const auto& words : biased_samplers) {
+                SampleKeys key = keys[0];
+                std::memcpy(key.ssharp, words.data(), sizeof(key.ssharp));
+                std::array<std::uint8_t, bytes> pixels{};
+                EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
+                UINT matches = 0;
+                for (UINT i = 0; i < texels; ++i) {
+                    const auto expected = words == negative_bias ? texel(i % size, i / size) : mip_colors[1];
+                    matches += std::memcmp(pixels.data() + 4 * i, expected.data(), 4) == 0;
+                }
+                std::printf("literal sampler bias %.0f: %u/%u samples match, first RGBA %u,%u,%u,%u\n",
+                            g::decode(words).lod_bias, matches, texels, pixels[0], pixels[1], pixels[2], pixels[3]);
+                EXPECT(matches == texels);
+            }
         }
         if (bc.p) {
             SampleKeys bc_key = keys[0];
@@ -1341,6 +1388,35 @@ int main() {
         lod_mismatches += array_mismatches;
         std::printf("array minimum LOD: %u/%u samples matched across two layers and four views\n",
                     UINT(array_pixels.size() / 4) - array_mismatches, UINT(array_pixels.size() / 4));
+
+        SampleKeys cube_keys[std::size(cube_lods)]{};
+        std::array<std::uint8_t, std::size(cube_lods) * bytes> cube_pixels{};
+        for (UINT i = 0; i < std::size(cube_lods); ++i) {
+            cube_keys[i] = keys[0];
+            std::memcpy(cube_keys[i].tsharp, view_bytes(cube_lod_slot + i), sizeof(cube_keys[i].tsharp));
+            cube_keys[i].layer = cube_lods[i].faces;
+            cube_keys[i].first = i * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, cube_keys, cube_pixels.data()));
+        UINT cube_errors = 0;
+        for (UINT view = 0; view < std::size(cube_lods); ++view) {
+            const auto& v = cube_lods[view];
+            UINT errors = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                const UINT face = v.first_face + i % v.faces;
+                const auto want = v.minimum_mip == 1 || d.image_view_min_lod
+                    ? array_color(face, v.minimum_mip) : std::array<std::uint8_t, 4>{};
+                const auto* sample = cube_pixels.data() + (view * texels + i) * 4;
+                if (std::memcmp(sample, want.data(), 4) && errors++ == 0)
+                    std::fprintf(stderr, "cube view %u, face %u, min mip %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
+                                 view, face, v.minimum_mip, sample[0], sample[1], sample[2], sample[3],
+                                 want[0], want[1], want[2], want[3]);
+            }
+            cube_errors += errors;
+        }
+        lod_mismatches += cube_errors;
+        std::printf("cube minimum LOD: %u/%u samples matched across cube and cube-array views\n",
+                    UINT(cube_pixels.size() / 4) - cube_errors, UINT(cube_pixels.size() / 4));
 
         const D3D12_CPU_DESCRIPTOR_HANDLE volume_slots[] = {view_slot(volume_all), view_slot(volume_mip),
                                                             linear_slot, srgb_slot};
@@ -1555,6 +1631,126 @@ int main() {
             EXPECT(differ == 0);
             std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n", many_views + 1,
                         many_samplers);
+        }
+
+        // 96-bit textures (D3D-62): R32G32B32_FLOAT holding the texture's red, green and blue as n/255,
+        // R32G32B32_UINT holding them as integers, and R32G32B32_TYPELESS holding the floats. Their texels are 12
+        // bytes; the layer keeps them in RGBA32 images whose fourth channel no upload writes, and a shader must
+        // read alpha as one. Default views of the typed textures, then the TYPELESS one through a FLOAT view and a
+        // UINT view (the bits of n/255 as integers: the shader clamps to 255, so 0 stays 0 and the rest is 255).
+        {
+            constexpr UINT rgb96_count = 3, rgb96_views = 4, rgb96_null = rgb96_views;
+            constexpr DXGI_FORMAT rgb96_formats[rgb96_count] = {DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32_UINT,
+                                                                DXGI_FORMAT_R32G32B32_TYPELESS};
+            constexpr UINT rgb96_view_texture[rgb96_views] = {0, 1, 2, 2};
+            constexpr bool rgb96_view_uint[rgb96_views] = {false, true, false, true};
+            Ref<ID3D12Resource> rgb96_textures[rgb96_count], rgb96_upload;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT rgb96_placed[rgb96_count]{};
+            const auto rgb96_upload_desc = buffer_desc(16384, D3D12_RESOURCE_FLAG_NONE);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &rgb96_upload_desc,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&rgb96_upload.p))));
+            void* rgb96_mapped = nullptr;
+            EXPECT(SUCCEEDED(rgb96_upload->Map(0, nullptr, &rgb96_mapped)));
+            for (UINT k = 0; k < rgb96_count; ++k) {
+                D3D12_RESOURCE_DESC rgb96_desc = texture_desc;
+                rgb96_desc.Format = rgb96_formats[k];
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rgb96_desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&rgb96_textures[k].p))));
+                device->GetCopyableFootprints(&rgb96_desc, 0, 1, k * 4096, &rgb96_placed[k], nullptr, nullptr, nullptr);
+                EXPECT(rgb96_placed[k].Footprint.Format == rgb96_formats[k]);
+                for (UINT y = 0; y < size; ++y)
+                    for (UINT x = 0; x < size; ++x)
+                        for (UINT c = 0; c < 3; ++c) {
+                            const float as_float = float(texel(x, y)[c]) / 255.0f;
+                            const std::uint32_t as_uint = texel(x, y)[c];
+                            std::memcpy(static_cast<std::uint8_t*>(rgb96_mapped) + rgb96_placed[k].Offset +
+                                            y * rgb96_placed[k].Footprint.RowPitch + x * 12 + c * 4,
+                                        k == 1 ? static_cast<const void*>(&as_uint) : static_cast<const void*>(&as_float), 4);
+                        }
+            }
+            rgb96_upload->Unmap(0, nullptr);
+
+            Ref<ID3D12DescriptorHeap> rgb96_heap;
+            const D3D12_DESCRIPTOR_HEAP_DESC rgb96_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, rgb96_views + 1,
+                                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&rgb96_heap_desc, IID_PPV_ARGS(&rgb96_heap.p))));
+            const std::uint64_t rgb96_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(rgb96_heap.p, 9))(rgb96_heap.p);
+            const auto rgb96_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(rgb96_cpu + i * step)}; };
+            const auto rgb96_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(rgb96_cpu + i * step); };
+            D3D12_SHADER_RESOURCE_VIEW_DESC rgb96_view{};
+            rgb96_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            rgb96_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            rgb96_view.Texture2D.MipLevels = 1;
+            for (UINT k = 0; k < rgb96_views; ++k) {
+                rgb96_view.Format = rgb96_view_uint[k] ? DXGI_FORMAT_R32G32B32_UINT : DXGI_FORMAT_R32G32B32_FLOAT;
+                device->CreateShaderResourceView(rgb96_textures[rgb96_view_texture[k]].p, k < 2 ? nullptr : &rgb96_view,
+                                                 rgb96_slot(k));
+                // The T# names the three-channel format (GFX10_FORMAT_32_32_32_UINT is 72, _FLOAT 74).
+                leonida::gfx10::ImageWords rgb96_words{};
+                std::memcpy(rgb96_words.data(), rgb96_bytes(k), sizeof(rgb96_words));
+                leonida::gfx10::Image rgb96_image{};
+                EXPECT(leonida::gfx10::is_image(rgb96_words) && leonida::gfx10::decode(rgb96_words, rgb96_image));
+                EXPECT(rgb96_image.format == (rgb96_view_uint[k] ? 72u : 74u));
+            }
+            // A 96-bit texture has no view of a four-channel format, a four-channel one none of a 96-bit format, and
+            // a typed 96-bit texture none of another type (only the TYPELESS one is cast).
+            const std::pair<ID3D12Resource*, DXGI_FORMAT> wrong[] = {
+                {rgb96_textures[0].p, DXGI_FORMAT_R32G32B32A32_FLOAT},
+                {texture.p, DXGI_FORMAT_R32G32B32_FLOAT},
+                {rgb96_textures[0].p, DXGI_FORMAT_R32G32B32_UINT},
+                {rgb96_textures[2].p, DXGI_FORMAT_R32G32B32A32_UINT}};
+            for (const auto& [resource, format] : wrong) {
+                rgb96_view.Format = format;
+                std::memset(rgb96_bytes(rgb96_null), 0x77, step);
+                device->CreateShaderResourceView(resource, &rgb96_view, rgb96_slot(rgb96_null));
+                EXPECT(std::all_of(rgb96_bytes(rgb96_null), rgb96_bytes(rgb96_null) + step,
+                                   [](std::uint8_t byte) { return byte == 0; }));
+            }
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            D3D12_TEXTURE_COPY_LOCATION to_rgb96{}, from_rgb96{};
+            to_rgb96.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from_rgb96.pResource = rgb96_upload.p;
+            from_rgb96.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            for (UINT k = 0; k < rgb96_count; ++k) {
+                to_rgb96.pResource = rgb96_textures[k].p;
+                from_rgb96.PlacedFootprint = rgb96_placed[k];
+                list->CopyTextureRegion(&to_rgb96, 0, 0, 0, &from_rgb96, nullptr);
+                const auto ready = transition(rgb96_textures[k].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &ready);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            d.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(d.device);
+
+            SampleKeys rgb96_keys[rgb96_views] = {};
+            for (UINT k = 0; k < rgb96_views; ++k) {
+                std::memcpy(rgb96_keys[k].tsharp, rgb96_bytes(k), sizeof(rgb96_keys[k].tsharp));
+                std::memcpy(rgb96_keys[k].ssharp, sampler_bytes, sizeof(rgb96_keys[k].ssharp));
+                rgb96_keys[k].first = k * texels;
+                rgb96_keys[k].mode = rgb96_view_uint[k] ? 1 : 0;
+            }
+            std::vector<std::uint8_t> rgb96_pixels(rgb96_views * bytes);
+            EXPECT(sample_through_set(d, set0, set0_layout, rgb96_keys, rgb96_pixels.data()));
+            const char* rgb96_names[rgb96_views] = {"FLOAT", "UINT", "TYPELESS as FLOAT", "TYPELESS as UINT"};
+            UINT rgb96_differ = 0;
+            for (UINT k = 0; k < rgb96_views; ++k)
+                for (UINT i = 0; i < texels; ++i) {
+                    std::array<std::uint8_t, 4> want = texel(i % size, i / size);
+                    if (k == 3)
+                        for (UINT c = 0; c < 3; ++c) want[c] = want[c] ? 255 : 0;
+                    want[3] = rgb96_view_uint[k] ? 1 : 255;  // alpha is one: 1 as an integer, 255 as UNORM
+                    const std::uint8_t* got = rgb96_pixels.data() + k * bytes + i * 4;
+                    if (std::memcmp(got, want.data(), 4) != 0 && rgb96_differ++ < 4)
+                        std::fprintf(stderr, "R32G32B32_%s texel %u: got %u,%u,%u,%u, want %u,%u,%u,%u\n", rgb96_names[k],
+                                     i, unsigned(got[0]), unsigned(got[1]), unsigned(got[2]), unsigned(got[3]),
+                                     unsigned(want[0]), unsigned(want[1]), unsigned(want[2]), unsigned(want[3]));
+                }
+            EXPECT(rgb96_differ == 0);
         }
 #endif
 

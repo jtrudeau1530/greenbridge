@@ -24,7 +24,10 @@ content-set nodes. They are never guessed from a similar spelling.
 The four documented prefix rules are measured: ``$(common)``, ``$(root)``, ``$(target)``, and
 ``platform:/`` split into ``levels`` and everything else. ``common:/`` occurs in the corpus but is
 not one of those rules, so it is reported as an unrecognized scheme and is not normalized to
-``$(common)``. ``parentPath`` values are XPath-like locators, not archive paths.
+``$(common)``. ``parentPath`` values are XPath-like locators, not archive paths. Those of the form
+``../Tag[@attr='value']`` are also followed inside their own document (exact match on a sibling of
+the element) and reported under ``parent_path_inheritance``: resolved, ambiguous and unresolved
+sites, inheritance chain depths and cycles. They never become document edges.
 
 The output is aggregate and schema-only: counts, root names, category names and reference prefixes.
 Target strings, ids, offsets, source names and element values are never written. This keeps the JSON reviewable without copying game data, and the tests are
@@ -54,6 +57,7 @@ PARENT_ATTRIBUTES = ("parentPath", "parentFile")
 MACRO_REF = re.compile(r"^\$\(([A-Za-z_][\w.-]*)\)(.*)$", re.S)
 PLATFORM_REF = re.compile(r"^platform:/([^/]*)(.*)$", re.I | re.S)
 SCHEME_REF = re.compile(r"^([A-Za-z][\w.-]*):/(.*)$", re.S)
+PARENT_SIBLING = re.compile(r"\.\./([A-Za-z_][\w.-]*)\[@([A-Za-z_][\w.-]*)=(['\"])(.*?)\3\]", re.S)
 RELATIVE = "relative/locator"
 
 
@@ -170,7 +174,59 @@ def scan_document(doc: dict) -> dict:
             value = (element.attrib.get(attribute) or "").strip()
             if value:
                 report["refs"].append({"kind": attribute, "target": value, "owner": ""})
+    report["parent_links"] = resolve_parent_paths(root)
     return report
+
+
+def resolve_parent_paths(root) -> dict:
+    """Follow ``parentPath`` locators of the form ``../Tag[@attr='value']`` inside one document.
+
+    ``..`` is the element's parent and the predicate selects the sibling with that exact attribute
+    value. Returns counts plus the inheritance links as element positions (no strings), so chain
+    depth and cycles can be measured without keeping any value.
+    """
+    parent_of = {child: parent for parent in root.iter() for child in parent}
+    position = {element: index for index, element in enumerate(root.iter())}
+    result = {"sites": 0, "xpath_sibling": 0, "resolved": 0, "ambiguous": 0, "links": []}
+    for element in root.iter():
+        value = (element.attrib.get("parentPath") or "").strip()
+        if not value:
+            continue
+        result["sites"] += 1
+        match = PARENT_SIBLING.fullmatch(value)
+        container = parent_of.get(element)
+        if not match or container is None:
+            continue
+        result["xpath_sibling"] += 1
+        tag, attribute, wanted = match.group(1), match.group(2), match.group(4)
+        hits = [sibling for sibling in container
+                if sibling.tag == tag and sibling.attrib.get(attribute) == wanted]
+        if len(hits) == 1:
+            result["resolved"] += 1
+            result["links"].append((position[element], position[hits[0]]))
+        elif hits:
+            result["ambiguous"] += 1
+    return result
+
+
+def parent_chains(links: list) -> tuple:
+    """Return (depth histogram over the linked children, cycle count) for one document's links."""
+    parent = dict(links)
+    depths = Counter()
+    cycles = 0
+    for child in parent:
+        seen = {child}
+        node, depth = child, 0
+        while node in parent:
+            node = parent[node]
+            depth += 1
+            if node in seen:
+                cycles += 1
+                break
+            seen.add(node)
+        else:
+            depths[depth] += 1
+    return depths, cycles
 
 
 def _strongly_connected(nodes: list, adjacency: dict) -> list:
@@ -367,6 +423,21 @@ def build_graph(documents: list) -> dict:
     for namespace, _ in target_ids:
         unique_by_namespace[namespace] += 1
 
+    # parentPath locators followed inside their own document (no archive path is involved).
+    inherit = Counter()
+    inherit_depths = Counter()
+    inherit_documents = 0
+    for report in reports:
+        links = report.get("parent_links")
+        if not links or not links["sites"]:
+            continue
+        inherit_documents += 1
+        for name in ("sites", "xpath_sibling", "resolved", "ambiguous"):
+            inherit[name] += links[name]
+        depths, cycles = parent_chains(links["links"])
+        inherit_depths.update(depths)
+        inherit["cycles"] += cycles
+
     summary = {
         "mode": "",
         "payloads": len(reports),
@@ -434,6 +505,16 @@ def build_graph(documents: list) -> dict:
             "targets": len(reachable_targets),
             "target_sites": reachable_target_sites,
         },
+        "parent_path_inheritance": {
+            "documents": inherit_documents,
+            "sites": inherit["sites"],
+            "xpath_sibling_form": inherit["xpath_sibling"],
+            "resolved_in_document": inherit["resolved"],
+            "ambiguous": inherit["ambiguous"],
+            "unresolved": inherit["sites"] - inherit["resolved"] - inherit["ambiguous"],
+            "chain_depths": {str(depth): count for depth, count in sorted(inherit_depths.items())},
+            "cycles": inherit["cycles"],
+        },
         "categories": dict(sorted(category_stats.items(), key=lambda kv: (-kv[1]["documents"],
                                                                           kv[0]))),
         "roots": dict(sorted(root_stats.items(), key=lambda kv: (-kv[1]["documents"], kv[0]))),
@@ -491,6 +572,11 @@ def print_summary(graph: dict) -> None:
           f'{content["cycles"]} cycles')
     print(f'reachable: {summary["reachable"]["targets"]:,} unique targets '
           f'({summary["reachable"]["target_sites"]:,} sites)')
+    inherit = summary["parent_path_inheritance"]
+    depths = ", ".join(f"{depth}: {count}" for depth, count in inherit["chain_depths"].items())
+    print(f'parentPath in-document: {inherit["resolved_in_document"]} of {inherit["sites"]} resolved '
+          f'in {inherit["documents"]} document(s), {inherit["ambiguous"]} ambiguous, '
+          f'{inherit["unresolved"]} unresolved; chain depths {{{depths}}}, {inherit["cycles"]} cycles')
     unresolved = graph["unresolved"]
     print(f'unresolved: {unresolved["total_sites"]:,} sites '
           f'({len(unresolved["document_unmapped"])} archive namespaces, '
@@ -509,6 +595,15 @@ def main() -> int:
         documents = list(gx.load_documents(args.targets))
     except FileNotFoundError as exc:
         print(f"not found: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # Same one-line contract as gamedata_xml.py and gamedata_index.py: a bad carve index is an error,
+        # not a traceback.
+        where = getattr(exc, "filename", None) or args.targets[0]
+        print(f"ERROR: cannot read {where}: {getattr(exc, 'strerror', None) or exc!r}", file=sys.stderr)
         return 2
     graph = build_graph(documents)
     graph["summary"]["mode"] = gx.document_mode(args.targets)

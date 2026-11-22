@@ -71,6 +71,33 @@ def test_64k_block_extent_comes_from_the_element_count():
         assert bw * bh * bpe == 65536
 
 
+def cli(tmp_path, *args):
+    import subprocess
+    tool = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "amd_swizzle.py")
+    return subprocess.run([sys.executable, "-I", tool, str(tmp_path / "blob.bin"), *args],
+                          capture_output=True, text=True, timeout=120, check=False)
+
+
+def test_out_cannot_overwrite_the_input(tmp_path):
+    # Before: --out naming the blob rendered the preview over the sample it had just detiled.
+    blob = tmp_path / "blob.bin"
+    blob.write_bytes(bytes(range(256)) * 64)
+    before = blob.read_bytes()
+    p = cli(tmp_path, "--width", "256", "--height", "256", "--out", str(blob))
+    assert p.returncode == 1, p.stderr
+    assert "overwrite the input" in p.stderr
+    assert "Traceback" not in p.stderr
+    assert blob.read_bytes() == before
+
+
+def test_out_directory_is_a_message_not_a_traceback(tmp_path):
+    (tmp_path / "blob.bin").write_bytes(bytes(range(256)) * 64)
+    p = cli(tmp_path, "--width", "256", "--height", "256", "--out", str(tmp_path))
+    assert p.returncode == 1, p.stderr
+    assert "is a directory" in p.stderr
+    assert "Traceback" not in p.stderr
+
+
 def test_uncompressed_feature_uses_raw_rgb_bytes():
     import numpy as np
     raw = np.arange(8, dtype=np.uint8).reshape(-1, 4)

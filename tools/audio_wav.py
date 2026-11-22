@@ -380,7 +380,9 @@ def audio_digest(ffmpeg, path, *, source):
         if samples:
             cmd += ["-af", f"atrim=end_sample={samples}"]
     cmd += ["-map_metadata", "-1", "-fflags", "+bitexact", "-c:a", "pcm_s16le" if source else "copy", "-f", "wav", "-"]
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
+    # No stdin for ffmpeg here or in decode(): it reads stdin for key commands, which stops a run started in the
+    # background of a terminal and swallows input piped to the caller (such as a shell loop's file list).
+    with subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
         header = proc.stdout.read(12)
         h = hashlib.sha256(header)
         for block in iter(lambda: proc.stdout.read(1024 * 1024), b""):
@@ -404,7 +406,7 @@ def decode(ffmpeg: str, src: str, dst: str):
             if samples:
                 cmd += ["-af", f"atrim=end_sample={samples}"]
             cmd += ["-c:a", "pcm_s16le", tmp]
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
             if r.returncode != 0:
                 return False, (r.stderr.strip() or f"ffmpeg exited with {r.returncode}")
             os.replace(tmp, dst)
@@ -413,14 +415,14 @@ def decode(ffmpeg: str, src: str, dst: str):
         return False, str(e)
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Decode Ogg Opus audio to 16-bit PCM WAV with ffmpeg.")
     ap.add_argument("src", help="a directory to search recursively, or one .ogg/.opus file")
     ap.add_argument("--out", help="output directory (default: <src>/wav for a directory, next to a single file)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="ffmpeg processes to run at once (default: half the CPU count)")
     ap.add_argument("--ffmpeg", help="ffmpeg executable (default: ffmpeg on PATH)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
 
@@ -441,6 +443,9 @@ def main() -> int:
     else:
         error(f"source not found: {a.src}")
         return 2
+
+    if a.out and os.path.isfile(a.out):
+        ap.error(f"{a.out} is a file, not a folder")
 
     out = os.path.abspath(a.out or default_out)
     print(f"{len(items)} Ogg Opus file(s) under {src} -> {out}")

@@ -54,6 +54,10 @@ class FakeDevice:
     separate_depth_stencil_layouts: bool = True
     subgroup_size_control: bool = True
     queue_flags: tuple[int, ...] = (vk_info.VK_QUEUE_GRAPHICS_BIT,)
+    subgroup_size: int = 32
+    subgroup_supported_stages: int = (
+        vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
+    )
     min_subgroup_size: int = 32
     max_subgroup_size: int = 64
     max_compute_workgroup_subgroups: int = 1024
@@ -157,15 +161,23 @@ class FakeVulkan:
         name_bytes = raw_name[:256].ljust(256, b"\x00")
         ctypes.memmove(base + vk_info.PROPS_DEVICE_NAME, name_bytes, 256)
 
+        found_subgroup = False
         found_sg = False
         for stype, node_addr in self._iter_chain(addr):
-            if stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES:
+            if stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES:
+                found_subgroup = True
+                subgroup = vk_info.SubgroupProperties.from_address(node_addr)
+                subgroup.subgroupSize = dev.subgroup_size
+                subgroup.supportedStages = dev.subgroup_supported_stages
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES:
                 found_sg = True
                 sg = vk_info.SubgroupSizeControl.from_address(node_addr)
                 sg.minSubgroupSize = dev.min_subgroup_size
                 sg.maxSubgroupSize = dev.max_subgroup_size
                 sg.maxComputeWorkgroupSubgroups = dev.max_compute_workgroup_subgroups
                 sg.requiredSubgroupSizeStages = dev.required_subgroup_size_stages
+        if not found_subgroup:
+            raise AssertionError("SubgroupProperties missing from vkGetPhysicalDeviceProperties2 pNext chain")
         if not found_sg:
             raise AssertionError("SubgroupSizeControl missing from vkGetPhysicalDeviceProperties2 pNext chain")
 
@@ -506,23 +518,24 @@ class QueryTest(unittest.TestCase):
     def test_native64_conditions_and_boundaries(self):
         both = vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
         cases = [
-            ("typical_32_64_both_stages", True, 32, 64, both, True, True, True),
-            ("exact_64_64_boundary", True, 64, 64, both, True, True, True),
-            ("range_16_128_includes_64", True, 16, 128, both, True, True, True),
-            ("extra_stage_bits_allowed", True, 32, 64, both | 0x10 | 0x40, True, True, True),
-            ("missing_subgroup_size_control", False, 32, 64, both, True, True, False),
-            ("max_subgroup_63_too_small", True, 32, 63, both, True, True, False),
-            ("max_subgroup_32_too_small", True, 32, 32, both, True, True, False),
-            ("min_subgroup_65_too_large", True, 65, 128, both, True, True, False),
-            ("missing_compute_stage_bit", True, 32, 64, vk_info.VK_SHADER_STAGE_MESH_BIT_EXT, False, True, False),
-            ("missing_mesh_stage_bit", True, 32, 64, vk_info.VK_SHADER_STAGE_COMPUTE_BIT, True, False, False),
-            ("no_required_stage_bits", True, 32, 64, 0, False, False, False),
+            ("typical_32_64_both_stages", True, 32, 64, both, True, True, True, 32),
+            ("exact_64_64_boundary", True, 64, 64, both, True, True, True, 64),
+            ("range_16_128_includes_64", True, 16, 128, both, True, True, True, 32),
+            ("extra_stage_bits_allowed", True, 32, 64, both | 0x10 | 0x40, True, True, True, 32),
+            ("missing_subgroup_size_control", False, 32, 64, both, True, True, False, 32),
+            ("max_subgroup_63_too_small", True, 32, 63, both, True, True, False, 32),
+            ("max_subgroup_32_too_small", True, 32, 32, both, True, True, False, 32),
+            ("min_subgroup_65_too_large", True, 65, 128, both, True, True, False, 128),
+            ("missing_compute_stage_bit", True, 32, 64, vk_info.VK_SHADER_STAGE_MESH_BIT_EXT, False, True, False, 32),
+            ("missing_mesh_stage_bit", True, 32, 64, vk_info.VK_SHADER_STAGE_COMPUTE_BIT, True, False, False, 32),
+            ("no_required_stage_bits", True, 32, 64, 0, False, False, False, 32),
         ]
-        for label, sgc, lo, hi, stages, want_comp, want_mesh, want_native64 in cases:
+        for label, sgc, lo, hi, stages, want_comp, want_mesh, want_native64, subgroup_size in cases:
             with self.subTest(case=label):
                 dev = FakeDevice(
                     name=f"GPU-{label}",
                     subgroup_size_control=sgc,
+                    subgroup_size=subgroup_size,
                     min_subgroup_size=lo,
                     max_subgroup_size=hi,
                     required_subgroup_size_stages=stages,
@@ -530,13 +543,48 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(dev)
                 self.assertEqual(res, {
                     "device": f"GPU-{label}",
+                    "subgroup_size": subgroup_size,
                     "min_subgroup_size": lo,
                     "max_subgroup_size": hi,
                     "subgroup_size_control": sgc,
                     "compute_in_required_stages": want_comp,
                     "mesh_in_required_stages": want_mesh,
+                    "compute_in_supported_stages": True,
+                    "mesh_in_supported_stages": True,
                     "native64": want_native64,
                 })
+
+    def test_native64_uses_default_size_without_required_mesh_stage(self):
+        dev = FakeDevice(
+            subgroup_size=64,
+            required_subgroup_size_stages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT,
+        )
+        res, _vk = self._run_query(dev)
+        self.assertEqual(res["subgroup_size"], 64)
+        self.assertTrue(res["compute_in_supported_stages"])
+        self.assertTrue(res["mesh_in_supported_stages"])
+        self.assertTrue(res["compute_in_required_stages"])
+        self.assertFalse(res["mesh_in_required_stages"])
+        self.assertTrue(res["native64"])
+
+    def test_native64_default_size_requires_both_supported_stages(self):
+        dev = FakeDevice(
+            subgroup_size=64,
+            subgroup_supported_stages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT,
+            required_subgroup_size_stages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT,
+        )
+        res, _vk = self._run_query(dev)
+        self.assertFalse(res["mesh_in_supported_stages"])
+        self.assertFalse(res["native64"])
+
+    def test_native64_required_size_requires_both_supported_stages(self):
+        dev = FakeDevice(
+            subgroup_supported_stages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT,
+        )
+        res, _vk = self._run_query(dev)
+        self.assertTrue(res["mesh_in_required_stages"])
+        self.assertFalse(res["mesh_in_supported_stages"])
+        self.assertFalse(res["native64"])
 
     def test_device_name_stops_at_nul_and_replaces_invalid_utf8(self):
         res_nul, _ = self._run_query(FakeDevice(name=b"RDNA2\x00garbage_after_nul"))

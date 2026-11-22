@@ -2,6 +2,7 @@
 import ast
 import contextlib
 import io
+import json
 import struct
 from pathlib import Path
 import sys
@@ -14,6 +15,7 @@ import check
 
 
 GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
+GOOD_XY_XYZ = struct.pack("<192I", *check.FMT_XY_XYZ_WORDS, *[0xEEEEEEEE] * 108)
 FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
              (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
 
@@ -25,13 +27,13 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the three
+# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, cs_fmt_xy_xyz, the dumps (#73, #152 cross-half, partial), the three
 # vk_store_test checks (cs_imgstore, cs_imgload, cs_imgload_d16), pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
 # does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
+TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
-         + 9)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, ps_gather_wrap, ps_ssharp
+         + 10)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, cs_fma_fused, ps_gather_wrap and ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -53,6 +55,10 @@ class Wave64Checks(unittest.TestCase):
                 if fmt[1] is not None:
                     dump.write_bytes(fmt[1])
                 return fmt[0], "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
+            if name == "cs_fmt_xy_xyz":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
+                Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ)
+                return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
@@ -60,6 +66,10 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_f32_sat":
                 return cvt_answer(env)
+            if name == "cs_fma_fused":
+                # The operands come in through VKC_SGPRS; without them the fused words are not produced.
+                self.assertEqual((env or {}).get("VKC_SGPRS"), check.FMA_FUSED_ENV["VKC_SGPRS"])
+                return 0, "out[0..7] = " + " ".join(map(str, check.FMA_FUSED)) + "\n"
             self.assertNotIn("VKC_SGPRS", env or {})
             if name in PARTIAL:
                 self.assertNotIn("--require-wave64", args)
@@ -100,7 +110,7 @@ class Wave64Checks(unittest.TestCase):
                 words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_store":
-                return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
+                return 0, "out[0..7] = " + " ".join(map(str, (check.CS_STORE + [0] * 8)[:8])) + "\n"
             if name == "cs_smem_soffset_imm":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CS_SMEM)) + "\n"
             if name in WAVE32_WORDS:           # wave32 dumps run on any subgroup size
@@ -298,6 +308,39 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("no subgroup width", problem)
 
+    def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
+        out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
+        for width in (8, 16):
+            with self.subTest(width=width):
+                # In SIMD8/SIMD16, "10p0i" targets lanes >= 16 (out of bounds), returning 0 or wrapped values.
+                data = b"".join(struct.pack("<4I", i % width, (i % width) ^ 9, 0, 0) for i in range(64 * 64))
+                problem = self.run_pixel("ps_bitmask_perm", 0, out, data=data)
+                self.assertIsInstance(problem, check.Skip)
+                self.assertIn(f"{width} lanes", problem)
+
+    def test_bitmask_perm_judges_variable_device_at_32_lanes(self):
+        out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
+        bad = b"".join(struct.pack("<4I", i % 32, (i % 32) ^ 9, 0, 0) for i in range(64 * 64))
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)
+
+    def test_bitmask_perm_fails_broken_lanes_instead_of_skipping(self):
+        # Fixed 32..32 device producing only lanes 0..15, or 8..32 device producing incomplete/too-narrow lanes.
+        simd16 = b"".join(struct.pack("<4I", i % 16, (i % 16) ^ 9, 0, 0) for i in range(64 * 64))
+        problem = self.run_pixel("ps_bitmask_perm", 0, "device: fake (subgroup 32..32)\nok 64x64\n", data=simd16)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)
+
+        out = "device: fake (subgroup 8..32)\nok 64x64\n"
+        for lanes in (1, 4, 15):
+            with self.subTest(lanes=lanes):
+                bad = b"".join(struct.pack("<4I", i % lanes, (i % lanes) ^ 9, 0, 0) for i in range(64 * 64))
+                problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
+                self.assertNotIsInstance(problem, check.Skip)
+                self.assertIn("wrong", problem)
+
 
 class SeededPixelTests(unittest.TestCase):
     """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""
@@ -473,6 +516,33 @@ class Wave32LaneDumps(unittest.TestCase):
         with patch.object(check, "run", return_value=(0, self.words("cs_store"))) as run:
             check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
         self.assertNotIn("env", run.call_args.kwargs)
+
+    def test_recorded_wave_size_is_requested(self):
+        # cs_barrier_loop is wave32 but not a lane dump: left to the default it ran 64-wide on an RX 9070 (32..64),
+        # two waves instead of four, and failed in check.py while run_gpu_tests.py (which reads index.json) passed.
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(json.dumps({"cs_barrier_loop": {"subgroup_size": 32},
+                                                           "cs_store": {}}), encoding="utf-8")
+            with patch.object(check, "run", return_value=(0, "out[0..7] = 128 96 64 32 128 96 64 0\n")) as run:
+                self.assertEqual(check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump",
+                                                    expected_words=[128, 96, 64, 32, 128, 96, 64]), "")
+            self.assertEqual(run.call_args.kwargs["env"]["VKC_SUBGROUP_SIZE"], "32")
+            with patch.object(check, "run", return_value=(0, self.words("cs_store"))) as run:
+                check.compute_test("tools", tmp, "cs_store", "1", "dump", expected_words=check.CS_STORE)
+            self.assertNotIn("env", run.call_args.kwargs)                 # nothing recorded: the default size
+            with patch.object(check, "run", return_value=(0, "out[0..7] = 0 0 0 0 0 0 0 0\n")) as run:
+                check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[1],
+                                   env={"VKC_SUBGROUP_SIZE": "64"})
+            self.assertEqual(run.call_args.kwargs["env"]["VKC_SUBGROUP_SIZE"], "64")   # a caller's choice wins
+
+    def test_recorded_wave_size_that_cannot_be_pinned_is_a_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(json.dumps({"cs_barrier_loop": {"subgroup_size": 32}}),
+                                               encoding="utf-8")
+            out = "compute subgroup size: 32 not available\nout[0..7] = 0 0 0 0 0 0 0 0\n"
+            with patch.object(check, "run", return_value=(0, out)):
+                problem = check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[128])
+        self.assertIsInstance(problem, check.Skip)
 
     def test_skipped_when_32_lanes_cannot_be_pinned(self):
         for name in check.WAVE32_LANE_DUMPS:

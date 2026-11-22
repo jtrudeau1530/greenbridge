@@ -722,7 +722,12 @@ def main():
         ap.error(f"no carved archive (a folder with index.json) in {a.carve}")
     allt = []
     for arch in archs:
-        t = scan_archive(a.carve, arch)
+        try:
+            t = scan_archive(a.carve, arch)
+        except (OSError, ValueError, KeyError, TypeError) as e:   # a malformed index.json: one line, as gamedata_index
+            where = getattr(e, "filename", None) or os.path.join(a.carve, arch, "index.json")
+            print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
+            return 2
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
     path = a.out or os.path.join(a.carve, "textures_index.json")

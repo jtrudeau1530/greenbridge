@@ -99,7 +99,7 @@ class ShaderStageResumeTest(unittest.TestCase):
         elif tool == "shader_disasm.py":
             os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
 
-    def fake_translate(self, disasm, spirv, jobs, emulate=False):
+    def fake_translate(self, disasm, spirv, jobs, emulate=False, fallbacks=()):
         self.ran.append("translate (emulated)" if emulate else "translate")
         self.touch(spirv, "index.json")
 
@@ -246,7 +246,7 @@ class ShaderStageResumeTest(unittest.TestCase):
     # A kill between the merge (index.json appears) and the end of shaders() must not leave a finished folder
     # whose mode is unknown or wrong.
     def kill_after_merge(self, emulate):
-        def translate_then_die(disasm, spirv, jobs, emulate=False):
+        def translate_then_die(disasm, spirv, jobs, emulate=False, fallbacks=()):
             self.touch(spirv, "index.json")                 # rdna2spirv.py --merge finished ...
             raise KeyboardInterrupt                         # ... and the PC died right after
         with mock.patch.object(make_game, "py", self.fake_py), \
@@ -360,7 +360,7 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.run_stage(emulate=True)
         self.record_sources("0" * 64)
 
-        def failing_translate(disasm, spirv, jobs, emulate=False):
+        def failing_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
             self.assertTrue(emulate)
             raise SystemExit(1)
         with mock.patch.object(make_game, "py", self.fake_py), \

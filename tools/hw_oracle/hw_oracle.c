@@ -5,7 +5,8 @@
  *                                           amdhip64_7.dll (then _6) from the normal search path
  *
  * Each kernel gets one 8-byte kernarg (a pointer to a <words> dword buffer pre-filled with 0xDEAD0000) and is
- * launched as one workgroup of one thread. Output, one line per kernel:  <name> <hex word> ...
+ * launched as one workgroup of one thread. A stdin token may be name:threads:words to launch a bigger workgroup
+ * and read back fewer words (threads 1..1024, words <= <words>). Output, one line per kernel:  <name> <hex word> ...
  * The first line is "# device=<name> arch=<gfxNNNN>". Exit 0 ok, 77 no runtime or no device, 2 usage, 3 failure.
  * Build: gcc -O1 hw_oracle.c -o hw_oracle.exe
  */
@@ -31,7 +32,7 @@ typedef int (*hipModuleLaunchKernel_t)(void *, unsigned, unsigned, unsigned, uns
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: hw_oracle code.co words < kernel-names\n"); return 2; }
     unsigned words = (unsigned)strtoul(argv[2], NULL, 0);
-    if (words < 1 || words > 4096) { fprintf(stderr, "words must be 1..4096\n"); return 2; }
+    if (words < 1 || words > 16384) { fprintf(stderr, "words must be 1..16384\n"); return 2; }
     HMODULE h = NULL;
     if (argc > 3) {
         h = LoadLibraryA(argv[3]);
@@ -67,18 +68,27 @@ int main(int argc, char **argv) {
     uint32_t *buf = malloc(words * 4);
     char kn[256];
     while (scanf("%255s", kn) == 1) {
-        for (unsigned i = 0; i < words; i++) buf[i] = 0xDEAD0000u;
-        CK(hipMemcpy(d, buf, words * 4, 1));
+        /* token: name[:threads[:words]] */
+        unsigned threads = 1, w = words;
+        char *c = strchr(kn, ':');
+        if (c) {
+            *c++ = 0;
+            threads = (unsigned)strtoul(c, &c, 10);
+            if (*c == ':') w = (unsigned)strtoul(c + 1, NULL, 10);
+            if (threads < 1 || threads > 1024 || w < 1 || w > words) { fprintf(stderr, "bad kernel token\n"); return 2; }
+        }
+        for (unsigned i = 0; i < w; i++) buf[i] = 0xDEAD0000u;
+        CK(hipMemcpy(d, buf, w * 4, 1));
         void *fn;
         CK(hipModuleGetFunction(&fn, mod, kn));
         void *arg = d;
         size_t asz = sizeof arg;
         void *extra[] = {(void *)1, &arg, (void *)2, &asz, (void *)3};
-        CK(hipModuleLaunchKernel(fn, 1, 1, 1, 1, 1, 1, 0, NULL, NULL, extra));
+        CK(hipModuleLaunchKernel(fn, 1, 1, 1, threads, 1, 1, 0, NULL, NULL, extra));
         CK(hipDeviceSynchronize());
-        CK(hipMemcpy(buf, d, words * 4, 2));
+        CK(hipMemcpy(buf, d, w * 4, 2));
         printf("%s", kn);
-        for (unsigned i = 0; i < words; i++) printf(" %08x", buf[i]);
+        for (unsigned i = 0; i < w; i++) printf(" %08x", buf[i]);
         printf("\n");
     }
     fflush(stdout);

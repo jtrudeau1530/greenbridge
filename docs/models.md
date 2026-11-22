@@ -2,7 +2,8 @@
 
 Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
 upstream `rpf9-explorer` fix that closes it. The fix is merged upstream and the submodule is
-pinned at `917e9b9`.
+pinned at `e293917` (the 350,248-model counts below were measured at `917e9b9`, before
+upstream `v1.2` PRs #8–#12 landed).
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -12,11 +13,15 @@ dropped valid models in three validation paths, all in `third_party/rpf9-explore
 
 [Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
 fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged, and
-`third_party/rpf9-explorer` is pinned at upstream `917e9b9` (was `48557ea`). The later upstream
-commits add the `packs.rpf` drawable-dictionary roots (one drawable per entry), the TTPF
-array/cubemap/volume layouts, and the external drawable-skeleton reader. This page keeps the
-pre-pin measurements as the control and records the new pin's `packs.rpf` count below; it is not
-a competing patch.
+`third_party/rpf9-explorer` is now pinned at upstream `e293917` (was `917e9b9`, originally
+`48557ea`). Commits up to `917e9b9` added the `packs.rpf` drawable-dictionary roots (one drawable
+per entry), the TTPF compact/array/cubemap/volume layouts, and the external drawable-skeleton
+reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (PRs #8–#12:
+optional fragment pointers, skipping texture dictionaries in drawable-dictionary scans, 16-bit
+bone-palette indices, probe-count parity, and zero-radius drawables) plus BCPack BC1/BC3/BC4/BC5
+decoding (PR #7). The 350,248-model counts below were measured at `917e9b9` and have not yet been
+re-counted at `e293917`. This page keeps the pre-pin measurements as the control and records the
+`917e9b9` counts below; it is not a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
 Leonida, including 169 previously rejected candidates (also verified after archive readback). A
@@ -304,6 +309,33 @@ records. No unhandled layout tag appears:
 `data.rpf` or the `levels.rpf` samples. `data.rpf` uses `(8, 16)` exclusively; the 674
 `(12, 6)` geometries are spread over 256 models in the levels sample.
 
+## Vehicle ratings and performance estimates
+
+`common.rpf` has one `CVehicleBaseRatingsAndEstimatesMap` XML document (see [gamedata.md](gamedata.md)): a
+`Map` of 252 `Item key="<model>"` entries, each with four blocks. Counts and ranges only; no model names.
+
+| Block | Fields |
+|---|---|
+| `estimatesRoad`, `estimatesOffroad` | `fTopSpeed`, `fCornerSpeed`, `fAccelerationTime`, `fBrakingTime`, `fStandingQuarterTime`, `fStandingQuarterSpeed`, `fAvgLatTraction` |
+| `ratingsRoad`, `ratingsOffroad` | `fOverallRating`, `fSpeedRating`, `fHandlingRating`, `fAccelerationRating`, `fBrakesRating` |
+
+- **Keys are vehicle model names.** The 252 keys are distinct plain names (no hex hashes), and all 252 are the
+  base name of a `.yft` in the local archive catalog. 245 of them are also among the 319 models of the
+  distant-light recipes; 74 of those 319 have no rating entry.
+- **Ratings are not fractions.** All ten rating fields have a minimum of exactly 10 and medians of 142 to 585,
+  with maxima up to 1,327 (`fAccelerationRating`). `fOverallRating` is not the mean of the other four: the two
+  differ by a median of 38 and agree within 0.01 in only 10 of 504 cases.
+- **Estimates look like SI units.** Road `fTopSpeed` has a median of 44.3 and a maximum of 77.4 (m/s would make
+  that 160 and 279 km/h); `fStandingQuarterTime` has a median of 15.8, the right size for seconds over a
+  quarter mile; `fAvgLatTraction` has a median of 1.42 on road and 0.92 off road (lateral g would fit). Offroad
+  speeds are lower than road ones (median top speed 19.3).
+- **Sentinels.** On each surface, 11 entries have every estimate 0 and 10 more have zero speeds with an
+  infinite time (`inf`). `inf` occurs in 38 road and 99 offroad blocks overall, so a parser must accept `inf`
+  in these fields (it reads as "never reaches the test speed or distance").
+
+Not measured here (hypothesis): the rating scale and how `fOverallRating` weights its parts, and whether the
+estimates are precomputed from handling data or measured by simulation.
+
 ## Character skeletons
 
 World drawables do not carry the shared 597-name humanoid skeleton. Character `.#ft` fragments
@@ -369,9 +401,8 @@ own light bones).
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
-2. **Done:** the pin is `917e9b9` (was `48557ea`).
-3. `tools/rpf9dump models` has been re-run over the model-bearing archives at the new pin; the
-   counts are in the table above. Triangle totals were not re-run, and the texture counts in
-   [textures.md](textures.md) come from the Python TTPF tool, which is independent of the
-   submodule pin.
+2. **Done:** the pin is `e293917` (was `917e9b9`, originally `48557ea`).
+3. `tools/rpf9dump models` was re-run over the model-bearing archives at `917e9b9` (counts in the
+   table above). A fresh re-count at `e293917` is still needed to measure the delta from upstream
+   `v1.2` PRs #8–#12. Triangle totals were not re-run.
 4. Keep the README and issue #29 in sync with the new counts.

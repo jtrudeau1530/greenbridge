@@ -309,6 +309,11 @@ def main() -> int:
             print(f"ERROR: {path} does not exist", file=sys.stderr)
             status = 1
             continue
+        if not os.path.isfile(path):
+            # A folder passed for an archive used to reach open() and end the whole run with PermissionError.
+            print(f"ERROR: {path} is not a file", file=sys.stderr)
+            status = 1
+            continue
         print(f"Processing {path}...")
         stats = process_archive(path, limit=args.limit)
         all_stats.append(stats)

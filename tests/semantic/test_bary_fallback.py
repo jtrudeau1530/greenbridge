@@ -12,11 +12,14 @@ run_gpu_tests.py / check.py with LEONIDA_BARY_FALLBACK=1 check ps_bary through t
 * the GS text has the vertex count, the one-hot weights and the locations the PS expects, and refuses a collision.
 """
 import gc
+import json
+from pathlib import Path
 import os
 import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
@@ -142,6 +145,63 @@ class BaryFallbackGeometryShader(unittest.TestCase):
         self.assertIn("%bary1 = OpConstantComposite %v3float %f0 %f1 %f0", text)
         self.assertIn("%bary2 = OpConstantComposite %v3float %f0 %f0 %f1", text)
 
+    def test_pair_forwards_the_producers_clip_array_for_each_vertex(self):
+        index = {"vs_clip": {"stage": "vs", "capabilities": ["ClipDistance"], "clip_distance_count": 2},
+                 "ps_bary": {"stage": "ps", "inputs": [1], "bary_fallback_input": {"location": 0}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            index_file = Path(tmp, "index.json")
+            index_file.write_text(json.dumps(index), encoding="utf-8")
+            ordinary, = bary_fallback_gs.write_for_index(tmp)
+            paired, = bary_fallback_gs.write_for_index(tmp, pair=("vs_clip", "ps_bary"))
+            self.assertNotEqual(ordinary, paired)
+            self.assertNotIn("BuiltIn ClipDistance", Path(ordinary).read_text())
+            asm = Path(paired).read_text()
+            self.assertIn("%clip_count = OpConstant %uint 2", asm)
+            self.assertEqual(asm.count("BuiltIn ClipDistance"), 2)
+            for vertex, emission in enumerate(asm.split("OpEmitVertex")[:-1]):
+                self.assertIn(f"OpAccessChain %ptr_in_clip %in_clip %int_{vertex}", emission)
+                self.assertIn(f"OpStore %out_clip %distances{vertex}", emission)
+            del index["vs_clip"]["clip_distance_count"]
+            index_file.write_text(json.dumps(index), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "regenerate"):
+                bary_fallback_gs.write_for_index(tmp, pair=("vs_clip", "ps_bary"))
+
+    def test_pair_forwards_cull_distances_and_checks_the_layout(self):
+        vs = {"stage": "vs", "capabilities": ["CullDistance"], "cull_distance_count": 2}
+        index = {"vs": vs, "ps": {"stage": "ps", "bary_fallback_input": {"location": 0}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            index_file = Path(tmp, "index.json")
+            index_file.write_text(json.dumps(index), encoding="utf-8")
+            path, = bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
+            self.assertEqual(Path(path).name, "ps.bary_gs.cull2.spvasm")
+            asm = Path(path).read_text()
+            self.assertEqual(asm.count("BuiltIn CullDistance"), 2)
+            self.assertNotIn("ClipDistance", asm)
+            self.assertIn("%cull_count = OpConstant %uint 2", asm)
+            for vertex, emission in enumerate(asm.split("OpEmitVertex")[:-1]):
+                self.assertIn(f"OpAccessChain %ptr_in_cull %in_cull %int_{vertex}", emission)
+                self.assertIn(f"OpLoad %cull %cull_ptr{vertex}", emission)
+                self.assertIn(f"OpStore %out_cull %distances{vertex}", emission)
+            del vs["cull_distance_count"]
+            index_file.write_text(json.dumps(index), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "cull_distance_count"):
+                bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
+            vs.update(capabilities=["ClipDistance", "CullDistance"], clip_distance_count=1, cull_distance_count=1)
+            index_file.write_text(json.dumps(index), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "mixed"):
+                bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
+            self.assertEqual(list(Path(tmp).glob("*.spvasm")), [Path(path)])
+
+    def test_a_missing_directory_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing")
+            p = subprocess.run([sys.executable, "-I", bary_fallback_gs.__file__, missing],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 1)
+            self.assertEqual(p.stdout, "")
+            self.assertIn("not a directory", p.stderr)
+            self.assertEqual(os.listdir(tmp), [])                          # nothing written
+
     def test_collision_is_refused(self):
         with self.assertRaises(ValueError):
             bary_fallback_gs.gs_spvasm([0, 1], 1)
@@ -152,7 +212,6 @@ class BaryFallbackGeometryShader(unittest.TestCase):
                      "ps_b": {"stage": "ps", "inputs": [0]},
                      "cs_c": {"stage": "cs"}}
             with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
-                import json
                 json.dump(index, f)
             written = bary_fallback_gs.write_for_index(tmp)
             self.assertEqual([os.path.basename(p) for p in written], ["ps_a.bary_gs.spvasm"])
@@ -165,13 +224,14 @@ class BaryFallbackGeometryShader(unittest.TestCase):
     def test_assembles_and_validates(self):
         with tempfile.TemporaryDirectory() as tmp:
             asm = os.path.join(tmp, "gs.spvasm")
-            with open(asm, "w", encoding="utf-8", newline="\n") as f:
-                f.write(bary_fallback_gs.gs_spvasm([0, 1, 5], 6))
-            spv = os.path.join(tmp, "gs.spv")
-            for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
-                        ["spirv-val", "--target-env", "vulkan1.2", spv]):
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            for clip, cull in ((0, 0), (1, 0), (2, 0), (3, 0), (8, 0), (0, 1), (0, 2), (0, 8)):
+                with open(asm, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(bary_fallback_gs.gs_spvasm([0, 1, 5], 6, clip, cull))
+                spv = os.path.join(tmp, "gs.spv")
+                for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
+                            ["spirv-val", "--target-env", "vulkan1.2", spv]):
+                    r = subprocess.run(cmd, capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 if __name__ == "__main__":

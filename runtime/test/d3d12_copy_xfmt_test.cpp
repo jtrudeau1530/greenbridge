@@ -1,6 +1,7 @@
 // Copies between two formats of one D3D12 copy family (depth <-> colour of the same size, BC <-> its uncompressed
 // equivalent), on the Vulkan-backed device and on host D3D12 (default adapter and WARP). Bytes read back compared.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
@@ -208,6 +209,7 @@ int main() {
         {"CopyResource R32G32B32A32_UINT 4x4 -> BC7 16x16", tex(DXGI_FORMAT_R32G32B32A32_UINT, 4, 4), tex(DXGI_FORMAT_BC7_UNORM, 16, 16), true, false},
     };
 
+    if (hostwine::host_is_wine()) return 77;  // vkd3d runs copies WARP refuses, so the controls can't hold
     Ref<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return 1;
     unsigned differ = 0, differ_depth = 0, compared = 0;

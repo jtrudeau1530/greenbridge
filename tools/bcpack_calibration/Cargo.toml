@@ -8,4 +8,4 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-bcpack = { package = "bcpack-rs", git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "0a887de1edc9c22a425605091f1a8365fdf74dbb", default-features = false }
+bcpack-rans = { path = "../../third_party/bcpack-rs" }

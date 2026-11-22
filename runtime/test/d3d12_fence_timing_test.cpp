@@ -1,6 +1,6 @@
 // D3D-30 on the Vulkan device, through the Xbox-ABI proxy: SetEventOnMultipleFenceCompletion (ALL and ANY, with an
 // event and blocking), queue GetClockCalibration on both paths (calibrated timestamps on the standalone device when
-// the GPU has them, the submitted timestamp query on a device without the extension), GetAdapterLuid (must name a
+// it exposes both clock domains, the submitted timestamp query otherwise), GetAdapterLuid (must name a
 // DXGI adapter) and GetCustomHeapProperties (compared with the host PC runtime's answer when the host adapter is
 // NUMA, as the layer reports itself). No shaders or game data. LEONIDA_VK_VALIDATION=1 runs the test-made device
 // under VK_LAYER_KHRONOS_validation; any validation error fails the test.
@@ -10,6 +10,7 @@
 
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -59,6 +60,7 @@ int check_calibration(ID3D12CommandQueue* queue, double gpu_frequency, const cha
     const UINT64 before1 = qpc();
     EXPECT(SUCCEEDED(queue->GetClockCalibration(&gpu1, &cpu1)));
     const UINT64 after1 = qpc();
+    EXPECT(before1 <= cpu1 && cpu1 <= after1);
     EXPECT(gpu1 > gpu0 && cpu1 > cpu0);
     const double gpu_s = double(gpu1 - gpu0) / gpu_frequency, cpu_s = double(cpu1 - cpu0) / double(qpf.QuadPart);
     std::printf("%s: GPU %.6f s, CPU %.6f s between two calibrations (%.1f us apart)\n", path, gpu_s, cpu_s,
@@ -136,7 +138,7 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
         signaller.join();
         EXPECT(reached && a->GetCompletedValue() == 3);
     }
-    // A fence released while an event waits on it: nothing fires and nothing crashes.
+    // A fence released while an event waits on it sets the event, as on the host PC runtime.
     {
         Ref<ID3D12Fence> c;
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.p))));
@@ -145,7 +147,7 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
         Event event;
         EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(one, values, 1, ALL, event.h)));
         c.reset();
-        EXPECT(!event.set_within(30));
+        EXPECT(event.set_within(2000));
     }
     // Bad arguments.
     {
@@ -155,9 +157,9 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
                                                            nullptr) == E_INVALIDARG);
         EXPECT(device1->SetEventOnMultipleFenceCompletion(with_null, values, 2, ALL, nullptr) == E_INVALIDARG);
         EXPECT(device1->SetEventOnMultipleFenceCompletion(nullptr, values, 2, ALL, nullptr) == E_INVALIDARG);
-        Event event;
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(nullptr, nullptr, 0, ALL, event.h)));
-        EXPECT(event.set_within(0));
+        Event event;  // no fences: refused and the event left alone, as on the host PC runtime
+        EXPECT(device1->SetEventOnMultipleFenceCompletion(nullptr, nullptr, 0, ALL, event.h) == E_INVALIDARG);
+        EXPECT(!event.set_within(0));
     }
     return 0;
 }
@@ -275,18 +277,37 @@ int main() {
         const auto extensions_of = d.instance_fn<PFN_vkEnumerateDeviceExtensionProperties>(
             "vkEnumerateDeviceExtensionProperties");
         std::uint32_t count = 0;
-        extensions_of(d.physical, nullptr, &count, nullptr);
+        EXPECT(extensions_of(d.physical, nullptr, &count, nullptr) == VK_SUCCESS);
         std::vector<VkExtensionProperties> extensions(count);
-        extensions_of(d.physical, nullptr, &count, extensions.data());
-        bool available = false;
-        for (const auto& e : extensions)
-            available = available || !std::strcmp(e.extensionName, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ||
-                        !std::strcmp(e.extensionName, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        EXPECT(extensions_of(d.physical, nullptr, &count, extensions.data()) == VK_SUCCESS);
+        extensions.resize(count);
+        const auto has_extension = [&](const char* name) {
+            return std::any_of(extensions.begin(), extensions.end(),
+                               [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+        };
+        const bool khr = has_extension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        const bool ext = has_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        bool device_clock = false, qpc_clock = false;
+        if (khr || ext) {
+            // A driver can expose the extension without a Vulkan time domain for Win32 QPC (e.g. llvmpipe in Wine).
+            const auto domains_of = d.instance_fn<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
+                khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+            EXPECT(domains_of);
+            EXPECT(domains_of(d.physical, &count, nullptr) == VK_SUCCESS);
+            std::vector<VkTimeDomainKHR> domains(count);
+            EXPECT(domains_of(d.physical, &count, domains.data()) == VK_SUCCESS);
+            domains.resize(count);
+            device_clock = std::find(domains.begin(), domains.end(), VK_TIME_DOMAIN_DEVICE_KHR) != domains.end();
+            qpc_clock = std::find(domains.begin(), domains.end(), VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR) !=
+                        domains.end();
+        }
         const bool calibrated = rt::d3d12::queue_uses_calibrated_timestamps(queue.p);
-        std::printf("calibrated timestamps: %s on the GPU, %s by the queue\n", available ? "available" : "missing",
-                    calibrated ? "used" : "not used");
-        EXPECT(calibrated == available);  // Windows drivers calibrate DEVICE against QueryPerformanceCounter
-        EXPECT(check_calibration(queue.p, gpu_frequency, calibrated ? "calibrated timestamps" : "fallback") == 0);
+        std::printf("calibrated timestamps: extension %s, DEVICE domain %s, QPC domain %s, queue capability %s\n",
+                    khr || ext ? "present" : "missing", device_clock ? "present" : "missing",
+                    qpc_clock ? "present" : "missing", calibrated ? "enabled" : "disabled");
+        EXPECT(calibrated == (device_clock && qpc_clock));
+        const char* clock_path = calibrated ? "calibration-capable queue" : "standalone fallback";
+        EXPECT(check_calibration(queue.p, gpu_frequency, clock_path) == 0);
         EXPECT(check_multiple_fences(standalone.p, queue.p) == 0);
         EXPECT(check_luid(standalone.p) == 0);
     }

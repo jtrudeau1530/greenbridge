@@ -242,15 +242,27 @@ same numeric fields; the rest are names (`type`, `clientSystemName`, tile prefix
 The tile count is the only reading under which the sector override's span matches: 16,384 / 512 = 32 and
 33,792 / 512 = 66, so `width`/`height` are world units, not tile or texel counts.
 
-Which corner `origin` names was tested against the 2,036,542 map placements of the local catalog (x 0.1th to
-99.9th percentile -9,955 to 4,577, y -8,096 to 9,440): with `origin` as the grid centre, 99.83% fall inside
-the grid; as the minimum corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The centre
+Which corner `origin` names was tested against entity positions from a local index of map resources: 2,036,542
+placements from 23,361 resources at every LOD level, 2,011,519 of them in `levels.rpf` and the rest in the
+minigame and story packs (x 0.1th to 99.9th percentile -9,955 to 4,577, y -8,096 to 9,440). This is a
+different count from the 1,670,442 entities of the levels census in [world_census.md](world_census.md); it was
+only used for the share below. With `origin` as the grid centre, 99.83% fall inside the grid; as the minimum
+corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The `levels.rpf` subset alone gives the
+same picture: 99.83%, 1.0% and 83.0%. The centre
 reading also gives a minimum x of exactly -13,312, the `PAMH` heightmap's minimum x above.
 
-Tile names: none of the four `tileTextureNamePrefix` values occurs at the start of a name in the local
-texture catalog, no fallback texture name's joaat hash is a catalog id, and seven obvious `prefix + x + y + suffix` spellings hash
-to 0-2 catalog ids out of 2,112 per atlas, which is chance level. The tile textures are therefore either outside
-the scanned archives or named another way; this is unresolved.
+Tile names: none of the four `tileTextureNamePrefix` values starts an archive entry name or a texture-dictionary
+item name in the local catalog (118,925 named items, 119,090 item hashes). Neither the global nor the sector
+fallback names match an item name or its joaat hash, and ten `prefix + x + y + suffix` spellings over all
+2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
+outside the scanned archives or named another way; this is unresolved.
+
+A fifth grid uses the same base fields: one `TextureGridInfo` document has `origin`, `width`, `height`,
+`tileSize`, `streamRadius` and `zInflation`, plus a low- and a high-detail fallback name, but no sector
+overrides. It is 32,768 x 32,768 units with the same 512 tile, so **64 x 64 tiles**, the same 512 stream
+radius and the same 1,000 `zInflation`, around a different origin. Tested the same way, 100.00% of the
+placements fall inside with `origin` as the centre, 0.01% as the minimum corner and 11.8% as the top-left
+corner, so the centre convention holds for both document types.
 
 Not measured here (hypothesis): what the four grids hold (their names suggest per-tile map data for separate
 client systems), and how `zInflation` widens a tile's streaming box vertically.
@@ -415,6 +427,16 @@ Measured over the 630 clouds:
 - `StrikeChance` and `BurstChance` are within 0..1 in all 630. `Rain` and `Fog` are within -1..1 (median 0),
   `Density` within -100..100 (median 0.5) and `FogHeight` within -100..300: signed values, so these act as
   offsets or overrides with a sign, not plain amounts.
+
+The cloud renderer's settings sit in one `STS_Config` document with 44 top-level sections: four cloud layers
+(`Nimbus`, `Cumulus`, `Stratus`, `Alto`) that share one set of 13 fields (noise weights and blends, erosion,
+density, lighting and multi-scattering density scale, shape fade, transition and altitude ranges, dilation,
+noise displacement); six media (`GlobalFog`, `LocalFog`, `Rain`, `Clouds`, `CloudsCirrus`, `CloudsHaze`) that
+share another set of 9; and 34 single-value or vector settings. Of the five cloud flags above, `Cumulus` and
+`Stratus` match a layer name, `Nimbus0`/`Nimbus1` would both fall on the one `Nimbus` layer, and
+`CirroStratus` has no layer of its own (`CloudsCirrus` is a medium, not a layer). The weather data's
+`CloudType` is fractional (14 distinct values from 0.01 to 0.67 over the 25 weathers), so it is a blend
+position rather than an index into these layers.
 
 Not measured here (hypothesis): how a cloud's radius range blends with the weather's `CloudType` and cloud maps,
 what a negative `Rain`/`Fog`/`Density` means (subtracting from the weather, or "unset"), and what the two
@@ -592,6 +614,99 @@ The one unresolved item points outside this archive or at a document lost to the
 Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
 regions are chosen at runtime, what the two plain-modifier numbers are (GTA V reads them as a value pair
 blended by strength), and how `controlValue` maps onto game state.
+## Vehicle and tyre XML documents
+
+Four roots account for 37 of the 45 documents (4,547,932 inflated bytes) in the vehicles/tyres category:
+`CVehiclePoints` (32), `CVehicleBoneOffsetsArray` (2), `CVehiclePerformanceMaps` (2), and `CTyreDataSet` (1).
+All 37 parse cleanly with no truncation errors. Only counts, element/attribute names, encodings, and numeric
+ranges are recorded below; no vehicle names or entry values are included.
+
+### `CVehiclePoints` (32 documents, 33,516 B)
+
+Each document fits in one stream (370 to 10,425 B, median 592 B) and holds one vehicle entry (31 distinct
+`DefinitionName` values across the 32 documents; `DefinitionName` equals `ModelName` in all 32). Element tree:
+
+| Path | Count | Content |
+|---|---:|---|
+| `DefinitionName`, `ModelName` | 32 each | text identifier (equal in all 32) |
+| `Flags`, `iNumBoardingPoints` | 32 each | `value="0"` in all 32 |
+| `Points`, `Props`, `AuthoredMeshName` | 32 each | empty in all 32 |
+| `fNavOverrideRecastCellSize` | 32 | `value=` float `0.0000..0.0625` (median `0.0312`, 4 distinct values) |
+| `fMinPatchAreaBeforeCulling` | 31 | `value=` float `0.1000..4.0000` (median `1.0000`, 6 distinct values) |
+| `fNavMaxHeightChange`, `fNavMinZDist` | 30 each | `value=` constant `0.35` and `0.50` |
+| `fNavOverrideAgentRadius`, `fNavOverrideAgentHeight` | 30 each | `value=` `0.00..0.15` (4 values) and `0.00..1.20` (2 values) |
+| `fNavOverrideRecastCellHeight` | 26 | `value=` `0.00..0.04` (2 values) |
+| `ModDefs` / `ModDefs/Item` | 6 / 49 | 1 to 32 mod entries per document (median 4) |
+
+Every `ModDefs/Item` carries `ChassisModName` (49/49 non-empty), `PropsetExteriorModName` (35/49 non-empty),
+`UtilityModName` (32/49 non-empty), `InteriorModName` (4/49 non-empty), and `CargoModName` (0/49 non-empty);
+17 items also include `RoofModName` (8 non-empty). Cross-referencing `ModelName` against the two
+`CVehiclePerformanceMaps` documents matches 20 keys in the watercraft map and 4 in the land/air map, matching
+the navmesh-override fields used for walkable/boardable hulls and large vehicles.
+
+### `CVehicleBoneOffsetsArray` (2 documents, 4,303,883 B)
+
+Two documents share the `CVehicleBoneOffsetsArray` root (`boneOffsets/Item`, 2,481 entries total) with a clean
+split between identifier fields:
+
+| Document | Inflated B | Streams | `boneOffsets/Item` | Identifier field | `attachBones/Item` per entry | `numEntries` per entry |
+|---|---:|---:|---:|---|---:|---:|
+| Doc 0 | 4,283,195 | 66 | 2,447 | `name` (2,447/2,447; `vehicleName` empty) | 8..3,200 (median 8; 66,128 total, 9,345 non-empty) | 24..9,600 (median 24; 740,376 total) |
+| Doc 1 | 20,688 | 1 | 34 | `vehicleName` (34/34; `name` empty) | 4 in all 34 (136 total, all non-empty) | 12 in all 34 (408 total) |
+
+33 of Doc 1's 34 `vehicleName` entries match keys in `CVehiclePerformanceMaps` Doc 0 (0 in Doc 1).
+
+Each `boneOffsets/Item/offsets` block stores a palette-compressed float16 table with four elements: `numEntries`
+(`value=`), `bitsPerIndex` (`value=`), `packedIndices` (`content="short_array"`), and `palette`
+(`content="float16_array"`). Measured over all **2,481 / 2,481** tables (740,784 unpacked entries):
+
+- **`numEntries` divisibility:** exact multiple of `len(attachBones)` in all 2,481 entries (remainder 0) and exact
+  multiple of 12 in all 2,481 entries. `numEntries / len(attachBones)` is `3` in 2,319 entries (including all 34
+  of Doc 1 — one 3-component vector per bone slot); the remaining 162 entries take multiples of 3 from `9` to
+  `1,200` (`9, 12, 27, 36, 48, 75, 108, 300, 1200`).
+- **Bit width and palette:** `bitsPerIndex` is `1` (253 tables, palette length 2), `2` (1,951 tables, length
+  3..4), `3` (258 tables, length 5..8), or `4` (19 tables, length 9..14) — always minimal for `len(palette)`.
+  Palette values span `-30.90625` to `2.542969`, with `0.0` present in 2,119/2,481 palettes.
+- **Exact packing rule:** `packedIndices` holds 107,229 non-negative unsigned 16-bit integers (`0..65535`)
+  encoding a continuous **LSB-first bitstream** across 16-bit words. The array length equals
+  `floor(numEntries * bitsPerIndex / 16) + 1` in **2,481 / 2,481** tables (when `numEntries * bitsPerIndex` is a
+  multiple of 16 — 2,043 tables — the writer appends one trailing `0` word; all 2,043 trailing words and all
+  unused tail bits across all 2,481 tables are `0`).
+- **Bounds check:** unpacking all 740,784 indices produces **0 out-of-bounds** palette indices.
+
+### `CVehiclePerformanceMaps` (2 documents, 133,848 B)
+
+Two documents with disjoint `Map/Item[@key]` sets (285 distinct keys total, 0 overlap). Every `Map/Item` carries
+the exact same 10 scalar `value=` children: `topSpeed`, `accelZeroTwenty`, `accelZeroSixty`, `brakingSixtyZero`,
+`turnRadius`, `maxGforceLateral`, `maxGforceSteering`, `idlePitchAngle`, `buoyancyOffsetZ`, and `takeOffSpeed`.
+
+| Document | Inflated B | Streams | Entries | Non-zero road braking/turn/G | Non-zero `buoyancyOffsetZ` | Non-zero `takeOffSpeed` | `topSpeed` range (median) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Doc 0 (land/air) | 117,808 | 2 | 251 | 203..223 | 0 | 10 (max `57.64`) | `0.00..115.96` (`45.32`) |
+| Doc 1 (watercraft) | 16,040 | 1 | 34 | 0 | 34 (`-1.11..1.91`) | 1 (`21.54`) | `0.00..55.05` (`16.82`) |
+
+### `CTyreDataSet` (1 document, 76,685 B, 2 streams)
+
+One document containing 40 `TyreDataEntries/Item` records (40 distinct `key` attributes, max tree depth 5). Each
+entry combines up to four nested parameter groups with 12 direct scalar `value=` fields:
+
+| Path under `TyreDataEntries/Item` | Present | Schema |
+|---|---:|---|
+| `roadPerformance` | 40 / 40 | 8 scalars: `fPeakSlipAngle`, `fAdhesionLimitAngle`, `fLateralFrictionMult`, `fPeakSlipRatio`, `fAdhesionLimitRatio`, `fLongitudinalFrictionMult`, `fPeakForceCoefficient`, `fSlidingForceCoefficient` |
+| `offRoadPerformance` | 38 / 40 | identical 8-scalar schema (omitted on 2 entries) |
+| `roadPenalties`, `offRoadPenalties` | 40 / 40 each | identical 6-scalar schema: `fMaterialTractionLoss`, `fMaterialRollingDragGain`, `fMaterialSinkDragGain`, `fMaterialSurfaceDragGain`, `fWetTractionLoss`, `fWetDragGain` |
+| Direct scalars (required) | 40 / 40 each | `fLoadShapeVarianceScale`, `fDamageShapeVarianceScale`, `fDamageCoefficientScale`, `fOptimumTyreTemp` (all `100.0`), `fOptimumTyreTempRange` (all `100.0`), `fGripDropOffWithTemp` (`0.01..0.05`) |
+| Direct scalars (optional) | 36..39 / 40 | `fPuncturedTyreGripReduction`, `fBurstTyreGripReduction`, `fTractionStiffnessSpeedMult`, `fTractionStiffnessSpeedCap` (39 each); `fLoadStability` (37); `fLoadSensitivity` (36) |
+**Sample hours come from data.** One `time_data` document (root attributes `version` and `mode`) has exactly 13
+`sample` elements, each with `name`, `hour`, `uw_tc_mod` and `interpolation_type`, plus one `region`. The 13
+hours are integers from 0 to 22 in strictly increasing order, with gaps of 1 hour (7 times), 2 (twice), 3 (once)
+and 4 (twice); `interpolation_type` is `EASE_LINEAR_IN` on 9 samples and `EASE_QUARTIC_INOUT` on 4, and all 13
+`uw_tc_mod` values are the same name, which resolves to one of the 4,592 modifier names. The `region` name equals one of the two keyframe
+region names. So unlike GTA V, where the 13 sample times are compiled in, this build reads them (and the easing
+between them) from `time_data`; their count matches the 13 values of every keyframe variable.
+
+Not measured here (hypothesis): how the two regions are chosen at runtime, what the two plain-modifier numbers
+are (GTA V reads them as a value pair blended by strength), and how `controlValue` maps onto game state.
 
 ## Relationship to `data.rpf` and `script.rpf`
 
@@ -623,8 +738,9 @@ So `common.rpf` is the XML/config layer that mounts levels content and reference
 of its `<filename>` entries use the `script` token. It may still reference script content through non-path
 content names, which this count does not cover. The 587 `$(common)/` entries are mostly movie paths (537 end
 in `.bk2`), not XML. Of the 57 `.xml` path entries, 50 are under `$(common)/` and 7 are relative/other; none
-are under `data/` or `script/`. A further 40 `parentPath` attributes are relative references that cannot be
-resolved without the table of contents. No XInclude (`xi:include`) elements occur.
+are under `data/` or `script/`. A further 40 `parentPath` attributes are XPath-style
+`../Item[@key='...']` steps that all resolve to sibling items inside their own document, so they need no table
+of contents (see [gamedata_graph.md](gamedata_graph.md#what-the-locators-point-at)). No XInclude (`xi:include`) elements occur.
 
 ## Shore wave placement
 

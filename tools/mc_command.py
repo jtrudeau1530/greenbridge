@@ -5,12 +5,15 @@ needs the command-line form when llvm-mc runs inside WSL, because the official W
 target:
 
     set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
+
+run() starts such a command and turns a missing llvm-mc into one line instead of a FileNotFoundError traceback.
 """
 from __future__ import annotations
 
 import os
 import shlex
 import shutil
+import subprocess
 
 
 def split_command(raw: str) -> list:
@@ -41,3 +44,20 @@ def mc_command(raw: str | None = None) -> list:
     if raw is None:
         raw = os.environ.get("LLVM_MC", "llvm-mc")
     return split_command(raw) or ["llvm-mc"]
+
+
+def not_found(exe: str, error: OSError, flag: str | None = None) -> str:
+    """The message for an llvm-mc that can't be started (shader_disasm.py's wording). `flag` is the tool's own
+    option for the command, if it has one (run_gpu_tests.py's --llvm-mc); the others read LLVM_MC only."""
+    where = f"set LLVM_MC (or pass {flag})" if flag else "set LLVM_MC"
+    return (f"'{exe}' could not be started: {error}. Put llvm-mc on PATH or {where} to it\n"
+            f"(on Windows, scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
+            f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+
+
+def run(cmd: list, flag: str | None = None, **kwargs) -> subprocess.CompletedProcess:
+    """subprocess.run for an llvm-mc command line; one that can't be started ends the tool with not_found()."""
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except OSError as e:
+        raise SystemExit(not_found(cmd[0], e, flag)) from None

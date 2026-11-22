@@ -4,6 +4,7 @@
 #include "d3d12_com_object.h"
 #include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
+#include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
@@ -51,6 +52,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
     case leonida::ReplayResult::invalid_query: return "invalid query";
+    case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -300,7 +302,7 @@ public:
     // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.
     void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buffer, UINT64 offset, D3D12_PREDICATION_OP op) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPredication");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         check(list_.set_predication({resource_id(buffer), offset, u(op)}));
     }
 
@@ -373,18 +375,28 @@ public:
                                count, rects);
     }
 
+    // As the host's Close reports it: compute and copy lists hold timestamps only (not even pipeline statistics on
+    // compute), and bundles no queries at all.
+    bool query_allowed(D3D12_QUERY_TYPE type) const {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) return true;
+        return type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE && type == D3D12_QUERY_TYPE_TIMESTAMP;
+    }
+
     // Queries (docs/d3d12_vulkan.md section 4.6). Heap types, index ranges and the destination buffer are checked
     // at ExecuteCommandLists, when the heap and the buffer are known.
     void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
+        if (!query_allowed(type)) return check(false);
         check(list_.begin_query({query_heap_id(heap), u(type), index}));
     }
 
     void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
+        if (!query_allowed(type)) return check(false);
         check(list_.end_query({query_heap_id(heap), u(type), index}));
     }
 
     void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT first, UINT count,
                                             ID3D12Resource* dst, UINT64 offset) override {
+        if (!query_allowed(type)) return check(false);
         check(list_.resolve_queries({query_heap_id(heap), u(type), first, count, resource_id(dst), offset}));
     }
 
@@ -603,6 +615,7 @@ public:
     Fence(leonida::VulkanContext& context, UINT64 initial, D3D12_FENCE_FLAGS flags)
         : context_(context), fence_(context, initial), flags_(flags), highest_(initial) {}
 
+    // As in D3D12, releasing the fence completes the waits still pending on it (ALL counts it as one fence).
     ~Fence() override { context_.cancel_fence_waits(fence_.semaphore()); }
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
@@ -671,8 +684,9 @@ public:
     }
 
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
-                 const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock)
-        : desc_(desc), context_(context), queue_(context, queue, family, queue_kind_for(desc.Type)),
+                 const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock, std::shared_ptr<void> queue_lease)
+        : desc_(desc), context_(context), queue_lease_(std::move(queue_lease)),
+          queue_(context, queue, family, queue_kind_for(desc.Type)),
           vk_queue_(queue), family_(family), clock_(clock) {}
 
     ~CommandQueue() override {
@@ -704,6 +718,11 @@ public:
                 d3d12_trace::record(method, "failed");
                 return;
             }
+            if (!timestamps_fit(*list)) {
+                last_result_ = leonida::ReplayResult::invalid_query;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
             recorded.push_back(&list->commands());
         }
         last_result_ = queue_.execute(recorded);
@@ -711,6 +730,19 @@ public:
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
                          name(last_result_));
+    }
+
+    // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.
+    bool timestamps_fit(const GraphicsCommandList& list) {
+        namespace h = leonida::d3d12_query_heap;
+        const auto other = list.type() == D3D12_COMMAND_LIST_TYPE_COPY ? h::timestamp : h::copy_queue_timestamp;
+        for (const auto& command : list.commands().commands()) {
+            const auto range = leonida::query_range(command);
+            if (range.count && range.type == leonida::d3d12_query::timestamp &&
+                context_.query_heap_type(range.heap) == other)
+                return false;
+        }
+        return true;
     }
 
     // Reserved resources are fully backed at creation (docs/d3d12_vulkan.md section 4.2), so tile mappings are not
@@ -784,10 +816,17 @@ public:
             domains[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
             domains[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
             std::uint64_t stamps[2]{}, deviation = 0;
+            LARGE_INTEGER before{}, after{};
+            QueryPerformanceCounter(&before);
             if (clock_.calibrated(context_.device(), 2, domains, stamps, &deviation) == VK_SUCCESS) {
-                *gpu = stamps[0];
-                *cpu = stamps[1];
-                return S_OK;
+                QueryPerformanceCounter(&after);
+                // Wine can expose a host monotonic clock that differs from its Win32 QPC clock.
+                // Keep the GPU and CPU samples paired by taking a fresh GPU sample on fallback.
+                if (stamps[1] >= UINT64(before.QuadPart) && stamps[1] <= UINT64(after.QuadPart)) {
+                    *gpu = stamps[0];
+                    *cpu = stamps[1];
+                    return S_OK;
+                }
             }
         }
         return submitted_calibration(*gpu, *cpu);
@@ -880,6 +919,8 @@ private:
     D3D12_COMMAND_QUEUE_DESC desc_;
     leonida::VulkanContext& context_;
     std::mutex mutex_;
+    // Destroyed after queue_ has waited idle, so the handle cannot be reused prematurely.
+    std::shared_ptr<void> queue_lease_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
     VkQueue vk_queue_;
@@ -901,10 +942,10 @@ private:
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,
-                             const QueueClock& clock) {
+                             const QueueClock& clock, std::shared_ptr<void> queue_lease) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* object = new CommandQueue(context, queue, queue_family, desc, clock);
+    auto* object = new CommandQueue(context, queue, queue_family, desc, clock, std::move(queue_lease));
     if (!object->ok()) {
         object->Release();
         return E_FAIL;
@@ -953,15 +994,11 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
                                                D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
     if (flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY)
         return E_INVALIDARG;
-    if (count && (!fences || !values)) return E_INVALIDARG;
+    if (!count || !fences || !values) return E_INVALIDARG;  // no fences is refused, as on the host runtime
     std::vector<Fence*> objects(count);
     for (UINT i = 0; i < count; ++i)
         if (!(objects[i] = Fence::from(fences[i]))) return E_INVALIDARG;
     const bool any = flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
-    if (!count) {  // nothing to wait for
-        if (event) SetEvent(event);
-        return S_OK;
-    }
     if (!event) {
         // One vkWaitSemaphores call: VK_SEMAPHORE_WAIT_ANY_BIT is the ANY flag, no flag is ALL.
         std::vector<VkSemaphore> semaphores(count);
@@ -980,6 +1017,7 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
 }
 
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     const CommandQueue* q = CommandQueue::from(queue);
     return q && q->uses_calibrated_timestamps();
 }
@@ -1002,6 +1040,7 @@ bool command_signature_info(ID3D12CommandSignature* signature, leonida::Indirect
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     const CommandQueue* q = CommandQueue::from(queue);
     return q ? q->last_result() : leonida::ReplayResult::unsupported;
 }

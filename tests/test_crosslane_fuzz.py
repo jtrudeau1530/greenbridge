@@ -4,12 +4,16 @@ from the RDNA ISA rules in its docstring. No GPU, no llvm-mc, no game files.
     python -I tests/test_crosslane_fuzz.py
 """
 import argparse
+import contextlib
+import io
 import os
 import random
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
 TOOL = os.path.join(TOOLS, "crosslane_fuzz.py")
@@ -189,6 +193,38 @@ class Modes(unittest.TestCase):
         self.assertIn("unknown mode 'emulat'", r.stderr)
 
 
+class MissingHarness(unittest.TestCase):
+    """Without vk_compute_test the translator oracle stops with one line before any program is generated. It used to
+    translate for a while and then end in a FileNotFoundError traceback from the first GPU run."""
+
+    def run_tool(self, *extra, env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "no-such-build", "vk_compute_test.exe")
+            # LLVM_MC points nowhere too: the check has to come before anything that would need llvm-mc.
+            env = dict(os.environ, LLVM_MC=os.path.join(tmp, "no-such-llvm-mc"), **(env or {}))
+            r = subprocess.run([sys.executable, "-I", TOOL, "--exe", exe, "--programs", "2", *extra],
+                               capture_output=True, text=True, env=env, timeout=300)
+        return exe, r
+
+    def test_missing_exe_is_one_line_before_anything_runs(self):
+        exe, r = self.run_tool()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn(f"vk_compute_test not found at {exe}", r.stderr)
+        self.assertIn("--target vk_compute_test", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_hardware_oracle_alone_does_not_need_it(self):
+        _, r = self.run_tool("--oracle", "hw", env={"LEONIDA_AMD_CLANG": os.path.join(TOOLS, "no-such-clang.exe")})
+        self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+
+    def test_self_test_does_not_need_it(self):
+        _, r = self.run_tool("--self-test")
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+
 class GpuEnv(unittest.TestCase):
     """FUZZ-13: vk_compute_test is asked for 32-wide subgroups for wave32 and emulated wave64 programs, as lds_fuzz.py
     and valu_fuzz.py do. On AMD the compute default is 64, and a wave32 group over 32 lanes ran as one subgroup."""
@@ -216,6 +252,145 @@ class GpuEnv(unittest.TestCase):
         self.assertEqual(env["KEEP"], "1")
         self.assertEqual(X.gpu_env(self.program(32, 1), False, "d", base={})["VKC_OUT_WORDS"],
                          str(max(len(X.OUT_REGS), 64)))
+
+
+class HardwareOracle(unittest.TestCase):
+    """--oracle hw: the native kernel text (no GPU needed) and the exit-77 contract."""
+
+    def test_hw_lines_resolve_branches_and_store_through_the_output_pointer(self):
+        for seed in range(40):
+            prog = X.make_program(seed, 64 if seed % 2 else 32, 24)
+            lines = prog.hw_lines(guard=False)
+            text = "\n".join(lines)
+            self.assertNotIn("@", text)
+            self.assertNotIn("buffer_store", text)
+            self.assertEqual(sum(ln.startswith("global_store_b32 v22, v20, s[2:3] offset:") for ln in lines),
+                             len(X.OUT_REGS))
+            self.assertEqual(lines[-1], "s_endpgm")
+            targets = re.findall(r"s_cbranch_\w+ (\.L\S+)", text)
+            for t in targets:
+                self.assertIn(t + ":", lines)
+            self.assertEqual(len(targets), len(set(targets)))
+
+    def test_guard_follows_every_instruction_but_the_end(self):
+        prog = X.make_program(3, 32, 10)
+        plain, guarded = prog.hw_lines(guard=False), prog.hw_lines(guard=True)
+        labels = [ln for ln in plain if ln.endswith(":")]
+        self.assertEqual(len(guarded), 2 * (len(plain) - len(labels)) - 1 + len(labels))
+        self.assertEqual([ln for ln in guarded if ln != "s_nop 7"], plain)
+
+    def test_native_kernel_geometry(self):
+        from hw_oracle import asm
+        prog = X.make_program(5, 64, 8)
+        k = asm.Kernel(prog.hw_lines(), prog.wave, prog.group, prog.group * len(X.OUT_REGS), raw=True)
+        text, names, _ = asm.module_text([k], "gfx1150", wave=64)
+        self.assertIn(".amdhsa_wavefront_size32 0", text)
+        self.assertIn(".wavefront_size: 64", text)
+        text32, _, _ = asm.module_text([asm.Kernel(["s_endpgm"], 32, 32, 1, raw=True)], "gfx1150")
+        self.assertIn(".amdhsa_wavefront_size32 1", text32)
+
+    def test_tool_exits_77_without_the_oracle_tools(self):
+        env = dict(os.environ, LEONIDA_AMD_CLANG=os.path.join(TOOLS, "no-such-clang.exe"))
+        r = subprocess.run([sys.executable, "-I", TOOL, "--oracle", "hw", "--programs", "2"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
+        self.assertIn("unavailable", r.stdout)
+
+    def test_unknown_oracle_is_a_usage_error(self):
+        r = subprocess.run([sys.executable, "-I", TOOL, "--oracle", "gpu"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
+    def test_on_hardware(self):
+        from hw_oracle import runner
+        try:
+            oracle = runner.open_oracle()
+        except runner.Unavailable as e:
+            self.skipTest(f"hardware oracle unavailable: {e}")
+        try:
+            stats, fails = {}, []
+            progs = [X.make_program(900 + i, (32, 64)[i % 2], 16, dpp=True) for i in range(12)]
+            X.run_hw(oracle, progs, stats, fails)
+        finally:
+            oracle.close()
+        self.assertEqual([(p.name, w) for p, _, w, _ in fails], [])
+        self.assertEqual(sum(st["programs"] for st in stats.values()), 12)
+        self.assertEqual(sum(st["match"] for st in stats.values()), 12)
+        for st in stats.values():
+            self.assertEqual((st["mismatch"], st["hyp_only"], st["rejected"]), (0, 0, 0))
+
+class HarnessErrors(unittest.TestCase):
+    """A program the GPU harness hangs or crashes on is one reported failure, not the end of the run."""
+
+    def test_timeout_is_a_harness_error(self):
+        prog = X.make_program(1, 32, 4)
+        with tempfile.TemporaryDirectory() as work, \
+                mock.patch.object(X.subprocess, "run", side_effect=subprocess.TimeoutExpired(["x"], 60)):
+            with self.assertRaises(X.HarnessError) as ctx:
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertIn("timed out after 60 s", str(ctx.exception))
+
+    def test_missing_dump_is_a_harness_error_with_the_exit_code(self):
+        prog = X.make_program(1, 32, 4)
+        done = subprocess.CompletedProcess(["x"], 3, stdout="", stderr="device lost\n")
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", return_value=done):
+            with self.assertRaises(X.HarnessError) as ctx:
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertIn("no dump (exit 3): device lost", str(ctx.exception))
+
+    def _main(self, run_gpu, argv):
+        """main() with the assembler, translator and GPU replaced: every program 'translates'."""
+        def translate(work, emulate):
+            spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
+            os.makedirs(spdir, exist_ok=True)
+            for name in names:
+                open(os.path.join(spdir, name + ".spv"), "wb").close()
+            return spdir, ""
+
+        names = []
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as build:
+            exe = os.path.join(build, "vk_compute_test.exe")   # only has to exist: run_gpu is replaced
+            open(exe, "wb").close()
+            with mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
+                    mock.patch.object(X, "translate", side_effect=translate), \
+                    mock.patch.object(X, "run_gpu", side_effect=run_gpu), \
+                    mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--exe", exe] + argv), \
+                    contextlib.redirect_stdout(out):
+                code = X.main()
+        return code, out.getvalue()
+
+    @staticmethod
+    def _expected_words(prog):
+        exp, _ = prog.expected()
+        words = [0] * (prog.group * len(X.OUT_REGS))
+        for (tid, j), v in exp.items():
+            words[tid * len(X.OUT_REGS) + j] = v
+        return words
+
+    def test_run_goes_on_after_a_hang_and_exits_2(self):
+        calls = []
+
+        def run_gpu(exe, spv, prog, work, emulate):
+            calls.append(prog.name)
+            if len(calls) == 2:
+                raise X.HarnessError("vk_compute_test timed out after 60 s")
+            return self._expected_words(prog)
+
+        with tempfile.TemporaryDirectory() as keep:
+            code, out = self._main(run_gpu, ["--programs", "4", "--wave", "32", "--modes", "native",
+                                             "--no-maskdata", "--keep", keep])
+            kept = os.listdir(keep)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(code, 2)
+        self.assertIn(f"{calls[1]} [native] harness error: vk_compute_test timed out after 60 s", out)
+        self.assertIn("programs 4, match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 1", out)
+        self.assertEqual(kept, [f"{calls[1]}_native.asm"])
+
+    def test_clean_run_still_exits_0(self):
+        code, out = self._main(lambda exe, spv, prog, work, emulate: self._expected_words(prog),
+                               ["--programs", "3", "--wave", "32", "--modes", "native", "--no-maskdata"])
+        self.assertEqual(code, 0)
+        self.assertIn("match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 0", out)
 
 
 if __name__ == "__main__":

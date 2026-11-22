@@ -98,6 +98,72 @@ HRESULT CALLBACK provider(XAsyncOp op, const XAsyncProviderData* data) {
     }
 }
 
+// xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
+// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path through the loader shims,
+// bound by the api set XCurl.dll imports them from, as a mapped image would be.
+void check_run_time_load() {
+    using LoadW = HMODULE(WINAPI*)(LPCWSTR);
+    using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+    using GetModW = HMODULE(WINAPI*)(LPCWSTR);
+    using GetProc = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    using Free = BOOL(WINAPI*)(HMODULE);
+    const char* set = "api-ms-win-core-libraryloader-l1-2-0.dll";
+    auto load_w = reinterpret_cast<LoadW>(rt::shims::find(set, "LoadLibraryW"));
+    auto load_ex_a = reinterpret_cast<LoadExA>(rt::shims::find("kernel32.dll", "LoadLibraryExA"));
+    auto get_mod_w = reinterpret_cast<GetModW>(rt::shims::find(set, "GetModuleHandleW"));
+    auto get_proc = reinterpret_cast<GetProc>(rt::shims::find(set, "GetProcAddress"));
+    auto free_lib = reinterpret_cast<Free>(rt::shims::find(set, "FreeLibrary"));
+    check(load_w && load_ex_a && get_mod_w && get_proc && free_lib, "the loader functions are registered");
+    if (!(load_w && load_ex_a && get_mod_w && get_proc && free_lib)) return;
+
+    check(rt::shims::owns_dll("xgameruntime.dll") && !rt::shims::owns_dll("kernel32.dll") &&
+              !rt::shims::owns_dll(set) && !rt::shims::owns_dll("nosuch.dll"),
+          "owns_dll: xgameruntime.dll yes; kernel32, api sets and unknown modules no");
+
+    HMODULE rt_mod = load_w(L"xgameruntime.dll");
+    check(rt_mod != nullptr, "LoadLibraryW(xgameruntime.dll) is served without the host runtime");
+    check(load_w(L"XGameRuntime") == rt_mod && load_ex_a("C:\\Some\\Dir\\XGAMERUNTIME.DLL", nullptr, 0) == rt_mod &&
+              get_mod_w(L"xgameruntime.dll") == rt_mod,
+          "the same module for a bare name, a full path in any case, LoadLibraryExA and GetModuleHandleW");
+
+    const char* entry_points[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
+                                  "UninitializeApiImpl", "QueryApiImpl"};
+    bool all = true;
+    for (const char* n : entry_points)
+        all = all && get_proc(rt_mod, n) &&
+              reinterpret_cast<void*>(get_proc(rt_mod, n)) == rt::shims::find("xgameruntime.dll", n);
+    check(all, "GetProcAddress serves the five entry points xgameruntime.lib looks up");
+    SetLastError(0);
+    check(get_proc(rt_mod, "NoSuchRuntimeFunction") == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
+          "an unserved name is NULL with ERROR_PROC_NOT_FOUND, as from a real module");
+
+    struct Options {
+        uint32_t unknown;
+        BOOL is_inline;
+        const char* game_config;
+    } options{1, FALSE, nullptr};
+    using InitEx2 = HRESULT(WINAPI*)(ULONG, ULONG, char, const Options*);
+    using Query = HRESULT(WINAPI*)(const GUID*, REFIID, void**);
+    using Uninit = HRESULT(WINAPI*)();
+    auto init_ex2 = reinterpret_cast<InitEx2>(get_proc(rt_mod, "InitializeApiImplEx2"));
+    auto query = reinterpret_cast<Query>(get_proc(rt_mod, "QueryApiImpl"));
+    auto uninit_api = reinterpret_cast<Uninit>(get_proc(rt_mod, "UninitializeApiImpl"));
+    check(init_ex2(0x2410, 0x0, 0x02, &options) == S_OK, "InitializeApiImplEx2 succeeds offline");
+    const GUID some_class = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+    void* out = reinterpret_cast<void*>(1);
+    check(query(&some_class, some_class, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr,
+          "QueryApiImpl refuses a class it doesn't provide yet (HRESULT 0x80070032) and clears the out pointer");
+    check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
+
+    HMODULE k32 = load_w(L"kernel32.dll");
+    check(k32 == GetModuleHandleW(L"kernel32.dll"), "a host module still loads from the host");
+    check(reinterpret_cast<void*>(get_proc(k32, "GetTickCount")) ==
+              reinterpret_cast<void*>(GetProcAddress(k32, "GetTickCount")),
+          "GetProcAddress on a host module is the host's");
+    check(free_lib(rt_mod) == TRUE && load_w(L"xgameruntime.dll") == rt_mod,
+          "FreeLibrary on the runtime succeeds and keeps it loaded");
+}
+
 }  // namespace
 
 int main() {
@@ -195,6 +261,8 @@ int main() {
     uninit();
     check(init() == S_OK, "XGameRuntimeInitialize works again after balanced uninitialize calls");
     uninit();
+
+    check_run_time_load();
 
     if (g_failures) {
         std::printf("xgameruntime_test: %d of %d checks failed\n", g_failures, g_checks);
