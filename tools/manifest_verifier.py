@@ -79,7 +79,7 @@ def walk(target_dir: str, *, exclude: str | None = None):
             if contains_manifest and os.path.normcase(name) == excluded_name:
                 continue
             abs_p = os.path.join(root, name)
-            rel_p = os.path.relpath(abs_p, target_dir).replace("\\", "/")
+            rel_p = os.path.relpath(abs_p, target_dir).replace(os.sep, "/")
             yield rel_p, abs_p
 
 
