@@ -76,10 +76,10 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
-                "cs_barrier_divergent", "cs_w32_lds_u8_d16")
+                "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is.
-WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute")
+WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
@@ -95,6 +95,7 @@ CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # mask-only wave64: s_bcnt1_i32_b64 on ordinary SGPRs, no WAVE64_RE EXEC markers (#210 / SHADER-28)
             ("cs_w64_mask_detect", [48]),
             ("cs_wqm_w64", [20, 4, 12, 8, 1, 0, 15728895, 20]), ("cs_wqm_w32", [12, 1, 4, 0, 8, 15728880, 4, 32]),
+            ("cs_bpermute32", [0, 50, 162, 99, 36, 218, 183, 15]),
             ("cs_wqm_w64_half", [11, 14, 0, 1, 6, 8, 12, 2]),
             # SHADER-91: two s_barrier sites in wave-uniform branches meet like one barrier; wave 0 reads wave 3
             ("cs_barrier_divergent", [127, 126, 125, 124, 123, 122, 121, 120])]
@@ -198,9 +199,37 @@ def start_failure(exe, err):
             "allow it, or turn Smart App Control off (Windows Security > App & browser control), and run again")
 
 
-def run(*cmd, env=None):
+# A test program that hangs (a driver deadlock, e.g. a barrier not every invocation reaches) must not stall the whole
+# suite: each run gets a time limit, is killed when it runs out, and counts as a failure. LEONIDA_GPU_TEST_TIMEOUT
+# sets the limit in seconds; 0 turns it off.
+DEFAULT_GPU_TEST_TIMEOUT = 120.0
+
+
+def gpu_test_timeout():
+    """Seconds one GPU test program may run (LEONIDA_GPU_TEST_TIMEOUT), or None for no limit."""
+    text = (os.environ.get("LEONIDA_GPU_TEST_TIMEOUT") or "").strip()
+    if not text:
+        return DEFAULT_GPU_TEST_TIMEOUT
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        limit = float(text)
+    except ValueError:
+        sys.exit(f"LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not {text!r}")
+    if math.isnan(limit):
+        sys.exit("LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not nan")
+    return None if limit <= 0 else limit
+
+
+def timed_out(name, limit):
+    return (f"timed out after {limit:g} s: {os.path.basename(str(name))} was killed (a GPU hang?); "
+            "LEONIDA_GPU_TEST_TIMEOUT sets the limit")
+
+
+def run(*cmd, env=None):
+    limit = gpu_test_timeout()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
+    except subprocess.TimeoutExpired:
+        return 1, timed_out(cmd[0], limit)
     except OSError as e:
         if not isinstance(e, FileNotFoundError):
             return 1, start_failure(cmd[0], e)
@@ -364,8 +393,11 @@ def mesh_w64x_test(tools, spirv, name):
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         harness = os.path.join(tools, "vk_harness" + EXE)
+        limit = gpu_test_timeout()
         try:
-            r = subprocess.run([harness, shader, fs, raw], capture_output=True, text=True, env=env)
+            r = subprocess.run([harness, shader, fs, raw], capture_output=True, text=True, env=env, timeout=limit)
+        except subprocess.TimeoutExpired:
+            return timed_out(harness, limit)
         except OSError as e:
             return start_failure(harness, e)
         if r.returncode == UNSUPPORTED:   # vk_harness: the device has no VK_EXT_mesh_shader

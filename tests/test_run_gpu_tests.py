@@ -44,7 +44,7 @@ class PackedFormatFixture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
 
-            def translate(_cmd):
+            def translate(_cmd, env=None, gpu=True):
                 (Path(tmp) / "spirv" / f"{name}.spv").touch()
                 return 0, ""
 
