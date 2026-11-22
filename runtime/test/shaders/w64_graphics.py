@@ -392,7 +392,13 @@ def main(argv):
         sys.exit(__doc__)
     spirv = os.path.join(argv[0], "spirv")
     tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
-    names = [a for a in argv[1:] if a in FIXTURES] or sorted(FIXTURES)
+    start = 2 if len(argv) > 1 and os.path.isdir(argv[1]) else 1
+    requested = argv[start:]
+    unknown = [a for a in requested if a not in FIXTURES]
+    if unknown:
+        print(f"Unknown fixture name{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}", file=sys.stderr)
+        return 1
+    names = requested or sorted(FIXTURES)
     failed = 0
     for name in names:
         problem = check(os.path.abspath(tools), spirv, name)
