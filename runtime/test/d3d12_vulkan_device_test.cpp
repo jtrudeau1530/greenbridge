@@ -2826,7 +2826,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 8)) && SUCCEEDED(fence->SetEventOnCompletion(8, nullptr)));
+            EXPECT(submit_and_wait());
             for (UINT col = 0; col < size; ++col)
                 report("1D texel", col, down + line_down.Offset + col * 4, pattern(col, 0).data(), 4);
             for (UINT col = 0; col < small_size; ++col)
@@ -3128,7 +3128,6 @@ int main() {
                 list7->Barrier(1, &buffer_group);
             };
             for (const bool enhanced : {false, true}) {
-                const UINT64 fence_value = enhanced ? 13 : 12;
                 std::memset(down, 0xcd, 65536);
                 EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
                 if (enhanced) {
@@ -3155,8 +3154,7 @@ int main() {
                 EXPECT(list->Close() == S_OK);
                 queue->ExecuteCommandLists(1, lists);
                 EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-                EXPECT(SUCCEEDED(queue->Signal(fence.p, fence_value)) &&
-                       SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr)));
+                EXPECT(submit_and_wait());
                 const std::uint8_t red_texel[4] = {255, 0, 0, 255}, blue_texel[4] = {0, 0, 255, 255};
                 for (UINT row = 0; row < size; ++row)
                     for (UINT col = 0; col < size; ++col)
