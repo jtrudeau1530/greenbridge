@@ -273,6 +273,68 @@ class PageIndexTest(unittest.TestCase):
                 self.assertEqual(proc.stdout, "")
                 self.assertFalse(os.path.exists(out))
 
+    def test_output_cannot_overwrite_source_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "archive.json")
+            make_rpf(arc, [header(0x100)])
+            with open(arc, "rb") as f:
+                original = f.read()
+
+            # Same path
+            proc = subprocess.run([sys.executable, "-I", TOOL, arc, arc, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output must not overwrite the source", proc.stderr)
+            with open(arc, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+            # Hard-link alias
+            if hasattr(os, "link"):
+                alias = os.path.join(tmp, "alias.json")
+                try:
+                    os.link(arc, alias)
+                except OSError:
+                    alias = None
+                if alias:
+                    proc2 = subprocess.run([sys.executable, "-I", TOOL, arc, alias, "--quiet"],
+                                           capture_output=True, text=True)
+                    self.assertEqual(proc2.returncode, 2)
+                    self.assertIn("output must not overwrite the source", proc2.stderr)
+                    with open(arc, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
+    def test_output_cannot_overwrite_carve_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "index.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                f.write('{"carve_manifest": true}')
+            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+                f.write(header(0x100))
+
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, manifest, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output would overwrite the carve manifest", proc.stderr)
+            with open(manifest, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_output_cannot_overwrite_carved_input(self):
+        if not hasattr(os, "link"):
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "00000001.bin")
+            with open(bin_path, "wb") as f:
+                f.write(header(0x100))
+            linked_json = os.path.join(tmp, "linked.json")
+            try:
+                os.link(bin_path, linked_json)
+            except OSError:
+                return
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, linked_json, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output would overwrite an input file", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
