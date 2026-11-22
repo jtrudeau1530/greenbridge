@@ -480,13 +480,18 @@ the same in every inflated page: `0x7A` (122). No format is inferred beyond thes
 ## Readable versus opaque
 
 Readable: zlib streams, Bink 2 streams, XML/text streams, `PSIN` section headers, `0DRP` page
-headers and `RSC8` fixed headers. Opaque: encrypted RPF9 tables of contents, the body of each
-`RSC8` resource, the nested high-entropy payloads in the script archive, and the raw region of
-`story000` that has no zlib stream.
+headers and `RSC8` resources. Opaque: encrypted RPF9 tables of contents and the nested
+high-entropy payloads in the script archive.
+
+The raw region of `story000` that has no zlib stream holds unencrypted `ADAT` (AWC) audio banks:
+63,861 of them, 9,423,830,212 bytes. Every `RSC8` resource in this family is an AWC tag `0x5c`
+facial/lip-sync clip inside one of those banks, next to its Opus dialogue line
+([rsc8_audio.md](rsc8_audio.md#resolution-of-the-docsstorymd-raw-gaps), decoded by
+`tools/rsc8_audio.py`).
 
 "Unread" in the index tables means bytes the zlib walk could not inflate. It is not a claim that
-those bytes are empty or unimportant; in minigame and restofworld they contain `RSC8` headers and
-nested RPF9 archives.
+those bytes are empty or unimportant; in minigame and restofworld they contain `ADAT` banks with
+their `RSC8` clips, and nested RPF9 archives.
 
 ## Likely format family
 
@@ -497,7 +502,8 @@ The bytes support a **new RAGE resource family in an RPF9 container**:
 - `0DRP` is a page header, not a GTA V `RSC7` header: magic at +16, version 122, page count at
   +0x20, and payload pages after it.
 - `RSC8` is the resource header in the raw story region: version 8001, a u32 at +8, flags and a
-  name string. No `RSC7` header was found in 20 GB.
+  name string. It is the payload of AWC tag `0x5c`, a facial/lip-sync clip dictionary, and the u32
+  at +8 is its body size ([rsc8_audio.md](rsc8_audio.md)). No `RSC7` header was found in 20 GB.
 - `PSIN` is a sectioned metadata container, not a script opcode stream. Repository notes already
   describe it as PSO metadata; this pass confirms the section names and the big-endian length
   chain, not the section semantics.
@@ -515,8 +521,8 @@ was found in the inflated sample.
    names, paths and exact entry boundaries remain unavailable.
 2. A recursive RPF9 walker. The flat zlib carve does not group streams by the 441 additional RPF9
    headers in `story000`; a decoder needs their spans and TOCs to group resources.
-3. An `RSC8` header parser and a type map for version 8001. The fixed 0x30-byte header and the
-   following name are measured; the payload is not decoded.
+3. An `RSC8` decoder for version 8001: done. `tools/rsc8_audio.py` decodes the header and the
+   facial/lip-sync clip payload ([rsc8_audio.md](rsc8_audio.md)).
 4. A `PSIN` section walker. The tag/length chain is measured; `LSCH`, `LENM`, `LSNS`, `LGID`,
    `LRSC` and `CHKS` semantics are still open.
 5. `0DRP` page grouping. The page count at +0x20 is the only measured grouping field; a decoder

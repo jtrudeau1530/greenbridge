@@ -242,11 +242,17 @@ A `data.rpf` hash table contains 12 occurrences of `joaat("burn")`, but it is no
 config blob has none, no AWC stream ID matches its low 29 bits, and the table has no audio
 reference.
 
-Residual uncertainty: `levels.rpf` (76 GB) was not fully inflated, and a custom RSC8 audio
-resource is the only mission-side container not decoded; the retail track may be a third master
-or patch content not covered by the public references; sub-30 s stings were not exhaustively
+Residual uncertainty: `levels.rpf` (76 GB) was not fully inflated; the retail track may be a third
+master or patch content not covered by the public references; sub-30 s stings were not exhaustively
 fingerprinted. No game audio is stored in the repository; the searches ran on a local copy and
 `radio-dump-v3` was not modified.
+
+This search first listed the `RSC8` resources of the story and minigame archives as the only
+mission-side container not decoded. They are decoded in [rsc8_audio.md](rsc8_audio.md), and none of
+them holds the song: all 641,428 raw `RSC8` headers in the package (225,281 in `story000.rpf`, 1,957
+in `shared_minigame000.rpf`, 9 in `story000_restofworld.rpf` and 414,181 in `audio.rpf`) are AWC tag
+`0x5c` facial/lip-sync clips. Each sits in an `ADAT` bank next to the 48 kHz mono Opus dialogue line
+it animates, none lies outside a bank, and none contains an `ADAT`, Ogg Opus or RIFF WAVE header.
 
 ## Stream names
 
