@@ -942,5 +942,71 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(c0, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_preservation_without_flush(self) -> None:
+        # Minimum positive subnormal (2^-24) and maximum subnormal
+        res = oracle_v_pack_b32_f16(MIN_SUBNORMAL, MAX_SUBNORMAL)
+        self.assertEqual(extract_half(res, False), MIN_SUBNORMAL)
+        self.assertEqual(extract_half(res, True), MAX_SUBNORMAL)
+        self.assertTrue(is_subnormal16(extract_half(res, False)))
+        self.assertTrue(is_subnormal16(extract_half(res, True)))
+
+        # Negative subnormals
+        res_neg = oracle_v_pack_b32_f16(MIN_SUBNORMAL_NEG, MAX_SUBNORMAL_NEG)
+        self.assertEqual(extract_half(res_neg, False), MIN_SUBNORMAL_NEG)
+        self.assertEqual(extract_half(res_neg, True), MAX_SUBNORMAL_NEG)
+        self.assertTrue(is_subnormal16(extract_half(res_neg, False)))
+        self.assertTrue(is_subnormal16(extract_half(res_neg, True)))
+
+    def test_nan_payload_exact_preservation(self) -> None:
+        # Custom quiet NaN and signaling NaN bit patterns
+        qnan_custom = EXP_MASK16 | QNAN_BIT16 | 0x00EF
+        snan_custom = EXP_MASK16 | 0x005A
+        res = oracle_v_pack_b32_f16(qnan_custom, snan_custom)
+        self.assertEqual(extract_half(res, False), qnan_custom)
+        self.assertEqual(extract_half(res, True), snan_custom)
+        self.assertTrue(is_qnan16(extract_half(res, False)))
+        # Signaling NaN does NOT get converted to Quiet NaN
+        self.assertTrue(is_snan16(extract_half(res, True)))
+
+    def test_all_payload_bits_preserved(self) -> None:
+        all_payload_qnan = EXP_MASK16 | FRAC_MASK16  # 0x7FFF
+        res = oracle_v_pack_b32_f16(all_payload_qnan, all_payload_qnan)
+        self.assertEqual(res, (0x7FFF << 16) | 0x7FFF)
+
+    def test_finite_boundary_extremes(self) -> None:
+        # Maximum finite (65504.0) and minimum finite (-65504.0)
+        res = oracle_v_pack_b32_f16(MAX_FINITE, MIN_FINITE_NEG)
+        self.assertEqual(extract_half(res, False), MAX_FINITE)
+        self.assertEqual(extract_half(res, True), MIN_FINITE_NEG)
+        self.assertEqual(bits_to_f16(MAX_FINITE), 65504.0)
+        self.assertEqual(bits_to_f16(MIN_FINITE_NEG), -65504.0)
+
+    def test_signed_zeros_permutations(self) -> None:
+        combos = [
+            (POS_ZERO, POS_ZERO),
+            (POS_ZERO, NEG_ZERO),
+            (NEG_ZERO, POS_ZERO),
+            (NEG_ZERO, NEG_ZERO),
+        ]
+        for s0, s1 in combos:
+            res = oracle_v_pack_b32_f16(s0, s1)
+            self.assertEqual(extract_half(res, False), s0)
+            self.assertEqual(extract_half(res, True), s1)
+
+    def test_nan_modifier_interaction(self) -> None:
+        qnan_neg = NEG_QNAN  # 0xFE00
+        # abs modifier clears sign bit 15
+        res_abs = oracle_v_pack_b32_f16(qnan_neg, ONE, abs0=True)
+        self.assertEqual(extract_half(res_abs, False), POS_QNAN)
+        self.assertTrue(is_qnan16(extract_half(res_abs, False)))
+
+        # neg modifier toggles sign bit 15
+        res_neg = oracle_v_pack_b32_f16(POS_QNAN, ONE, neg0=True)
+        self.assertEqual(extract_half(res_neg, False), NEG_QNAN)
+
+
 if __name__ == "__main__":
     unittest.main()
