@@ -21,7 +21,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <type_traits>
@@ -325,10 +327,11 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
 // The host PC runtime's D3D12 device to compare answers with: the default adapter, or the one LEONIDA_HOST_ADAPTER
 // names ("warp", or part of an adapter's name); false if there is none.
 // Under Wine there is none (copycmp::create_host).
-bool create_host_device(Ref<ID3D12Device>& host) {
+bool create_host_device(Ref<ID3D12Device>& host, std::string* adapter_name = nullptr) {
     copycmp::Ptr<ID3D12Device> device;
     std::string name;
     if (!copycmp::create_host(device, name)) return false;
+    if (adapter_name) *adapter_name = name;
     host.p = device.p;
     device.p = nullptr;
     return true;
@@ -4854,21 +4857,38 @@ int main() {
         bool compared = false;
         const char* source = "no host";
         Ref<ID3D12Device> host_device;
-        const auto host_side = [&](ID3D12Device10* device10) {
+        const auto host_side = [&](ID3D12Device10* device10, bool same_adapter) {
             std::array<HRESULT, 3> host_refusals{};
             if (!placed_cast_scenario(device10, false, host.data())) return false;
             if (!placed_cast_refusals(device10, host_refusals)) return false;
             unsigned differences = 0;
+            // D3D12 does not pin float -> UNORM at a tie: the D3D11.3 functional spec (3.2.3.6 FLOAT -> UNORM)
+            // computes c * (2^n - 1) + 0.5 and drops the fraction, but permits a tolerance of 0.6 ULP on the integer
+            // side, so a value exactly halfway between two codes (0.5 * 255 = 127.5) may map to either. WARP and AMD
+            // give the upper code; NVIDIA's D3D12 driver and its Vulkan driver the lower (RTX 3080 616.64, RTX 3090
+            // 610.88 and RTX 5070 Laptop 617.42). On the layer's own adapter (same LUID) the comparison stays exact;
+            // against another adapter or WARP the plain clear accepts either code on a tie channel.
+            const FLOAT clear_value[4] = {0.25f, 0.5f, 0.75f, 1.0f};  // placed_cast_scenario's clear colour
+            unsigned tie_bytes_other_way = 0;
             for (UINT row = 0; row < 4; ++row)
                 for (UINT i = 0; i < 16; ++i) {
                     const UINT a = row * 256 + i, b = 1024 + row * 256 + i;
+                    const double scaled = double(clear_value[i % 4]) * 255.0;
+                    const bool tie = !same_adapter && scaled - std::floor(scaled) == 0.5;
+                    if (tie && std::abs(int(ours[b]) - int(host[b])) == 1) {
+                        ++tie_bytes_other_way;
+                    } else if (ours[b] != host[b] && differences++ < 8) {
+                        std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,
+                                     ours[b], host[b]);
+                    }
                     if (ours[a] != host[a] && differences++ < 8)
                         std::fprintf(stderr, "placed SRGB-cast clear row %u byte %u: ours %02x, host %02x\n", row,
                                      i, ours[a], host[a]);
-                    if (ours[b] != host[b] && differences++ < 8)
-                        std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,
-                                     ours[b], host[b]);
                 }
+            if (tie_bytes_other_way)
+                std::printf("placed plain clear: the host rounds the exact .5 tie the other way in %u bytes (within "
+                            "the 0.6 ULP tolerance of D3D11.3 spec 3.2.3.6)\n",
+                            tie_bytes_other_way);
             for (UINT i = 0; i < 3; ++i)
                 if (our_refusals[i] != host_refusals[i]) {
                     ++differences;
@@ -4885,12 +4905,28 @@ int main() {
                                                         sizeof(options12))) &&
                    options12.RelaxedFormatCastingSupported;
         };
-        if (create_host_device(host_device)) {
+        // The host is the layer's own adapter (matched by LUID, then PCI ids) unless LEONIDA_HOST_ADAPTER names
+        // one: drivers round float -> UNORM ties differently, so the same GPU is the fair reference.
+        std::string host_adapter, host_source;
+        char host_override[8] = {};
+        const bool named = GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", host_override, sizeof(host_override)) > 0;
+        const bool have_host =
+            named ? create_host_device(host_device, &host_adapter)
+                  : create_host_device_for_physical(d.instance, d.physical, d.instance_proc, host_device, host_adapter);
+        if (have_host) {
+            VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+            d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &properties);
+            const LUID host_luid = host_device->GetAdapterLuid();
+            const bool same_adapter =
+                id.deviceLUIDValid && std::memcmp(&host_luid, id.deviceLUID, sizeof(host_luid)) == 0;
             Ref<ID3D12Device10> host10;
             if (can_cast(host_device.p, host10)) {
-                EXPECT(host_side(host10.p));
+                EXPECT(host_side(host10.p, same_adapter));
                 compared = true;
-                source = "the host runtime";
+                host_source = "the host runtime on " + host_adapter +
+                              (same_adapter ? " (the layer's own adapter)" : " (a different adapter from the layer's)");
+                source = host_source.c_str();
             }
         }
         std::string warp_name;
@@ -4904,7 +4940,7 @@ int main() {
 
             Ref<ID3D12Device10> warp10;
             if (copycmp::try_create_host(warp, warp_name) && can_cast(warp.p, warp10)) {
-                EXPECT(host_side(warp10.p));
+                EXPECT(host_side(warp10.p, false));
                 compared = true;
                 source = warp_name.c_str();
             }
