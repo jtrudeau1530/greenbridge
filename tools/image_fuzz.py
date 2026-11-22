@@ -605,14 +605,18 @@ def main() -> int:
             print("note: GFX11 is RDNA3 or newer, not RDNA2: a match supports the model and does not prove RDNA2")
     a.build = find_test_program(a.build, HARNESS) or a.build
     cases = make_cases(a.programs, a.seed, formats)
-    parent = os.path.abspath(a.work) if a.work else None
-    if parent is not None:
-        os.makedirs(parent, exist_ok=True)
-    work = tempfile.mkdtemp(prefix="image_fuzz_", dir=parent)
-    print(f"work dir {work}")
     code = 0
     verdicts = {}
     try:
+        try:
+            parent = os.path.abspath(a.work) if a.work else None
+            if parent is not None:
+                os.makedirs(parent, exist_ok=True)
+            work = tempfile.mkdtemp(prefix="image_fuzz_", dir=parent)
+        except OSError as e:
+            print(f"ERROR: cannot create work directory: {e}", file=sys.stderr)
+            return 2
+        print(f"work dir {work}")
         if "translator" in backends:
             passed, failed, skipped, verdicts = run_translator(cases, a, work)
             summary = f"{passed}/{passed + failed} programs that ran match"

@@ -64,6 +64,88 @@ class ImageFuzzWorkIsolation(unittest.TestCase):
                 self.assertTrue(any(str(run) in output for output in outputs))
             self.assertNotEqual(runs[0], runs[1])
 
+    def test_concurrent_processes_get_distinct_folders(self):
+        child = r'''
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+import image_fuzz
+
+def run_case(*args, **kwargs):
+    (Path(args[4]) / "worker.bin").write_bytes(str(os.getpid()).encode("ascii"))
+    return True
+
+image_fuzz.run_case = run_case
+sys.argv = ["image_fuzz.py", "--programs", "1", "--work", sys.argv[2]]
+raise SystemExit(image_fuzz.main())
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "work"
+            parent.mkdir()
+            sentinel = parent / "texels.bin"
+            sentinel.write_bytes(b"caller data")
+            tools = str(Path(__file__).resolve().parents[1] / "tools")
+            command = [sys.executable, "-I", "-c", child, tools, str(parent)]
+            workers = []
+            try:
+                for _ in range(2):
+                    workers.append(subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                    stderr=subprocess.PIPE, text=True))
+                results = [worker.communicate(timeout=20) for worker in workers]
+            finally:
+                for worker in workers:
+                    if worker.poll() is None:
+                        worker.kill()
+                        worker.communicate()
+            paths = []
+            for worker, (stdout, stderr) in zip(workers, results):
+                self.assertEqual(worker.returncode, 0, (stdout, stderr))
+                lines = [line.removeprefix("work dir ") for line in stdout.splitlines() if line.startswith("work dir ")]
+                self.assertEqual(len(lines), 1, stdout)
+                paths.append(Path(lines[0]))
+            self.assertNotEqual(paths[0], paths[1])
+            self.assertTrue(all(path.parent == parent for path in paths))
+            self.assertNotEqual((paths[0] / "worker.bin").read_bytes(), (paths[1] / "worker.bin").read_bytes())
+            self.assertEqual(sentinel.read_bytes(), b"caller data")
+
+    def test_existing_file_as_work_reports_one_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "not-a-directory"
+            parent.write_bytes(b"caller data")
+            script = Path(__file__).resolve().parents[1] / "tools" / "image_fuzz.py"
+            result = subprocess.run([sys.executable, "-I", str(script), "--programs", "1", "--work", str(parent)],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("ERROR:", result.stderr)
+            self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(parent.read_bytes(), b"caller data")
+
+    def test_work_error_closes_an_open_hardware_oracle(self):
+        from hw_oracle import runner
+
+        class Oracle:
+            arch = "gfx1030"
+            device = "synthetic device"
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "not-a-directory"
+            parent.write_bytes(b"caller data")
+            oracle = Oracle()
+            argv = ["image_fuzz.py", "--oracle", "hw", "--programs", "1", "--work", str(parent)]
+            stderr = io.StringIO()
+            with (patch.object(sys, "argv", argv), patch.object(runner, "open_oracle", return_value=oracle),
+                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr)):
+                self.assertEqual(imf.main(), 2)
+            self.assertTrue(oracle.closed)
+            self.assertIn("ERROR:", stderr.getvalue())
+            self.assertEqual(parent.read_bytes(), b"caller data")
+
     def test_setup_failure_reports_the_retained_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
             parent = Path(tmp) / "new" / "work"
