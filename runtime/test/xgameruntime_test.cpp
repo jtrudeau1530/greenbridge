@@ -442,25 +442,86 @@ void check_run_time_load() {
             reinterpret_cast<IsPackagedExport>(rt::shims::find("xgameruntime.dll", "XPackageIsPackagedProcess"));
         check(packaged_export && reinterpret_cast<IsPackaged>(slot(pk, 4))(pk) == packaged_export(),
               "slot 4 is XPackageIsPackagedProcess");
+        // Slot 11, XPackageGetUserLocale: one of the package's declared locales, never the host's; nothing written
+        // (but S_OK) when the package declares none.
         using Locale = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
-        char locale[128] = {};
-        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK && std::strlen(locale) >= 2 &&
-                  reinterpret_cast<Locale>(slot(pk, 11))(pk, 1, locale) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
-              "slot 11 (XPackageGetUserLocale) gives the host locale; a 1-byte buffer is too short");
-        using PathSize = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t*);
-        using Path = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t, char*);
-        using CloseMount = void(STDMETHODCALLTYPE*)(void*, void*);
+        char tmp[MAX_PATH] = {};
+        GetTempPathA(sizeof(tmp), tmp);
+        const std::string game = std::string(tmp) + "leonida_xpackage_locale_test";
+        CreateDirectoryA(game.c_str(), nullptr);
+        SetEnvironmentVariableA("LEONIDA_GAME_DIR", game.c_str());
+        char locale[128];
+        std::memset(locale, 'z', sizeof(locale));
+        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK && locale[0] == 'z',
+              "slot 11 without declared locales: S_OK and nothing written");
+        if (FILE* f = std::fopen((game + "\\MicrosoftGame.Config").c_str(), "wb")) {
+            std::fputs("<Game><Resources><Resource Language=\"zz-ZZ\"/><Resource Language='xx-YY'/></Resources></Game>",
+                       f);
+            std::fclose(f);
+        }
+        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK &&
+                  (std::strcmp(locale, "zz-ZZ") == 0 || std::strcmp(locale, "xx-YY") == 0) &&
+                  reinterpret_cast<Locale>(slot(pk, 11))(pk, 3, locale) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+              "slot 11 gives one of the package's declared locales, not the host's; a short buffer is refused");
+        DeleteFileA((game + "\\MicrosoftGame.Config").c_str());
+        RemoveDirectoryA(game.c_str());
+        SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+        // Slots 23-26 are the named exports' content-package mounts: XPackageMount, the path size and path of the
+        // handle, and closing it. XPackageMountHandle is one u64, passed by value.
+        using Mount = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint64_t*);
+        using PathSize = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, size_t*);
+        using Path = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, size_t, char*);
+        using CloseMount = void(STDMETHODCALLTYPE*)(void*, uint64_t);
+        SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", "SLOTDLC_12345678901234567890123=C:\\LeonidaSlotDLC");
+        uint64_t handle = 0;
         size_t need = 0;
         char path[MAX_PATH] = {};
-        check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, nullptr, &need) == S_OK && need > 1 &&
-                  reinterpret_cast<Path>(slot(pk, 25))(pk, nullptr, need, path) == S_OK && std::strlen(path) + 1 == need &&
-                  reinterpret_cast<Path>(slot(pk, 25))(pk, nullptr, need - 1, path) ==
+        check(reinterpret_cast<Mount>(slot(pk, 23))(pk, "SLOTDLC_12345678901234567890123", &handle) == S_OK &&
+                  handle != 0,
+              "slot 23 (XPackageMount) mounts a content package and hands out a handle");
+        check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == S_OK &&
+                  need == std::strlen("C:\\LeonidaSlotDLC") + 1 &&
+                  reinterpret_cast<Path>(slot(pk, 25))(pk, handle, need, path) == S_OK &&
+                  std::strcmp(path, "C:\\LeonidaSlotDLC") == 0 &&
+                  reinterpret_cast<Path>(slot(pk, 25))(pk, handle, need - 1, path) ==
                       HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
-              "slots 24/25: the mount path size is exactly what XPackageGetMountPath needs");
-        reinterpret_cast<CloseMount>(slot(pk, 26))(pk, nullptr);
+              "slots 24/25: the mount's path, and exactly the size XPackageGetMountPath needs");
+        reinterpret_cast<CloseMount>(slot(pk, 26))(pk, handle);
+        check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, handle, &need) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+              "slot 26 (XPackageCloseMountHandle) closes the handle");
+        SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
         using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
         check(reinterpret_cast<Stub>(slot(pk, 5))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
               "the slots without an offline answer (5, 40) are E_NOTIMPL");
+        struct Progress {
+            uint64_t total, installed, launch;
+            bool launchable, completed;
+        } progress{~0ull, 7, 7, false, false};
+        using GetProgress = void(STDMETHODCALLTYPE*)(void*, void*, Progress*);
+        reinterpret_cast<GetProgress>(slot(pk, 7))(pk, nullptr, &progress);
+        check(progress.launchable && progress.completed && progress.installed == progress.total,
+              "slot 7 (void XPackageGetInstallationProgress) writes an installed, launchable, completed package");
+        using Update = bool(STDMETHODCALLTYPE*)(void*, void*);
+        using UnregProgress = bool(STDMETHODCALLTYPE*)(void*, void*, XTaskQueueRegistrationToken, bool);
+        using UnregInstalled = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
+        using Uninstall = bool(STDMETHODCALLTYPE*)(void*, const char*);
+        check(!reinterpret_cast<Update>(slot(pk, 8))(pk, nullptr) &&
+                  reinterpret_cast<UnregProgress>(slot(pk, 10))(pk, nullptr, XTaskQueueRegistrationToken{1}, true) &&
+                  reinterpret_cast<UnregInstalled>(slot(pk, 22))(pk, XTaskQueueRegistrationToken{1}, false) &&
+                  !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, "pkg"),
+              "the bool slots 8, 10, 22 and 34 return their documented offline answers");
+        const GUID chain[] = {
+            package_cls,
+            {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}},
+            {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}},
+            package3};
+        bool all = true;
+        for (const GUID& iid : chain) {
+            void* same = nullptr;
+            all = all && query(&package_cls, iid, &same) == S_OK && same == pk;
+            if (same) release(same);
+        }
+        check(all, "IXPackageImpl3 answers for IXPackageImpl and IXPackageImpl2 too");
         release(pk);
     }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");

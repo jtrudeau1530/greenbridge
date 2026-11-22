@@ -16,15 +16,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "file_system.h"
 #include "shims.h"
 
 namespace {
@@ -707,7 +711,11 @@ bool __stdcall XPackageIsPackagedProcess() {
 // returns E_NOTIMPL, so the first boot shows which ones the title needs.
 
 constexpr GUID kPackageClass = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
+// IXPackageImpl3 : IXPackageImpl2 : IXPackageImpl (xgameruntime include/xpackage.idl); the class id is its own.
+constexpr GUID kPackage1 = {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}};
+constexpr GUID kPackage2 = {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}};
 constexpr GUID kPackage3 = {0xe2a4734b, 0x2f4a, 0x456d, {0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09}};
+const GUID* const kPackageIids[] = {&kPackage1, &kPackage2, &kPackage3, nullptr};
 
 template <int Slot> HRESULT STDMETHODCALLTYPE package_not_implemented(void*) {
     static std::atomic<bool> s_logged{false};
@@ -719,31 +727,86 @@ HRESULT STDMETHODCALLTYPE pkg_identifier(void*, size_t size, char* buffer) {
     return XPackageGetCurrentProcessPackageIdentifier(size, buffer);
 }
 bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess(); }
-// XPackageGetUserLocale(size_t localeSize, char* locale): the host user's locale name ("en-US").
+// The locales the package declares: <Resources><Resource Language="xx-YY"/> in MicrosoftGame.Config, read from
+// the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
+std::vector<std::string> package_locales() {
+    std::vector<std::string> out;
+    char env[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", env, sizeof(env));
+    const std::filesystem::path dir = (n > 0 && n < sizeof(env)) ? std::filesystem::path(env) : rt::fs::game_dir();
+    if (dir.empty()) return out;
+    std::ifstream f(dir / "MicrosoftGame.Config", std::ios::binary);
+    if (!f) return out;
+    const std::string xml{std::istreambuf_iterator<char>(f), {}};
+    for (size_t at = 0; (at = xml.find("<Resource", at)) != std::string::npos; ++at) {
+        if (xml.compare(at, 10, "<Resources") == 0) continue;
+        const size_t end = xml.find('>', at);
+        const size_t key = xml.find("Language=", at);
+        if (end == std::string::npos || key == std::string::npos || key + 10 > end) continue;
+        const char quote = xml[key + 9];
+        const size_t close = xml.find(quote, key + 10);
+        if ((quote == '"' || quote == '\'') && close != std::string::npos && close < end)
+            out.push_back(xml.substr(key + 10, close - key - 10));
+    }
+    return out;
+}
+
+// XPackageGetUserLocale(size_t localeSize, char* locale): of the locales the package declares, the one closest to
+// the user's (the same name, else the same language, else the first declared). Microsoft's contract: "If no locale
+// information is declared for the package, this function succeeds but does not return a user locale". The host's
+// locale is never handed out as the package's.
 HRESULT STDMETHODCALLTYPE pkg_user_locale(void*, size_t size, char* locale) {
     if (!locale || !size) return E_INVALIDARG;
+    const std::vector<std::string> declared = package_locales();
+    if (declared.empty()) return S_OK;
     wchar_t wide[LOCALE_NAME_MAX_LENGTH] = {};
-    char name[LOCALE_NAME_MAX_LENGTH * 4] = "en-US";
+    char user[LOCALE_NAME_MAX_LENGTH * 4] = "";
     if (GetUserDefaultLocaleName(wide, LOCALE_NAME_MAX_LENGTH) > 0)
-        WideCharToMultiByte(CP_UTF8, 0, wide, -1, name, static_cast<int>(sizeof(name)), nullptr, nullptr);
-    const size_t len = std::strlen(name);
-    if (size < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    std::memcpy(locale, name, len + 1);
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, user, static_cast<int>(sizeof(user)), nullptr, nullptr);
+    const auto language = [](const std::string& name) { return name.substr(0, name.find('-')); };
+    const auto same = [](const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) == 0; };
+    const std::string* pick = &declared.front();
+    bool exact = false;
+    for (const std::string& d : declared)
+        if (same(d, user)) { pick = &d; exact = true; break; }
+    if (!exact)
+        for (const std::string& d : declared)
+            if (same(language(d), language(user))) { pick = &d; break; }
+    if (size < pick->size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(locale, pick->c_str(), pick->size() + 1);
     return S_OK;
 }
-// XPackageGetMountPathSize(mount, size_t* pathSize): the size XPackageGetMountPath needs, terminator included.
-HRESULT STDMETHODCALLTYPE pkg_mount_path_size(void*, void* mount, size_t* size) {
-    if (!size) return E_INVALIDARG;
-    char path[MAX_PATH] = {};
-    const HRESULT hr = XPackageGetMountPath(mount, sizeof(path), path);
-    if (FAILED(hr)) return hr;
-    *size = std::strlen(path) + 1;
-    return S_OK;
+// Slots 23-26 forward to the named exports' content-package mounts (XPackageMount and its handle registry), so the two
+// ways in behave the same. XPackageMountHandle is one u64, passed in a register like the named exports take it.
+HRESULT STDMETHODCALLTYPE pkg_mount(void*, const char* package_identifier, XPackageMountHandle* mount) {
+    return XPackageMount(package_identifier, mount);
 }
-HRESULT STDMETHODCALLTYPE pkg_mount_path(void*, void* mount, size_t size, char* path) {
+HRESULT STDMETHODCALLTYPE pkg_mount_path_size(void*, XPackageMountHandle mount, size_t* size) {
+    return XPackageGetMountPathSize(mount, size);
+}
+HRESULT STDMETHODCALLTYPE pkg_mount_path(void*, XPackageMountHandle mount, size_t size, char* path) {
     return XPackageGetMountPath(mount, size, path);
 }
-void STDMETHODCALLTYPE pkg_close_mount(void*, void*) {}  // offline mounts own nothing
+void STDMETHODCALLTYPE pkg_close_mount(void*, XPackageMountHandle mount) { XPackageCloseMountHandle(mount); }
+
+// XPackageInstallationProgress: totalBytes, installedBytes, launchBytes (u64), launchable, completed (bool).
+struct InstallationProgress {
+    uint64_t total_bytes, installed_bytes, launch_bytes;
+    bool launchable, completed;
+};
+static_assert(sizeof(InstallationProgress) == 32, "XPackageInstallationProgress layout");
+// void XPackageGetInstallationProgress(monitor, XPackageInstallationProgress*): an offline package is installed,
+// launchable and completed, every byte present.
+void STDMETHODCALLTYPE pkg_installation_progress(void*, void*, InstallationProgress* progress) {
+    if (progress) *progress = {0, 0, 0, true, true};
+}
+// The bool methods with no offline work, as Microsoft documents them: XPackageUpdateInstallationMonitor is false
+// (nothing changed), the two Unregister* calls are true (nothing pending), XPackageUninstallPackage is false (not
+// uninstalled). A generic E_NOTIMPL stub would read as true in al.
+bool STDMETHODCALLTYPE pkg_update_monitor(void*, void*) { return false; }
+bool STDMETHODCALLTYPE pkg_unregister_progress(void*, void*, XTaskQueueRegistrationToken, bool) { return true; }
+bool STDMETHODCALLTYPE pkg_unregister_installed(void*, XTaskQueueRegistrationToken, bool) { return true; }
+bool STDMETHODCALLTYPE pkg_uninstall_package(void*, const char*) { return false; }
 
 #define PN(n) reinterpret_cast<const void*>(&package_not_implemented<n>)
 const void* const kPackageVtable[] = {
@@ -751,20 +814,24 @@ const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&object_release),
     reinterpret_cast<const void*>(&pkg_identifier),   // 3  XPackageGetCurrentProcessPackageIdentifier
     reinterpret_cast<const void*>(&pkg_is_packaged),  // 4  XPackageIsPackagedProcess
-    PN(5), PN(6), PN(7), PN(8), PN(9), PN(10),        // 5-10 installation monitor: create, close, progress, update,
-                                                      //      register / unregister progress changed
+    PN(5), PN(6),                                     // 5-6 installation monitor: create, close
+    reinterpret_cast<const void*>(&pkg_installation_progress),  // 7  XPackageGetInstallationProgress (void, writes)
+    reinterpret_cast<const void*>(&pkg_update_monitor),         // 8  XPackageUpdateInstallationMonitor (bool)
+    PN(9),                                                      // 9  XPackageRegisterInstallationProgressChanged
+    reinterpret_cast<const void*>(&pkg_unregister_progress),    // 10 ...UnregisterInstallationProgressChanged (bool)
     reinterpret_cast<const void*>(&pkg_user_locale),  // 11 XPackageGetUserLocale
     PN(12), PN(13), PN(14), PN(15), PN(16), PN(17),   // 12-19 chunks: find / enumerate availability, change order,
     PN(18), PN(19),                                   //       install (+ async, result), estimate size, uninstall
     PN(20), PN(21),                                   // 20-21 _unknown_ (older enumerate / register installed)
-    PN(22),                                           // 22 XPackageUnregisterPackageInstalled
-    PN(23),                                           // 23 XPackageMount
+    reinterpret_cast<const void*>(&pkg_unregister_installed),  // 22 XPackageUnregisterPackageInstalled (bool)
+    reinterpret_cast<const void*>(&pkg_mount),            // 23 XPackageMount
     reinterpret_cast<const void*>(&pkg_mount_path_size),  // 24 XPackageGetMountPathSize
     reinterpret_cast<const void*>(&pkg_mount_path),       // 25 XPackageGetMountPath
     reinterpret_cast<const void*>(&pkg_close_mount),      // 26 XPackageCloseMountHandle
     PN(27), PN(28), PN(29), PN(30), PN(31),           // 27 _unknown_, 28 EnumeratePackages, 29 RegisterPackageInstalled,
                                                       // 30 GetWriteStats, 31 _unknown_
-    PN(32), PN(33), PN(34),                           // 32 UninstallUWPInstance, 33 EnumerateFeatures, 34 UninstallPackage
+    PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
+    reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
     PN(35), PN(36), PN(37), PN(38),                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
                                                       //   MountWithUiAsync, MountWithUiResult
     PN(39), PN(40),                                   // IXPackageImpl3: EnumeratePackages, RegisterPackageInstalled
@@ -773,7 +840,7 @@ const void* const kPackageVtable[] = {
 static_assert(std::size(kPackageVtable) == 41, "IUnknown + IXPackageImpl's 32 + IXPackageImpl2's 4 + IXPackageImpl3's 2");
 
 RuntimeObject& package_object() {
-    static RuntimeObject object{kPackageVtable, &kPackageClass, &kPackage3};
+    static RuntimeObject object{kPackageVtable, &kPackageClass, kPackageIids};
     return object;
 }
 
