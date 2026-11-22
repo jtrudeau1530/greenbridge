@@ -1206,5 +1206,131 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(wrap_boundary.address_wrapped)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling for ds_dec_rtn_u64."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState(capacity_qwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_snan_preservation_without_quietening_u64(self) -> None:
+        # 64-bit float Signaling NaN: exp=0x7FF, fraction != 0, bit 51 (0x0008_0000_0000_0000) is 0
+        snan = 0x7FF0_0000_0000_0002
+        self.assertEqual(snan & 0x0008_0000_0000_0000, 0)
+
+        qword_idx = 10
+        self.state.lds.write_qword(qword_idx * 8, snan)
+        self.state.set_vgpr(1, qword_idx * 8)
+        self.state.set_vgpr64(RegPair(2), MASK_64)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, snan)
+        self.assertEqual(old_val & 0x0008_0000_0000_0000, 0)
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), snan)
+
+        self.assertEqual(new_mem, 0x7FF0_0000_0000_0001)
+        self.assertEqual(new_mem & 0x0008_0000_0000_0000, 0)
+        self.assertEqual(self.state.lds.read_qword(qword_idx * 8), 0x7FF0_0000_0000_0001)
+
+    def test_qnan_payload_preservation_u64(self) -> None:
+        qnan = 0x7FF8_1234_5678_9ABC
+        qword_idx = 12
+        self.state.lds.write_qword(qword_idx * 8, qnan)
+        self.state.set_vgpr(1, qword_idx * 8)
+        self.state.set_vgpr64(RegPair(2), MASK_64)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, qnan)
+        self.assertEqual(new_mem, 0x7FF8_1234_5678_9ABB)
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), qnan)
+        self.assertEqual(self.state.lds.read_qword(qword_idx * 8), 0x7FF8_1234_5678_9ABB)
+
+    def test_signed_zeros_distinct_behavior_u64(self) -> None:
+        # +0.0 is 0x0 -> triggers wrap on zero
+        qword_pos = 14
+        self.state.lds.write_qword(qword_pos * 8, POS_ZERO_F64)
+        self.state.set_vgpr(1, qword_pos * 8)
+        self.state.set_vgpr64(RegPair(2), 50)
+
+        instr1 = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+        )
+        old1, new1 = self.interp.step(instr1, self.state)
+        self.assertEqual(old1, POS_ZERO_F64)
+        self.assertEqual(new1, 50)
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), POS_ZERO_F64)
+
+        # -0.0 is 0x8000_0000_0000_0000 (2^63) -> strictly > 50 -> wraps to 50
+        qword_neg = 15
+        self.state.lds.write_qword(qword_neg * 8, NEG_ZERO_F64)
+        self.state.set_vgpr(1, qword_neg * 8)
+        self.state.set_vgpr64(RegPair(2), 50)
+
+        instr2 = DSDecRtnU64Instruction(
+            vdst=RegPair(6),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+        )
+        old2, new2 = self.interp.step(instr2, self.state)
+        self.assertEqual(old2, NEG_ZERO_F64)
+        self.assertEqual(new2, 50)
+        self.assertEqual(self.state.get_vgpr64(RegPair(6)), NEG_ZERO_F64)
+
+    def test_subnormals_without_flush_to_zero_u64(self) -> None:
+        qword_idx = 16
+        self.state.lds.write_qword(qword_idx * 8, MIN_SUBNORMAL_F64)
+        self.state.set_vgpr(1, qword_idx * 8)
+        self.state.set_vgpr64(RegPair(2), 100)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+        )
+        old_val, new_mem = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, MIN_SUBNORMAL_F64)
+        self.assertEqual(new_mem, 0)
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), MIN_SUBNORMAL_F64)
+
+        # Max subnormal decrements to MAX_SUBNORMAL_F64 - 1 with bound = MASK_64
+        self.state.lds.write_qword(qword_idx * 8, MAX_SUBNORMAL_F64)
+        self.state.set_vgpr64(RegPair(2), MASK_64)
+        old_max, new_max = self.interp.step(instr, self.state)
+        self.assertEqual(old_max, MAX_SUBNORMAL_F64)
+        self.assertEqual(new_max, MAX_SUBNORMAL_F64 - 1)
+
+    def test_signed_infinities_preservation_u64(self) -> None:
+        qword_idx = 18
+        self.state.lds.write_qword(qword_idx * 8, POS_INF_F64)
+        self.state.set_vgpr(1, qword_idx * 8)
+        self.state.set_vgpr64(RegPair(2), MASK_64)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+        )
+        old_inf, new_inf = self.interp.step(instr, self.state)
+        self.assertEqual(old_inf, POS_INF_F64)
+        self.assertEqual(new_inf, POS_INF_F64 - 1)
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), POS_INF_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
