@@ -1168,5 +1168,211 @@ class TestBufferAtomicSmaxIEEE754BitwiseBoundaries(unittest.TestCase):
         self.assertEqual(self.mem.read_u32(16), U32_INT32_MAX)
 
 
+def parse_buffer_atomic_smax_asm(line: str) -> Instruction:
+    """Parse textual assembly instruction into symbolic Instruction AST."""
+    line = line.strip()
+    if not line:
+        raise ValueError("Empty assembly line")
+
+    tokens = line.split(None, 1)
+    if not tokens or tokens[0] != Opcode.BUFFER_ATOMIC_SMAX.value:
+        raise ValueError(f"Expected opcode '{Opcode.BUFFER_ATOMIC_SMAX.value}', got '{tokens[0] if tokens else ''}'")
+
+    if len(tokens) < 2:
+        raise ValueError("Missing operands in assembly line")
+
+    rest = tokens[1].strip()
+    parts = [p.strip() for p in rest.split(",")]
+    if len(parts) < 4:
+        raise ValueError(f"Expected 4 operands (vdata, vaddr, srsrc, soffset), got {len(parts)}")
+
+    # vdata: e.g. v0
+    vdata_str = parts[0]
+    if not vdata_str.startswith("v"):
+        raise ValueError(f"vdata must be a VGPR: {vdata_str}")
+    vdata = Register(RegKind.VGPR, int(vdata_str[1:]))
+
+    # vaddr: e.g. v1
+    vaddr_str = parts[1]
+    if not vaddr_str.startswith("v"):
+        raise ValueError(f"vaddr must be a VGPR: {vaddr_str}")
+    vaddr = Register(RegKind.VGPR, int(vaddr_str[1:]))
+
+    # srsrc: e.g. s[4:7]
+    srsrc_str = parts[2]
+    if not (srsrc_str.startswith("s[") and srsrc_str.endswith("]")):
+        raise ValueError(f"srsrc must be an SGPR range s[N:N+3]: {srsrc_str}")
+    s_inner = srsrc_str[2:-1].split(":")
+    if len(s_inner) != 2:
+        raise ValueError(f"Malformed SGPR range: {srsrc_str}")
+    s_start = int(s_inner[0])
+    s_end = int(s_inner[1])
+    s_count = s_end - s_start + 1
+    if s_count != 4:
+        raise ValueError(f"srsrc must be 4 SGPRs, got {s_count}")
+    srsrc = Register(RegKind.SGPR, s_start, count=4)
+
+    # soffset and trailing modifiers
+    so_tokens = parts[3].split()
+    if not so_tokens:
+        raise ValueError("Missing soffset")
+    so_str = so_tokens[0]
+    mod_tokens = so_tokens[1:]
+
+    if so_str.startswith("s"):
+        soffset = Register(RegKind.SGPR, int(so_str[1:]))
+    else:
+        soffset = int(so_str)
+
+    offset = 0
+    glc = False
+    slc = False
+    offen = False
+    idxen = False
+
+    for mod in mod_tokens:
+        if mod == "glc":
+            glc = True
+        elif mod == "slc":
+            slc = True
+        elif mod == "offen":
+            offen = True
+        elif mod == "idxen":
+            idxen = True
+        elif mod.startswith("offset:"):
+            offset = int(mod.split(":", 1)[1])
+        else:
+            raise ValueError(f"Unknown modifier: {mod}")
+
+    mods = BufferAtomicModifiers(
+        offset=offset,
+        glc=glc,
+        slc=slc,
+        offen=offen,
+        idxen=idxen,
+    )
+    return Instruction(
+        opcode=Opcode.BUFFER_ATOMIC_SMAX,
+        vdata=vdata,
+        vaddr=vaddr,
+        srsrc=srsrc,
+        soffset=soffset,
+        mods=mods,
+    )
+
+
+class TestBufferAtomicSmaxNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for syntax rejection, negative controls, and mutation detection."""
+
+    def test_syntax_rejection_malformed_instructions(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_buffer_atomic_smax_asm("")
+
+        with self.assertRaises(ValueError):
+            parse_buffer_atomic_smax_asm("buffer_atomic_smin v0, v1, s[0:3], 0")
+
+        with self.assertRaises(ValueError):
+            parse_buffer_atomic_smax_asm("buffer_atomic_smax s0, v1, s[0:3], 0")
+
+        with self.assertRaises(ValueError):
+            parse_buffer_atomic_smax_asm("buffer_atomic_smax v0, v1, s[0:1], 0")
+
+        with self.assertRaises(ValueError):
+            parse_buffer_atomic_smax_asm("buffer_atomic_smax v0, v1, s[0:3], 0 bad_mod")
+
+    def test_mutation_oob_check_omission(self) -> None:
+        # Mutant: skips NUM_RECORDS check
+        mem = BufferMemory(256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=32)
+
+        def mutated_smax_no_oob(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            m.write_u32(off, u32(max(s32(old), s32(val))))
+            return old
+
+        # Access at offset 64 should be suppressed by the oracle
+        _, in_bounds = ref_buffer_atomic_smax(mem, desc, soffset=0, vaddr=64, cmp_val=10, glc=True)
+        self.assertFalse(in_bounds)
+
+        # Mutated oracle would incorrectly treat it as valid
+        with self.assertRaises(AssertionError):
+            self.assertEqual(in_bounds, True)
+
+    def test_mutation_glc_returns_post_op_value(self) -> None:
+        # Mutant: returns post-op new_val instead of pre-op old_val
+        mem = BufferMemory(256)
+        mem.write_u32(0, 10)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_glc_post_op(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            new_val = u32(max(s32(old), s32(val)))
+            m.write_u32(off, new_val)
+            return new_val  # BUG: returns new value instead of old
+
+        # For old=10, cmp=20, correct glc return is 10. Mutated returns 20.
+        mutated_ret = mutated_glc_post_op(mem, desc, 0, 20)
+        correct_ret, _ = ref_buffer_atomic_smax(BufferMemory(256), desc, 0, 0, 20, glc=True)
+        self.assertNotEqual(mutated_ret, 10)
+
+    def test_mutation_signed_min_instead_of_max(self) -> None:
+        # Mutant: using min() instead of max()
+        mem = BufferMemory(256)
+        mem.write_u32(0, u32(-50))
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_smin_instead_of_smax(m: BufferMemory, off: int, val: int) -> None:
+            old = m.read_u32(off)
+            m.write_u32(off, u32(min(s32(old), s32(val))))  # BUG: min instead of max
+
+        # -50 vs -10: correct max is -10. Mutated produces -50.
+        mutated_smin_instead_of_smax(mem, 0, u32(-10))
+        self.assertEqual(s32(mem.read_u32(0)), -50)
+        self.assertNotEqual(s32(mem.read_u32(0)), -10)
+
+    def test_mutation_unsigned_instead_of_signed_max(self) -> None:
+        # Mutant: using unsigned max instead of signed max
+        # For -1 (0xFFFFFFFF = 4294967295) and 0:
+        # Signed max: max(-1, 0) = 0
+        # Unsigned max: max(0xFFFFFFFF, 0) = 0xFFFFFFFF (-1)
+        mem = BufferMemory(256)
+        mem.write_u32(0, 0)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_umax(m: BufferMemory, off: int, val: int) -> None:
+            old = m.read_u32(off)
+            m.write_u32(off, max(old, val))  # BUG: unsigned max
+
+        mutated_umax(mem, 0, U32_MINUS_ONE)
+        # Unsigned max produced 0xFFFFFFFF (-1), whereas correct signed max is 0!
+        self.assertEqual(mem.read_u32(0), U32_MINUS_ONE)
+        self.assertNotEqual(s32(mem.read_u32(0)), 0)
+
+    def test_mutation_simd_exec_leak(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        simd.set_buffer_descriptor(0, desc)
+        simd.set_exec_mask(0)  # all lanes disabled
+
+        canary = 0x12345678
+        simd.mem.write_u32(0, canary)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=True),
+        )
+        simd.step(inst)
+        self.assertEqual(simd.mem.read_u32(0), canary)
+
+        # Mutated leaky write would corrupt memory
+        simd.mem.write_u32(0, 999999)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.mem.read_u32(0), canary)
+
+
 if __name__ == "__main__":
     unittest.main()
