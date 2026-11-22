@@ -221,6 +221,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(winhttp_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(winhttp_offline_test PRIVATE /OPT:NOREF)
 
+  # Synthetic tests for the atomic API reference lifecycle.
+  add_executable(api_ref_state_test test/api_ref_state_test.cpp)
+  target_include_directories(api_ref_state_test PRIVATE
+    ${XTASKQUEUE_DIR}/Source/Task)
+  target_compile_definitions(api_ref_state_test PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(api_ref_state_test PRIVATE
+    /W4 /permissive- /utf-8)
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
   add_executable(xgameruntime_test
@@ -739,6 +747,10 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET api_ref_state_test)
+    add_test(NAME api_ref_state COMMAND api_ref_state_test)
+    set_tests_properties(api_ref_state PROPERTIES TIMEOUT 10)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
