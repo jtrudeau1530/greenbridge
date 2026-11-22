@@ -52,19 +52,24 @@ SENTINEL_FILL = 0xDEADBEEF
 # Canonical binary32 IEEE-754 bit patterns.
 POS_ZERO = 0x00000000
 NEG_ZERO = 0x80000000
-HALF = 0x3F000000          # 0.5
-NEG_HALF = 0xBF000000      # -0.5
-ONE = 0x3F800000           # 1.0
-NEG_ONE = 0xBF800000       # -1.0
-TWO = 0x40000000           # 2.0
-NEG_TWO = 0xC0000000       # -2.0
-FOUR = 0x40800000          # 4.0
-SIXTEEN = 0x41800000       # 16.0
-POS_INF = 0x7F800000       # +inf
-NEG_INF = 0xFF800000       # -inf
-QNAN = 0x7FC00000          # canonical positive quiet NaN
-NEG_QNAN = 0xFFC00000      # canonical negative quiet NaN
-SNAN = 0x7F800001          # signaling NaN
+SUBNORM_MIN = 0x00000001       # 2^-149 (smallest positive subnormal)
+NEG_SUBNORM_MIN = 0x80000001   # -2^-149
+SUBNORM_MAX = 0x007FFFFF       # (1 - 2^-23) * 2^-126
+FLT_MIN = 0x00800000           # 2^-126 (smallest positive normal)
+NEG_FLT_MIN = 0x80800000       # -2^-126
+HALF = 0x3F000000              # 0.5
+NEG_HALF = 0xBF000000          # -0.5
+ONE = 0x3F800000               # 1.0
+NEG_ONE = 0xBF800000           # -1.0
+TWO = 0x40000000               # 2.0
+NEG_TWO = 0xC0000000           # -2.0
+FOUR = 0x40800000              # 4.0
+SIXTEEN = 0x41800000           # 16.0
+POS_INF = 0x7F800000           # +inf
+NEG_INF = 0xFF800000           # -inf
+QNAN = 0x7FC00000              # canonical positive quiet NaN
+NEG_QNAN = 0xFFC00000          # canonical negative quiet NaN
+SNAN = 0x7F800001              # signaling NaN
 
 
 def f32_to_bits(val: float) -> int:
@@ -581,6 +586,134 @@ class TestRcpRsqShaderExecution(unittest.TestCase):
             self.assertEqual(words[0], ref_rcp_f32(vb))
             self.assertEqual(words[1], ref_rsq_f32(vb))
             self.assertEqual(words[2], ref_sqrt_f32(vb))
+
+
+class TestSpecialFloatBoundaries(unittest.TestCase):
+    """Test suite validating special float values: zeros, infinities, subnormals, and NaNs."""
+
+    def test_rcp_special_values(self):
+        # rcp(+-0.0) = +-inf
+        self.assertEqual(ref_rcp_f32(POS_ZERO), POS_INF)
+        self.assertEqual(ref_rcp_f32(NEG_ZERO), NEG_INF)
+        # rcp(+-inf) = +-0.0
+        self.assertEqual(ref_rcp_f32(POS_INF), POS_ZERO)
+        self.assertEqual(ref_rcp_f32(NEG_INF), NEG_ZERO)
+
+    def test_rsq_special_values(self):
+        # rsq(+0.0) = +inf
+        self.assertEqual(ref_rsq_f32(POS_ZERO), POS_INF)
+        # rsq(-x) = qNaN for x > 0
+        self.assertTrue(is_f32_nan_bits(ref_rsq_f32(NEG_ONE)))
+        self.assertTrue(is_f32_nan_bits(ref_rsq_f32(NEG_TWO)))
+        # rsq(+inf) = +0.0
+        self.assertEqual(ref_rsq_f32(POS_INF), POS_ZERO)
+        # rsq(-inf) = qNaN
+        self.assertTrue(is_f32_nan_bits(ref_rsq_f32(NEG_INF)))
+
+    def test_sqrt_special_values(self):
+        # sqrt(+0.0) = +0.0, sqrt(-0.0) = -0.0
+        self.assertEqual(ref_sqrt_f32(POS_ZERO), POS_ZERO)
+        self.assertEqual(ref_sqrt_f32(NEG_ZERO), NEG_ZERO)
+        # sqrt(-x) = qNaN for x > 0
+        self.assertTrue(is_f32_nan_bits(ref_sqrt_f32(NEG_ONE)))
+        self.assertTrue(is_f32_nan_bits(ref_sqrt_f32(NEG_TWO)))
+        # sqrt(+inf) = +inf, sqrt(-inf) = qNaN
+        self.assertEqual(ref_sqrt_f32(POS_INF), POS_INF)
+        self.assertTrue(is_f32_nan_bits(ref_sqrt_f32(NEG_INF)))
+
+    def test_trig_special_values(self):
+        # cos(+-0.0) = 1.0
+        self.assertEqual(ref_cos_f32(POS_ZERO), ONE)
+        self.assertEqual(ref_cos_f32(NEG_ZERO), ONE)
+        # sin(+0.0) = +0.0, sin(-0.0) = -0.0
+        self.assertEqual(ref_sin_f32(POS_ZERO), POS_ZERO)
+        self.assertEqual(ref_sin_f32(NEG_ZERO), NEG_ZERO)
+        # cos(+-inf) = qNaN, sin(+-inf) = qNaN
+        self.assertTrue(is_f32_nan_bits(ref_cos_f32(POS_INF)))
+        self.assertTrue(is_f32_nan_bits(ref_cos_f32(NEG_INF)))
+        self.assertTrue(is_f32_nan_bits(ref_sin_f32(POS_INF)))
+        self.assertTrue(is_f32_nan_bits(ref_sin_f32(NEG_INF)))
+
+    def test_nan_propagation(self):
+        # Both qNaN and sNaN must produce a NaN result across all operations
+        for nan_input in (QNAN, NEG_QNAN, SNAN):
+            self.assertTrue(is_f32_nan_bits(ref_cos_f32(nan_input)), f"cos({nan_input:#x}) not NaN")
+            self.assertTrue(is_f32_nan_bits(ref_sin_f32(nan_input)), f"sin({nan_input:#x}) not NaN")
+            self.assertTrue(is_f32_nan_bits(ref_rcp_f32(nan_input)), f"rcp({nan_input:#x}) not NaN")
+            self.assertTrue(is_f32_nan_bits(ref_rsq_f32(nan_input)), f"rsq({nan_input:#x}) not NaN")
+            self.assertTrue(is_f32_nan_bits(ref_sqrt_f32(nan_input)), f"sqrt({nan_input:#x}) not NaN")
+
+    def test_subnormal_boundaries(self):
+        # Reciprocal of tiny subnormals overflows to infinity (2^149 > 2^128)
+        self.assertEqual(ref_rcp_f32(SUBNORM_MIN), POS_INF)
+        self.assertEqual(ref_rcp_f32(NEG_SUBNORM_MIN), NEG_INF)
+        # Inverse sqrt of subnormal min: 1 / sqrt(2^-149) = 2^74.5 fits in f32 normal range
+        rsq_subnorm = ref_rsq_f32(SUBNORM_MIN)
+        self.assertFalse(is_f32_nan_bits(rsq_subnorm))
+        self.assertNotEqual(rsq_subnorm, POS_INF)
+        self.assertAlmostEqual(bits_to_f32(rsq_subnorm), 1.0 / math.sqrt(bits_to_f32(SUBNORM_MIN)), delta=1e16)
+        # Smallest normal float: 1 / 2^-126 = 2^126 (fits in f32)
+        rcp_flt_min = ref_rcp_f32(FLT_MIN)
+        self.assertFalse(is_f32_nan_bits(rcp_flt_min))
+        self.assertNotEqual(rcp_flt_min, POS_INF)
+        self.assertAlmostEqual(bits_to_f32(rcp_flt_min), 2.0 ** 126, delta=1e20)
+
+
+class TestNegativeControlsAndFaults(unittest.TestCase):
+    """Test suite validating negative controls, fault handling, and unsupported constructs."""
+
+    def test_spirv_unsupported_rcp_zero(self):
+        # In SPIR-V / spirv_mini_interp, OpFDiv by zero raises UnsupportedConstruct
+        for zero_word in (POS_ZERO, NEG_ZERO):
+            lines = [
+                f"v_mov_b32 v0, 0x{zero_word:08x}",
+                "v_rcp_f32 v1, v0",
+                "exp mrt0 v1, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_rcp_zero_{zero_word:08x}", lines)
+            with self.assertRaises(si.UnsupportedConstruct):
+                support.mrt0_words(spv)
+
+    def test_spirv_unsupported_rsq_zero_or_negative(self):
+        # In GLSL.std.450 / spirv_mini_interp, InverseSqrt of <= 0 raises UnsupportedConstruct
+        for bad_val in (POS_ZERO, NEG_ZERO, NEG_ONE):
+            lines = [
+                f"v_mov_b32 v0, 0x{bad_val:08x}",
+                "v_rsq_f32 v1, v0",
+                "exp mrt0 v1, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_rsq_bad_{bad_val:08x}", lines)
+            with self.assertRaises(si.UnsupportedConstruct):
+                support.mrt0_words(spv)
+
+    def test_simd_interpreter_fault_rejection(self):
+        # Disallow unsupported wave sizes
+        with self.assertRaises(ValueError):
+            Rdna2ValuSimdInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            Rdna2ValuSimdInterpreter(wave_size=128)
+
+        # Disallow vector destination to a scalar register
+        interp = Rdna2ValuSimdInterpreter(wave_size=32)
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_rcp_f32 s0, v0")
+
+        # Disallow unknown token syntax
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_mov_b32 v0, invalid_token_xyz")
+
+    def test_negative_control_oracle_assertions(self):
+        # Sanity check: assert that intentionally mutated values fail
+        with self.assertRaises(AssertionError):
+            self.assertEqual(ref_rcp_f32(f32_to_bits(2.0)), f32_to_bits(0.25))
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(ref_rsq_f32(f32_to_bits(4.0)), f32_to_bits(2.0))
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(ref_cos_f32(POS_ZERO), NEG_ONE)
 
 
 if __name__ == "__main__":
