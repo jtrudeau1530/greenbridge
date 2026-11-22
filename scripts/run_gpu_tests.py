@@ -292,6 +292,11 @@ def w64_emulated() -> bool:
     # subgroup, matching check.py (W64_EMULATED). Accepts "1"/"true"/"yes"/"on" and tolerates
     # the trailing space cmd.exe's `set VAR=1 &` leaves in the value.
     return (os.environ.get("LEONIDA_W64_EMULATE") or "").strip().lower() in ("1", "true", "yes", "on")
+def pc_tail_ubo() -> bool:
+    # LEONIDA_PC_TAIL_UBO=1: translate with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the tail in a uniform
+    # block at set 1), for devices whose maxPushConstantsSize is 128. The test programs read the same variable
+    # (runtime/test/vk_pc_tail.h) and bind the block; same accepted values as LEONIDA_W64_EMULATE.
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
 def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) -> tuple[bool | None, str]:
     """cs_wavemask, as in check.py: (passed, detail), passed None for a skip. The native build needs a 64-wide
     subgroup and skips where the device has none; with LEONIDA_W64_EMULATE=1 it was translated with
@@ -718,6 +723,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
+        if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
+            cmd.append("--pc-tail-ubo")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add: GLSL Fma or OpFmaKHR (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
         rc, out = run_cmd(cmd, gpu=False)
