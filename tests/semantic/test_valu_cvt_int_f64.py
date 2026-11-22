@@ -216,6 +216,152 @@ def oracle_v_cvt_u32_f64(src0_bits: int, abs_mod: bool = False, neg_mod: bool = 
     return trunc_val & MASK32
 
 
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional, Union
+
+
+class Opcode(Enum):
+    V_CVT_F64_I32 = auto()
+    V_CVT_F64_U32 = auto()
+    V_CVT_I32_F64 = auto()
+    V_CVT_U32_F64 = auto()
+
+
+class RegKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Register:
+    """Architectural register or register pair."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of valid range [0, 255]")
+        if self.count not in (1, 2):
+            raise ValueError(f"Register count must be 1 (32-bit) or 2 (64-bit), got {self.count}")
+        if self.index + self.count > 256:
+            raise ValueError(f"Register {self.kind.name} {self.index} with count {self.count} exceeds index 255")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        if self.count == 1:
+            return f"{prefix}{self.index}"
+        return f"{prefix}[{self.index}:{self.index + 1}]"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """32-bit integer literal or inline constant."""
+    bits: int
+
+    @property
+    def as_uint(self) -> int:
+        return self.bits & MASK32
+
+    @property
+    def as_int(self) -> int:
+        return u32_to_i32(self.bits)
+
+    @property
+    def name(self) -> str:
+        return str(self.as_int)
+
+
+@dataclass(frozen=True)
+class Literal64:
+    """64-bit double-precision float literal or inline constant."""
+    bits: int
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal64:
+        return cls(f64_to_bits(val))
+
+    @property
+    def float_value(self) -> float:
+        return bits_to_f64(self.bits)
+
+    @property
+    def name(self) -> str:
+        if self.bits == POS_ZERO_64:
+            return "0.0"
+        if self.bits == NEG_ZERO_64:
+            return "-0.0"
+        f = self.float_value
+        if math.isnan(f):
+            return "nan"
+        if math.isinf(f):
+            return "inf" if f > 0 else "-inf"
+        return f"{f:g}"
+
+
+@dataclass(frozen=True)
+class VOP1Operand:
+    """Typed source operand with optional VOP3 modifiers (abs, neg)."""
+    source: Union[Register, Literal32, Literal64]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass(frozen=True)
+class VCvtInstruction:
+    """Symbolic AST node for RDNA2 integer <-> float64 conversion instructions."""
+    opcode: Opcode
+    dst: Register
+    src0: VOP1Operand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.VGPR:
+            raise TypeError(f"VALU instruction destination must be a VGPR, got {self.dst.kind}")
+
+        if self.opcode in (Opcode.V_CVT_F64_I32, Opcode.V_CVT_F64_U32):
+            if self.dst.count != 2:
+                raise ValueError(f"{self.opcode.name} destination must be a 64-bit VGPR pair, got count={self.dst.count}")
+            if isinstance(self.src0.source, Register) and self.src0.source.count != 1:
+                raise ValueError(f"{self.opcode.name} source register must be 32-bit (count=1), got count={self.src0.source.count}")
+            if isinstance(self.src0.source, Literal64):
+                raise TypeError(f"{self.opcode.name} source cannot be Literal64")
+            if self.src0.abs_mod or self.src0.neg_mod:
+                raise ValueError(f"{self.opcode.name} does not support float input modifiers on integer source")
+
+        elif self.opcode in (Opcode.V_CVT_I32_F64, Opcode.V_CVT_U32_F64):
+            if self.dst.count != 1:
+                raise ValueError(f"{self.opcode.name} destination must be a 32-bit VGPR (count=1), got count={self.dst.count}")
+            if isinstance(self.src0.source, Register) and self.src0.source.count != 2:
+                raise ValueError(f"{self.opcode.name} source register must be a 64-bit pair (count=2), got count={self.src0.source.count}")
+            if isinstance(self.src0.source, Literal32):
+                raise TypeError(f"{self.opcode.name} source cannot be Literal32")
+            if self.clamp:
+                raise ValueError(f"{self.opcode.name} cannot clamp integer destination")
+
+    def disassemble(self) -> str:
+        op_name = self.opcode.name.lower()
+        s = f"{op_name} {self.dst.name}, {self.src0.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
 # ==============================================================================
 # Unit Tests: Mathematical Model and Reference Oracles
 # ==============================================================================
@@ -379,6 +525,136 @@ class TestVCvtIntF64ModelAndOracle(unittest.TestCase):
         self.assertEqual(oracle_v_cvt_u32_f64(f64_to_bits(-123.45), abs_mod=True), 123)
         # neg converts positive to negative -> clamps to 0
         self.assertEqual(oracle_v_cvt_u32_f64(f64_to_bits(50.0), neg_mod=True), 0)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_creation_and_bounds(self) -> None:
+        v0 = Register(RegKind.VGPR, 0, count=1)
+        self.assertEqual(v0.name, "v0")
+        v_pair = Register(RegKind.VGPR, 2, count=2)
+        self.assertEqual(v_pair.name, "v[2:3]")
+
+        s8 = Register(RegKind.SGPR, 8, count=1)
+        self.assertEqual(s8.name, "s8")
+        s_pair = Register(RegKind.SGPR, 10, count=2)
+        self.assertEqual(s_pair.name, "s[10:11]")
+
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=3)
+        with self.assertRaises(ValueError):
+            # Index 255 with count 2 spills past 255
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_literal_properties(self) -> None:
+        lit32 = Literal32(0xFFFF_FFFF)
+        self.assertEqual(lit32.as_uint, 0xFFFF_FFFF)
+        self.assertEqual(lit32.as_int, -1)
+        self.assertEqual(lit32.name, "-1")
+
+        lit64 = Literal64.from_float(3.14)
+        self.assertAlmostEqual(lit64.float_value, 3.14)
+        self.assertEqual(lit64.name, "3.14")
+
+    def test_operand_modifiers_disassembly(self) -> None:
+        v_pair = Register(RegKind.VGPR, 4, count=2)
+        op_plain = VOP1Operand(v_pair)
+        self.assertEqual(op_plain.disassemble(), "v[4:5]")
+
+        op_abs = VOP1Operand(v_pair, abs_mod=True)
+        self.assertEqual(op_abs.disassemble(), "|v[4:5]|")
+
+        op_neg = VOP1Operand(v_pair, neg_mod=True)
+        self.assertEqual(op_neg.disassemble(), "-v[4:5]")
+
+        op_neg_abs = VOP1Operand(v_pair, abs_mod=True, neg_mod=True)
+        self.assertEqual(op_neg_abs.disassemble(), "-|v[4:5]|")
+
+    def test_instruction_construction_all_opcodes(self) -> None:
+        # v_cvt_f64_i32
+        i1 = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_I32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Register(RegKind.VGPR, 4, count=1)),
+            clamp=True,
+        )
+        self.assertEqual(i1.disassemble(), "v_cvt_f64_i32 v[0:1], v4 clamp")
+
+        # v_cvt_f64_u32
+        i2 = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_U32,
+            dst=Register(RegKind.VGPR, 2, count=2),
+            src0=VOP1Operand(Register(RegKind.SGPR, 6, count=1)),
+        )
+        self.assertEqual(i2.disassemble(), "v_cvt_f64_u32 v[2:3], s6")
+
+        # v_cvt_i32_f64
+        i3 = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2), abs_mod=True, neg_mod=True),
+        )
+        self.assertEqual(i3.disassemble(), "v_cvt_i32_f64 v0, -|v[2:3]|")
+
+        # v_cvt_u32_f64
+        i4 = VCvtInstruction(
+            opcode=Opcode.V_CVT_U32_F64,
+            dst=Register(RegKind.VGPR, 10, count=1),
+            src0=VOP1Operand(Literal64.from_float(10.5)),
+        )
+        self.assertEqual(i4.disassemble(), "v_cvt_u32_f64 v10, 10.5")
+
+    def test_instruction_validation_errors(self) -> None:
+        # Non-VGPR destination
+        with self.assertRaises(TypeError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_F64_I32,
+                dst=Register(RegKind.SGPR, 0, count=2),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=1)),
+            )
+
+        # Count mismatch: v_cvt_f64_i32 requires dst count=2
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_F64_I32,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=1)),
+            )
+
+        # Count mismatch: v_cvt_i32_f64 requires dst count=1
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_I32_F64,
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2)),
+            )
+
+        # Clamp invalid on integer destination
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_I32_F64,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2)),
+                clamp=True,
+            )
+
+    def test_structural_equality(self) -> None:
+        inst_a = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_U32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Literal32(42)),
+        )
+        inst_b = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_U32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Literal32(42)),
+        )
+        self.assertEqual(inst_a, inst_b)
 
 
 if __name__ == "__main__":
