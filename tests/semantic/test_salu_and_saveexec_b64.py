@@ -1497,5 +1497,151 @@ class TestSaluAndSaveexecB64IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(interp.state.scc, 1)
 
 
+class TestSaluAndSaveexecB64NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, illegal syntax rejection, and boundary enforcement."""
+
+    def test_rejection_odd_aligned_destination_sgpr(self) -> None:
+        """Reject unaligned 64-bit destination SGPR pair (e.g. s[1:2])."""
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 1, size=64).validate()
+        with self.assertRaises(ValueError):
+            parse_instruction("s_and_saveexec_b64 s[1:2], s[0:1]")
+
+    def test_rejection_odd_aligned_source_sgpr(self) -> None:
+        """Reject unaligned 64-bit source SGPR pair (e.g. s[3:4])."""
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 3, size=64).validate()
+        with self.assertRaises(ValueError):
+            parse_instruction("s_and_saveexec_b64 s[0:1], s[3:4]")
+
+    def test_rejection_out_of_bounds_sgpr_index(self) -> None:
+        """Reject SGPR indices beyond architectural maximum of 105."""
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106, size=64).validate()
+        with self.assertRaises(ValueError):
+            parse_instruction("s_and_saveexec_b64 s[106:107], s[0:1]")
+
+    def test_rejection_vgpr_destination(self) -> None:
+        """Reject VGPR destination for SALU s_and_saveexec_b64."""
+        with self.assertRaises(ValueError):
+            parse_instruction("s_and_saveexec_b64 v[0:1], s[0:1]")
+
+    def test_rejection_invalid_operand_count(self) -> None:
+        """Reject instructions with too few or too many operands."""
+        with self.assertRaises(ValueError):
+            parse_instruction("s_and_saveexec_b64 s[0:1]")
+        with self.assertRaises(ValueError):
+            parse_instruction("s_and_saveexec_b64 s[0:1], s[2:3], s[4:5]")
+
+    def test_rejection_32bit_register_size_mismatch(self) -> None:
+        """Reject 32-bit scalar register for 64-bit opcode."""
+        with self.assertRaises(ValueError):
+            inst = Instruction(
+                Opcode.S_AND_SAVEEXEC_B64,
+                dst=Register(RegKind.SGPR, 0, size=32),
+                src0=Operand(imm=ALL_LANES_64, size=64),
+            )
+            inst.validate()
+
+
+class TestSaluAndSaveexecB64MutationDetection(unittest.TestCase):
+    """Mutation testing suite: verifies deliberate architectural mutations are caught."""
+
+    def test_mutation_or_instead_of_and(self) -> None:
+        """Detect mutation changing bitwise AND to OR."""
+        def mutated_eval(exec_mask: int, src: int) -> tuple[int, int, int]:
+            sdst = exec_mask & MASK64
+            new_exec = (exec_mask | src) & MASK64  # Mutation: | instead of &
+            return sdst, new_exec, (1 if new_exec != 0 else 0)
+
+        # In reference: 0 & 0xFFFFFFFF = 0. In mutated: 0 | 0xFFFFFFFF = 0xFFFFFFFF.
+        ref_res = ref_s_and_saveexec_b64(0, 0xFFFFFFFF)
+        mut_res = mutated_eval(0, 0xFFFFFFFF)
+        self.assertNotEqual(ref_res, mut_res)
+
+    def test_mutation_xor_instead_of_and(self) -> None:
+        """Detect mutation changing bitwise AND to XOR."""
+        def mutated_eval(exec_mask: int, src: int) -> tuple[int, int, int]:
+            sdst = exec_mask & MASK64
+            new_exec = (exec_mask ^ src) & MASK64  # Mutation: ^ instead of &
+            return sdst, new_exec, (1 if new_exec != 0 else 0)
+
+        # In reference: 1 & 1 = 1. In mutated: 1 ^ 1 = 0.
+        ref_res = ref_s_and_saveexec_b64(1, 1)
+        mut_res = mutated_eval(1, 1)
+        self.assertNotEqual(ref_res, mut_res)
+
+    def test_mutation_andn2_instead_of_and(self) -> None:
+        """Detect mutation changing AND to ANDN2 (exec & ~src)."""
+        def mutated_eval(exec_mask: int, src: int) -> tuple[int, int, int]:
+            sdst = exec_mask & MASK64
+            new_exec = (exec_mask & ~src) & MASK64  # Mutation: & ~
+            return sdst, new_exec, (1 if new_exec != 0 else 0)
+
+        ref_res = ref_s_and_saveexec_b64(ALL_LANES_64, ALL_LANES_64)
+        mut_res = mutated_eval(ALL_LANES_64, ALL_LANES_64)
+        self.assertNotEqual(ref_res, mut_res)
+
+    def test_mutation_sdst_receives_new_exec(self) -> None:
+        """Detect mutation saving updated EXEC instead of previous EXEC."""
+        def mutated_eval(exec_mask: int, src: int) -> tuple[int, int, int]:
+            new_exec = (exec_mask & src) & MASK64
+            sdst = new_exec  # Mutation: new_exec instead of old exec_mask
+            return sdst, new_exec, (1 if new_exec != 0 else 0)
+
+        ref_res = ref_s_and_saveexec_b64(ALL_LANES_64, 0)
+        mut_res = mutated_eval(ALL_LANES_64, 0)
+        self.assertNotEqual(ref_res, mut_res)
+
+    def test_mutation_sdst_receives_src(self) -> None:
+        """Detect mutation saving source operand into sdst."""
+        def mutated_eval(exec_mask: int, src: int) -> tuple[int, int, int]:
+            sdst = src & MASK64  # Mutation: src instead of exec_mask
+            new_exec = (exec_mask & src) & MASK64
+            return sdst, new_exec, (1 if new_exec != 0 else 0)
+
+        ref_res = ref_s_and_saveexec_b64(ALL_LANES_64, 0x12345678)
+        mut_res = mutated_eval(ALL_LANES_64, 0x12345678)
+        self.assertNotEqual(ref_res, mut_res)
+
+    def test_mutation_scc_from_sdst_instead_of_new_exec(self) -> None:
+        """Detect mutation deriving SCC from sdst instead of new_exec."""
+        def mutated_eval(exec_mask: int, src: int) -> tuple[int, int, int]:
+            sdst = exec_mask & MASK64
+            new_exec = (exec_mask & src) & MASK64
+            scc = 1 if sdst != 0 else 0  # Mutation: sdst != 0
+            return sdst, new_exec, scc
+
+        ref_res = ref_s_and_saveexec_b64(ALL_LANES_64, 0)
+        mut_res = mutated_eval(ALL_LANES_64, 0)
+        self.assertEqual(ref_res[2], 0)  # Reference SCC is 0
+        self.assertEqual(mut_res[2], 1)  # Mutated SCC is 1
+        self.assertNotEqual(ref_res, mut_res)
+
+    def test_mutation_scc_inversion(self) -> None:
+        """Detect mutation inverting SCC condition."""
+        def mutated_eval(exec_mask: int, src: int) -> tuple[int, int, int]:
+            sdst = exec_mask & MASK64
+            new_exec = (exec_mask & src) & MASK64
+            scc = 1 if new_exec == 0 else 0  # Mutation: inverted
+            return sdst, new_exec, scc
+
+        ref_res = ref_s_and_saveexec_b64(ALL_LANES_64, ALL_LANES_64)
+        mut_res = mutated_eval(ALL_LANES_64, ALL_LANES_64)
+        self.assertNotEqual(ref_res, mut_res)
+
+    def test_mutation_32bit_truncation(self) -> None:
+        """Detect mutation truncating 64-bit EXEC to 32 bits."""
+        def mutated_eval(exec_mask: int, src: int) -> tuple[int, int, int]:
+            sdst = exec_mask & MASK64
+            new_exec = (exec_mask & src) & MASK32  # Mutation: 32-bit truncation
+            return sdst, new_exec, (1 if new_exec != 0 else 0)
+
+        # Upper 32-bit mask: ref preserves bits 32..63, mutated zeroes them
+        ref_res = ref_s_and_saveexec_b64(ALL_LANES_64, HIGH32_LANES_64)
+        mut_res = mutated_eval(ALL_LANES_64, HIGH32_LANES_64)
+        self.assertNotEqual(ref_res, mut_res)
+
+
 if __name__ == "__main__":
     unittest.main()
