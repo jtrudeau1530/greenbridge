@@ -2284,9 +2284,21 @@ class Gen:
             return addr, d3, in_b, (check if mode in (None, 0, 3) else None), step
         return addr, d3, in_b, step
 
-    def buffer_store(self, op, a, mods):
-        """buffer_store_dword[xN] (raw) and buffer_store_format_* (f32 formats stored raw, f16x2/x4, unorm8x4).
-        Only active lanes store, inside a structured if."""
+    def mtbuf_format(self, op, mods):
+        """The format code an MTBUF instruction (tbuffer_load/store_format_*) encodes for itself, which replaces the
+        V#'s. LLVM omits the modifier for GFX10's default, BUF_FMT_8_UNORM (code 1)."""
+        fm = next((m for m in mods if m.startswith("format:")), "format:[BUF_FMT_8_UNORM]")
+        name = "GFX10_FORMAT_" + fm.split("BUF_FMT_")[-1].rstrip("]")
+        code = next((c for c, n in GFX10_FORMATS.items() if n == name), None)
+        if code is None or code not in self.FORMATS:
+            raise Unsupported(op + " " + name)
+        self.fixed_format_codes.add(code)
+        return code
+
+    def buffer_store(self, op, a, mods, fixed_fmt=None):
+        """buffer_store_dword[xN] (raw) and buffer_store_format_* (every format in FORMATS, read from the V# at run
+        time). tbuffer_store_format_* comes here with its own format in fixed_fmt: only that one is encoded, and the
+        bounds check uses its element size, whatever the V# says. Only active lanes store, inside a structured if."""
         if any(m in mods for m in ("lds", "tfe", "d16")):
             raise Unsupported(op + " form")
         d16 = "_d16_" in op
@@ -2295,7 +2307,7 @@ class Gen:
         if dword_store:
             addr, d3, in_b, per, step = self.buffer_address(a, mods, parts=True)
         else:
-            addr, d3, in_b, step = self.buffer_address(a, mods, elem="fmt")
+            addr, d3, in_b, step = self.buffer_address(a, mods, elem="fmt", fixed_fmt=fixed_fmt)
             per = None
         if dword_store:
             n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -2320,8 +2332,11 @@ class Gen:
             else:
                 comps = [self.load_reg("vgpr", vd["r"] + i) for i in range(n)]
                 icomps = comps
-            fmt = self.tmp()
-            self.emit(f"{fmt} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
+            if fixed_fmt is not None:
+                fmt = None                    # tbuffer: the instruction's format, so no V# FORMAT to branch on
+            else:
+                fmt = self.tmp()
+                self.emit(f"{fmt} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
             # Encodings for the formats that appear in store-heavy shaders; others store nothing.
             f32 = {22: 1, 64: 2, 74: 3, 77: 4}
             # Float views of the components, computed before any branch so every branch can use them.
@@ -2344,6 +2359,14 @@ class Gen:
                 self.emit(f"OpBranch {lbl_end}")
                 self.emit(f"{lbl_end} = OpLabel")
             return
+        if fixed_fmt is not None:
+            # A V# whose FORMAT is 0 (INVALID) disables the store, though MTBUF brings its own format (measured natively
+            # on gfx1035, wave32 and wave64, in OOB_SELECT 0, 1 and 3).
+            vf, valid, ok = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{vf} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
+            self.emit(f"{valid} = OpINotEqual %bool {vf} {self.cu(0)}")
+            self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {valid}")
+            in_b = ok
         act = self.tmp()
         self.emit(f"{act} = OpLogicalAnd %bool {self.active_b()} {in_b}")
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
@@ -2385,13 +2408,15 @@ class Gen:
                     extended = self.tmp()
                     self.emit(f"{extended} = OpBitFieldSExtract %int {self.as_int(component)} {self.cu(0)} {self.cu(16)}")
                     signed_ic.append(self.tou(extended))
-            for code, (size, kind, widths) in self.FORMATS.items():
-                e = self.tmp()
-                self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
-                ld, le = self.tmp() + "_s", self.tmp() + "_se"
-                self.emit(f"OpSelectionMerge {le} None")
-                self.emit(f"OpBranchConditional {e} {ld} {le}")
-                self.emit(f"{ld} = OpLabel")
+            formats = self.FORMATS.items() if fmt is not None else [(fixed_fmt, self.FORMATS[fixed_fmt])]
+            for code, (size, kind, widths) in formats:
+                if fmt is not None:
+                    e = self.tmp()
+                    self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
+                    ld, le = self.tmp() + "_s", self.tmp() + "_se"
+                    self.emit(f"OpSelectionMerge {le} None")
+                    self.emit(f"OpBranchConditional {e} {ld} {le}")
+                    self.emit(f"{ld} = OpLabel")
                 ncomp = min(len(widths), n)
                 source = normalized if kind in ("unorm", "snorm") else fc
                 fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
@@ -2426,8 +2451,9 @@ class Gen:
                     self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
                     self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
                     self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
-                self.emit(f"OpBranch {le}")
-                self.emit(f"{le} = OpLabel")
+                if fmt is not None:
+                    self.emit(f"OpBranch {le}")
+                    self.emit(f"{le} = OpLabel")
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
@@ -4732,13 +4758,11 @@ class Gen:
         elif op in ("tbuffer_load_format_x", "tbuffer_load_format_xy", "tbuffer_load_format_xyz",
                     "tbuffer_load_format_xyzw", "tbuffer_load_format_d16_x", "tbuffer_load_format_d16_xy",
                     "tbuffer_load_format_d16_xyz", "tbuffer_load_format_d16_xyzw"):
-            # MTBUF encodes its own format. LLVM omits the modifier for GFX10's default, BUF_FMT_8_UNORM.
-            fm = next((m for m in mods if m.startswith("format:")), "format:[BUF_FMT_8_UNORM]")
-            name = "GFX10_FORMAT_" + fm.split("BUF_FMT_")[-1].rstrip("]")
-            code = next((c for c, n in GFX10_FORMATS.items() if n == name), None)
-            if code is None or code not in self.FORMATS:
-                raise Unsupported(op + " " + name)
-            self.buffer_load_format(op[1:], a, mods, fixed_fmt=code)
+            self.buffer_load_format(op[1:], a, mods, fixed_fmt=self.mtbuf_format(op, mods))
+        elif op in ("tbuffer_store_format_x", "tbuffer_store_format_xy", "tbuffer_store_format_xyz",
+                    "tbuffer_store_format_xyzw", "tbuffer_store_format_d16_x", "tbuffer_store_format_d16_xy",
+                    "tbuffer_store_format_d16_xyz", "tbuffer_store_format_d16_xyzw"):
+            self.buffer_store(op[1:], a, mods, fixed_fmt=self.mtbuf_format(op, mods))
         elif op in ("s_bitset0_b64", "s_bitset1_b64"):
             # D[S0 & 63] = 0 / 1 in the SGPR pair D (D is both source and destination); SCC is not written. The pair
             # is 64-bit data (as for s_lshl_b64); a pair that lane_masks.py marks as a lane mask stays Unsupported.
@@ -9983,7 +10007,8 @@ def read_before_write_vgprs(insns):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(("exp", "buffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store")) \
+        reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
+                                   "global_store")) \
             or (op.startswith("global_atomic_") and "glc" not in ins["mods"])   # no vdst without glc
         regs = []
         for x in (a if reads_all else a[1:]):
@@ -10041,7 +10066,8 @@ def interp_ij_analysis(insns, g):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(("exp", "buffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store"))
+        reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
+                                   "global_store"))
         if not reads_all and a[0]["k"] == "vgpr":
             for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)):
                 writes[r].append(n)
@@ -10212,7 +10238,8 @@ def reg_reads_writes(insns):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(("exp", "buffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store"))
+        reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
+                                   "global_store"))
         regs = []
         for x in (a if reads_all else a[1:]):
             if x["k"] == "vgpr":

@@ -188,6 +188,16 @@ FMT_XY_XYZ_WORDS = [
     0x3F800000, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0x0000FFFF, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
     0x0003FF01, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
     0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
+# cs_tbuffer_store.asm: 13 tbuffer_store_format_* regions read back, as a Radeon 680M (gfx1035) gives them
+# natively. Layout and rules in the .asm header.
+TBUFFER_STORE_WORDS = [
+    0x3F800000, 0x40000000, 0x40400000, 0x40800000, 0x40003C00, 0x00000000, 0xA5A50218, 0xA5A5021C,
+    0x00030201, 0xA5A50224, 0xA5A50228, 0xA5A5022C, 0xA5A5FF30, 0xA5A50234, 0xA5A50238, 0xA5A5023C,
+    0x40000240, 0xA5A50244, 0xA5A50248, 0xA5A5024C, 0xD00003FF, 0xA5A50254, 0xA5A50258, 0xA5A5025C,
+    0x3F800000, 0x40000000, 0xA5A50268, 0xA5A5026C, 0x40003C00, 0xA5A50274, 0xA5A50278, 0xA5A5027C,
+    0xFF0080FF, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0xA5A50290, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
+    0xA5A502FF, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0x3F800000, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
+    0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
@@ -465,6 +475,12 @@ def fmt_xy_xyz_test(tools, spirv, env=None):
     """TEST-185: the 84 result words and the untouched words after them, up to the inputs at 0x200. The heap needs
     0x2d0 bytes, so it is 192 words."""
     return dump_test(tools, spirv, "cs_fmt_xy_xyz", FMT_XY_XYZ_WORDS + [0xEEEEEEEE] * 44, 192, env)
+
+
+def tbuffer_store_test(tools, spirv, env=None):
+    """The 52 region words tbuffer_store_format_* leaves and the untouched words after them, up to the regions at
+    0x200. The heap needs 0x2d0 bytes, so it is 192 words."""
+    return dump_test(tools, spirv, "cs_tbuffer_store", TBUFFER_STORE_WORDS + [0xEEEEEEEE] * 76, 192, env)
 
 
 class Skip(str):
@@ -1223,6 +1239,7 @@ def main():
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
+    results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
