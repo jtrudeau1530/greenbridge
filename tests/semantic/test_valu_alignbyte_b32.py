@@ -1257,5 +1257,161 @@ class TestValuAlignbyteB32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual((swapped >> 16) & 0xFFFF, 0x3C00)
 
 
+# ---------------------------------------------------------------------------
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ---------------------------------------------------------------------------
+
+class TestValuAlignbyteB32NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+
+    def test_invalid_destination_kind(self) -> None:
+        # Destination cannot be an SGPR for VALU instruction
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_ALIGNBYTE_B32,
+                dst=Register(RegKind.SGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+                src1=Register(RegKind.VGPR, 2),
+                src2=Immediate(0),
+            )
+
+    def test_scalar_interpreter_out_of_bounds_access(self) -> None:
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.VGPR, 256)
+        with self.assertRaises(IndexError):
+            interp.write_reg_u32(RegKind.SGPR, 106, 0)
+
+    def test_simd_interpreter_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=128)
+
+    def test_unsupported_operand_type(self) -> None:
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(TypeError):
+            interp.read_operand("v0")  # type: ignore[arg-type]
+
+    def test_unsupported_opcode_rejection(self) -> None:
+        # Create a mock instruction with unsupported opcode
+        class FakeOpcode(enum.Enum):
+            UNKNOWN = "v_unknown"
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Immediate(0),
+        )
+        object.__setattr__(inst, "opcode", FakeOpcode.UNKNOWN)
+
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(NotImplementedError):
+            interp.step(inst)
+
+
+class TestValuAlignbyteB32MutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_inverted_shift_direction(self) -> None:
+        # Sabotage: left shift instead of right shift
+        def mutated_alignbyte(s0: int, s1: int, s2: int) -> int:
+            concat = ((s0 & MASK32) << 32) | (s1 & MASK32)
+            shift = (s2 & 3) * 8
+            return (concat << shift) & MASK32
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_alignbyte(0x88776655, 0x44332211, 1), 0x55443322)
+
+    def test_mutation_inverted_operands_order(self) -> None:
+        # Sabotage: concatenating {S1, S0} instead of {S0, S1}
+        def mutated_alignbyte(s0: int, s1: int, s2: int) -> int:
+            concat = ((s1 & MASK32) << 32) | (s0 & MASK32)
+            shift = (s2 & 3) * 8
+            return (concat >> shift) & MASK32
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_alignbyte(0x88776655, 0x44332211, 1), 0x55443322)
+
+    def test_mutation_shift_mask_omitted(self) -> None:
+        # Sabotage: omitting & 3 on shift count, so shift 4 shifts 32 bits
+        def mutated_alignbyte(s0: int, s1: int, s2: int) -> int:
+            concat = ((s0 & MASK32) << 32) | (s1 & MASK32)
+            shift = s2 * 8  # bug: missing & 3
+            return (concat >> shift) & MASK32
+
+        # In RDNA2, shift 4 must behave identically to shift 0 (returning S1)
+        src0 = 0x88776655
+        src1 = 0x44332211
+        expected = ref_alignbyte_b32(src0, src1, 4)  # returns src1
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_alignbyte(src0, src1, 4), expected)
+
+    def test_mutation_endianness_reversal(self) -> None:
+        # Sabotage: big-endian byte unpack
+        def mutated_pack_bytes(b0: int, b1: int, b2: int, b3: int) -> int:
+            return ((b0 & 0xFF) << 24) | ((b1 & 0xFF) << 16) | ((b2 & 0xFF) << 8) | (b3 & 0xFF)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_pack_bytes(0x11, 0x22, 0x33, 0x44), 0x44332211)
+
+    def test_mutation_exec_mask_leak(self) -> None:
+        # Sabotage: inactive SIMD lane modifies destination register
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.set_exec_mask(0)  # All lanes inactive
+        canary = 0xBAD0CAFE
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 0, canary)
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(1),
+            src1=Immediate(2),
+            src2=Immediate(0),
+        )
+        simd.step(inst)
+        # Canary must be preserved
+        self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), canary)
+
+        # Mutated behavior: unconditionally overwrite
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 0, 0x12345678)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), canary)
+
+    def test_mutation_vcc_clobber(self) -> None:
+        # Sabotage: alignbyte clobbering VCC
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0x1234567890ABCDEF
+        interp.vcc = canary_vcc
+
+        # Proper step preserves VCC
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(1),
+            src1=Immediate(2),
+            src2=Immediate(0),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.vcc, canary_vcc)
+
+        # Mutated step clobbers VCC
+        interp.vcc = 0
+        with self.assertRaises(AssertionError):
+            self.assertEqual(interp.vcc, canary_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
