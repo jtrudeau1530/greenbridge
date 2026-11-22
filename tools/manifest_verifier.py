@@ -43,7 +43,13 @@ def below_normal() -> None:
     if os.name == "nt":
         try:
             import ctypes
+            from ctypes import wintypes
+
             k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.argtypes = ()
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            k32.SetPriorityClass.restype = wintypes.BOOL
             k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
         except Exception:
             pass
