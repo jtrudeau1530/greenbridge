@@ -88,6 +88,8 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8G8_UNORM: return {VK_FORMAT_R8G8_UNORM, color};
     case DXGI_FORMAT_R8G8_SNORM: return {VK_FORMAT_R8G8_SNORM, color};
     case DXGI_FORMAT_R16_UNORM: return {VK_FORMAT_R16_UNORM, color};
+    // DXGI names packed channels from the high bits down, Vulkan's PACK formats the same way but spelled the other
+    // way round: B5G5R5A1 (alpha in bit 15) is A1R5G5B5_PACK16, as B5G6R5 above is R5G6B5_PACK16.
     case DXGI_FORMAT_B5G5R5A1_UNORM: return {VK_FORMAT_A1R5G5B5_UNORM_PACK16, color};
     case DXGI_FORMAT_R8G8_UINT: return {VK_FORMAT_R8G8_UINT, color};
     case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
