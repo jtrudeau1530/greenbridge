@@ -2612,6 +2612,99 @@ struct TextureView {
     float min_lod = 0.0f;
 };
 
+// In-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4). D3D12 cached blobs are driver-specific
+// and ignored across runs; Serialize writes a versioned header so CreatePipelineLibrary recognizes our own blobs
+// and returns D3D12_ERROR_DRIVER_VERSION_MISMATCH for foreign or corrupt ones.
+class PipelineLibrary final
+    : public Child<PipelineLibrary, ID3D12PipelineLibrary1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12PipelineLibrary, ID3D12PipelineLibrary1> {
+public:
+    // {6e2a9d41-7b5f-4c83-8e14-2a9d6f3c5b10}
+    static constexpr GUID kTag{0x6e2a9d41, 0x7b5f, 0x4c83, {0x8e, 0x14, 0x2a, 0x9d, 0x6f, 0x3c, 0x5b, 0x10}};
+
+    struct Header {
+        std::uint32_t magic;
+        std::uint32_t version;
+        std::uint32_t count;
+        std::uint32_t reserved;
+    };
+    static constexpr std::uint32_t kMagic = 0x314C504Cu;  // "LPL1"
+    static constexpr std::uint32_t kVersion = 1;
+
+    ~PipelineLibrary() override {
+        std::lock_guard lock(mutex_);
+        for (auto& [name, pso] : entries_)
+            if (pso) pso->Release();
+        entries_.clear();
+    }
+
+    static bool valid_blob(const void* data, SIZE_T size) {
+        if (!data || size < sizeof(Header)) return false;
+        Header h{};
+        std::memcpy(&h, data, sizeof(h));
+        return h.magic == kMagic && h.version == kVersion && h.reserved == 0;
+    }
+
+    HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState* pipeline) override {
+        if (!name || !*name || !pipeline) return E_INVALIDARG;
+        if (!PipelineState::from<PipelineState>(pipeline)) return E_INVALIDARG;
+        std::lock_guard lock(mutex_);
+        auto [it, inserted] = entries_.emplace(name, pipeline);
+        if (!inserted) return E_INVALIDARG;
+        pipeline->AddRef();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                                   REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc) return E_INVALIDARG;
+        return load_entry(name, false, true, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                                  REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc) return E_INVALIDARG;
+        return load_entry(name, true, false, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE LoadPipeline(LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                           REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!name || !*name || !desc || !desc->SizeInBytes || !desc->pPipelineStateSubobjectStream) return E_INVALIDARG;
+        return load_entry(name, false, false, riid, out);
+    }
+
+    SIZE_T STDMETHODCALLTYPE GetSerializedSize() override { return sizeof(Header); }
+
+    HRESULT STDMETHODCALLTYPE Serialize(void* data, SIZE_T size) override {
+        if (!data || size < sizeof(Header)) return E_INVALIDARG;
+        std::lock_guard lock(mutex_);
+        const Header h{kMagic, kVersion, static_cast<std::uint32_t>(entries_.size()), 0};
+        std::memcpy(data, &h, sizeof(h));
+        return S_OK;
+    }
+
+private:
+    HRESULT load_entry(LPCWSTR name, bool require_compute, bool require_graphics, REFIID riid, void** out) {
+        std::lock_guard lock(mutex_);
+        const auto it = entries_.find(name);
+        if (it == entries_.end()) return E_INVALIDARG;
+        PipelineState* ps = PipelineState::from<PipelineState>(it->second);
+        if (!ps) return E_INVALIDARG;
+        if (require_compute && !ps->compute()) return E_INVALIDARG;
+        if (require_graphics && !ps->graphics()) return E_INVALIDARG;
+        return it->second->QueryInterface(riid, out);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::wstring, ID3D12PipelineState*> entries_;
+};
+
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
 bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
@@ -3720,6 +3813,19 @@ public:
             return hr;
         }
         return hand_out(pipeline, riid, out);
+    }
+
+    // Device1: in-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4).
+    HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(const void* blob, SIZE_T size, REFIID riid, void** out) override {
+        constexpr auto method = "ID3D12Device1::CreatePipelineLibrary";
+        if (out) *out = nullptr;
+        if (size > 0 && !blob) return d3d12_trace::result(method, E_INVALIDARG);
+        if (size > 0 && !PipelineLibrary::valid_blob(blob, size))
+            return d3d12_trace::result(method, D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+        if (!out) return d3d12_trace::result(method, S_FALSE);
+        auto* lib = new PipelineLibrary();
+        lib->attach_device(identity());
+        return d3d12_trace::result(method, hand_out(lib, riid, out));
     }
 
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
