@@ -2924,6 +2924,32 @@ class Gen:
         self.store_reg("sgpr", d["r"], rlo)
         self.store_reg("sgpr", d["r"] + 1, rhi)
 
+    # f(S0, EXEC) of the saveexec / wrexec family (RDNA2 ISA SOP1; tools/cf_ref.py _SAVEEXEC): (op, NOT S0, NOT EXEC,
+    # NOT the result). andn1/orn1 complement S0, andn2/orn2 complement EXEC.
+    EXEC_LOGIC = {"and": ("OpBitwiseAnd", 0, 0, 0), "or": ("OpBitwiseOr", 0, 0, 0), "xor": ("OpBitwiseXor", 0, 0, 0),
+                  "andn1": ("OpBitwiseAnd", 1, 0, 0), "andn2": ("OpBitwiseAnd", 0, 1, 0),
+                  "orn1": ("OpBitwiseOr", 1, 0, 0), "orn2": ("OpBitwiseOr", 0, 1, 0),
+                  "nand": ("OpBitwiseAnd", 0, 0, 1), "nor": ("OpBitwiseOr", 0, 0, 1), "xnor": ("OpBitwiseXor", 0, 0, 1)}
+
+    def exec_logic(self, kind, s0, exec_):
+        """f(S0, EXEC) for one lane's mask bit (0 or ~0); see EXEC_LOGIC."""
+        k, n0, ne, nr = self.EXEC_LOGIC[kind]
+        if n0:
+            t = self.tmp()
+            self.emit(f"{t} = OpNot %uint {s0}")
+            s0 = t
+        if ne:
+            t = self.tmp()
+            self.emit(f"{t} = OpNot %uint {exec_}")
+            exec_ = t
+        r = self.tmp()
+        self.emit(f"{r} = {k} %uint {s0} {exec_}")
+        if nr:
+            t = self.tmp()
+            self.emit(f"{t} = OpNot %uint {r}")
+            r = t
+        return r
+
     def mask_dst(self, d, v):
         if d["k"] == "special" and d["t"] in ("exec", "exec_lo"):
             self.set_exec(v)
@@ -5337,27 +5363,20 @@ class Gen:
             self.compare(op, a, scalar=False, mods=mods)
         elif op.startswith("v_cmpx_") and not op.startswith("v_cmpx_class") and not op.endswith(("_u64", "_i64")):
             self.compare_x(op, a, mods=mods)
-        elif op in ("s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
-                    "s_or_saveexec_b32", "s_andn2_saveexec_b32"):
+        elif op.endswith(("_saveexec_b64", "_saveexec_b32")) and op[2:].split("_saveexec")[0] in self.EXEC_LOGIC:
+            # RDNA2 ISA SOP1: D = EXEC; EXEC = f(S0, EXEC); SCC = (EXEC != 0). One invocation holds its own lane's bit
+            # (0 or ~0), so f is the bitwise op on that bit, NOT included: a lane EXEC had off becomes active when f
+            # gives 1 for it (nand, nor, orn2, xnor ...), as on hardware. Definitions as tools/cf_ref.py _SAVEEXEC.
             saved = self.exec_value()
             src = self.mask_src(a[1], wide=op.endswith("b64"))
-            r = self.tmp()
-            kind = op[2:].split("_saveexec")[0]
-            if kind == "andn2":
-                n = self.tmp()
-                self.emit(f"{n} = OpNot %uint {saved}")
-                self.emit(f"{r} = OpBitwiseAnd %uint {src} {n}")
-            else:
-                self.emit(f"{r} = {'OpBitwiseAnd' if kind == 'and' else 'OpBitwiseOr'} %uint {src} {saved}")
+            r = self.exec_logic(op[2:].split("_saveexec")[0], src, saved)
             self.mask_dst(a[0], saved)
             self.set_exec(r)
             self.scc_from_mask(r)
-        elif op in ("s_andn2_wrexec_b64", "s_andn2_wrexec_b32"):
-            # RDNA ISA: EXEC = S0 & ~EXEC; D = EXEC; SCC = (EXEC != 0). Two operands: sdst, ssrc0.
+        elif op in ("s_andn2_wrexec_b64", "s_andn2_wrexec_b32", "s_andn1_wrexec_b64", "s_andn1_wrexec_b32"):
+            # RDNA ISA: andn2: EXEC = S0 & ~EXEC; andn1: EXEC = ~S0 & EXEC; then D = EXEC; SCC = (EXEC != 0).
             x, y = self.mask_src(a[1], wide=op.endswith("b64")), self.exec_value()
-            n, r = self.tmp(), self.tmp()
-            self.emit(f"{n} = OpNot %uint {y}")
-            self.emit(f"{r} = OpBitwiseAnd %uint {x} {n}")
+            r = self.exec_logic(op[2:].split("_wrexec")[0], x, y)
             self.set_exec(r)
             self.mask_dst(a[0], r)
             self.scc_from_mask(r)
