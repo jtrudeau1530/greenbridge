@@ -4328,6 +4328,55 @@ class Gen:
                 self.dst(a[0], v)
             else:
                 self.write_lo16(a[0], lo, preserve_high=e64)
+        elif op in ("v_mad_u16", "v_mad_i16"):
+            # D.u16 = S0.u16 * S1.u16 + S2.u16 on the low halves (op_sel picks high halves: bits 0..2 the sources, bit 3 the
+            # destination); VOP3-only, so the high half of the destination is kept (RDNA2 ISA; Mesa ACO can_use_opsel).
+            # The product and sum are formed in 32 bits (no overflow possible), then the low 16 bits are kept. With
+            # `clamp` the full-width result saturates to [0, 0xFFFF] (v_mad_u16) or [-32768, 32767] (v_mad_i16).
+            sb, dhi = self.opsel_bits(mods, 3)
+            vals = []
+            for k, s_ in enumerate(a[1:4]):
+                u = self.src_u(s_)
+                if sb[k]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+                    u = t
+                h = self.tmp()
+                if op == "v_mad_u16":
+                    self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                else:
+                    hi_ = self.tmp()
+                    self.emit(f"{hi_} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
+                    self.emit(f"{h} = OpBitcast %uint {hi_}")
+                vals.append(h)
+            x, y, z = vals
+            prod, tot = self.tmp(), self.tmp()
+            self.emit(f"{prod} = OpIMul %uint {x} {y}")
+            self.emit(f"{tot} = OpIAdd %uint {prod} {z}")
+            r = tot
+            if "clamp" in mods:
+                sat = self.tmp()
+                if op == "v_mad_u16":
+                    ov = self.tmp()
+                    self.emit(f"{ov} = OpUGreaterThan %bool {tot} {self.cu(0xFFFF)}")
+                    self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0xFFFF)} {tot}")
+                else:
+                    ti, lo_c, hi_c = self.as_int(tot), self.tmp(), self.tmp()
+                    self.emit(f"{lo_c} = OpExtInst %int %glsl SMax {ti} {self.as_int(self.cu(0xFFFF8000))}")
+                    self.emit(f"{hi_c} = OpExtInst %int %glsl SMin {lo_c} {self.as_int(self.cu(0x7FFF))}")
+                    self.emit(f"{sat} = OpBitcast %uint {hi_c}")
+                r = sat
+            lo = self.tmp()
+            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            if dhi:
+                old, keep, sh16, v = (self.tmp() for _ in range(4))
+                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
+                self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                self.dst(a[0], v)
+            else:
+                self.write_lo16(a[0], lo)
         elif op == "v_bcnt_u32_b32":
             x, acc = self.src_u(a[1]), self.src_u(a[2])
             c, r = self.tmp(), self.tmp()
