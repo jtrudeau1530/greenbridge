@@ -4532,6 +4532,30 @@ class Gen:
             self.emit(f"{c1} = OpCompositeExtract %float {r} 1")
             self.emit(f"{p} = OpCopyObject %uint {self.f16_pack2(c0, c1)}")
             self.dst(a[0], p)
+        elif op in ("s_movrels_b32", "s_movrels_b64"):
+            # Relative SGPR read through M0 (RDNA2 ISA SOP1): D = SGPR[S0 + M0] (the b64 form reads the pair at
+            # S0 + M0 and S0 + M0 + 1). The SGPR file is an array, so this is a dynamic load, as v_movrels is for
+            # VGPRs. The index wraps to the 128 array slots, so it can't reach the lane-mask parking slots past them;
+            # the hardware's own range check (and reads past s105 landing on VCC and the other specials) is not
+            # modelled. SCC is not written. s_movreld (a dynamic SGPR write) stays Unsupported: the translator keeps
+            # translate-time knowledge of SGPR values (literal S# words, descriptor caches) a dynamic write would
+            # invalidate.
+            n = 2 if op.endswith("_b64") else 1
+            d, src = a[0], a[1]
+            if d["k"] != "sgpr" or src["k"] != "sgpr" or d.get("n", 1) != n or src.get("n", 1) != n:
+                raise Unsupported(op + " operands")
+            m0 = self.tmp()
+            self.emit(f"{m0} = OpLoad %uint %m0")
+            vals = []
+            for w in range(n):
+                i, j, ptr, v = (self.tmp() for _ in range(4))
+                self.emit(f"{i} = OpIAdd %uint {self.cu(src['r'] + w)} {m0}")
+                self.emit(f"{j} = OpBitwiseAnd %uint {i} {self.cu(self.SGPRS - 1)}")
+                self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %sgpr {j}")
+                self.emit(f"{v} = OpLoad %uint {ptr}")
+                vals.append(v)
+            for w, v in enumerate(vals):        # every read before the first write (D may overlap the source)
+                self.store_reg("sgpr", d["r"] + w, v)
         elif op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"):
             # Relative VGPR indexing through M0: movrels reads VGPR[src + M0], movreld writes VGPR[dst + M0],
             # movrelsd does both. The register file is an array, so these become dynamic array accesses.
