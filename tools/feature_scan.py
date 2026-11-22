@@ -375,7 +375,7 @@ def main() -> int:
         folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
         if folder:
             os.makedirs(folder, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8") as f:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(result, f, indent=1)
     return 0
 

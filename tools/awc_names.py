@@ -317,7 +317,7 @@ def main(argv=None) -> int:
     if a.out:
         try:
             if a.out.lower().endswith(".json"):
-                with open(a.out, "w", encoding="utf-8") as fh:
+                with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
                     json.dump({"summary": summary, "streams": rows}, fh, indent=1)
             else:
                 with open(a.out, "w", encoding="utf-8", newline="") as fh:

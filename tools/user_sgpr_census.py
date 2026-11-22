@@ -103,7 +103,7 @@ def main(argv=None):
               f"pointer gaps {s['pointer_gap']}; after a ptr32 {s['after_ptr32']}"
               + (f"; below base {s['below_base']}" if "below_base" in s else ""))
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(summary, f, indent=1, sort_keys=True)
     bad = []
     for item in a.expect:

@@ -119,7 +119,7 @@ def main(argv=None) -> int:
     # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
     with tempfile.TemporaryDirectory(dir=out, prefix=".shader-index-") as staging:
         tmp = os.path.join(staging, "index.json")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(index, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
