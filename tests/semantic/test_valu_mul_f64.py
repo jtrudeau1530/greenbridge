@@ -972,5 +972,98 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(actual, expected)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_inplace_dst_equals_src0(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(3.0))
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(5.0))
+
+        # v[4:5] = v[4:5] * v[6:7]
+        res = interp.execute_asm("v_mul_f64 v[4:5], v[4:5], v[6:7]")
+        self.assertEqual(u64_to_f64(res), 15.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(4), f64_to_u64(15.0))
+        # src1 v[6:7] must remain intact
+        self.assertEqual(u64_to_f64(interp.vgpr.get_vgpr_pair(6)), 5.0)
+
+    def test_inplace_dst_equals_src1(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(7.0))
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(2.0))
+
+        # v[6:7] = v[4:5] * v[6:7]
+        res = interp.execute_asm("v_mul_f64 v[6:7], v[4:5], v[6:7]")
+        self.assertEqual(u64_to_f64(res), 14.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(6), f64_to_u64(14.0))
+        # src0 v[4:5] must remain intact
+        self.assertEqual(u64_to_f64(interp.vgpr.get_vgpr_pair(4)), 7.0)
+
+    def test_inplace_self_squaring(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(-4.0))
+
+        # v[2:3] = v[2:3] * v[2:3] -> 16.0
+        res = interp.execute_asm("v_mul_f64 v[2:3], v[2:3], v[2:3]")
+        self.assertEqual(u64_to_f64(res), 16.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(2), f64_to_u64(16.0))
+
+    def test_partially_overlapping_register_pairs(self) -> None:
+        interp = ScalarInterpreter()
+        # Setup:
+        # v0 = 0xAAAA0000, v1 = 0x0000BBBB -> src0 v[0:1]
+        # v2 = 0xCCCC0000, v3 = 0x0000DDDD -> src1 v[2:3]
+        s0_val = f64_to_u64(3.0)
+        s1_val = f64_to_u64(6.0)
+        interp.vgpr.set_vgpr_pair(0, s0_val)
+        interp.vgpr.set_vgpr_pair(2, s1_val)
+
+        v0_before = interp.vgpr.get_vgpr(0)
+        v3_before = interp.vgpr.get_vgpr(3)
+
+        # Execute with dst as unaligned v[1:2] overlapping both src0 (via v1) and src1 (via v2)
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=1)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src1 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2)
+        inst = ASTInstruction(opcode="v_mul_f64", dst=dst, src0=src0, src1=src1)
+        res = interp.execute_ast(inst)
+
+        self.assertEqual(u64_to_f64(res), 18.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(1), f64_to_u64(18.0))
+        # Non-overlapping boundary dwords v[0] and v[3] must remain completely unchanged
+        self.assertEqual(interp.vgpr.get_vgpr(0), v0_before)
+        self.assertEqual(interp.vgpr.get_vgpr(3), v3_before)
+
+    def test_simd_inplace_divergent_mask(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        init_vals = [f64_to_u64(float(i + 1)) for i in range(32)]
+        scale_vals = [f64_to_u64(10.0) for _ in range(32)]
+        sim.store_vgpr_pair_wave(0, init_vals)
+        sim.store_vgpr_pair_wave(2, scale_vals)
+
+        # Active on odd lanes only: 0xAAAAAAAA
+        sim.exec_mask = 0xAAAAAAAA
+        res = sim.step_v_mul_f64(0, 0, 2)
+
+        for lane in range(32):
+            if lane % 2 == 1:
+                # Active lane: multiplied
+                self.assertEqual(u64_to_f64(res[lane]), (lane + 1) * 10.0)
+            else:
+                # Inactive lane: preserved original
+                self.assertEqual(res[lane], init_vals[lane])
+
+    def test_successive_inplace_chain(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(0, f64_to_u64(1.0))
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(2.0))
+
+        # Repeatedly double v[0:1] 5 times: 1.0 -> 2.0 -> 4.0 -> 8.0 -> 16.0 -> 32.0
+        for _ in range(5):
+            interp.execute_asm("v_mul_f64 v[0:1], v[0:1], v[2:3]")
+
+        self.assertEqual(u64_to_f64(interp.vgpr.get_vgpr_pair(0)), 32.0)
+
+
 if __name__ == "__main__":
     unittest.main()
