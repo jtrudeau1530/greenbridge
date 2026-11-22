@@ -3015,6 +3015,47 @@ class Gen:
             self.emit(f"{r} = OpExtInst %float %glsl FClamp {vals[2]} {lo_} {hi_}")
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
+        elif op in ("v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_msad_u8"):
+            # Sums of absolute differences (RDNA ISA pseudocode), all unsigned and wrapping at 32 bits:
+            #   v_sad_u8:    S2 + sum over the 4 bytes of |S0.b - S1.b|
+            #   v_sad_hi_u8: S2 + (that byte sum << 16)
+            #   v_sad_u16:   S2 + sum over the 2 halves of |S0.h - S1.h|
+            #   v_sad_u32:   S2 + |S0 - S1|
+            #   v_msad_u8:   v_sad_u8, skipping each byte where S1's byte is 0 (masked SAD)
+            # clamp is not modelled: rejected rather than guessed.
+            if "clamp" in mods:
+                raise Unsupported(op + " clamp")
+            x, y, acc = (self.src_u(t) for t in a[1:4])
+            width = {"v_sad_u16": 16, "v_sad_u32": 32}.get(op, 8)
+            total = None
+            for off in range(0, 32, width):
+                if width == 32:
+                    xa, ya = x, y
+                else:
+                    xa, ya = self.tmp(), self.tmp()
+                    self.emit(f"{xa} = OpBitFieldUExtract %uint {x} {self.cu(off)} {self.cu(width)}")
+                    self.emit(f"{ya} = OpBitFieldUExtract %uint {y} {self.cu(off)} {self.cu(width)}")
+                hi_, lo_, d = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{hi_} = OpExtInst %uint %glsl UMax {xa} {ya}")
+                self.emit(f"{lo_} = OpExtInst %uint %glsl UMin {xa} {ya}")
+                self.emit(f"{d} = OpISub %uint {hi_} {lo_}")
+                if op == "v_msad_u8":
+                    md = self.tmp()
+                    self.emit(f"{md} = OpSelect %uint {self.tmp_bool_nz(ya)} {d} {self.cu(0)}")
+                    d = md
+                if total is None:
+                    total = d
+                else:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpIAdd %uint {total} {d}")
+                    total = t
+            if op == "v_sad_hi_u8":
+                t = self.tmp()
+                self.emit(f"{t} = OpShiftLeftLogical %uint {total} {self.cu(16)}")
+                total = t
+            r = self.tmp()
+            self.emit(f"{r} = OpIAdd %uint {total} {acc}")
+            self.dst(a[0], r)
         elif op == "v_xad_u32":
             x, y, z = (self.src_u(t) for t in a[1:4])
             t, r = self.tmp(), self.tmp()
