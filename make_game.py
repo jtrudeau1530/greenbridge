@@ -1304,7 +1304,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
               fallbacks: tuple[str, ...] = ()) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
 
-    A shard renames its index.part<i>.json into place last, so a part on disk is a finished shard. A run stopped
+    A shard publishes shard<i>.json and then index.part<i>.json. Both are needed to reuse it. A run stopped
     part-way, or during the merge, keeps those parts when it resumes with the same --jobs, wave64 mode, fallback
     flags and translator source, and starts only the shards that have none. shaders() drops the plan whenever an
     earlier step reruns."""
@@ -1325,7 +1325,11 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
                 os.remove(os.path.join(spirv, f))
         with open(plan_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(plan, f)
-    todo = [i for i in range(jobs) if not os.path.isfile(os.path.join(spirv, f"index.part{i}.json"))]
+    todo = [
+        i for i in range(jobs)
+        if not (os.path.isfile(os.path.join(spirv, f"index.part{i}.json"))
+                and os.path.isfile(os.path.join(spirv, f"shard{i}.json")))
+    ]
     if len(todo) < jobs:
         log(f"  keeping {jobs - len(todo)} of {jobs} shards finished by the run before")
     tool = os.path.join(TOOLS, "rdna2spirv.py")
