@@ -154,6 +154,44 @@ def _s32(x):
     return x - (1 << 32) if x >> 31 else x
 
 
+def _fraction_to_f32(q):
+    """Round an exact non-negative Fraction below 2**128 to binary32: nearest, ties to even (subnormals too)."""
+    if q == 0:
+        return 0.0
+    e = q.numerator.bit_length() - q.denominator.bit_length()     # 2**e <= q < 2**(e+1) after the fix-up
+    if Fraction(2) ** e > q:
+        e -= 1
+    e = max(e, -126)                                              # below 2**-126 the step stays 2**-149
+    m = q * Fraction(2) ** (23 - e)                               # significand in units of the last place
+    n = m.numerator // m.denominator
+    rem = m - n
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n & 1):
+        n += 1
+    return f32(n * 2.0 ** (e - 23))                               # exact: n <= 2**24
+
+
+def _fract(x):
+    """GLSL.std.450 Fract: x - floor(x), here computed exactly and rounded once to binary32, so a tiny negative x
+    gives 1.0 (the nearest float to 1 - |x|). NaN stays NaN; +-inf gives NaN (inf - inf)."""
+    if math.isnan(x) or math.isinf(x):
+        return math.nan
+    q = Fraction(x)
+    return _fraction_to_f32(q - math.floor(q))
+
+
+def _nmin_nmax(name, x, y):
+    """GLSL.std.450 NMin / NMax: a NaN operand gives the other operand; both NaN give a NaN. Zeros are ordered
+    -0 < +0, the order RDNA2 v_min_f32/v_max_f32 use (measured on an RX 6800, see docs/design.md)."""
+    if math.isnan(x):
+        return y if not math.isnan(y) else math.nan
+    if math.isnan(y):
+        return x
+    kx, ky = (x, math.copysign(1.0, x)), (y, math.copysign(1.0, y))
+    if name == "NMin":
+        return y if ky < kx else x
+    return y if ky > kx else x
+
+
 class _Types:
     def __init__(self):
         self.t = {}
@@ -320,6 +358,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     id_type = {}                # constant / result id -> its type id (the width of a signed comparison)
     pc_type = {}                # id -> pointee type id of a PushConstant pointer
     in_body = False
+    first_fn = None
     body = []
     outputs = []
 
@@ -358,6 +397,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             continue
         if op == "OpFunction":
             in_body = True
+            first_fn = res
             continue
         if op in _IGNORED:
             continue
@@ -450,7 +490,20 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         return signed(val(x), t[1] if t else 32)
 
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
-    pc = 0
+    # Every function's first body index and parameter ids. The first OpFunction was consumed by the header parse;
+    # later ones are in the body. Execution starts at %main (the entry point the translator names).
+    fn_start, fn_params = {first_fn: 0}, {}
+    for idx, (res, op, _, _) in enumerate(body):
+        if op == "OpFunction":
+            fn_start[res] = idx + 1
+    for fid, start in list(fn_start.items()):           # parameters come right after OpFunction
+        params, i = [], start
+        while i < len(body) and body[i][1] == "OpFunctionParameter":
+            params.append(body[i][0])
+            i += 1
+        fn_params[fid], fn_start[fid] = params, i
+    calls = []                                          # (return pc, result id, cur_label, prev_label)
+    pc = fn_start.get("%main", 0)
     killed = False
     cur_label = prev_label = None
     while pc < len(body):
@@ -463,6 +516,28 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         if op == "OpLabel":
             prev_label, cur_label = cur_label, res
             continue
+        if op == "OpFunctionCall":
+            fid, args = a[1], a[2:]
+            if fid not in fn_start or len(args) != len(fn_params[fid]) or len(calls) > 16:
+                raise UnsupportedConstruct(f"OpFunctionCall {fid}")
+            for prm, arg in zip(fn_params[fid], args):
+                values[prm] = val(arg)
+                if arg in id_type:
+                    id_type[prm] = id_type[arg]
+            calls.append((pc, res, cur_label, prev_label))
+            pc = fn_start[fid]
+            continue
+        if op == "OpReturnValue":
+            if not calls:
+                raise UnsupportedConstruct("OpReturnValue outside a called function")
+            ret = val(a[0])
+            pc, res_id, cur_label, prev_label = calls.pop()
+            values[res_id] = ret
+            continue
+        if op == "OpReturn" and not calls:
+            break
+        if op in ("OpFunction", "OpFunctionParameter"):
+            raise UnsupportedConstruct(f"{op} reached by falling through")
         if op in _IGNORED:
             continue
         if op == "OpKill":
@@ -854,8 +929,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name in ("FMax", "FClamp"):
                 if any(math.isnan(v) for v in args) or (name == "FClamp" and args[1] > args[2]):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
-                v = max(args[0], args[1])
-                values[res] = f32(v if name == "FMax" else min(v, args[2]))
+                # Equal zeros: -0 is ordered below +0, as in NMin/NMax above (the order RDNA2 hardware uses, so a
+                # med3 built from these ops is the hardware's median for signed zeros too).
+                v = _nmin_nmax("NMax", args[0], args[1])
+                values[res] = f32(v if name == "FMax" else _nmin_nmax("NMin", v, args[2]))
             elif name in ("RoundEven", "Floor", "Ceil", "Trunc"):
                 # round() breaks ties to even. An integral result keeps the operand's sign (IEEE 754
                 # roundToIntegral), so RoundEven(-0.4), Ceil(-0.5) and Trunc(-0.5) are -0.0, not +0.0.
@@ -890,7 +967,17 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name == "FMin":
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
-                values[res] = f32(min(args))
+                values[res] = f32(_nmin_nmax("NMin", *args))
+            elif name in ("NMin", "NMax"):
+                x, y = args
+                if isinstance(x, tuple):
+                    values[res] = tuple(_nmin_nmax(name, p, q) for p, q in zip(x, y))
+                else:
+                    values[res] = _nmin_nmax(name, x, y)
+            elif name == "Fract":
+                if not isinstance(args[0], float):
+                    raise UnsupportedConstruct("Fract on non-float")
+                values[res] = _fract(args[0])
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":

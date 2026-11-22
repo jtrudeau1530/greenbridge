@@ -10,12 +10,21 @@ Classes:
 Usage:
     python -I classify_carve.py <work>\\carve
 Writes types.json (per archive and overall counts/bytes per class, plus size stats) and prints a summary.
+Every per-class entry, overall and per archive, is {"files": N, "bytes": B, "min": ..., "max": ..., "median": ...}:
+min, max and median are the smallest, largest and median file size in bytes among the files of that class in that
+scope. For an even count the median is the lower of the two middle sizes (statistics.median_low), so every value
+in the report is an integer. A class only appears when it has at least one file, so the stats keys are never null.
+The tool keeps one size (a plain Python int) per file per class to compute these.
 """
 import json
 import os
 import sys
 import tempfile
 from collections import defaultdict
+from statistics import median_low
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 
 def classify(r):
@@ -49,6 +58,11 @@ def index_rows(path):
         yield row
 
 
+def entry(v):
+    sizes = v[2]
+    return {"files": v[0], "bytes": v[1], "min": min(sizes), "max": max(sizes), "median": median_low(sizes)}
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: python -I classify_carve.py <work>\\carve", file=sys.stderr)
@@ -59,31 +73,34 @@ def main():
         print(f"{root}: {what}; give the carve folder (the one with an index.json per archive)", file=sys.stderr)
         return 2
     per = {}
-    total = defaultdict(lambda: [0, 0])
+    total = defaultdict(lambda: [0, 0, []])
     for name in sorted(os.listdir(root)):
         p = os.path.join(root, name, "index.json")
         if not os.path.isfile(p):
             continue
-        c = defaultdict(lambda: [0, 0])
+        c = defaultdict(lambda: [0, 0, []])
         try:
             for r in index_rows(p):
                 k = classify(r)
                 c[k][0] += 1
                 c[k][1] += r["size"]
+                c[k][2].append(r["size"])
                 total[k][0] += 1
                 total[k][1] += r["size"]
+                total[k][2].append(r["size"])
         except (OSError, ValueError) as error:
             print(f"{p}: {error}", file=sys.stderr)
             return 2
-        per[name] = {k: {"files": v[0], "bytes": v[1]} for k, v in sorted(c.items(), key=lambda kv: -kv[1][1])}
+        per[name] = {k: entry(v) for k, v in sorted(c.items(), key=lambda kv: -kv[1][1])}
     top = sorted(total.items(), key=lambda kv: -kv[1][1])
-    out = {"overall": {k: {"files": v[0], "bytes": v[1]} for k, v in top}, "per_archive": per}
+    out = {"overall": {k: entry(v) for k, v in top}, "per_archive": per}
     fd, temp = tempfile.mkstemp(dir=root, prefix=".types-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(temp, published_mode(os.path.join(root, "types.json")))   # mkstemp creates 0600
         os.replace(temp, os.path.join(root, "types.json"))
     except BaseException:
         try:

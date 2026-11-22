@@ -10,7 +10,8 @@
 //   whatever the format's type: 0x3f800000 into an R32_FLOAT channel is 1.0, 0xff into an R8_UNORM one is 1.0.
 //   A raw or structured buffer view takes value 0 for every 32-bit word.
 // - Float converts to the format: UNORM and SNORM clamp to [0, 1] / [-1, 1] and round to nearest (NaN is 0);
-//   16-bit and the packed 11/10-bit floats round to nearest even (the small floats have no sign: negative is 0).
+//   16-bit and the packed 11/10-bit floats round toward zero, a finite value too large becoming the largest finite
+//   (D3D11.3 3.2.2; WARP and NVIDIA agree), and the small floats have no sign: negative is 0.
 //   D3D11 calls Float on an integer view invalid and D3D12 does not say; here the value is converted to the
 //   integer (rounded toward zero, clamped, NaN is 0) so the result is defined. A raw or structured buffer view
 //   takes value 0's bits.
@@ -123,7 +124,7 @@ inline std::uint32_t get(const Element& e, Channel c) {
 }
 
 // A float32 as a float with `mantissa` fraction bits, `exponent` exponent bits and an optional sign bit (IEEE
-// half: 10, 5, signed; the packed formats: 6 or 5, 5, unsigned), rounded to nearest even. Too large is infinity.
+// half: 10, 5, signed; the packed formats: 6 or 5, 5, unsigned), rounded toward zero. Too large is the largest finite; only infinity stays infinity.
 inline std::uint32_t small_float(float value, unsigned mantissa, unsigned exponent, bool sign) {
     const std::uint32_t f = std::bit_cast<std::uint32_t>(value);
     const std::uint32_t negative = f >> 31;
@@ -132,19 +133,18 @@ inline std::uint32_t small_float(float value, unsigned mantissa, unsigned expone
     if (std::isnan(value)) return sign_bit | (max_exponent << mantissa) | (1u << (mantissa - 1));
     if (!sign && negative) return 0;
     const std::uint32_t magnitude = f & 0x7fffffffu;
+    if (magnitude == 0x7f800000u) return sign_bit | (max_exponent << mantissa);  // infinity stays infinity
+    // D3D11.3 3.2.2: float-to-float conversion rounds toward zero, so a finite value too large is the largest finite.
+    const std::uint32_t largest = (max_exponent << mantissa) - 1;
     const int bias = int(max_exponent >> 1);
     const int e = int(magnitude >> 23) - 127 + bias;  // the exponent field in the small format
-    if (e >= int(max_exponent)) return sign_bit | (max_exponent << mantissa);  // overflow, or infinity
+    if (e >= int(max_exponent)) return sign_bit | largest;
     const std::uint32_t full = (magnitude & 0x7fffffu) | 0x800000u;           // 24-bit significand
-    // A normal result keeps `mantissa` bits; a subnormal one shifts further right.
     const int shift = (e > 0 ? 0 : 1 - e) + int(23 - mantissa);
-    if (shift > 24) return sign_bit;  // rounds to zero
-    std::uint32_t kept = full >> shift;
-    const std::uint32_t rest = full & mask(unsigned(shift));
-    const std::uint32_t half = 1u << (shift - 1);
-    if (rest > half || (rest == half && (kept & 1))) ++kept;  // may carry into the exponent, which is right
+    if (shift > 24) return sign_bit;
+    const std::uint32_t kept = full >> shift;
     const std::uint32_t biased = e > 0 ? (std::uint32_t(e) << mantissa) + (kept - (1u << mantissa)) : kept;
-    return sign_bit | std::min(biased, max_exponent << mantissa);
+    return sign_bit | biased;
 }
 
 inline float from_small_float(std::uint32_t bits, unsigned mantissa, unsigned exponent, bool sign) {

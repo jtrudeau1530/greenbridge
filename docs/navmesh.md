@@ -271,9 +271,9 @@ remain **open**.
   JSON and optional numeric CSV metadata. It never writes payload bytes and never touches the TOC.
 
 ```powershell
-python -I tools/navmesh_decode.py <package>\navmeshes.rpf --out navmesh-decode.json --csv navmesh-decode.csv
-python -I tools/navmesh_decode.py <package>\navmeshes.rpf --deep --out navmesh-decode-deep.json
-python -I tools/navmesh_decode.py <carve-dir> --out carved-decode.json
+python -I tools/navmesh_decode.py <package>\navmeshes.rpf --out <temp>/navmesh-decode.json --csv <temp>/navmesh-decode.csv
+python -I tools/navmesh_decode.py <package>\navmeshes.rpf --deep --out <temp>/navmesh-decode-deep.json
+python -I tools/navmesh_decode.py <carve-dir> --out <temp>/carved-decode.json
 python -I -W error::ResourceWarning tests/test_navmesh_decode.py -v
 python -I tests/test_navmesh_index.py
 ```

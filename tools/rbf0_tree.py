@@ -23,11 +23,14 @@ import os
 import re
 import struct
 import sys
+import tempfile
+from contextlib import suppress
 from xml.etree import ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rbf0_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 MAGIC = rbf0_index.MAGIC
 PROLOGUE = rbf0_index.PROLOGUE
@@ -388,10 +391,9 @@ def _rows(source):
         entries.sort(key=lambda e: e[0])
         rows = [{"offset": off, "stored": os.path.getsize(full), "size": os.path.getsize(full),
                  "head": head, "name": name} for off, name, full, head in entries]
-        by_offset = {row["offset"]: full for row, (_, _, full, _) in zip(rows, entries)}
 
         def read(row):
-            with open(by_offset[row["offset"]], "rb") as f:
+            with open(os.path.join(source, row["name"]), "rb") as f:
                 return f.read()
         return rows, read
     with open(source, "rb") as f:
@@ -651,9 +653,22 @@ def write_csv(path, docs):
 
 
 def write_json(path, docs, summary):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"tool": "rbf0_tree", "format": 1, "summary": summary, "resources": docs},
-                  f, indent=1, ensure_ascii=False, allow_nan=False)
+    """Replace the report only after the full JSON has been written, keeping its permission bits."""
+    directory = os.path.dirname(os.path.abspath(path))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=".rbf0_tree-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            json.dump({"tool": "rbf0_tree", "format": 1, "summary": summary, "resources": docs},
+                      f, indent=1, ensure_ascii=False, allow_nan=False)
+        os.chmod(temp, published_mode(path))   # NamedTemporaryFile creates 0600
+        os.replace(temp, path)
+    except BaseException:
+        if temp is not None:
+            with suppress(OSError):
+                os.unlink(temp)
+        raise
 
 
 def main(argv=None):
@@ -672,15 +687,27 @@ def main(argv=None):
         if not args.quiet and (n % 100 == 0 or n == total):
             print(f"[{n}/{total}] resources", flush=True)
 
+    path = args.source
     try:
-        docs, summary = decode_source(args.source, roots=args.root, offset=args.offset,
+        docs, summary = decode_source(path, roots=args.root, offset=args.offset,
                                       limit=args.limit, progress=progress)
+        path = args.out
+        write_json(path, docs, summary)
+        if args.csv:
+            path = args.csv
+            write_csv(path, docs)
+        paths = []
+        if args.xml:
+            path = args.xml
+            paths = write_xml(path, docs)
     except SelectionError as error:
         ap.error(str(error))
-    write_json(args.out, docs, summary)
-    if args.csv:
-        write_csv(args.csv, docs)
-    paths = write_xml(args.xml, docs) if args.xml else []
+    except RecursionError:
+        print(f"{path!r}: tree exceeds the export depth limit", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"{path!r}: {error.strerror or error}", file=sys.stderr)
+        return 1
     if not args.quiet:
         print(f"{summary['resources']} resources: {summary['ok']} ok, {summary['bad']} bad, "
               f"{summary['truncated']} truncated, {summary['trailing']} trailing")

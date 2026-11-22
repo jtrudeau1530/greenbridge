@@ -15,6 +15,16 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
+if (-not $Keep) {
+    # Compare directory boundaries, including when the paths do not exist yet.
+    $paths = $ExecutionContext.SessionState.Path
+    $tempDir = [IO.Path]::GetFullPath($paths.GetUnresolvedProviderPathFromPSPath($Temp)).TrimEnd('\') + '\'
+    $destDir = [IO.Path]::GetFullPath($paths.GetUnresolvedProviderPathFromPSPath($Dest)).TrimEnd('\') + '\'
+    if ($destDir.StartsWith($tempDir, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cleanup would delete the installation. Choose a -Dest outside -Temp or use -Keep."
+    }
+}
+
 foreach ($t in "git", "python") {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t wasn't found on PATH." }
 }

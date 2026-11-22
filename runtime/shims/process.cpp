@@ -4,9 +4,9 @@
 // arguments and finally calls exit(); both go through the EXE's own import table, so they can be answered here:
 //   - argv/argc and the command line are the game's (set by run_entry), not gta6rt's;
 //   - exit(), _exit(), quick_exit(), ExitProcess() and abort() from the game end the game's run, not the host:
-//     the exit code is recorded, the run is signalled as finished and the calling thread ends. atexit handlers
-//     and static destructors of the game are not run (its CRT shares the host's, whose process-wide atexit table
-//     also holds gta6rt's own).
+//     the exit code is recorded, the run is signalled as finished and the calling thread waits for the host to
+//     exit. atexit handlers and static destructors of the game are not run (its CRT shares the host's, whose
+//     process-wide atexit table also holds gta6rt's own).
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 #include <windows.h>
@@ -36,6 +36,7 @@ wchar_t** g_wargv_ptr = nullptr;
 char** g_env = nullptr;
 wchar_t** g_wenv = nullptr;
 
+std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};
 std::atomic<int> g_exit_code{0};
 HANDLE g_done = nullptr;
@@ -43,17 +44,25 @@ HANDLE g_done = nullptr;
 std::string quote(const std::string& a) {
     if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
     std::string out = "\"";
+    size_t slashes = 0;  // CommandLineToArgvW: backslashes are literal unless they precede a quote
     for (char c : a) {
-        if (c == '"') out += '\\';
+        if (c == '\\') {
+            ++slashes;
+        } else {
+            if (c == '"') out.append(slashes + 1, '\\');
+            slashes = 0;
+        }
         out += c;
     }
-    return out + "\"";
+    return out.append(slashes, '\\') + "\"";  // a trailing run is doubled before the closing quote
 }
 
+// The narrow arguments are ANSI code page text (main.cpp passes std::filesystem::path::string(), and the CRT's
+// narrow argv is ACP too); under a UTF-8 activeCodePage CP_ACP is UTF-8 anyway.
 std::wstring widen(const std::string& s) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    int n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
     std::wstring w(n > 0 ? n - 1 : 0, L'\0');
-    if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    if (n > 1) MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w.data(), n);
     return w;
 }
 
@@ -62,8 +71,9 @@ std::wstring widen(const std::string& s) {
     if (g_exited.compare_exchange_strong(expected, true)) {
         g_exit_code = code;
         if (g_done) SetEvent(g_done);
-        ExitThread(static_cast<DWORD>(code));
     }
+    // Park until the host's ExitProcess, not ExitThread: Wine < 11.2 can exit 0 if the two race (4a9bc42a).
+    if (g_running) for (;;) Sleep(INFINITE);
     // The run is already over: this is game code running during host shutdown (an atexit handler the game
     // registered with the shared CRT calling exit again). Finish the process with the game's exit code; ending
     // just this thread here would make the host's last thread, and so the process, exit with `code` instead.
@@ -153,9 +163,11 @@ int run_entry(void* entry, size_t stack_bytes) {
     g_exited = false;
     g_exit_code = 0;
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_running = true;
     EntryCall call{entry};
     HANDLE thread = CreateThread(nullptr, stack_bytes, game_thread, &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!thread) {
+        g_running = false;
         CloseHandle(g_done);
         g_done = nullptr;
         return -1;
@@ -163,9 +175,11 @@ int run_entry(void* entry, size_t stack_bytes) {
     // The run ends when any game thread exits the process (exit/ExitProcess/abort) or the entry point returns.
     HANDLE waits[] = {g_done, thread};
     WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+    if (g_exited) WaitForSingleObject(g_done, 5000);
     CloseHandle(thread);
     CloseHandle(g_done);
     g_done = nullptr;
+    g_running = false;
     return g_exit_code.load();
 }
 

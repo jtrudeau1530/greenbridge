@@ -1,0 +1,71 @@
+import ctypes
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "carve_all.ps1"
+INDEX = {"summary": {"files": 1, "bink2_files": 0, "span": 10, "compressed_bytes": 5, "unread_bytes": 5,
+                     "inflated_bytes": 5}, "files": []}
+
+
+@unittest.skipUnless(os.name == "nt", "PowerShell research script")
+class CarveAllGamePathTest(unittest.TestCase):
+    def test_relative_and_trailing_separator_game_paths_find_existing_carves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game, out = Path(tmp, "game"), Path(tmp, "out")
+            (game / "pack" / "p1").mkdir(parents=True)
+            (game / "common.rpf").write_bytes(b"x")
+            (game / "pack" / "p1" / "p1.rpf").write_bytes(b"xy")
+            # Both archives are already carved, so no carve should start.
+            for name in ("common", "pack_p1_p1"):
+                (out / name).mkdir(parents=True)
+                (out / name / "index.json").write_text(json.dumps(INDEX), encoding="utf-8")
+            for arg in ("game", ".\\game", str(game) + "\\"):
+                with self.subTest(game=arg):
+                    result = subprocess.run(
+                        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                         "-Game", arg, "-Out", str(out)], cwd=tmp, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("carving", result.stdout)
+                    rows = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
+                    self.assertEqual([r["archive"] for r in rows], ["common.rpf", "pack\\p1\\p1.rpf"])
+                    self.assertEqual(sorted(p.name for p in out.iterdir()),
+                                     ["common", "coverage.json", "pack_p1_p1"])
+
+    def test_game_path_with_83_short_name_component_finds_existing_carves(self):
+        # Resolve-Path keeps an 8.3 component (e.g. RUNNER~1) but Get-ChildItem emits canonical
+        # FullNames. A trailing separator plus such a component used to cut the rel path at the
+        # wrong offset, re-carving archives that were already present.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp, "LongDirectoryNameForCarveAllShortPath")
+            game, out = base / "game", base / "out"
+            (game / "pack" / "p1").mkdir(parents=True)
+            (game / "common.rpf").write_bytes(b"x")
+            (game / "pack" / "p1" / "p1.rpf").write_bytes(b"xy")
+            for name in ("common", "pack_p1_p1"):
+                (out / name).mkdir(parents=True)
+                (out / name / "index.json").write_text(json.dumps(INDEX), encoding="utf-8")
+            buf = ctypes.create_unicode_buffer(1024)
+            get_short = ctypes.windll.kernel32.GetShortPathNameW
+            get_short.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+            get_short.restype = ctypes.c_uint
+            if not get_short(str(game), buf, len(buf)):
+                self.skipTest("GetShortPathNameW failed")
+            short_game = buf.value + "\\"
+            if short_game == str(game) + "\\":
+                self.skipTest("8.3 short names are unavailable on this volume")
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", short_game, "-Out", str(out)], cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("carving", result.stdout)
+            rows = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
+            self.assertEqual([r["archive"] for r in rows], ["common.rpf", "pack\\p1\\p1.rpf"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -82,12 +82,13 @@ class PreflightTest(unittest.TestCase):
 
 
 class RuntimeBuildPreflightTest(unittest.TestCase):
-    def preflight(self, build, files):
+    def preflight(self, build, files, err=None):
         for name in files:
             open(os.path.join(build, name), "wb").close()
-        err = io.StringIO()
+        err = io.StringIO() if err is None else err
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch("sys.stderr", err), \
+                mock.patch.object(make_game.sys, "version_info", (3, 12, 0)), \
                 mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=False) as vs:
             make_game.preflight(["runtime"], os.path.join(build, "w"), runtime_build=build)
         vs.assert_not_called()
@@ -98,9 +99,12 @@ class RuntimeBuildPreflightTest(unittest.TestCase):
             self.preflight(build, make_game.RUNTIME_FILES)
 
     def test_runtime_build_without_the_tls_host_fails_before_any_work(self):
+        err = io.StringIO()
         with tempfile.TemporaryDirectory() as build:
-            with self.assertRaises(SystemExit):
-                self.preflight(build, ["gta6rt.exe"])
+            with self.assertRaises(SystemExit) as ctx:
+                self.preflight(build, ["gta6rt.exe"], err=err)
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("gta6rt_tls_host.dll", err.getvalue())
             self.assertFalse(os.path.exists(os.path.join(build, "w")))
 
 

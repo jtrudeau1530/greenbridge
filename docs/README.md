@@ -18,6 +18,7 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [models.md](models.md) | 350,248 models at the `917e9b9` pin, including 159,483 drawable-dictionary children; the re-count table is in models.md. |
+| [character_skeleton.md](character_skeleton.md) | Character `.#ft` fragments: the 597-name shared skeleton table (596 `joaat32` hashes), the 597-record instance tree with 580 measured parents, and the model-side bone-hash mapping; the reference TRS is not the bind pose. |
 | [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
 | [textures.md](textures.md) | 308,895 TTPF textures exported; 48,220 skips, mostly BCPack. |
 | [textures_arrays.md](textures_arrays.md) | 678 TTPF array/volume descriptors: 90 tile-mode-9 cubes have a validated 6-slice allocation layout; 588 remain unresolved. |
@@ -27,11 +28,11 @@ method, scope and caveats. No game data is included.
 | [rbf0.md](rbf0.md) | 1,263 RBF0 resources, 475,461 elements; UI/Scaleform definitions, not a sectioned container; strict JSON/CSV/XML tree decoder. |
 | [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN. |
 | [gamedata_graph.md](gamedata_graph.md) | `common.rpf` mount graph: 25 manifest documents, 30 content-set ids, 14 include refs (12 resolve), 3,386 target refs, 0 cycles. |
-| [world.md](world.md) | `levels.rpf` placement: 9,918 map files / 680,228 entities measured in 55% of the archive (lower bound; estimate 16k-39.6k / 1.03M-2.64M); `0x7a` resource layout. |
-| [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact. |
-| [world_names.md](world_names.md) | Name resolution: `archetypeName` and map `name`/`parent` are lower-cased joaat; 64-bit keys are MurmurHash3 x64 low 64. 79,738 local names resolve 8,263/203,799 sampled entities; 5/23,535 map names, all five confirmed by the map 64-bit key. |
+| [world.md](world.md) | `levels.rpf` placement: 9,918 map files / 680,228 entities measured in 55% of the archive (lower bound; estimate 16k-39.6k / 1.03M-2.64M); `0x7a` resource layout. Building a placed world from entity rows (`world_build.py --placements`). |
+| [world_census.md](world_census.md) | Full `levels.rpf` pass: 23,535 maps / 1,670,442 entities, 98.32% stream coverage, sharded and exact; the SixNG 30,785-map difference reconciled map by map (interiors and entity groups). |
+| [world_names.md](world_names.md) | Name resolution: `archetypeName` and map `name`/`parent` are lower-cased joaat; 64-bit keys are MurmurHash3 x64 low 64. With `rpf9_names.py` names, 99.85% of the 1,670,435 entities a whole-archive `world_index` run reads resolve (64-bit verified); 5/23,535 map names, all five confirmed by the map 64-bit key. |
 | [page_directory.md](page_directory.md) | RPF9 `0DRP`: 0x60-byte header, `q38` 16-byte records; 15,768 pages / 60,880 records in `data.rpf`; targets and sizes, names still TOC-only. |
-| [psin.md](psin.md) | PSIN metadata container: header, section walk, 671 streams in the `script.rpf` carve. |
+| [psin.md](psin.md) | PSIN metadata container: header, section walk, `LSCH`/`LENM` schema, and the instance data (block table, pointers, arrays, maps) read through it on 17,507 containers, 99.986% of block bytes reached. |
 | [story.md](story.md) | `story000.rpf` 18.65 GiB mixed: 264 Bink 2 streams / 3.33 GB, 225,281 `RSC8` headers, 442 nested RPF9; `story000_script` PSIN, `shared_minigame` mixed content. |
 | [restofworld.md](restofworld.md) | Six rest-of-world/script archives, 1.57 GB total: `core_restofworld` 1.21 GB (11 Bink 2, 37 models, 958 graphics pages), `story000_script` PSIN, small `appdata0`/licences. |
 | [movies.md](movies.md) | Bink 2 streams and audio tracks; decode through the real loader and `Bink2Scarlett.dll`. |
@@ -41,6 +42,7 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [audio.md](audio.md) | AWC banks: Opus, PCM and XMA2; lossless Ogg Opus repack and WAV paths. |
+| [rsc8_audio.md](rsc8_audio.md) | 641,428 `RSC8` v8001 resources across 4 archives: 100% AWC tag `0x5c` facial/lip-sync `crClipDictionary` paired with 48 kHz mono Opus dialogue, 0 hidden audio containers. |
 | [awc_shorts.md](awc_shorts.md) | Export short streamed-music idents/stings by duration; stereo-aware, no re-encode. |
 | [audio_config.md](audio_config.md) | The music/radio record table: 1,589 records, exact durations, AWC stream ids; no start offsets. |
 | [radio_stations.md](radio_stations.md) | Audio-config station blocks: 19 records, boundary u32, content-id lists; VCRR 80/80 mapping; no start offsets. |
@@ -51,12 +53,20 @@ method, scope and caveats. No game data is included.
 |---|---|
 | [d3d12_vulkan.md](d3d12_vulkan.md) | Xbox D3D12 to Vulkan plan and status; device proxy, queues, command lists, barriers, copies. |
 | [descriptor_lookup_apple.md](descriptor_lookup_apple.md) | M3 Max GPU timings for texture and sampler descriptor lookups at 1k, 10k and 100k live entries. |
+| [descriptor_lookup_ada.md](descriptor_lookup_ada.md) | RTX 4070 SUPER (Ada, Windows) timings for the same lookups in VRAM, host-visible and ReBAR memory. |
 | [d3d12_xs_surface.md](d3d12_xs_surface.md) | The 116-slot `d3d12_xs.dll` export surface; 83/83 standard GUIDs match the PC SDK. |
 | [xdxr.md](xdxr.md) | `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) from `XboxBvhBuilder.dll`'s reads; stream records' offsets and defaults; offline statistics not in the package. |
 | [d3d12_command_objects.md](d3d12_command_objects.md) | Measured command queue/list/fence/`PresentX` surface; verified vs prior art vs open. |
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |
+| [gameinput.md](gameinput.md) | The GameInput shim on SDL3: `GameInputCreate` and the v0 `IGameInput`/`IGameInputDevice`/`IGameInputReading`/`IGameInputDispatcher` surface on any SDL gamepad, DualSense adaptive-trigger approximation and lightbar; 77 checks on virtual joysticks, not yet tried on a real pad. |
 | [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder; key hashes are case-sensitive joaat (`tools/save_keys.py`). |
 | [pipeline_check.md](pipeline_check.md) | Driver-level corpus check: 10/12 shards, 22,092 modules, 2,217 compute pipelines, 0 failures. |
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |
+| [coder.md](coder.md) | The compressed mass in `story000_script.rpf`: entry framing (`align16(entry+8)` payload), the 32-value tag alphabet, deflate-shaped but proprietary, variable-length 7/8-bit LSB-first codes with no stored table, and the `n7 = 116..127` search that finishes it. |
+| [mission_logic.md](mission_logic.md) | Mission state tables: 0x20 record layout (band counter, byte offsets), the 64-byte pool element with world transforms, case-folding joaat keys, 53.5 % of states named, 113 state-set clusters covering 82.4 % of files. |
+
+## Other languages
+
+Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`pt-BR`).

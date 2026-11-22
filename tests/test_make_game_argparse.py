@@ -312,12 +312,16 @@ class JobsHandlingTest(unittest.TestCase):
                                             "--stages", "shaders", "--jobs", "6"]):
                 with patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
-                        with patch("make_game.preflight"):
+                        with patch("make_game.preflight") as mock_preflight:
                             with patch("make_game.log"):
                                 with patch("make_game.shaders") as mock_shaders, \
-                                        patch("make_game.wave64_emulate", return_value=True):
+                                        patch("make_game.wave64_emulate", return_value=True) as probe:
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
+                                    probe.assert_called_once_with("auto")
+                                    mock_preflight.assert_called_once_with(
+                                        ["shaders"], os.path.abspath(work), False, None,
+                                        emulate=True, keep_emulated=True)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
                                                                          emulate=True, keep_emulated=True)
 

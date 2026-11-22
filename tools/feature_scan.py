@@ -279,8 +279,9 @@ def main() -> int:
               file=sys.stderr)
         return 2
     result = {"shaders": len(index), "dxbc": scan_dxbc(dxbc_dir, index)}
-    stage_of = {os.path.splitext(e["file"])[0]: e.get("stage") or "?" for e in index}
-    stage_of |= {e["name"]: e.get("stage") or "?" for e in index}
+    # Original names can be shared by variants, so indexed filenames take precedence.
+    stage_of = {e["name"]: e.get("stage") or "?" for e in index}
+    stage_of |= {os.path.splitext(e["file"])[0]: e.get("stage") or "?" for e in index}
     disasm = os.path.join(dxbc_dir, "disasm")
     if os.path.isdir(disasm):
         result["disasm"] = scan_disasm(disasm, stage_of)
@@ -316,6 +317,9 @@ def main() -> int:
     if d["unreadable"]:
         print(f"{d['unreadable']} .dxbc files could not be read")
     if a.out:
+        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=1)
     return 0

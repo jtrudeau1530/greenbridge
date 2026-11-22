@@ -15,6 +15,12 @@ field.
 | exported at least one mip | 308,895 |
 | skipped | 48,220 |
 
+A skipped row has `File: null` and a `Limitation`. Either the catalog marks the texture as
+unextractable, or its content does not decode (`NotSupportedException`, `InvalidDataException`).
+Both are properties of the pool, so `rpf9dump` still exits 0 and publishes the manifest. A failure
+to read the pool or write a DDS is different. It exits 1 and withholds `manifest.json`, and a rerun
+resumes from the DDS files already written.
+
 **Bottom line:** the compact mip chain is decoded and validated below, and a clean-room
 stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`,
 `tools/bcpack_tables_bptc.py`) now decodes the rANS entropy layer and rebuilds BC blocks
@@ -394,6 +400,58 @@ This mapping is the strongest evidence that the codec field is the GDK's
 `DSTORAGE_BCPACK_MODE` (1 = BC1 … 7 = BC7), not a generic compression id. The field is per
 chunk, so a texture can mix zlib and BCPack mips; 15,201 partial exports do.
 
+### From a chunk entry to `bcpack.decode`
+
+`tools/bcpack.py` takes the codec as the BCPack mode (1–7), not the on-disk tag. Per codec:
+
+| Blocks | Tag in the chunk entry | `decode` codec | Lane widths in stream order (bits) | Symbols per lane per block |
+|---|---:|---:|---|---:|
+| BC1 | `0x04` | 1 | 8,8,5,6,5,5,6,5,8,8,8,8 | 1 |
+| BC3 | `0x0c` | 3 | 4,4,8,6,6,6,6,5,6,5,8,8 | 2 |
+| BC4 | `0x10` | 4 | 8,8,8,8,6,6,6,6,6,6,6,6 | 1 |
+| BC5 | `0x14` | 5 | 4,4,8,8,6,6,6,6,6,6,6,6 | 2 |
+| BC6H | `0x18` | 6 | 4,4,8,8,8,5,5,5,6,6,6,8,8,8,8,5 | 2 |
+| BC7 | `0x1c` | 7 | 4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5 | 2 |
+
+The widths are `LANE_WIDTHS` in `tools/bcpack.py`. The tag is `(v >> 24) & 0x3c`, the codec field
+above shifted left by 2; tags `0x00` (raw) and `0x20` (zlib) are not BCPack and are handled
+before it. Each lane emits `decoded_bytes / 8` symbols (`ELEMENT_BYTES = 8`), so the decoded
+byte count of the chunk must be passed as `out_size` and must be a whole number of blocks.
+
+For entry `v` and the next entry `nxt` (this is what `TtpfReader` in `tools/ttpf_mips.py` does):
+
+- input: the bytes from `(v & 0x3FFFFFF) * 256` up to `(nxt & 0x3FFFFFF) * 256 − (v >> 52)`;
+- `out_size`: `((nxt >> 30) & 0x3FFFFF) * 4096 − ((v >> 30) & 0x3FFFFF) * 4096`.
+
+The decoded blocks are still in the surface's tiled storage order; `ttpf_mips.py` detiles them
+before writing a linear DDS.
+
+A synthetic one-block BC7 chunk (no game data; the encoder is in `tests/test_bcpack.py`) with a
+byte-exact result in strict mode, which `tests/test_bcpack.py` runs as
+`test_bc7_fixed_stream_strict`:
+
+```python
+import sys
+sys.path.insert(0, "tools")
+import bcpack
+
+packed = bytes.fromhex("""
+101010101010101004040303030304040101010101010140
+000000000000024002027546281800000101df5f4b7c0341
+020202411010101004040403101010104004100103030304
+4001080001010104000000080000000041020994e4db27a4
+410511fe6b020005
+""")
+blocks, provisional = bcpack.decode_with_info(packed, 7, 16)
+assert blocks == bytes.fromhex("40 31 72 04 a5 68 19 be 02 34 56 78 9a bc de f0")
+assert not provisional   # strict mode: nothing unconfirmed was used
+```
+
+`decode_with_info` returns the set of unconfirmed history entries used; it is empty in
+strict mode, which raises `BcpackProvisionalError` instead of using one.
+(Byte-exact blocks, a clean entropy end state and a DDS with fitted colours are three
+different levels of confirmation; this example shows the first.)
+
 ### The descriptor `mode` is tiling, not codec
 
 The ETPF descriptor's `mode` field (`b >> 23`) is the mip/tile family: mode 0 uses 64 KiB
@@ -422,6 +480,41 @@ material carries an albedo: the jacket, crop tee and some sports pieces have no 
 entry. Exporters must **not** fall back to the first texture in that case; a normal map painted
 as a base colour is the usual symptom. The hashes are treated as measured corpus semantics, not
 as a claim that they are globally unique across every shader.
+
+### Map material texture parameters
+
+The character table above covers 246 records. Map drawables (buildings, roads, terrain, props) use more
+parameters. Five more names come from the case-sensitive joaat of the parameter name, the same check that
+names `0xC8E8C282` (`diffusetex`) in rpf9-explorer's `ModelTextureBindings`:
+
+| Parameter | Name (joaat) |
+|---|---|
+| `0x1E77BF4C` | `bumptex` |
+| `0xC6F46E79` | `speculartex` |
+| `0x739E3D0D` | `speculartex2` |
+| `0x3FB7964F` | `tinttexture` |
+| `0xC075F9B6` | `lookuptexture` (terrain materials) |
+
+Content check on map drawables: a random sample of 1,500 `.ydr`/`.yft` models (seed 7), each referenced
+texture counted once per parameter. A texture is "normal-map-like" when its mean colour (BC1 colour-0
+endpoints, BC7 mode-6 endpoints) has blue > 190 and red and green within 45 of 128; BC5 is two-channel.
+
+| Parameter | Normal-map-like | Not normal-like | BC5 | Formats (DXGI: count) |
+|---|---:|---:|---:|---|
+| `0x1E77BF4C` `bumptex` | 1,394 | 74 | 131 | 71: 1,659, 83: 131, 98: 106 |
+| `0xC6F46E79` `speculartex` | 69 | 1,469 | 0 | 71: 1,650, 98: 372, 28: 4 |
+| `0x739E3D0D` `speculartex2` | 5 | 851 | 0 | 98: 738, 71: 225, 72: 1 |
+| `0xC8E8C282` `diffusetex` | 28 | 1,887 | 0 | 72: 1,322, 99: 709, 78: 145 |
+| `0x3FB7964F` `tinttexture` | 0 | 61 | 0 | 72: 61, 99: 2, 78: 1 |
+
+So on map materials `bumptex` is the tangent-space normal map and `speculartex` is not a normal map. The
+character table above lists `0xC6F46E79` as the normal map; these character textures are mostly outside the
+measured catalog here, so that row is left unchanged, but it should be re-checked against the name.
+
+Three more parameters hold sRGB colour-like textures on map materials and are not in `ModelTextureBindings`
+(names not found): `0x17D3B5C2` (72: 47), `0x6994EF3F` (99: 25) and `0x7485DAFB` (99: 162, 78: 15, 72: 12;
+a tiling detail layer next to the two-layer `lyr0diffusetex`/`lyr1diffusetex` blend). `tinttexture` holds an
+ID/palette map on most materials and is not a base colour outside terrain.
 
 ## BCPack block structure and limits
 
@@ -786,6 +879,8 @@ via `bcpack.decode_with_info`).
 
 ## Reproduce
 
+The normal `make_game.py` assets stage now fills missing and partial BCPack DDS entries in the same pool manifests used for model texture lookup. It uses strict decoding by default and discovers an optional local reconstruction profile at `<work>/bcpack-calibration.json`. The single-entry exporter accepts the same profile through `--calibration`. Build instructions, the JSON schema and the game-independent test are in the [calibrated export guide](../tools/bcpack_calibration/README.md).
+
 `tools/ttpf_mips.py` is the read-only measurement and decode tool (with `tools/bcpack.py`
 enabled in strict confirmed-history mode by default):
 
@@ -821,3 +916,10 @@ only the 24-byte RDS5 header, the chunk table, the ETPF records and the chunk ra
 wrote no texture data. `tools/ttpf_mips.py scan` is that mirror, now committed with the
 compact-layout and BCPack work; it reproduces the baseline split and adds the recovery
 columns.
+
+A pool's `manifest.json` is published only when the DDS of every `CanExtract` record was
+written or already present. If any write fails, `rpf9dump ttpf` keeps the DDS it did write,
+removes an older `manifest.json` for that pool and exits 1. Records with `File: null` are
+deliberate skips and do not fail the pool. The assets stage exports a pool again when its
+manifest is missing, unreadable or lists a `File` that is not on disk, so a manifest from an
+older build that names an absent DDS is repaired on the next run.

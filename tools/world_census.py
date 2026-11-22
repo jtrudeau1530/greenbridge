@@ -47,7 +47,7 @@ WARMUP = 8 << 20
 JOIN_MAX = 64
 BAND_GAP = 64 << 20
 GAP_CHUNK = 4 << 20
-FORMAT = 4
+FORMAT = 5  # Format 4 shards may count warm-up streams again.
 SOURCE_SAMPLE = 4096
 
 
@@ -372,7 +372,7 @@ def scan_shard(job, source_id=None):
     stats = {"streams": 0, "stored": 0, "raw_system": 0, "inflated": 0, "rejected": 0, "meta": 0,
              "map_meta": 0, "meta_other": 0, "map_meta_bytes": 0,
              "invalid": 0, "incomplete": 0, "join_max": 0, "entity_gfx": 0,
-             "entity_unresolved": 0, "adopted": 0}
+             "entity_unresolved": 0}
     rows, intervals, raw_pages, raw_system = [], [], [], []
     with _mapped_source(archive, source_id) as (m, scanned_id):
         size = len(m)
@@ -388,15 +388,21 @@ def scan_shard(job, source_id=None):
             if s % 16:
                 pos = s + 1
                 continue
+            # A stream that starts in the warm-up window belongs to the previous shard, which counts it: here it
+            # only moves the scan past its bytes, so the next stream is found on a real boundary.
+            warm_up = s < start
             try:
                 res = assemble(m, s, size)
             except (zlib.error, struct.error, IndexError):
-                stats["rejected"] += 1
+                stats["rejected"] += not warm_up
                 pos = s + 1
                 continue
             if res is None:
-                stats["rejected"] += 1
+                stats["rejected"] += not warm_up
                 pos = s + 1
+                continue
+            if warm_up:
+                pos = max(res["end"], s + 1)
                 continue
             for a, used in res["spans"]:
                 intervals.append([a, a + used])
@@ -409,9 +415,6 @@ def scan_shard(job, source_id=None):
             if not res["is_meta"]:
                 continue
             res["offset"] = s
-            if s < start:
-                stats["adopted"] += 1
-                continue
             raw_system.extend([a, a + used] for a, used in res["raw_spans"])
             stats["raw_system"] += res["raw_system"]
             if not res["complete"]:
@@ -689,7 +692,7 @@ def _summarize(archive, start, end, data_start, size, source_id, expected, docs)
     totals = {"streams": 0, "stored": 0, "raw_system": 0, "inflated": 0, "rejected": 0, "meta": 0,
               "map_meta": 0, "meta_other": 0, "map_meta_bytes": 0,
               "invalid": 0, "incomplete": 0, "join_max": 0, "entity_gfx": 0,
-              "entity_unresolved": 0, "adopted": 0}
+              "entity_unresolved": 0}
     shards = []
     for want in expected:
         doc = docs.get(want["index"])

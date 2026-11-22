@@ -185,5 +185,29 @@ v_fma_f32 v18, v18, 8.0, v15
 v_fma_f32 v18, v18, 8.0, v12
 v_mov_b32 v24, v18
 v_fma_f32 v7, v19, 0x45800000, v24
+; At UV (0.5,0.5), gather red from x=3,4 at LOD zero: the four bytes are (96,128,128,96).
+; Gather green with offset (0,-1): (96,96,64,64). As binary16, 64/255 = 0x3404,
+; 96/255 = 0x3606 and 128/255 = 0x3804. Each gather must write just two packed VGPRs.
+v_mov_b32 v19, 0x3f00
+v_mov_b32 v20, 0.5
+v_mov_b32 v21, 0.5
+v_mov_b32 v22, 0
+v_mov_b32 v10, 0
+v_mov_b32 v14, 0
+image_gather4_l v[8:9], v[20:22], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D d16
+image_gather4_l_o v[12:13], v[19:22], s[8:15], s[16:19] dmask:0x2 dim:SQ_RSRC_IMG_2D d16
+s_waitcnt vmcnt(0)
+v_xor_b32 v8, 0x38043606, v8
+v_xor_b32 v9, 0x36063804, v9
+v_or_b32 v8, v8, v9
+v_or_b32 v8, v8, v10
+v_cmp_eq_u32_e32 vcc_lo, 0, v8
+v_cndmask_b32_e32 v4, 0, v4, vcc_lo
+v_xor_b32 v12, 0x36063606, v12
+v_xor_b32 v13, 0x34043404, v13
+v_or_b32 v12, v12, v13
+v_or_b32 v12, v12, v14
+v_cmp_eq_u32_e32 vcc_lo, 0, v12
+v_cndmask_b32_e32 v5, 0, v5, vcc_lo
 exp mrt0 v4, v5, v6, v7 done vm
 s_endpgm

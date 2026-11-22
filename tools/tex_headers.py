@@ -71,9 +71,9 @@ GFX10_TO_DXGI = {
     27: 36,
     28: 38,
     29: 34,
-    43: 26,
-    44: 24,
-    48: 25,
+    36: 26,
+    50: 24,
+    54: 25,
     56: 28,
     57: 31,
     60: 30,
@@ -726,6 +726,9 @@ def main():
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
     path = a.out or os.path.join(a.carve, "textures_index.json")
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(allt, f)
     print(f"{len(allt)} textures -> {path}")

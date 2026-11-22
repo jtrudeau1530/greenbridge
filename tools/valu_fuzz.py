@@ -45,7 +45,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
-from compute_fixture import compute_header  # noqa: E402
+from compute_fixture import compute_header, find_test_program  # noqa: E402
 
 THREADS = 64
 POOL = list(range(20, 36))  # result registers, stored at the end
@@ -527,9 +527,10 @@ class MemFamily(Family):
         # raw V#: base SCR_BASE, stride 0, num_records = raw_slots * SLOT bytes; word 3 as the push-constant V#
         out += [f"s_mov_b32 s{VRAW}, {SCR_BASE:#x}", f"s_mov_b32 s{VRAW + 1}, 0",
                 f"s_mov_b32 s{VRAW + 2}, {self.raw_slots * SLOT:#x}", f"s_mov_b32 s{VRAW + 3}, s3",
-                # structured V#: same base, stride SLOT (dword1[29:16]), num_records = idx_slots elements
+                # structured V#: same base, stride SLOT (dword1[29:16]), num_records = idx_slots elements, OOB_SELECT 1 (index check);
+                # the raw one keeps the push-constant V#'s OOB_SELECT 3
                 f"s_mov_b32 s{VIDX}, {SCR_BASE:#x}", f"s_mov_b32 s{VIDX + 1}, {SLOT << 16:#x}",
-                f"s_mov_b32 s{VIDX + 2}, {self.idx_slots:#x}", f"s_mov_b32 s{VIDX + 3}, s3",
+                f"s_mov_b32 s{VIDX + 2}, {self.idx_slots:#x}", f"s_mov_b32 s{VIDX + 3}, 0x11016fac",
                 f"s_mov_b32 s52, {self.soff:#x}",
                 f"v_mul_u32_u24_e32 v{ADDR}, {SLOT}, v0"]          # raw: byte offset of the thread's slot
         for op in self.ops:
@@ -651,6 +652,9 @@ def translate(progs, work, emulate):
 
 def run_gpu(p, spv, build, index_entry, emulate, dump):
     exe = os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+    if not os.path.isfile(exe):
+        sys.exit(f"vk_compute_test not found in {build} or its RelWithDebInfo/Release folder; "
+                 "build it first (cmake --build <build dir> --target vk_compute_test)")
     env = dict(os.environ, VKC_OUT_WORDS=str(p.out_words()), VKC_DUMP=str(dump))
     args = [exe, str(spv), "1", "dump"]
     if p.wave == 64 and not emulate:
@@ -706,6 +710,7 @@ def main():
             p.model()
         print(f"{len(progs)} {a.family} programs generated and modelled")
         return 0
+    a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
     work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_"))
     work.mkdir(parents=True, exist_ok=True)
     try:

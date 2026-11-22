@@ -63,6 +63,23 @@ jobs:
           path: .vulkan-headers
           sparse-checkout: include
           persist-credentials: false
+      - name: Install glslang for D3D12 test shaders
+        shell: pwsh
+        run: |
+          $version = '16.6.0'
+          $release = "glslang-$version-windows-x86_64-release.zip"
+          $archive = Join-Path $env:RUNNER_TEMP $release
+          $destination = Join-Path $env:RUNNER_TEMP "glslang-$version"
+          Invoke-WebRequest -Uri "https://github.com/KhronosGroup/glslang/releases/download/$version/$release" -OutFile $archive
+          $expectedHash = '82bf434e69b9bb4829de7e2b4bc2c5e7a7861e53d66cf75e5cc70f5f694a8d9b'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash -ne $expectedHash) {
+            throw "Unexpected SHA-256 for $release"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $bin = Join-Path $destination 'bin'
+          # FindVulkan and the runtime fallback look for the legacy executable name.
+          Copy-Item -LiteralPath (Join-Path $bin 'glslang.exe') -Destination (Join-Path $bin 'glslangValidator.exe')
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin -Encoding utf8
       - name: Configure
         env:
           VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers
@@ -75,6 +92,20 @@ jobs:
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
       - name: Build
         run: cmake --build runtime/build
+      - name: Verify the descriptor test shaders
+        shell: pwsh
+        run: |
+          $shaders = @(
+            'LEONIDA_TEST_CS_SAMPLE_SPV', 'LEONIDA_TEST_MS_FLOAT_SPV',
+            'LEONIDA_TEST_MS_UINT_SPV', 'LEONIDA_TEST_MS_SINT_SPV',
+            'LEONIDA_TEST_MSAA_VERT_SPV', 'LEONIDA_TEST_MSAA_FRAG_SPV'
+          )
+          foreach ($shader in $shaders) {
+            $path = "runtime/build/generated/$shader.spv"
+            if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "The Windows runtime build did not compile $path"
+            }
+          }
       # For the wine job: the test list, the checkout it was made in, and the built executables and DLLs. Only what
       # this repository builds goes in; there is no game data on the runner.
       - name: List tests for Wine
@@ -98,12 +129,17 @@ jobs:
 
   # Runs the Windows build's tests under Wine, so a change that breaks the loader on Linux (through Wine or Proton)
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
-  # shows the rest. run_tiny_game_exit_code isn't required: under Wine the process now and then exits 0 although
-  # gta6rt calls ExitProcess(1) (#634, finding).
+  # shows the rest.
+  # Two Wines: Ubuntu's own (9.0) and WineHQ's current stable, which is closer to what Proton users run.
   wine:
     needs: windows
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        wine: [ubuntu, winehq-stable]
+    name: wine (${{ matrix.wine }})
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -111,18 +147,33 @@ jobs:
           name: runtime-windows
           path: runtime/build
       - name: Install Wine, Xvfb and llvmpipe
+        env:
+          WINE_FLAVOUR: ${{ matrix.wine }}
         run: |
+          pkgs=(xvfb xauth mesa-vulkan-drivers libvulkan1)
+          if [ "$WINE_FLAVOUR" = winehq-stable ]; then
+            # WineHQ's packages need the i386 architecture. https://gitlab.winehq.org/wine/wine/-/wikis/Debian-Ubuntu
+            sudo dpkg --add-architecture i386
+            sudo mkdir -pm755 /etc/apt/keyrings
+            sudo wget -q -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+            sudo wget -q -NP /etc/apt/sources.list.d/ \
+              "https://dl.winehq.org/wine-builds/ubuntu/dists/$(. /etc/os-release && echo "$VERSION_CODENAME")/winehq-$(. /etc/os-release && echo "$VERSION_CODENAME").sources"
+            pkgs+=(winehq-stable)
+          else
+            pkgs+=(wine wine64)
+          fi
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wine wine64 xvfb xauth mesa-vulkan-drivers libvulkan1
+          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
           wine --version
       - name: Create the Wine prefix
+        # wineserver -w inside the same X session: once Xvfb is gone, a Wine process left waiting for the display
+        # (explorer.exe) can keep wineserver -w waiting until the job's timeout.
+        timeout-minutes: 5
         env:
           WINEPREFIX: ${{ runner.temp }}/wineprefix
           WINEDLLOVERRIDES: "mscoree,mshtml="
           WINEDEBUG: "-all"
-        run: |
-          xvfb-run -a wineboot --init
-          wineserver -w
+        run: xvfb-run -a sh -c 'wineboot --init && wineserver -w'
       - name: Windows tests under Wine
         env:
           WINEPREFIX: ${{ runner.temp }}/wineprefix
@@ -132,9 +183,9 @@ jobs:
           xvfb-run -a python3 -I scripts/run_wine_tests.py
           --tests runtime/build/ctest.json
           --windows-root "$(cat runtime/build/windows-root.txt)"
-          --summary "$GITHUB_STEP_SUMMARY"
+          --summary "$GITHUB_STEP_SUMMARY" --label "$(wine --version)"
           --require loader --require pe_loader --require loader_tls --require unimplemented_policy
-          --require run_tiny_game
+          --require run_tiny_game --require run_tiny_game_exit_code
 
   # Also runs the hand-written GPU tests (runtime/test/shaders) on Mesa's llvmpipe, a software Vulkan driver, so a
   # translator or harness change that breaks a test result shows up on every pull request, without a GPU.
@@ -164,7 +215,7 @@ jobs:
         run: cmake --build runtime/build --parallel
       - name: Check GPU tools exist
         run: |
-          for tool in vk_harness vk_pipeline_check vk_command_replay_test vk_compute_test vk_texture_test vk_store_test vk_bindless_test clear_color_test d3d12_state_map_test command_list_test descriptor_table_test gfx10_descriptors_test; do
+          for tool in vk_harness vk_pipeline_check vk_command_replay_test vk_compute_test vk_texture_test vk_store_test vk_bindless_test depth24_convert_test clear_color_test d3d12_state_map_test command_list_test descriptor_table_test gfx10_descriptors_test; do
             if [ ! -f "runtime/build/$tool" ] && [ ! -f "runtime/build/$tool.exe" ]; then
               echo "Missing: $tool"
               exit 1
@@ -199,9 +250,18 @@ jobs:
           check
           grep -Fx 'ps pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
           grep -Fx 'vs pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
+          if grep -F 'cache feedback' "$dir/check.log"; then exit 1; fi  # opt-in: nothing without the flag
 
           check --max-bytes 1
           grep -F 'big modules skipped: 2' "$dir/check.log"
+
+          # --cache-feedback: hits + no hit reported + unavailable == ok per stage; no particular bit is required
+          check --cache-feedback
+          for st in ps vs; do
+            awk -v st="$st" '$1 == st && $2 == "pipelines:" { ok = $3 }
+              $1 == st && $2 == "cache" && $3 == "feedback:" { sum = $4 + $6 + $10; seen = 1 }
+              END { exit !(seen && ok == 1 && sum == ok) }' "$dir/check.log"
+          done
       - name: GPU tests on llvmpipe, compute with wave64 emulation
         # llvmpipe has 8-wide subgroups, so the wave64 compute tests only run emulated. The emulated mesh tests are
         # left out: llvmpipe's LLVM backend aborts compiling them ("Cannot emit physreg copy instruction").

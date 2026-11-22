@@ -81,6 +81,8 @@ def unpack(dxbc: bytes, payload: str = "last"):
         raise ValueError(f"size mismatch {len(data)} != {unpacked}")
     if len(data) < 6:
         raise ValueError("truncated FSSM magic or version")
+    if data[:4] != b"FSSM":
+        raise ValueError(f"invalid FSSM magic {data[:4]!r}")
     return data, ents
 
 
@@ -97,17 +99,18 @@ def main(argv=None) -> int:
         print(f"ERROR: {src} {what}. Give the folder with the carved .dxbc files.", file=sys.stderr)
         return 2
     try:
-        names = sorted(os.listdir(src))
+        with os.scandir(src) as entries:
+            shaders = sorted((entry for entry in entries
+                              if entry.name.endswith(".dxbc") and entry.is_file()),
+                             key=lambda entry: entry.name)
     except OSError as e:
         print(f"ERROR: cannot list {src}: {e.strerror or e}", file=sys.stderr)
         return 2
     out = os.path.join(src, "fssm")
     os.makedirs(out, exist_ok=True)
     rows, problems = [], Counter()
-    for name in names:
-        if not name.endswith(".dxbc"):
-            continue
-        with open(os.path.join(src, name), "rb") as f:
+    for shader in shaders:
+        with open(shader.path, "rb") as f:
             d = f.read()
         try:
             fssm, ents = unpack(d, payload=a.payload)
@@ -117,7 +120,7 @@ def main(argv=None) -> int:
         if fssm is None:
             problems["no XBCH"] += 1
             continue
-        stem = name[:-5]
+        stem = shader.name[:-5]
         with open(os.path.join(out, stem + ".fssm"), "wb") as f:
             f.write(fssm)
         ends = [i for i in range(0, len(fssm) - 3, 4) if fssm[i:i + 4] == b"\x00\x00\x81\xbf"]

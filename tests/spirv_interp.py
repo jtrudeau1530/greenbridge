@@ -166,6 +166,16 @@ def run(spvasm):
         simple = {"FMin": min, "FMax": max, "FAbs": abs, "Sin": math.sin, "Cos": math.cos,
                   "Sqrt": math.sqrt, "InverseSqrt": lambda x: 1 / math.sqrt(x), "Exp2": lambda x: 2.0 ** x,
                   "Log2": math.log2}
+        if fn in ("NMin", "NMax"):
+            # A NaN operand gives the other operand (both NaN: a NaN); zeros ordered -0 < +0 as on RDNA2.
+            def pick(x, y):
+                if math.isnan(x) or math.isnan(y):
+                    return y if math.isnan(x) else x
+                kx, ky = (x, math.copysign(1.0, x)), (y, math.copysign(1.0, y))
+                return y if (ky < kx if fn == "NMin" else ky > kx) else x
+            if isinstance(a[0], tuple):
+                return tuple(pick(x, y) for x, y in zip(a[0], a[1]))
+            return pick(a[0], a[1])
         if fn in simple:
             return f32(float(simple[fn](*a)))
         if fn == "Fract":
