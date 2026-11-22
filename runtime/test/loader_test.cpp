@@ -841,6 +841,26 @@ void test_process_detach_dependencies() {
     g_live_modules.clear();
 }
 
+// A dependency whose import table is corrupt fails while the parent binds it. Neither must stay findable by name:
+// a later load or GetModuleHandle would otherwise get a mapped image whose imports were never bound.
+void test_failed_dependency_not_registered() {
+    const char* what = "a failed load leaves neither the module nor its failed dependency loaded";
+    auto dep = make_import_image("kernel32.dll", "GetCurrentProcessId");
+    reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(dep.data() + 0x200)->Name = 0x5000;  // past SizeOfImage
+    const auto dep_path = write_image_as(dep, "fail_dep.dll");
+    const auto parent_path = write_image_as(make_import_image("fail_dep.dll", "x"), "fail_parent.dll");
+    rt::Loader loader(g_dir);
+    auto throws = [&](const std::filesystem::path& p) {
+        try { loader.load(p); return false; } catch (const std::exception&) { return true; }
+    };
+    if (!throws(parent_path)) return failed(what, "the parent loaded over a corrupt dependency");
+    if (loader.find_loaded_module("fail_dep.dll") || loader.find_loaded_module("fail_parent.dll"))
+        return failed(what, "a failed module is still found by name");
+    if (!throws(dep_path)) return failed(what, "a second load of the dependency returned the half-loaded module");
+    if (!throws(parent_path)) return failed(what, "a second load of the parent returned the half-loaded module");
+    pass(what);
+}
+
 void test_forwarded_exports() {
     {
         const char* what = "a forwarded export binds to its target instead of into the string";
@@ -1179,6 +1199,7 @@ int main() {
         test_process_detach_invalid_tls();
         test_process_detach_without_entry();
         test_process_detach_dependencies();
+        test_failed_dependency_not_registered();
         test_delay_descriptor_fields();
         test_forwarded_exports();
         test_export_bounds();
