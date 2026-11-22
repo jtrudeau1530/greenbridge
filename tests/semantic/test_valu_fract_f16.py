@@ -507,6 +507,93 @@ class SIMDInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_fract_f16_flags(
+    src_bits: int,
+    res_bits: int,
+    abs_mod: bool = False,
+    neg_mod: bool = False,
+    clamp: bool = False,
+    mul: int = 1,
+    div: int = 1,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_fract_f16."""
+    s = apply_f16_modifiers(src_bits, abs_mod, neg_mod)
+
+    s_nan = is_nan(s)
+    s_snan = is_snan(s)
+    s_inf = is_inf(s)
+
+    invalid = s_snan or s_inf
+    nan_flag = is_nan(res_bits)
+    inf_flag = is_inf(res_bits)
+    zero_flag = is_zero(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK)
+    denorm_flag = is_subnormal(res_bits)
+
+    overflow = False
+    if not (s_nan or s_inf) and inf_flag:
+        overflow = True
+
+    underflow = denorm_flag
+
+    inexact = False
+    if not (s_nan or s_inf or nan_flag or inf_flag):
+        q = h16_to_fraction(s)
+        exact_f = q - math.floor(q)
+        exact_scaled = exact_f * Fraction(mul, div)
+        if clamp:
+            exact_scaled = min(max(exact_scaled, Fraction(0)), Fraction(1))
+        res_float = bits_to_f16(res_bits)
+        if Fraction(res_float) != exact_scaled:
+            inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def compute_f16_fractional_borrow(src_bits: int, abs_mod: bool = False, neg_mod: bool = False) -> Tuple[int, int]:
+    """Demonstrate architectural integer borrow generation during fract(x) = x - floor(x).
+
+    When x < 0 and not an exact integer, floor(x) requires borrowing 1 from the next integer unit.
+    Returns (effective_sign, borrow_out).
+    """
+    s = apply_f16_modifiers(src_bits, abs_mod, neg_mod)
+    if is_nan(s) or is_inf(s) or is_zero(s):
+        return 0, 0
+    sign = (s & SIGN_MASK) >> 15
+    q = h16_to_fraction(s)
+    is_int = (q.denominator == 1)
+    borrow = 1 if (sign == 1 and not is_int) else 0
+    return sign, borrow
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -959,6 +1046,88 @@ class TestRegisterAliasing(unittest.TestCase):
         for lane in range(32):
             self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.HI), H_0P75)
             self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), H_NEG_1P25)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and borrow generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        src = H_0P25  # 0.25 -> 0.25 exact
+        res = oracle_v_fract_f16(src)
+        flags = evaluate_v_fract_f16_flags(src, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flags(self) -> None:
+        # 1/3 cannot be represented exactly in binary16
+        # Let's use negative subnormal: 1.0 - |x| rounds to NEAR_ONE_F16 (0x3BFF)
+        src = H_NEG_SUB_MIN
+        res = oracle_v_fract_f16(src)
+        flags = evaluate_v_fract_f16_flags(src, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+
+    def test_invalid_operation_flags(self) -> None:
+        # Signaling NaN
+        snan = 0x7C01
+        res_snan = oracle_v_fract_f16(snan)
+        flags_snan = evaluate_v_fract_f16_flags(snan, res_snan)
+        self.assertTrue(flags_snan.invalid)
+        self.assertTrue(flags_snan.nan)
+
+        # Infinity
+        res_inf = oracle_v_fract_f16(POS_INF)
+        flags_inf = evaluate_v_fract_f16_flags(POS_INF, res_inf)
+        self.assertTrue(flags_inf.invalid)
+        self.assertTrue(flags_inf.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # Integer operand 2.0 -> fract is +0.0
+        src = H_2P0
+        res = oracle_v_fract_f16(src)
+        flags = evaluate_v_fract_f16_flags(src, res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+
+        # Negative zero -> fract is strictly +0.0
+        src_nz = H_NEG_ZERO
+        res_nz = oracle_v_fract_f16(src_nz)
+        flags_nz = evaluate_v_fract_f16_flags(src_nz, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertFalse(flags_nz.negative)
+
+    def test_underflow_and_denorm_flags(self) -> None:
+        # Positive subnormal: fract is subnormal
+        src = H_SUB_MIN
+        res = oracle_v_fract_f16(src)
+        flags = evaluate_v_fract_f16_flags(src, res)
+        self.assertTrue(flags.denormal)
+        self.assertTrue(flags.underflow)
+        self.assertFalse(flags.overflow)
+
+    def test_fractional_borrow_generation(self) -> None:
+        # Negative non-integer (-0.25): borrow 1 from integer unit
+        sign, borrow = compute_f16_fractional_borrow(H_NEG_0P25)
+        self.assertEqual(sign, 1)
+        self.assertEqual(borrow, 1)
+
+        # Negative integer (-2.0): no borrow needed
+        sign_int, borrow_int = compute_f16_fractional_borrow(H_NEG_2P0)
+        self.assertEqual(sign_int, 1)
+        self.assertEqual(borrow_int, 0)
+
+        # Positive non-integer (+0.25): no borrow
+        sign_pos, borrow_pos = compute_f16_fractional_borrow(H_0P25)
+        self.assertEqual(sign_pos, 0)
+        self.assertEqual(borrow_pos, 0)
 
 
 if __name__ == "__main__":
