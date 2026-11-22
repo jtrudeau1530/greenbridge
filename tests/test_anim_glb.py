@@ -332,6 +332,32 @@ class ClipChannelTest(unittest.TestCase):
         self.assertEqual(tally["tracks_mover_skipped"], 1)
 
 
+class SamplerTimeTest(unittest.TestCase):
+    def test_fractional_time_bounds_match_the_binary_accessor(self) -> None:
+        skeleton = skeleton_resource()
+        joints, _ = anim_glb.read_skeleton(skeleton, anim_glb.drawable_at(skeleton, None))
+        keys = [(1 / 30, (0.0, 0.0, 0.0)), (2 / 30, (1.0, 0.0, 0.0))]
+        glb, _ = anim_glb.build(joints, [], [("sample", {(0, "translation"): keys})])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sampler.glb")
+            with open(path, "wb") as out:
+                out.write(glb)
+            gltf, binary = read_glb(path)
+
+        sampler = gltf["animations"][0]["samplers"][0]
+        index = sampler["input"]
+        min_time, max_time = accessor_values(gltf, binary, index)
+        self.assertEqual(gltf["accessors"][index]["min"], list(min_time))
+        self.assertEqual(gltf["accessors"][index]["max"], list(max_time))
+
+    def test_keys_that_collapse_to_one_stored_time_are_refused(self) -> None:
+        skeleton = skeleton_resource()
+        joints, _ = anim_glb.read_skeleton(skeleton, anim_glb.drawable_at(skeleton, None))
+        keys = [(1.0, (0.0, 0.0, 0.0)), (1.0 + 2 ** -25, (1.0, 0.0, 0.0))]
+        with self.assertRaisesRegex(ValueError, "key times are not increasing"):
+            anim_glb.build(joints, [], [("sample", {(0, "translation"): keys})])
+
+
 class ExportTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

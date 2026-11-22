@@ -531,9 +531,10 @@ def build(joints, meshes, clips, *, root_motion=True, generator="Leonida anim_gl
     for name, channels in clips:
         samplers, out_channels = [], []
         for (target, path), keys in sorted(channels.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
-            times = [t for t, _v in keys]
+            time_bytes = _floats([t for t, _v in keys])
+            times = struct.unpack(f"<{len(keys)}f", time_bytes)
             require(all(b > a for a, b in zip(times, times[1:])), "key times are not increasing")
-            tv = _view(buf, views, _floats(times))
+            tv = _view(buf, views, time_bytes)
             ta = _accessor(accessors, tv, COMPONENT_FLOAT, len(times), "SCALAR", min=[min(times)], max=[max(times)])
             values = [x for _t, v in keys for x in v]
             vv = _view(buf, views, _floats(values))
