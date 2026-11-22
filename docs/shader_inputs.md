@@ -40,7 +40,8 @@ The fields below are the ones confirmed. The rest of the record is read but not 
 |---|---|---|
 | +0x10 | 3 × f32 | Light position; the shader subtracts the world position of the pixel from it. |
 | +0x20 | u32 | Bits 0–8: profile index (9 bits) into the profile table. Bits 9–17 and 18–21 are two more fields, not decoded. |
-| +0x28 | u32 | Flags. Bit 24 enables the light-shaping planes; bit 16 takes part in the shadow-map gate; bits 17, 20, 21, 26, 27 and 30 are tested, not decoded. |
+| +0x28 | u32 | Flags. Bit 24 enables the light-shaping planes; bit 16 takes part in the shadow-map gate; bits 30–31 are the light type (0–3), which selects how +0x3C is used; bits 17, 20, 21, 26 and 27 are tested, not decoded. |
+| +0x3C | 2 × f16 | Light shape size: the light's dimensions, used differently per light type. See [Light shape size](#light-shape-size). |
 | +0x40 | u32 | Low 24 bits non-zero turns on one per-light factor; at zero that factor is 1.0, so the light still shades. The top byte isn't read on the paths checked. |
 | +0x4C | u32 | Top byte: number of light-shaping planes (0–255). See below. |
 | +0x5F | u8 | Read as byte / 255; at 0 one block of the light's shading is skipped. |
@@ -57,6 +58,25 @@ Only 11 planes fit in the record (the last at +0x1F0). A larger count reads on i
 end of the buffer after the last light. A float in this dword has its exponent in the top byte: 1.0f (`0x3F800000`)
 gives 63 planes. The loop itself ends after at most 255 iterations. If a device-lost still shows up there, check this
 dword and the buffer's bounds first.
+
+#### Light shape size
+
+Reported by @Silliana [on the pull request](https://github.com/ItsNotRexed/Leonida/pull/3157): +0x3C holds two f16,
+the low half a sphere radius and the high half a range. Since intensity is radiance, the light's power grows with
+radius², so a radius that's too big (for example the range written into both halves) gives scattered single-pixel
+specular blowups that look like a translator bug.
+
+What the shader shows confirms the two f16 halves, but their use depends on the light type (bits 30–31 at +0x28):
+
+- In one path they are the two half-sizes of a rectangle. The light's position is moved by ± the low half along one
+  axis and ± the high half along the other, and points are clamped to those bounds.
+- In another path the high half is a length along the light's axis (clamped to ± half of it), and it is also squared
+  and compared against a distance.
+- The low half also sets one blend factor.
+- No range-style falloff was found: neither half divides a distance.
+
+So a wrong value here makes the light the wrong size, and an oversized area light is a likely cause of the blowups.
+Which light type reads the low half as a sphere radius isn't decoded yet.
 
 #### Correction to #1892
 
