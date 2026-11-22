@@ -85,13 +85,71 @@ def test_add_f64(prefix, want, tmp_path):
     assert (v[4], v[5]) == want
 
 
-@pytest.mark.parametrize("prefix,want", [("", (0, 0x40000000)), (RTZ, (0xFFFFFFFF, 0x3FFFFFFF))])
-def test_add_f64_mode_rounds_before_omod(prefix, want, tmp_path):
-    # (1 - 2^-60) * 2: the sum rounds by MODE first (1 - 2^-53 toward zero), then omod doubles it exactly
+@pytest.mark.parametrize("a,b,prefix,want", [
+    (0x4000, 0x0001, "", 0x4000),            # 2 + 2^-24: an f32 tie below 2.0's neighbour; both modes give 2.0
+    (0x4000, 0x0001, RTZ, 0x4000),
+    (0x7BFF, 0x4C00, "", 0x7C00),            # 65504 + 16 = 65520: the tie rounds to inf, toward zero stays 65504
+    (0x7BFF, 0x4C00, RTZ, 0x7BFF),
+])
+def test_f16_add_hardware_rows(a, b, prefix, want, tmp_path):
+    # words measured on an RX 6800 (SHADER-35)
+    asm = f"v_mov_b32 v1, {a:#x}\nv_mov_b32 v2, {b:#x}\n{prefix}v_add_f16_e32 v3, v1, v2\n"
+    assert vgprs(tmp_path, asm)[3] & 0xFFFF == want
+
+
+@pytest.mark.parametrize("prefix,want", [("", 0xBC01), (RTZ, 0xBC00)])
+def test_f16_sub_hardware_row(prefix, want, tmp_path):
+    # -1 - (2^-11 + 2^-21): above the half-ulp tie, so nearest rounds away (RX 6800)
+    asm = f"v_mov_b32 v1, 0xbc00\nv_mov_b32 v2, 0x1001\n{prefix}v_sub_f16_e32 v3, v1, v2\n"
+    assert vgprs(tmp_path, asm)[3] & 0xFFFF == want
+
+
+@pytest.mark.parametrize("prefix,want", [("", (0, 0x3FF00000)), (RTZ, (0xFFFFFFFF, 0x3FEFFFFF))])
+def test_add_f64_with_omod_not_asserted(prefix, want, tmp_path):
+    # (1 - 2^-60) + 0 toward zero, no omod. The hardware ignores omod when f64 denormals are kept (3ff00000:0 and
+    # 3fefffff:ffffffff unscaled with mul:2, RX 6800), the translator applies it either way: that is unmodelled
+    # (docs/design.md), so no omod order is claimed here.
     asm = ("v_mov_b32 v0, 0\nv_mov_b32 v1, 0x3ff00000\nv_mov_b32 v2, 0\nv_mov_b32 v3, 0xbc300000\n"
-           f"{prefix}v_add_f64 v[4:5], v[0:1], v[2:3] mul:2\n")
+           f"{prefix}v_add_f64 v[4:5], v[0:1], v[2:3]\n")
     v = vgprs(tmp_path, asm)
     assert (v[4], v[5]) == want
+
+
+@pytest.mark.parametrize("op,src", [
+    ("v_rcp_f16_e32", 0x3037), ("v_rsq_f16_e32", 0x3037), ("v_sqrt_f16_e32", 0x4200), ("v_sin_f16_e32", 0x3037),
+    ("v_cos_f16_e32", 0x3037),
+])
+def test_transcendental_f16_ignores_mode(op, src, tmp_path):
+    # RX 6800: rcp/sqrt/rsq/sin give the same words in every rounding mode
+    got = []
+    for prefix in ("", RNE, RTZ):
+        asm = f"v_mov_b32 v1, {src:#x}\n{prefix}{op} v2, v1\n"
+        got.append(vgprs(tmp_path, asm)[2] & 0xFFFF)
+    assert got[0] == got[1] == got[2]
+
+
+def test_transcendental_f16_without_write_matches(tmp_path):
+    # the same four, written in a program that sets MODE after them: still nearest even, as without any write
+    for op, src, want in (("v_rcp_f16_e32", 0x3037, 0x4798), ("v_rsq_f16_e32", 0x3037, 0x4183),
+                          ("v_sqrt_f16_e32", 0x4200, 0x3EEE), ("v_sin_f16_e32", 0x3037, 0x39E4)):
+        asm = f"v_mov_b32 v1, {src:#x}\n{RTZ}{op} v2, v1\n"
+        assert vgprs(tmp_path, asm)[2] & 0xFFFF == want, op
+
+
+@pytest.mark.parametrize("prefix,want", [("", 0x4000), (RTZ, 0x3FFF)])
+def test_fma_mix_single_rounding(prefix, want, tmp_path):
+    # 1 * 2 - 2^-30 with f32 operands: toward zero the hardware rounds the exact value once to f16 (0x3fff); rounding
+    # to f32 first (2.0) then narrowing would give 0x4000 (RX 6800)
+    asm = ("v_mov_b32 v1, 0x3f800000\nv_mov_b32 v2, 0x40000000\nv_mov_b32 v4, 0xb0800000\n"
+           f"{prefix}v_fma_mixlo_f16 v3, v1, v2, v4\n")
+    assert vgprs(tmp_path, asm)[3] & 0xFFFF == want
+
+
+def test_fma_mix_toward_zero_negative_and_hi(tmp_path):
+    # -(1 * 2) + 2^-30 -> -0x3fff in the high half, the low half kept
+    asm = ("v_mov_b32 v1, 0x3f800000\nv_mov_b32 v2, 0xc0000000\nv_mov_b32 v4, 0x30800000\nv_mov_b32 v3, 0x1234\n"
+           f"{RTZ}v_fma_mixhi_f16 v3, v1, v2, v4\n")
+    assert vgprs(tmp_path, asm)[3] == 0xBFFF << 16 | 0x1234
 
 
 def test_add_f64_overflow_saturates(tmp_path):

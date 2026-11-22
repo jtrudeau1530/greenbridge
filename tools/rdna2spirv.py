@@ -584,6 +584,54 @@ class Gen:
         self.emit(f"{r} = OpBitcast %float {res}")
         return r
 
+    def fma_mix_odd(self, x, y, z):
+        """fma(x, y, z) for f32 operands rounded to f32 with round-to-odd, so that narrowing it to f16 in any direction
+        gives the exactly rounded f16 (the hardware rounds v_fma_mix once, straight to f16, under MODE toward zero).
+        Unlike fma_f16_odd the product is not exact in f32: r = Fma (nearest) is corrected by the sign of
+        exact - r = (s - r) + (se + pe), where p = x*y, pe = Fma(x, y, -p) is the exact product error, s = p + z and se
+        the TwoSum error of that sum. When that is non-zero and r is even, r moves one f32 ulp towards it (the exact
+        value lies between r and its neighbour, so the neighbour is the odd one). A zero, infinite or NaN r is
+        left alone (an f32 subnormal narrows to +-0 either way). Sign-exact except where se + pe itself rounds to
+        the opposite side of s - r, which needs an f32-ulp-level cancellation."""
+        t = self.tmp
+        r, p, np_, pe, s_, bb, sb, da, db, se = (t() for _ in range(10))
+        self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
+        self.emit(f"{p} = OpFMul %float {x} {y}")
+        self.emit(f"{np_} = OpFNegate %float {p}")
+        self.emit(f"{pe} = OpExtInst %float %glsl Fma {x} {y} {np_}")
+        self.emit(f"{s_} = OpFAdd %float {p} {z}")
+        self.emit(f"{bb} = OpFSub %float {s_} {p}")
+        self.emit(f"{sb} = OpFSub %float {s_} {bb}")
+        self.emit(f"{da} = OpFSub %float {p} {sb}")
+        self.emit(f"{db} = OpFSub %float {z} {bb}")
+        self.emit(f"{se} = OpFAdd %float {da} {db}")
+        tt, d0, res = t(), t(), t()
+        self.emit(f"{tt} = OpFAdd %float {se} {pe}")
+        self.emit(f"{d0} = OpFSub %float {s_} {r}")
+        self.emit(f"{res} = OpFAdd %float {d0} {tt}")
+        rbits, mag, lsb, even, nzr, ok, need = (t() for _ in range(7))
+        self.emit(f"{rbits} = OpBitcast %uint {r}")
+        self.emit(f"{mag} = OpBitwiseAnd %uint {rbits} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{lsb} = OpBitwiseAnd %uint {rbits} {self.cu(1)}")
+        self.emit(f"{even} = OpIEqual %bool {lsb} {self.cu(0)}")
+        self.emit(f"{nzr} = OpULessThan %bool {self.cu(0)} {mag}")
+        self.emit(f"{ok} = OpULessThan %bool {mag} {self.cu(0x7F800000)}")           # finite
+        rnz, rfin = t(), t()
+        self.emit(f"{rnz} = OpFUnordNotEqual %bool {res} %f0")                       # true for a NaN residual too...
+        self.emit(f"{rfin} = OpFOrdEqual %bool {res} {res}")                         # ...so require a non-NaN one
+        inexact = self.emit_land(rnz, rfin)
+        self.emit(f"{need} = OpLogicalAnd %bool {self.emit_land(even, inexact)} {self.emit_land(nzr, ok)}")
+        ebits, xs, same, up, dn, adj, out, rr = (t() for _ in range(8))
+        self.emit(f"{ebits} = OpBitcast %uint {res}")
+        self.emit(f"{xs} = OpBitwiseXor %uint {rbits} {ebits}")
+        self.emit(f"{same} = OpULessThan %bool {xs} {self.cu(0x80000000)}")           # same sign: away from zero
+        self.emit(f"{up} = OpIAdd %uint {rbits} {self.cu(1)}")
+        self.emit(f"{dn} = OpISub %uint {rbits} {self.cu(1)}")
+        self.emit(f"{adj} = OpSelect %uint {same} {up} {dn}")
+        self.emit(f"{out} = OpSelect %uint {need} {adj} {rbits}")
+        self.emit(f"{rr} = OpBitcast %float {out}")
+        return rr
+
     def emit_land(self, a, b):
         r = self.tmp()
         self.emit(f"{r} = OpLogicalAnd %bool {a} {b}")
@@ -596,12 +644,12 @@ class Gen:
         self.emit(f"{r} = OpBitwiseOr %uint {a} {sh}")
         return r
 
-    def f16_out(self, d, r, hi=0, fract=False):
+    def f16_out(self, d, r, hi=0, fract=False, mode=True):
         """Narrow f32 ``r`` to f16 (f16_res: nearest even, or toward zero under MODE) and write it to the low half of ``d``, or to the high half when
         ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16).
         ``fract`` (v_fract_f16): a result that rounded up to 1.0 (0x3c00) becomes 0x3bff, the largest f16 below 1,
         as on hardware (docs/design.md, float min/max/med3 with NaN and v_fract)."""
-        lo = self.f16_res(r)
+        lo = self.f16_res(r) if mode else self.f16_bits(r)     # mode=False: the op ignores MODE rounding (rcp/rsq/sqrt)
         if fract:
             one, below = self.tmp(), self.tmp()
             self.emit(f"{one} = OpIEqual %bool {lo} {self.cu(0x3C00)}")
@@ -2826,7 +2874,7 @@ class Gen:
             self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.clamp_mods(r, mods)
-            self.write_lo16(a[0], self.f16_res(r))
+            self.write_lo16(a[0], self.f16_bits(r))    # ignores MODE rounding on hardware (RX 6800, SHADER-35)
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             def bits(name, default):
@@ -4027,7 +4075,9 @@ class Gen:
             r = self.clamp_mods(r, mods)
             # 0x3c00 -> 0x3bff only when 0x3c00 is Fract's own rounding: after mul:2 fract(0.5) is a true 1.0.
             omod = any(m in ("mul:2", "mul:4", "div:2") for m in mods)
-            self.f16_out(a[0], r, dhi, fract=fn == "Fract" and not omod)  # GFX10: f16 ops keep the other half
+            # rcp/rsq/sqrt (and sin/cos below) ignore MODE rounding on hardware (RX 6800, SHADER-35): nearest even always.
+            self.f16_out(a[0], r, dhi, fract=fn == "Fract" and not omod,
+                         mode=op not in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16"))  # GFX10: f16 ops keep the other half
         elif op == "v_not_b32":
             x = self.src_u(a[1])
             r = self.tmp()
@@ -4688,6 +4738,14 @@ class Gen:
             vals = self.fma_mix_srcs(a, mods)
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
+            if self.round_mode:
+                # Toward zero the hardware rounds the exact fma once, to f16; round-to-odd at f32 narrows exactly.
+                # Nearest even keeps the f32 Fma then narrow (unchanged).
+                ro, m, isz, rs = self.fma_mix_odd(*vals), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{m} = OpLoad %uint %mode_r16")
+                self.emit(f"{isz} = OpIEqual %bool {m} {self.cu(3)}")
+                self.emit(f"{rs} = OpSelect %float {isz} {ro} {r}")
+                r = rs
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
         elif op == "v_cvt_pk_u8_f32":
