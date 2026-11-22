@@ -68,6 +68,25 @@ class FloatToIntTest(unittest.TestCase):
             self.assertEqual(u_res, expected_u)
             self.assertEqual(s_res, expected_s)
 
+    def test_multi_lane_divergence_and_rounding(self):
+        rounding_cases = [
+            (0x3F800000, 1, 1),      # 1.0 -> 1
+            (0x3FA00000, 1, 1),      # 1.25 -> 1 (trunc toward zero)
+            (0x3FE00000, 1, 1),      # 1.75 -> 1 (trunc toward zero)
+            (0xBF800000, 0, 0xFFFFFFFF), # -1.0 -> -1
+            (0xBFA00000, 0, 0xFFFFFFFF), # -1.25 -> -1
+            (0xBFE00000, 0, 0xFFFFFFFF), # -1.75 -> -1
+        ]
+        fssm = bytes(0x138) + struct.pack("<4I", 0x808A, 1, 1, 1)
+        spv = support.translate_fixture("cs_cvt_f32_sat", fssm=fssm)
+        for bits, unsigned, signed in rounding_cases:
+            memory = {}
+            support.run_fragment(
+                spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                push_constants=[0, 0, 8, 0x31016FAC, bits] + [0] * 27, memory=memory)
+            self.assertEqual(memory[0], unsigned)
+            self.assertEqual(memory[4], signed)
+
     def test_saturating_conversions(self):
         fssm = bytes(0x138) + struct.pack("<4I", 0x808A, 1, 1, 1)
         spv = support.translate_fixture("cs_cvt_f32_sat", fssm=fssm)
