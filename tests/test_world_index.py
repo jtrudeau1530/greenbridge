@@ -9,6 +9,7 @@ import io
 import json
 import os
 import struct
+import sys
 import tempfile
 import unittest
 import zlib
@@ -332,6 +333,39 @@ class WorldIndexTest(unittest.TestCase):
                     "--entities-out would overwrite the input")
                 self.assertFalse(os.path.exists(missing))
                 self.assertFalse(os.path.exists(summary))
+
+    def test_new_report_paths_that_differ_only_in_case(self):
+        # On a case-insensitive volume (macOS's default APFS, Windows) out/R.json and out/r.json are one file, so
+        # the CSV used to replace the JSON summary; on a case-sensitive one they are two reports.
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        folder = os.path.join(self.dir, "out")
+        upper, lower = os.path.join(folder, "R.json"), os.path.join(folder, "r.json")
+        os.makedirs(folder)
+        with open(upper, "wb"):
+            pass
+        insensitive = os.path.exists(lower)
+        os.unlink(upper)
+        if insensitive:
+            self.assert_report_collision([source, "--out", upper, "--csv", lower],
+                                         "--out and --csv must use different paths")
+            self.assertEqual(os.listdir(folder), [])
+            accent = os.path.join(folder, "café.json")             # composed é
+            self.assert_report_collision([source, "--out", accent, "--csv", os.path.join(folder, "CAFÉ.json")],
+                                         "--out and --csv must use different paths")
+        else:
+            self.assertEqual(WI.main([source, "--out", upper, "--csv", lower]), 0)
+            with open(upper, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["resources"], 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS volume case query")
+    def test_macos_case_query_follows_the_volume(self):
+        missing = os.path.join(self.dir, "new", "deeper", "report.json")
+        probe = os.path.join(self.dir, "Probe")
+        with open(probe, "wb"):
+            pass
+        self.assertEqual(WI._case_insensitive_volume(missing), os.path.exists(probe.lower()))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
     def test_windows_verbatim_path_can_name_a_distinct_report(self):

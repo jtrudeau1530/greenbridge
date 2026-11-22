@@ -374,6 +374,9 @@ int main(int argc, char** argv) {
     VkSubpassDescription sd{}; sd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sd.colorAttachmentCount = 1; sd.pColorAttachments = &ar;
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpi.attachmentCount = 1; rpi.pAttachments = &ad; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
+    VkSubpassDependency copy_dep{0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    rpi.dependencyCount = 1; rpi.pDependencies = &copy_dep;
     VkRenderPass rp; CHECK(vkCreateRenderPass(dev, &rpi, nullptr, &rp));
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbi.renderPass = rp; fbi.attachmentCount = 1; fbi.pAttachments = &rtv; fbi.width = W; fbi.height = H; fbi.layers = 1;

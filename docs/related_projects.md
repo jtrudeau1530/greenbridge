@@ -84,6 +84,19 @@ and file list in its README) with the licence file. `runtime/shims/xgameruntime.
 `xgameruntime.dll` imports. The HTTP and WebSocket stack is not included. Unlike the projects above, this is code
 use under a compatible licence, so the MIT notice must stay with the files.
 
+## AMD machine-readable GPU ISA specification
+
+<https://gpuopen.com/machine-readable-isa> (reader: <https://github.com/GPUOpen-Tools/isa_spec_manager>)
+
+AMD's XML description of the RDNA and CDNA instruction sets: instructions, encodings, operands, data formats.
+
+**Licence:** MIT (`<License>MIT</License>` in each XML file; `isa_spec_manager` is MIT too), compatible with
+GPL-3.0-or-later.
+
+**What we use it for:** `tools/isa_coverage.py` reads `amdgpu_isa_rdna2.xml` from a path the user supplies and counts
+which instructions the translator has a rule for ([isa_coverage.md](isa_coverage.md)). The XML is not vendored (11 MB);
+tests use a small fixture of our own in the same schema.
+
 ## The line
 
 | Fine | Not fine |

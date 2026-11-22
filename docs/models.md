@@ -4,6 +4,10 @@ Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, an
 upstream `rpf9-explorer` fixes that close it. The fixes are merged upstream and the submodule is
 pinned at `e293917`, where a full ten-archive re-count recovers **382,781 models** (**2.64 billion
 triangles**, **0 decode failures**), up from 350,248 at `917e9b9` and 190,792 at `c3708fb`.
+upstream `rpf9-explorer` fix that closes it. The fix is merged upstream and the submodule is
+pinned at `e293917` (the 350,251-model counts below were measured at `917e9b9`, before
+upstream `v1.2` PRs #8-#12 landed; the non-`levels.rpf` archives were then re-counted at
+`e293917`).
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -23,6 +27,9 @@ decoding (PR #7). A full ten-archive re-count at `e293917` recovers **382,781 mo
 over `917e9b9`'s 350,248) and **2,636,248,990 triangles** with **0 decode failures**; the earlier
 `917e9b9`, `c3708fb`, and `48557ea` measurements are kept below as controls. This page records the
 measured state; it is not a competing patch.
+decoding (PR #7). The 350,251-model counts below were measured at `917e9b9` and are kept as the
+control; the `e293917` re-count for the non-`levels.rpf` archives is in the table below. This page
+records both, and is not a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
 Leonida, including 169 previously rejected candidates (also verified after archive readback). A
@@ -36,12 +43,14 @@ drawable/LOD variant. The two sets are different scopes, not contradictory.
 ### `packs.rpf` after the pin bump
 
 `packs.rpf`'s `.#dr` pages are drawable-dictionary roots, not drawables, so the old candidate
-scan never saw them. At the new pin the dictionary walk recovers **24,034 models** from that
-archive (23,720 dictionary children plus the 314 fragments), against 314 before. A full
-`rpf9dump models` export of the archive reports **`ok=24,034 fail=0 skip=0` in 263 s** (0
-embedded textures); the OBJs and manifest are local. The 314 `48557ea`/`c3708fb` entries in the
-table below are therefore the pre-pin control, not the current `packs.rpf` result. The other
-model-bearing archives were re-counted at the new pin; the results are below.
+scan never saw them. The dictionary walk recovers **23,720 dictionary children** from that
+archive at both `917e9b9` and `e293917`; the fragment count grew from **314** to **2,865** when
+upstream `v1.2` began recovering zero-radius fragments. The archive total is therefore
+**24,034 models at `917e9b9`** (23,720 children + 314 fragments) and **26,585 at `e293917`**
+(23,720 + 2,865), against 314 at `c3708fb`. A full `rpf9dump models` export at `917e9b9`
+reported **`ok=24,034 fail=0 skip=0` in 263 s** (0 embedded textures); the OBJs and manifest are
+local. The 314 `48557ea`/`c3708fb` entries in the table below are the pre-pin control, not the
+current `packs.rpf` result.
 
 ### Full-archive re-count at `e293917`
 
@@ -109,17 +118,45 @@ entries are dictionary children.
 | `data.rpf` | 2,402 | **2,581** | 268 | 2,313 |
 | `pack/shared_minigame000/...` | 1,070 | **1,288** | 317 | 971 |
 | `pack/core_restofworld/...` | 1,024 | **885** | 797 | 88 |
-| `pack/story000/story000.rpf` | 4,195 | **7,460** | 4,156 | 3,304 |
+| `pack/story000/story000.rpf` | 4,195 | **7,460** | 4,156 | 3,305 |
 | `packs.rpf` | 23,838 | **24,034** | 23,720 | 314 |
 | `levels.rpf` | 206,981 | **314,000** | 130,225 | 183,801 |
-| `common`, `textures`, `story000_restofworld`, `core_restofworld001` | 0 | 0 | 0 | 0 |
-| **Total** | **239,510** | **350,248** | **159,483** | **190,792** |
+| `story000_restofworld` | 1 | **3** | 3 | 0 |
+| `common`, `textures`, `story000_script`, `core_restofworld001` | 0 | 0 | 0 | 0 |
+| **Total** | **239,511** | **350,251** | **159,486** | **190,792** |
+
+### Re-count at `e293917`
+
+A full `rpf9dump models` re-run over the same archives at the current pin (the manifests are
+local; `levels.rpf` has a recovery count but no full OBJ export):
+
+| Archive | Rows | Non-fragment | Fragments | Delta vs `917e9b9` |
+|---|---:|---:|---:|---:|
+| `packs.rpf` | **26,585** | 23,720 | 2,865 | +2,551 |
+| `data.rpf` | **3,175** | 1,417 | 1,758 | +594 |
+| `pack/shared_minigame000/...` | **1,294** | 1,284 | 10 | +6 |
+| `pack/core_restofworld/...` | **936** | 883 | 53 | +51 |
+| `pack/story000/story000.rpf` | **7,461** | 7,461 | 0 | +1 |
+| `story000_restofworld` | **3** | 3 | 0 | 0 |
+| `common`, `textures`, `story000_script`, `core_restofworld001` | 0 | 0 | 0 | 0 |
+| **Total, excluding `levels.rpf`** | **39,454** | **34,768** | **4,686** | **+3,203** |
+| `levels.rpf` | recovery count only, see below | - | - | +29,327 |
+
+The gain outside `levels.rpf` is fragments: upstream `v1.2` PRs #8-#12 recover zero-radius
+fragments that the earlier export skipped (2,551 in `packs.rpf`, 594 in `data.rpf`), plus one
+drawable in `story000`. `story000_restofworld` has the same 3 models at both pins, so its delta
+is 0.
+
+`levels.rpf` was re-counted at `e293917` (10 shards over 235,330 candidates): **343,327 models**
+(130,239 dictionary children + 213,088 standalone), against 314,000 at `917e9b9` (206,981
+candidates; 130,225 children + 183,801). The +29,327 is a recovery count, not a row-for-row delta,
+and no full OBJ export was run. Triangle totals were not re-run either.
 
 The last column is the `c3708fb` recovery for comparison. `story000`'s standalone count is
 3,304 vs 3,305; the full new-pin standalone total is 190,765, 27 below the `c3708fb` 190,792.
 Those 27 are not merged duplicates: they are the 27 models with more than 256 geometries that the
 probe rejects at `917e9b9` (26 in `levels.rpf`, 1 in `story000`; see
-[rejected candidates](#rejected-candidates-at-917e9b9)). The new entries are **159,483
+[rejected candidates](#rejected-candidates-at-917e9b9)). The new entries are **159,486
 drawable-dictionary children**: one model per embedded drawable in a dictionary root, not new
 pages. `core_restofworld` recovers 873 of its 1,024 candidates (885 models); the 151 rejects are
 140 texture dictionaries and 11 drawable dictionaries whose drawable has radius 0.
@@ -208,9 +245,10 @@ reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
 | **Total** | **190,792** | **155,598** | **190,792** |
 
 The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archive recovers
-24,034 models, and the other archives' new-pin counts are in the table above. The rows here are
-the `c3708fb` measurements (190,792 models); the new-pin re-count is 350,248. Triangle totals
-have not been re-run at the new pin.
+24,034 models (26,585 at `e293917`), and the other archives' new-pin counts are in the table above.
+The rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,251,
+and the `e293917` re-count outside `levels.rpf` is 39,454. Triangle totals have not been re-run at
+either new pin.
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
@@ -467,3 +505,8 @@ own light bones).
 4. Investigate the 71 remaining unrecovered fragment candidates in `levels.rpf` (and the 1
    texture-dictionary candidate in `textures.rpf`) if further upstream recovery is wanted.
 5. Keep issue #29 in sync with the `e293917` counts.
+3. **Done:** `tools/rpf9dump models` was re-run over the model-bearing archives at `e293917`;
+   the six non-`levels.rpf` archives total 39,454 rows (+3,203, almost all recovered fragments).
+   `levels.rpf` has a recovery count (343,327 models, +29,327) but no full OBJ export; triangle
+   totals were not re-run.
+4. Keep the README and issue #29 in sync with the new counts.
