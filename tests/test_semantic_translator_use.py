@@ -51,21 +51,26 @@ def _parse(path):
 
 
 def _imports(tree):
-    """(module or helper name, line) for every import, at any nesting depth, relative ones included."""
+    """(module, bound name, line) for every import, at any nesting depth, relative ones included.
+
+    The bound name is what the module body can use: ``import support`` binds ``support``,
+    ``from support import translate_lines`` binds ``translate_lines``.
+    """
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                yield alias.name, node.lineno
-        elif isinstance(node, ast.ImportFrom) and node.level == 0:
-            if node.module:
-                yield node.module, node.lineno
-        elif isinstance(node, ast.ImportFrom) and node.level == 1:
-            # from . import support / from .support import x
-            if node.module:
-                yield node.module, node.lineno
-            else:
-                for alias in node.names:
-                    yield alias.name, node.lineno
+                yield alias.name, alias.asname or alias.name.split(".")[0], node.lineno
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level > 1:      # from ..x import y: outside tests/semantic
+                continue
+            for alias in node.names:
+                yield module, alias.asname or alias.name, node.lineno
+
+
+def _used_names(tree):
+    """Every name loaded in the module body: an import that is never referenced cannot reach anything."""
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
 
 
 def _docstring_literals(tree):
@@ -81,7 +86,7 @@ def _docstring_literals(tree):
 
 def _process_names_translator(tree):
     """The line of a non-docstring string naming rdna2spirv.py, when the file also drives a process."""
-    imports_process = any(name in ("subprocess", "runpy") for name, _ in _imports(tree))
+    imports_process = any(module.split(".")[0] in ("subprocess", "runpy") for module, _, _ in _imports(tree))
     if not imports_process:
         return None
     docstrings = _docstring_literals(tree)
@@ -98,24 +103,26 @@ def _first_line(path):
         tree = _parse(path)
     except SyntaxError:
         return 1
-    lines = [line for _, line in _imports(tree)]
+    lines = [line for _, _, line in _imports(tree)]
     return min(lines) if lines else 1
 
 
 def _reaches(path, seen, semantic_dir):
-    """True when `path` imports the translator, a helper that does, or names it to a subprocess."""
+    """True when `path` imports (and uses) the translator, a helper that does, or names it to a subprocess."""
     path = os.path.normpath(path)
     if path in seen:
         return False
     seen = seen | {path}
     tree = _parse(path)
-    for name, _ in _imports(tree):
-        if name.split(".")[0] == "rdna2spirv":
-            return True
+    used = _used_names(tree) | {"*"}      # a star import has no name to match
     if _process_names_translator(tree) is not None:
         return True
-    for name, _ in _imports(tree):
-        helper = os.path.join(semantic_dir, name.split(".")[0] + ".py")
+    for module, binding, _ in _imports(tree):
+        if binding not in used:
+            continue                      # imported and never referenced: it cannot reach the translator
+        if module.split(".")[0] == "rdna2spirv":
+            return True
+        helper = os.path.join(semantic_dir, (module.split(".")[0] or binding) + ".py")
         if os.path.isfile(helper) and _reaches(helper, seen, semantic_dir):
             return True
     return False
@@ -162,18 +169,21 @@ class TranslatorUseTests(unittest.TestCase):
         """A guard that accepts everything cannot pass: check direct, helper, process and silent files."""
         with tempfile.TemporaryDirectory() as tmp:
             files = {
-                "support.py": "import rdna2spirv\n",
-                "test_direct.py": "import rdna2spirv\n",
-                "test_helper.py": "import support\n",
-                "test_nested.py": "def f():\n    import support\n",
+                "support.py": "import rdna2spirv\nrdna2spirv.translate\n",
+                "test_direct.py": "import rdna2spirv\nrdna2spirv.translate\n",
+                "test_helper.py": "import support\nsupport.translate_lines\n",
+                "test_nested.py": "def f():\n    import support\n    return support.translate_lines\n",
                 "test_process.py": "import subprocess\nCMD = 'tools/rdna2spirv.py'\n",
                 "test_silent.py": "import spirv_mini_interp\n",
+                "test_unused.py": "import support\n",   # an unused import reaches nothing
             }
             for name, text in files.items():
                 with open(os.path.join(tmp, name), "w", encoding="utf-8", newline="\n") as f:
                     f.write(text)
             self.assertEqual(offenders(tmp, allowlist={}), [
                 (os.path.join("tests", "semantic", "test_silent.py"), 1,
+                 "imports no rdna2spirv and no helper that does"),
+                (os.path.join("tests", "semantic", "test_unused.py"), 1,
                  "imports no rdna2spirv and no helper that does")])
 
 
