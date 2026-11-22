@@ -849,5 +849,85 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(simd.read_lane_vgpr(lane, 4), QUARTER_F32)
 
 
+# ============================================================================
+# Section 5: Register Aliasing and In-Place Operand Preservation
+# ============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_complete_in_place_aliasing_scalar(self) -> None:
+        """In-place execution where destination and source are identical (v0 = rsq(v0))."""
+        state = ScalarMachineState()
+        state.write_vgpr(0, FOUR_F32)
+
+        instr = VRSQF32Instruction(
+            dst=RegRef(0, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(0),
+        )
+        interp = ScalarInterpreter(state)
+        res = interp.execute(instr)
+
+        self.assertEqual(res, HALF_F32)
+        self.assertEqual(state.read_vgpr(0), HALF_F32)
+
+    def test_successive_in_place_evaluations(self) -> None:
+        """Two successive in-place rsq evaluations: rsq(rsq(16.0)) == rsq(0.25) == 2.0."""
+        state = ScalarMachineState()
+        state.write_vgpr(4, SIXTEEN_F32)
+
+        instr = VRSQF32Instruction(
+            dst=RegRef(4, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(4),
+        )
+        interp = ScalarInterpreter(state)
+
+        # Step 1: rsq(16.0) -> 0.25
+        r1 = interp.execute(instr)
+        self.assertEqual(r1, QUARTER_F32)
+        self.assertEqual(state.read_vgpr(4), QUARTER_F32)
+
+        # Step 2: rsq(0.25) -> 2.0
+        r2 = interp.execute(instr)
+        self.assertEqual(r2, TWO_F32)
+        self.assertEqual(state.read_vgpr(4), TWO_F32)
+
+    def test_in_place_simd_multi_lane(self) -> None:
+        """Wavefront executing in-place v0 = rsq(v0) with lane divergence."""
+        simd = SIMDState(num_lanes=64, exec_mask=0x5555_5555_5555_5555)  # even lanes
+        for lane in range(64):
+            simd.write_lane_vgpr(lane, 0, FOUR_F32)
+
+        instr = VRSQF32Instruction(
+            dst=RegRef(0, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(0),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(res[lane], HALF_F32)
+                self.assertEqual(simd.read_lane_vgpr(lane, 0), HALF_F32)
+            else:
+                self.assertIsNone(res[lane])
+                self.assertEqual(simd.read_lane_vgpr(lane, 0), FOUR_F32)
+
+    def test_in_place_negative_to_nan(self) -> None:
+        """In-place replacement of negative float by Canonical QNaN."""
+        state = ScalarMachineState()
+        state.write_vgpr(6, NEG_FOUR_F32)
+
+        instr = VRSQF32Instruction(
+            dst=RegRef(6, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(6),
+        )
+        interp = ScalarInterpreter(state)
+        res = interp.execute(instr)
+
+        self.assertEqual(res, CANONICAL_QNAN_F32)
+        self.assertEqual(state.read_vgpr(6), CANONICAL_QNAN_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
