@@ -312,6 +312,24 @@ The count does not equal the `q38` record count or the stream count. A `data.rpf
 records; a navmesh page with count 3 has six; an animation page with count 3 can have 22. The unit is **unresolved**.
 The earlier label "presumed page count" is kept only as a name for `u32@0x20`.
 
+### The `+0x20` count does not mark stream boundaries
+
+`story000.rpf` was measured to decide whether the field can group a resource's streams. In a 256 MiB carve
+(33,315 streams, 16,977 `0DRP` directories) a directory is followed by **exactly one** non-directory stream in
+16,128 cases, and that is the same for counts 2, 3 and 4 (9,616 / 5,663 / 633), so the field is not a stream count.
+Compared against the 64 KiB units the resource group actually occupies (directory plus the continuations needed to
+reach the `q38` table and its last record), the declared count matches on **9,010 of 16,977 pages (53.1%)**. Growing
+the group until the `q28`/`q30`/`q38`/`q40` tables also fit raises that only to 9,622 (56.7%). Against
+the directory stream alone the best unit is 32 KiB, at 7,660 pages (45.1%). Against counts derived from the `q28`
+table (`n28`, `sum(flags >> 16)`, `max(flags >> 16)`, `sum(field_08)`) the match is **0%** on all 16,977 pages, and
+the `q38` records tile the resource with zero overlaps and 138,583 gaps in the 1 GiB slice, so they are entries, not
+pages either.
+
+The boundary is therefore taken from the tables, not from `+0x20`: a resource is the directory stream plus the
+following streams needed to reach the `q38` table and its last record. `tools/page_index.py` reports that group per
+page as `resource` (`streams`, `bytes`, `page_units`, `declared_pages`, `declared_matches_units`), and the summary
+counts how often the declared count agrees, so the disagreement is recorded rather than used.
+
 ## Readable versus opaque
 
 **Readable from bytes:** the `0DRP` magic, version 122, header length and pointers, the four `u16` counts, the
@@ -326,9 +344,10 @@ path or resource type is present in a `0DRP` page.
 
 1. **Names and types.** Join a `q38` hash to the TOC or the executable's resource registry. Do not guess from a
    four-byte value.
-2. **`+0x20` unit.** Test on more archives and versions; do not assume 128 KiB. The measured `data.rpf` page
-   `0x11f4010` has span 195,211 bytes and count 2 (1.49 x 128 KiB), while a navmesh page with span below 8 KiB
-   has count 3.
+2. **`+0x20` unit.** Tested and rejected as a boundary on `story000.rpf`: no page-size reading fits (best 56.7% at
+   64 KiB, 45.1% at 32 KiB over the directory stream, 0% against the `q28`-derived counts). The measured `data.rpf`
+   page `0x11f4010` has span 195,211 bytes and count 2 (1.49 x 128 KiB), while a navmesh page with span below 8 KiB
+   has count 3. A loader or a decoded dictionary is needed before the field itself is named.
 3. **`q28` fields.** `hash_b`, `field_08` and `count_or_size` need a loader or a decoded dictionary. The hash
    tables it points at look like `{hash, 0, index, 0}` records, but the index semantics are not proven.
 4. **`q30`/`q40`.** Both contain hash-like tables and are not needed for boundaries. Decode them only with a
@@ -358,7 +377,8 @@ header, gives an index with no pages.
 
 JSON has a `summary` and one object per page: offset, stored/inflated size, version, `page_count` (`u32@0x20`),
 the four counts, table offsets, `q38_records`, raw `q28_records`, continuation streams, `span`,
-`payload_at_0x60` and `complete`. CSV is one row per `q38` record:
+`payload_at_0x60`, `complete`, and a `resource` group (its `streams` with offsets and inflated sizes, `bytes`,
+`page_units` at 64 KiB, `declared_pages` and `declared_matches_units`). CSV is one row per `q38` record:
 `page_offset,stored,inflated,version,page_count,q28_count,q30_count,q38_count,span,complete,record_index,hash,size,target,target_stream`.
 `target_stream` is 0 for the directory stream and 1..N for a continuation.
 
