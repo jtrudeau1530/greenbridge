@@ -1824,14 +1824,32 @@ The trace will enumerate them.
   On an RX 5700 XT, 13 synthetic full/rectangle readbacks match Windows WARP (UINT exact, normalized
   channels within one byte), including descriptor rewrites, format switches and an SRGB RTV on a UAV resource.
   The same tests fail without this change and when the cache ignores format. CPU replay covers 31 scenarios;
-  17 unsupported/invalid frontend views fail `Close` without submission. Other typeless families,
-  typed-resource casts, MSAA and 3D typeless RTVs remain unsupported.
+  17 unsupported/invalid frontend views fail `Close` without submission. Typed-resource casts, MSAA and 3D
+  typeless RTVs remain unsupported.
   Phase 2 adds 54 mip/array and 12 non-array higher-mip readbacks against WARP, including untouched sentinels.
   D3D-161 adds SINT and SNORM views when the Vulkan format supports color attachments. SINT uses the existing
   integer clear conversion, and SNORM passes floating-point values to the attachment. Signed channels matched
   WARP byte for byte in full and rectangular clears on an RX 9070 XT (driver 32.0.32029.2010) and the integrated
   Radeon in a Ryzen 5 9600X (32.0.21045.29003), including mip and array selections. The SNORM vectors avoid
   half-step rounding ties.
+- **Typed RTVs of the other typeless families (D3D-275):** an RTV of any TYPELESS color texture (B8G8R8A8,
+  R16G16B16A16, R32G32B32A32, R32G32, R16G16, R10G10B10A2, R8G8, R32, R16, and R8 once it is mapped) names a typed
+  format of its family; `TargetView` carries that view's VkFormat (`ColorViewFormat` holds VkFormat numbers) and
+  `color_view_format` accepts any format of the resource's family (`typeless_view_family`), so the clear writes
+  through a view in that format. Typeless images are already mutable without a format list. Before, only RGBA8 was
+  reinterpreted and the others cleared through the resource's own format (an `R8_UINT` RTV cleared to 7 wrote 0xff).
+  `d3d12_typeless_families_test` clears every typed RTV format of each family with two value sets and compares the
+  bytes with the host D3D12 on the same adapter: 62 of 62 equal on an RTX 3060 (NVIDIA 32.0.16.1714) with
+  `LEONIDA_VK_VALIDATION=1`; WARP differs from that host in 8 (rounding of 0.5 to UNORM/SNORM and the
+  R10G10B10A2_UNORM alpha). Formats the layer does not map yet (R16G16B16A16_SNORM, R16G16_UNORM/SNORM,
+  R16_UINT/SNORM/SINT, the R8 family; #1914) are reported and skipped. Draws need no change: the replay builds a
+  draw's attachment view in the PSO's `RTVFormats[slot]` (`GraphicsPipeline::color_formats`, applied in
+  `vulkan_replay.h`'s draw setup), which D3D12 requires to equal the RTV's format, so pipeline and attachment
+  already agree and the mutable image is written in the typed format. The same test draws a full-screen pass (GLSL
+  stand-ins for translated shaders found by FSSM hash; HLSL through d3dcompiler_47 on the host) writing
+  `uint4(7, 300, 1000, 3)` or `float4(0.5, -2, 1.5, 0.25)` into R16G16B16A16_UINT/FLOAT/UNORM, R32_UINT/FLOAT,
+  R10G10B10A2_UINT/UNORM and R8G8B8A8_UINT views of the matching TYPELESS textures: 8 of 8 equal the host, with no
+  validation error, before and after the clear fix.
 - **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For every integer RTV format the device
   exposes (`R8G8`, `R8G8B8A8`, `R16G16`, `R16G16B16A16`, `R32`, `R32G32` and `R32G32B32A32` in `_UINT` and `_SINT`,
   plus `R10G10B10A2_UINT`; `R8`/`R16` `_UINT`/`_SINT` are handled in replay too) convert those values numerically

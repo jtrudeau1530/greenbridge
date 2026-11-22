@@ -1570,7 +1570,7 @@ public:
 
         leonida::ResourceBinding binding{};
         binding.image = image_;
-        binding.rgba8_typeless = desc_.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        binding.typeless = format.typeless && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT;  // views name their format
         binding.castable_view_formats = !view_formats_.empty();  // a castable list made the image mutable
         binding.rgb96 = format.rgb96;
         binding.depth24_as_float = format.d24_as_float;
@@ -4326,7 +4326,9 @@ public:
                 log_once("render-target view dimension not supported:", desc->ViewDimension);
                 view = {};
             }
-            const bool typeless_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+            // A TYPELESS color texture of any family takes RTVs in its family's formats (D3D-275; RGBA8 only before).
+            const bool typeless_color = vulkan_format(rd.Format, false).typeless &&
+                                        !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
@@ -4336,16 +4338,16 @@ public:
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                     (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format))
                     view = {};
-            } else if (typeless_rgba8 || typed_rgba8) {
+            } else if (typeless_color || typed_rgba8) {
                 const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
                 // A typed UNORM RGBA8 resource with a castable list may be viewed in a listed family format
                 // (D3D-85's committed path, D3D-90's placed one): its image is mutable and lists the view
                 // format, so the reinterpretation is the typeless path's. Only a UNORM image is advertised,
-                // as that is what the clear path reinterprets. The switch knows the RGBA8 family only.
+                // as that is what the clear path reinterprets.
                 const bool listed = requested == rd.Format ||
                                     (r && r->has_view_format_list() &&
                                      r->allows_view_format(vulkan_format(requested, false).format));
-                if (typeless_rgba8 || (requested != rd.Format && listed &&
+                if (typeless_color || (requested != rd.Format && listed &&
                                        rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
                     const bool msaa = rd.SampleDesc.Count > 1;
                     const bool plain_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D;
@@ -4366,14 +4368,15 @@ public:
                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
                         view = {};
                     } else {
-                        switch (requested) {
-                        case DXGI_FORMAT_R8G8B8A8_UNORM: view.format = leonida::ColorViewFormat::rgba8_unorm; break;
-                        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: view.format = leonida::ColorViewFormat::rgba8_srgb; break;
-                        case DXGI_FORMAT_R8G8B8A8_UINT: view.format = leonida::ColorViewFormat::rgba8_uint; break;
-                        case DXGI_FORMAT_R8G8B8A8_SINT: view.format = leonida::ColorViewFormat::rgba8_sint; break;
-                        case DXGI_FORMAT_R8G8B8A8_SNORM: view.format = leonida::ColorViewFormat::rgba8_snorm; break;
-                        default: view = {}; break;
-                        }
+                        // The view's own format, of the resource's family (B8G8R8X8 and B8G8R8A8 are two families
+                        // that share Vulkan formats); the clear and the attachment view reinterpret the image in it.
+                        const Format named = vulkan_format(requested, false);
+                        const int family = leonida::detail::typeless_view_family(named.format);
+                        if (named.typeless || named.rgb96 || !family || alpha_unused(requested) != alpha_unused(rd.Format) ||
+                            family != leonida::detail::typeless_view_family(vulkan_format(rd.Format, false).format))
+                            view = {};
+                        else
+                            view.format = static_cast<leonida::ColorViewFormat>(named.format);
                         if (view.resource) {
                             const auto format = vulkan_format(requested, false);
                             VkFormatProperties properties{};
@@ -4384,7 +4387,7 @@ public:
                 } else if (requested != rd.Format) {
                     view = {}; // No typed-resource format casting is advertised by this backend.
                 }
-                if (!view.resource) log_once("unsupported RGBA8 RTV format/subresource:", int(requested));
+                if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");
