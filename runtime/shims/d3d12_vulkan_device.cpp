@@ -1,4 +1,4 @@
-// A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
+﻿// A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
 // committed buffers and textures (1D, 1D arrays, 2D, multisampled 2D, 3D) and their 1/2/3 variants, allocation
 // info, CPU texture copies (WriteToSubresource/ReadFromSubresource), query heaps, a few feature queries. Everything else is a
@@ -8,6 +8,7 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #endif
 #include "d3d12_com.h"
+#include "root_signature.h"
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
@@ -638,6 +639,102 @@ public:
 private:
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
     std::unique_ptr<std::byte[]> storage_;
+};
+
+class RootSignature final
+    : public Child<RootSignature, ID3D12RootSignature, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
+public:
+    // {c8e14b72-3a9f-4d1c-9e2b-7f5a1c3d8e90}
+    static constexpr GUID kTag{0xc8e14b72, 0x3a9f, 0x4d1c, {0x9e, 0x2b, 0x7f, 0x5a, 0x1c, 0x3d, 0x8e, 0x90}};
+
+    RootSignature(DeviceState& device, rt::rootsig::RootSignature parsed, rt::rootsig::PackResult packed,
+                  VkPipelineLayout pipeline_layout, PFN_vkDestroyPipelineLayout destroy_pipeline_layout)
+        : device_(device),
+          parsed_(std::move(parsed)),
+          packed_(std::move(packed)),
+          pipeline_layout_(pipeline_layout),
+          destroy_pipeline_layout_(destroy_pipeline_layout) {}
+
+    ~RootSignature() override {
+        if (pipeline_layout_ != VK_NULL_HANDLE && destroy_pipeline_layout_) {
+            destroy_pipeline_layout_(device_.info.device, pipeline_layout_, nullptr);
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return E_NOTIMPL;
+    }
+
+    VkPipelineLayout pipeline_layout() const { return pipeline_layout_; }
+    const rt::rootsig::RootSignature& parsed() const { return parsed_; }
+    const rt::rootsig::PackResult& packed() const { return packed_; }
+
+private:
+    DeviceState& device_;
+    rt::rootsig::RootSignature parsed_;
+    rt::rootsig::PackResult packed_;
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    PFN_vkDestroyPipelineLayout destroy_pipeline_layout_ = nullptr;
+};
+
+class PipelineState final
+    : public Child<PipelineState, ID3D12PipelineState, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12PipelineState> {
+public:
+    // {7f2a9c41-8b3d-4e5a-9c1f-2d4e6a8b0c3e}
+    static constexpr GUID kTag{0x7f2a9c41, 0x8b3d, 0x4e5a, {0x9c, 0x1f, 0x2d, 0x4e, 0x6a, 0x8b, 0x0c, 0x3e}};
+
+    PipelineState(DeviceState& device, VkPipeline pipeline, VkShaderModule shader_module,
+                  VkPipelineLayout owned_layout, PFN_vkDestroyPipeline destroy_pipeline,
+                  PFN_vkDestroyShaderModule destroy_shader_module,
+                  PFN_vkDestroyPipelineLayout destroy_pipeline_layout,
+                  VkShaderModule shader_module2 = VK_NULL_HANDLE)
+        : device_(device),
+          pipeline_(pipeline),
+          shader_module_(shader_module),
+          shader_module2_(shader_module2),
+          owned_layout_(owned_layout),
+          destroy_pipeline_(destroy_pipeline),
+          destroy_shader_module_(destroy_shader_module),
+          destroy_pipeline_layout_(destroy_pipeline_layout) {}
+
+    ~PipelineState() override {
+        const VkDevice dev = device_.info.device;
+        if (pipeline_ != VK_NULL_HANDLE && destroy_pipeline_) destroy_pipeline_(dev, pipeline_, nullptr);
+        if (shader_module_ != VK_NULL_HANDLE && destroy_shader_module_)
+            destroy_shader_module_(dev, shader_module_, nullptr);
+        if (shader_module2_ != VK_NULL_HANDLE && destroy_shader_module_)
+            destroy_shader_module_(dev, shader_module2_, nullptr);
+        if (owned_layout_ != VK_NULL_HANDLE && destroy_pipeline_layout_)
+            destroy_pipeline_layout_(dev, owned_layout_, nullptr);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob**) override { return E_NOTIMPL; }
+
+    VkPipeline pipeline() const { return pipeline_; }
+
+private:
+    DeviceState& device_;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkShaderModule shader_module_ = VK_NULL_HANDLE;
+    VkShaderModule shader_module2_ = VK_NULL_HANDLE;
+    VkPipelineLayout owned_layout_ = VK_NULL_HANDLE;
+    PFN_vkDestroyPipeline destroy_pipeline_ = nullptr;
+    PFN_vkDestroyShaderModule destroy_shader_module_ = nullptr;
+    PFN_vkDestroyPipelineLayout destroy_pipeline_layout_ = nullptr;
 };
 
 class Resource final
@@ -1855,7 +1952,19 @@ public:
             if (resource) stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
             return;
         }
-        if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
+        if (!r->image()) {
+            ShaderView view{};
+            view.kind = ShaderViewKind::SRV;
+            view.dimension = desc ? static_cast<uint32_t>(desc->ViewDimension) : D3D12_SRV_DIMENSION_BUFFER;
+            view.resource_id = r->id();
+            view.format = static_cast<uint16_t>(desc ? desc->Format : r->desc().Format);
+            if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+                view.gpu_va_or_offset = desc->Buffer.FirstElement;
+                view.size_or_mip_count = desc->Buffer.NumElements;
+            }
+            std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
+            return;
+        }
         if (r->desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
             log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
             return;
@@ -1939,7 +2048,20 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image() || counter) return stub("ID3D12Device::CreateUnorderedAccessView(buffer)");
+        if (!r->image() || counter) {
+            if (counter) return stub("ID3D12Device::CreateUnorderedAccessView(counter)");
+            ShaderView view{};
+            view.kind = ShaderViewKind::UAV;
+            view.dimension = desc ? static_cast<uint32_t>(desc->ViewDimension) : D3D12_UAV_DIMENSION_BUFFER;
+            view.resource_id = r->id();
+            view.format = static_cast<uint16_t>(desc ? desc->Format : r->desc().Format);
+            if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+                view.gpu_va_or_offset = desc->Buffer.FirstElement;
+                view.size_or_mip_count = desc->Buffer.NumElements;
+            }
+            std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
+            return;
+        }
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
@@ -2041,6 +2163,86 @@ public:
             return "CreateSampler2 refused: non-normalized sampler LOD; flags";
         return nullptr;
     }
+    enum class ShaderViewKind : uint32_t { Empty = 0, CBV = 1, SRV = 2, UAV = 3 };
+
+    struct ShaderView {
+        ShaderViewKind kind = ShaderViewKind::Empty;
+        uint32_t dimension = 0;
+        leonida::ResourceId resource_id = 0;
+        uint64_t gpu_va_or_offset = 0;
+        uint32_t size_or_mip_count = 0;
+        uint16_t first_mip = 0;
+        uint16_t format = 0;
+    };
+    static_assert(sizeof(ShaderView) <= kDescriptorSize);
+
+    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                                                    D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!destination.ptr) return;
+        ShaderView view{};
+        if (desc) {
+            view.kind = ShaderViewKind::CBV;
+            view.gpu_va_or_offset = desc->BufferLocation;
+            view.size_or_mip_count = desc->SizeInBytes;
+        }
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
+    }
+
+
+    HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT, const void* blob_with_root_signature,
+                                                  SIZE_T blob_length_in_bytes, REFIID riid,
+                                                  void** out_root_signature) override {
+        if (!out_root_signature) return E_INVALIDARG;
+        *out_root_signature = nullptr;
+        if (!blob_with_root_signature || blob_length_in_bytes == 0) return E_INVALIDARG;
+
+        auto decoded = rt::rootsig::parse_rts0(static_cast<const std::uint8_t*>(blob_with_root_signature),
+                                               blob_length_in_bytes);
+        if (!decoded.ok) return E_INVALIDARG;
+
+        auto packed = rt::rootsig::pack(decoded.sig);
+        if (!packed.ok) return E_INVALIDARG;
+
+        // Bindless contract (docs/d3d12_vulkan.md): 144-byte push-constant block (s0..s31 + metadata).
+        VkPushConstantRange push_range{};
+        push_range.stageFlags = VK_SHADER_STAGE_ALL;
+        push_range.offset = 0;
+        push_range.size = 144;
+
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.setLayoutCount = 0;
+        layout_info.pSetLayouts = nullptr;
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push_range;
+
+        const auto vk_module = GetModuleHandleA("vulkan-1.dll");
+        const auto get_dev_proc =
+            vk_module ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(vk_module, "vkGetDeviceProcAddr"))
+                      : nullptr;
+        const auto create_pipeline_layout =
+            get_dev_proc ? reinterpret_cast<PFN_vkCreatePipelineLayout>(
+                               get_dev_proc(state_.info.device, "vkCreatePipelineLayout"))
+                         : nullptr;
+        const auto destroy_pipeline_layout =
+            get_dev_proc ? reinterpret_cast<PFN_vkDestroyPipelineLayout>(
+                               get_dev_proc(state_.info.device, "vkDestroyPipelineLayout"))
+                         : nullptr;
+        if (!create_pipeline_layout || !destroy_pipeline_layout) return E_FAIL;
+
+        VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+        if (create_pipeline_layout(state_.info.device, &layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
+            return E_OUTOFMEMORY;
+        }
+
+        auto* root_sig = new (std::nothrow)
+            RootSignature(state_, std::move(decoded.sig), std::move(packed), pipeline_layout, destroy_pipeline_layout);
+        if (!root_sig) {
+            destroy_pipeline_layout(state_.info.device, pipeline_layout, nullptr);
+            return E_OUTOFMEMORY;
+        }
+        return hand_out(root_sig, riid, out_root_signature);
+    }
+
 
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
@@ -3153,6 +3355,7 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
 }
 
 // Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
+
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;

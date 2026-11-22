@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+﻿cmake_minimum_required(VERSION 3.24)
 project(gta6rt LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -590,7 +590,7 @@ if(TARGET Vulkan::Headers)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp
                 shims/dxgi_com.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers)
+    target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers PRIVATE gta6rt_root_signature)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8)
 
@@ -598,6 +598,16 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_com_test PRIVATE /W4 /permissive- /utf-8)
+
+    add_executable(d3d12_shader_views_test test/d3d12_shader_views_test.cpp)
+    target_link_libraries(d3d12_shader_views_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_shader_views_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_shader_views_test PRIVATE /W4 /permissive- /utf-8)
+
+    add_executable(d3d12_root_signature_vk_test test/d3d12_root_signature_vk_test.cpp)
+    target_link_libraries(d3d12_root_signature_vk_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_root_signature_vk_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_root_signature_vk_test PRIVATE /W4 /permissive- /utf-8)
 
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
     add_executable(d3d12_gcl8_test test/d3d12_gcl8_test.cpp)
