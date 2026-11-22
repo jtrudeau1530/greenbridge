@@ -923,8 +923,8 @@ def test_buffer_format_f16_narrowing_avoids_packhalf2x16(make_shader, body):
     assert "PackHalf2x16" not in spv
 
 
-def test_image_sample_and_gather_d16_avoid_packhalf2x16(make_shader):
-    """d16 image_sample and image_gather4 pack f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
+def test_image_sample_d16_avoids_packhalf2x16(make_shader):
+    """d16 image_sample packs f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (
         "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
         "s_mov_b32 s16, 0x92\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
@@ -937,17 +937,21 @@ def test_image_sample_and_gather_d16_avoid_packhalf2x16(make_shader):
     assert "PackHalf2x16" not in asm1
     assert "OpBitwiseOr %uint" in asm1 and "OpSelect %uint" in asm1
 
+
+@pytest.mark.parametrize("suffix,last_addr", [("lz", 1), ("l", 2), ("l_o", 3)])
+def test_gather_d16_avoids_packhalf2x16(make_shader, suffix, last_addr):
     gather_asm = (
         "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
         "s_mov_b32 s16, 0x92\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
-        "image_gather4_lz v[4:5], v[0:1], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D d16\n"
+        f"image_gather4_{suffix} v[4:5], v[0:{last_addr}], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D d16\n"
         "s_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v4, v5 done vm\ns_endpgm\n"
     )
-    sh2 = make_shader(gather_asm, name="ps_d16_gather_ci")
+    sh2 = make_shader(gather_asm, name=f"ps_d16_gather_{suffix}_ci")
     asm2 = sh2.translate()
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
+    assert asm2.count("OpImageFetch ") == (0 if suffix == "lz" else 4)
 
 
 def _load_mini_interp():
