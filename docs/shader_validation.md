@@ -1091,8 +1091,8 @@ Results:
 
 | GPU | Driver | `translator` | `vulkan` | `hw` |
 |---|---|---|---|---|
-| NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | double | double, 8 of 8 words | not AMD |
-| AMD Radeon iGPU (RDNA2, gfx1036), Windows 11, HIP backend | 32.0.21044.64 | double | not run | **single**, 7 of 7 ties; control `0x4100` |
+| NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | single | single, 8 of 8 words | not AMD |
+| AMD Radeon iGPU (RDNA2, gfx1036), Windows 11, HIP backend | 32.0.21044.64 | single | single, 8 of 8 words | **single**, 7 of 7 ties; control `0x4100` |
 
 RDNA2 rounds once. Every tie input gives the single-rounded word (A `0x3c01`, B `0x3c01`, C `0xbc01`, D `0x0001`,
 E `0x7bff`, F `0x3c01`, G `0x3c01`), so the translator is one f16 ulp off on exactly these inputs (SHADER-135; the
@@ -1103,6 +1103,9 @@ translator is not changed here). On the RTX 5060, a translator copy changed to u
 
 Measurement on AMD RDNA2 (gfx1036) confirmed single rounding across all 7 discriminating cases (finding 7079901079).
 Using `fma_mix_odd` produces the exact hardware single-rounded words in both nearest-even and toward-zero modes.
+E `0x7bff`, F `0x3c01`, G `0x3c01`), which the translator produces across all 7 discriminating cases via
+`fma_mix_odd` in both nearest-even and toward-zero modes (SHADER-297). On Vulkan, using `fma_mix_odd` matches the
+exact single-rounded hardware words for all inputs.
 
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
