@@ -311,12 +311,13 @@ class Gen:
 
     def f16_roundtrip(self, f):
         """f32 -> f16 -> f32 (round to nearest), modelling a 32-bit v_interp read of a 16-bit interpolant
-        (FSSM pixel-input table flag bit 4 marks the position; see the PS input path in translate)."""
-        v2, p, back, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{v2} = OpCompositeConstruct %v2float {f} %f0")
-        self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v2}")
-        self.emit(f"{back} = OpExtInst %v2float %glsl UnpackHalf2x16 {p}")
-        self.emit(f"{r} = OpCompositeExtract %float {back} 0")
+        (FSSM pixel-input table flag bit 4 marks the position; see the PS input path in translate).
+
+        Single OpQuantizeToF16 instruction on purpose: a PackHalf2x16/UnpackHalf2x16 round-trip is
+        observably folded to a no-op by at least one Vulkan driver (RTX 5080, validated), while a lone
+        OpQuantizeToF16 is implemented as a real conversion."""
+        r = self.tmp()
+        self.emit(f"{r} = OpQuantizeToF16 %float {f}")
         return r
 
     def f16_rtz(self, f):
