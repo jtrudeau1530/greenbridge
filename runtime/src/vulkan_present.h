@@ -28,9 +28,8 @@
 #include "vulkan_backend.h"
 #include "vulkan_present_compose.h"
 
-// Both extension names share the structures (the KHR one was promoted from the EXT one); headers older than the
-// promotion do not have the KHR types, and the presenter then never tears.
-#if defined(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
+// Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
+#if defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
 #define LEONIDA_SWAPCHAIN_MAINTENANCE1 1
 #endif
 
@@ -422,7 +421,7 @@ public:
         present.pImageIndices = &image;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // The swapchain was created with FIFO and tear_mode_ (both come from the same recreate).
-        VkSwapchainPresentModeInfoKHR present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR};
+        VkSwapchainPresentModeInfoEXT present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT};
         const bool tearing = tear && vsync_ && tear_supported();
         if (tearing) {
             present_mode.swapchainCount = 1;
@@ -635,7 +634,7 @@ private:
         constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         const bool same = planes.count > 1 && planes.plane[1].source == planes.plane[0].source;
-        std::array<std::vector<LayoutPiece>, 2> pieces;
+        std::array<LayoutPieces, 2> pieces;
         std::array<VkImageLayout, 2> read_layout{};
         // Each distinct source: its PRESENT (common) layout, then readable by the compute pass. A never-written back buffer
         // is zero-filled first, as any committed resource is.
@@ -958,7 +957,7 @@ private:
         info.presentMode = mode;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // A vsync swapchain that can also be presented in IMMEDIATE (or FIFO_RELAXED), switched per present.
-        VkSwapchainPresentModesCreateInfoKHR switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR};
+        VkSwapchainPresentModesCreateInfoEXT switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT};
         std::array<VkPresentModeKHR, 2> switchable_modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAX_ENUM_KHR};
         VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
         if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
@@ -1030,11 +1029,11 @@ private:
         // The capabilities of the surface for one present mode, and the modes it can switch to from there.
         const auto ask = [&](VkPresentModeKHR asked, VkSurfaceCapabilitiesKHR& caps,
                              std::array<VkPresentModeKHR, 16>* compatible, std::uint32_t* compatible_count) {
-            VkSurfacePresentModeKHR for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR};
+            VkSurfacePresentModeEXT for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT};
             for_mode.presentMode = asked;
             VkPhysicalDeviceSurfaceInfo2KHR surface_info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &for_mode};
             surface_info.surface = surface_;
-            VkSurfacePresentModeCompatibilityKHR compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR};
+            VkSurfacePresentModeCompatibilityEXT compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT};
             if (compatible) {
                 compat.presentModeCount = std::uint32_t(compatible->size());
                 compat.pPresentModes = compatible->data();

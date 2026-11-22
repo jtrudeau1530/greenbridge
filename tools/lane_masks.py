@@ -87,6 +87,8 @@ def put(state, a, k):
             state[a["r"] + 1] = MASK_HI
             return
         regs = [a["r"] + i for i in range(n)]
+    elif a["k"] == "slist":
+        regs = [r if isinstance(r, int) else "vcc" for r in a["r"]]
     elif a["k"] == "special" and a.get("t") in ("vcc", "vcc_lo"):
         regs = ["vcc"]
     elif a["k"] == "special" and a.get("t") == "vcc_hi":

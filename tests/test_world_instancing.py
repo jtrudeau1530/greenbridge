@@ -371,6 +371,28 @@ class LodSetsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "lod-sets needs --placements"):
                 world_build.build_world(assets, os.path.join(tmp, "w"), lod_sets=True)
 
+    def test_cli_rejects_unnamed_lod_levels_with_lod_sets(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = twp.write_assets(tmp)
+            ents = os.path.join(tmp, "e.jsonl")
+            twp.write_entities(ents, [self.lod_row((10, 10, 0), level) for level in (7, 255)])
+            out = os.path.join(tmp, "w")
+            for level in (7, 255):
+                with self.subTest(level=level), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    result = world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                               "--lod-sets", "--lod-levels", f"0,{level}"])
+                    self.assertEqual(result, 1)
+                    self.assertIn(f"--lod-sets does not recognize lodLevel {level}", stderr.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
+    def test_unnamed_lod_levels_work_without_lod_sets(self):
+        rows = [self.lod_row((10, 10, 0), level) for level in (7, 255)]
+        doc, _ = self.build(rows, lod_levels=(7, 255))
+        self.assertEqual(doc["stats"]["placements"]["placed"], 2)
+        self.assertNotIn("lod_bands", doc)
+
     def test_cli_places_every_level_with_lod_sets(self):
         import contextlib
         import io
