@@ -491,9 +491,12 @@ side inwards:
   - `flush()` also uploads the table to its buffer: device-local memory, written from a mapped staging copy when
     the buffers are created (first use or growth) and with `vkCmdUpdateBuffer` for slot changes. Adding a key only
     puts a new entry in an empty slot, and the copy of an entry is not atomic; a running lookup that does not know
-    the key cannot resolve to it, which is accepted. Erasing a key compacts its probe cluster, which moves other
-    keys' entries, and a table that has grown gets a new buffer behind binding 2: `flush_needs_idle()` says when a
-    flush would do either, and the device waits for the queue before flushing in that case.
+    the key cannot resolve to it, which is accepted. Erasing a key empties its slot and moves no other entry
+    (every lookup, CPU and shader, compares all eight probe slots and never stops at an empty one), so it is
+    uploaded like an add. Replacing a live key's index, an insert that relocates a live entry, and a table that
+    has grown (a new buffer behind binding 2) change what running lookups see: `flush_needs_idle()` says when a
+    flush would do one of those, and the device waits for the queue before flushing in that case. Erasing used to
+    compact the probe cluster, which moved other keys and made every texture release wait for the whole GPU.
 - **`runtime/src/gfx10_descriptors.h`**: the T#, S# and V# structures (section 5.3), encoded and decoded, with
   their mapping to Vulkan formats, view types, component mappings and samplers. Field positions are Mesa's
   (`src/amd/registers/gfx10-rsrc.json`) and agree with what the translator and the GPU tests already use. Bits
