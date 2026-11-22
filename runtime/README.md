@@ -43,6 +43,9 @@ code from the mapped images runs. TLS reserves its module index through the runt
 callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
 run.
 
+`--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
+print the usage and exit 2 before anything is mapped.
+
 The report line is:
 
 ```

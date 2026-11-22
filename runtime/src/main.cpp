@@ -65,7 +65,8 @@ int wmain(int argc, wchar_t** argv) {
         else return usage();
     }
     if (image.empty()) return usage();
-    if (!dry_run && !init && !run) return usage();
+    // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
+    if (dry_run + init + run != 1) return usage();
     if (game_dir.empty()) game_dir = image.parent_path();
     rt::d3d12_trace::set_enabled(trace_d3d12);
 
