@@ -443,6 +443,79 @@ class SIMDInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_fract_f64_flags(
+    src0_bits: int,
+    res_bits: int,
+    abs0: bool = False,
+    neg0: bool = False,
+    clamp: bool = False,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_fract_f64."""
+    s0 = apply_f64_modifiers(src0_bits, abs_mod=abs0, neg_mod=neg0)
+
+    s0_snan = is_snan_f64(s0)
+    s0_inf = is_inf_f64(s0)
+    s0_nan = is_nan_f64(s0)
+
+    invalid = False
+    if s0_snan or s0_inf:
+        invalid = True
+
+    nan_flag = is_nan_f64(res_bits)
+    inf_flag = is_inf_f64(res_bits)
+    zero_flag = is_zero_f64(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK_F64)
+    denorm_flag = is_subnormal_f64(res_bits)
+
+    inexact = False
+    if not (s0_nan or s0_inf or nan_flag or inf_flag):
+        exact_frac = exact_fract_f64_fraction(s0)
+        if exact_frac is not None:
+            res_frac = f64_to_fraction(res_bits)
+            if exact_frac != res_frac:
+                inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=False,
+        underflow=denorm_flag,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def compute_f64_fract_borrow(s0_bits: int) -> tuple[int, int]:
+    """Compute mathematical floor integer and borrow generated when computing x - floor(x)."""
+    if is_nan_f64(s0_bits) or is_inf_f64(s0_bits):
+        return 0, 0
+    f = bits_to_f64(s0_bits)
+    floor_val = math.floor(f)
+    borrow = 1 if f < 0 and not f.is_integer() else 0
+    return floor_val, borrow
+
+
+# ==============================================================================
 # Unit Tests: Reference Oracle and Architectural Model
 # ==============================================================================
 
@@ -885,6 +958,81 @@ class TestRegisterAliasing(unittest.TestCase):
         self.simd_interp.step(instr, state)
         for lane in range(32):
             self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 0)), 0.3125)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry/borrow generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s0 = f64_to_bits(1.25)
+        res = oracle_v_fract_f64(s0)
+        flags = evaluate_v_fract_f64_flags(s0, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_invalid_operation_flag(self) -> None:
+        # Infinities trigger invalid
+        res_inf = oracle_v_fract_f64(POS_INF_F64)
+        flags_inf = evaluate_v_fract_f64_flags(POS_INF_F64, res_inf)
+        self.assertTrue(flags_inf.invalid)
+        self.assertTrue(flags_inf.nan)
+
+        # Signaling NaN triggers invalid
+        snan = 0x7FF0_0000_0000_0005
+        res_snan = oracle_v_fract_f64(snan)
+        flags_snan = evaluate_v_fract_f64_flags(snan, res_snan)
+        self.assertTrue(flags_snan.invalid)
+        self.assertTrue(flags_snan.nan)
+
+    def test_zero_flag(self) -> None:
+        # Exact integer gives zero
+        s0 = f64_to_bits(5.0)
+        res = oracle_v_fract_f64(s0)
+        flags = evaluate_v_fract_f64_flags(s0, res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+
+        # -0.0 gives zero
+        res_nz = oracle_v_fract_f64(NEG_ZERO_F64)
+        flags_nz = evaluate_v_fract_f64_flags(NEG_ZERO_F64, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertFalse(flags_nz.negative)
+
+    def test_inexact_flag(self) -> None:
+        # Tiny negative value where x - floor(x) rounds to 1.0 -> clamped to largest below 1.0
+        s0 = f64_to_bits(-1e-16)
+        res = oracle_v_fract_f64(s0)
+        flags = evaluate_v_fract_f64_flags(s0, res)
+        self.assertTrue(flags.inexact)
+
+    def test_denormal_flag(self) -> None:
+        sub = 0x0000_0000_0000_0005
+        res = oracle_v_fract_f64(sub)
+        self.assertEqual(res, sub)
+        flags = evaluate_v_fract_f64_flags(sub, res)
+        self.assertTrue(flags.denormal)
+        self.assertTrue(flags.underflow)
+
+    def test_borrow_generation_negative_inputs(self) -> None:
+        # Negative fractional number requires borrow of 1
+        floor_neg, borrow_neg = compute_f64_fract_borrow(f64_to_bits(-0.25))
+        self.assertEqual(floor_neg, -1)
+        self.assertEqual(borrow_neg, 1)
+
+        # Positive fractional number requires borrow of 0
+        floor_pos, borrow_pos = compute_f64_fract_borrow(f64_to_bits(0.25))
+        self.assertEqual(floor_pos, 0)
+        self.assertEqual(borrow_pos, 0)
+
+        # Exact integer requires borrow of 0
+        floor_int, borrow_int = compute_f64_fract_borrow(f64_to_bits(-3.0))
+        self.assertEqual(floor_int, -3)
+        self.assertEqual(borrow_int, 0)
 
 
 if __name__ == "__main__":
