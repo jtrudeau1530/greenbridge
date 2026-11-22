@@ -596,8 +596,8 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
         info.maxLod = 0.25f;
     }
     // An integer image sampled with a FLOAT border colour reads it as 0 on NVIDIA (Vonsek, #538), so the type follows
-    // integer_border. A table colour is not kept yet: transparent black.
-    const bool integer = sampler.integer_border && sampler.border_color != BorderColor::table;
+    // integer_border. A table colour falls back to transparent black matching integer_border.
+    const bool integer = sampler.integer_border;
     switch (sampler.border_color) {
     case BorderColor::opaque_black:
         info.borderColor = integer ? VK_BORDER_COLOR_INT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;

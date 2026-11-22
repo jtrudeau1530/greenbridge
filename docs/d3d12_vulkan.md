@@ -396,7 +396,9 @@ What is implemented (all of it testable without the game):
     colours produce distinct keys in the descriptor hash table and distinct `VkSampler` objects. On sampler creation,
     `VkSamplerCustomBorderColorCreateInfoEXT` passes the colour components with `VK_BORDER_COLOR_FLOAT_CUSTOM_EXT` or
     `VK_BORDER_COLOR_INT_CUSTOM_EXT` and `format = VK_FORMAT_UNDEFINED` (via `customBorderColorWithoutFormat`). Without
-    the extension, custom colours fall back to transparent black with a diagnostic log line. An integer border colour
+    the extension, custom colours fall back to transparent black with a diagnostic log line, using
+    `VK_BORDER_COLOR_INT_TRANSPARENT_BLACK` for integer borders and `VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK` for
+    float borders to satisfy Vulkan input validation rules on integer views. An integer border colour
     with the bits of `1.0f` is not white and receives a table colour index.
     `D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES` sets `FORCE_UNNORMALIZED` (word 0, bit 15) and changes nothing
     else; `vulkan_sampler` makes it `unnormalizedCoordinates`. The layer answers `D3D12_OPTIONS17` with

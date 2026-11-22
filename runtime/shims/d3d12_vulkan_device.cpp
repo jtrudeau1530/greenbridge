@@ -929,6 +929,8 @@ struct DeviceState {
         VkSamplerCustomBorderColorCreateInfoEXT custom_border{
             VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
         if (sampler.border_color == g::BorderColor::table) {
+            const bool is_int = sampler.border_color_index < border_color_table.size() &&
+                                border_color_table[sampler.border_color_index].is_int;
             if (info.custom_border_color && info.custom_border_color_without_format &&
                 sampler.border_color_index < border_color_table.size()) {
                 const auto& entry = border_color_table[sampler.border_color_index];
@@ -939,6 +941,8 @@ struct DeviceState {
                 custom_border.pNext = sampler_info.pNext;
                 sampler_info.pNext = &custom_border;
             } else {
+                sampler_info.borderColor =
+                    is_int ? VK_BORDER_COLOR_INT_TRANSPARENT_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
                 log_once("custom sampler border colours without VK_EXT_custom_border_color; transparent black instead, index",
                          int(sampler.border_color_index));
             }

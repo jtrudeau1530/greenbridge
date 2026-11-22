@@ -19,6 +19,33 @@
 
 namespace {
 
+static PFN_vkGetInstanceProcAddr g_real_instance_proc = nullptr;
+static PFN_vkGetDeviceProcAddr g_real_device_proc = nullptr;
+static PFN_vkCreateSampler g_real_create_sampler = nullptr;
+static std::vector<VkSamplerCreateInfo> g_intercepted_samplers;
+
+static VkResult VKAPI_CALL intercept_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCreateInfo,
+                                                     const VkAllocationCallbacks* pAllocator, VkSampler* pSampler) {
+    if (pCreateInfo) g_intercepted_samplers.push_back(*pCreateInfo);
+    return g_real_create_sampler(device, pCreateInfo, pAllocator, pSampler);
+}
+
+static PFN_vkVoidFunction VKAPI_CALL intercept_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
+    if (pName && std::strcmp(pName, "vkCreateSampler") == 0) {
+        g_real_create_sampler = reinterpret_cast<PFN_vkCreateSampler>(g_real_device_proc(device, pName));
+        return reinterpret_cast<PFN_vkVoidFunction>(intercept_vkCreateSampler);
+    }
+    return g_real_device_proc(device, pName);
+}
+
+static PFN_vkVoidFunction VKAPI_CALL intercept_vkGetInstanceProcAddr(VkInstance instance, const char* pName) {
+    if (pName && std::strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+        g_real_device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(g_real_instance_proc(instance, pName));
+        return reinterpret_cast<PFN_vkVoidFunction>(intercept_vkGetDeviceProcAddr);
+    }
+    return g_real_instance_proc(instance, pName);
+}
+
 template<class T>
 struct Ref {
     T* p = nullptr;
@@ -218,6 +245,8 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.bindless = d.bindless;
+        info.bindless_partially_bound = d.partially_bound;
         info.custom_border_color = d.custom_border_color;
         info.custom_border_color_without_format = d.custom_border_color_without_format;
         Ref<ID3D12Device11> device;
@@ -305,6 +334,46 @@ int main() {
         D3D12_SAMPLER_DESC2 float_bits = border2;
         for (UINT& c : float_bits.UintBorderColor) c = one;
         EXPECT(via2(float_bits) == via1(with_border(border, 1, 1, 1, 1)));
+
+        // vulkan_sampler defaults for table borders follow integer_border.
+        leonida::gfx10::Sampler s_table_int{};
+        s_table_int.border_color = leonida::gfx10::BorderColor::table;
+        s_table_int.integer_border = true;
+        EXPECT(leonida::gfx10::vulkan_sampler(s_table_int).borderColor == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK);
+        leonida::gfx10::Sampler s_table_flt{};
+        s_table_flt.border_color = leonida::gfx10::BorderColor::table;
+        s_table_flt.integer_border = false;
+        EXPECT(leonida::gfx10::vulkan_sampler(s_table_flt).borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
+
+        // Fallback device without VK_EXT_custom_border_color: bind_sampler selects
+        // VK_BORDER_COLOR_INT_TRANSPARENT_BLACK for UINT custom borders and
+        // VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK for float custom borders.
+        {
+            g_intercepted_samplers.clear();
+            g_real_instance_proc = d.instance_proc;
+            rt::d3d12::VulkanDeviceInfo fallback_info = info;
+            fallback_info.get_instance_proc = intercept_vkGetInstanceProcAddr;
+            fallback_info.custom_border_color = false;
+            fallback_info.custom_border_color_without_format = false;
+            Ref<ID3D12Device11> fallback_device;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(fallback_info, IID_PPV_ARGS(&fallback_device.p))));
+            Slots fallback_slots;
+            EXPECT(fallback_slots.create(fallback_device.p));
+
+            g_intercepted_samplers.clear();
+            const D3D12_CPU_DESCRIPTOR_HANDLE h_uint = fallback_slots.take();
+            const D3D12_SAMPLER_DESC2 uint_s = with_uint_border(border2, 9, 33, 117, 211);
+            fallback_device->CreateSampler2(&uint_s, h_uint);
+            EXPECT(!g_intercepted_samplers.empty());
+            EXPECT(g_intercepted_samplers.back().borderColor == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK);
+
+            g_intercepted_samplers.clear();
+            const D3D12_CPU_DESCRIPTOR_HANDLE h_flt = fallback_slots.take();
+            const D3D12_SAMPLER_DESC flt_s = with_border(border, 0.25f, 0.5f, 0.75f, 1.0f);
+            fallback_device->CreateSampler(&flt_s, h_flt);
+            EXPECT(!g_intercepted_samplers.empty());
+            EXPECT(g_intercepted_samplers.back().borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
+        }
 
         // Non-normalized coordinates: CreateSampler's S# with FORCE_UNNORMALIZED set, nothing else changed.
         for (const D3D12_FILTER filter : {D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
