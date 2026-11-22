@@ -114,14 +114,16 @@ scanned TTPF pools. The head has no texture reference at all.
 
 ```powershell
 rpf9dump models <packs.rpf> <outdir>
-python - <<'PY'
+```
+
+```python
 import json
+
 items = json.load(open(r"<outdir>/packs/models/manifest.json", encoding="utf-8"))["Items"]
 names = sorted({i["Name"] for i in items})
 print(len(items), len(names))
-print(sum(n.lower().endswith(".#ft") for n in names), "fragments")
+print(sum(1 for i in items if i.get("IsFragment")), "fragments")
 print([n for n in names if "lucia" in n.lower()])
-PY
 ```
 
 The fragment and skinning fields are in the same manifest; the skeleton measurements are in
