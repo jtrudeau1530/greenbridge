@@ -4,10 +4,6 @@ Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, an
 upstream `rpf9-explorer` fixes that close it. The fixes are merged upstream and the submodule is
 pinned at `e293917`, where a full ten-archive re-count recovers **382,781 models** (**0 decode
 failures**), up from 350,251 at `917e9b9` and 190,792 at `c3708fb`.
-upstream `rpf9-explorer` fix that closes it. The fix is merged upstream and the submodule is
-pinned at `e293917` (the 350,251-model counts below were measured at `917e9b9`, before
-upstream `v1.2` PRs #8-#12 landed; the non-`levels.rpf` archives were then re-counted at
-`e293917`).
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -256,11 +252,8 @@ The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archiv
 24,034 models (26,585 at `e293917`), and the other archives' new-pin counts are in the table above.
 The rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,251,
 and the `e293917` re-count outside `levels.rpf` is 39,454. Triangle totals have not been re-run at
-either new pin.
-24,034 models (26,585 at `e293917`), and the other archives' counts are in the tables above. The
-rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,251.
-Triangle totals for that pin have not been re-run; the `e293917` `levels.rpf` geometry cells are
-not independently reproduced (see the table note above).
+either new pin; the `e293917` `levels.rpf` geometry cells are not independently reproduced (see
+the table note above).
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
