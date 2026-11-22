@@ -999,5 +999,161 @@ class TestRegisterAliasing(unittest.TestCase):
                 self.assertEqual(res_wave[lane], canary_vals[lane])
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Isolation for v_interp_p2_f16
+# ==============================================================================
+
+@dataclass
+class InterpStatusFlags:
+    invalid_op: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    nan: bool = False
+
+
+def compute_interp_p2_f16_status_flags(
+    j_val: float,
+    p20_val: float,
+    p1_accum: float,
+    res_u16: int,
+) -> InterpStatusFlags:
+    """Compute IEEE-754 exception and status flags for v_interp_p2_f16."""
+    flags = InterpStatusFlags()
+    if math.isnan(j_val) or math.isnan(p20_val) or math.isnan(p1_accum):
+        flags.invalid_op = True
+    elif (math.isinf(j_val) and p20_val == 0.0) or (j_val == 0.0 and math.isinf(p20_val)):
+        flags.invalid_op = True
+
+    if is_nan_f16(res_u16):
+        flags.nan = True
+        flags.invalid_op = True
+    else:
+        sign = (res_u16 >> 15) & 1
+        flags.negative = bool(sign)
+        if (res_u16 & 0x7FFF) == 0:
+            flags.zero = True
+        elif res_u16 in (H_POS_INF, H_NEG_INF):
+            if not math.isinf(j_val) and not math.isinf(p20_val) and not math.isinf(p1_accum):
+                flags.overflow = True
+                flags.inexact = True
+        elif (res_u16 & 0x7C00) == 0 and (res_u16 & 0x03FF) != 0:
+            flags.underflow = True
+
+    return flags
+
+
+def ref_cmp_f16(op: str, a_u16: int, b_u16: int) -> bool:
+    """Evaluate 16-bit float comparison."""
+    if op in ("u", "unordered"):
+        return is_nan_f16(a_u16) or is_nan_f16(b_u16)
+    if is_nan_f16(a_u16) or is_nan_f16(b_u16):
+        return op in ("ne", "neq", "!=")
+
+    v_a = u16_to_f16(a_u16)
+    v_b = u16_to_f16(b_u16)
+    if op in ("eq", "=="):
+        return v_a == v_b
+    elif op in ("ne", "!="):
+        return v_a != v_b
+    elif op in ("lt", "<"):
+        return v_a < v_b
+    elif op in ("le", "<="):
+        return v_a <= v_b
+    elif op in ("gt", ">"):
+        return v_a > v_b
+    elif op in ("ge", ">="):
+        return v_a >= v_b
+    raise ValueError(f"Unknown comparison operator: {op}")
+
+
+def generate_interp_condition_mask_f16(op: str, a_lanes: List[int], b_lanes: List[int]) -> int:
+    """Generate per-lane condition bitmask (VCC) from comparisons on interpolation results."""
+    mask = 0
+    for lane, (a, b) in enumerate(zip(a_lanes, b_lanes)):
+        if ref_cmp_f16(op, a, b):
+            mask |= (1 << lane)
+    return mask
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_status_flags_invalid_nan(self):
+        # 0.0 * Inf
+        res = ref_interp_p2_f16(0.0, pack_f16_pair(H_POS_INF, 0), 1.0)
+        flags = compute_interp_p2_f16_status_flags(0.0, float("inf"), 1.0, unpack_f16_pair(res)[0])
+        self.assertTrue(flags.invalid_op)
+        self.assertTrue(flags.nan)
+
+    def test_status_flags_overflow(self):
+        # Extremely large values overflowing f16
+        res = ref_interp_p2_f16(1000.0, pack_f16_pair(f16_to_u16(500.0), 0), 1000.0)
+        res_u16 = unpack_f16_pair(res)[0]
+        self.assertEqual(res_u16, H_POS_INF)
+        flags = compute_interp_p2_f16_status_flags(1000.0, 500.0, 1000.0, res_u16)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+
+    def test_status_flags_zero_and_negative(self):
+        # Result = -2.0 (negative, non-zero)
+        res_neg = ref_interp_p2_f16(1.0, pack_f16_pair(f16_to_u16(-5.0), 0), 3.0)
+        flags_neg = compute_interp_p2_f16_status_flags(1.0, -5.0, 3.0, unpack_f16_pair(res_neg)[0])
+        self.assertTrue(flags_neg.negative)
+        self.assertFalse(flags_neg.zero)
+
+        # Result = -0.0
+        res_neg_zero = ref_interp_p2_f16(1.0, pack_f16_pair(H_NEG_ZERO, 0), -0.0)
+        flags_nz = compute_interp_p2_f16_status_flags(1.0, -0.0, -0.0, unpack_f16_pair(res_neg_zero)[0])
+        self.assertTrue(flags_nz.negative)
+        self.assertTrue(flags_nz.zero)
+
+    def test_vcc_and_scc_preserved(self):
+        # In RDNA2, VINTRP instructions do not write or clobber VCC / SCC carry/borrow bits
+        state = SIMDState(wave_size=32)
+        sim = SIMDInterpInterpreter()
+        state.vcc = 0x12345678_9ABCDEF0
+        state.scc = 1
+
+        state.attributes.write_param_channel(2, 0, 0, pack_f16_pair(f16_to_u16(2.0), 0))
+        state.set_vgpr_f32_wave(1, [0.5] * 32)
+        state.set_vgpr_f32_wave(0, [1.0] * 32)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_P2_F16,
+            dst=ASTOperand(0),
+            src_j=ASTOperand(1),
+            attr=AttributeRef(0, Channel.X),
+        )
+        sim.step(inst, state)
+        self.assertEqual(state.vcc, 0x12345678_9ABCDEF0)
+        self.assertEqual(state.scc, 1)
+
+    def test_condition_code_mask_generation(self):
+        # Generate condition mask based on interpolation results across 4 lanes:
+        # [ -2.0, 0.0, 2.0, NaN ]
+        interp_res = [
+            f16_to_u16(-2.0),
+            H_POS_ZERO,
+            f16_to_u16(2.0),
+            H_QNAN,
+        ]
+        zeros = [H_POS_ZERO] * 4
+
+        mask_lt = generate_interp_condition_mask_f16("<", interp_res, zeros)
+        self.assertEqual(mask_lt, 0b0001)
+
+        mask_eq = generate_interp_condition_mask_f16("==", interp_res, zeros)
+        self.assertEqual(mask_eq, 0b0010)
+
+        mask_gt = generate_interp_condition_mask_f16(">", interp_res, zeros)
+        self.assertEqual(mask_gt, 0b0100)
+
+        mask_u = generate_interp_condition_mask_f16("u", interp_res, zeros)
+        self.assertEqual(mask_u, 0b1000)
+
+
 if __name__ == "__main__":
     unittest.main()
