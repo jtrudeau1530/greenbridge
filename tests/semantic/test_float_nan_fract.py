@@ -1,8 +1,20 @@
-"""Float min/max/min3/max3/med3 with a quiet NaN and v_fract next to 1.0, translated and executed.
+from __future__ import annotations
+
+"""Float min/max/min3/max3/med3 with quiet/signaling NaN, payload preservation, and v_fract near 1.0.
 
 The expected words were measured on RDNA2 hardware: AMD Radeon RX 6800 (gfx1030), with the hw-oracle tool from
 the AnyPS5 project, in all four IEEE/DX10_CLAMP mode combinations and in wave32 and wave64 (docs/design.md,
 "Float min/max/med3 with NaN, v_fract"). The rules:
+  * IEEE 754 binary32 NaN layout:
+    - Sign bit: [31]
+    - Exponent: [30:23] = 0xFF (all 1s)
+    - Mantissa: [22:0] != 0
+    - Quiet NaN (qNaN): MSB of mantissa (bit 22) is 1. Payload in bits [21:0]. Canonical qNaN is 0x7FC00000.
+    - Signaling NaN (sNaN): MSB of mantissa (bit 22) is 0, payload in bits [21:0] is non-zero.
+  * RDNA2 ALU NaN handling & quieting:
+    - When an sNaN enters a float ALU operation, it is converted to a quiet NaN by setting bit 22 to 1.
+    - The custom mantissa payload in bits [21:0] is preserved where possible by unary rounding / transcendental
+      ops (v_floor_f32, v_ceil_f32, v_trunc_f32, v_rndne_f32).
   * v_min/v_max (f32, f16, each half of v_pk_min/max_f16): one NaN operand gives the other operand, bits
     unchanged; -0 < +0. Both NaN: here only "a NaN", since NMin/NMax leave the payload open.
   * v_min3/v_max3 = f(f(s0, s1), s2) with that min/max.
@@ -28,21 +40,104 @@ import support  # noqa: E402  (puts LEONIDA_TOOLS_DIR or tools/ on the path)
 import spirv_mini_interp as si  # noqa: E402
 
 rdna2spirv = support.rdna2spirv
+
+MASK32 = 0xFFFFFFFF
+EXP_MASK32 = 0x7F800000
+MANTISSA_MASK32 = 0x007FFFFF
+QUIET_BIT32 = 0x00400000
+PAYLOAD_MASK32 = 0x003FFFFF
+SIGN_BIT32 = 0x80000000
+
 NAN_A, NAN_B = 0x7FC10001, 0xFFC20002          # two quiet NaNs with different signs and payloads
 M25, P35, P50, P70, ONE = 0xC0200000, 0x40600000, 0x40A00000, 0x40E00000, 0x3F800000   # -2.5 3.5 5 7 1
 PZ, NZ = 0x00000000, 0x80000000
 PUSH = [0x1000, 0, 32, 0] + [0] * 28            # V#: base 0x1000, num_records 32
 
 
-def is_nan32(w):
-    return (w & 0x7F800000) == 0x7F800000 and w & 0x7FFFFF
+def is_nan32(w: int) -> bool:
+    return (w & EXP_MASK32) == EXP_MASK32 and bool(w & MANTISSA_MASK32)
 
 
-def is_nan16(h):
-    return (h & 0x7C00) == 0x7C00 and h & 0x3FF
+def is_qnan32(w: int) -> bool:
+    return is_nan32(w) and bool(w & QUIET_BIT32)
 
 
-def translate_text(body):
+def is_snan32(w: int) -> bool:
+    return is_nan32(w) and not bool(w & QUIET_BIT32)
+
+
+def nan_payload32(w: int) -> int:
+    return w & PAYLOAD_MASK32
+
+
+def nan_sign32(w: int) -> int:
+    return (w >> 31) & 1
+
+
+def make_qnan32(sign: int = 0, payload: int = 0) -> int:
+    return ((sign & 1) << 31) | EXP_MASK32 | QUIET_BIT32 | (payload & PAYLOAD_MASK32)
+
+
+def make_snan32(sign: int = 0, payload: int = 1) -> int:
+    pay = payload & PAYLOAD_MASK32
+    if pay == 0:
+        pay = 1
+    return ((sign & 1) << 31) | EXP_MASK32 | pay
+
+
+def quiet_nan32(w: int) -> int:
+    """RDNA2 quieting: forces bit 22 to 1, preserving sign and mantissa payload."""
+    return (w & MASK32) | QUIET_BIT32
+
+
+def ref_quiet_snan(w: int) -> int:
+    """If w is sNaN, return quieted NaN; otherwise return w unchanged."""
+    if is_snan32(w):
+        return quiet_nan32(w)
+    return w & MASK32
+
+
+def is_nan16(h: int) -> bool:
+    return (h & 0x7C00) == 0x7C00 and bool(h & 0x3FF)
+
+
+# Hand-worked test vectors for IEEE 754 NaN bitfields and quieting.
+NAN_BITFIELD_SAMPLES: tuple[tuple[str, int, bool, bool, int, int], ...] = (
+    # name, bits, is_qnan, is_snan, sign, payload
+    ("pos_canonical_qnan", 0x7FC00000, True, False, 0, 0),
+    ("neg_canonical_qnan", 0xFFC00000, True, False, 1, 0),
+    ("pos_qnan_min_payload", 0x7FC00001, True, False, 0, 1),
+    ("neg_qnan_min_payload", 0xFFC00001, True, False, 1, 1),
+    ("pos_qnan_alt_bits1", 0x7FD55555, True, False, 0, 0x155555),
+    ("neg_qnan_alt_bits2", 0xFFEAAAAA, True, False, 1, 0x2AAAAA),
+    ("pos_qnan_max_payload", 0x7FFFFFFF, True, False, 0, PAYLOAD_MASK32),
+    ("neg_qnan_max_payload", 0xFFFFFFFF, True, False, 1, PAYLOAD_MASK32),
+    ("pos_snan_min_payload", 0x7F800001, False, True, 0, 1),
+    ("neg_snan_min_payload", 0xFF800001, False, True, 1, 1),
+    ("pos_snan_alt_bits1", 0x7F955555, False, True, 0, 0x155555),
+    ("neg_snan_alt_bits2", 0xFFAAAAAA, False, True, 1, 0x2AAAAA),
+    ("pos_snan_max_payload", 0x7FBFFFFF, False, True, 0, PAYLOAD_MASK32),
+    ("neg_snan_max_payload", 0xFFBFFFFF, False, True, 1, PAYLOAD_MASK32),
+    ("pos_snan_custom_tag", 0x7FBA5A5A, False, True, 0, 0x3A5A5A),
+    ("neg_snan_custom_tag", 0xFFBA5A5A, False, True, 1, 0x3A5A5A),
+)
+
+NON_NAN_BOUNDARY_SAMPLES: tuple[tuple[str, int], ...] = (
+    ("pos_zero", 0x00000000),
+    ("neg_zero", 0x80000000),
+    ("pos_subnorm_min", 0x00000001),
+    ("neg_subnorm_min", 0x80000001),
+    ("pos_norm_min", 0x00800000),
+    ("pos_one", 0x3F800000),
+    ("neg_one", 0xBF800000),
+    ("pos_max_normal", 0x7F7FFFFF),
+    ("neg_max_normal", 0xFF7FFFFF),
+    ("pos_infinity", 0x7F800000),
+    ("neg_infinity", 0xFF800000),
+)
+
+
+def translate_text(body: str) -> str:
     """SPIR-V text for a pixel shader whose instructions are ``body`` (one per line)."""
     with tempfile.TemporaryDirectory() as tmp:
         os.mkdir(os.path.join(tmp, "disasm"))
@@ -68,11 +163,73 @@ v_mov_b32_e32 v0, 0
 """
 
 
-def run_op(line, inputs):
+def run_op(line: str, inputs: tuple[int, ...]) -> int:
     """Run ``line`` (writing v0, reading v1..v4 = inputs) and return the v0 word."""
     spv = translate_text(LOAD + line + "\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
     mem = {0x1000 + 4 * i: w for i, w in enumerate((list(inputs) + [0] * 4)[:4])}
     return support.mrt0_words(spv, push_constants=PUSH, memory=mem)[0]
+
+
+class NanBitfieldPayloadOracleTests(unittest.TestCase):
+    """Reference oracle tests for IEEE 754 NaN bitfield classification, payload preservation, and quieting."""
+
+    def test_nan_classification_and_payload_extraction(self):
+        for name, bits, want_qnan, want_snan, want_sign, want_payload in NAN_BITFIELD_SAMPLES:
+            with self.subTest(sample=name, bits=f"{bits:#010x}"):
+                self.assertTrue(is_nan32(bits))
+                self.assertEqual(is_qnan32(bits), want_qnan)
+                self.assertEqual(is_snan32(bits), want_snan)
+                self.assertEqual(nan_sign32(bits), want_sign)
+                self.assertEqual(nan_payload32(bits), want_payload)
+
+    def test_non_nan_boundary_rejection(self):
+        for name, bits in NON_NAN_BOUNDARY_SAMPLES:
+            with self.subTest(sample=name, bits=f"{bits:#010x}"):
+                self.assertFalse(is_nan32(bits))
+                self.assertFalse(is_qnan32(bits))
+                self.assertFalse(is_snan32(bits))
+
+    def test_make_qnan_and_snan_constructors(self):
+        for sign in (0, 1):
+            for payload in (0, 1, 0x1234, 0x155555, 0x2AAAAA, PAYLOAD_MASK32):
+                q = make_qnan32(sign, payload)
+                self.assertTrue(is_qnan32(q))
+                self.assertFalse(is_snan32(q))
+                self.assertEqual(nan_sign32(q), sign)
+                self.assertEqual(nan_payload32(q), payload)
+
+                s_pay = payload if payload != 0 else 1
+                s = make_snan32(sign, s_pay)
+                self.assertTrue(is_snan32(s))
+                self.assertFalse(is_qnan32(s))
+                self.assertEqual(nan_sign32(s), sign)
+                self.assertEqual(nan_payload32(s), s_pay)
+
+    def test_snan_quieting_preserves_sign_and_payload(self):
+        for name, bits, _, is_snan, want_sign, want_payload in NAN_BITFIELD_SAMPLES:
+            if not is_snan:
+                continue
+            with self.subTest(sample=name, bits=f"{bits:#010x}"):
+                quieted = quiet_nan32(bits)
+                self.assertTrue(is_qnan32(quieted))
+                self.assertFalse(is_snan32(quieted))
+                self.assertEqual(nan_sign32(quieted), want_sign)
+                self.assertEqual(nan_payload32(quieted), want_payload)
+                self.assertEqual(quieted, bits | QUIET_BIT32)
+                # Quieting an already quiet NaN must be idempotent.
+                self.assertEqual(quiet_nan32(quieted), quieted)
+                self.assertEqual(ref_quiet_snan(bits), quieted)
+                self.assertEqual(ref_quiet_snan(quieted), quieted)
+
+    def test_all_single_bit_payloads_roundtrip(self):
+        for bit_idx in range(22):
+            payload = 1 << bit_idx
+            for sign in (0, 1):
+                snan = make_snan32(sign, payload)
+                qnan = make_qnan32(sign, payload)
+                self.assertEqual(nan_payload32(snan), payload)
+                self.assertEqual(nan_payload32(qnan), payload)
+                self.assertEqual(quiet_nan32(snan), qnan)
 
 
 class MinMaxNaN(unittest.TestCase):
