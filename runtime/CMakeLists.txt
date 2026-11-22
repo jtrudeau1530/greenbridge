@@ -485,6 +485,20 @@ if(BUILD_TESTING)
     target_link_options(unimplemented_policy_test PRIVATE /OPT:NOREF)
     add_dependencies(unimplemented_policy_test gta6rt_tls_host)
     add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
+
+    # gta6rt --trace FILE (shims/startup_trace.h): a synthetic image with an unimplemented import, an
+    # OutputDebugStringA call and a read of address 0; checks the JSON lines. No game files, no GPU.
+    add_executable(startup_trace_test
+      test/startup_trace_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(startup_trace_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(startup_trace_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(startup_trace_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(startup_trace_test PRIVATE /OPT:NOREF)
+    add_dependencies(startup_trace_test gta6rt_tls_host)
+    add_test(NAME startup_trace COMMAND startup_trace_test)
   endif()
 
   if(TARGET device_proxy_test)

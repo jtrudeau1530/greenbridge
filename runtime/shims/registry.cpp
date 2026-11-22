@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::shims {
 namespace {
@@ -162,6 +163,9 @@ extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
         }
     }
     const uint64_t fail_value = cls == ReturnClass::HResult ? kENotImpl : 0;
+    if (first && startup_trace::enabled())
+        startup_trace::event("unimplemented_call", "\"import\":" + startup_trace::quote(what) +
+                                                       ",\"caller\":" + startup_trace::quote(module_offset(info->ret)));
 
     if (policy == UnimplementedPolicy::Stop) {
         std::fprintf(stderr,
@@ -312,6 +316,31 @@ bool mapped_image_base(uint64_t address, uint64_t& base) {
             return true;
         }
     return false;
+}
+
+std::string module_offset(uint64_t address) {
+    char b[48];
+    std::string module;
+    uint32_t rva = 0;
+    {
+        std::lock_guard lock(g_lookup_mutex);
+        for (auto& l : g_lookups)
+            if (l.fn(l.ctx, address, module, rva)) {
+                std::snprintf(b, sizeof b, "+0x%x", rva);
+                return module + b;
+            }
+    }
+    HMODULE host = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(address), &host) && host) {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(host, path, MAX_PATH);
+        const char* slash = std::strrchr(path, '\\');
+        std::snprintf(b, sizeof b, "+0x%llx", static_cast<unsigned long long>(address - reinterpret_cast<uint64_t>(host)));
+        return std::string("host:") + (slash ? slash + 1 : path) + b;
+    }
+    std::snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(address));
+    return b;
 }
 
 void remove_module_lookup(void* ctx) {
