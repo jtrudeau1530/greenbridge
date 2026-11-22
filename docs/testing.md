@@ -91,6 +91,8 @@ python -I scripts/run_gpu_tests.py --build runtime/build/linux     # Windows: th
 
 `--filter <text>` runs only matching tests, and `--work <dir>` keeps the intermediate files.
 
+**Rebuild the test programs after pulling.** The programs carry the V# and push-constant layout the translator expects. An executable from an older commit still loads and runs every shader, so a stale `vk_compute_test` does not fail loudly: when a newer translator starts enforcing a descriptor rule the old program does not set up (the raw V# in `pc[2..3]`, for one), every compute test reports the untouched `0xEEEEEEEE` fill pattern and the run looks like a translator regression. If all the compute tests in a run return that pattern, rebuild first (`cmake --build runtime/build/linux`, or `cmake --build runtime\build` on Windows) and run again before reading anything into the words.
+
 The two-step form, which `CONTRIBUTING.md` describes:
 
 ```sh
