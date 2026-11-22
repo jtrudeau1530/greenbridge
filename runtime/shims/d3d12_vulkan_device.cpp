@@ -2584,9 +2584,17 @@ public:
         }
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
-        if (stages[0].entry && stages[1].entry && !stages[1].entry->f16_halves.empty()) {
+        // stages[] is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is stages[2], and with a
+        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
+        Stage& vs_stage = stages[0];
+        Stage& gs_stage = stages[1];
+        Stage& ps_stage = stages[2];
+        if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
+            log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
+        }
+        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry && !ps_stage.entry->f16_halves.empty()) {
             std::string link_error;
-            if (!leonida::link_f16_halves(stages[0].words, *stages[0].entry, stages[1].words, *stages[1].entry,
+            if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
                                           &link_error)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
