@@ -18,6 +18,7 @@ Architectural model:
     [lo: bits 15..0, hi: bits 31..16].
 """
 
+from dataclasses import dataclass
 from enum import Enum, auto
 from fractions import Fraction
 import math
@@ -1328,6 +1329,238 @@ class TestFmaF16RegisterAliasing(unittest.TestCase):
         for lane in range(32):
             expected = float(lane) * 2.0 + 1.0
             self.assertEqual(wave.get_lane_vgpr_half_f16(lane, 0, HalfSel.LO), expected)
+
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_fma_f16_flags(
+    u0: int,
+    u1: int,
+    u2: int,
+    res_u16: int,
+    *,
+    neg0: bool = False,
+    neg1: bool = False,
+    neg2: bool = False,
+    abs0: bool = False,
+    abs1: bool = False,
+    abs2: bool = False,
+    clamp: bool = False,
+    omod: int = 0,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_fma_f16."""
+    s0 = apply_src_mods_u16(u0, neg=neg0, abs_=abs0)
+    s1 = apply_src_mods_u16(u1, neg=neg1, abs_=abs1)
+    s2 = apply_src_mods_u16(u2, neg=neg2, abs_=abs2)
+
+    s0_nan = is_nan_f16(s0)
+    s1_nan = is_nan_f16(s1)
+    s2_nan = is_nan_f16(s2)
+    s0_snan = is_snan_f16(s0)
+    s1_snan = is_snan_f16(s1)
+    s2_snan = is_snan_f16(s2)
+    s0_inf = is_inf_f16(s0)
+    s1_inf = is_inf_f16(s1)
+    s2_inf = is_inf_f16(s2)
+
+    invalid = False
+    if s0_snan or s1_snan or s2_snan:
+        invalid = True
+    elif (s0_inf and is_zero_f16(s1)) or (is_zero_f16(s0) and s1_inf):
+        invalid = True
+    elif (s0_inf or s1_inf) and s2_inf:
+        prod_sign = ((s0 >> 15) ^ (s1 >> 15)) & 1
+        s2_sign = (s2 >> 15) & 1
+        if prod_sign != s2_sign:
+            invalid = True
+
+    nan_flag = is_nan_f16(res_u16)
+    inf_flag = is_inf_f16(res_u16)
+    zero_flag = is_zero_f16(res_u16)
+    neg_flag = bool(res_u16 & SIGN_MASK_F16)
+    denorm_flag = (
+        is_subnormal_f16(s0)
+        or is_subnormal_f16(s1)
+        or is_subnormal_f16(s2)
+        or is_subnormal_f16(res_u16)
+    )
+
+    overflow = False
+    if not (s0_nan or s1_nan or s2_nan or s0_inf or s1_inf or s2_inf) and inf_flag:
+        overflow = True
+
+    underflow = False
+    if is_subnormal_f16(res_u16):
+        underflow = True
+
+    inexact = False
+    if overflow:
+        inexact = True
+    elif not (s0_nan or s1_nan or s2_nan or s0_inf or s1_inf or s2_inf or nan_flag or inf_flag):
+        f0 = u16_to_f16(s0)
+        f1 = u16_to_f16(s1)
+        f2 = u16_to_f16(s2)
+        exact_math = Fraction(f0) * Fraction(f1) + Fraction(f2)
+        if omod == 1:
+            exact_math *= 2
+        elif omod == 2:
+            exact_math *= 4
+        elif omod == 3:
+            exact_math /= 2
+        if clamp:
+            exact_math = min(Fraction(1), max(Fraction(0), exact_math))
+        res_f = u16_to_f16(res_u16)
+        if exact_math != Fraction(res_f):
+            inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def compute_f16_mantissa_fma_carry(u0: int, u1: int, u2: int) -> tuple[int, int]:
+    """Demonstrate IEEE 754 mantissa alignment and carry-out generation during FMA."""
+    _, exp0, frac0 = split_f16(u0)
+    _, exp1, frac1 = split_f16(u1)
+    _, exp2, frac2 = split_f16(u2)
+
+    m0 = (1 << 10) | frac0 if exp0 != 0 else frac0
+    m1 = (1 << 10) | frac1 if exp1 != 0 else frac1
+    m2 = (1 << 10) | frac2 if exp2 != 0 else frac2
+
+    m_prod = m0 * m1
+    exp_prod = (exp0 if exp0 != 0 else 1) + (exp1 if exp1 != 0 else 1) - 15
+    e2 = exp2 if exp2 != 0 else 1
+
+    m2_shifted = m2 << 10
+    if exp_prod > e2:
+        shift = min(exp_prod - e2, 30)
+        m2_aligned = m2_shifted >> shift
+        prod_aligned = m_prod
+    else:
+        shift = min(e2 - exp_prod, 30)
+        prod_aligned = m_prod >> shift
+        m2_aligned = m2_shifted
+
+    mant_sum = prod_aligned + m2_aligned
+    carry_out = 1 if mant_sum >= (1 << 21) else 0
+    return mant_sum, carry_out
+
+
+class TestFmaF16ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for status flags, condition codes, and carry generation."""
+
+    def test_exact_finite_flags(self):
+        u0 = f16_to_u16(1.0)
+        u1 = f16_to_u16(2.0)
+        u2 = f16_to_u16(0.5)
+        res = ref_fma_f16_u16(u0, u1, u2)
+        flags = evaluate_v_fma_f16_flags(u0, u1, u2, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flag(self):
+        # 1.0009765625 * 1.0009765625 + 0.0 has inexact remainder 2^-20
+        u0 = 0x3C01
+        u1 = 0x3C01
+        u2 = 0x0000
+        res = ref_fma_f16_u16(u0, u1, u2)
+        flags = evaluate_v_fma_f16_flags(u0, u1, u2, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+
+    def test_overflow_flag(self):
+        # 60000.0 * 2.0 + 0.0 overflows max normal f16 (65504.0) to +inf
+        u0 = f16_to_u16(60000.0)
+        u1 = f16_to_u16(2.0)
+        u2 = 0x0000
+        res = ref_fma_f16_u16(u0, u1, u2)
+        flags = evaluate_v_fma_f16_flags(u0, u1, u2, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+        self.assertTrue(flags.infinite)
+        self.assertFalse(flags.invalid)
+
+    def test_underflow_flag(self):
+        # Smallest subnormal result
+        u0 = 0x3C01
+        u1 = 0x3C01
+        u2 = 0xBC02
+        res = ref_fma_f16_u16(u0, u1, u2)
+        self.assertEqual(res, 0x0010)
+        flags = evaluate_v_fma_f16_flags(u0, u1, u2, res)
+        self.assertTrue(flags.underflow)
+        self.assertTrue(flags.denormal)
+
+    def test_invalid_operation_flags(self):
+        # Signaling NaN
+        u_snan = F16_SNAN
+        res1 = ref_fma_f16_u16(u_snan, F16_ONE, F16_POS_ZERO)
+        flags1 = evaluate_v_fma_f16_flags(u_snan, F16_ONE, F16_POS_ZERO, res1)
+        self.assertTrue(flags1.invalid)
+        self.assertTrue(flags1.nan)
+
+        # Inf * 0
+        res2 = ref_fma_f16_u16(F16_POS_INF, F16_POS_ZERO, F16_ONE)
+        flags2 = evaluate_v_fma_f16_flags(F16_POS_INF, F16_POS_ZERO, F16_ONE, res2)
+        self.assertTrue(flags2.invalid)
+        self.assertTrue(flags2.nan)
+
+        # (+inf) + (-inf)
+        res3 = ref_fma_f16_u16(F16_POS_INF, F16_ONE, F16_NEG_INF)
+        flags3 = evaluate_v_fma_f16_flags(F16_POS_INF, F16_ONE, F16_NEG_INF, res3)
+        self.assertTrue(flags3.invalid)
+        self.assertTrue(flags3.nan)
+
+    def test_zero_and_negative_condition_codes(self):
+        # Negative zero
+        res_neg0 = ref_fma_f16_u16(F16_NEG_ZERO, F16_ONE, F16_NEG_ZERO)
+        flags_neg0 = evaluate_v_fma_f16_flags(F16_NEG_ZERO, F16_ONE, F16_NEG_ZERO, res_neg0)
+        self.assertTrue(flags_neg0.zero)
+        self.assertTrue(flags_neg0.negative)
+
+        # Positive zero
+        res_pos0 = ref_fma_f16_u16(F16_POS_ZERO, F16_ONE, F16_POS_ZERO)
+        flags_pos0 = evaluate_v_fma_f16_flags(F16_POS_ZERO, F16_ONE, F16_POS_ZERO, res_pos0)
+        self.assertTrue(flags_pos0.zero)
+        self.assertFalse(flags_pos0.negative)
+
+    def test_mantissa_carry_generation(self):
+        # 1.0 * 1.0 + 1.0 -> mantissas: (1 << 20) + (1 << 20) = (1 << 21) -> carry out = 1
+        _, carry1 = compute_f16_mantissa_fma_carry(F16_ONE, F16_ONE, F16_ONE)
+        self.assertEqual(carry1, 1)
+
+        # 1.0 * 1.0 + 0.25 -> mantissas sum < (1 << 21) -> carry out = 0
+        _, carry0 = compute_f16_mantissa_fma_carry(F16_ONE, F16_ONE, f16_to_u16(0.25))
+        self.assertEqual(carry0, 0)
 
 
 if __name__ == "__main__":
