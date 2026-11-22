@@ -913,6 +913,29 @@ class CliInputTest(unittest.TestCase):
                 self.assertIn("index.json", p.stderr)
                 self.assertFalse(os.path.exists(out))
 
+    def test_out_overwriting_input_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            manifest = os.path.join(tmp, "carve", "a", "index.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", manifest)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("output would overwrite an input manifest", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            with open(manifest, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"files": []})
+
+    def test_out_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", tmp)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("is a directory", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
