@@ -9,6 +9,14 @@ executable is in place; booting can start as soon as `game_scarlett_master.exe` 
   reports that quote game data are never committed, uploaded or shared. `reports/` is git-ignored for this reason.
 - Nothing in this folder decrypts, unpacks or works around Xbox package protection. The tools only read files that
   are already plain on disk.
+- The store keeps the game as one packaged container (`.xvc`): an XVD file whose contents are encrypted, so the
+  build can't use it and needs the folder that holds `MicrosoftGame.Config`. Given one as `--game`, finding one
+  with `--find`, or finding one alone in the folder given, `make_game.py` reads only its plain 4 KiB header to say
+  what it is instead of "not found". Fields read, at file offsets (xvdtool's `XvdHeader` + 0x200 for the
+  signature in front of it), checked on one 1.0.2.1 package: `msft-xvd` magic at 0x200; VolumeFlags at 0x208
+  (`0x41`, ReadOnly and RegionIdInXts; EncryptionDisabled `0x2` is clear); ContentType at 0x284 (1, Title);
+  XvcDataLength at 0x290 (non-zero for an XVC); PackageVersion at 0x3BC, four u16 stored lowest part first
+  (1, 2, 0, 1 is 1.0.2.1). No key field is read.
 
 ## Why a loader before a recompiler
 
