@@ -6,7 +6,7 @@ From the repository root, build with Rust/Cargo and run in the Python environmen
 
 ```text
 python -m pip install numpy
-cargo build --release --locked --manifest-path tools/bcpack_calibration/Cargo.toml
+cargo build --release --locked --offline --manifest-path tools/bcpack_calibration/Cargo.toml
 python -IB tests/test_calibrated_texture.py -v
 python -I tools/ttpf_mips.py export path/to/pool.ttpf 0 output.dds --calibration path/to/profile.json
 ```
@@ -30,4 +30,4 @@ The top-level JSON object contains `"version": 1` and the sections used by the r
 - `bc7.labels` has 1,024 rows of mode, partition, rotation and index selection indexed by the two signature symbols. `anchors` contains 128 unsigned 16-bit masks. Each entry of `seeds` is a 256 × 56 × 2 array indexed by age and field with left-aligned byte value and known-bit count. Tables are named `base`, `secondary`, `early` and `refined`. Optional fitted endpoint adjustments are keyed by SHA-256 of the contiguous lane-symbol matrix followed by little-endian signed 64-bit unresolved block indices. Each adjustment gives age, endpoint field and fitted byte value.
 - Optional `entries` maps pool basename and zero-based index to a profile name (default `base`). Optional `compatibility` maps a compressed BC1 stream's SHA-256 to a list of flattened symbol positions. Rotate the symbols at those positions left once to reproduce a known historical feeder ordering.
 
-The Rust entropy reader comes from the pinned `bcpack-rs` dependency. The Python reader handles streams for which that reader does not report full consumption. The fitted BC7 reconstruction tracks precision while decoding blocks in archive order. Visible blocks must resolve before the DDS is written.
+Cargo builds the entropy decoder from the two upstream modules included in `third_party/bcpack-rs`. With the Rust toolchain installed, this step works offline with an empty Cargo cache. The [source and license notes](../../third_party/bcpack-rs/README.md) identify the upstream revision. The Python reader handles streams for which that reader does not report full consumption. The fitted BC7 reconstruction tracks precision while decoding blocks in archive order. Visible blocks must resolve before the DDS is written.
