@@ -19,9 +19,13 @@ Architecture:
       * op_sel: selects low or high 16-bit half for src0, src1, and dst independently.
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from fractions import Fraction
 import math
+import re
 import struct
+from typing import Optional, Union
 import unittest
 
 MASK16: int = 0xFFFF
@@ -377,6 +381,239 @@ def ref_subrev_f16_rational(
     return apply_f16_output_mods(res_bits, clamp)
 
 
+# ============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ============================================================================
+
+class Opcode(Enum):
+    V_SUBREV_F16 = "v_subrev_f16"
+
+
+class Encoding(Enum):
+    VOP2 = "vop2"
+    VOP3 = "vop3"
+
+
+class RegKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+class DataType(Enum):
+    F16 = auto()
+    F32 = auto()
+    I16 = auto()
+    I32 = auto()
+    U16 = auto()
+    U32 = auto()
+
+
+@dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+    hi: bool = False  # True: high 16-bit half (bits 16..31); False: low (0..15)
+
+    def validate(self) -> None:
+        if self.kind == RegKind.VGPR:
+            if not (0 <= self.index < 256):
+                raise ValueError(f"VGPR index {self.index} out of valid range [0, 255].")
+        elif self.kind == RegKind.SGPR:
+            if not (0 <= self.index < 106):
+                raise ValueError(f"SGPR index {self.index} out of valid range [0, 105].")
+
+    def __str__(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        suffix = ".h" if self.hi else ""
+        return f"{prefix}{self.index}{suffix}"
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg: Optional[Register] = None
+    imm_val: Optional[Union[float, int]] = None
+    abs_mod: bool = False
+    neg_mod: bool = False
+    dtype: DataType = DataType.F16
+
+    def is_register(self) -> bool:
+        return self.reg is not None
+
+    def is_literal(self) -> bool:
+        return self.imm_val is not None
+
+    def validate(self) -> None:
+        if self.reg is None and self.imm_val is None:
+            raise ValueError("Operand must specify either register or immediate value.")
+        if self.reg is not None and self.imm_val is not None:
+            raise ValueError("Operand cannot specify both register and immediate value.")
+        if self.reg is not None:
+            self.reg.validate()
+        if self.dtype != DataType.F16:
+            raise TypeError(f"v_subrev_f16 expects F16 operand data type, got {self.dtype}.")
+
+    def __str__(self) -> str:
+        if self.reg is not None:
+            base = str(self.reg)
+        elif isinstance(self.imm_val, float):
+            base = f"{self.imm_val}"
+        else:
+            base = f"{self.imm_val:#x}"
+        if self.abs_mod:
+            base = f"|{base}|"
+        if self.neg_mod:
+            base = f"-{base}"
+        return base
+
+
+@dataclass
+class InstructionModifiers:
+    clamp: bool = False
+    omod: str = "none"  # "none", "mul:2", "mul:4", "div:2"
+    op_sel: tuple[bool, bool, bool] = (False, False, False)  # (src0_hi, src1_hi, dst_hi)
+
+    def validate(self, encoding: Encoding) -> None:
+        if encoding == Encoding.VOP2:
+            if self.clamp:
+                raise ValueError("VOP2 encoding does not support clamp modifier.")
+            if self.omod != "none":
+                raise ValueError(f"VOP2 encoding does not support omod modifier {self.omod}.")
+            if any(self.op_sel):
+                raise ValueError("VOP2 encoding does not support op_sel modifier.")
+        if self.omod not in ("none", "mul:2", "mul:4", "div:2"):
+            raise ValueError(f"Invalid omod value: {self.omod}.")
+
+
+@dataclass
+class InstructionAST:
+    opcode: Opcode
+    dst: Register
+    src0: Operand
+    src1: Operand
+    mods: InstructionModifiers = field(default_factory=InstructionModifiers)
+    encoding: Encoding = Encoding.VOP2
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.V_SUBREV_F16:
+            raise ValueError(f"Unsupported opcode: {self.opcode}.")
+        if self.dst.kind != RegKind.VGPR:
+            raise TypeError("VALU destination register must be a VGPR.")
+        self.dst.validate()
+        self.src0.validate()
+        self.src1.validate()
+        if self.encoding == Encoding.VOP2:
+            if self.src0.abs_mod or self.src0.neg_mod or self.src1.abs_mod or self.src1.neg_mod:
+                raise ValueError("VOP2 encoding does not support input modifiers (abs/neg).")
+        self.mods.validate(self.encoding)
+
+    def to_asm(self) -> str:
+        self.validate()
+        suffix = "_e64" if self.encoding == Encoding.VOP3 else "_e32"
+        op_name = f"{self.opcode.value}{suffix}"
+        dst_str = str(self.dst)
+        src0_str = str(self.src0)
+        src1_str = str(self.src1)
+        parts = [f"{op_name} {dst_str}, {src0_str}, {src1_str}"]
+        if self.mods.clamp:
+            parts.append("clamp")
+        if self.mods.omod != "none":
+            parts.append(self.mods.omod)
+        if any(self.mods.op_sel):
+            sel_str = f"op_sel:[{int(self.mods.op_sel[0])},{int(self.mods.op_sel[1])},{int(self.mods.op_sel[2])}]"
+            parts.append(sel_str)
+        return " ".join(parts)
+
+
+def parse_subrev_f16_asm(asm_text: str) -> InstructionAST:
+    """Parse a single assembly instruction line into an InstructionAST."""
+    tokens = asm_text.strip().split()
+    if not tokens:
+        raise ValueError("Empty assembly instruction.")
+
+    op_token = tokens[0].rstrip(",")
+    if "v_subrev_f16" not in op_token:
+        raise ValueError(f"Expected v_subrev_f16 opcode, got: {op_token}")
+
+    is_e64 = "_e64" in op_token or any(
+        t in ("clamp", "mul:2", "mul:4", "div:2") or t.startswith("op_sel")
+        for t in tokens
+    )
+    encoding = Encoding.VOP3 if is_e64 else Encoding.VOP2
+
+    rest = " ".join(tokens[1:])
+    operands_raw = [
+        o.strip()
+        for o in re.split(r",|\s+", rest)
+        if o.strip()
+        and not o.startswith("clamp")
+        and not o.startswith("mul:")
+        and not o.startswith("div:")
+        and not o.startswith("op_sel")
+    ]
+
+    if len(operands_raw) < 3:
+        raise ValueError(f"v_subrev_f16 requires at least 3 operands (dst, src0, src1), got: {operands_raw}")
+
+    dst_tok = operands_raw[0]
+    dst_hi = dst_tok.endswith(".h")
+    dst_idx = int(re.search(r"v(\d+)", dst_tok).group(1))
+    dst = Register(RegKind.VGPR, dst_idx, hi=dst_hi)
+
+    def parse_operand(tok: str) -> Operand:
+        abs_m = (tok.startswith("|") and tok.endswith("|")) or ("-|" in tok)
+        neg_m = tok.startswith("-")
+        clean = tok.replace("-", "").replace("|", "")
+
+        if clean.startswith("v"):
+            hi = clean.endswith(".h")
+            idx = int(re.search(r"v(\d+)", clean).group(1))
+            return Operand(reg=Register(RegKind.VGPR, idx, hi=hi), abs_mod=abs_m, neg_mod=neg_m, dtype=DataType.F16)
+        elif clean.startswith("s"):
+            hi = clean.endswith(".h")
+            idx = int(re.search(r"s(\d+)", clean).group(1))
+            return Operand(reg=Register(RegKind.SGPR, idx, hi=hi), abs_mod=abs_m, neg_mod=neg_m, dtype=DataType.F16)
+        else:
+            if "." in clean or "e" in clean.lower():
+                val = float(clean)
+            elif clean.startswith("0x") or clean.startswith("0X"):
+                val = int(clean, 16)
+            else:
+                val = int(clean)
+            return Operand(imm_val=val, abs_mod=abs_m, neg_mod=neg_m, dtype=DataType.F16)
+
+    src0 = parse_operand(operands_raw[1])
+    src1 = parse_operand(operands_raw[2])
+
+    clamp_m = "clamp" in tokens
+    omod_m = "none"
+    for t in tokens:
+        if t in ("mul:2", "mul:4", "div:2"):
+            omod_m = t
+
+    op_sel = (False, False, False)
+    for t in tokens:
+        if t.startswith("op_sel:"):
+            m = re.search(r"op_sel:\[(\d+),(\d+),(\d+)\]", t)
+            if m:
+                op_sel = (bool(int(m.group(1))), bool(int(m.group(2))), bool(int(m.group(3))))
+
+    mods = InstructionModifiers(clamp=clamp_m, omod=omod_m, op_sel=op_sel)
+    ast = InstructionAST(
+        opcode=Opcode.V_SUBREV_F16,
+        dst=dst,
+        src0=src0,
+        src1=src1,
+        mods=mods,
+        encoding=encoding,
+    )
+    ast.validate()
+    return ast
+
+
+# ============================================================================
+# Unit Tests
+# ============================================================================
+
 class TestValuSubrevF16Oracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and architectural model of v_subrev_f16."""
 
@@ -514,6 +751,108 @@ class TestValuSubrevF16Oracle(unittest.TestCase):
         # omod div:2
         res_d2 = ref_subrev_f16(ONE_F16, TWO_F16, omod="div:2")  # (2.0 - 1.0) / 2 = 0.5
         self.assertEqual(bits_to_f16(res_d2), 0.5)
+
+
+class TestValuSubrevF16SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions for v_subrev_f16."""
+
+    def test_ast_valid_creation_vop2_and_vop3(self) -> None:
+        # VOP2
+        ast_vop2 = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Operand(reg=Register(RegKind.VGPR, 1)),
+            src1=Operand(reg=Register(RegKind.VGPR, 2)),
+            encoding=Encoding.VOP2,
+        )
+        ast_vop2.validate()
+        self.assertEqual(ast_vop2.to_asm(), "v_subrev_f16_e32 v0, v1, v2")
+
+        # VOP3
+        ast_vop3 = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0, hi=True),
+            src0=Operand(reg=Register(RegKind.VGPR, 1), abs_mod=True, neg_mod=True),
+            src1=Operand(reg=Register(RegKind.SGPR, 2)),
+            mods=InstructionModifiers(clamp=True, omod="mul:2", op_sel=(False, True, True)),
+            encoding=Encoding.VOP3,
+        )
+        ast_vop3.validate()
+        self.assertEqual(ast_vop3.to_asm(), "v_subrev_f16_e64 v0.h, -|v1|, s2 clamp mul:2 op_sel:[0,1,1]")
+
+    def test_ast_to_asm_formatting(self) -> None:
+        ast = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 5),
+            src0=Operand(imm_val=1.5),
+            src1=Operand(reg=Register(RegKind.VGPR, 10)),
+            mods=InstructionModifiers(clamp=True),
+            encoding=Encoding.VOP3,
+        )
+        self.assertEqual(ast.to_asm(), "v_subrev_f16_e64 v5, 1.5, v10 clamp")
+
+    def test_asm_parser_vop2(self) -> None:
+        ast = parse_subrev_f16_asm("v_subrev_f16_e32 v0, v1, v2")
+        self.assertEqual(ast.opcode, Opcode.V_SUBREV_F16)
+        self.assertEqual(ast.dst, Register(RegKind.VGPR, 0))
+        self.assertEqual(ast.src0.reg, Register(RegKind.VGPR, 1))
+        self.assertEqual(ast.src1.reg, Register(RegKind.VGPR, 2))
+        self.assertEqual(ast.encoding, Encoding.VOP2)
+        self.assertFalse(ast.mods.clamp)
+
+    def test_asm_parser_vop3_modifiers_and_op_sel(self) -> None:
+        ast = parse_subrev_f16_asm("v_subrev_f16_e64 v3.h, -|v1|, v2 clamp mul:4 op_sel:[1,0,1]")
+        self.assertEqual(ast.encoding, Encoding.VOP3)
+        self.assertTrue(ast.dst.hi)
+        self.assertEqual(ast.dst.index, 3)
+        self.assertTrue(ast.src0.abs_mod)
+        self.assertTrue(ast.src0.neg_mod)
+        self.assertTrue(ast.mods.clamp)
+        self.assertEqual(ast.mods.omod, "mul:4")
+        self.assertEqual(ast.mods.op_sel, (True, False, True))
+
+    def test_ast_validation_rejects_sgpr_dst(self) -> None:
+        ast = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.SGPR, 0),
+            src0=Operand(reg=Register(RegKind.VGPR, 1)),
+            src1=Operand(reg=Register(RegKind.VGPR, 2)),
+        )
+        with self.assertRaises(TypeError):
+            ast.validate()
+
+    def test_ast_validation_rejects_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256).validate()
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106).validate()
+
+    def test_ast_validation_rejects_vop2_with_clamp_or_mods(self) -> None:
+        ast_clamp = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Operand(reg=Register(RegKind.VGPR, 1)),
+            src1=Operand(reg=Register(RegKind.VGPR, 2)),
+            mods=InstructionModifiers(clamp=True),
+            encoding=Encoding.VOP2,
+        )
+        with self.assertRaises(ValueError):
+            ast_clamp.validate()
+
+        ast_neg = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Operand(reg=Register(RegKind.VGPR, 1), neg_mod=True),
+            src1=Operand(reg=Register(RegKind.VGPR, 2)),
+            encoding=Encoding.VOP2,
+        )
+        with self.assertRaises(ValueError):
+            ast_neg.validate()
+
+    def test_ast_validation_rejects_wrong_data_type(self) -> None:
+        op = Operand(reg=Register(RegKind.VGPR, 1), dtype=DataType.F32)
+        with self.assertRaises(TypeError):
+            op.validate()
 
 
 if __name__ == "__main__":
