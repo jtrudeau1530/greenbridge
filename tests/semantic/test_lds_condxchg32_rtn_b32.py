@@ -16,9 +16,9 @@ Semantics:
 from __future__ import annotations
 
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Tuple, Union
+from typing import List, Tuple, Union
 
 # RDNA2 Local Data Share (LDS) Architectural Constants
 LDS_SIZE_BYTES: int = 65536         # 64 KiB default capacity
@@ -355,6 +355,212 @@ class TestSymbolicAST(unittest.TestCase):
         imm1 = Immediate(42)
         imm2 = Immediate(42)
         self.assertEqual(imm1, imm2)
+
+
+# ==============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register and scratchpad state for scalar execution."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    lds: LDSModel = field(default_factory=LDSModel)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK_32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK_32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK_32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK_32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter for ds_condxchg32_rtn_b32."""
+
+    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
+        if isinstance(op, VGPR):
+            return state.get_vgpr(op.index)
+        if isinstance(op, SGPR):
+            return state.get_sgpr(op.index)
+        if isinstance(op, Immediate):
+            return op.value & MASK_32
+        raise TypeError(f"Unknown operand type: {type(op).__name__}")
+
+    def evaluate_condition(self, curr_mem: int, cmp_val: int, cond: Condition) -> bool:
+        if cond == Condition.EQ:
+            return curr_mem == cmp_val
+        if cond == Condition.NE:
+            return curr_mem != cmp_val
+        if cond == Condition.GT_U32:
+            return curr_mem > cmp_val
+        if cond == Condition.LT_U32:
+            return curr_mem < cmp_val
+        raise ValueError(f"Unsupported condition: {cond}")
+
+    def step(
+        self,
+        instr: DSCondxchg32Instruction,
+        state: ScalarMachineState,
+    ) -> Tuple[int, int, bool]:
+        """Execute a single ds_condxchg32_rtn_b32 instruction deterministically.
+        
+        All operands are latched before write-back to ensure operand preservation.
+        Returns:
+            (returned_old_val, updated_mem_val, exchanged)
+        """
+        # 1. Latch inputs
+        vaddr = state.get_vgpr(instr.addr.index)
+        cmp_val = self.resolve_operand(instr.cmp_val, state)
+        new_val = self.resolve_operand(instr.new_val, state)
+
+        # 2. Compute effective address and fetch current LDS value
+        eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+        curr_mem = state.lds.read_dword(eff_addr)
+
+        # 3. Evaluate conditional exchange
+        cond_met = self.evaluate_condition(curr_mem, cmp_val, instr.cond)
+        next_mem = new_val if cond_met else curr_mem
+
+        # 4. Atomic memory writeback
+        if cond_met:
+            state.lds.write_dword(eff_addr, next_mem)
+
+        # 5. Write return value to destination VGPR
+        state.set_vgpr(instr.dst.index, curr_mem)
+
+        return curr_mem, next_mem, cond_met
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_step_successful_exchange(self) -> None:
+        addr = 0x200
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0x12345678)  # cmp_val
+        self.state.set_vgpr(3, 0x9ABCDEF0)  # new_val
+        self.state.lds.write_dword(addr, 0x12345678)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(1),
+            cmp_val=VGPR(2),
+            new_val=VGPR(3),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 0x12345678)
+        self.assertEqual(mem, 0x9ABCDEF0)
+        self.assertEqual(self.state.get_vgpr(0), 0x12345678)
+        self.assertEqual(self.state.lds.read_dword(addr), 0x9ABCDEF0)
+
+    def test_scalar_step_failed_exchange_retains_mem(self) -> None:
+        addr = 0x300
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0xAAAAAAAA)  # cmp_val (mismatch)
+        self.state.set_vgpr(3, 0xBBBBBBBB)  # new_val
+        self.state.lds.write_dword(addr, 0x55555555)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(1),
+            cmp_val=VGPR(2),
+            new_val=VGPR(3),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertFalse(swapped)
+        self.assertEqual(old, 0x55555555)
+        self.assertEqual(mem, 0x55555555)
+        self.assertEqual(self.state.get_vgpr(0), 0x55555555)
+        self.assertEqual(self.state.lds.read_dword(addr), 0x55555555)
+
+    def test_scalar_step_with_sgpr_operands(self) -> None:
+        addr = 0x400
+        self.state.set_vgpr(1, addr)
+        self.state.set_sgpr(10, 0x11111111)  # cmp_val in SGPR
+        self.state.set_sgpr(11, 0x22222222)  # new_val in SGPR
+        self.state.lds.write_dword(addr, 0x11111111)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(4),
+            addr=VGPR(1),
+            cmp_val=SGPR(10),
+            new_val=SGPR(11),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 0x11111111)
+        self.assertEqual(mem, 0x22222222)
+        self.assertEqual(self.state.get_vgpr(4), 0x11111111)
+
+    def test_scalar_step_with_immediate_operands(self) -> None:
+        addr = 0x500
+        self.state.set_vgpr(1, addr)
+        self.state.lds.write_dword(addr, 0x42)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(5),
+            addr=VGPR(1),
+            cmp_val=Immediate(0x42),
+            new_val=Immediate(0x99),
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 0x42)
+        self.assertEqual(mem, 0x99)
+        self.assertEqual(self.state.get_vgpr(5), 0x42)
+        self.assertEqual(self.state.lds.read_dword(addr), 0x99)
+
+    def test_scalar_step_immediate_offset(self) -> None:
+        base_addr = 0x600
+        offset = 0x08
+        eff_addr = base_addr + offset
+        self.state.set_vgpr(2, base_addr)
+        self.state.lds.write_dword(eff_addr, 0x77777777)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(6),
+            addr=VGPR(2),
+            cmp_val=Immediate(0x77777777),
+            new_val=Immediate(0x88888888),
+            offset=offset,
+        )
+        old, mem, swapped = self.interp.step(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 0x77777777)
+        self.assertEqual(mem, 0x88888888)
+        self.assertEqual(self.state.lds.read_dword(eff_addr), 0x88888888)
+        # Check base address dword was not altered
+        self.assertEqual(self.state.lds.read_dword(base_addr), 0)
+
+    def test_scalar_step_alternate_condition_gt(self) -> None:
+        addr = 0x700
+        self.state.set_vgpr(1, addr)
+        self.state.lds.write_dword(addr, 100)
+
+        # Condition: curr_mem > 50 -> should swap
+        instr_gt = DSCondxchg32Instruction(
+            dst=VGPR(7),
+            addr=VGPR(1),
+            cmp_val=Immediate(50),
+            new_val=Immediate(200),
+            cond=Condition.GT_U32,
+        )
+        old, mem, swapped = self.interp.step(instr_gt, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 100)
+        self.assertEqual(mem, 200)
 
 
 if __name__ == "__main__":
