@@ -684,8 +684,9 @@ public:
     }
 
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
-                 const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock)
-        : desc_(desc), context_(context), queue_(context, queue, family, queue_kind_for(desc.Type)),
+                 const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock, std::shared_ptr<void> queue_lease)
+        : desc_(desc), context_(context), queue_lease_(std::move(queue_lease)),
+          queue_(context, queue, family, queue_kind_for(desc.Type)),
           vk_queue_(queue), family_(family), clock_(clock) {}
 
     ~CommandQueue() override {
@@ -918,6 +919,8 @@ private:
     D3D12_COMMAND_QUEUE_DESC desc_;
     leonida::VulkanContext& context_;
     std::mutex mutex_;
+    // Destroyed after queue_ has waited idle, so the handle cannot be reused prematurely.
+    std::shared_ptr<void> queue_lease_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
     VkQueue vk_queue_;
@@ -939,10 +942,10 @@ private:
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,
-                             const QueueClock& clock) {
+                             const QueueClock& clock, std::shared_ptr<void> queue_lease) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* object = new CommandQueue(context, queue, queue_family, desc, clock);
+    auto* object = new CommandQueue(context, queue, queue_family, desc, clock, std::move(queue_lease));
     if (!object->ok()) {
         object->Release();
         return E_FAIL;

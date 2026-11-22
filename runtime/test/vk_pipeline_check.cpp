@@ -442,7 +442,7 @@ int main(int argc, char** argv) {
     const std::vector<Item> work(all.begin() + lo, all.begin() + hi);
 
     // Scan selected shaders to request only the optional extensions they actually use.
-    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false;
+    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false;
     for (auto& [_, meta] : work) {
         if (meta->stage == "ms") want_mesh = true;
         if (meta->needs_maintenance8) want_m8 = true;
@@ -450,6 +450,7 @@ int main(int argc, char** argv) {
             if (feat == "meshShader") want_mesh = true;
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
+            else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
         }
     }
 
@@ -521,6 +522,13 @@ int main(int argc, char** argv) {
     const bool ext_m8 = link(&m8, reinterpret_cast<VkBaseOutStructure*>(&m8), VK_KHR_MAINTENANCE_8_EXTENSION_NAME, want_m8);
 #else
     (void)want_m8;
+#endif
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+    VkPhysicalDeviceShaderFmaFeaturesKHR fma{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+    const bool ext_fma = link(&fma, reinterpret_cast<VkBaseOutStructure*>(&fma), VK_KHR_SHADER_FMA_EXTENSION_NAME, want_fma);
+#else
+    const bool ext_fma = false;
+    (void)want_fma;
 #endif
     const bool ext_exe = link(&exe, reinterpret_cast<VkBaseOutStructure*>(&exe),
                               VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, !stats_path.empty());
@@ -601,6 +609,13 @@ int main(int argc, char** argv) {
             if (feat == "geometryShader" && !f2.features.geometryShader) return "no geometryShader";
             if (feat == "fragmentShaderBarycentric" && !(ext_bary && bary.fragmentShaderBarycentric)) return "no fragmentShaderBarycentric";
             if (feat == "fragmentShaderPixelInterlock" && !(ext_lock && lock.fragmentShaderPixelInterlock)) return "no fragmentShaderPixelInterlock";
+            if (feat == "shaderFmaFloat32") {
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+                if (!(ext_fma && fma.shaderFmaFloat32)) return "no VK_KHR_shader_fma (shaderFmaFloat32)";
+#else
+                return "no VK_KHR_shader_fma (shaderFmaFloat32)";
+#endif
+            }
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";

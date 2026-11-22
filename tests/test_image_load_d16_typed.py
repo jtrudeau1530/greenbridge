@@ -25,3 +25,21 @@ def test_d16_image_load_reads_integer_views(make_shader, mask, dst):
     assert "OpImageRead" not in spv and "StorageImageReadWithoutFormat" not in spv   # sampled aliases, not storage
     assert "PackHalf2x16" not in spv      # the float branch keeps the integer RTE f16 pack (#489)
     sh.validate(spv)
+
+
+def test_d16_integer_fetch_saturates_before_packing(make_shader):
+    shader = make_shader("image_load v3, v[1:2], s[8:15] dmask:0x9 dim:SQ_RSRC_IMG_2D d16\n"
+                         "s_waitcnt vmcnt(0)\nexp mrt0 v3, v3, v3, v3 done vm\ns_endpgm\n", name="ps_d16_sat")
+    text = shader.translate()
+    # R and A are both narrowed on each integer path. Full-width and float paths have different conversions.
+    for op, bounds in (("UMin", [65535]), ("SClamp", [0xffff8000, 32767])):
+        clamps = re.findall(rf"OpExtInst %\w+ %glsl {op} (%\w+(?: %\w+)+)", text)
+        assert len(clamps) == 2
+        for args in clamps:
+            bound_ids = args.split()[1:]
+            assert len(bound_ids) == len(bounds)
+            for bound, expected in zip(bound_ids, bounds):
+                cast = re.search(rf"{bound} = OpBitcast %int (%\w+)", text)
+                const = cast[1] if cast else bound
+                assert re.search(rf"{const} = OpConstant %uint {expected}\b", text)
+    shader.validate(text)

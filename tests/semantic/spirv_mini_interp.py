@@ -830,6 +830,13 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = fn(x, y)
             else:
                 raise UnsupportedConstruct(f"{op} on non-float")
+        elif op == "OpFmaKHR":
+            # SPV_KHR_fma: x * y + z correctly rounded, the same exact single rounding as GLSL Fma above (fma_f32)
+            x, y, z = (val(t) for t in a[1:4])
+            if isinstance(x, tuple):
+                values[res] = tuple(fma_f32(p, q, s) for p, q, s in zip(x, y, z))
+            else:
+                values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
         elif op == "OpFDiv":

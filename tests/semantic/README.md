@@ -58,6 +58,12 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   constants) through the interpreter, and checks that the words each `.asm` header derives are the ones `check.py`
   and `scripts/run_gpu_tests.py` expect. The two interp fixtures get the constants their vertex shader,
   `vs_interp_consts`, exports.
+- `test_vcmpx_forms.py` runs the 14 `v_cmpx` forms that had no test (`eq`/`gt`/`le`/`lt`/`ngt`/`nle` `_f32`,
+  `f_i32`, `t_u32`, `eq`/`gt`/`le` `_i64`, `ge`/`lt`/`ne` `_u64`) in both encodings: each on a table of
+  operands (NaN, signed zeros, infinities; 64-bit values that only one word or the sign tells apart), where
+  the pixel must survive exactly when Python's comparison of the operands holds, and on a 16-lane wave with
+  one lane switched off beforehand, where the lanes left running and an untouched VCC are checked. It also
+  runs the GPU test `ps_vcmpx_forms` and re-derives its four words.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
@@ -95,7 +101,7 @@ dynamic-bounds merge; no backward branches, loops, calls or switches), no textur
 Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
 undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
 through a float op lose NaN payloads (Python floats), so expected output words avoid NaN bit patterns; a
-signalling NaN read back through `OpBitcast` comes out quieted. `Fma` is exact: the product and sum are rationals,
+signalling NaN read back through `OpBitcast` comes out quieted. `Fma` and `OpFmaKHR` (SPV_KHR_fma, `--fma khr`) are exact: the product and sum are rationals,
 rounded once to binary32. `Exp2`/`Log2`/`Sqrt`/`InverseSqrt` are correctly rounded (Vulkan allows a few ULP), and
 inputs GLSL.std.450 or SPIR-V leave undefined (`Log2` of x <= 0, `OpFDiv` by zero, `FMax` of NaN...) raise
 `UnsupportedConstruct`. `Fract` is

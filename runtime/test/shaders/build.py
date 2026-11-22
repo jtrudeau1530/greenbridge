@@ -11,6 +11,8 @@ Compute shaders can override the default header with leading "; group: X,Y,Z" an
 The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
 their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
+With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
+VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 """
@@ -95,6 +97,8 @@ def translate_tests(work, names):
         cmd.append("--wave64-emulate")
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
+    if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR
+        cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode

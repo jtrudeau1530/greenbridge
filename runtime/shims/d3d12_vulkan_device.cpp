@@ -473,8 +473,12 @@ struct DeviceState {
             return {};
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if (desc.SampleDesc.Count != 1 ||
-                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                               D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+                return {};
+            if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+                (!color_attachment_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) ||
+                 ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                  !storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))))
                 return {};
             if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && r9g9b9e5_uav_emulated) {
                 log_once("R9G9B9E5_SHAREDEXP UAV unavailable natively, using mutable R32_UINT; format", desc.Format);
@@ -1614,6 +1618,7 @@ public:
 
     explicit Device(const VulkanDeviceInfo& info) {
         state_.info = info;
+        queue_busy_.resize(info.command_queues.size(), false);
         const auto get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
             info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
         state_.format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
@@ -1960,11 +1965,41 @@ public:
                                                  void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandQueue";
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
-        // Copy and compute queues share the one graphics VkQueue for now (section 8.2, question 12).
-        if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT) log_once("command queue type on the direct VkQueue:", desc->Type);
-        return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
-                                                                state_.info.queue_family, *desc, riid, out,
-                                                                identity(), state_.clock));
+        if (!out) return d3d12_trace::result(method, E_POINTER);
+        *out = nullptr;
+        if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+            desc->Type != D3D12_COMMAND_LIST_TYPE_COPY) return d3d12_trace::result(method, E_INVALIDARG);
+        // Caller-owned devices that only provide the legacy queue cannot acquire more handles from their VkDevice.
+        if (state_.info.command_queues.empty())
+            return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
+                                                                     state_.info.queue_family, *desc, riid, out,
+                                                                     identity(), state_.clock));
+        // Vulkan only guarantees ordering within a VkQueue. Assign a distinct handle to each live D3D12 queue;
+        // otherwise a Wait submitted before another queue's Signal can deadlock the shared handle.
+        std::size_t slot = queue_busy_.size();
+        {
+            std::lock_guard lock(queue_mutex_);
+            for (std::size_t i = 0; i < queue_busy_.size(); ++i) {
+                if (!queue_busy_[i]) {
+                    queue_busy_[i] = true;
+                    slot = i;
+                    break;
+                }
+            }
+        }
+        if (slot == queue_busy_.size()) {
+            std::fprintf(stderr, "[rt] d3d12: no independent Vulkan queue available\n");
+            return d3d12_trace::result(method, E_OUTOFMEMORY);
+        }
+        // Child holds a device reference until after the lease has been released.
+        std::shared_ptr<void> lease(nullptr, [this, slot](void*) {
+            std::lock_guard lock(queue_mutex_);
+            queue_busy_[slot] = false;
+        });
+        const VkQueue queue = state_.info.command_queues[slot];
+        return d3d12_trace::result(method, create_command_queue(*state_.context, queue,
+                                                                 state_.info.queue_family, *desc, riid, out,
+                                                                 identity(), state_.clock, std::move(lease)));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
@@ -2167,10 +2202,13 @@ public:
             const bool typeless_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
-            if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM) ||
-                rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
-                (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
+            if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
                 view = {};
+            } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
+                       (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
+                if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+                    (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format))
+                    view = {};
             } else if (typeless_rgba8 || typed_rgba8) {
                 const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
                 if (typeless_rgba8) {
@@ -3161,6 +3199,14 @@ public:
                     s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
                 }
             }
+            if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+                // D3D12 never renders to the shared-exponent format, but a Vulkan driver may: AMD's RDNA4 driver
+                // (26.11.2) gives E5B9G9R9_UFLOAT_PACK32 COLOR_ATTACHMENT and COLOR_ATTACHMENT_BLEND, which the
+                // checks above turned into render-target, blend and multisample support the PC runtime doesn't report.
+                s1 &= ~(D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
+                        D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
+                        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD);
+            }
             fs->Support1 = s1;
             fs->Support2 = s2;
             return d3d12_trace::result(method, S_OK);
@@ -3552,6 +3598,8 @@ private:
         return desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (region.Width || region.Height || region.Depth);
     }
 
+    std::mutex queue_mutex_;
+    std::vector<bool> queue_busy_;
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -4024,11 +4072,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.samplerMirrorClampToEdge = info.sampler_mirror_clamp_to_edge;
     if (!info.bindless)
         std::fprintf(stderr, "[rt] d3d12: the GPU lacks a descriptor-indexing feature the bindless set needs\n");
-    const float priority = 1.0f;
+    std::uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, families.data());
+    const std::uint32_t command_queue_count = std::min(16u, families[info.queue_family].queueCount);
+    std::vector<float> priorities(command_queue_count, 1.0f);
     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue_info.queueFamilyIndex = info.queue_family;
-    queue_info.queueCount = 1;
-    queue_info.pQueuePriorities = &priority;
+    queue_info.queueCount = command_queue_count;
+    queue_info.pQueuePriorities = priorities.data();
     VkPhysicalDeviceFeatures enable{};
     info.texture_compression_bc = chosen_bc;
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
@@ -4076,6 +4129,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
 
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+    // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
+    // Translated shaders built with `rdna2spirv.py --fma khr` need it (index capability FMAKHR, feature
+    // shaderFmaFloat32); when it is missing they must not be created, so use `--fma glsl` there.
+    VkPhysicalDeviceShaderFmaFeaturesKHR shader_fma{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_KHR_SHADER_FMA_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &shader_fma};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.shader_fma = shader_fma.shaderFmaFloat32 == VK_TRUE;
+        if (info.shader_fma) {
+            shader_fma.pNext = enable13.pNext;
+            enable13.pNext = &shader_fma;
+        }
+    }
+#endif
+
     // GetClockCalibration reads both clocks at once with calibrated timestamps (KHR, or the older EXT).
     const char* calibrated = nullptr;
     for (const char* name :
@@ -4094,6 +4165,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+    if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+#endif
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
@@ -4109,8 +4183,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return fail("vkCreateDevice failed");
     info.device = owned.device;
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
-    reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"))(
-        owned.device, info.queue_family, 0, &info.queue);
+    info.command_queues.resize(command_queue_count);
+    const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"));
+    for (std::uint32_t i = 0; i < command_queue_count; ++i)
+        get_queue(owned.device, info.queue_family, i, &info.command_queues[i]);
+    info.queue = info.command_queues[0];
     info.max_push_constants_size = chosen.limits.maxPushConstantsSize;
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,

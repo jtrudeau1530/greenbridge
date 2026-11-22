@@ -76,6 +76,38 @@ class PixelChecks(unittest.TestCase):
             with self.subTest(check=name):
                 self.assertFalse(check(empty)[0])
 
+    def test_partial_pixel_is_no_frame(self):
+        # TEST-29: a readback that ends mid-pixel is malformed, even with 4096 whole pixels before the tail.
+        odd = self.raw(struct.pack("<4f", 0.5, 0.25, 0.25, 0.125) * 4096 + b"\0" * 8)
+        self.assertEqual(rgt.read_raw_rgba32f(odd), [])
+        self.assertEqual(rgt.read_raw_u32(odd), [])
+        self.assertFalse(rgt.check_bary(odd)[0])
+
+    def test_remaining_checks_reject_short_and_nan_frames(self):
+        # TEST-29: the checks 662752cc did not reach.
+        def uniform(i_value):   # (s5, bit, i, w) with all three (s5, bit) kinds present
+            kinds = ((8, 1, 0.5), (8, 0, 0.1), (7, 0, 0.1))
+            return b"".join(struct.pack("<2I2f", s5, bit, i_value if i_value is not None else i, 0.0)
+                            for s5, bit, i in (kinds[k % 3] for k in range(4096)))
+        self.assertTrue(rgt.check_uniform_branch(self.raw(uniform(None)))[0])
+        self.assertIn("non-finite", rgt.check_uniform_branch(self.raw(uniform(NAN)))[1])
+        self.assertFalse(rgt.check_uniform_branch(self.raw(uniform(None)[:16 * 300]))[0])
+
+        flat = b"".join(struct.pack("<2I2f", 0x101, 0x102, (i % 64 + 0.5) / 64, (i // 64 + 0.5) / 64)
+                        for i in range(4096))
+        self.assertTrue(rgt.check_flat(self.raw(flat))[0])
+        self.assertIn("non-finite", rgt.check_flat(self.raw(struct.pack("<2I2f", 0x101, 0x102, NAN, NAN) * 4096))[1])
+        self.assertFalse(rgt.check_flat(self.raw(b""))[0])   # used to raise ValueError (max of nothing)
+
+        nan = self.raw(struct.pack("<4f", NAN, NAN, NAN, NAN) * 4096)
+        self.assertIn("non-finite", rgt.check_clip_half(nan, 0.5, 1.0)[1])
+
+        short = self.raw(b"".join(struct.pack("<4I", i % 32, (i % 32) ^ 9, (((i % 32) & 5) | 16) ^ 1, 0)
+                                  for i in range(64)))
+        ok, detail = rgt.check_bitmask_perm(short, "device: NVIDIA (subgroup 32..32)\nok 64x64\n")
+        self.assertIs(ok, False)
+        self.assertIn("4096", detail)
+
     def test_bitmask_perm_narrow_fragment_subgroup_skip(self):
         import check
         self.assertIs(rgt.bitmask_perm_narrow_skip, check.bitmask_perm_narrow_skip)

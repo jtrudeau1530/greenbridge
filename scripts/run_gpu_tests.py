@@ -214,14 +214,14 @@ def make_fs_passthru(loc: int) -> str:
 def read_raw_rgba32f(path: str) -> list[tuple[float, float, float, float]]:
     with open(path, "rb") as source:
         data = source.read()
-    n = len(data) // 16
+    n = len(data) // 16 if len(data) % 16 == 0 else 0   # a partial pixel means a malformed readback: no frame
     return [struct.unpack_from("<4f", data, 16 * i) for i in range(n)]
 
 
 def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     with open(path, "rb") as source:
         data = source.read()
-    n = len(data) // 16
+    n = len(data) // 16 if len(data) % 16 == 0 else 0   # a partial pixel means a malformed readback: no frame
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
@@ -331,6 +331,8 @@ def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
     px = read_raw_u32(raw_path)
     if skip := bitmask_perm_narrow_skip(msg, px):
         return None, str(skip)
+    if problem := frame_problem(px):
+        return False, problem
     bad = 0
     first = ""
     judged = 0
@@ -350,6 +352,13 @@ def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter (same table as check.py).
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
+             # the 14 v_cmpx forms: f32 and 64-bit operands from memory (derivations in the .asm header)
+             "ps_vcmpx_forms": {"VKH_SGPRS": "0x1000,0,96,0",
+                                "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x3f800000,0x1008=0x40000000,0x100c=0x80000000,"
+                                            "0x1010=0,0x1014=0xff800000,0x1018=0,0x101c=0,0x1020=0x80000000,0x1024=0,"
+                                            "0x1028=0x1,0x102c=0,0x1030=0x7,0x1034=0x80000000,0x1038=0x7,0x103c=0,"
+                                            "0x1040=0x1,0x1044=0x5,0x1048=0x80000000,0x104c=0x5,0x1050=0x7,0x1054=0x5,"
+                                            "0x1058=0x7,0x105c=0x5"},
              # float NaN / fract rows measured on RDNA2 hardware (see the .asm headers)
              "ps_fnan_med3": {"VKH_SGPRS": "0x1000,0,32,0",
                               "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"
@@ -362,7 +371,11 @@ def check_flat(raw_path: str) -> tuple[bool, str]:
     """ps_flat with vs_ids: the integer IDs come from the first (provoking) vertex, the UVs still interpolate."""
     with open(raw_path, "rb") as source:
         data = source.read()
+    if len(data) != 64 * 64 * 16:
+        return False, f"expected a 64x64 frame, got {len(data)} bytes"
     px = list(struct.iter_unpack("<2I2f", data))
+    if problem := frame_problem(px):
+        return False, problem
     w = int(len(px) ** 0.5)
     wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
     err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
@@ -389,6 +402,9 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     """ps_uniform_branch / ps_scc_mask32: s5 = 8 wherever the lane's own bit is set; a lane with bit 0 gets 8 when
     another lane of its wave has the bit (the wave-wide vote), else 7. All three kinds must occur, as in check.py:
     without a (8, bit 0) pixel the vote is not shown, and a translator that decides per lane would pass."""
+    # Only z (the barycentric i) is judged as a float; a NaN i passes both range tests below.
+    if problem := frame_problem([p[2:3] for p in px]):
+        return False, problem
     bad = 0
     n8 = 0
     n7 = 0
@@ -460,8 +476,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
     """Check 64x64 output with ClipDistance[0] = NDC x: left half (x < 32) clipped to clear (-1),
     right half (x >= 32) covered (2048/4096 pixels) with the gradient."""
     px = read_raw_rgba32f(raw_path)
-    if len(px) != 64 * 64:
-        return False, f"expected 4096 pixels, got {len(px)}"
+    if problem := frame_problem(px):
+        return False, problem
     covered = 0
     bad = 0
     first = ""
@@ -491,7 +507,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_gather_wrap": "vs_ids.asm",
-              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm",
+              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm"}
 
@@ -639,6 +655,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
+        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add: GLSL Fma or OpFmaKHR (docs/design.md)
+            cmd += ["--fma", os.environ["LEONIDA_FMA"]]
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
     print(out)
@@ -762,7 +780,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_exec_const", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -773,7 +791,7 @@ def run_suite(a, work: str) -> int:
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec"):
             cs_dump_wants = {
-                "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
+                "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
                 "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
                                         0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
@@ -787,6 +805,9 @@ def run_suite(a, work: str) -> int:
                 "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
                 # constant EXEC masks (cs_exec_const.asm): each lane takes its own bit of the constant
                 "cs_exec_const": [16, 8, 2, 16, 0, 16],
+                # constant lane masks: lane L takes bit L (cs_w32_mask_imm.asm / cs_w64_mask_imm.asm headers)
+                "cs_w32_mask_imm": [2056, 20, 2, 6152, 2050, 4112, 258, 32],
+                "cs_w64_mask_imm": [2056, 1084, 828, 2052, 319, 2104, 516, 2064],
                 "cs_dpp": [1, 0, 3, 2, 5, 4, 7, 6],
                 "cs_dpp_row": [0, 0, 1, 2, 3, 4, 5, 6],
                 "cs_dpp_mask": [1, 0, 3, 2, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE],
@@ -846,7 +867,7 @@ def run_suite(a, work: str) -> int:
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp",
-                                  "cs_exec_const", "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
+                                  "cs_exec_const", "cs_w32_mask_imm", "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
@@ -864,7 +885,7 @@ def run_suite(a, work: str) -> int:
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in ("cs_imgload", "cs_imgload_d16"):
-            rc, msg = run_cmd([vk_store, spv, "load"])
+            rc, msg = run_cmd([vk_store, spv, "load-d16" if name == "cs_imgload_d16" else "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
@@ -963,6 +984,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, msg))
                 continue
             const_wants = {
+                "ps_clip_color": (0x3E800000, 0x3F000000, 0x3F400000, 0x3F800000),
                 "ps_ops": (0x48804300, 5, 7, 0xFFFFFFFC),
                 "ps_ops2": (0xABCD4400, 0x46001234, 0xFFFFFFFA, 7),
                 "ps_ops3": (0xFFFFFFFA, 0x44660066, 0x44AABBCC, 16),
@@ -976,6 +998,7 @@ def run_suite(a, work: str) -> int:
                 "ps_ops8": (0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F),
                 "ps_f32_mods": (0xC0256A01, 0x3F800000, 0x41E00000, 0x3FC00000),
                 "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
+                "ps_vcmpx_forms": (0xF05B2A48, 0xF05E8A12, 0xB174BE18, 0x15550000),   # 14 v_cmpx forms (.asm header)
                 "ps_med3_mods": (0x3F800000, 0x40400000, 0x40C00000, 0x3F400000),
                 "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
