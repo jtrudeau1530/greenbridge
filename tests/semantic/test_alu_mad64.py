@@ -85,12 +85,24 @@ def ref_mad_u64_components(s0: int, s1: int, s2: int) -> tuple[int, int, int]:
     return lo, hi, carry
 
 
+def ref_mad_i64_i32(s0: int, s1: int, s2: int) -> tuple[int, int]:
+    """Pure-Python reference oracle for RDNA2 v_mad_i64_i32: (D.u64, sign_bit 64)."""
+    exact_sum = s32(s0) * s32(s1) + s64(s2)
+    return exact_sum & M64, 1 if exact_sum < 0 else 0
+
+
+def ref_mad_i64_components(s0: int, s1: int, s2: int) -> tuple[int, int, int]:
+    """Return (dst_lo, dst_hi, sign_bit 64) for v_mad_i64_i32."""
+    res_u64, sign = ref_mad_i64_i32(s0, s1, s2)
+    lo, hi = unpack_u64_pair(res_u64)
+    return lo, hi, sign
+
+
 def ref(op: str, x: int, y: int, z: int) -> tuple:
     """(D.u64, sdst bit) from the 65-bit result."""
     if op == "v_mad_u64_u32":
         return ref_mad_u64_u32(x, y, z)
-    r = s32(x) * s32(y) + s64(z)
-    return r & M64, (r >> 64) & 1
+    return ref_mad_i64_i32(x, y, z)
 
 
 SPECIAL32 = [0, 1, 2, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0xFFFFFFFE, 0x12345678]
@@ -219,6 +231,169 @@ class MadU64ReferenceOracleTests(unittest.TestCase):
             expected_res = expected_sum & M64
             expected_carry = (expected_sum >> 64) & 1
             self.assertEqual(ref_mad_u64_u32(s0, s1, s2), (expected_res, expected_carry))
+
+
+class MadI64ReferenceOracleTests(unittest.TestCase):
+    """Mathematical reference oracle tests for signed 64-bit widening multiply-add v_mad_i64_i32."""
+
+    def test_signed_zero_and_identity(self):
+        # 0 * y + z = z
+        for z in (0, 1, 0x1234567890ABCDEF, M64):
+            self.assertEqual(ref_mad_i64_i32(0, 0x7FFFFFFF, z), (z & M64, 1 if s64(z) < 0 else 0))
+            self.assertEqual(ref_mad_i64_i32(0x80000000, 0, z), (z & M64, 1 if s64(z) < 0 else 0))
+
+        # +1 identity multiplier
+        self.assertEqual(ref_mad_i64_i32(12345, 1, 0), (12345, 0))
+        self.assertEqual(ref_mad_i64_i32(0xFFFFFFFF, 1, 0), (M64, 1))  # -1 * 1 = -1
+
+        # -1 multiplier (0xFFFFFFFF)
+        self.assertEqual(ref_mad_i64_i32(50, M32, 0), ((-50) & M64, 1))
+        self.assertEqual(ref_mad_i64_i32(M32, M32, 0), (1, 0))  # (-1) * (-1) = +1
+
+    def test_positive_times_negative(self):
+        # 100 * (-5) = -500
+        res, sign = ref_mad_i64_i32(100, (-5) & M32, 0)
+        self.assertEqual(res, (-500) & M64)
+        self.assertEqual(sign, 1)
+
+    def test_negative_times_negative(self):
+        # (-10) * (-20) = +200
+        res, sign = ref_mad_i64_i32((-10) & M32, (-20) & M32, 0)
+        self.assertEqual(res, 200)
+        self.assertEqual(sign, 0)
+
+    def test_extreme_signed_min_product(self):
+        # (-2^31) * (-2^31) = +2^62 = 0x4000000000000000
+        res, sign = ref_mad_i64_i32(0x80000000, 0x80000000, 0)
+        self.assertEqual(res, 0x4000000000000000)
+        self.assertEqual(sign, 0)
+
+        # (-2^31) * (2^31 - 1) = -2^62 + 2^31 = -0x3FFFFFFF80000000 = 0xC000000080000000
+        res, sign = ref_mad_i64_i32(0x80000000, 0x7FFFFFFF, 0)
+        self.assertEqual(res, 0xC000000080000000)
+        self.assertEqual(sign, 1)
+
+    def test_signed_destination_register_pair(self):
+        # Register pair v[D:D+1] receiving two's complement sign-extended high dword
+        lo, hi, sign = ref_mad_i64_components(M32, 1, 0)  # -1
+        self.assertEqual(lo, 0xFFFFFFFF)
+        self.assertEqual(hi, 0xFFFFFFFF)
+        self.assertEqual(sign, 1)
+        self.assertEqual(pack_u64_pair(lo, hi), M64)
+
+        lo, hi, sign = ref_mad_i64_components(1, 1, 0)  # +1
+        self.assertEqual(lo, 1)
+        self.assertEqual(hi, 0)
+        self.assertEqual(sign, 0)
+        self.assertEqual(pack_u64_pair(lo, hi), 1)
+
+    def test_signed_accumulator_cancellation(self):
+        # Exact cancellation to 0
+        res, sign = ref_mad_i64_i32((-5) & M32, 4, 20)
+        self.assertEqual(res, 0)
+        self.assertEqual(sign, 0)
+
+        # Negative sum by 1
+        res, sign = ref_mad_i64_i32((-5) & M32, 4, 19)
+        self.assertEqual(res, M64)
+        self.assertEqual(sign, 1)
+
+    def test_prng_seeded_i64_verification(self):
+        rng = random.Random(0x84)
+        for _ in range(100):
+            s0_raw = rng.getrandbits(32)
+            s1_raw = rng.getrandbits(32)
+            s2_raw = rng.getrandbits(64)
+            s0_val = s32(s0_raw)
+            s1_val = s32(s1_raw)
+            s2_val = s64(s2_raw)
+            exact = s0_val * s1_val + s2_val
+            expected_res = exact & M64
+            expected_sign = 1 if exact < 0 else 0
+            self.assertEqual(ref_mad_i64_i32(s0_raw, s1_raw, s2_raw), (expected_res, expected_sign))
+
+
+class Mad64SignedUnsignedDivergenceTests(unittest.TestCase):
+    """Direct comparison of v_mad_u64_u32 vs v_mad_i64_i32 on identical bit patterns."""
+
+    def test_high_bit_square_divergence(self):
+        # Raw operands 0xFFFFFFFF x 0xFFFFFFFF + 0
+        u_res, u_carry = ref_mad_u64_u32(M32, M32, 0)
+        i_res, i_sign = ref_mad_i64_i32(M32, M32, 0)
+
+        self.assertEqual(u_res, 0xFFFFFFFE00000001)
+        self.assertEqual(u_carry, 0)
+        self.assertEqual(i_res, 0x0000000000000001)
+        self.assertEqual(i_sign, 0)
+
+        u_lo, u_hi = unpack_u64_pair(u_res)
+        i_lo, i_hi = unpack_u64_pair(i_res)
+        self.assertEqual(u_lo, i_lo)  # low dwords both 1 (since (-1)*(-1) == 1 mod 2^32)
+        self.assertNotEqual(u_hi, i_hi)  # high dwords diverge: 0xFFFFFFFE vs 0x00000000
+        self.assertEqual(u_hi, 0xFFFFFFFE)
+        self.assertEqual(i_hi, 0x00000000)
+
+    def test_high_bit_unit_multiplier_divergence(self):
+        # Raw operands 0xFFFFFFFF x 1 + 0
+        u_res, u_carry = ref_mad_u64_u32(M32, 1, 0)
+        i_res, i_sign = ref_mad_i64_i32(M32, 1, 0)
+
+        self.assertEqual(u_res, 0x00000000FFFFFFFF)
+        self.assertEqual(u_carry, 0)
+        self.assertEqual(i_res, 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(i_sign, 1)
+
+        u_lo, u_hi = unpack_u64_pair(u_res)
+        i_lo, i_hi = unpack_u64_pair(i_res)
+        self.assertEqual(u_lo, i_lo)  # low dwords both 0xFFFFFFFF
+        self.assertEqual(u_hi, 0x00000000)
+        self.assertEqual(i_hi, 0xFFFFFFFF)
+
+    def test_msb_scale_divergence(self):
+        # Raw operands 0x80000000 x 2 + 0
+        u_res, u_carry = ref_mad_u64_u32(0x80000000, 2, 0)
+        i_res, i_sign = ref_mad_i64_i32(0x80000000, 2, 0)
+
+        self.assertEqual(u_res, 0x0000000100000000)
+        self.assertEqual(u_carry, 0)
+        self.assertEqual(i_res, 0xFFFFFFFF00000000)
+        self.assertEqual(i_sign, 1)
+
+        u_lo, u_hi = unpack_u64_pair(u_res)
+        i_lo, i_hi = unpack_u64_pair(i_res)
+        self.assertEqual(u_lo, i_lo)  # low dwords both 0
+        self.assertEqual(u_hi, 0x00000001)
+        self.assertEqual(i_hi, 0xFFFFFFFF)
+
+    def test_msb_positive_max_divergence(self):
+        # Raw operands 0x80000000 x 0x7FFFFFFF + 0
+        u_res, u_carry = ref_mad_u64_u32(0x80000000, 0x7FFFFFFF, 0)
+        i_res, i_sign = ref_mad_i64_i32(0x80000000, 0x7FFFFFFF, 0)
+
+        self.assertEqual(u_res, 0x3FFFFFFF80000000)
+        self.assertEqual(u_carry, 0)
+        self.assertEqual(i_res, 0xC000000080000000)
+        self.assertEqual(i_sign, 1)
+
+    def test_shader_execution_divergence(self):
+        # Verify divergence in compiled SPIR-V fragment execution
+        # 0xFFFFFFFF x 0xFFFFFFFF + 0
+        u_out = run_op("v_mad_u64_u32", M32, M32, 0)
+        i_out = run_op("v_mad_i64_i32", M32, M32, 0)
+        self.assertEqual(u_out, (0xFFFFFFFE00000001, 0))
+        self.assertEqual(i_out, (1, 0))
+
+        # 0xFFFFFFFF x 1 + 0
+        u_out = run_op("v_mad_u64_u32", M32, 1, 0)
+        i_out = run_op("v_mad_i64_i32", M32, 1, 0)
+        self.assertEqual(u_out, (M32, 0))
+        self.assertEqual(i_out, (M64, 1))
+
+        # 0x80000000 x 2 + 0
+        u_out = run_op("v_mad_u64_u32", 0x80000000, 2, 0)
+        i_out = run_op("v_mad_i64_i32", 0x80000000, 2, 0)
+        self.assertEqual(u_out, (0x100000000, 0))
+        self.assertEqual(i_out, (0xFFFFFFFF00000000, 1))
 
 
 class Mad64Tests(unittest.TestCase):
