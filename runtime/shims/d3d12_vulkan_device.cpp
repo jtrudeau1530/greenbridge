@@ -2675,11 +2675,13 @@ public:
     bool graphics() const { return registered_ && is_graphics_; }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
 
-    // A VS (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the VS's
-    // input signature by semantic name and index: location = the element's register, the translator's rule
-    // (docs/design.md, "Vertex fetch"). Hull, domain and geometry stages, more than one sample, and two stages
-    // that both read their code base are refused with a log. Viewport, scissor, topology, vertex strides, stencil
-    // reference and blend factor are dynamic, set from the list's state at each draw.
+    // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
+    // VS's input signature by semantic name and index: location = the element's register, the translator's rule
+    // (docs/design.md, "Vertex fetch"). Refused with a log: hull and domain stages, stream output, the centre
+    // multisample pattern, two stages that both read their code base, and state that needs a Vulkan feature the
+    // device lacks (including the geometryShader feature a GS needs). A GS takes triangles; the sample count may
+    // be above one. Viewport, scissor, topology, vertex strides, stencil reference and blend factor are dynamic,
+    // set from the list's state at each draw.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
