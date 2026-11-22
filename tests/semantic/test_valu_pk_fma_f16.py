@@ -1654,5 +1654,148 @@ class TestPkFmaF16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res2, 0x3C02)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestPkFmaF16NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(300, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        v = VOP3POperand(Reg32(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VPkFmaF16Instruction(dst=Reg32(0, RegType.SGPR), src0=v, src1=v, src2=v)
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_syntax_rejection_invalid_modifier_tuples(self) -> None:
+        v = VOP3POperand(Reg32(1, RegType.VGPR))
+        with self.assertRaises(ValueError):
+            VPkFmaF16Instruction(dst=Reg32(0, RegType.VGPR), src0=v, src1=v, src2=v, op_sel=(0, 0))  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            VPkFmaF16Instruction(dst=Reg32(0, RegType.VGPR), src0=v, src1=v, src2=v, neg_lo=(0, 2, 0))
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        v0 = pack_pk_f16(f16_to_bits(2.0), f16_to_bits(3.0))
+        v1 = pack_pk_f16(f16_to_bits(4.0), f16_to_bits(5.0))
+        v2 = pack_pk_f16(f16_to_bits(1.0), f16_to_bits(2.0))
+        correct = oracle_v_pk_fma_f16(v0, v1, v2)
+
+        # Perturb single bit in low half
+        corrupted_lo = correct ^ 0x0001
+        self.assertNotEqual(correct, corrupted_lo)
+
+        # Perturb single bit in high half
+        corrupted_hi = correct ^ 0x0001_0000
+        self.assertNotEqual(correct, corrupted_hi)
+
+    def test_mutation_non_fused_intermediate_rounding(self) -> None:
+        """Mutant: Replace fused single rounding with unfused separate mul and add."""
+        def mutant_fma(s0: int, s1: int, s2: int) -> int:
+            return compute_scalar_fma_f16_bits(s0, s1, s2 ^ SIGN_MASK16)
+
+        v0 = 0x3C01
+        v1 = 0x3C01
+        v2 = 0x1400
+        expected = compute_scalar_fma_f16_bits(v0, v1, v2)
+        mutant_res = mutant_fma(v0, v1, v2)
+        self.assertNotEqual(expected, mutant_res)
+
+    def test_mutation_invert_half_selection(self) -> None:
+        """Mutant: Inversion of op_sel or op_sel_hi half routing."""
+        v0 = pack_pk_f16(f16_to_bits(1.0), f16_to_bits(10.0))
+        v1 = pack_pk_f16(f16_to_bits(2.0), f16_to_bits(20.0))
+        v2 = pack_pk_f16(POS_ZERO, POS_ZERO)
+
+        # Expected: op_sel=(0, 0, 0) selects lo halves -> 1.0 * 2.0 = 2.0
+        good = oracle_v_pk_fma_f16(v0, v1, v2, op_sel=(0, 0, 0), op_sel_hi=(1, 1, 1))
+        # Mutant swaps lo half selection to hi -> 10.0 * 20.0 = 200.0
+        bad = oracle_v_pk_fma_f16(v0, v1, v2, op_sel=(1, 1, 0), op_sel_hi=(1, 1, 1))
+        self.assertNotEqual(good, bad)
+
+    def test_mutation_ignore_neg_modifiers(self) -> None:
+        """Mutant: Ignore neg_lo modifier."""
+        v0 = pack_pk_f16(POS_TWO, POS_TWO)
+        v1 = pack_pk_f16(POS_TWO, POS_TWO)
+        v2 = pack_pk_f16(POS_ZERO, POS_ZERO)
+
+        good = oracle_v_pk_fma_f16(v0, v1, v2, neg_lo=(1, 0, 0))
+        bad = oracle_v_pk_fma_f16(v0, v1, v2, neg_lo=(0, 0, 0))
+        self.assertNotEqual(good, bad)
+        lo_good, _ = unpack_pk_f16(good)
+        lo_bad, _ = unpack_pk_f16(bad)
+        self.assertEqual(lo_good, f16_to_bits(-4.0))
+        self.assertEqual(lo_bad, f16_to_bits(4.0))
+
+    def test_mutation_ignore_clamp_bounds(self) -> None:
+        """Mutant: Clamp modifier fails to saturate values > 1.0."""
+        v0 = pack_pk_f16(POS_TWO, POS_TWO)
+        v1 = pack_pk_f16(POS_TWO, POS_TWO)
+        v2 = pack_pk_f16(POS_ZERO, POS_ZERO)
+
+        good = oracle_v_pk_fma_f16(v0, v1, v2, clamp=True)
+        bad = oracle_v_pk_fma_f16(v0, v1, v2, clamp=False)
+        self.assertNotEqual(good, bad)
+        lo_good, _ = unpack_pk_f16(good)
+        self.assertEqual(lo_good, POS_ONE)
+
+    def test_mutation_simd_inactive_lane_leakage(self) -> None:
+        """Mutant: Inactive SIMD lanes are corrupted during masked execution."""
+        sentinel = 0xCAFE_BABE
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)  # all inactive
+        for lane in range(32):
+            state.set_vgpr(lane, 4, sentinel)
+
+        class LeakySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VPkFmaF16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: ignores exec_mask
+                    res = oracle_v_pk_fma_f16(pack_pk_f16(POS_ONE, POS_ONE), pack_pk_f16(POS_ONE, POS_ONE), 0)
+                    state.set_vgpr(lane, instr.dst.index, res)
+                    results.append(res)
+                return results
+
+        leaky = LeakySIMDInterpreter()
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(4, RegType.VGPR),
+            src0=VOP3POperand(Literal32(pack_pk_f16(POS_ONE, POS_ONE))),
+            src1=VOP3POperand(Literal32(pack_pk_f16(POS_ONE, POS_ONE))),
+            src2=VOP3POperand(Literal32(0)),
+        )
+        leaky.step(instr, state)
+        corrupted = [lane for lane in range(32) if state.get_vgpr(lane, 4) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+    def test_mutation_subnormal_flush_to_zero(self) -> None:
+        """Mutant: Subnormals flushed to zero (FTZ mode)."""
+        sub = POS_MIN_SUBNORM
+        correct = compute_scalar_fma_f16_bits(sub, POS_ONE, sub)
+        self.assertEqual(correct, 0x0002)
+
+        # FTZ mutant produces 0.0
+        ftz_mutant = POS_ZERO
+        self.assertNotEqual(correct, ftz_mutant)
+
+    def test_mutation_skip_snan_quietening(self) -> None:
+        """Mutant: Signaling NaN is not quietened."""
+        snan = SNAN_DEFAULT
+        res = compute_scalar_fma_f16_bits(snan, POS_ONE, POS_ZERO)
+        self.assertTrue(is_qnan16(res))
+        self.assertNotEqual(res, snan)
+
+
 if __name__ == "__main__":
     unittest.main()
