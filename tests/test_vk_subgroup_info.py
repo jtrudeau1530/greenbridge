@@ -423,6 +423,13 @@ class PhysicalDevicesTest(unittest.TestCase):
 
 
 class QueryTest(unittest.TestCase):
+    def setUp(self):
+        # A LEONIDA_VK_DEVICE in the caller's environment would narrow the fake devices too.
+        env = mock.patch.dict(vk_info.os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        vk_info.os.environ.pop("LEONIDA_VK_DEVICE", None)
+
     def _run_query(self, *devices):
         vk = FakeVulkan(devices=devices)
         with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
@@ -729,6 +736,13 @@ class QueryTest(unittest.TestCase):
 
 
 class MainCliTest(unittest.TestCase):
+    def setUp(self):
+        # A LEONIDA_VK_DEVICE in the caller's environment would narrow the fake devices too.
+        env = mock.patch.dict(vk_info.os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        vk_info.os.environ.pop("LEONIDA_VK_DEVICE", None)
+
     def test_main_exits_0_and_prints_single_line_json_on_stdout(self):
         vk = FakeVulkan(devices=(FakeDevice(name="CLI GPU"),))
         out, err = io.StringIO(), io.StringIO()
