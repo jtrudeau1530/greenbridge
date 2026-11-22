@@ -892,5 +892,69 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(ref_mul_clamp_f16(CANONICAL_QNAN_F16, CANONICAL_QNAN_F16), POS_ZERO_F16)
 
 
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection test cases."""
+
+    def test_syntax_rejection_invalid_opcodes(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_v_mul_clamp_f16_asm("v_add_f16 v0.l, v1.l, v2.l clamp")
+        with self.assertRaises(ValueError):
+            parse_v_mul_clamp_f16_asm("v_mul_f32 v0, v1, v2 clamp")
+
+    def test_syntax_rejection_malformed_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_v_mul_clamp_f16_asm("v_mul_f16 v0.x, v1.l, v2.l clamp")
+        with self.assertRaises(ValueError):
+            parse_v_mul_clamp_f16_asm("v_mul_f16 reg0, v1.l, v2.l clamp")
+
+    def test_syntax_rejection_invalid_destination(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_v_mul_clamp_f16_asm("v_mul_f16 -v0.l, v1.l, v2.l clamp")
+        with self.assertRaises(TypeError):
+            parse_v_mul_clamp_f16_asm("v_mul_f16 s0.l, v1.l, v2.l clamp")
+
+    def test_syntax_rejection_invalid_omod(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_v_mul_clamp_f16_asm("v_mul_f16 v0.l, v1.l, v2.l clamp mul:8")
+
+    def test_mutation_sabotage_clamp_omission(self) -> None:
+        # Sabotage: clamp omitted on result > 1.0 (e.g. 2.0 * 3.0 = 6.0)
+        s0 = f16_to_bits(2.0)
+        s1 = f16_to_bits(3.0)
+        expected_clamped = ref_mul_clamp_f16(s0, s1)
+        self.assertEqual(expected_clamped, POS_ONE_F16)
+        mutated_unclamped = f16_to_bits(6.0)
+        self.assertNotEqual(expected_clamped, mutated_unclamped)
+
+    def test_mutation_sabotage_nan_clamp_leak(self) -> None:
+        # Sabotage: clamp fails to suppress NaN to +0.0
+        qnan = CANONICAL_QNAN_F16
+        expected = ref_mul_clamp_f16(qnan, POS_ONE_F16)
+        self.assertEqual(expected, POS_ZERO_F16)
+        mutated_nan_leak = qnan
+        self.assertNotEqual(expected, mutated_nan_leak)
+
+    def test_mutation_sabotage_negative_zero_leak(self) -> None:
+        # Sabotage: clamp fails to force -0.0 to +0.0
+        s0 = NEG_ZERO_F16
+        s1 = f16_to_bits(2.0)
+        expected = ref_mul_clamp_f16(s0, s1)
+        self.assertEqual(expected, POS_ZERO_F16)
+        mutated_neg_zero = NEG_ZERO_F16
+        self.assertNotEqual(expected, mutated_neg_zero)
+
+    def test_mutation_sabotage_exec_mask_leak(self) -> None:
+        # Sabotage: inactive SIMD lane overwritten
+        sim = SIMDWavefront(wave_size=32)
+        sim.exec_mask = 0x00000001
+        sim.store_vgpr_half_wave(0, hi=False, values=[0xCAFE] * 32)
+        sim.store_vgpr_half_wave(1, hi=False, values=[POS_HALF_F16] * 32)
+        sim.store_vgpr_half_wave(2, hi=False, values=[POS_HALF_F16] * 32)
+
+        results = sim.step_v_mul_clamp_f16(0, False, 1, False, 2, False)
+        self.assertEqual(bits_to_f16(results[0]), 0.25)
+        self.assertEqual(results[1], 0xCAFE)
+
+
 if __name__ == "__main__":
     unittest.main()
