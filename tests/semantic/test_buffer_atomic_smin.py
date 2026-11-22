@@ -444,6 +444,68 @@ class SIMDBufferInterpreter:
                 self.write_lane_vgpr(lane, inst.vdata.index, ret_val)
 
 
+class TestBufferAtomicSminIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, integer ranges, and IEEE 754 bit-pattern handling."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+    def test_signed_zero_bit_patterns_as_integers(self) -> None:
+        # In float32: +0.0 is 0x00000000, -0.0 is 0x80000000
+        # In signed 32-bit int: 0x80000000 is -2147483648, 0x00000000 is 0
+        # min(0, -2147483648) = -2147483648 (0x80000000)
+        self.mem.write_u32(0, 0)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 0, 0x80000000, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.mem.read_u32(0), 0x80000000)
+
+    def test_signed_infinities_as_integers(self) -> None:
+        # +inf (0x7F800000 = +2139095040), -inf (0xFF800000 = -8388608)
+        self.mem.write_u32(4, 0x7F800000)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 4, 0xFF800000, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0x7F800000)
+        self.assertEqual(self.mem.read_u32(4), 0xFF800000)
+
+    def test_nan_bit_patterns_unaltered_and_no_traps(self) -> None:
+        # qNaN (0x7FC00000 = +2143289344) vs -1 (0xFFFFFFFF = -1) -> min is -1
+        self.mem.write_u32(8, 0x7FC00000)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 8, 0xFFFFFFFF, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0x7FC00000)
+        self.assertEqual(self.mem.read_u32(8), 0xFFFFFFFF)
+
+        # sNaN (0x7F800001 = +2139095041) vs +100 -> min is +100
+        self.mem.write_u32(12, 0x7F800001)
+        ret2, ok2 = ref_buffer_atomic_smin(self.mem, self.desc, 0, 12, 100, glc=True)
+        self.assertTrue(ok2)
+        self.assertEqual(ret2, 0x7F800001)
+        self.assertEqual(self.mem.read_u32(12), 100)
+
+    def test_subnormal_bit_patterns_as_integers(self) -> None:
+        # Smallest positive subnormal (0x00000001 = +1) vs -5 -> min is -5
+        self.mem.write_u32(16, 1)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 16, u32(-5), glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 1)
+        self.assertEqual(s32(self.mem.read_u32(16)), -5)
+
+    def test_last_valid_dword_boundary_and_oob(self) -> None:
+        # Buffer has 256 bytes. Last valid dword starts at 252 (252 + 4 = 256).
+        self.mem.write_u32(252, 100)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 252, 20, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 100)
+        self.assertEqual(self.mem.read_u32(252), 20)
+
+        # Offset 253 + 4 = 257 > 256 -> OOB
+        ret_oob, ok_oob = ref_buffer_atomic_smin(self.mem, self.desc, 0, 253, 5, glc=True)
+        self.assertFalse(ok_oob)
+        self.assertEqual(ret_oob, 0)
+
+
 class TestBufferAtomicSminConditionCodes(unittest.TestCase):
     """Unit tests for condition codes, status flags, and carry/borrow isolation."""
 
