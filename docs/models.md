@@ -486,9 +486,11 @@ file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy,
 | Compute programs named `<effect>:<entry>` | 2,689 (every CS), 564 effects |
 | Effects with `RaytracingResolve` CS programs | 341 (1,004 programs; 3 each for 324) |
 | Materials whose hash is the joaat of a carved effect name | 3,211 (96%), 8 of the 18 hashes |
+| Materials whose hash is the joaat of a native effect record's name (both SGD5 databases, below) | 3,340 (100%), 18 of the 18 hashes, one record each |
 
-So a material leads to its effect and that effect's ray-tracing resolve programs. The draw (VS/PS/MS) programs
-are not reachable through the carved programs' names, order or suffixes:
+So a material leads to its effect. Through the carved compute names it reaches only 8 of the 18 hashes; the
+effect records' own names reach all 18 (@jeremygold02, `tools/sgd5_effects.py` in #3036). The draw (VS/PS/MS)
+programs are not reachable through the carved programs' names, order or suffixes:
 
 - None of the 23,619 graphics programs (2,236 VS, 12,101 PS, 9,282 MS; the 195 GS are left out here) carries an
   effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
@@ -533,10 +535,11 @@ are little-endian:
    otherwise `stage_list[selector - 1]`.
 
 The group walk and its counts above were reproduced on a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256
-`0bc16345…`), and the record and pass format on the three records below. @jeremygold02 reports a census of
-both databases' effects found by a validated search, with no per-effect offsets given. 913 effects have one
-matching technique table: 891 + 22 tables, 23,938 + 1,099 techniques and 27,536 + 1,262 passes. Until that
-census is reproduced, the format beyond these three records is reported rather than confirmed here:
+`0bc16345…`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
+--list-effects` (#3036, `0029eba7`): 932 effect records with 932 distinct name hashes, 913 of them with a
+technique table, 25,037 techniques and 28,798 passes. The census finds technique tables by a validated search
+inside each effect, not by a decoded pointer. The record and pass format below was also checked by hand on
+three records:
 
 | Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass list 0 / list 1 ordinal |
 |---|---|---:|---:|---|
@@ -546,9 +549,8 @@ census is reproduced, the format beyond these three records is reported rather t
 
 Two things are still open:
 
-- **Finding effect records in general.** The three were found by their offsets. The census locates technique
-  tables by a validated search inside each effect, not by a decoded pointer, and the u32 after an effect's name
-  is still opaque.
+- **Decoding the pointers.** The census finds every effect's technique table by a validated search, not by a
+  decoded pointer, and the u32 after an effect's name is still opaque.
 - **Which technique and pass the game draws with.** That is a run-time choice; it is presumably made in the
   executable (RT-5).
 
