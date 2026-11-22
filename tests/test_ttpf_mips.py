@@ -4,13 +4,18 @@ synthetic RDS5/ETPF pool round trip. No game data is used.
     python -I tests/test_ttpf_mips.py
 """
 import importlib.util
+import io
 import json
 import os
+import random
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 import zlib
+from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "ttpf_mips.py")
@@ -381,6 +386,288 @@ class Bc3CheckTest(unittest.TestCase):
                 code, result = self.run_check(fmt, black)
                 self.assertEqual(code, 1, result)
                 self.assertEqual(result["chain_error"], [170.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+
+BC1_BLACK = bytes(8)
+BC1_WHITE = struct.pack("<HHI", 0xFFFF, 0xFFFF, 0)
+# Four-colour mode (white > black): selector 1 = black, selector 0 = white.
+BC1_LEFT_BLACK = struct.pack("<HHI", 0xFFFF, 0, 0x05050505)  # columns 0-1 black, 2-3 white
+BC1_LEFT_WHITE = struct.pack("<HHI", 0xFFFF, 0, 0x50505050)  # columns 0-1 white, 2-3 black
+
+
+def bc1_black(x, y):
+    return BC1_BLACK
+
+
+def bc1_column(cx, block=BC1_WHITE):
+    return lambda x, y: block if x == cx else BC1_BLACK
+
+
+def bc1_single(cx, cy):
+    return lambda x, y: BC1_WHITE if (x, y) == (cx, cy) else BC1_BLACK
+
+
+def bc1_blocks(mip, block_fn):
+    return b"".join(block_fn(x, y) for y in range(mip["blocks_h"]) for x in range(mip["blocks_w"]))
+
+
+def odd_mip(index, pw, ph):
+    return dict(index=index, pixels_w=pw, pixels_h=ph, blocks_w=(pw + 3) // 4, blocks_h=(ph + 3) // 4)
+
+
+def pair_error(parent, parent_fn, child, child_fn):
+    ppx = ttpf.decode_pixels(71, bc1_blocks(parent, parent_fn), parent["blocks_w"], parent["blocks_h"])
+    cpx = ttpf.decode_pixels(71, bc1_blocks(child, child_fn), child["blocks_w"], child["blocks_h"])
+    means = ttpf.block_means(cpx, child["blocks_w"], child["blocks_h"],
+                             child["pixels_w"], child["pixels_h"])
+    return ttpf.mean_abs_error(ttpf.predict_child_means(ppx, parent, child),
+                               ttpf.visible_block_means(means, child))
+
+
+class PredictChildMeansTest(unittest.TestCase):
+    def test_odd_block_counts_match_box_filter_oracles(self):
+        cases = (
+            ((12, 8), bc1_black, bc1_single(1, 0), 127.5),
+            ((8, 12), bc1_black, bc1_single(0, 1), 127.5),
+            ((12, 12), bc1_black, bc1_single(1, 1), 63.75),
+            ((12, 8), bc1_column(2), bc1_single(1, 0), 0.0),
+            ((12, 8), bc1_column(2), bc1_black, 127.5),
+            # 5x3 -> 3x2 blocks: a flat zip of 2x1 predictions would misalign rows.
+            ((20, 12), bc1_column(4), bc1_column(2), 0.0),
+            ((20, 12), bc1_column(4), bc1_black, 85.0),
+            # Child texels 6-7 are padding: only the visible half of the edge block counts.
+            ((12, 8), bc1_black, bc1_column(1, BC1_LEFT_BLACK), 0.0),
+            ((12, 8), bc1_black, bc1_column(1, BC1_LEFT_WHITE), 127.5),
+            # Parent texels 10-11 are padding and must not leak into child texel 4.
+            ((10, 8), bc1_column(2, BC1_LEFT_BLACK), bc1_black, 0.0),
+            ((10, 8), bc1_column(2, BC1_LEFT_WHITE), bc1_black, 127.5),
+        )
+        for (w, h), parent_fn, child_fn, expected in cases:
+            with self.subTest(size=(w, h), expected=expected):
+                self.assertAlmostEqual(pair_error(odd_mip(0, w, h), parent_fn,
+                                                  odd_mip(1, w // 2, h // 2), child_fn),
+                                       expected, places=9)
+
+    def test_matches_block_downsample_on_power_of_two_chains(self):
+        rng = random.Random(1)
+        for w, h in ((16, 8), (8, 8), (4, 4), (2, 2), (1, 1)):
+            with self.subTest(size=(w, h)):
+                parent = odd_mip(0, w, h)
+                child = odd_mip(1, max(1, w // 2), max(1, h // 2))
+                bw, bh = parent["blocks_w"], parent["blocks_h"]
+                data = bytes(rng.randrange(256) for _ in range(8 * bw * bh))
+                px = ttpf.decode_pixels(71, data, bw, bh)
+                old = ttpf.downsample2(ttpf.block_means(px, bw, bh, w, h), bw, bh)
+                new = ttpf.predict_child_means(px, parent, child)
+                self.assertEqual(len(new), len(old))
+                for a, b in zip(new, old):
+                    for x, y in zip(a, b):
+                        self.assertAlmostEqual(x, y, places=9)
+
+    def test_matches_nested_list_box_filter_on_odd_sizes(self):
+        rng = random.Random(2)
+        for w, h in ((28, 20), (22, 14), (6, 1), (1, 6)):
+            with self.subTest(size=(w, h)):
+                parent = odd_mip(0, w, h)
+                child = odd_mip(1, max(1, w // 2), max(1, h // 2))
+                bw, bh = parent["blocks_w"], parent["blocks_h"]
+                px = ttpf.decode_pixels(71, bytes(rng.randrange(256) for _ in range(8 * bw * bh)), bw, bh)
+                grid = [[px[y * bw * 4 + x] for x in range(w)] for y in range(h)]
+                cw, ch = child["pixels_w"], child["pixels_h"]
+                texels = [[tuple(sum(grid[min(h - 1, 2 * y + dy)][min(w - 1, 2 * x + dx)][k]
+                                     for dy in (0, 1) for dx in (0, 1)) / 4 for k in range(3))
+                           for x in range(cw)] for y in range(ch)]
+                expected = []
+                for by in range(0, ch, 4):
+                    for bx in range(0, cw, 4):
+                        cell = [t for row in texels[by:by + 4] for t in row[bx:bx + 4]]
+                        expected.append(tuple(sum(t[k] for t in cell) / len(cell) for k in range(3)))
+                got = ttpf.predict_child_means(px, parent, child)
+                self.assertEqual(len(got), child["blocks_w"] * child["blocks_h"])
+                for a, b in zip(got, expected):
+                    for x, y in zip(a, b):
+                        self.assertAlmostEqual(x, y, places=9)
+
+    def test_mismatched_geometry_is_rejected(self):
+        parent = odd_mip(0, 12, 8)
+        px = ttpf.decode_pixels(71, BC1_BLACK * 6, 3, 2)
+        for child in (odd_mip(1, 5, 4), odd_mip(1, 6, 3), dict(odd_mip(1, 6, 4), blocks_w=1)):
+            with self.subTest(child=child), self.assertRaises(ttpf.MipGeometryError):
+                ttpf.predict_child_means(px, parent, child)
+        with self.assertRaises(ttpf.MipGeometryError):
+            ttpf.predict_child_means(px[:-1], parent, odd_mip(1, 6, 4))
+        with self.assertRaises(ttpf.MipGeometryError):
+            ttpf.visible_block_means([(0.0, 0.0, 0.0)], odd_mip(1, 6, 4))
+        with self.assertRaises(ValueError):
+            ttpf.mean_abs_error([(0.0, 0.0, 0.0)], [(0.0, 0.0, 0.0)] * 2)
+
+
+def linear_layout(sizes, first_tail=0, depth=1):
+    """Fake layout storing each mip block-linear, mip-major across `depth` slices."""
+    mips, off = [], 0
+    for i, (w, h) in enumerate(sizes):
+        m = odd_mip(i, w, h)
+        m.update(offset=off, region=8 * m["blocks_w"] * m["blocks_h"], tile_x=0, tile_y=0)
+        m["slice_stride"] = m["region"]
+        mips.append(m)
+        off += m["region"] * depth
+    return dict(mips=mips, size=off, slice_size=off // depth, face_size=off, tile=4096,
+                first_tail=first_tail, element_bytes=8)
+
+
+def run_shape_check(shape, sizes, chunks, first_tail=0, depth=1):
+    layout = linear_layout(sizes, first_tail, depth)
+    if shape == "cubemap":
+        layout.update(data_offset=0, full_bytes=6 * layout["size"], snapshots=1)
+    w, h = sizes[0]
+    d = dict(base=0, format=71, width=w, height=h, depth=depth, mips=len(sizes), non_tail=0)
+    a = dict(layout=layout, descriptor=d, available=True, full_chain=True)
+    if shape != "2d":
+        a["shape"] = shape
+    tiled = b"".join(chunks) + bytes(1 << 17)
+    buf = io.StringIO()
+    with mock.patch.object(ttpf, "analyze", lambda pool, index: a), \
+            mock.patch.object(ttpf, "_read_range_or_block", lambda *args, **kw: tiled), \
+            mock.patch.object(ttpf, "detile", lambda lay, mip, data: bytes(
+                data[:8 * mip["blocks_w"] * mip["blocks_h"]])), \
+            redirect_stdout(buf):
+        code = ttpf.check(None, 0)
+    return code, json.loads(buf.getvalue())
+
+
+class OddBlockShapeCheckTest(unittest.TestCase):
+    """check() on 12x8 -> 6x4 BC1 (3x2 parent blocks) for each 2D-family shape. The container
+    and tiling are faked (block-linear mips); OddBlockPoolTest covers the real path."""
+    SIZES = ((12, 8), (6, 4))
+
+    def chunk(self, level, block_fn):
+        return bc1_blocks(odd_mip(level, *self.SIZES[level]), block_fn)
+
+    def test_2d_edge_column_and_tail_origin(self):
+        parent = self.chunk(0, bc1_column(2))
+        code, result = run_shape_check("2d", self.SIZES, [parent, self.chunk(1, bc1_column(1))],
+                                       first_tail=1)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["chain_error"], [0.0])
+        # The fake tile-origin read sees parent blocks 0-1 (black) where the white edge belongs.
+        self.assertEqual(result["tail_origin_control"], 127.5)
+        code, result = run_shape_check("2d", self.SIZES, [parent, self.chunk(1, bc1_black)],
+                                       first_tail=1)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["chain_error"], [127.5])
+
+    def test_array_reports_the_slice_with_a_dropped_edge(self):
+        parents = [self.chunk(0, bc1_column(2))] * 3
+        children = [self.chunk(1, bc1_column(1)), self.chunk(1, bc1_black),
+                    self.chunk(1, bc1_column(1))]
+        code, result = run_shape_check("2d_array", self.SIZES, parents + children, depth=3)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["per_slice_max_error"], [0.0, 127.5, 0.0])
+        self.assertEqual(result["max_error"], 127.5)
+
+    def test_cube_reports_the_face_with_a_dropped_edge_and_tail_origin(self):
+        chunks = []
+        for face in range(6):
+            chunks += [self.chunk(0, bc1_column(2)),
+                       self.chunk(1, bc1_black if face == 4 else bc1_column(1))]
+        code, result = run_shape_check("cubemap", self.SIZES, chunks, first_tail=1)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result["per_face_max_error"], [0.0, 0.0, 0.0, 0.0, 127.5, 0.0])
+        self.assertEqual(result["tail_origin_control"], 127.5)
+
+    def test_mismatched_mip_geometry_is_blocked(self):
+        sizes = ((12, 8), (5, 4))
+        chunks = [bc1_blocks(odd_mip(0, 12, 8), bc1_black), bc1_blocks(odd_mip(1, 5, 4), bc1_black)]
+        code, result = run_shape_check("2d", sizes, chunks)
+        self.assertEqual(code, 2, result)
+        self.assertIn("geometry", result["blocked"])
+
+
+def odd_bc1_pool(path, width, height, parent_fn, child_fn):
+    """Write a two-mip BC1 pool through the real layout and tiling."""
+    layout = ttpf.surface_layout(width, height, 71, 2, 4096)
+    payload = bytearray(layout["size"])
+    for mip, block_fn in zip(layout["mips"], (parent_fn, child_fn)):
+        retile_to(layout, mip, bc1_blocks(mip, block_fn), payload)
+    non_tail = layout["first_tail"]
+    record = pack_etpf_record(width, height, 2 - non_tail, non_tail, 71, 1, 1, 2, 4096)
+    write_rds5_pool(path, [record], [payload])
+
+
+class OddBlockPoolTest(unittest.TestCase):
+    """Before the fix the changed 12x8, 8x12 and 12x12 children passed with error 0."""
+    CASES = (
+        # (width, height, parent, child, rc, chain_error)
+        (12, 8, bc1_black, bc1_black, 0, [0.0]),
+        (12, 8, bc1_black, bc1_single(1, 0), 1, [127.5]),
+        (8, 12, bc1_black, bc1_black, 0, [0.0]),
+        (8, 12, bc1_black, bc1_single(0, 1), 1, [127.5]),
+        (12, 12, bc1_black, bc1_black, 0, [0.0]),
+        (12, 12, bc1_black, bc1_single(1, 1), 1, [63.75]),
+        (12, 8, bc1_column(2), bc1_column(1), 0, [0.0]),
+        (16, 8, bc1_black, bc1_black, 0, [0.0]),
+        (16, 8, bc1_black, bc1_single(1, 0), 1, [127.5]),
+        (256, 256, bc1_black, bc1_black, 0, [0.0]),
+        (256, 256, bc1_black, bc1_single(31, 31), 0, [0.25]),
+    )
+
+    def run_check(self, *case):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "odd.ttpf")
+            odd_bc1_pool(path, *case)
+            pool = ttpf.Pool(path)
+            buf = io.StringIO()
+            try:
+                with redirect_stdout(buf):
+                    code = ttpf.check(pool, 0)
+            finally:
+                pool.close()
+        return code, json.loads(buf.getvalue())
+
+    def test_odd_block_counts_cover_every_child_block(self):
+        for w, h, parent_fn, child_fn, rc, errs in self.CASES:
+            with self.subTest(size=(w, h), rc=rc, chain_error=errs):
+                code, result = self.run_check(w, h, parent_fn, child_fn)
+                self.assertEqual(code, rc, result)
+                self.assertEqual(result["chain_error"], errs)
+
+    def test_cli_rejects_a_dropped_edge_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "odd.ttpf")
+            odd_bc1_pool(path, 12, 8, bc1_black, bc1_single(1, 0))
+            proc = subprocess.run([sys.executable, "-I", TOOL, "check", path, "0"],
+                                  capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["max_error"], 127.5)
+        self.assertTrue(result["full_chain"])
+
+
+class VisibleExportTest(unittest.TestCase):
+    """Before the fix 17x13 BC1 exported its 2x2-block child as 3x2 storage blocks (208 bytes)."""
+    RED = (255, 0, 0)
+
+    def test_export_packs_visible_blocks_only(self):
+        def child(x, y):
+            return solid_bc1(self.RED) if y == 1 else bc1_black(x, y)
+        for w, h in ((17, 13), (17, 16), (16, 13), (16, 16)):
+            with self.subTest(size=(w, h)), tempfile.TemporaryDirectory() as tmp:
+                path, out = os.path.join(tmp, "edge.ttpf"), os.path.join(tmp, "edge.dds")
+                odd_bc1_pool(path, w, h, bc1_black, child)
+                pool = ttpf.Pool(path)
+                try:
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(ttpf.export(pool, 0, out), 0)
+                finally:
+                    pool.close()
+                with open(out, "rb") as f:
+                    blob = f.read()
+                pw, ph, cw, ch = (w + 3) // 4, (h + 3) // 4, (w // 2 + 3) // 4, (h // 2 + 3) // 4
+                self.assertEqual(len(blob) - 148, 8 * (pw * ph + cw * ch))
+                self.assertEqual(struct.unpack_from("<I", blob, 20)[0], 8 * pw * ph)
+                at = 148 + 8 * (pw * ph + cw)
+                px = ttpf.decode_pixels(71, blob[at:at + 8], 1, 1)
+                self.assertEqual(tuple(px[0][:3]), self.RED)
 
 
 class SyntheticPoolTest(unittest.TestCase):
