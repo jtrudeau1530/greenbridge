@@ -2054,8 +2054,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
             const bool expect_ok = (type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
                                     type == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
                                     type == D3D12_COMMAND_LIST_TYPE_COPY) &&
-                                   (prio == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ||
-                                    prio == D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
+                                   prio == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
             if (ours->CheckFeatureSupport(D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, &q, sizeof(q)) != S_OK ||
                 q.PriorityForTypeIsSupported != (expect_ok ? TRUE : FALSE))
                 fail("COMMAND_QUEUE_PRIORITY answer mismatch");
