@@ -127,6 +127,12 @@ class DivFmasF32Tests(unittest.TestCase):
         self.assertEqual(run_f32(2.0 ** 100, 1.0, 0.0, True), f2u(float("inf")))
         self.assertEqual(run_f32(-(2.0 ** 100), 1.0, 0.0, True), f2u(float("-inf")))
 
+    def test_tiny_intermediate_does_not_underflow_when_vcc_set(self):
+        # 2^-75 * 2^-75 = 2^-150 would flush to 0 if rounded before multiplying by 2^32,
+        # but fused scaling yields 2^-118 (0x04800000).
+        self.assertEqual(run_f32(2.0 ** -75, 2.0 ** -75, 0.0, False), 0)
+        self.assertEqual(run_f32(2.0 ** -75, 2.0 ** -75, 0.0, True), f2u(2.0 ** -118))
+
     def test_input_and_output_modifiers(self):
         # |-2.0| * (-1.5) + 4.0 = 1.0; mul:2 -> 2.0; clamp -> 1.0
         self.assertEqual(run_f32(-2.0, 1.5, 4.0, False, "v_div_fmas_f32 v0, |v1|, -v2, v3"), f2u(1.0))
@@ -173,7 +179,8 @@ class DivFmasF64Tests(unittest.TestCase):
                 self.assertIn(f"OpConstant %uint {scale_lo}", spv)
                 self.assertRegex(spv, r"OpSelect %double %\w+ %\w+ %\w+")
                 fmul_count = len(re.findall(r"OpFMul %double", spv))
-                self.assertEqual(fmul_count, 2 if want_mul else 1)
+                # 3 pre-scale multiplies (2^32, 2^32, 2^64) + 1 post-scale multiply (2^64) + optional omod
+                self.assertEqual(fmul_count, 5 if want_mul else 4)
                 if want_clamp:
                     self.assertIn("FClamp", spv)
                 else:
