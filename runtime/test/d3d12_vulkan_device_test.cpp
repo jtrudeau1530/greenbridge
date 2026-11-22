@@ -789,6 +789,10 @@ int compare_allocation_info(ID3D12Device* ours) {
     for (const Case& c : cases) {
         const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 1, &c.desc);
         const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 1, &c.desc);
+        if (c.top_mip_bytes && b.SizeInBytes == UINT64_MAX) {
+            std::printf("allocation info %s: host unsupported, skipped\n", c.name);
+            continue;
+        }
         if (b.SizeInBytes == UINT64_MAX || !c.top_mip_bytes) {
             if (a.SizeInBytes != b.SizeInBytes || (b.SizeInBytes != UINT64_MAX && a.Alignment != b.Alignment))
                 mismatch(c.name, a, b);
