@@ -8,12 +8,15 @@ Run:
     python -I tests/test_shader_profile.py
     python -m unittest discover -s tests -v
 """
+from contextlib import nullcontext, redirect_stdout
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -475,6 +478,51 @@ class TestCommandLineEndToEnd(unittest.TestCase):
 
         self.assertEqual(data["shaders"], 1)
         self.assertEqual([shader["name"] for shader in data["per_shader"]], ["cs_main"])
+
+    def test_profile_rankings_do_not_depend_on_directory_order(self) -> None:
+        self.write("ps_vector", "\n".join((
+            "\tv_add_f32 v0, v0, v1",
+            "\tv_add_f32 v0, v0, v1",
+            "\tv_and_b32 v0, v0, v1",
+            "\tv_max_f32 v0, v0, v1",
+            "\tv_min_f32 v0, v0, v1",
+            "\tv_mov_b32 v0, v1",
+            "\tv_or_b32 v0, v0, v1",
+            "\tv_xor_b32 v0, v0, v1",
+            "\ts_endpgm",
+        )))
+        self.write("ps_scalar", "\n".join((
+            "\ts_add_u32 s0, s0, s1",
+            "\ts_and_b32 s0, s0, s1",
+            "\ts_mov_b32 s0, s1",
+            "\ts_nop 0",
+            "\ts_or_b32 s0, s0, s1",
+            "\ts_xor_b32 s0, s0, s1",
+            "\ts_endpgm",
+        )))
+        with os.scandir(self.disasm_dir) as scan:
+            entries = sorted(scan, key=lambda entry: entry.name)
+        report = os.path.join(self.tmp.name, "profile.json")
+        args = ["shader_profile.py", self.disasm_dir, "--out", report]
+
+        def profile(order: list[os.DirEntry[str]]) -> tuple[str, bytes]:
+            stdout = io.StringIO()
+            with (patch.object(P.os, "scandir", return_value=nullcontext(order)),
+                  patch.object(sys, "argv", args), redirect_stdout(stdout)):
+                self.assertIsNone(P.main())
+            with open(report, "rb") as output:
+                return stdout.getvalue(), output.read()
+
+        forward, data = profile(entries)
+        reverse, reversed_data = profile(list(reversed(entries)))
+        self.assertEqual(data, reversed_data)
+        self.assertEqual(forward, reverse)
+        rankings = json.loads(data)["by_mnemonic"]
+        self.assertEqual(rankings[0], {"m": "s_endpgm", "shaders": 2, "count": 2})
+        self.assertEqual([row["m"] for row in rankings[1:]], sorted(row["m"] for row in rankings[1:]))
+        most_widespread = next(line for line in forward.splitlines() if "most widespread:" in line)
+        self.assertEqual(most_widespread.removeprefix("  most widespread: "),
+                         ", ".join(f"{row['m']} ({row['shaders']})" for row in rankings[:12]))
 
     def test_cli_warning_words_from_llvm_messages(self):
         a = echo("070080bf feffffff ffffffd7 050080bf feffffff 000081bf")
