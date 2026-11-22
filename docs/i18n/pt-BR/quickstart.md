@@ -3,7 +3,7 @@
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
 > [`docs/README.md`](../../README.md)) é a **referência oficial**. Este guia reúne apenas instruções estáveis de
-> configuração e compilação (sincronizado com o commit `4eb6155d`). Para o status diário do projeto, consulte o
+> configuração e compilação (sincronizado com o commit `16282101`). Para o status diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
 ## O que é o Leonida
@@ -50,6 +50,13 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 - **Visual Studio 2022** com *Desenvolvimento para desktop com C++* e **Windows SDK `10.0.26100` ou mais recente** (necessário para o estágio `runtime`, que usa root signatures 1.2).
 - [ffmpeg](https://ffmpeg.org/download.html) no `PATH` *(opcional: decodifica streams XMA2 e é exigido ao usar `--wav`)*.
 
+**Pouco espaço em disco:** o valor de ~350 GB refere-se ao build completo. Para *executar* o port,
+`--stages check,shaders,runtime` precisa de cerca de **30 GB**; o estágio `assets` (~300 GB) serve apenas para as
+ferramentas de extração de assets, e `--wav` adiciona várias vezes o tamanho dos arquivos Ogg Opus. `--work` e `--out`
+podem apontar para outro disco; se o pacote do jogo estiver em uma unidade somente leitura, use `--overlay` em um disco
+gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm`: apagá-los mantendo a pasta faz o estágio parecer
+concluído com zero shaders, e um link simbólico em `disasm` é recusado.
+
 ## Como compilar
 
 ### Modo simples (Windows)
@@ -69,7 +76,9 @@ Se o build for interrompido, basta rodar novamente para retomar de onde parou.
 
 ```powershell
 python -I make_game.py --find                          # lista as cópias encontradas neste PC
+python -I make_game.py --pick                          # escolhe a pasta do jogo em uma janela de diálogo
 python -I make_game.py --check                         # verifica os arquivos do jogo sem compilar
+python -I make_game.py --check --full-check            # também compara o SHA-256 de cada arquivo (lento)
 python -I make_game.py --game "D:\caminho\do\pacote" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # roda apenas os estágios escolhidos
 python -I make_game.py --game "D:\caminho\do\pacote" --wav  # também decodifica Ogg Opus para PCM WAV (grande)
@@ -78,8 +87,10 @@ python -I make_game.py --wave64-emulate auto           # auto (padrão), on ou o
 
 Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
 
-- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação automaticamente quando necessário.
-- **`--work`**: recomenda-se apontar para um disco com pelo menos 350 GB livres; o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
+- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação automaticamente quando necessário (exceto em GPUs AMD RDNA2 no driver Windows que executam wave64 nativamente, onde o compilador do driver falha em código LDS emulado, #857). O modo escolhido fica salvo junto aos shaders traduzidos.
+- **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
+- **`--work`**: recomenda-se apontar para um disco com pelo menos 350 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
+- **`--wav`**: fica desativado por padrão porque WAV PCM de 16 bits é várias vezes maior que Ogg Opus; quando ativado, decodifica os streams Ogg Opus para `work\assets\audio\wav` e pula arquivos WAV já existentes ao retomar um build.
 
 ### Diagnóstico do Vulkan no Linux
 
