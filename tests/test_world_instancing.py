@@ -448,6 +448,43 @@ class LodSetsTest(unittest.TestCase):
                 with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
                     self.assertEqual(sorted(json.load(f)["lod_bands"]), ["hd"])
 
+    def test_prune_stale_chunks_removes_obsolete_lod_set_chunks(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            chunks_dir = os.path.join(tmp, "direct_chunks")
+            os.makedirs(chunks_dir)
+            for name in ("c_hd_0_-1.glb", "c_lod_0_-1.glb", "c_slod2_0_-1.glb",
+                         "c_orphan_hd_1_-1.glb", "c_hd_0_-1.glb.tmp", "c_0_-1.glb", "unrelated.glb"):
+                with open(os.path.join(chunks_dir, name), "wb") as f:
+                    f.write(b"x")
+            world_build._prune_stale_chunks(chunks_dir, {"c_hd_0_-1.glb"})
+            self.assertEqual(sorted(os.listdir(chunks_dir)), ["c_hd_0_-1.glb", "unrelated.glb"])
+
+            assets = twp.write_assets(tmp)
+            ents = os.path.join(tmp, "e.jsonl")
+            twp.write_entities(ents, [self.lod_row((10, 10, 0), 0), self.lod_row((10, 10, 0), 3, child=1000.0)])
+            out = os.path.join(tmp, "w")
+            out_chunks = os.path.join(out, "chunks")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-sets"]), 0)
+                self.assertEqual(sorted(os.listdir(out_chunks)), ["c_hd_0_-1.glb", "c_slod2_0_-1.glb"])
+                # Narrowing --lod-levels must prune the obsolete slod2 chunk.
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-sets", "--lod-levels", "0"]), 0)
+                self.assertEqual(sorted(os.listdir(out_chunks)), ["c_hd_0_-1.glb"])
+                # Switching to a non-LOD build must prune the obsolete c_hd_* chunk.
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-levels", "0"]), 0)
+                self.assertEqual(sorted(os.listdir(out_chunks)), ["c_0_-1.glb"])
+                # Rebuilding with --lod-sets and then --limit 0 must clear all LOD chunks.
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-sets"]), 0)
+                self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                   "--lod-sets", "--limit", "0"]), 0)
+                self.assertEqual(os.listdir(out_chunks), [])
+
 
 class IterPlacementsTest(unittest.TestCase):
     def test_same_rows_and_counts_as_load_placements(self):
