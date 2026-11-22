@@ -540,10 +540,19 @@ Module& Loader::load(const std::filesystem::path& image) {
     std::lock_guard lock(mutex_);
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
-    Module& m = map_image(image);
-    bind_imports(m);  // loads every bundled module m imports first, so they land in init_order_ before m
-    protect_sections(m);
-    register_unwind(m);
+    Module* mapped = nullptr;
+    try {
+        mapped = &map_image(image);
+        bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
+        protect_sections(*mapped);
+        register_unwind(*mapped);
+    } catch (...) {
+        // A failed load, nested ones (a dependency of a run-time load) included, must not stay findable by name:
+        // a later lookup would get a half-mapped image with unbound imports. ~Loader still frees it through order_.
+        by_name_.erase(key);
+        throw;
+    }
+    Module& m = *mapped;
     init_order_.push_back(&m);
     if (startup_trace::enabled())
         startup_trace::event("map", "\"module\":" + startup_trace::quote(m.name) +
@@ -598,8 +607,8 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
         std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
         return static_cast<void*>(m.base);
     } catch (const std::exception& e) {
-        // Do not leave a failed run-time load indexed by name so later GetModuleHandle/LoadLibrary calls do not
-        // observe a half-initialised module. ~Loader still frees any VirtualAlloc'd mapping in order_.
+        // load() drops a module that failed to map or bind (dependencies included); this also drops one whose
+        // initialise() failed, so later GetModuleHandle/LoadLibrary calls don't see it. ~Loader frees it via order_.
         by_name_.erase(dll_lower);
         std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
