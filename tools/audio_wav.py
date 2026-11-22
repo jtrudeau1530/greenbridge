@@ -472,14 +472,16 @@ def main(argv=None) -> int:
     t0 = time.time()
     written = skipped = 0
     todo = []
+    failures: list[tuple[str, str]] = []
     for path, rel in items:
         dst = os.path.join(out, rel + ".wav")
-        if os.path.exists(dst):
+        if os.path.isfile(dst):
             skipped += 1
+        elif os.path.exists(dst):
+            failures.append((rel, f"output path is not a file: {dst}"))
         else:
             todo.append((path, rel, dst))
 
-    failures = []
     done = 0
     workers = min(a.jobs, len(todo)) if todo else 1
     if todo:

@@ -541,6 +541,31 @@ class FakeFfmpegDecodeTest(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("0 WAV written, 3 already present", p.stdout)
 
+    def test_directory_at_wav_destination_counts_as_failed_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            out = os.path.join(tmp, "out")
+            blocker = os.path.join(out, "blocked.wav")
+            write_fake_opus_inputs(src, ("blocked.ogg", "existing.ogg", "new.ogg"))
+            os.makedirs(blocker)
+            marker = os.path.join(blocker, "keep")
+            with open(marker, "wb") as f:
+                f.write(b"keep the directory")
+            with open(os.path.join(out, "existing.wav"), "wb") as f:
+                f.write(b"existing audio")
+
+            run = [sys.executable, "-I", TOOL, src, "--out", out, "--jobs", "1",
+                   "--ffmpeg", write_fake_ffmpeg(tmp)]
+            result = subprocess.run(run, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("1 WAV written, 1 already present, 1 failed", result.stdout)
+            self.assertIn("FAILED blocked: output path is not a file", result.stdout)
+            for filename, expected in ((marker, b"keep the directory"),
+                                       (os.path.join(out, "existing.wav"), b"existing audio"),
+                                       (os.path.join(out, "new.wav"), b"FAKE:new.ogg")):
+                with open(filename, "rb") as f:
+                    self.assertEqual(f.read(), expected)
+
     def test_ffmpeg_gets_no_stdin(self):
         # ffmpeg reads stdin for key commands. Given the caller's stdin, it stops a run in the background of a
         # terminal ("Stopped (tty output)") and swallows input piped to the caller, such as a shell loop's file list.
