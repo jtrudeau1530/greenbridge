@@ -23,6 +23,7 @@ Stages, in order (each skips work that is already done, so a stopped build conti
 """
 import argparse
 import functools
+import hashlib
 import json
 import os
 import re
@@ -396,34 +397,52 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         drop(translated)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
         mark_done(disassembled)
+    # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
+    # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
+    # disassembly stay current.
+    sources_file = os.path.join(spirv, "translation_sources.sha256")
+    sources = translation_sources_digest()
+    if os.path.isfile(translated):
+        try:
+            with open(sources_file, encoding="utf-8") as f:
+                had_sources = f.read().strip()
+        except (OSError, UnicodeError):
+            had_sources = ""
+        if had_sources != sources:
+            log("shaders: no matching translator fingerprint for the existing shaders: translating again")
+            drop(translated)
     # The translation depends on --wave64-emulate, so the mode it was made with is kept beside it. A folder from
     # before the file existed was translated without emulation.
     mode_file = os.path.join(spirv, "wave64_emulate.txt")
     want = "on" if emulate else "off"
-    if os.path.isfile(translated):
-        try:
-            with open(mode_file, encoding="utf-8") as f:
-                had = f.read().strip()
-        except OSError:
-            had = "off"
-        if had == "on" and want == "off" and keep_emulated:
-            # auto answers differently from run to run (a GPU asleep or hidden, vulkaninfo missing); emulated
-            # shaders are exact on every GPU, so they are kept rather than translating the whole corpus again.
-            log("shaders: the shaders were translated with wave64 emulation and are kept (exact on every GPU); "
-                "--wave64-emulate off translates them natively")
-        elif had != want:
-            log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
-                "translating again")
-            drop(translated)
+    try:
+        with open(mode_file, encoding="utf-8", errors="replace") as f:
+            had = f.read().strip()
+    except OSError:
+        had = "off"
+    if had == "on" and want == "off" and keep_emulated:
+        # auto answers differently from run to run (a GPU asleep or hidden, vulkaninfo missing); emulated shaders are
+        # exact on every GPU, so they are kept rather than translating the whole corpus again. When they are
+        # translated again for another reason, or a stopped translation is retried, they stay emulated.
+        log("shaders: the shaders were translated with wave64 emulation and it stays on (exact on every GPU); "
+            "--wave64-emulate off translates them natively")
+        emulate, want = True, "on"
+    elif had != want and os.path.isfile(translated):
+        log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
+            "translating again")
+        drop(translated)
     if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
-        # The mode goes down before the translation starts, while there is no index.json: a stop at any point then
-        # leaves either no index (translated again) or an index with the right mode, never one with a guessed mode.
+        # The mode and the translator's digest go down before the translation starts, while there is no index.json:
+        # a stop at any point then leaves either no index (translated again) or an index with the right mode and
+        # digest, never a guessed one. rdna2spirv.py --merge writes index.json last, after the stubs.
         os.makedirs(spirv, exist_ok=True)
         with open(mode_file, "w", encoding="utf-8") as f:
             f.write(want + "\n")
+        with open(sources_file, "w", encoding="utf-8") as f:
+            f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate)
     log("shaders: done")
 
@@ -496,6 +515,22 @@ def runtime_gpu_native64():
         return bool(json.loads(r.stdout.strip().splitlines()[-1])["native64"])
     except (OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError):
         return None
+
+
+# Source and data files that produce the translated modules, metadata and partner stubs.
+TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py",
+                       "shader_meta.py", "spirv_stubs.py", "gfx10_formats.json")
+
+
+def translation_sources_digest() -> str:
+    """SHA-256 over the name and exact bytes of each TRANSLATION_SOURCES file."""
+    h = hashlib.sha256()
+    for name in TRANSLATION_SOURCES:
+        with open(os.path.join(TOOLS, name), "rb") as f:
+            data = f.read()
+        h.update(f"{name}\0{len(data)}\0".encode())
+        h.update(data)
+    return h.hexdigest()
 
 
 def drop(*paths: str) -> None:
