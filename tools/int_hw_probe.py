@@ -656,6 +656,41 @@ def build_cases():
             "v_med3_i16 v10, v1, v2, v3",
             "v_med3_u16 v11, v1, v2, v3",
         ], "v_med3_i16 / v_med3_u16 signed vs unsigned median with op_sel"),
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_i16_u16_clamp", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0xfff00005", "v_mov_b32 v2, 0x00010002", "v_mov_b32 v3, 0x0003fff8",
+            "v_min3_i16 v8, v1, v2, v3 op_sel:[1,0,0,1] clamp",   # writes hi (fff0), keeps lo (5a5a)
+            "v_max3_u16 v9, v1, v2, v3 op_sel:[1,0,0,0] clamp",   # writes lo (fff8), keeps hi (beef)
+            "v_min3_u16 v10, v1, v2, v3 op_sel:[1,0,0,0] clamp",  # writes lo (0002), keeps hi (beef)
+            "v_max3_i16 v11, v1, v2, v3 op_sel:[1,0,0,1] clamp",  # writes hi (0002), keeps lo (5a5a)
+        ], "v_min3/max3_i16/u16 clamp range-invariance and untouched destination half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_med3_i16_u16_clamp", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0xfff00010", "v_mov_b32 v2, 0x00050020", "v_mov_b32 v3, 0x0001fff5",
+            "v_med3_i16 v8, v1, v2, v3 op_sel:[1,1,0,1] clamp",   # writes hi (fff5), keeps lo (5a5a)
+            "v_med3_u16 v9, v1, v2, v3 op_sel:[1,1,0,0] clamp",   # writes lo (fff0), keeps hi (beef)
+            "v_med3_i16 v10, v1, v2, v3 clamp",                   # writes lo (0010), keeps hi (beef)
+            "v_med3_u16 v11, v1, v2, v3 clamp",                   # writes lo (0020), keeps hi (beef)
+        ], "v_med3_i16 / v_med3_u16 clamp range-invariance and untouched destination half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_med3_f16_clamp_nan", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0x38007e00",
+            "v_mov_b32 v2, 0xc0004000",
+            "v_mov_b32 v3, 0x3800bc00",
+            "v_min3_f16 v8, v1, v2, v3 clamp",
+            "v_max3_f16 v9, v1, v2, v3 clamp",
+            "v_med3_f16 v10, v1, v2, v3 clamp",
+            "v_med3_f16 v11, v1, v2, v3 op_sel:[1,1,1,1] clamp",
+        ], "v_min3/max3/med3_f16 NaN, DX10 clamp, dirty high-half sentinels and op_sel"),
     ]
 
     # 22. v_swaprel_b32 (M0[25:16] dst offset, M0[9:0] src offset, ignored upper M0 bits, self-swap, inactive EXEC)

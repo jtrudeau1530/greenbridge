@@ -5914,15 +5914,7 @@ class Gen:
                 r = m
             lo = self.tmp()
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
-            if dhi:
-                old, keep, sh16, v = (self.tmp() for _ in range(4))
-                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
-                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
-                self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
-                self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
-                self.dst(a[0], v)
-            else:
-                self.write_lo16(a[0], lo)
+            self.write_half16(a[0], lo, dhi)
         elif op == "v_bcnt_u32_b32":
             x, acc = self.src_u(a[1]), self.src_u(a[2])
             c, r = self.tmp(), self.tmp()
