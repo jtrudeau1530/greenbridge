@@ -375,16 +375,36 @@ What is implemented (all of it testable without the game):
 
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
-- **`runtime/src/vulkan_bindless.h`**: set 0 includes the twenty bindings the translator declares, with the
-  array sizes `vk_pipeline_check` uses, and `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1)
-  behind binding 2. One set for the device. Details:
+- **`runtime/src/vulkan_bindless.h`**: set 0 includes the twenty bindings the translator declares, and
+  `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind binding 2. One set for the device.
+  The translator declares every array as a runtime array, so the counts are the runtime's choice. Details:
+  - The device sizes the arrays once, when it creates the set. It does not recreate the set, because pipeline
+    layouts are built on `bindless_set_layout()`. `bindless::size_bindings` reads the update-after-bind limits
+    (`maxPerStageDescriptorUpdateAfterBind*`, `maxDescriptorSetUpdateAfterBind*`,
+    `maxPerStageUpdateAfterBindResources`, `maxUpdateAfterBindDescriptorsInAllPools`), or the plain limits for a
+    set without update-after-bind. It starts from the default counts below (4096 sampled 2D images, 1024
+    samplers, 1024 2D-array, 256 1D, 256 3D and 256 per storage array). Where a limit is lower, it clamps the
+    sampler, storage and 2D arrays, in that order, and the device logs it. Next come the MS pairs that fit. Then it
+    grows the arrays, in the same order, towards the maximums:
+    - samplers: up to 4096, and at most `maxSamplerAllocationCount` less 64 for samplers outside the set. That
+      covers a full 2048-sampler D3D12 heap plus room for literal and static S#s.
+    - 2D images: up to 65536.
+    - storage arrays: up to 4096 each.
+
+    Growth leaves 64 descriptors of each limit to the other sets of a pipeline layout. It also stays within
+    `maxPerSetDescriptors`, which never shrinks the default counts, because a layout past it may still be
+    supported. The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
+    and 4000 samplers) the set has 65536 2D images, 3936 samplers and 4096 storage indices in 2D: 93793
+    descriptors, 3-6 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and
+    `bindless_sizing_test` checks the rules on synthetic limits.
   - An image has one index in its dimension (2D, 2D array, 3D, 1D, 2DMS or 2DMS array), shared by the
     bindings for that dimension. The runtime adds sampled-image bindings in pairs for 2DMS and 2DMS array:
     20/21 for floating-point and normalized color, 22/23 for unsigned integers, and 24/25 for signed integers.
     The runtime enables pairs that fit the device's descriptor limits and have a multisampled zero fallback
     of the matching numeric class. A missed key reads zero at texel (0, 0), layer 0, sample 0.
-  - The storage arrays are shorter (256), so an image with a storage view gets an index below 256 and a read-only
-    one goes above where there is room.
+  - The storage arrays are shorter (`BindlessSet::storage_capacity`). Each array holds at most as many images
+    as its dimension, and the 2D r32ui array is the same size as the other 2D storage arrays. So an image with a
+    storage view gets an index the storage arrays hold, and a read-only one goes above where there is room.
   - Index 0 of every array is a fallback (a 1x1 image of zeros, a nearest clamping sampler), because a miss is
     index 0.
   - Changes are queued and written by `flush()`, one write a slot, so a view that is removed before the next
@@ -451,7 +471,8 @@ the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
 of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
-feature, each logged and approximated; the storage arrays hold 255 images a dimension; nothing writes through a
+feature, each logged and approximated; the storage arrays hold 255 images a dimension at the default counts, more
+where the device has room (4095 2D and 1023 2D-array on an RTX 5070); nothing writes through a
 storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan
 level). The set is flushed at every `ExecuteCommandLists`; a flush that erases keys or moves the table to a larger
 buffer (`BindlessSet::flush_needs_idle()`) first waits for the device to be idle and then frees the retired table
@@ -507,7 +528,7 @@ and any validation error fails them.
   loads a T# and an S# from a descriptor table and samples. The test draws the gradient with the T# at the fourth
   slot probed, the fallback after the key is erased, the gradient again after the table has grown into a new
   buffer, another view at the same index, and the fallback after removal, with and without the
-  descriptor-indexing flags.
+  descriptor-indexing flags. Last, it draws through a 2D image past 5000 others and a sampler past 2100 others.
 - `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
   the CPU has not signalled holds the GPU back.
 - `dxgi_swapchain_test`: creates a Win32 HWND and exercises `rt::d3d12::create_dxgi_factory`,
@@ -621,6 +642,9 @@ and any validation error fails them.
     this one in Vulkan and binds the device's set. It reads the texture through the view's own slot and through
     a copy of it, and gets the fallback from a slot of bytes no view was made for and, after the texture is
     destroyed, from the view's own bytes.
+  - Capacity: 5000 distinct SRVs of that texture and one more, and 2100 distinct wrapping samplers in two
+    2048-slot heaps. The last view through the last sampler reads the texture one tile to the right. With the
+    sizes of before, both were past their arrays ("array is full") and the shader read the fallback.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
@@ -763,10 +787,12 @@ The layer's descriptor model:
   If the logical device lacks the feature, the runtime logs the unsupported view
   and its descriptor resolves to the fallback. A clamp at or below the first mip needs no extension. Above the
   last mip, the view retains its dimensions and maps sampled channels to zero while preserving constant channels.
-- Set 0 is a fixed bindless layout. The GPU tests use 4096 sampled 2D images, 1024 samplers, 1024 2D-array
-  images, 256 1D, 256 3D, 1024 storage images and 256 per storage dimension/class; start there and grow by
-  recreating the set at a frame boundary. Use `UPDATE_AFTER_BIND` and `PARTIALLY_BOUND` so a new view does not
-  require rewriting every descriptor; without those features, rebuild the set when it changes.
+- Set 0 is a fixed bindless layout, sized once when the device creates it. The defaults are 4096 sampled 2D
+  images, 1024 samplers, 1024 2D-array images, 256 1D, 256 3D and 256 per storage dimension/class. The 2D, sampler and
+  storage arrays grow to what the device's limits allow, up to 65536, 4096 and 4096 (see `vulkan_bindless.h`
+  above). The set is not recreated to grow, because recreating it would invalidate the pipeline
+  layouts built on it. Use `UPDATE_AFTER_BIND` and `PARTIALLY_BOUND` so a new view does not require rewriting
+  every descriptor; without those features, rebuild the set when it changes.
 - The command buffer binds set 0 once; descriptor-heap changes only update the arrays and the hash table.
 
 **Descriptor lifetime.** A bindless index may be referenced by in-flight command buffers after the resource is
