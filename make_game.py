@@ -238,6 +238,23 @@ def default_out() -> str:
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
 
+def assets_exported(work: str) -> bool:
+    """Whether an earlier run finished the assets stage's exports, so its space is already in use. xma.done is the
+    last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
+    too. A marker counts only when it holds what mark() writes, not because a file of that name exists.
+    xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
+    ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again."""
+    audio = os.path.join(work, "assets", "audio")
+    for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
+        try:
+            with open(os.path.join(audio, name), encoding="utf-8") as f:
+                if f.read().strip() != f"{what} finished":
+                    return False
+        except (OSError, UnicodeError):
+            return False
+    return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
+
+
 def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
     """Why the pipelines stage can't run yet. Kept here so preflight can fail before a long shader build;
     pipelines() prints its own, more detailed message when the stage is reached. On Windows the runtime stage
@@ -292,7 +309,13 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
             missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
-    need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
+    need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
+    # A rerun that only refreshes the shaders shouldn't need room for a second copy of exports already on disk.
+    # --wav still counts it: the WAV decode writes several times the Ogg Opus size and has no marker.
+    if need.get("assets") and not wav and assets_exported(work):
+        log(f"preflight: the assets are already exported in {work}; not counting their {need['assets']} GB")
+        need["assets"] = 0
+    need_gb = sum(need.values())
     os.makedirs(work, exist_ok=True)
     free_gb = shutil.disk_usage(work).free / 2**30
     if free_gb < need_gb:
@@ -710,14 +733,20 @@ def mark(path: str, what: str) -> None:
         f.write(f"{what} finished\n")
 
 
-def decode_xma(ff: str, xma_dir: str) -> None:
-    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
-    temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
+def pending_xma(xma_dir: str) -> list:
+    """The XMA2 streams (.xma.wav) under xma_dir that have no decoded .wav next to them yet."""
     todo = []
     for root, _, files in os.walk(xma_dir):
         for f in files:
             if f.endswith(".xma.wav") and not os.path.isfile(os.path.join(root, f[:-8] + ".wav")):
                 todo.append(os.path.join(root, f))
+    return todo
+
+
+def decode_xma(ff: str, xma_dir: str) -> None:
+    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
+    temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
+    todo = pending_xma(xma_dir)
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
