@@ -251,6 +251,7 @@ struct DeviceState {
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
+    float max_sampler_lod_bias = 0;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
     VkResolveModeFlags stencil_resolve_modes = 0;
@@ -554,7 +555,7 @@ struct DeviceState {
         const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
         if (sampler_entries.count(key)) return true;
         const g::Sampler sampler = g::decode(words);
-        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler);
+        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler, max_sampler_lod_bias);
         // What vulkan_sampler leaves to its caller, and features this device may not have enabled.
         if (sampler_info.anisotropyEnable && !info.sampler_anisotropy) {
             log_once("anisotropic sampler without samplerAnisotropy; anisotropy", int(sampler.max_anisotropy));
@@ -1516,6 +1517,7 @@ public:
         // Timestamps: what the one VkQueue every D3D12 queue submits to can write.
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
+        state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
