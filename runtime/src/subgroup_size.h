@@ -65,6 +65,7 @@ enum class SubgroupOutcome {
     emulated,         // --wave64-emulate: exact on any size, nothing is required
     required,         // the stage asks for `size`
     device_fixed,     // the device has one size and it is the wanted one: nothing to ask for
+    device_default,   // cannot be required, but the default size is the wanted one: works, not guaranteed stable
     unavailable,      // the wanted size cannot be had: the shader runs at another size and may be inexact
     unknown_stage,    // no Vulkan stage for this entry
     unknown_device,   // the device sizes were not queried (all zero): nothing is asked for
@@ -89,11 +90,13 @@ inline bool subgroup_is_power_of_two(std::uint32_t v) { return v && !(v & (v - 1
 //     (VUID-VkPipelineShaderStageCreateInfo-pNext-02755 and -02756,
 //     VUID-VkPipelineShaderStageRequiredSubgroupSizeCreateInfo-requiredSubgroupSize-02760..02762).
 //   - A compute stage also gets VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT when computeFullSubgroups
-//     is enabled and the local size X is a multiple of the size (VUID-VkPipelineShaderStageCreateInfo-flags-02784
-//     and -02785: the flag needs the feature and a compute, task or mesh stage; with a required size,
-//     -pNext-02757 wants X to be a multiple of it).
+//     is enabled and the local size X is a multiple of the size (VUID-VkPipelineShaderStageCreateInfo-flags-02785:
+//     the flag needs the feature; -flags-08988: a compute, task or mesh stage; with a required size, -pNext-02757
+//     wants X to be a multiple of it).
 //   - A device whose one and only subgroup size (min == max) is the wanted one needs nothing (`device_fixed`).
-//     When the size cannot be required on any other device, the outcome is `unavailable`.
+//   - Where the size cannot be required (stage not listed, feature off) but the device default is the wanted size,
+//     the shader works as it is (`device_default`): nothing guarantees it, a driver may change its default.
+//     Otherwise the outcome is `unavailable`.
 inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const SubgroupSizeCaps& caps) {
     SubgroupRequest r;
     r.stage = subgroup_stage_bit(entry.stage);
@@ -125,6 +128,8 @@ inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const Subg
         if (r.stage == VK_SHADER_STAGE_COMPUTE_BIT && caps.compute_full_subgroups &&
             entry.local_size[0] % r.wanted == 0)
             r.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    } else if (caps.default_size == r.wanted) {
+        r.outcome = SubgroupOutcome::device_default;
     } else {
         r.outcome = SubgroupOutcome::unavailable;
     }
