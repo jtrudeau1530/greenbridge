@@ -153,6 +153,31 @@ class DisasmInputTest(unittest.TestCase):
         with open(os.path.join(self.src, name), "wb") as f:
             f.write(data)
 
+    def test_skip_existing_only_reuses_published_nonempty_listings(self):
+        for name in ("kept", "empty", "unfinished"):
+            self.write(name + ".fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.mkdir(out)
+        kept = os.path.join(out, "kept.s")
+        with open(kept, "w", encoding="utf-8", newline="\n") as f:
+            f.write("completed listing\n")
+        open(os.path.join(out, "empty.s"), "w").close()
+        open(os.path.join(out, ".disasm-abandoned.tmp"), "w").close()
+
+        result = self.run_tool(self.src, "--out", out, "--skip-existing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'reused': 1", result.stdout)
+        self.assertIn("'clean': 2", result.stdout)
+        with open(kept, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "completed listing\n")
+        for name in ("empty", "unfinished"):
+            with open(os.path.join(out, name + ".s"), encoding="utf-8") as f:
+                self.assertIn("s_endpgm", f.read())
+
+        result = self.run_tool(self.src, "--out", out, "--skip-existing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'reused': 3", result.stdout)
+
     def test_code_range_scans_a_blob_shorter_than_the_header(self):
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         try:

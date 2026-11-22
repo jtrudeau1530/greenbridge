@@ -145,6 +145,15 @@ cmake --build runtime/build/windows --parallel
 WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/windows
 ```
 
+Use a recent xwin: 0.10.0 lays out SDK 10.0.26100 with the command above, while 0.6.5 stops with "unable to find
+x86_64 headers for Win11SDK_10.0.26100".
+
+On a machine without a display (a server, a container, WSL without WSLg), Wine has no graphics driver to create a
+Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (VkResult -3)` and, with
+`WINEDEBUG=+vulkan`, "Failed to load Wine graphics driver supporting Vulkan". Run the tests under a virtual X server,
+as CI does: `xvfb-run -a ctest --test-dir runtime/build/windows` (package `xvfb`). With Mesa installed, the tests
+then run on llvmpipe.
+
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
 runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are
@@ -206,6 +215,22 @@ Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixt
 3. Add it to `EXPECT` in `tests/test_wave64_halves_fixtures.py` with the tier, reasons and idioms the translator
    should give it, and run `python -m pytest tests/test_wave64_halves_fixtures.py`.
 4. Run `w64_graphics.py` on a RADV GPU and say which GPU and Mesa version in the pull request.
+## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
+
+The translated shaders take 144 bytes of push constants: s0..s31, then the heap base and the code base. A device whose
+`maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
+`vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
+AMD's Windows driver reports 128 on RDNA2 iGPUs (Radeon 680M, 610M, the Ryzen 7000 iGPU); RADV reports more on the
+same chips.
+
+To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
+`run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
+and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
+block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
+`vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
+only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
+(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
+constants, so those tests skip.
 
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 
@@ -307,6 +332,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 
 | What you see | Cause | What to do |
 |---|---|---|
+| `ctest` passes but runs far fewer tests than expected (about 45 instead of 125 on Windows), no `d3d12_*` GPU tests, and `LEONIDA_D3D12=vulkan` does nothing | CMake found no Vulkan headers: `VULKAN_SDK` was not set in the environment that ran CMake (for example a user variable set after the terminal opened), and `CMakeCache.txt` keeps that failed lookup. The configure prints a `CMake Warning` "Vulkan headers not found" | Set `VULKAN_SDK` in that environment (or pass `-DLEONIDA_VULKAN_HEADERS_FETCH=ON`), delete `CMakeCache.txt` and configure again. `-DLEONIDA_REQUIRE_VULKAN=ON` makes this a configure error; CI and `scripts/build_runtime.ps1` (with `VULKAN_SDK` set) pass it |
 | Windows refuses to start freshly built test programs ("An Application Control policy has blocked this file"), and the runner stops with a traceback | Smart App Control on Windows 11 | Turn Smart App Control off for the run |
 | Validation errors without a VUID, or messages from a layer you didn't ask for | An implicit Vulkan layer from other software (Rockstar Social Club, ReShade, MangoHud, an overlay) | Set `VK_LOADER_LAYERS_DISABLE=~implicit~`. Overlays that hook the swapchain (RivaTuner `VK_LAYER_RTSS`, OBS `VK_LAYER_OBS_HOOK`) can stay loaded: see the next row |
 | Validation errors that only your machine shows (e.g. `xbox_present`'s sRGB swapchain `STORAGE` message), with MSI Afterburner/RivaTuner or OBS installed | An overlay layer that hooks the swapchain: while RivaTuner Statistics Server is running, its `VK_LAYER_RTSS` adds `STORAGE` usage to it (OBS's `VK_LAYER_OBS_HOOK` injects `VK_IMAGE_USAGE_STORAGE_BIT` too). In an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE` (`VK_LOADER_DEBUG=all` says so), so `~implicit~` leaves the layer in | Run the tests from a normal terminal, close the overlay application, or set the layer's own switch, which works elevated too: `DISABLE_RTSS_LAYER=1`, `DISABLE_VULKAN_OBS_CAPTURE=1` (OBS). Any other layer's switch is the `disable_environment` entry in its manifest (the JSON listed under `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers` or `HKCU\...`). `VK_LOADER_DEBUG=layer` prints the layers that were actually inserted |

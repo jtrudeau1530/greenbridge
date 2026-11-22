@@ -27,11 +27,11 @@ def _u32(data, at):
     return struct.unpack_from("<I", data, at)[0]
 
 def is_mesh_page(data):
-    """Same as meshlet_page.py - checks if data starts with block or valid group."""
+    """Check whether data starts with either vertex block header or a meshlet group."""
     if len(data) < 16:
         return False
     word = struct.unpack_from("<I", data, 0)[0]
-    if word == BLOCK_MAGIC:
+    if word in (BLOCK_MAGIC, OTHER_BLOCK_MAGIC):
         return True
     if not word & 0x80000000:
         return False

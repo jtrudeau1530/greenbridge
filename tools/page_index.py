@@ -14,9 +14,13 @@ The header has no key: what earlier reports called a 64-bit key at +0x60 is the 
 29,297 of 29,298 measured pages. This tool reports `payload_at_0x60` instead.
 
 The +0x28 table (32-byte records) is reported raw as `q28_records`: the hash in its first u32 matches a +0x38
-hash on most pages, its +0x10 pointer resolves in the resource, and its +0x1c word behaves as flags. The
-+0x08 and +0x18 words are not decoded and are exported as `field_08` and `count_or_size`. The +0x30 and +0x40
+hash on most pages, its +0x10 pointer resolves in the resource, and its +0x1c word behaves as flags.The +0x08 and +0x18 words are not decoded and are exported as `field_08` and `count_or_size`. The +0x30 and +0x40
 tables are reported by offset only; their internal layout is not decoded here.
+
+Each page also carries a `resource`: the directory stream plus the continuations that reach the q38 table and its
+last record, their byte total, and the +0x20 count next to the 64 KiB units the group occupies. The count does not
+predict the boundary (its best byte reading matches 56.7% of `story000` pages), so the table extent is used and the
+mismatch stays visible as `declared_matches_units`.
 
 Usage:
     python -I page_index.py <archive.rpf> <out.json|out.csv> [--start N] [--limit BYTES] [--quiet]
@@ -38,6 +42,7 @@ import zlib
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 BASE = 0x50000000
 HEADER_SIZE = 0x60
+PAGE_UNIT = 0x10000   # 64 KiB: the unit a resource's declared +0x20 count is compared against
 MAX_CONTINUATIONS = 16
 COLUMNS = [
     "page_offset", "stored", "inflated", "version", "page_count",
@@ -238,18 +243,43 @@ def parse_page(base, continuations):
     return page, True
 
 
+def resource_of(page):
+    """The streams that make up one logical resource, and how its declared count compares.
+
+    The boundary is the q38 table and its last record: the resource is the directory stream plus the
+    continuation streams needed to reach them. The +0x20 count is reported next to the 64 KiB units
+    the group actually occupies, so a caller can see a disagreement instead of trusting the field.
+    """
+    streams = [{"offset": page["offset"], "inflated": page["inflated"]}]
+    streams += [{"offset": c["offset"], "inflated": c["inflated"]} for c in page["continuations"]]
+    total = page["inflated"] + sum(c["inflated"] for c in page["continuations"])
+    units = max(1, -(-total // PAGE_UNIT))
+    declared = page["page_count"]
+    return {
+        "streams": streams,
+        "bytes": total,
+        "page_units": units,
+        "declared_pages": declared,
+        "declared_matches_units": None if declared is None else declared == units,
+    }
+
+
 def index_streams(streams, progress=None):
     """Consume a stream sequence and return page records. At most one page waits for a continuation."""
     pages = []
     waiting = None
     streams_seen = 0
 
+    def add(page):
+        page["resource"] = resource_of(page)
+        pages.append(page)
+
     def start(offset, stored, data):
         page, complete = parse_page(data, [])
         page["offset"] = offset
         page["stored"] = stored
         if complete:
-            pages.append(page)
+            add(page)
             return None
         return (page, data, [])
 
@@ -264,7 +294,7 @@ def index_streams(streams, progress=None):
             page["offset"] = waiting[0]["offset"]
             page["stored"] = waiting[0]["stored"]
             if complete:
-                pages.append(page)
+                add(page)
                 waiting = None
                 continue
             if is_page(data):
@@ -274,13 +304,13 @@ def index_streams(streams, progress=None):
                 # continuation was appended and would lose it from the reported continuations/records.
                 page["complete"] = False
                 page["error"] = page["error"] or "resource ended before q38 was complete"
-                pages.append(page)
+                add(page)
                 waiting = start(offset, stored, data)
                 continue
             if len(cont) >= MAX_CONTINUATIONS:
                 page["complete"] = False
                 page["error"] = page["error"] or "too many continuation streams"
-                pages.append(page)
+                add(page)
                 waiting = None
             else:
                 waiting = (page, base, cont)
@@ -291,7 +321,7 @@ def index_streams(streams, progress=None):
         page = waiting[0]
         page["complete"] = False
         page["error"] = page["error"] or "archive ended before q38 was complete"
-        pages.append(page)
+        add(page)
     return pages, streams_seen
 
 
@@ -308,6 +338,12 @@ def summarise(pages, mode, source):
         "pages_with_continuations": sum(1 for p in pages if p["continuations"]),
         "span_bytes": sum(p["span"] for p in pages),
         "payload_at_0x60": sum(1 for p in pages if p["payload_at_0x60"]),
+        "resource_streams": {str(n): sum(1 for p in pages if len(p["resource"]["streams"]) == n)
+                             for n in sorted({len(p["resource"]["streams"]) for p in pages})},
+        "page_units": sum(p["resource"]["page_units"] for p in pages),
+        "declared_matches_units": sum(1 for p in pages if p["resource"]["declared_matches_units"]),
+        "declared_differs_from_units": sum(1 for p in pages
+                                           if p["resource"]["declared_matches_units"] is False),
         "versions": {str(v): sum(1 for p in pages if p["version"] == v)
                      for v in sorted({p["version"] for p in pages})},
         "page_counts": {str(v): sum(1 for p in pages if p["page_count"] == v)
