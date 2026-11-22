@@ -284,6 +284,41 @@ loadouts, combat references and animation configuration. Vehicle handling-style 
 vehicle/tyre roots, and the remaining gameplay tables are not XML. Do not infer a full gameplay schema from
 `common.rpf` alone.
 
+## Fog volumes
+
+Volumetric fog comes in two documents: `FogVolumeProfileList` (the media) and
+`CScatteringTransmittance__FogVolumeListData` (placed volumes). Counts; no values or names.
+
+**Profiles** (`ProfileList/Item`, 43): `Name`, `UUID`, `Anisotropy`, `WaterDropletDensity`,
+`DiffusionIntensity`, `ScatteringColorBlend`, `AbsorptionColorBlend`, `Scattering` and `Absorption` (`x y z`),
+`IntExtMode`, plus optional `WaterDropletVariance` (8) and `WindDensityInfluence` (15). Names and UUIDs are
+unique. `Scattering` and `Absorption` are within 0..1 per channel in 41 of 43. `IntExtMode` is 0 in 31 and 1 in 12.
+
+**Volumes** (`FogVolumeList/Item`, 14), 37 fields each: shape (`IsBox`, `Position`, `PositionOffset`, `Scale`,
+`Rotation`, `Shear`, `Wedge`), falloff (`Falloff`, `FalloffCurve` and per-axis versions), two 3x3 matrices
+(`RotationMtx`, `TransformMtx`, 9 numbers each), ambient/emissive intensity, noise and wind, `Scattering`, `Density`,
+`Anisotropy`, `WaterDropletDensity`, `Color`, `BlendMode`, `IntExtMode`, `SortKey`, `ProfileIndex`,
+`SecondaryProfileIndex`, `ProfileInterpolation`, `uuid` and `Name`.
+
+| Check | Result |
+|---|---|
+| `ProfileIndex` and `SecondaryProfileIndex` in `0..42` | 14 of 14 each: profiles are referenced by **list position**, not by UUID |
+| Volume `uuid` equal to a profile `UUID` | 0 of 14 (separate id spaces) |
+| Distinct profiles referenced | 2 of 43; primary equals secondary in 12; `ProfileInterpolation` is 0 in all 14 |
+| `RotationMtx` and `TransformMtx` | identity in all 14, while `Rotation` is zero and `Scale` ranges 0.6 to 28 |
+| `Shear` | zero in all 14 |
+| `IsBox` | true in 13, false in 1 |
+| `BlendMode` / `IntExtMode` | 0 or 1, seven each / 0 in all 14 |
+| Positions | 7 at exactly (0, 0, 0); 8 distinct; all within x -2,093..30, y 0..803, z 0..109 |
+
+Two consequences for a loader. The stored matrices do not include `Scale`, so the volume transform has to be
+built from `Position`, `Rotation` and `Scale` rather than read from `TransformMtx`. Profile indices are
+positions in `ProfileList`, so its order must be kept.
+
+Not measured here (hypothesis): with half the volumes at the origin, two profiles in use and no interpolation,
+this list looks like a sample or default set; the placed fog of the map is probably elsewhere (map resources
+or another archive). What `IntExtMode` (interior/exterior) and `BlendMode` select is also untested.
+
 ## Schema style
 
 Four patterns cover almost everything:
