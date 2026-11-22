@@ -2551,9 +2551,34 @@ class Gen:
             return self.cu(0xFFFFFFFF if a["v"] & 1 else 0)
         raise Unsupported("mask operand")
 
+    def is_mask_op(self, x):
+        return self.holds_lane_mask(x) or (
+            x["k"] == "special" and x.get("t", "").startswith(("exec", "vcc"))
+        )
+
+    def src64_data(self, s, op):
+        if s["k"] == "sgpr" and s.get("n") == 2:
+            return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
+        if s["k"] == "imm":
+            v = s["v"] & 0xFFFFFFFFFFFFFFFF
+            return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+        if s["k"] == "special" and s.get("t") == "null":
+            return self.cu(0), self.cu(0)
+        raise Unsupported(op + " source")
+
+    def dst64_data(self, d, rlo, rhi, op, *, allow_null=False):
+        if allow_null and d["k"] == "special" and d.get("t") == "null":
+            return
+        if d["k"] != "sgpr" or d.get("n") != 2:
+            raise Unsupported(op + " destination")
+        self.store_reg("sgpr", d["r"], rlo)
+        self.store_reg("sgpr", d["r"] + 1, rhi)
+
     def mask_dst(self, d, v):
         if d["k"] == "special" and d["t"] in ("exec", "exec_lo"):
             self.set_exec(v)
+        elif d["k"] == "special" and d["t"] == "null":
+            return
         elif d["k"] == "sgpr":
             self.store_reg("sgpr", d["r"], v)
             if d.get("n") == 2:
@@ -4023,11 +4048,24 @@ class Gen:
             self.emit(f"{r} = OpIAdd %uint {t} {z}")
             self.dst(a[0], r)
         elif op == "s_not_b64":
-            v = self.mask_src(a[1])
-            r = self.tmp()
-            self.emit(f"{r} = OpNot %uint {v}")
-            self.mask_dst(a[0], r)
-            self.scc_from_mask(r)
+            if (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or self.is_mask_op(a[1]):
+                v = self.mask_src(a[1])
+                r = self.tmp()
+                self.emit(f"{r} = OpNot %uint {v}")
+                self.mask_dst(a[0], r)
+                self.scc_from_mask(r)
+            else:
+                if not ((a[0]["k"] == "sgpr" and a[0].get("n") == 2) or
+                        (a[0]["k"] == "special" and a[0].get("t") == "null")):
+                    raise Unsupported(op + " destination")
+                vlo, vhi = self.src64_data(a[1], op)
+                rlo, rhi = self.tmp(), self.tmp()
+                self.emit(f"{rlo} = OpNot %uint {vlo}")
+                self.emit(f"{rhi} = OpNot %uint {vhi}")
+                self.dst64_data(a[0], rlo, rhi, op, allow_null=True)
+                orr = self.tmp()
+                self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
+                self.scc_nonzero(orr)
         elif op in ("v_rsq_f16", "v_rcp_f16", "v_sqrt_f16", "v_exp_f16", "v_log_f16", "v_floor_f16", "v_fract_f16",
                     "v_ceil_f16", "v_trunc_f16", "v_rndne_f16"):
             # f16 unary on the low half (op_sel:[src,dst] picks the high half of the source / of the destination);
@@ -4605,24 +4643,42 @@ class Gen:
             self.dst(a[0], out)
         elif op in ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64",
                     "s_and_b32_mask", "s_or_b32_mask"):
-            x, y = self.mask_src(a[1]), self.mask_src(a[2])
-            r = self.tmp()
-            if op.endswith("n2_b64"):
-                n = self.tmp()
-                self.emit(f"{n} = OpNot %uint {y}")
-                y = n
             k = {"and": "OpBitwiseAnd", "or": "OpBitwiseOr", "xor": "OpBitwiseXor", "andn2": "OpBitwiseAnd",
-                 "orn2": "OpBitwiseOr"}[op[2:].rsplit("_", 1)[0]]
-            self.emit(f"{r} = {k} %uint {x} {y}")
-            self.mask_dst(a[0], r)
-            self.scc_from_mask(r)
+                 "orn2": "OpBitwiseOr"}[op.split("_")[1]]
+            if op.endswith("_mask") or \
+                    (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
+                    self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
+                x, y = self.mask_src(a[1]), self.mask_src(a[2])
+                r = self.tmp()
+                if op.endswith("n2_b64"):
+                    n = self.tmp()
+                    self.emit(f"{n} = OpNot %uint {y}")
+                    y = n
+                self.emit(f"{r} = {k} %uint {x} {y}")
+                self.mask_dst(a[0], r)
+                self.scc_from_mask(r)
+            else:
+                if not ((a[0]["k"] == "sgpr" and a[0].get("n") == 2) or
+                        (a[0]["k"] == "special" and a[0].get("t") == "null")):
+                    raise Unsupported(op + " destination")
+                # Load all source dwords before storing to a[0] so destination aliasing stays exact;
+                # lane_masks.py already clears a[0]'s mask state when either source is non-mask.
+                (xlo, xhi), (ylo, yhi) = self.src64_data(a[1], op), self.src64_data(a[2], op)
+                if op.endswith("n2_b64"):
+                    nlo, nhi = self.tmp(), self.tmp()
+                    self.emit(f"{nlo} = OpNot %uint {ylo}")
+                    self.emit(f"{nhi} = OpNot %uint {yhi}")
+                    ylo, yhi = nlo, nhi
+                rlo, rhi = self.tmp(), self.tmp()
+                self.emit(f"{rlo} = {k} %uint {xlo} {ylo}")
+                self.emit(f"{rhi} = {k} %uint {xhi} {yhi}")
+                self.dst64_data(a[0], rlo, rhi, op, allow_null=True)
+                orr = self.tmp()
+                self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
+                self.scc_nonzero(orr)
         elif op == "s_cselect_b64":
-            def is_mask_op(x):
-                return self.holds_lane_mask(x) or (
-                    x["k"] == "special" and x.get("t", "").startswith(("exec", "vcc"))
-                )
             if (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
-                    is_mask_op(a[1]) or is_mask_op(a[2]):
+                    self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
                 x, y = self.mask_src(a[1]), self.mask_src(a[2])
                 c, b, r = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{c} = OpLoad %uint %scc")
@@ -4632,25 +4688,15 @@ class Gen:
             else:
                 if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
                     raise Unsupported("s_cselect_b64 destination")
-                def src64(s):
-                    if s["k"] == "sgpr" and s.get("n") == 2:
-                        return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
-                    if s["k"] == "imm":
-                        v = s["v"] & 0xFFFFFFFFFFFFFFFF
-                        return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-                    if s["k"] == "special" and s.get("t") == "null":
-                        return self.cu(0), self.cu(0)
-                    raise Unsupported("s_cselect_b64 source")
                 # Load all source dwords before storing to a[0] so destination aliasing stays exact;
                 # lane_masks.py already clears a[0]'s mask state when either source is non-mask.
-                (lo1, hi1), (lo2, hi2) = src64(a[1]), src64(a[2])
+                (lo1, hi1), (lo2, hi2) = self.src64_data(a[1], op), self.src64_data(a[2], op)
                 c, b, rlo, rhi = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{c} = OpLoad %uint %scc")
                 self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
                 self.emit(f"{rlo} = OpSelect %uint {b} {lo1} {lo2}")
                 self.emit(f"{rhi} = OpSelect %uint {b} {hi1} {hi2}")
-                self.store_reg("sgpr", a[0]["r"], rlo)
-                self.store_reg("sgpr", a[0]["r"] + 1, rhi)
+                self.dst64_data(a[0], rlo, rhi, op)
         elif op in ("v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_interp_p2_f16"):
             attr = next((x for x in a if x["k"] == "attr"), None)
             if attr is None or self.stage != "ps":
