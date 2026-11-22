@@ -1191,6 +1191,199 @@ class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
         self.assertTrue(flags_modified.modified)
 
 
+# ============================================================================
+# Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ============================================================================
+
+def f32_to_u32(val: float) -> int:
+    """Pack Python float to IEEE 754 single-precision 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def u32_to_f32(val: int) -> float:
+    """Unpack IEEE 754 single-precision 32-bit unsigned integer to Python float."""
+    return struct.unpack("<f", struct.pack("<I", u32(val)))[0]
+
+
+# IEEE 754 Single-Precision Architectural Bit Patterns
+FLOAT32_POS_ZERO: int = 0x0000_0000
+FLOAT32_NEG_ZERO: int = 0x8000_0000
+FLOAT32_POS_ONE: int = 0x3F80_0000
+FLOAT32_NEG_ONE: int = 0xBF80_0000
+FLOAT32_POS_INF: int = 0x7F80_0000
+FLOAT32_NEG_INF: int = 0xFF80_0000
+FLOAT32_QNAN_DEFAULT: int = 0x7FC0_0000
+FLOAT32_SNAN_EXAMPLE: int = 0x7F80_0001
+FLOAT32_MIN_SUBNORMAL: int = 0x0000_0001
+FLOAT32_MAX_SUBNORMAL: int = 0x007F_FFFF
+FLOAT32_MIN_NORMAL: int = 0x0080_0000
+FLOAT32_MAX_NORMAL: int = 0x7F7F_FFFF
+FLOAT32_SIGN_BIT: int = 0x8000_0000
+
+
+class TestIEEE754BoundaryExtremesSubnormalsAndNaNs(unittest.TestCase):
+    """Unit tests for IEEE 754 single-precision values manipulated via ds_xor_rtn_b32."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_sign_bit_toggle_zero(self) -> None:
+        """XOR with 0x80000000 toggles +0.0 to -0.0 and vice-versa."""
+        addr = 0x100
+        # +0.0 -> -0.0
+        self.state.lds.write_dword(addr, FLOAT32_POS_ZERO)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FLOAT32_SIGN_BIT)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, FLOAT32_POS_ZERO)
+        self.assertEqual(new_val, FLOAT32_NEG_ZERO)
+        self.assertEqual(self.state.get_vgpr(0), FLOAT32_POS_ZERO)
+        self.assertEqual(self.state.lds.read_dword(addr), FLOAT32_NEG_ZERO)
+
+        # -0.0 -> +0.0
+        old_val2, new_val2 = self.interp.step(instr, self.state)
+        self.assertEqual(old_val2, FLOAT32_NEG_ZERO)
+        self.assertEqual(new_val2, FLOAT32_POS_ZERO)
+        self.assertEqual(self.state.lds.read_dword(addr), FLOAT32_POS_ZERO)
+
+    def test_sign_bit_toggle_normals(self) -> None:
+        """XOR with 0x80000000 toggles +1.0 to -1.0."""
+        addr = 0x110
+        self.state.lds.write_dword(addr, FLOAT32_POS_ONE)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FLOAT32_SIGN_BIT)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, FLOAT32_POS_ONE)
+        self.assertEqual(new_val, FLOAT32_NEG_ONE)
+        self.assertEqual(u32_to_f32(new_val), -1.0)
+
+    def test_sign_bit_toggle_infinities(self) -> None:
+        """XOR with 0x80000000 toggles +Infinity to -Infinity."""
+        addr = 0x120
+        self.state.lds.write_dword(addr, FLOAT32_POS_INF)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FLOAT32_SIGN_BIT)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, FLOAT32_POS_INF)
+        self.assertEqual(new_val, FLOAT32_NEG_INF)
+        self.assertEqual(math.isinf(u32_to_f32(new_val)), True)
+
+    def test_subnormals_preserved_without_ftz(self) -> None:
+        """Subnormals must NEVER flush to zero (FTZ) during bitwise atomic operations."""
+        addr = 0x130
+        subnormals = [
+            FLOAT32_MIN_SUBNORMAL,       # Smallest subnormal
+            FLOAT32_MAX_SUBNORMAL,       # Largest subnormal
+            0x0000_1234,                 # Intermediate subnormal
+        ]
+        for sub in subnormals:
+            self.state.lds.write_dword(addr, sub)
+            self.state.set_vgpr(1, addr)
+            self.state.set_vgpr(2, 0)  # Identity read
+
+            instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+            old_val, new_val = self.interp.step(instr, self.state)
+
+            self.assertEqual(old_val, sub)
+            self.assertEqual(new_val, sub)
+            self.assertNotEqual(new_val, 0, "Subnormal was incorrectly flushed to zero")
+
+    def test_signaling_nan_preserved_not_quietened(self) -> None:
+        """Signaling NaNs (sNaN) must NOT be quietened (quiet bit 22 must NOT be forced to 1)."""
+        addr = 0x140
+        snan = FLOAT32_SNAN_EXAMPLE  # 0x7F800001
+        self.state.lds.write_dword(addr, snan)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0)  # Identity read
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, snan)
+        self.assertEqual(new_val, snan)
+        # Check quiet bit (bit 22) is still 0
+        self.assertEqual(new_val & (1 << 22), 0, "sNaN was mutated into qNaN")
+
+    def test_quiet_nan_payload_preservation(self) -> None:
+        """Arbitrary NaN payloads are preserved bit-for-bit without alteration."""
+        addr = 0x150
+        nan_with_payload = 0x7FC0_1234
+        payload_mask = 0x0000_00FF
+
+        self.state.lds.write_dword(addr, nan_with_payload)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, payload_mask)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, nan_with_payload)
+        self.assertEqual(new_val, nan_with_payload ^ payload_mask)
+
+    def test_float_boundaries_max_normal_min_normal(self) -> None:
+        """Maximum and minimum finite normal floats retain exact bitwise integrity."""
+        addr = 0x160
+        self.state.lds.write_dword(addr, FLOAT32_MAX_NORMAL)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FLOAT32_SIGN_BIT)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, FLOAT32_MAX_NORMAL)
+        self.assertEqual(new_val, FLOAT32_MAX_NORMAL | FLOAT32_SIGN_BIT)
+
+    def test_simd_wavefront_mixed_floating_point_lanes(self) -> None:
+        """SIMD wavefront where different lanes hold distinct IEEE 754 special values."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        special_values = [
+            FLOAT32_POS_ZERO,
+            FLOAT32_NEG_ZERO,
+            FLOAT32_POS_ONE,
+            FLOAT32_NEG_ONE,
+            FLOAT32_POS_INF,
+            FLOAT32_NEG_INF,
+            FLOAT32_QNAN_DEFAULT,
+            FLOAT32_SNAN_EXAMPLE,
+            FLOAT32_MIN_SUBNORMAL,
+            FLOAT32_MAX_SUBNORMAL,
+            FLOAT32_MIN_NORMAL,
+            FLOAT32_MAX_NORMAL,
+        ]
+
+        for lane in range(32):
+            val = special_values[lane % len(special_values)]
+            addr = 0x300 + lane * 4
+            state.lds.write_dword(addr, val)
+            state.set_vgpr(lane, 1, addr)
+            state.set_vgpr(lane, 2, FLOAT32_SIGN_BIT)  # Flip sign bit on all lanes
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            orig_val = special_values[lane % len(special_values)]
+            expected_new = orig_val ^ FLOAT32_SIGN_BIT
+            res = results[lane]
+            self.assertIsNotNone(res)
+            self.assertEqual(res, (orig_val, expected_new))
+            self.assertEqual(state.get_vgpr(lane, 0), orig_val)
+            self.assertEqual(state.lds.read_dword(0x300 + lane * 4), expected_new)
+
+
+
 
 
 
