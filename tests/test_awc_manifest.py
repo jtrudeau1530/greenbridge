@@ -293,6 +293,26 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((doc["bank_count"], doc["stream_count"]), (0, 0))
         self.assertEqual(doc["streams"], [])
 
+    def test_incomplete_bank_discovery_preserves_the_previous_manifest(self):
+        root = self.tmp.name
+        blocked = os.path.join(root, "blocked")
+        out = os.path.join(root, "manifest.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+
+        def walk(path, onerror=None):
+            if onerror:
+                onerror(PermissionError(13, "permission denied", blocked))
+            return iter(())
+
+        with mock.patch.object(awc_manifest.os, "walk", walk), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc_manifest.main([root, "--out", out]), 1)
+        self.assertIn(blocked, err.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+
     def test_unreadable_bank_preserves_the_previous_manifest(self):
         good = os.path.join(self.tmp.name, "good.awc")
         blocked = os.path.join(self.tmp.name, "unreadable.awc")

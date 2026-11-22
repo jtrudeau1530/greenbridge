@@ -155,8 +155,11 @@ def collect(src: str, *, out: str | None = None):
     """
     recursive = os.path.isdir(src)
     if recursive:
+        def scan_failed(error):
+            raise error
+
         banks = []
-        for root, dirs, files in os.walk(src):
+        for root, dirs, files in os.walk(src, onerror=scan_failed):
             dirs.sort()
             banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
         banks.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
