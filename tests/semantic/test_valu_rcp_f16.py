@@ -620,6 +620,155 @@ class TestValuRcpF16AST(unittest.TestCase):
             InstructionAST(opcode="v_rcp_f16", dst=oob_dst, src0=bad_src).validate()
 
 
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU instructions."""
+
+    def __init__(self) -> None:
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgpr = [0] * self.num_vgprs
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = MASK64
+
+    def reset(self) -> None:
+        self.vgpr = [0] * self.num_vgprs
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = MASK64
+
+    def get_vgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_vgprs):
+            raise IndexError(f"VGPR index {idx} out of range [0, {self.num_vgprs})")
+        return self.vgpr[idx] & MASK32
+
+    def set_vgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_vgprs):
+            raise IndexError(f"VGPR index {idx} out of range [0, {self.num_vgprs})")
+        self.vgpr[idx] = val & MASK32
+
+    def get_vgpr_half(self, idx: int, is_hi: bool) -> int:
+        dword = self.get_vgpr_u32(idx)
+        return (dword >> 16) & MASK16 if is_hi else dword & MASK16
+
+    def set_vgpr_half(self, idx: int, is_hi: bool, half_val: int) -> int:
+        """Write halfword into VGPR, preserving the untouched 16-bit half."""
+        current = self.get_vgpr_u32(idx)
+        h = half_val & MASK16
+        if is_hi:
+            new_dword = (current & 0x0000FFFF) | (h << 16)
+        else:
+            new_dword = (current & 0xFFFF0000) | h
+        self.set_vgpr_u32(idx, new_dword)
+        return new_dword
+
+    def get_sgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index {idx} out of range [0, {self.num_sgprs})")
+        return self.sgpr[idx] & MASK32
+
+    def set_sgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index {idx} out of range [0, {self.num_sgprs})")
+        self.sgpr[idx] = val & MASK32
+
+    def get_sgpr_half(self, idx: int, is_hi: bool) -> int:
+        dword = self.get_sgpr_u32(idx)
+        return (dword >> 16) & MASK16 if is_hi else dword & MASK16
+
+    def eval_operand_f16(self, op: Operand, op_sel_hi: bool = False) -> int:
+        is_hi = op.is_hi or op_sel_hi
+        if op.kind in (OperandKind.VGPR_HALF, OperandKind.VGPR_FULL):
+            val = self.get_vgpr_half(op.reg_index, is_hi)
+        elif op.kind in (OperandKind.SGPR_HALF, OperandKind.SGPR_FULL):
+            val = self.get_sgpr_half(op.reg_index, is_hi)
+        elif op.kind == OperandKind.LITERAL_F16:
+            val = op.literal_val & MASK16
+        elif op.kind == OperandKind.INLINE_CONST:
+            val = op.literal_val & MASK16
+        else:
+            raise ValueError(f"Unsupported operand kind {op.kind}")
+
+        if op.abs_mod:
+            val &= ~SIGN_MASK_F16
+        if op.neg_mod:
+            val ^= SIGN_MASK_F16
+        return val
+
+    def execute(self, ast: InstructionAST) -> int:
+        ast.validate()
+        if ast.opcode == "v_rcp_f16":
+            src0_hi = ast.src0.is_hi or bool(ast.op_sel[1])
+            dst_hi = ast.dst.is_hi or bool(ast.op_sel[0])
+
+            s0_val = self.eval_operand_f16(ast.src0, src0_hi)
+            res_half = ref_rcp_f16(s0_val, clamp=ast.clamp)
+            return self.set_vgpr_half(ast.dst.reg_index, dst_hi, res_half)
+        raise NotImplementedError(f"Opcode '{ast.opcode}' not implemented in scalar interpreter")
+
+    def execute_asm(self, asm_line: str) -> int:
+        ast = parse_vop_rcp_f16(asm_line)
+        return self.execute(ast)
+
+
+class TestValuRcpF16ScalarInterpreter(unittest.TestCase):
+    def setUp(self):
+        self.interp = ScalarVALUInterpreter()
+
+    def test_basic_scalar_execution(self):
+        # 1.0 / 2.0 = 0.5
+        self.interp.set_vgpr_u32(1, TWO_F16)
+        res = self.interp.execute_asm("v_rcp_f16 v0, v1")
+        self.assertEqual(res & MASK16, HALF_F16)
+
+        # 1.0 / 0.5 = 2.0
+        self.interp.set_vgpr_u32(2, HALF_F16)
+        res = self.interp.execute_asm("v_rcp_f16 v3, v2")
+        self.assertEqual(res & MASK16, TWO_F16)
+
+    def test_scalar_preserve_untouched_half(self):
+        # Set v0 to 0xABCD1234
+        self.interp.set_vgpr_u32(0, 0xABCD1234)
+        self.interp.set_vgpr_u32(1, TWO_F16)
+
+        # Write to low half v0.l
+        res = self.interp.execute_asm("v_rcp_f16 v0.l, v1")
+        self.assertEqual(res >> 16, 0xABCD)
+        self.assertEqual(res & MASK16, HALF_F16)
+
+        # Write to high half v0.h
+        self.interp.set_vgpr_u32(2, FOUR_F16)
+        res = self.interp.execute_asm("v_rcp_f16 v0.h, v2")
+        self.assertEqual(res >> 16, QUARTER_F16)
+        self.assertEqual(res & MASK16, HALF_F16)
+
+    def test_scalar_sgpr_and_literal_source(self):
+        # SGPR source
+        self.interp.set_sgpr_u32(4, FOUR_F16)
+        res = self.interp.execute_asm("v_rcp_f16 v0, s4")
+        self.assertEqual(res & MASK16, QUARTER_F16)
+
+        # Literal source
+        res = self.interp.execute_asm("v_rcp_f16 v0, 2.0")
+        self.assertEqual(res & MASK16, HALF_F16)
+
+    def test_scalar_modifiers_and_clamp(self):
+        self.interp.set_vgpr_u32(1, NEG_TWO_F16)
+        # abs modifier: 1 / |-2.0| = 0.5
+        res = self.interp.execute_asm("v_rcp_f16 v0, |v1|")
+        self.assertEqual(res & MASK16, HALF_F16)
+
+        # neg modifier: 1 / -(-2.0) = 0.5
+        res = self.interp.execute_asm("v_rcp_f16 v0, -v1")
+        self.assertEqual(res & MASK16, HALF_F16)
+
+        # clamp on negative: 1 / -2.0 = -0.5 -> clamped to 0.0
+        res = self.interp.execute_asm("v_rcp_f16 v0, v1 clamp")
+        self.assertEqual(res & MASK16, POS_ZERO_F16)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
