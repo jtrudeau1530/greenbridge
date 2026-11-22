@@ -876,5 +876,116 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(bits_to_f16(r_hi), 180.0 + float(lane))
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_2xf16(f16_to_bits(10.0), f16_to_bits(20.0)))
+        state.set_vgpr(1, pack_2xf16(f16_to_bits(3.0), f16_to_bits(5.0)))
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+        r_lo, r_hi = unpack_2xf16(state.get_vgpr(0))
+        self.assertEqual(bits_to_f16(r_lo), 7.0)
+        self.assertEqual(bits_to_f16(r_hi), 15.0)
+        # src1 untouched
+        s1_lo, s1_hi = unpack_2xf16(state.get_vgpr(1))
+        self.assertEqual(bits_to_f16(s1_lo), 3.0)
+        self.assertEqual(bits_to_f16(s1_hi), 5.0)
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_2xf16(f16_to_bits(10.0), f16_to_bits(20.0)))
+        state.set_vgpr(1, pack_2xf16(f16_to_bits(3.0), f16_to_bits(5.0)))
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(1, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+        r_lo, r_hi = unpack_2xf16(state.get_vgpr(1))
+        self.assertEqual(bits_to_f16(r_lo), 7.0)
+        self.assertEqual(bits_to_f16(r_hi), 15.0)
+        # src0 untouched
+        s0_lo, s0_hi = unpack_2xf16(state.get_vgpr(0))
+        self.assertEqual(bits_to_f16(s0_lo), 10.0)
+        self.assertEqual(bits_to_f16(s0_hi), 20.0)
+
+    def test_dst_alias_both_srcs(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_2xf16(f16_to_bits(42.0), f16_to_bits(100.0)))
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(0, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+        r_lo, r_hi = unpack_2xf16(state.get_vgpr(0))
+        self.assertEqual(r_lo, POS_ZERO_F16)
+        self.assertEqual(r_hi, POS_ZERO_F16)
+
+    def test_inplace_iterative_subtraction(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_2xf16(f16_to_bits(50.0), f16_to_bits(100.0)))
+        state.set_vgpr(1, pack_2xf16(f16_to_bits(1.0), f16_to_bits(2.0)))
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+        )
+        for _ in range(30):
+            self.scalar_interp.step(instr, state)
+        r_lo, r_hi = unpack_2xf16(state.get_vgpr(0))
+        self.assertEqual(bits_to_f16(r_lo), 20.0)
+        self.assertEqual(bits_to_f16(r_hi), 40.0)
+
+    def test_non_aliased_registers_preserved(self) -> None:
+        state = ScalarMachineState()
+        sentinel_v2 = 0x1111_2222
+        sentinel_v3 = 0x3333_4444
+        state.set_vgpr(0, pack_2xf16(f16_to_bits(5.0), f16_to_bits(5.0)))
+        state.set_vgpr(1, pack_2xf16(f16_to_bits(2.0), f16_to_bits(2.0)))
+        state.set_vgpr(2, sentinel_v2)
+        state.set_vgpr(3, sentinel_v3)
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr(2), sentinel_v2)
+        self.assertEqual(state.get_vgpr(3), sentinel_v3)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, pack_2xf16(f16_to_bits(float(lane) + 10.0), f16_to_bits(10.0)))
+            state.set_vgpr(lane, 1, pack_2xf16(f16_to_bits(2.0), f16_to_bits(3.0)))
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            r_lo, r_hi = unpack_2xf16(state.get_vgpr(lane, 0))
+            self.assertEqual(bits_to_f16(r_lo), float(lane) + 8.0)
+            self.assertEqual(bits_to_f16(r_hi), 7.0)
+
+
 if __name__ == "__main__":
     unittest.main()
