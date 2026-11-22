@@ -84,6 +84,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+# ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
+EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
 EXPECTED_VCMP_F32_NAN = [0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7]   # derivation in ps_vcmp_f32_nan.asm
 EXPECTED_VCMP_64 = [0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93]        # derivation in ps_vcmp_64.asm
 EXPECTED_ANDN2_EXEC = [1, 8, 16, 2064, 2068, 3, 20, 1544]                   # derivation in cs_w32_andn2_exec.asm
@@ -325,52 +327,53 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+def reference_sdwa_f16_const():
+    # An f16 float inline constant is its f16 bits over a zero high half; an integer op reads 1.0 as its f32 bits.
+    # src_sel then picks a zero-extended field of those 32 bits, like a register's.
+    def sel(word, off, width):
+        return (word >> off) & ((1 << width) - 1)
+    v1, s8 = 0x64003800, 0x3C000000
+    x = _unhalf(sel(_half(1.0), 16, 16)) + _unhalf(sel(v1, 0, 16))          # +0.0 + 0.5
+    y = _unhalf(sel(_half(2.0), 8, 8)) * _unhalf(sel(v1, 16, 16))           # 2^-18 * 1024.0
+    z = _unhalf(sel(s8, 16, 16)) + _unhalf(sel(v1, 0, 16))                  # 1.0 + 0.5
+    w = float(sel(struct.unpack("<I", struct.pack("<f", 1.0))[0], 16, 16))  # u16 0x3f80 -> f16
+    return [0xAAAA0000 | _half(v) for v in (x, y, z, w)]
+
+
 def _pack_nibbles(ops, pairs, test):
     """Bit 4*k + i of the word: op k on pair i."""
     return sum(int(test(op, *pair)) << (4 * k + i) for k, op in enumerate(ops) for i, pair in enumerate(pairs))
-
-
 def reference_vcmp_f32_nan():
     nan = float("nan")
     pairs = ((nan, 1.0), (1.0, 2.0), (2.0, 1.0), (1.0, 1.0))
     ordered = {"lt": lambda a, b: a < b, "le": lambda a, b: a <= b, "gt": lambda a, b: a > b,
                "ge": lambda a, b: a >= b, "eq": lambda a, b: a == b, "lg": lambda a, b: a < b or a > b,
                "o": lambda a, b: not (math.isnan(a) or math.isnan(b)), "f": lambda a, b: False}
-
     def test(op, a, b):
         if op == "tru":
             return True
         if op.startswith("n"):                        # nge/ngt/nle/nlt/neq: the negated ordered compare
             return not ordered[op[1:]](a, b)
         return ordered[op](a, b)
-
     return [_pack_nibbles(ops, pairs, test) for ops in (("ge", "lg", "neq", "nge"), ("ngt", "nle", "nlt", "tru"),
                                                          ("ge", "lg", "nge", "nlt"), ("neq", "o", "tru", "f"))]
-
-
 def reference_vcmp_64():
     w = VCMP_64_HEAP
     pairs = [((w[4 * i + 1] << 32) | w[4 * i], (w[4 * i + 3] << 32) | w[4 * i + 2]) for i in range(4)]
-
     def test(op, a, b):
         cond, ty = op.split("_")
         if ty == "i64":
             a, b = (x - (1 << 64) if x >> 63 else x for x in (a, b))
         return {"lt": a < b, "le": a <= b, "gt": a > b, "ge": a >= b, "eq": a == b, "ne": a != b}[cond]
-
     return [_pack_nibbles(ops, pairs, test) for ops in (("lt_u64", "le_u64", "gt_u64", "ge_u64"),
                                                          ("lt_i64", "le_i64", "gt_i64", "ge_i64"),
                                                          ("ne_u64", "eq_i64", "ne_i64", "lt_i64"),
                                                          ("gt_u64", "ge_i64", "le_u64", "ne_i64"))]
-
-
 def reference_andn2_exec():
     def popcount(m):
         return bin(m).count("1")
-
     def ff1(m):
         return (m & -m).bit_length() - 1 if m else -1
-
     lanes = range(32)
     mask = lambda f: sum(1 << i for i in lanes if f(i))                         # noqa: E731
     out = []
@@ -388,8 +391,6 @@ def reference_andn2_exec():
     e1, e2 = vcc & ~0x0000FFFF & 0xFFFFFFFF, vcc & ~0xFFFFFFFF & 0xFFFFFFFF
     out.append((5 if e1 else 6) << 8 | (7 if e2 else 8))
     return out
-
-
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -440,6 +441,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_sdwa_f16_const(), EXPECTED_SDWA_F16_CONST)
         self.assertEqual(reference_vcmp_f32_nan(), EXPECTED_VCMP_F32_NAN)
         self.assertEqual(reference_vcmp_64(), EXPECTED_VCMP_64)
         self.assertEqual(reference_andn2_exec(), EXPECTED_ANDN2_EXEC)
@@ -509,6 +511,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
 
+    def test_sdwa_src_sel_narrows_an_f16_inline_constant(self):
+        # 1.0 in v_add_f16_sdwa is 0x00003c00, so src0_sel:WORD_1 reads +0.0 and BYTE_1 of 2.0 is the denormal
+        # 0x0040; an SGPR source and v_cvt_f16_u16 reading the f32 bits of 1.0 are narrowed the same way.
+        self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
+
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
         push = [0x1000, 0, 16, 0] + [0] * 28
@@ -553,6 +560,23 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
+
+    def test_narrow_integer_typed_buffers(self):
+        # cs_fmt_int_narrow.asm in the interpreter against the words check.py expects from the GPU, which are the
+        # same program's output on gfx1036 run natively: a 136-word heap filled with 0xee as vk_compute_test's.
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        try:
+            import check
+        finally:
+            sys.path.pop(0)
+        spv = support.translate_fixture("cs_fmt_int_narrow", fssm=CS_BOUNDS_FSSM)
+        memory = {4 * i: 0xEEEEEEEE for i in range(len(check.FMT_INT_NARROW_WORDS))}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        for i, word in enumerate(check.FMT_INT_NARROW_WORDS):
+            with self.subTest(word=i):
+                self.assertEqual(memory[4 * i], word)
 
     def test_signed_typed_buffers(self):
         spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
