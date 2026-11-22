@@ -198,7 +198,7 @@ if(WIN32)
   option(LEONIDA_SDL3 "Build the GameInput shim when SDL3 is available" ON)
   option(LEONIDA_SDL3_FETCH "Download the pinned SDL3 release if no installed SDL3 is found" OFF)
   if(LEONIDA_SDL3)
-    find_package(SDL3 3.2 CONFIG QUIET COMPONENTS SDL3-static)
+    find_package(SDL3 3.2 CONFIG QUIET COMPONENTS SDL3-static NO_SYSTEM_ENVIRONMENT_PATH)
     if(NOT TARGET SDL3::SDL3-static AND (LEONIDA_SDL3_FETCH OR FETCHCONTENT_SOURCE_DIR_SDL3))
       include(FetchContent)
       FetchContent_Declare(SDL3
