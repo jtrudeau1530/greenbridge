@@ -1522,6 +1522,45 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     return mismatches;
 }
 
+// A software Vulkan device (llvmpipe on CI) and the host's WARP device answer about different machines, so the
+// OPTIONS1 comparison is skipped there; on a GPU both runtimes see the same hardware.
+bool software_vulkan_device(const vktest::Device& vk) {
+    const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        vk.instance_proc(vk.instance, "vkGetPhysicalDeviceProperties"));
+    if (!get_properties) return true;
+    VkPhysicalDeviceProperties properties{};
+    get_properties(vk.physical, &properties);
+    return properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+}
+
+// D3D12_OPTIONS1 (D3D-86): wave ops and the lane range come from the Vulkan device's subgroup properties, so the
+// host PC runtime on the same GPU is the oracle. Returns the number of mismatches, -2 for a software Vulkan device,
+// or -1 when the host has no D3D12 device.
+int compare_options1(ID3D12Device* ours, const vktest::Device& vk) {
+    if (software_vulkan_device(vk)) return -2;
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 theirs{};
+    if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &theirs, sizeof(theirs)))) return -1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 mine{};
+    if (FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mine, sizeof(mine)))) return 1;
+    int mismatches = 0;
+    const auto same = [&](const char* field, UINT got, UINT want) {
+        if (got == want) return;
+        if (mismatches++ < 4)
+            std::fprintf(stderr, "D3D12_OPTIONS1 %s: ours %u, host %u\n", field, got, want);
+    };
+    same("WaveOps", mine.WaveOps, theirs.WaveOps);
+    same("WaveLaneCountMin", mine.WaveLaneCountMin, theirs.WaveLaneCountMin);
+    same("WaveLaneCountMax", mine.WaveLaneCountMax, theirs.WaveLaneCountMax);
+    same("ExpandedComputeResourceStates", mine.ExpandedComputeResourceStates,
+         theirs.ExpandedComputeResourceStates);
+    // TotalLaneCount is deliberately not compared: the host counts every lane of the device (6144 on the RTX 5070)
+    // and the layer answers one full wave (docs section 4.1).
+    std::printf("D3D12_OPTIONS1: lanes %u..%u, total %u (host total %u)\n", mine.WaveLaneCountMin,
+                mine.WaveLaneCountMax, mine.TotalLaneCount, theirs.TotalLaneCount);
+    return mismatches;
+}
 
 }  // namespace
 
@@ -1704,6 +1743,27 @@ int main() {
         EXPECT(!uses_unaligned_blocks(texture_desc(8, 8, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE)));
         EXPECT(!uses_unaligned_blocks(texture_desc(10, 6, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)));
 
+        // D3D12_OPTIONS1 (D3D-86): the lane range is the Vulkan device's own subgroup range and the device-wide lane
+        // count is deliberately one wave, so those are pinned here rather than only compared. Wave ops can only be
+        // promised by a GPU, and a software Vulkan device has no host GPU to compare with either.
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 wave{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &wave, sizeof(wave))));
+            EXPECT(wave.WaveLaneCountMin >= 1);
+            EXPECT(wave.WaveLaneCountMax >= wave.WaveLaneCountMin);
+            EXPECT(wave.TotalLaneCount == wave.WaveLaneCountMax);
+            EXPECT(wave.ExpandedComputeResourceStates);
+            const int options1 = compare_options1(device.p, d);
+            if (options1 == -2)
+                std::printf("D3D12_OPTIONS1: software Vulkan device, host comparison skipped\n");
+            else if (options1 < 0)
+                std::printf("D3D12_OPTIONS1: no host D3D12 device to compare with, skipped\n");
+            EXPECT(options1 <= 0);
+            if (options1 != -2) EXPECT(wave.WaveOps);
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 shrunk{};
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &shrunk, sizeof(shrunk) - 4)));
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, nullptr, sizeof(shrunk))));
+        }
         const int footprint_mismatches = compare_footprints(device.p);
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
