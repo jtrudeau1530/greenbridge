@@ -5909,13 +5909,13 @@ class Gen:
             self.emit(f"{e} = OpIEqual %bool {v} {w}")
             self.emit(f"{m2} = OpLogicalAnd %bool {match} {e}")
             match = m2
+        self.emit("OpSelectionMerge %dl_next None")
+        self.emit(f"OpBranchConditional {match} %dl_hit %dl_next")
+        self.body.append("%dl_hit = OpLabel")
         o, p, v = self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{o} = OpIAdd %uint {base} {self.cu(9)}")
         self.emit(f"{p} = OpAccessChain %_ptr_SB_uint %desc_map %c0 {o}")
         self.emit(f"{v} = OpLoad %uint {p}")
-        self.emit("OpSelectionMerge %dl_next None")
-        self.emit(f"OpBranchConditional {match} %dl_hit %dl_next")
-        self.body.append("%dl_hit = OpLabel")
         self.emit(f"OpStore {iv} {v}")
         self.emit(f"OpStore {kv} {self.cu(self.PROBES)}")          # the first match ends the search
         self.emit("OpBranch %dl_next")
