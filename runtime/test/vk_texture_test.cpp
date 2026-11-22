@@ -458,7 +458,10 @@ int main(int argc, char** argv) {
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(q));
-    std::ofstream(out_path, std::ios::binary).write(static_cast<const char*>(rbp), std::streamsize(W) * H * 16);
+    std::ofstream output(out_path, std::ios::binary);
+    output.write(static_cast<const char*>(rbp), std::streamsize(W) * H * 16);
+    output.close();
+    if (!output) { std::fprintf(stderr, "failed to write %s\n", out_path.c_str()); return 1; }
     std::fprintf(stderr, "ok -> %s (heap base 0x%llx)\n", out_path.c_str(), (unsigned long long)heap_base);
     if (autonomous && cube) {
         // Expected: the texel a cube sample of the pixel centre's direction reads from the second cube (layer 6 + face).
