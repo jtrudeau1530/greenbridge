@@ -1131,5 +1131,104 @@ class TestValuMed3StatusFlags(unittest.TestCase):
         self.assertFalse(interp.flags.inexact)
 
 
+class TestValuMed3IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, signed zeros, and NaN handling."""
+
+    def setUp(self):
+        self.interp = ScalarVALUInterpreter()
+
+    def test_single_nan_suppression_all_permutations(self):
+        f1 = f32_to_bits(10.0)
+        f2 = f32_to_bits(20.0)
+        nan = QNAN_F32
+
+        for perm in itertools.permutations([nan, f1, f2]):
+            self.interp.set_vgpr_u32(1, perm[0])
+            self.interp.set_vgpr_u32(2, perm[1])
+            self.interp.set_vgpr_u32(3, perm[2])
+            res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+            self.assertEqual(bits_to_f32(res), 10.0)
+
+    def test_two_nans_suppression_all_permutations(self):
+        f = f32_to_bits(-42.5)
+        nan1 = QNAN_F32
+        nan2 = 0x7FD00000
+
+        for perm in itertools.permutations([nan1, nan2, f]):
+            self.interp.set_vgpr_u32(1, perm[0])
+            self.interp.set_vgpr_u32(2, perm[1])
+            self.interp.set_vgpr_u32(3, perm[2])
+            res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+            self.assertEqual(bits_to_f32(res), -42.5)
+
+    def test_three_nans_returns_quiet_nan(self):
+        self.interp.set_vgpr_u32(1, SNAN_F32)
+        self.interp.set_vgpr_u32(2, QNAN_F32)
+        self.interp.set_vgpr_u32(3, 0x7FE00000)
+        res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+        self.assertTrue(is_nan_f32(res))
+        self.assertTrue(bool(res & 0x00400000))
+
+    def test_signed_zeros_hardware_ordering(self):
+        neg_zero = NEG_ZERO_F32
+        pos_zero = POS_ZERO_F32
+        pos_val = f32_to_bits(1.0)
+        neg_val = f32_to_bits(-1.0)
+
+        for perm in itertools.permutations([neg_zero, pos_zero, pos_val]):
+            self.interp.set_vgpr_u32(1, perm[0])
+            self.interp.set_vgpr_u32(2, perm[1])
+            self.interp.set_vgpr_u32(3, perm[2])
+            res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+            self.assertEqual(res, pos_zero)
+
+        for perm in itertools.permutations([neg_zero, pos_zero, neg_val]):
+            self.interp.set_vgpr_u32(1, perm[0])
+            self.interp.set_vgpr_u32(2, perm[1])
+            self.interp.set_vgpr_u32(3, perm[2])
+            res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+            self.assertEqual(res, neg_zero)
+
+    def test_subnormal_extremes(self):
+        sub_min = MIN_SUBNORMAL_F32
+        sub_max = MAX_SUBNORMAL_F32
+        norm_min = MIN_NORMAL_F32
+
+        self.interp.set_vgpr_u32(1, sub_min)
+        self.interp.set_vgpr_u32(2, norm_min)
+        self.interp.set_vgpr_u32(3, sub_max)
+        res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+        self.assertEqual(res, sub_max)
+
+    def test_infinities_boundaries(self):
+        pos_inf = POS_INF_F32
+        neg_inf = NEG_INF_F32
+        zero = POS_ZERO_F32
+
+        self.interp.set_vgpr_u32(1, neg_inf)
+        self.interp.set_vgpr_u32(2, zero)
+        self.interp.set_vgpr_u32(3, pos_inf)
+        res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+        self.assertEqual(res, zero)
+
+        self.interp.set_vgpr_u32(1, neg_inf)
+        self.interp.set_vgpr_u32(2, neg_inf)
+        self.interp.set_vgpr_u32(3, pos_inf)
+        res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+        self.assertEqual(res, neg_inf)
+
+    def test_max_finite_overflow_and_clamp(self):
+        max_f = MAX_FINITE_F32
+        self.interp.set_vgpr_u32(1, max_f)
+        self.interp.set_vgpr_u32(2, max_f)
+        self.interp.set_vgpr_u32(3, max_f)
+
+        res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3 mul:2")
+        self.assertEqual(res, POS_INF_F32)
+
+        res_c = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3 clamp")
+        self.assertEqual(res_c, ONE_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
