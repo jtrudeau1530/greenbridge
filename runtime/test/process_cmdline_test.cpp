@@ -93,9 +93,11 @@ void check_winmain(const std::wstring& program, const std::vector<std::wstring>&
     using Wide = wchar_t*(__cdecl*)();
     using Narrow = char*(__cdecl*)();
     for (const char* dll : {"api-ms-win-crt-runtime-l1-1-0.dll", "ucrtbase.dll"}) {
-        const wchar_t* wide =
-            reinterpret_cast<Wide>(rt::shims::find(dll, "_get_wide_winmain_command_line"))();
-        const char* line = reinterpret_cast<Narrow>(rt::shims::find(dll, "_get_narrow_winmain_command_line"))();
+        const auto wide_fn = reinterpret_cast<Wide>(rt::shims::find(dll, "_get_wide_winmain_command_line"));
+        const auto narrow_fn = reinterpret_cast<Narrow>(rt::shims::find(dll, "_get_narrow_winmain_command_line"));
+        if (!wide_fn || !narrow_fn) continue;  // check_import_names has reported the missing shim
+        const wchar_t* wide = wide_fn();
+        const char* line = narrow_fn();
         char expected[256] = {};
         WideCharToMultiByte(CP_ACP, 0, want, -1, expected, sizeof(expected), nullptr, nullptr);
         if (!wide || std::wcscmp(wide, want) != 0) {
