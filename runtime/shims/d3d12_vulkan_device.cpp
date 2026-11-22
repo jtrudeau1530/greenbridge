@@ -1386,7 +1386,7 @@ public:
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            hr = resource->create_buffer();
+            hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0 ? resource->create_buffer() : E_INVALIDARG;
         } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
             log_once("committed resource dimension not supported:", desc->Dimension);
@@ -1396,11 +1396,12 @@ public:
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
             hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
         } else if (const UINT samples = desc->SampleDesc.Count;
-                   samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
-                                   desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-                                   !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))) {
-            hr = E_INVALIDARG;  // D3D12: a multisampled texture is a single-mip 2D render target or depth-stencil
+                   !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || desc->SampleDesc.Quality != 0 ||
+                   (samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
+                                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                                    !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))) {
+            hr = E_INVALIDARG;  // D3D12: nonzero power-of-two sample count up to 32; MSAA needs a single-mip 2D attachment
         } else {
             const Format format = state_.texture_format(*desc);
             if (format.format == VK_FORMAT_UNDEFINED) {
@@ -1645,6 +1646,9 @@ public:
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
         log_once("CheckFeatureSupport feature", feature);
         if (!data) return E_INVALIDARG;
+        constexpr VkSampleCountFlags d3d12_multisample_sample_counts =
+            VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT |
+            VK_SAMPLE_COUNT_16_BIT | VK_SAMPLE_COUNT_32_BIT;
         switch (feature) {
         case D3D12_FEATURE_FEATURE_LEVELS: {
             if (size != sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) return E_INVALIDARG;
@@ -1748,7 +1752,7 @@ public:
                 if (state_.image_format_properties &&
                     state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
                                                    VK_IMAGE_TILING_OPTIMAL, usage, flags, &image_properties) == VK_SUCCESS &&
-                    (image_properties.sampleCounts & ~VK_SAMPLE_COUNT_1_BIT)) {
+                    (image_properties.sampleCounts & d3d12_multisample_sample_counts)) {
                     s1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
                           D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
                 }
@@ -1777,17 +1781,30 @@ public:
             auto* levels = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(data);
             levels->NumQualityLevels = 0;
             if (levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE ||
-                levels->SampleCount == 0 || levels->SampleCount > 64 ||
+                levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
                 (levels->SampleCount & (levels->SampleCount - 1)) != 0)
                 return E_INVALIDARG;
-            const Format format = vulkan_format(levels->Format, false);
+            Format format = vulkan_format(levels->Format, false);
+            if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                D3D12_RESOURCE_DESC depth_desc{};
+                depth_desc.Format = levels->Format;
+                depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                format = state_.texture_format(depth_desc);  // includes the D24-to-D32 fallback used by creation
+            }
             if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
                 return DXGI_ERROR_UNSUPPORTED;
 
             // Vulkan exposes one standard sample pattern per supported count, so each supported count maps to
-            // one D3D12 quality level (quality index 0). Query the exact usages used for a D3D12 RT texture.
-            const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            // one D3D12 quality level (quality index 0). Query the matching colour or depth/stencil attachment
+            // usage, plus the transfer and sampled usages used by the resource implementation.
+            VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_SAMPLED_BIT;
+            if (format.aspects & VK_IMAGE_ASPECT_COLOR_BIT)
+                usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            else if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+                usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            else
+                return DXGI_ERROR_UNSUPPORTED;
             const VkImageCreateFlags flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
             VkImageFormatProperties image_properties{};
             const VkResult result = state_.image_format_properties(state_.info.physical, format.format,
@@ -1859,8 +1876,9 @@ private:
         const UINT max_layers =
             volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
         if (!desc.Width || !desc.Height || !desc.DepthOrArraySize || desc.Width > max_extent ||
-            desc.Height > max_extent || desc.DepthOrArraySize > max_layers || !samples || samples > 16 ||
-            (samples & (samples - 1)) || desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+            desc.Height > max_extent || desc.DepthOrArraySize > max_layers || !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
+            (samples & (samples - 1)) || desc.SampleDesc.Quality != 0 ||
+            desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
             return kInvalidAllocation;
         const UINT16 full = full_mips(desc.Width, desc.Height, depth);
         D3D12_RESOURCE_DESC resolved = desc;
