@@ -631,7 +631,10 @@ The compute path, end to end:
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
   - Shader programs (FSSM blobs) are copied in as the code base.
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place from `pack()`; a
-  signature `pack()` refuses (more than 32 user dwords: the spill layout is open) is refused with its reason.
+  signature `pack()` refuses (more than 32 user dwords: the spill layout is open) is refused with its reason. Before
+  that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
+  `S_FALSE` for a null output whatever the blob, then `E_INVALIDARG` for a node other than node 0 or a DXBC
+  container whose size (the dword at +24) is not the size passed.
   **`CreateComputePipelineState`** (PC slot 11, Xbox slot 62 through the proxy) finds the shader by its FSSM
   hash, builds a pipeline with the 144-byte push-constant range and registers it for replay. Shaders that declare
   set-0 bindings get the device's bindless set 0 in their layout and bound at every dispatch (M2); on a device without
@@ -2233,7 +2236,10 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
   clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
   `pipelineStatisticsQuery`. `SO_STATISTICS`, `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and
-  amplification counts) are logged and refused with `E_NOTIMPL`.
+  amplification counts) are logged and refused with `E_NOTIMPL`. Invalid descriptions are answered as the host runtime
+  answers them (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node
+  other than node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with
+  a null output is then `E_UNEXPECTED`, not `S_FALSE`.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and

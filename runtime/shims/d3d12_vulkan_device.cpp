@@ -4551,30 +4551,41 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
-        if (!desc || !desc->Count || desc->NodeMask > 1) return E_INVALIDARG;  // one node
+        // The host runtime's order (compare_invalid_arguments, "query heap:"): the description first, refused with
+        // E_INVALIDARG for no queries, a node other than node 0 or a type past PIPELINE_STATISTICS1 (7; 6 has no
+        // name in the SDK but the host takes it), then E_UNEXPECTED for a null output. A known type this layer
+        // can't create stays E_NOTIMPL.
+        if (!desc || !desc->Count || desc->NodeMask > 1 ||
+            UINT(desc->Type) > UINT(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1))
+            return E_INVALIDARG;
+        if (!out) return E_UNEXPECTED;
         auto* heap = new QueryHeap(state_);
         heap->attach_device(identity());
         if (const HRESULT hr = heap->create(*desc); FAILED(hr)) {
             heap->Release();
             return hr;
         }
-        if (!out) {  // a capability check: D3D12 allows a null output
-            heap->Release();
-            return S_FALSE;
-        }
         return hand_out(heap, riid, out);
     }
 
-    HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT, const void* blob, SIZE_T size, REFIID riid,
+    HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT node_mask, const void* blob, SIZE_T size, REFIID riid,
                                                   void** out) override {
-        if (!out) return E_POINTER;
+        // The host runtime answers a null output with S_FALSE before it looks at the blob or the node mask
+        // (compare_invalid_arguments, "root signature:"). Otherwise it refuses a node other than node 0, and a DXBC
+        // container whose own size (the dword at +24) is not the size passed.
+        if (!out) return S_FALSE;
         *out = nullptr;
-        if (!blob || !size) return E_INVALIDARG;
+        if (!blob || !size || (node_mask & ~1u)) return E_INVALIDARG;
+        const auto* bytes = static_cast<const std::uint8_t*>(blob);
+        if (size >= 28 && std::memcmp(bytes, "DXBC", 4) == 0) {
+            std::uint32_t container_size = 0;
+            std::memcpy(&container_size, bytes + 24, sizeof(container_size));
+            if (container_size != size) return E_INVALIDARG;
+        }
         // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
         // the parameters into the 32 user-data dwords. pack() refuses what it cannot place (more than 32 dwords:
         // the console spills those to memory, in a layout that is still open), and so does this.
-        const rt::rootsig::DecodeResult parsed =
-            rt::rootsig::parse_rts0(static_cast<const std::uint8_t*>(blob), size);
+        const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
             return E_INVALIDARG;

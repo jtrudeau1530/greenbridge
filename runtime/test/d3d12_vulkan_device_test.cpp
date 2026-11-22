@@ -2781,6 +2781,56 @@ HRESULT command_queue(ID3D12Device* device, D3D12_COMMAND_QUEUE_DESC desc) {
     return released(device->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), &out), &out);
 }
 
+HRESULT query_heap(ID3D12Device* device, D3D12_QUERY_HEAP_TYPE type, UINT count, UINT node_mask = 0,
+                   bool output = true) {
+    const D3D12_QUERY_HEAP_DESC desc{type, count, node_mask};
+    void* out = nullptr;
+    return released(device->CreateQueryHeap(&desc, __uuidof(ID3D12QueryHeap), output ? &out : nullptr), &out);
+}
+
+// A root signature blob from the host's own serializer (version 1.0): empty, or one root CBV at b0, or one table of
+// unbounded SRVs from t0. Empty when d3d12.dll has no serializer, and both devices then get the same refusal.
+std::vector<std::uint8_t> root_signature_blob(int parameters) {
+    using Serialize = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**,
+                                       ID3DBlob**);
+    static const auto serialize = reinterpret_cast<Serialize>(reinterpret_cast<void*>(GetProcAddress(
+        LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32), "D3D12SerializeRootSignature")));
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 0,
+                                       D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+    if (parameters == 1) {
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    } else if (parameters == 2) {
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameter.DescriptorTable = {1, &range};
+    }
+    const D3D12_ROOT_SIGNATURE_DESC desc{parameters ? 1u : 0u, parameters ? &parameter : nullptr, 0, nullptr,
+                                         D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* error = nullptr;
+    std::vector<std::uint8_t> bytes;
+    if (serialize && SUCCEEDED(serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) && blob) {
+        const auto* first = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+        bytes.assign(first, first + blob->GetBufferSize());
+    }
+    if (blob) blob->Release();
+    if (error) error->Release();
+    return bytes;
+}
+
+// CreateRootSignature with `blob`, passed as `size` bytes (the blob's own size when 0; the vector is padded with
+// zeros when `size` is larger).
+HRESULT root_signature(ID3D12Device* device, std::vector<std::uint8_t> blob, SIZE_T size = 0, UINT node_mask = 0,
+                       bool output = true, REFIID riid = __uuidof(ID3D12RootSignature)) {
+    if (!size) size = blob.size();
+    if (blob.size() < size) blob.resize(size);
+    void* out = nullptr;
+    return released(device->CreateRootSignature(node_mask, blob.empty() ? nullptr : blob.data(), size, riid,
+                                                output ? &out : nullptr),
+                    &out);
+}
+
 // CreateCommandSignature without a root signature. Each argument is only its type; a CONSTANT one sets one value.
 HRESULT command_signature(ID3D12Device* device, UINT stride, std::initializer_list<D3D12_INDIRECT_ARGUMENT_TYPE> types,
                           UINT node_mask = 0) {
@@ -3512,6 +3562,94 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command queue: compute", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COMPUTE}); }},
         {"command queue: copy", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COPY}); }},
+        // CreateQueryHeap: the description is checked first (types past PIPELINE_STATISTICS1 are refused), then a
+        // null output is E_UNEXPECTED. Known types this layer has no path for (stream output, video decode, mesh
+        // statistics) are E_NOTIMPL here and not compared.
+        {"query heap: occlusion", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4); }},
+        {"query heap: timestamps", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 4); }},
+        {"query heap: no queries", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0); }},
+        {"query heap: type 8", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE(8), 1); }},
+        {"query heap: type 99", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE(99), 1); }},
+        {"query heap: type -1", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE(-1), 1); }},
+        {"query heap: node mask 1", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 1);
+         }},
+        {"query heap: node mask 2", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 2);
+         }},
+        {"query heap: null output", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0, false);
+         }},
+        {"query heap: null output, no queries", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0, false);
+         }},
+        {"query heap: null output, type 99", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE(99), 1, 0, false);
+         }},
+        {"query heap: null output, node mask 2", [](ID3D12Device* d) {
+             return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 2, false);
+         }},
+        {"query heap: wrong interface", [](ID3D12Device* d) {
+             const D3D12_QUERY_HEAP_DESC desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+             void* out = nullptr;
+             return released(d->CreateQueryHeap(&desc, __uuidof(ID3D12Fence), &out), &out);
+         }},
+        // CreateRootSignature: a null output is S_FALSE whatever the blob; otherwise node 0 only, and the blob's
+        // DXBC size must be the size passed.
+        {"root signature: empty", [](ID3D12Device* d) { return root_signature(d, root_signature_blob(0)); }},
+        {"root signature: root CBV", [](ID3D12Device* d) { return root_signature(d, root_signature_blob(1)); }},
+        {"root signature: unbounded SRV table", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(2));
+         }},
+        {"root signature: size 0", [](ID3D12Device* d) {
+             void* out = nullptr;
+             const auto blob = root_signature_blob(0);
+             return released(d->CreateRootSignature(0, blob.data(), 0, __uuidof(ID3D12RootSignature), &out), &out);
+         }},
+        {"root signature: one byte short", [](ID3D12Device* d) {
+             const auto blob = root_signature_blob(0);
+             return root_signature(d, blob, blob.size() - 1);
+         }},
+        {"root signature: 4 bytes over", [](ID3D12Device* d) {
+             const auto blob = root_signature_blob(1);
+             return root_signature(d, blob, blob.size() + 4);
+         }},
+        {"root signature: 16 bytes over", [](ID3D12Device* d) {
+             const auto blob = root_signature_blob(0);
+             return root_signature(d, blob, blob.size() + 16);
+         }},
+        {"root signature: 64 zero bytes", [](ID3D12Device* d) {
+             return root_signature(d, std::vector<std::uint8_t>(64, 0));
+         }},
+        {"root signature: null blob", [](ID3D12Device* d) {
+             void* out = nullptr;
+             return released(d->CreateRootSignature(0, nullptr, 64, __uuidof(ID3D12RootSignature), &out), &out);
+         }},
+        {"root signature: node mask 1", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 1);
+         }},
+        {"root signature: node mask 2", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 2);
+         }},
+        {"root signature: node mask 0x80000000", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 0x80000000u);
+         }},
+        {"root signature: wrong interface", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 0, true, __uuidof(ID3D12Fence));
+         }},
+        {"root signature: null output", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(1), 0, 0, false);
+         }},
+        {"root signature: null output, 64 zero bytes", [](ID3D12Device* d) {
+             return root_signature(d, std::vector<std::uint8_t>(64, 0), 0, 0, false);
+         }},
+        {"root signature: null output, node mask 2", [](ID3D12Device* d) {
+             return root_signature(d, root_signature_blob(0), 0, 2, false);
+         }},
+        {"root signature: null output, 16 bytes over", [](ID3D12Device* d) {
+             const auto blob = root_signature_blob(0);
+             return root_signature(d, blob, blob.size() + 16, 0, false);
+         }},
         {"command queue: high priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_HIGH});
          }},
@@ -5411,7 +5549,8 @@ int main() {
             Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, refused;
             D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));
-            EXPECT(device->CreateQueryHeap(&query_desc, __uuidof(ID3D12QueryHeap), nullptr) == S_FALSE);
+            // A null output is E_UNEXPECTED, as on the host runtime (compare_invalid_arguments, "query heap:").
+            EXPECT(device->CreateQueryHeap(&query_desc, __uuidof(ID3D12QueryHeap), nullptr) == E_UNEXPECTED);
             {
                 Ref<ID3D12Device> parent;
                 EXPECT(SUCCEEDED(occlusion->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
