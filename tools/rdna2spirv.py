@@ -709,10 +709,12 @@ class Gen:
             raise Unsupported(f"{op} on MODE bits {off}..{off + size - 1} (only FP_ROUND[3:2] as a whole is modelled)")
         if op != "s_setreg_imm32_b32" or a[1]["k"] != "imm":
             raise Unsupported(f"{op} with a register value on MODE.FP_ROUND")
-        new = a[1]["v"] & 3
-        if new in (1, 2):
-            raise Unsupported("MODE.FP_ROUND[3:2] directed rounding (+inf/-inf)")
-        self.emit(f"OpStore %mode_r16 {self.cu(new)}")
+        self.write_half_round_mode(op, a[1]["v"] & 3)
+
+    def write_half_round_mode(self, op: str, mode: int) -> None:
+        if mode in (1, 2):
+            raise Unsupported(f"{op}: MODE.FP_ROUND[3:2] directed rounding (+inf/-inf)")
+        self.emit(f"OpStore %mode_r16 {self.cu(mode)}")
 
     def emit_ne0(self, v):
         r = self.tmp()
@@ -4211,8 +4213,16 @@ class Gen:
         if op in ("s_setreg_imm32_b32", "s_setreg_b32"):
             self.mode_write(op, a)
             return
-        if op in ("s_denorm_mode", "s_round_mode"):
-            raise Unsupported(op + " (not in the corpus; MODE is modelled through s_setreg only)")
+        if op == "s_round_mode":
+            if len(a) != 1 or a[0]["k"] != "imm":
+                raise Unsupported(op + " requires an immediate")
+            mode = a[0]["v"]
+            if mode & 3:
+                raise Unsupported(op + ": only nearest-even FP32 rounding is modelled")
+            self.write_half_round_mode(op, (mode >> 2) & 3)
+            return
+        if op == "s_denorm_mode":
+            raise Unsupported(op + ": denormal mode writes are not modelled")
         if op == "s_mov_b32" and a[0]["k"] == "special" and a[0]["t"] in ("exec_lo", "exec_hi") and \
                 (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm") or
                  (a[1]["k"] == "sgpr" and not self.holds_lane_mask(a[1]))):
@@ -11249,7 +11259,9 @@ def translate(path):
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
         g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
                            (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
-    g.round_mode =any(i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", "") for i in insns)
+    g.round_mode = any(i["op"] == "s_round_mode" or
+                       (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
+                       for i in insns)
     code_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
                    (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
                    for i in insns)
