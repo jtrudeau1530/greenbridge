@@ -753,6 +753,26 @@ def self_test():
     return 0
 
 
+def _validate_json_out(raw_path):
+    """Validate --json output path before running translator/hardware cases; return (abs_path, err_msg)."""
+    if not raw_path.strip():
+        return None, "ERROR: --json path must not be empty"
+    out_path = os.path.abspath(raw_path)
+    if os.path.isdir(out_path):
+        return None, f"ERROR: --json path is a directory: {out_path}"
+    cur = os.path.dirname(out_path)
+    while cur:
+        if os.path.exists(cur):
+            if not os.path.isdir(cur):
+                return None, f"ERROR: --json parent path is not a directory: {cur}"
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return out_path, None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("translator", "hw", "both"), default="translator")
@@ -786,6 +806,13 @@ def main(argv=None):
             return 2
         want = set(args.group)
         cases = [c for c in cases if c.group in want]
+
+    out_path = None
+    if args.json_out is not None:
+        out_path, err_msg = _validate_json_out(args.json_out)
+        if err_msg:
+            print(err_msg, file=sys.stderr)
+            return 2
 
     waves = (32, 64) if args.wave == "both" else (int(args.wave),)
     tr_res = run_translator(cases) if args.oracle in ("translator", "both") else None
@@ -844,17 +871,17 @@ def main(argv=None):
     print(f"summary: {total} cases: {matched} match, {known_diffs} known divergence, "
           f"{mismatches} unexpected mismatch, {wave_diffs} wave32/64 diff")
 
-    if args.json_out:
-        out_path = os.path.abspath(args.json_out)
-        if os.path.isdir(out_path):
-            print(f"ERROR: --json path is a directory: {out_path}", file=sys.stderr)
+    if out_path is not None:
+        try:
+            parent = os.path.dirname(out_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: failed to write --json {out_path}: {e}", file=sys.stderr)
             return 2
-        parent = os.path.dirname(out_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
-            f.write("\n")
 
     if mismatches or wave_diffs or (args.strict and known_diffs):
         return 1

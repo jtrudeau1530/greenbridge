@@ -913,6 +913,20 @@ class UndocumentedTagsTest(unittest.TestCase):
         self.assertFalse(rsc8_audio.decode_index_runs(self.RUNS, grid_entries=10)["indices_within_grid"])
         self.assertIsNone(rsc8_audio.decode_index_runs(self.RUNS)["indices_within_grid"])
 
+        # Non-ascending runs must still check the true maximum, not only run[-1].
+        non_asc = build_synthetic_indexruns([(2, [100, 0])])
+        r_na = rsc8_audio.decode_index_runs(non_asc, grid_entries=10)
+        self.assertFalse(r_na["indices_ascending"])
+        self.assertEqual(r_na["index_max"], 100)
+        self.assertFalse(r_na["indices_within_grid"])
+
+        # Empty runs contain no indices and must not report an overrun against grid_entries=0.
+        empty = struct.pack("<I", 0)
+        r_empty = rsc8_audio.decode_index_runs(empty, grid_entries=0)
+        self.assertEqual((r_empty["groups"], r_empty["values"]), (0, 0))
+        self.assertIsNone(r_empty["index_max"])
+        self.assertTrue(r_empty["indices_within_grid"])
+
     def test_indexrun_flags_violations(self):
         declared_bad = build_synthetic_indexruns([(2, [1, 2])], declared=3)
         self.assertFalse(rsc8_audio.decode_index_runs(declared_bad)["group_count_matches"])

@@ -406,7 +406,11 @@ shared base is `cs_lucia_legacypedcs`
 about 25 million generated strings — gives **0/18** exact matches. The sibling nine-entry table
 resolves 9 of 18 values to `joaat("outfit_01")` … `joaat("outfit_10")` (frequency corroborates
 it), so the table stores build-time design labels, not shipped asset names; the 18 component
-values are not recoverable by name enumeration.
+values are not recoverable by name enumeration. `common.rpf` contains one variation manager,
+`CPedVariationBodyTypeManager` (77,422 bytes, 67 keys). Its keys are literal model names;
+`joaat32` of all 67 keys gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for
+Lucia and Monalisa) is a body/height scale, not a name. There is no component/outfit-name
+manager in `common.rpf`; `outfit_NN` exists only as a hash in the packs table.
 
 The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not

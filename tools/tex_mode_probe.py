@@ -26,17 +26,24 @@ def bc_bpe(fmt_name):
     return BPE.get(fmt_name.split("_", 1)[0])
 
 
-def mip_bytes(w, h, bpe, align):
+def _tile_shape(tile_bytes: int, bpe: int) -> tuple[int, int]:
+    elements = tile_bytes // bpe
+    width = 1 << (elements.bit_length() // 2)
+    return width, elements // width
+
+
+def mip_bytes(w: int, h: int, bpe: int, align: int) -> int:
+    """Size of a mip in 4K/64K tiles, or its aligned linear size for other alignments."""
     bw, bh = max(1, (w + 3) // 4), max(1, (h + 3) // 4)
+    if align in (4096, 65536):
+        tw, th = _tile_shape(align, bpe)
+        return ((bw + tw - 1) // tw) * ((bh + th - 1) // th) * align
     n = bw * bh * bpe
     return (n + align - 1) // align * align
 
 
 def offsets_for(eq, bb, bpe, wb, hb):
-    elems = (1 << bb) // bpe
-    lb = elems.bit_length() - 1
-    bw = 1 << ((lb + 1) // 2)
-    bh = elems // bw
+    bw, bh = _tile_shape(1 << bb, bpe)
     y, x = np.mgrid[0:hb, 0:wb].astype(np.int64)
     o = np.zeros_like(x)
     for bit, (mx, my) in enumerate(eq):

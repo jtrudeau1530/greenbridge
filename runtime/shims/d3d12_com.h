@@ -29,6 +29,7 @@
 
 namespace leonida {
 class VulkanPresenter;
+struct PresentPlanes;
 }
 
 namespace rt::d3d12 {
@@ -77,6 +78,10 @@ struct VulkanDeviceInfo {
     // Distinct handles from queue_family, when the creator requested more than one queue.
     // Empty for caller-owned devices that only supplied queue above.
     std::vector<VkQueue> command_queues;
+    std::uint32_t compute_family = UINT32_MAX;
+    std::uint32_t copy_family = UINT32_MAX;
+    std::vector<VkQueue> compute_queues;
+    std::vector<VkQueue> copy_queues;
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
@@ -120,6 +125,9 @@ struct VulkanDeviceInfo {
     // instance (only meaningful with `presentation`): a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per
     // present, which PresentX's ImmediateThresholdPercent uses.
     bool swapchain_maintenance1 = false;
+    // VK_EXT_swapchain_colorspace is enabled on the instance (with `presentation`): the surface can list its HDR10
+    // (ST.2084) formats, which a PresentX plane in HDR10 uses. Without it HDR10 planes are clipped to SDR.
+    bool swapchain_colorspace = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
     // Pixel-shader extensions translated shaders can declare, each enabled with its feature where the GPU has it:
@@ -263,6 +271,13 @@ public:
                     bool tear = false);
     // A black frame, nothing read (PresentX with no planes).
     HRESULT present_blank(UINT sync_interval);
+    // One or two planes composed (VulkanPresenter::present_planes); `planes` names the textures by ResourceId, so the
+    // caller fills it with resource_id(). DXGI_ERROR_UNSUPPORTED for a source the compose pass cannot read.
+    HRESULT present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear = false);
+    // The swapchain holds HDR10 (ST.2084) values; and a test hook (VulkanPresenter::force_hdr_encoding).
+    bool hdr_active() const;
+    void force_hdr_encoding(bool on);
+    std::uint64_t composed_presents() const;  // presents that went through the compose pass
     bool tear_supported() const;
     bool last_present_tore() const;
     std::uint64_t tear_presents() const;
@@ -278,6 +293,9 @@ private:
     IUnknown* device_;
     std::unique_ptr<leonida::VulkanPresenter> presenter_;
 };
+
+// Whether `device` (from create_vulkan_device*) was created with VK_EXT_swapchain_colorspace on its instance.
+bool device_has_swapchain_colorspace(ID3D12Device* device);
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);

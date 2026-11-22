@@ -8,6 +8,7 @@
 //     arguments they were recorded with, and the results copied to a readback buffer.
 // The shader (test/glsl/cs_user_data.comp) is written to the translator's push-constant and address contract.
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
@@ -269,7 +270,7 @@ int main() {
     EXPECT(leonida::fssm_program(container) == fssm);
     const auto library = std::filesystem::temp_directory_path() / "leonida_compute_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "cs_user_data.spv",
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);

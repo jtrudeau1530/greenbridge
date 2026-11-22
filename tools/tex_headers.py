@@ -554,7 +554,11 @@ D3D10_RESOURCE_MISC_TEXTURECUBE = 0x4
 
 
 def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, array_size=1):
-    """Build a DX10 DDS header; array_size counts cubes, not faces, for cubemaps."""
+    """Build a DX10 DDS header; array_size counts cubes for cubemaps.
+
+    For known uncompressed formats, derive the row pitch. A nonzero linear_size
+    overrides the derived top mip size for compressed formats.
+    """
     hdr = bytearray(128)
     hdr[0:4] = b"DDS "
     flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT
@@ -562,10 +566,15 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, arra
         flags |= DDSD_MIPMAPCOUNT
     if depth > 1:
         flags |= DDSD_DEPTH
-    if linear_size > 0:
-        flags |= DDSD_LINEARSIZE
+    layout = FMT_INFO.get(fmt)
+    if layout is not None and layout[1] == 1:
+        flags |= DDSD_PITCH
+        pitch_or_size = calc_mip_level_bytes(w, 1, fmt=fmt)
     else:
-        flags |= 0x80000
+        flags |= DDSD_LINEARSIZE
+        pitch_or_size = linear_size
+        if layout is not None and linear_size == 0:
+            pitch_or_size = calc_mip_level_bytes(w, h, depth=depth, fmt=fmt)
 
     caps = DDSCAPS_TEXTURE
     if mips > 1:
@@ -579,7 +588,8 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, arra
     if is_cube:
         caps2 |= DDSCAPS2_CUBEMAP_ALLFACES
 
-    struct.pack_into("<IIIIIII", hdr, 4, 124, flags, h, w, linear_size, depth if depth > 1 else 0, mips if mips > 1 else 1)
+    struct.pack_into("<IIIIIII", hdr, 4, 124, flags, h, w, pitch_or_size,
+                     depth if depth > 1 else 0, mips if mips > 1 else 1)
     struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
     struct.pack_into("<II", hdr, 108, caps, caps2)
 
@@ -590,8 +600,9 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, arra
 
 
 def dds_bytes(w, h, fmt, payload=b"", mips=1, depth=1, is_cube=False, array_size=1):
+    linear_size = 0 if fmt in FMT_INFO else len(payload)
     return dds_header(w, h, depth=depth, mips=mips, fmt=fmt, is_cube=is_cube,
-                      linear_size=len(payload), array_size=array_size) + payload
+                      linear_size=linear_size, array_size=array_size) + payload
 
 
 def parse_dds_header(data):
@@ -721,6 +732,21 @@ def same_output_path(first, second):
         return False
 
 
+def input_files(carve, archs):
+    """Yield (kind, path) for every file the scan reads from the selected carve archives.
+
+    Each archive contributes its ``index.json`` manifest and the ``<offset>.bin`` streams next to it.
+    A report path only has to match one of these, not the carve folder argument itself.
+    """
+    for arch in archs:
+        folder = os.path.join(carve, arch)
+        yield "manifest", os.path.join(folder, "index.json")
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.lower().endswith(".bin"):
+                    yield "blob", entry.path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve")
@@ -739,10 +765,9 @@ def main():
     path = a.out or os.path.join(a.carve, "textures_index.json")
     if os.path.isdir(path):
         ap.error(f"{path} is a directory, not a .json file")
-    for arch in archs:
-        manifest = os.path.join(a.carve, arch, "index.json")
-        if same_output_path(manifest, path):
-            ap.error(f"output would overwrite an input manifest: {path}")
+    for kind, source in input_files(a.carve, archs):
+        if same_output_path(source, path):
+            ap.error(f"output would overwrite an input {kind}: {path}")
     allt = []
     for arch in archs:
         try:

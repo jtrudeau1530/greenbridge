@@ -38,6 +38,26 @@ void poll();
 // Number of gamepads currently open by the backend (tests, gameinput_probe).
 int connected_count();
 
+// The SDL haptic calls the shim makes, one entry per call, so a test can stand in for them: SDL's virtual joysticks
+// report no haptics, and a pad that does is the only other way to reach this path. `joystick` is the SDL_Joystick the
+// gamepad was opened from, `haptic` what open_joystick returned, `effect` is an SDL_HapticEffect. Returning null from
+// open_joystick says the pad has no force feedback, which is what a pad without it does.
+struct HapticApi {
+    void* (*open_joystick)(void* joystick);   // SDL_OpenHapticFromJoystick
+    void (*close)(void* haptic);              // SDL_CloseHaptic
+    uint32_t (*features)(void* haptic);       // SDL_GetHapticFeatures: the SDL_HAPTIC_* bits the device supports
+    int (*max_effects)(void* haptic);         // SDL_GetMaxHapticEffects
+    int (*create_effect)(void* haptic, const void* effect);      // SDL_CreateHapticEffect, -1 on failure
+    bool (*update_effect)(void* haptic, int effect, const void* data);  // SDL_UpdateHapticEffect
+    bool (*run_effect)(void* haptic, int effect, uint32_t iterations);  // SDL_RunHapticEffect
+    bool (*stop_effect)(void* haptic, int effect);            // SDL_StopHapticEffect
+    void (*destroy_effect)(void* haptic, int effect);         // SDL_DestroyHapticEffect
+    bool (*set_gain)(void* haptic, int gain);                 // SDL_SetHapticGain, 0..100
+};
+// Where the haptics come from (tests). nullptr restores SDL. Applies to pads opened after the call: a pad keeps the
+// haptic device it was opened with.
+void set_haptic_source(const HapticApi* api);
+
 // What the shim last sent to SDL for the device that is index `i` in connection order. Test seam.
 struct OutputState {
     uint16_t low = 0, high = 0;           // SDL_RumbleGamepad
@@ -45,6 +65,8 @@ struct OutputState {
     uint8_t ds_right[11] = {}, ds_left[11] = {};  // last DualSense trigger effects sent
     bool is_dualsense = false;
     bool trigger_rumble = false;          // the pad takes SDL_RumbleGamepadTriggers
+    bool force_feedback = false;          // SDL opened the pad as a haptic device
+    uint32_t haptic_motors = 0;           // haptic motors the pad reports (0 or 2)
 };
 bool output_state(int i, OutputState* out);
 

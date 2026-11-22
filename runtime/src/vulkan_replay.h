@@ -87,6 +87,7 @@ struct ResourceBinding {
     // bytes, and copies between it and a buffer are repacked by the depth24 pass (Depth24Job::rgb96).
     bool rgb96 = false;
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
+    bool sampled = false;              // has SAMPLED usage (no DENY_SHADER_RESOURCE): the present compose pass reads it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
     bool sparse_buffer = false;
 };
@@ -773,6 +774,7 @@ struct ReplayFunctions {
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
+    VkPipelineStageFlags2 queue_stages = 0;
     PFN_vkCmdBeginRendering begin_rendering = nullptr;      // rectangle clears
     PFN_vkCmdEndRendering end_rendering = nullptr;
     PFN_vkCmdClearAttachments clear_attachments = nullptr;
@@ -792,6 +794,9 @@ struct ReplayFunctions {
     PFN_vkCmdEndQuery end_query = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
+    // Set only where a copy of timestamp results is not ordered after the timestamps written before it (MoltenVK on
+    // Apple GPUs, docs/d3d12_vulkan.md section 4.6): records what orders them, before each timestamp resolve.
+    std::function<void(VkCommandBuffer)> order_timestamp_copy;
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize)>
         sum_occlusion;
     PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
@@ -826,6 +831,10 @@ struct ReplayFunctions {
     // rendering: the segments of a statistics query split around resolves (D3D-162).
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> sum_statistics;
+    // Sums `count` binary-occlusion segments and normalizes the total to a 64-bit 0 or 1, outside conditional
+    // rendering: a binary query split over physical segments because it overlaps other occlusion queries (D3D-252).
+    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
+                       VkBuffer dst, VkDeviceSize offset)> sum_binary_occlusion;
     // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
     PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
     PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
@@ -1101,6 +1110,36 @@ inline void clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t l
     }
 }
 
+inline constexpr VkPipelineStageFlags2 queue_stages_copy =
+    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
+    VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+inline constexpr VkPipelineStageFlags2 queue_stages_compute =
+    queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+    VK_PIPELINE_STAGE_2_CLEAR_BIT;
+
+inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& stages, VkAccessFlags2& access) {
+    if (!vk.queue_stages) return;
+    VkAccessFlags2 allowed = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                             VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT |
+                             VK_ACCESS_2_HOST_WRITE_BIT;
+    if (vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+        allowed |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
+                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    stages &= vk.queue_stages;
+    if (!stages) stages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    access &= allowed;
+}
+
+inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags& stages, VkAccessFlags& access) {
+    if (!vk.queue_stages) return;
+    VkPipelineStageFlags2 s2 = stages;
+    VkAccessFlags2 a2 = access;
+    restrict_to_queue(vk, s2, a2);
+    stages = static_cast<VkPipelineStageFlags>(s2 & 0xFFFFFFFFull);
+    access = static_cast<VkAccessFlags>(a2 & 0xFFFFFFFFull);
+}
+
 // A D3D12 barrier on a volume mip covers every W slice, including on devices with maintenance9.
 inline VkImageSubresourceRange layout_range(const ResourceBinding& resource, VkImageSubresourceRange range) {
     if (resource.volume) range.layerCount = VK_REMAINING_ARRAY_LAYERS;
@@ -1111,6 +1150,8 @@ inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buf
                           const VkImageSubresourceRange& range, VkImageLayout old_layout, VkImageLayout new_layout,
                           VkAccessFlags src_access, VkPipelineStageFlags src_stages, VkAccessFlags dst_access,
                           VkPipelineStageFlags dst_stages) {
+    restrict_to_queue(vk, src_stages, src_access);
+    restrict_to_queue(vk, dst_stages, dst_access);
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.srcAccessMask = src_access;
@@ -1126,6 +1167,8 @@ inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buf
 
 inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkAccessFlags src_access,
                            VkPipelineStageFlags src_stages, VkAccessFlags dst_access, VkPipelineStageFlags dst_stages) {
+    restrict_to_queue(vk, src_stages, src_access);
+    restrict_to_queue(vk, dst_stages, dst_access);
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = src_access;
@@ -1152,7 +1195,7 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
                                   const ResourceBinding& resource, const VkImageSubresourceRange& range,
                                   VkImageLayout dst_layout) {
     const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
-    if (fmt.block <= 1 || !fmt.bytes || !vk.copy_buffer_to_image) return false;
+    if (fmt.block < 1 || !fmt.bytes || !vk.copy_buffer_to_image) return false;
     const std::uint32_t mip_begin = range.baseMipLevel;
     const std::uint32_t mip_end =
         range.levelCount == VK_REMAINING_MIP_LEVELS ? resource.mip_levels
@@ -1296,8 +1339,10 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
-        const bool compressed = fmt.block > 1;
-        if (resource.not_zeroed) {
+        const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
+        const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
+        const bool compressed = fmt.block > 1 || (!can_clear && color);
+        if (resource.not_zeroed || (!can_clear && !color)) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         } else if (compressed) {
@@ -1498,21 +1543,46 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         if (block > 1) {
             // D3D12 copies whole blocks: the box is rounded up to blocks and must fit the destination's padded mip.
             // Vulkan takes an extent that is a block multiple or reaches the edge of each image separately, so the
-            // extent is cut where it reaches an edge, and a copy that cannot satisfy both images is refused.
+            // extent is cut where it reaches an edge, and a copy that cannot satisfy both images is staged (below).
             if ((box.left | box.top | copy.x | copy.y) % block || box.left >= from.width || box.top >= from.height ||
                 copy.x >= padded(to.width) || copy.y >= padded(to.height))
                 return ReplayResult::invalid_copy;
             w = padded(w);
             h = padded(h);
             if (w > padded(to.width) - copy.x || h > padded(to.height) - copy.y) return ReplayResult::invalid_copy;
-            w = std::min({w, from.width - box.left, to.width - copy.x});
-            h = std::min({h, from.height - box.top, to.height - copy.y});
+            // Each image's own extent: the whole blocks, cut where they reach that image's edge.
+            const std::uint32_t src_w = std::min(w, from.width - box.left), src_h = std::min(h, from.height - box.top);
+            const std::uint32_t dst_w = std::min(w, to.width - copy.x), dst_h = std::min(h, to.height - copy.y);
+            const std::uint32_t blocks_w = w, blocks_h = h;
+            w = std::min(src_w, dst_w);
+            h = std::min(src_h, dst_h);
             const auto fits = [block](std::uint32_t offset, std::uint32_t extent, std::uint32_t size) {
                 return extent % block == 0 || offset + extent == size;
             };
             if (!fits(box.left, w, from.width) || !fits(copy.x, w, to.width) || !fits(box.top, h, from.height) ||
-                !fits(copy.y, h, to.height))
-                return ReplayResult::invalid_copy;
+                !fits(copy.y, h, to.height)) {
+                // No one extent does for both images: a mip edge inside a block on one side only (a 4x4 box into a
+                // 3x3 mip, a 6x6 mip into a 12x12 one). The source's blocks go into transfer scratch with its own
+                // cut extent and from there into the destination with the destination's (`staged_reads` and
+                // `staged_writes`, offsets from the start of the scratch; prepare allocates it). The box fits the
+                // source's padded mip, so the scratch holds every block the destination reads.
+                if (!within(copy.z, d, to_depth)) return ReplayResult::invalid_copy;
+                VkBufferImageCopy read{};
+                read.bufferRowLength = blocks_w;
+                read.bufferImageHeight = blocks_h;
+                read.imageSubresource = {src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1};
+                read.imageOffset = {std::int32_t(box.left), std::int32_t(box.top), std::int32_t(box.front)};
+                read.imageExtent = {src_w, src_h, d};
+                VkBufferImageCopy write = read;
+                write.imageSubresource = {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1};
+                write.imageOffset = {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)};
+                write.imageExtent = {dst_w, dst_h, d};
+                p.staged_reads.push_back(read);
+                p.staged_writes.push_back(write);
+                p.range = dst;
+                p.source_range = src;
+                return ReplayResult::success;
+            }
         }
         if (!within(copy.x, w, to.width) || !within(copy.y, h, to.height) || !within(copy.z, d, to_depth))
             return ReplayResult::invalid_copy;
@@ -1819,7 +1889,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     };
 
     p.colors.assign(pipeline->color_formats.size(), {});
-    for (std::size_t slot = 0; slot < draw.render_targets.size() && slot < p.colors.size(); ++slot) {
+    for (std::size_t slot = 0; slot < draw.render_target_count && slot < draw.render_targets.size() && slot < p.colors.size(); ++slot) {
         const TargetView& target = draw.render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);
@@ -1991,6 +2061,9 @@ public:
     VkQueryPool statistics_pool = VK_NULL_HANDLE;
     std::uint32_t statistics_base = 0;
     std::uint32_t statistics_segment_count = 0;
+    // The list's statistics queries overlap (D3D-252): without a statistics pool they cannot run whole, because
+    // two Vulkan queries of one type may not be active at once; QueryReplay::plan refuses such a list.
+    bool statistics_overlaps = false;
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
@@ -2009,7 +2082,9 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
         const Command& command = out.list->commands()[query.command];
         if (std::holds_alternative<ResolveQueries>(command)) continue;
         const auto range = query_range(command);
-        if (range.type != d3d12_query::occlusion) continue;
+        // Binary occlusion is virtualized alongside the ordinary kind (D3D-252): both are VK_QUERY_TYPE_OCCLUSION,
+        // so one physical query is open at a time and a binary resolve normalizes the summed counts (0 or 1).
+        if (range.type != d3d12_query::occlusion && range.type != d3d12_query::binary_occlusion) continue;
         const auto key = std::pair{range.heap, range.first};
         query.end_segment = current;
         if (std::holds_alternative<BeginQuery>(command)) {
@@ -2069,6 +2144,60 @@ inline void plan_statistics_segments(PreparedList& out) {
             }
         }
     }
+}
+
+// Overlapping pipeline-statistics queries (D3D-252): the same physical-segment layout the occlusion planner
+// builds, in the statistics pool. Each Begin and End of a statistics query — and every non-timestamp resolve
+// while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
+// a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
+// (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
+inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
+    std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
+    std::uint32_t current = detail::PreparedQuery::no_segment;
+    std::size_t next_query = 0;
+    for (std::size_t i = 0; i < out.commands.size(); ++i) {
+        auto& p = out.commands[i];
+        detail::PreparedQuery* query = nullptr;
+        if (next_query != out.queries.size() && out.queries[next_query].command == i)
+            query = &out.queries[next_query++];
+        if (!query) {
+            // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
+            // segment before it and open a new one after, the way resolves do.
+            if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24)) {
+                p.statistics_end = current;
+                current = out.statistics_segment_count++;
+                p.statistics_begin = current;
+            }
+            continue;
+        }
+        const Command& command = out.list->commands()[i];
+        const auto range = query_range(command);
+        if (!std::holds_alternative<ResolveQueries>(command)) {
+            // A Begin or End of another query kind leaves the shared segment alone.
+            if (range.type != d3d12_query::pipeline_statistics) continue;
+            query->statistics_end = current;
+            const auto key = std::pair{range.heap, range.first};
+            if (std::holds_alternative<BeginQuery>(command)) {
+                // A flattened bundle can reuse a slot already active in the parent list.
+                if (!active.emplace(key, out.statistics_segment_count).second) return ReplayResult::invalid_query;
+            } else {
+                const auto start = active.find(key);
+                if (start == active.end()) return ReplayResult::invalid_query;
+                query->statistics_first = start->second;
+                query->statistics_count = out.statistics_segment_count - start->second;
+                active.erase(start);
+            }
+        } else {
+            if (current == detail::PreparedQuery::no_segment || range.type == d3d12_query::timestamp) continue;
+            query->statistics_end = current;
+            current = out.statistics_segment_count++;
+            query->statistics_begin = current;
+            continue;
+        }
+        current = active.empty() ? detail::PreparedQuery::no_segment : out.statistics_segment_count++;
+        query->statistics_begin = current;
+    }
+    return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
 }
 
 // detail::initialize zero-clears an image piece the tracker holds in UNDEFINED (D3D12 committed resources start
@@ -2150,9 +2279,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.unpredicated_copies = 0;
     const bool queries = vk.reset_query_pool && vk.begin_query && vk.end_query && vk.write_timestamp &&
                          vk.copy_query_pool_results && vk.fill_buffer && vk.query_pool;
-    // Vulkan allows one active query per type. Only ordinary occlusion uses virtual segments.
-    std::size_t ordinary_active = 0;
-    bool overlaps = false, binary_active = false, statistics_active = false;
+    // Vulkan allows one active query per type. Overlapping ordinary and binary occlusion share one physical
+    // segment pool, and overlapping statistics split into the statistics pool (D3D-252); a physical query of a
+    // type is still open at most once at any point, because each event closes the one open slot and opens a new
+    // one. The occlusion kinds share their D3D12 heap, statistics have their own, so their states are separate.
+    std::size_t ordinary_active = 0, binary_active = 0, statistics_active_count = 0;
+    bool overlaps = false, statistics_overlaps = false, statistics_active = false;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
 
@@ -2321,6 +2453,20 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
+                if (result == ReplayResult::success && !p.staged_reads.empty()) {
+                    // A block-compressed copy staged through transfer scratch (prepare_texture_copy): whole blocks of
+                    // the read's row length and height, one region a copy.
+                    const VkBufferImageCopy& read = p.staged_reads[0];
+                    const BlockFormat f = block_format(p.source.format, read.imageSubresource.aspectMask);
+                    const VkDeviceSize bytes = VkDeviceSize(read.bufferRowLength / f.block) *
+                                               (read.bufferImageHeight / f.block) * read.imageExtent.depth * f.bytes;
+                    VkDeviceSize base = 0;
+                    if (!f.bytes || !vk.copy_image_to_buffer || !vk.copy_buffer_to_image || !vk.copy_scratch ||
+                        !vk.copy_scratch(bytes, p.staged, base))
+                        return ReplayResult::invalid_copy;  // refused as before this path existed
+                    p.staged_reads[0].bufferOffset += base;
+                    p.staged_writes[0].bufferOffset += base;
+                }
                 // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
                 const bool upload = texture_copy->src.footprint;
                 const ResourceBinding& image = upload ? p.binding : p.source;
@@ -2495,15 +2641,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (range.type != d3d12_query::timestamp && !std::holds_alternative<ResolveQueries>(command)) {
                 const bool begin = std::holds_alternative<BeginQuery>(command);
                 if (range.type == d3d12_query::occlusion) {
-                    if (begin && binary_active) return ReplayResult::unsupported;
-                    if (begin) overlaps |= ordinary_active++ != 0;
-                    else --ordinary_active;
+                    overlaps |= begin && (ordinary_active || binary_active);
+                    if (begin) ++ordinary_active; else --ordinary_active;
                 } else if (range.type == d3d12_query::binary_occlusion) {
-                    if (begin && (binary_active || ordinary_active)) return ReplayResult::unsupported;
-                    binary_active = begin;
+                    overlaps |= begin && (ordinary_active || binary_active);
+                    if (begin) ++binary_active; else --binary_active;
                 } else {
-                    if (begin && statistics_active) return ReplayResult::unsupported;
-                    statistics_active = begin;
+                    statistics_overlaps |= begin && statistics_active_count;
+                    if (begin) ++statistics_active_count; else --statistics_active_count;
+                    statistics_active = statistics_active_count != 0;
                 }
             }
             if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
@@ -2603,8 +2749,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
         }
     }
-    if (ordinary_active) return ReplayResult::invalid_query;
-    plan_statistics_segments(out);
+    if (ordinary_active || binary_active) return ReplayResult::invalid_query;
+    out.statistics_overlaps = statistics_overlaps;
+    if (statistics_overlaps) {
+        const auto result = plan_overlapping_statistics_segments(out);
+        if (result != ReplayResult::success) return result;
+    } else {
+        plan_statistics_segments(out);
+    }
     if (overlaps) {
         if (!vk.sum_occlusion || out.queries.size() >= detail::PreparedQuery::no_segment)
             return ReplayResult::unsupported;
@@ -2634,6 +2786,9 @@ public:
                 retain(statistics_pool);
                 list.statistics_pool = statistics_pool->pool;
                 list.statistics_base = statistics_base;
+            } else if (list.statistics_overlaps) {
+                // Whole queries on the heap pool would keep two pipeline-statistics queries active at once.
+                return ReplayResult::unsupported;
             } else {
                 for (const auto& command : list.commands)
                     if (command.statistics_end != detail::PreparedQuery::no_segment)
@@ -2674,11 +2829,14 @@ public:
                     detail::QueryResolveRun run{value.ended ? query.heap->pool : VK_NULL_HANDLE,
                                                 index, 1, offset + VkDeviceSize(i) * size};
                     if (value.occlusion.segments) {
-                        if (resolve.type != d3d12_query::occlusion && !statistics) return ReplayResult::invalid_query;
+                        if (resolve.type != d3d12_query::occlusion && !binary && !statistics)
+                            return ReplayResult::invalid_query;
                         const auto& saved = value.occlusion;
                         run = {saved.segments->pool, saved.first, saved.count, run.offset, saved.count > 1};
                         if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
-                        (statistics ? needs_statistics_sum : needs_sum) |= run.sum;
+                        if (statistics) needs_statistics_sum |= run.sum;
+                        else if (binary) (run.sum ? needs_sum_binary : needs_binary) = true;
+                        else needs_sum |= run.sum;
                         retain(saved.segments);
                     }
                     if (!query.resolves.empty() && !run.sum && run.count == 1) {
@@ -2707,6 +2865,7 @@ public:
     bool needs_sum = false;
     bool needs_binary = false;
     bool needs_statistics_sum = false;
+    bool needs_sum_binary = false;  // a binary query whose segments must be summed before the 0/1 normalize
     std::vector<std::shared_ptr<const OcclusionSegmentPool>> retained;
 
 private:
@@ -2782,11 +2941,16 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         const bool suspend = predicate.buffer && !query.resolves.empty();
         end_statistics();
         if (suspend) vk.end_conditional_rendering(cb);
+        if (resolve.type == d3d12_query::timestamp && vk.order_timestamp_copy &&
+            std::any_of(query.resolves.begin(), query.resolves.end(), [](const auto& run) { return run.pool; }))
+            vk.order_timestamp_copy(cb);
         for (const auto& run : query.resolves) {
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
             } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
                 vk.sum_statistics(cb, run.pool, run.first, run.count, dst, run.offset);
+            } else if (run.sum && binary) {
+                vk.sum_binary_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else if (run.sum || binary) {
                 const auto& resolve_occlusion = run.sum ? vk.sum_occlusion : vk.resolve_binary_occlusion;
                 resolve_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
@@ -2925,6 +3089,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             barrier.dstStageMask = dst.stages;
             barrier.srcAccessMask = src.access;
             barrier.dstAccessMask = dst.access;
+            if (barrier.srcStageMask) detail::restrict_to_queue(vk, barrier.srcStageMask, barrier.srcAccessMask);
+            if (barrier.dstStageMask) detail::restrict_to_queue(vk, barrier.dstStageMask, barrier.dstAccessMask);
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
             dependency.memoryBarrierCount = 1;
             dependency.pMemoryBarriers = &barrier;
@@ -2959,6 +3125,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.image = p.binding.image;
                 b.subresourceRange = detail::layout_range(p.binding, piece.range);
+                if (b.srcStageMask) detail::restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
+                if (b.dstStageMask) detail::restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
                 barriers.push_back(b);
             }
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -3099,7 +3267,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
             } else if (p.staged) {
-                // Depth <-> colour: the source into the scratch, then the scratch into the destination.
+                // Depth <-> colour, or a block-compressed copy no one extent fits: the source into the scratch, then
+                // the scratch into the destination. The destination's copy_layout comes after the scratch write, so
+                // its barrier orders every earlier transfer write before the destination's (#860, Vonsek's
+                // synchronization-validation run).
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
