@@ -1294,7 +1294,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS)) return E_INVALIDARG;
             auto* levels = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(data);
             levels->NumQualityLevels = 0;
-            if (levels->NodeIndex != 0 || levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE ||
+            if (levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE ||
                 levels->SampleCount == 0 || levels->SampleCount > 64 ||
                 (levels->SampleCount & (levels->SampleCount - 1)) != 0)
                 return E_INVALIDARG;
