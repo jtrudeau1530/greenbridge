@@ -690,7 +690,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
-                      "cs_bpermute32"):
+                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -728,6 +728,8 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_lds_raw": [132, 137, 100, 108, 131, 101, 149, 118],
                 "cs_w64x_lds_war": [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031],
                 "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
+                "cs_w64x_partial_scmp": [0, 1, 0, 1, 1, 1, 1, 0],     # s_cmp mask, -1 in a partial wave
+                "cs_w32_partial_scmp": [0, 1, 1, 0, 1, 1, 1, 1],      # the same in a 20-thread wave32
                 "cs_w64x_sbarrier": [605, 605, 686, 686, 3032, 3013, 3032, 3031],
                 "cs_w64x_load_ballot_load": [43, 74, 75, 42, 42, 18, 41, 32],
                 "cs_bpermute32": [0, 50, 162, 99, 36, 218, 183, 15],     # wave32: needs 32 lanes
@@ -740,11 +742,13 @@ def run_suite(a, work: str) -> int:
             # ask for a 64-wide subgroup and skip, as check.py does, where the device has none (vk_compute_test
             # exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were translated with
             # --wave64-emulate and run on any subgroup size.
-            # cs_w64x_partial (a 40-thread group) can't have full subgroups: it asks for size 64 without them.
+            # cs_w64x_partial and cs_w64x_partial_scmp (40-thread groups) can't have full subgroups: they ask for
+            # size 64 without them.
             emulated = w64_emulated()
-            partial = name == "cs_w64x_partial"
+            partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
-                                  "cs_w32_permute", "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32") and not emulated and not partial
+                                  "cs_w32_permute", "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32",
+                                  "cs_w32_partial_scmp") and not emulated and not partial
 
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")

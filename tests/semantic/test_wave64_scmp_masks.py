@@ -296,7 +296,7 @@ class FastPathPreservationTests(unittest.TestCase):
             WAVE64_BUILD_VCC_AND_SGPR
             + "s_cmp_eq_u32 vcc_lo, 0\n"
             + "s_cmp_eq_u32 vcc_lo, exec_lo\n"
-            + "s_cmp_lg_u32 vcc_hi, -1\n"
+            + "s_cmp_lg_u32 vcc_hi, 0\n"
             + "s_cmp_eq_u64 vcc, exec\n"
             + "s_endpgm\n"
         )
@@ -312,6 +312,9 @@ class FastPathPreservationTests(unittest.TestCase):
             ("imm", "s_cmp_eq_u32 vcc_lo, 0x80000003"),
             ("ord", "s_cmp_lt_u32 vcc_lo, s6"),
             ("u64", "s_cmp_eq_u64 vcc, s[6:7]"),
+            # -1 (all ones): a vote misses lanes that were never launched, whose bits are 0 in the mask
+            ("ones32", "s_cmp_lg_u32 vcc_hi, -1"),
+            ("ones64", "s_cmp_eq_u64 vcc, -1"),
         ):
             with self.subTest(case=name):
                 spv = translate_cs(f"cs_w64_wm_{name}", prologue + cmp_op + "\ns_endpgm\n", threads=64)
