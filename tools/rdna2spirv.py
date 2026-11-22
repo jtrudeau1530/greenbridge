@@ -9033,6 +9033,11 @@ def assemble(gen):
     used = set(gen.inputs.values())
     if len(used) != len(gen.inputs):    # --f16-interp-fallback: a decoded-half location is also an attribute
         raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
+    # The producer fills both halves of every attribute in f16_halves (the index's f16_halves lists the pair), so a
+    # raw attribute at the location of a half this shader doesn't read is overwritten all the same.
+    reserved = {f16_half_location(n, h) for n in gen.f16_halves for h in (0, 1)}
+    if any(not k.startswith("%in_f16h") and v in reserved for k, v in gen.inputs.items()):
+        raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
     gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs or bary:
