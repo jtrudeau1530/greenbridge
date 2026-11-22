@@ -465,5 +465,53 @@ class SyntheticBcpackPoolTest(unittest.TestCase):
         self.assertEqual(code_prov, 0, buf2.getvalue())
 
 
+class BadPoolTest(unittest.TestCase):
+    """A truncated or unsupported pool, or an index past the pool, is a one-line error, not a traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.good = os.path.join(self.tmp.name, "good.ttpf")
+        build_pool(self.good)
+        self.bad = os.path.join(self.tmp.name, "bad.ttpf")
+        with open(self.good, "rb") as f:
+            data = f.read()
+        with open(self.bad, "wb") as f:
+            f.write(data[:300])         # RDS5 header intact, chunk data cut off
+
+    def run_main(self, *argv):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = ttpf.main(list(argv))
+        return code, err.getvalue()
+
+    def test_failed_open_releases_the_file(self):
+        with self.assertRaises(ValueError):
+            ttpf.Pool(self.bad)
+        os.remove(self.bad)             # on Windows this failed while the pool was left open and mapped
+
+    def test_layout_check_export_name_the_bad_pool(self):
+        out = os.path.join(self.tmp.name, "x.dds")
+        for argv in (["layout", self.bad, "0"], ["check", self.bad, "0"], ["export", self.bad, "0", out]):
+            code, err = self.run_main(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertIn(self.bad, err)
+            self.assertNotIn("Traceback", err)
+        self.assertFalse(os.path.exists(out))
+
+    def test_scan_names_the_bad_pool(self):
+        code, err = self.run_main("scan", self.good, self.bad)
+        self.assertEqual(code, 2)
+        self.assertIn(self.bad, err)
+
+    def test_index_past_the_pool(self):
+        for index in ("1", "-1"):
+            code, err = self.run_main("layout", self.good, index)
+            self.assertEqual(code, 2)
+            self.assertIn("out of range", err)
+
+
 if __name__ == "__main__":
     unittest.main()

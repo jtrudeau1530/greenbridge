@@ -637,7 +637,7 @@ void test_delay_descriptor_fields() {
         expect_rejects("a delay-import descriptor without the RVA attribute", img);
     }
     {
-        const char* what = "a delay import with no name table binds through its address table";
+        // Without a name table the IAT still holds delay thunks, not import names, so there is no symbol to bind.
         auto img = make_image();
         std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
         auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
@@ -646,24 +646,10 @@ void test_delay_descriptor_fields() {
         d->ImportNameTableRVA = 0;
         d->ImportAddressTableRVA = 0x1180;
         std::memcpy(img.data() + 0x260, "kernel32.dll\0", 13);
-        *reinterpret_cast<uint64_t*>(img.data() + 0x380) = 0x1120;  // RVA 0x1180: the single hint/name entry
-        *reinterpret_cast<uint16_t*>(img.data() + 0x320) = 0;
-        std::memcpy(img.data() + 0x322, "GetCurrentProcessId\0", 20);
         auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
         dir.VirtualAddress = 0x1000;
         dir.Size = sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
-        try {
-            rt::Loader loader(g_dir);
-            rt::Module& m = loader.load(write_image_as(img, "delay.exe"));
-            void* expected = host_symbol("kernel32.dll", "GetCurrentProcessId");
-            if (m.imports.size() != 1) return failed(what, "expected one bound import");
-            if (m.imports[0].binding != rt::Binding::Host) return failed(what, "the delay import did not bind to the host");
-            if (*reinterpret_cast<void**>(m.base + 0x1180) != expected)
-                return failed(what, "the address table does not hold the host function");
-            pass(what);
-        } catch (const std::exception& e) {
-            failed(what, e.what());
-        }
+        expect_rejects("a delay-import descriptor without a name table", img);
     }
 }
 

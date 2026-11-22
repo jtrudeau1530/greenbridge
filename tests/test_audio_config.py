@@ -101,6 +101,16 @@ class TestScan(unittest.TestCase):
         self.assertEqual([(row["file"], row["id"]) for row in rows],
                          [("first.bin", 0x1000), ("second.bin", 0x1001)])
 
+    def test_join_marker_at_stream_boundary_uses_the_file_containing_it(self):
+        record = make_record(0x3000, 150_000)
+        name = "\U0001f3b5.bin"
+        with tempfile.TemporaryDirectory() as tmp:
+            for filename, data in (("a.bin", record[:4]), ("b.bin", b""), (name, record[4:])):
+                with open(os.path.join(tmp, filename), "wb") as f:
+                    f.write(data)
+            rows = A.collect(tmp, join=True)
+        self.assertEqual([(row["offset"], row["file"]) for row in rows], [(4, name)])
+
 
 class TestCli(unittest.TestCase):
     def test_json_and_names(self):

@@ -2,8 +2,8 @@
 // the proxy the way the game will call it: device methods (forwarded slots), descriptor heaps from slot 14 with
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue and a fence. Results are read back through D3D12 itself
-// (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints and GetResourceAllocationInfo are
-// compared with the host PC runtime's.
+// (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo and
+// GetResourceTiling are compared with the host PC runtime's.
 // No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation
 // error fails the test.
 #include "vk_test_device.h"
@@ -304,6 +304,128 @@ int compare_allocation_info(ID3D12Device* ours) {
     return mismatches;
 }
 
+D3D12_RESOURCE_DESC reserved_desc(D3D12_RESOURCE_DIMENSION dimension, UINT64 width, UINT height, UINT16 depth,
+                                  UINT16 mips, DXGI_FORMAT format) {
+    D3D12_RESOURCE_DESC desc = dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                                   ? buffer_desc(width)
+                                   : texture_desc(UINT(width), height, format, D3D12_RESOURCE_FLAG_NONE, mips, depth);
+    desc.Dimension = dimension;
+    if (dimension != D3D12_RESOURCE_DIMENSION_BUFFER) desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    return desc;
+}
+
+// GetResourceTiling against the PC runtime, for the same reserved resources. What D3D12 defines must match: the
+// tile shape, the standard and packed mip counts, every standard mip's tile counts and its start within its array
+// slice, the start of slice 0's packed tiles, and the number of standard tiles. How many tiles the packed mips
+// take is the driver's choice (src/resource_tiling.h), and with it the slice size and the total. A layout the host
+// refuses is skipped (drivers differ in what they accept); one the host accepts and ours refuses is a mismatch.
+// Returns the number of mismatches, or -1 without a host D3D12 device with tiled resources or with every layout
+// skipped.
+int compare_tiling(ID3D12Device* ours) {
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                    reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                              : nullptr;
+    Ref<ID3D12Device> host;
+    if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return -1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+        options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED)
+        return -1;
+    const bool volumes = options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_3;
+    const auto B = D3D12_RESOURCE_DIMENSION_BUFFER, T2 = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+               T3 = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const D3D12_RESOURCE_DESC cases[] = {
+        reserved_desc(B, 200000, 1, 1, 1, DXGI_FORMAT_UNKNOWN),
+        reserved_desc(T2, 1024, 1024, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM),
+        reserved_desc(T2, 1000, 300, 3, 0, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+        reserved_desc(T2, 512, 512, 1, 0, DXGI_FORMAT_R8_UNORM),
+        reserved_desc(T2, 512, 512, 1, 0, DXGI_FORMAT_R16_FLOAT),
+        reserved_desc(T2, 512, 512, 1, 0, DXGI_FORMAT_R16G16B16A16_FLOAT),
+        reserved_desc(T2, 512, 512, 2, 0, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        reserved_desc(T2, 2048, 2048, 1, 0, DXGI_FORMAT_BC1_UNORM),
+        reserved_desc(T2, 2048, 1024, 2, 0, DXGI_FORMAT_BC7_UNORM),
+        reserved_desc(T2, 1000, 600, 1, 0, DXGI_FORMAT_BC3_UNORM),
+        reserved_desc(T2, 128, 128, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM),
+        reserved_desc(T2, 100, 100, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM),
+        reserved_desc(T2, 4096, 64, 1, 0, DXGI_FORMAT_B8G8R8A8_UNORM),
+        reserved_desc(T2, 1024, 1024, 4, 3, DXGI_FORMAT_R32_FLOAT),
+        reserved_desc(T3, 256, 256, 64, 0, DXGI_FORMAT_R8G8B8A8_UNORM),
+        reserved_desc(T3, 128, 128, 128, 0, DXGI_FORMAT_R8_UNORM),
+        reserved_desc(T3, 64, 64, 64, 0, DXGI_FORMAT_R16G16B16A16_FLOAT),
+        reserved_desc(T3, 64, 64, 64, 0, DXGI_FORMAT_R32G32B32A32_FLOAT),
+    };
+    struct Tiling {
+        UINT total = 0, count = 64;
+        D3D12_PACKED_MIP_INFO packed{};
+        D3D12_TILE_SHAPE shape{};
+        D3D12_SUBRESOURCE_TILING subresources[64]{};
+    };
+    int mismatches = 0, compared = 0;
+    const auto report = [&](int index, const char* what, UINT a, UINT b) {
+        if (mismatches++ < 24) std::fprintf(stderr, "tiling case %d %s: ours %u host %u\n", index, what, a, b);
+    };
+    for (int index = 0; index < int(std::size(cases)); ++index) {
+        const D3D12_RESOURCE_DESC& desc = cases[index];
+        if (desc.Dimension == T3 && !volumes) continue;
+        Ref<ID3D12Resource> a, b;
+        const HRESULT ours_hr =
+            ours->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a.p));
+        const HRESULT host_hr =
+            host->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&b.p));
+        if (FAILED(host_hr)) {
+            // Which reserved resources a PC driver accepts varies: an RTX 3090 on driver 616.56 refuses texture
+            // arrays whose mips reach the packed tail (cases 2, 6 and 8, at tier 3), an RTX 5070 on 621.01 accepts
+            // them. The console is the reference for what the layer accepts, not the host, so there is nothing to
+            // compare here.
+            std::printf("GetResourceTiling case %d: the host runtime refuses it (0x%08lx), skipped\n", index,
+                        static_cast<unsigned long>(host_hr));
+            continue;
+        }
+        if (FAILED(ours_hr)) {
+            report(index, "creation refused by ours, accepted by the host (HRESULT low word)", ours_hr & 0xffff, 0);
+            continue;
+        }
+        ++compared;
+        Tiling x, y;
+        ours->GetResourceTiling(a.p, &x.total, &x.packed, &x.shape, &x.count, 0, x.subresources);
+        host->GetResourceTiling(b.p, &y.total, &y.packed, &y.shape, &y.count, 0, y.subresources);
+        if (x.shape.WidthInTexels != y.shape.WidthInTexels) report(index, "tile width", x.shape.WidthInTexels, y.shape.WidthInTexels);
+        if (x.shape.HeightInTexels != y.shape.HeightInTexels) report(index, "tile height", x.shape.HeightInTexels, y.shape.HeightInTexels);
+        if (x.shape.DepthInTexels != y.shape.DepthInTexels) report(index, "tile depth", x.shape.DepthInTexels, y.shape.DepthInTexels);
+        if (x.packed.NumStandardMips != y.packed.NumStandardMips) report(index, "standard mips", x.packed.NumStandardMips, y.packed.NumStandardMips);
+        if (x.packed.NumPackedMips != y.packed.NumPackedMips) report(index, "packed mips", x.packed.NumPackedMips, y.packed.NumPackedMips);
+        if (x.packed.StartTileIndexInOverallResource != y.packed.StartTileIndexInOverallResource)
+            report(index, "packed start", x.packed.StartTileIndexInOverallResource, y.packed.StartTileIndexInOverallResource);
+        if (x.count != y.count) {
+            report(index, "subresource count", x.count, y.count);
+            continue;
+        }
+        const UINT layers = desc.Dimension == T2 ? desc.DepthOrArraySize : 1;
+        const UINT mips = x.count / layers;
+        const UINT slice_x = x.total / layers, slice_y = y.total / layers;
+        if (slice_x - x.packed.NumTilesForPackedMips != slice_y - y.packed.NumTilesForPackedMips)
+            report(index, "standard tiles per slice", slice_x - x.packed.NumTilesForPackedMips,
+                   slice_y - y.packed.NumTilesForPackedMips);
+        if (y.packed.NumPackedMips && !x.packed.NumTilesForPackedMips) report(index, "packed tiles", 0, y.packed.NumTilesForPackedMips);
+        for (UINT i = 0; i < x.count; ++i) {
+            const auto &s = x.subresources[i], &t = y.subresources[i];
+            const UINT layer = i / mips;
+            if (desc.Dimension != B && i % mips >= y.packed.NumStandardMips) {
+                // Packed: no tiles of its own. (On slices after the first the PC runtime writes a tile index here,
+                // not the D3D12_PACKED_TILE its documentation gives; ours follows the documentation.)
+                if (s.WidthInTiles || s.HeightInTiles || s.DepthInTiles || s.StartTileIndexInOverallResource != D3D12_PACKED_TILE)
+                    report(index, "packed subresource", i, 0);
+                continue;
+            }
+            if (s.WidthInTiles != t.WidthInTiles || s.HeightInTiles != t.HeightInTiles || s.DepthInTiles != t.DepthInTiles ||
+                s.StartTileIndexInOverallResource - layer * slice_x != t.StartTileIndexInOverallResource - layer * slice_y)
+                report(index, "standard subresource", i, 0);
+        }
+    }
+    return compared ? mismatches : -1;
+}
+
 }  // namespace
 
 int main() {
@@ -402,6 +524,11 @@ int main() {
         if (allocation_mismatches < 0)
             std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
         EXPECT(allocation_mismatches <= 0);
+        const int tiling_mismatches = compare_tiling(device.p);
+        if (tiling_mismatches < 0)
+            std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
+                        "skipped\n");
+        EXPECT(tiling_mismatches <= 0);
 
         // Command objects; their GetDevice is the proxy, never the inner device.
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -418,6 +545,69 @@ int main() {
         {
             Ref<ID3D12Device> parent;
             EXPECT(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
+        }
+        // Residency and power (D3D-33): no-ops on Vulkan that still check their arguments, through the proxy's
+        // forwarded slots. EnqueueMakeResident must signal its fence, or a queue waiting on it would hang.
+        {
+            Ref<ID3D12Fence> residency;
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&residency.p))));
+            ID3D12Pageable* const pageables[] = {fence.p, allocator.p};
+            EXPECT(device->MakeResident(2, pageables) == S_OK);
+            EXPECT(device->MakeResident(0, nullptr) == S_OK);
+            EXPECT(device->MakeResident(1, nullptr) == E_INVALIDARG);
+            EXPECT(device->Evict(2, pageables) == S_OK);
+            EXPECT(device->Evict(0, nullptr) == S_OK);
+            EXPECT(device->Evict(1, nullptr) == E_INVALIDARG);
+            EXPECT(device->SetStablePowerState(TRUE) == S_OK);
+            EXPECT(device->SetStablePowerState(FALSE) == S_OK);
+
+            Ref<ID3D12Device1> device1;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
+            const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_MAXIMUM,
+                                                           D3D12_RESIDENCY_PRIORITY(D3D12_RESIDENCY_PRIORITY_LOW + 5)};
+            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == S_OK);
+            EXPECT(device1->SetResidencyPriority(0, nullptr, nullptr) == S_OK);
+            EXPECT(device1->SetResidencyPriority(1, pageables, nullptr) == E_INVALIDARG);
+            EXPECT(device1->SetResidencyPriority(1, nullptr, priorities) == E_INVALIDARG);
+
+            Ref<ID3D12Device3> device3;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device3.p))));
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, pageables, residency.p, 7) == S_OK);
+            EXPECT(residency->GetCompletedValue() == 7);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p, 9) ==
+                   S_OK);
+            EXPECT(residency->GetCompletedValue() == 9);
+            // Refused calls leave the fence alone.
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == E_INVALIDARG);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) ==
+                   E_INVALIDARG);
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) ==
+                   E_INVALIDARG);
+            EXPECT(residency->GetCompletedValue() == 9);
+            // The GPU sees the signal: a queue waits on it, then signals past it.
+            EXPECT(SUCCEEDED(queue->Wait(residency.p, 9)));
+            EXPECT(SUCCEEDED(queue->Signal(residency.p, 10)));
+            EXPECT(SUCCEEDED(residency->SetEventOnCompletion(10, nullptr)) && residency->GetCompletedValue() == 10);
+
+            Ref<ID3D12Device6> device6;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device6.p))));
+            const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            EXPECT(done);
+            BOOL further = TRUE;
+            const HRESULT background = device6->SetBackgroundProcessingMode(
+                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK, D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS,
+                done, &further);
+            const DWORD signalled = WaitForSingleObject(done, 0);
+            CloseHandle(done);
+            EXPECT(background == S_OK && signalled == WAIT_OBJECT_0 && further == FALSE);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                                                        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr) == S_OK);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE(4),
+                                                        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr) ==
+                   E_INVALIDARG);
+            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                                                        D3D12_MEASUREMENTS_ACTION(4), nullptr, nullptr) ==
+                   E_INVALIDARG);
         }
         {
             Ref<ID3D12Device4> device4;
@@ -864,6 +1054,131 @@ int main() {
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
         }
 
+        // Reserved resources (docs/d3d12_vulkan.md section 4.2): fully backed at creation, so they copy like
+        // committed ones and their first use reads zero; D3D12's description rules hold; tile-mapping calls are
+        // accepted and change nothing.
+        {
+            const auto B = D3D12_RESOURCE_DIMENSION_BUFFER, T2 = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            Ref<ID3D12Resource> tiled, tiled_buffer, xbox_tiled, refused;
+            const D3D12_RESOURCE_DESC tiled_desc = reserved_desc(T2, size, size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+            EXPECT(SUCCEEDED(device->CreateReservedResource(&tiled_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                            IID_PPV_ARGS(&tiled.p))));
+            EXPECT(tiled->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+            D3D12_HEAP_PROPERTIES reserved_heap{};
+            EXPECT(tiled->GetHeapProperties(&reserved_heap, nullptr) == E_INVALIDARG);  // no heap of its own
+            EXPECT(device->CreateReservedResource(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  __uuidof(ID3D12Resource), nullptr) == S_FALSE);
+            const auto refuses = [&](D3D12_RESOURCE_DESC desc) {
+                const HRESULT hr = device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                  IID_PPV_ARGS(&refused.p));
+                return hr == E_INVALIDARG && !refused.p;
+            };
+            auto bad = tiled_desc;
+            bad.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;  // textures need a 64 KiB swizzle layout
+            EXPECT(refuses(bad));
+            bad.Layout = D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;  // StandardSwizzle64KBSupported is FALSE
+            EXPECT(refuses(bad));
+            EXPECT(refuses(reserved_desc(T2, 64, 64, 1, 1, DXGI_FORMAT_R32G32B32_FLOAT)));  // 12-byte texels: no tiles
+            bad = reserved_desc(B, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN);
+            bad.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;  // buffers are ROW_MAJOR
+            EXPECT(refuses(bad));
+            const D3D12_RESOURCE_DESC tiled_buffer_desc = reserved_desc(B, 2 * 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN);
+            EXPECT(SUCCEEDED(device->CreateReservedResource(&tiled_buffer_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&tiled_buffer.p))));
+            auto xbox_desc = tiled_desc;
+            xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);  // the Xbox tiled layout word
+            EXPECT(SUCCEEDED(device->CreateReservedResource(&xbox_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&xbox_tiled.p))));
+            {
+                Ref<ID3D12Device4> device4;
+                Ref<ID3D12Device10> device10;
+                Ref<ID3D12Resource> one, two;
+                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
+                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                  nullptr, IID_PPV_ARGS(&one.p))));
+                EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
+                                                                   nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
+                UINT tiles = 0;
+                device->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
+                EXPECT(tiles == 1);  // 8x8 RGBA8: one packed tile
+            }
+
+            // Tiling: a resource that is not reserved has none, as on the PC runtime; a first index past the end
+            // returns no subresources.
+            UINT total = 7, count = 4;
+            D3D12_PACKED_MIP_INFO packed{1, 1, 1, 1};
+            D3D12_TILE_SHAPE shape{1, 1, 1};
+            D3D12_SUBRESOURCE_TILING tilings[4]{};
+            device->GetResourceTiling(upload.p, &total, &packed, &shape, &count, 0, tilings);
+            EXPECT(total == 0 && count == 0 && shape.WidthInTexels == 0 && packed.NumStandardMips == 0 &&
+                   packed.NumTilesForPackedMips == 0);
+            count = 4;
+            device->GetResourceTiling(tiled_buffer.p, &total, &packed, &shape, &count, 0, tilings);
+            EXPECT(total == 2 && count == 1 && shape.WidthInTexels == 65536 && tilings[0].WidthInTiles == 2);
+            count = 4;
+            device->GetResourceTiling(tiled_buffer.p, nullptr, nullptr, nullptr, &count, 1, tilings);
+            EXPECT(count == 0);
+
+            // Mapping calls: accepted, logged once, and the resources keep their memory.
+            D3D12_TILED_RESOURCE_COORDINATE origin{};
+            D3D12_TILE_REGION_SIZE one_tile{1, FALSE, 0, 0, 0};
+            const D3D12_TILE_RANGE_FLAGS unmap = D3D12_TILE_RANGE_FLAG_NULL;
+            queue->UpdateTileMappings(tiled.p, 1, &origin, &one_tile, nullptr, 1, &unmap, nullptr, nullptr,
+                                      D3D12_TILE_MAPPING_FLAG_NONE);
+            queue->CopyTileMappings(tiled_buffer.p, &origin, tiled_buffer.p, &origin, &one_tile,
+                                    D3D12_TILE_MAPPING_FLAG_NONE);
+
+            // Upload a pattern into the reserved texture and bytes into the reserved buffer, read both back, and
+            // read the never-written Xbox-layout texture, which is zero.
+            UINT64 tiled_up_cursor = 0;
+            const auto tiled_up = place(device.p, tiled.p, 0, tiled_up_cursor);
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col)
+                    std::memcpy(up + tiled_up.Offset + row * tiled_up.Footprint.RowPitch + col * 4,
+                                pattern(col, row).data(), 4);
+            const UINT64 tiled_bytes_up = (tiled_up_cursor + 255) / 256 * 256;
+            for (UINT i = 0; i < 256; ++i) up[tiled_bytes_up + i] = std::uint8_t(0x5a ^ i);
+            UINT64 tiled_down_cursor = 0;
+            const auto tiled_down = place(device.p, tiled.p, 0, tiled_down_cursor);
+            const auto xbox_down = place(device.p, xbox_tiled.p, 0, tiled_down_cursor);
+            const UINT64 tiled_bytes_down = (tiled_down_cursor + 255) / 256 * 256;
+            std::memset(down, 0xcd, 65536);
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            {
+                const auto dst = subresource(tiled.p, 0);
+                const auto src = footprint(upload.p, tiled_up);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            barrier = transition(tiled.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            barrier = transition(xbox_tiled.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            for (const auto& [resource, placed] : {std::pair{tiled.p, tiled_down}, std::pair{xbox_tiled.p, xbox_down}}) {
+                const auto dst = footprint(readback.p, placed);
+                const auto src = subresource(resource, 0);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            list->CopyBufferRegion(tiled_buffer.p, 65536 + 4096, upload.p, tiled_bytes_up, 256);  // into the second tile
+            barrier = transition(tiled_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            list->CopyBufferRegion(readback.p, tiled_bytes_down, tiled_buffer.p, 65536 + 4096, 256);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 9)) && SUCCEEDED(fence->SetEventOnCompletion(9, nullptr)));
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col) {
+                    report("reserved texel", row * size + col,
+                           down + tiled_down.Offset + row * tiled_down.Footprint.RowPitch + col * 4,
+                           pattern(col, row).data(), 4);
+                    report("unwritten reserved texel", row * size + col,
+                           down + xbox_down.Offset + row * xbox_down.Footprint.RowPitch + col * 4, zero, 4);
+                }
+            report("reserved buffer", 0, down + tiled_bytes_down, up + tiled_bytes_up, 256);
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
@@ -897,6 +1212,6 @@ int main() {
         return 1;
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
-                "BC copies, a resolve, and GetCopyableFootprints all matched\n");
+                "BC copies, a resolve, reserved resources, and GetCopyableFootprints and GetResourceTiling all matched\n");
     return 0;
 }

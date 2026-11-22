@@ -3,7 +3,7 @@
 // layouts: rectangle clears, a depth clear while the stencil plane is in another state, a texture used after
 // implicit promotion from common, and enhanced barriers. Part C copies a volume (footprint, box and whole) and
 // resolves a multisampled target. Part D records every D3D12 sync/access pair as enhanced barriers, which the
-// validation layer must accept.
+// validation layer must accept. Part E (where VK_EXT_conditional_rendering is available) checks SetPredication.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -532,12 +532,128 @@ int part_d(vktest::Device& d) {
     return 0;
 }
 
+// SetPredication on VK_EXT_conditional_rendering (D3D-18). One layer per case: a clear runs or is skipped by the
+// 64-bit predicate value (0 or 1) and the op. Whole-view clears under a predicate go through vkCmdClearAttachments,
+// which conditional rendering covers. A predicate still set at the end of the list must be ended by the replay.
+int part_e(vktest::Device& d) {
+    if (!d.conditional_rendering) {
+        std::printf("E: skipped, no VK_EXT_conditional_rendering\n");
+        return 0;
+    }
+    namespace pred = d3d12_predication;
+    constexpr std::uint32_t size = 4, layers = 5, texels = size * size;
+    const VkImage color = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, layers, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    void* predicate_words = nullptr;
+    const VkBuffer predicate = d.buffer(32, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT, &predicate_words);
+    void* mapped = nullptr;
+    const VkBuffer readback = d.buffer(texels * layers * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
+    EXPECT(color && predicate && readback);
+    // Offset 0: the 64-bit value 0. Offset 8: the 64-bit value 1. Written before the submit, so visible to it.
+    const std::uint32_t words[4] = {0, 0, 1, 0};
+    std::memcpy(predicate_words, words, sizeof(words));
+
+    ResourceBinding color_binding{};
+    color_binding.image = color;
+    color_binding.format = VK_FORMAT_R8G8B8A8_UNORM;
+    color_binding.width = color_binding.height = size;
+    color_binding.array_layers = layers;
+    ResourceBinding predicate_binding{};
+    predicate_binding.buffer = predicate;
+    predicate_binding.size = 32;
+    constexpr ResourceId color_id = 20, predicate_id = 21, missing_id = 22;
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        if (id == color_id) return &color_binding;
+        if (id == predicate_id) return &predicate_binding;
+        return nullptr;
+    };
+
+    Views views{d, {}};
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    vk.clear_depth_stencil_image = d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
+    vk.begin_rendering = d.fn<PFN_vkCmdBeginRendering>("vkCmdBeginRendering");
+    vk.end_rendering = d.fn<PFN_vkCmdEndRendering>("vkCmdEndRendering");
+    vk.clear_attachments = d.fn<PFN_vkCmdClearAttachments>("vkCmdClearAttachments");
+    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    vk.image_view = [&](const ResourceBinding& r, const VkImageSubresourceRange& range) { return views(r, range); };
+    ReplayFunctions without_conditional = vk;
+    vk.begin_conditional_rendering =
+        d.fn<PFN_vkCmdBeginConditionalRenderingEXT>("vkCmdBeginConditionalRenderingEXT");
+    vk.end_conditional_rendering = d.fn<PFN_vkCmdEndConditionalRenderingEXT>("vkCmdEndConditionalRenderingEXT");
+    EXPECT(vk.begin_conditional_rendering && vk.end_conditional_rendering);
+
+    // Lists that are rejected, and the count of copies Vulkan cannot predicate. Nothing is written by prepare().
+    const auto prepared_with = [&](auto&& record, const ReplayFunctions& functions, PreparedList& out) {
+        CommandList bad;
+        record(bad);
+        bad.close();
+        return prepare(bad, resolve, functions, out);
+    };
+    PreparedList scratch;
+    const auto set = [](ResourceId buffer, std::uint64_t offset, std::uint32_t op) {
+        return [=](CommandList& l) { l.set_predication({buffer, offset, op}); };
+    };
+    EXPECT(prepared_with(set(predicate_id, 0, pred::equal_zero), without_conditional, scratch) ==
+           ReplayResult::unsupported);
+    EXPECT(prepared_with(set(0, 0, 0), without_conditional, scratch) == ReplayResult::success);  // off needs nothing
+    EXPECT(prepared_with(set(missing_id, 0, pred::equal_zero), vk, scratch) == ReplayResult::unresolved_resource);
+    EXPECT(prepared_with(set(predicate_id, 32, pred::equal_zero), vk, scratch) == ReplayResult::invalid_predication);
+    EXPECT(prepared_with(set(color_id, 0, pred::equal_zero), vk, scratch) == ReplayResult::invalid_predication);
+    const auto copies = [&](CommandList& l) {
+        l.copy_buffer({predicate_id, 16, predicate_id, 0, 8});                  // before the predicate: counted 0
+        l.set_predication({predicate_id, 0, pred::equal_zero});
+        l.copy_buffer({predicate_id, 16, predicate_id, 0, 8});                  // under it: counted
+        l.set_predication({0, 0, 0});
+        l.copy_buffer({predicate_id, 16, predicate_id, 0, 8});                  // after it: counted 0
+    };
+    EXPECT(prepared_with(copies, vk, scratch) == ReplayResult::success);
+    EXPECT(scratch.unpredicated_copies == 1);
+
+    const Rect corner{0, 0, 2, 2};
+    CommandList list;
+    EXPECT(list.clear_render_target({color_id, 0, 0, layers}, {1, 0, 0, 1}));    // every layer red, unpredicated
+    EXPECT(list.set_predication({predicate_id, 0, pred::equal_zero}));           // value 0: skipped
+    EXPECT(list.clear_render_target({color_id, 0, 0, 1}, {0, 1, 0, 1}));         // layer 0, whole view
+    EXPECT(list.clear_render_target({color_id, 0, 0, 1}, {0, 0, 1, 1}, {&corner, 1}));  // layer 0, rectangle
+    EXPECT(list.set_predication({predicate_id, 8, pred::equal_zero}));           // value 1: runs
+    EXPECT(list.clear_render_target({color_id, 0, 1, 1}, {0, 1, 0, 1}));         // layer 1
+    EXPECT(list.set_predication({predicate_id, 8, pred::not_equal_zero}));       // value 1: skipped
+    EXPECT(list.clear_render_target({color_id, 0, 2, 1}, {0, 1, 0, 1}));         // layer 2
+    EXPECT(list.set_predication({predicate_id, 0, pred::not_equal_zero}));       // value 0: runs
+    EXPECT(list.clear_render_target({color_id, 0, 3, 1}, {0, 1, 0, 1}));         // layer 3
+    EXPECT(list.set_predication({predicate_id, 0, pred::equal_zero}));
+    EXPECT(list.set_predication({0, 0, 0}));                                     // off again: runs
+    EXPECT(list.clear_render_target({color_id, 0, 4, 1}, {0, 1, 0, 1}));         // layer 4
+    EXPECT(list.transition({color_id, all_subresources, s::render_target, s::copy_source}));
+    EXPECT(list.set_predication({predicate_id, 0, pred::equal_zero}));           // left set: the replay ends it
+    EXPECT(list.close());
+
+    const bool ok = d.run([&](VkCommandBuffer cb) {
+        d.initial_layout(cb, color, VK_IMAGE_ASPECT_COLOR_BIT, layers, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (replay(list, cb, resolve, vk) != ReplayResult::success) return false;
+        d.read_back(cb, color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, layers,
+                    readback, 0);
+        return true;
+    });
+    EXPECT(ok);
+    const auto* data = static_cast<const std::uint8_t*>(mapped);
+    const Rgba expected[layers] = {red, green, red, green, green};
+    for (std::uint32_t i = 0; i < texels * layers; ++i) expect_rgba("E predication", data, i, expected[i / texels]);
+    std::printf("E: predicated clears on %u layers (equal/not-equal zero, whole view and rectangle, off), "
+                "rejected predicates, %zu copy under a predicate counted\n", layers, scratch.unpredicated_copies);
+    return 0;
+}
+
 } // namespace
 
 int main() {
     vktest::Device device;
     EXPECT(device.create());
-    if (part_a(device) || part_b(device) || part_c(device) || part_d(device)) return 1;
+    if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device)) return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", device.validation_errors());
