@@ -27,7 +27,7 @@ from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test, fmt_1010102_test
 from compute_fixture import compute_header
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
-                   TEXTURE_MIP_TEST, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
+                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -432,7 +432,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
-DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
+DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm"}
 
@@ -762,8 +762,8 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgload":
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == TEXTURE_MIP_TEST:
-            problem = texture_mip_test(a.build, spirv_dir)
+        elif name in MIP_TEST_PASSES:
+            problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
         elif name in GRADIENT_TESTS:

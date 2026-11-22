@@ -179,7 +179,13 @@ PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
+GATHER_LOD_TEST = "ps_gather_sampler_lod"
 TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
+# Each pair of draws expects mip 0, then mip 1. S# word 1 is minLOD[11:0], maxLOD[23:12], unsigned 4.8.
+MIP_TEST_PASSES = {
+    TEXTURE_MIP_TEST: ((TEXTURE_MIP_TEST, "c00000"), ("ps_texture_sample", "c00000")),
+    GATHER_LOD_TEST: ((GATHER_LOD_TEST, "40000"), (GATHER_LOD_TEST, "1000c0")),
+}
 
 
 # Windows error codes for a program the system refuses to start, and who refused it.
@@ -574,20 +580,20 @@ def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -
     return ""
 
 
-def texture_mip_test(tools: str, spirv: str) -> str:
+def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> str:
     tool = Path(tools) / ("vk_texture_test" + EXE)
     if not tool.is_file():
         return f"missing {tool}"
     shaders = Path(spirv)
     vertex = shaders / "vs_ids.spv"
     with tempfile.TemporaryDirectory(prefix="leonida-mip-") as tmp:
-        for mip, name in enumerate((TEXTURE_MIP_TEST, "ps_texture_sample")):
+        for mip, (name, limits) in enumerate(MIP_TEST_PASSES[test]):
             fragment = shaders / (name + ".spv")
             for shader in (vertex, fragment):
                 if not shader.is_file():
                     return f"missing {shader}"
             raw = Path(tmp) / f"mip{mip}.raw"
-            code, output = run(tool, vertex, fragment, raw, "0", "92", "c00000", "14500000", "0", "--two-mip")
+            code, output = run(tool, vertex, fragment, raw, "0", "92", limits, "14500000", "0", "--two-mip")
             if code == UNSUPPORTED:
                 return Skip(f"SKIP (texture mip test: {output.strip() or 'unsupported device'})")
             if code or not raw.is_file():
@@ -731,7 +737,8 @@ def main():
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_gather_wrap", gather_wrap_test(tools, spirv)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
-    results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
+    for name in MIP_TEST_PASSES:
+        results.append((name, texture_mip_test(tools, spirv, name)))
     for name in GRADIENT_TESTS:
         results.append((name, texture_gradient_a16_test(tools, spirv, name)))
     for name, problem in results:

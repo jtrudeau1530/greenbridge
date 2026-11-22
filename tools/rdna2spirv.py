@@ -4886,6 +4886,25 @@ class Gen:
             out.append(m)
         return tuple(out)
 
+    def clamp_gather_lod(self, lod: str, word_reg: int) -> str:
+        """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip."""
+        literal = self.sgpr_imm.get(word_reg)
+        if literal is not None:
+            limits = [self.fconst(((literal >> bit) & 0xfff) / 256.0) for bit in (0, 12)]
+        else:
+            word = self.load_reg("sgpr", word_reg)
+            scale = self.fconst(1.0 / 256.0)
+            limits = []
+            for bit in (0, 12):
+                raw, value, scaled = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{raw} = OpBitFieldUExtract %uint {word} {self.cu(bit)} {self.cu(12)}")
+                self.emit(f"{value} = OpConvertUToF %float {raw}")
+                self.emit(f"{scaled} = OpFMul %float {value} {scale}")
+                limits.append(scaled)
+        clamped = self.tmp()
+        self.emit(f"{clamped} = OpExtInst %float %glsl FClamp {lod} {limits[0]} {limits[1]}")
+        return clamped
+
     def gather_addr(self, c, n, mode):
         """Texel coordinate c (int id) after the address mode (int, or a uint id) for an axis of n texels (int id):
         wrap: c mod n; mirror: c mod 2n, reflected in the upper half; mirror once: the negative side reflected
@@ -5094,7 +5113,8 @@ class Gen:
                 lv, lvm, rl, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1 = (self.tmp() for _ in range(15))
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
-                self.emit(f"{rl} = OpExtInst %float %glsl RoundEven {f[2]}")
+                lod = self.clamp_gather_lod(f[2], a[3]["r"] + 1)
+                self.emit(f"{rl} = OpExtInst %float %glsl RoundEven {lod}")
                 self.emit(f"{mi} = OpConvertFToS %int {rl}")
                 self.emit(f"{mz} = OpExtInst %int %glsl SMax {mi} {self.as_int(self.cu(0))}")
                 self.emit(f"{mc} = OpExtInst %int %glsl SMin {mz} {lvm}")
