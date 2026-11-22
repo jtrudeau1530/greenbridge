@@ -325,6 +325,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
               "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
+              "ps_f64_round": (0xc12af665, 0x3fe7ffff, 0xbfffffff, 0xc12af666),
               "ps_outmods_f16": (0xaaaa3c00, 0xaaaa3e00, 0x7c000000, 0x3c000000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
               "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),
