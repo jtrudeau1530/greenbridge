@@ -24,6 +24,10 @@ Write-Host "`n== PE inspection"
 python -I (Join-Path $root "tools\pe_inspect.py") $Exe --game-dir $GameDir --out $out
 if ($LASTEXITCODE -ne 0) { throw "pe_inspect failed" }
 
+Write-Host "`n== GDK runtime classes and slots called through xgameruntime.lib (read from the file)"
+python -I (Join-Path $root "tools\gdk_runtime_calls.py") $Exe --out $out
+if ($LASTEXITCODE -ne 0) { Write-Warning "gdk_runtime_calls could not read all of $Exe; its report may be incomplete" }
+
 $rt = Join-Path $root "runtime\build\gta6rt.exe"
 if (-not (Test-Path $rt)) { & (Join-Path $PSScriptRoot "build_runtime.ps1") }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"

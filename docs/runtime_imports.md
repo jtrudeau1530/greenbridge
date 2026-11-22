@@ -232,12 +232,64 @@ xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; co
 | Module | Runtime classes referenced (highest interface id present) |
 |---|---|
 | `XCurl.dll` | `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` (`IXNetworkingImpl2`) |
-| `libHttpClient.GDK.dll` | 24 of the 24 documented classes, each GUID once. Five are called through thunks ("Class layouts, measured" below): `XThreadingImpl` (27 thunks), `XPackageImpl` (30), `XNetworkingImpl` (18), `XSystemImpl` (6), `XErrorImpl` (3); the others are referenced only by the id table. Highest interfaces: `IXSystemImpl5`, `IXUserImpl5` (not 6), `IXGameImpl3`, `IXStoreImpl6`, `IXPackageImpl3` (not 4), `IXGameUiImpl4`, `IXGameSaveImpl3`, `IXGameStreamingImpl3`, `IXPersistentLocalStorageImpl3`, `IXUserDeviceImpl2`, `IXNetworkingImpl2` |
+| `libHttpClient.GDK.dll` | 23 of the 24 documented classes (not `XGameActivationImpl`), each GUID once: the ids of the `xgameruntime.lib` thunks the incremental link kept, 404 of them. `XThreadingImpl` (27 thunks), `XPackageImpl` (30), `XNetworkingImpl` (18) and `XSystemImpl` (6) are the ones read by hand above; `XErrorImpl` (3) and 18 more classes have thunks too. Only `XThreadingImpl`'s and `XErrorImpl`'s are called ([below](#measuring-which-runtime-classes-a-binary-calls)). Highest interfaces: `IXSystemImpl5`, `IXUserImpl5` (not 6), `IXGameImpl3`, `IXStoreImpl6`, `IXPackageImpl3` (not 4), `IXGameUiImpl4`, `IXGameSaveImpl3`, `IXGameStreamingImpl3`, `IXPersistentLocalStorageImpl3`, `IXUserDeviceImpl2`, `IXNetworkingImpl2` |
 | every other `.dll` | none |
 
 So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
 `libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
-`IXUserImpl6`. The executable's own set is still unmeasured. `QueryApiImpl`'s log gives it on the first boot.
+`IXUserImpl6`. The executable's own set is still unmeasured. `tools/gdk_runtime_calls.py` gives it from the file
+(below), and `QueryApiImpl`'s log on the first boot.
+
+### Measuring which runtime classes a binary calls
+
+`tools/gdk_runtime_calls.py` lists, from the file alone, the runtime classes, interface ids and vtable slots an image
+calls through `xgameruntime.lib`'s thunks, so the executable's list is known before it first runs.
+`scripts/first_look.ps1` runs it on the executable.
+
+```powershell
+python -I tools/gdk_runtime_calls.py "$game\XCurl.dll" "$game\libHttpClient.GDK.dll"   # text; --json for JSON
+python -I tools/gdk_runtime_calls.py <exe> --out <dir>    # writes <exe>.gdk_calls.txt and .json, prints a summary
+```
+
+It finds the helper the thunks share (the call a known id's `lea` feeds, after which a vtable slot past IUnknown is
+called), takes every call to it as a thunk, reads the class and interface ids loaded into `rcx` and `rdx` (an id the
+table doesn't know is listed as unknown) and records each slot called up to `Release`, within the thunk's
+`.pdata` function or a byte window without one. The slots are named from `tools/gdk_runtime_classes.json`: the ids,
+inheritance and method order of xodus-gaming/xgameruntime-docs (GPL-3.0; facts only), made with
+`python -I tools/gen_gdk_runtime_classes.py <docs clone>`. An interface's slot table is its chain's methods, base
+first, from slot 3. For each class the report says whether `runtime/shims/xgameruntime.cpp` has its class id (a
+`constexpr GUID k...Class`), and for each thunk whether anything in the image reaches it: a call, tail jump, address
+load or pointer in data, directly or through an incremental-link `jmp` stub, a call from another thunk counting only
+when that thunk is reached. The argument count it prints is an estimate from the registers and stack slots written
+before the call.
+
+Measured on the package's DLLs (counts and slots only):
+
+| Image | Thunks (referenced) | Classes and slots |
+|---|---:|---|
+| `XCurl.dll` | 16 (16) | `XThreadingImpl` 3, 5, 12, 16-18, 22, 29; `XErrorImpl` 3; `XNetworkingImpl` as `IXNetworkingImpl2` 11-17, as in the table above. The estimated argument counts match the documented signatures for all 16 |
+| `libHttpClient.GDK.dll` | 404 (15) | 23 classes through one helper. `XThreadingImpl` 3-7, 9-30, `XNetworkingImpl` as `IXNetworkingImpl2` 3-20, `XSystemImpl` as `IXSystemImpl5` 3-8 and `XPackageImpl` as `IXPackageImpl3` 3-19, 22, 24-27, 30, 32-34, 37-40 match the slots read by hand; the other 19 classes have thunks too. Referenced: `XThreadingImpl` 3, 5, 7, 9-15, 17, 19, 22, 29 and `XErrorImpl` 3 only |
+| the other 14 DLLs | 0 | none |
+
+`libHttpClient.GDK.dll` is incrementally linked (its entry point is a `jmp rel32` stub), and an incremental link
+doesn't remove unreferenced functions (`/INCREMENTAL` turns `/OPT:REF` off): it carries 404 thunks and calls 15. Two
+interface ids its thunks ask for are not in xgameruntime-docs: one of `XGameSaveImpl` (slots 33-49, after the 30 of
+`IXGameSaveImpl3`'s chain) and one of `XGameStreamingImpl` (slots 3-6). The report prints them.
+
+Limits:
+
+- x86-64 only, and the thunk shape measured here: the class id loaded with a RIP-relative `lea` into `rcx` and the
+  interface id into `rdx` (or the class id copied there), the vtable read with `mov r,[r]` and the slot with
+  `mov r,[r+disp]` and a call (the CFG dispatch, or `call r`) or `call [r+disp]`, register copies followed. A
+  `QueryApiImpl` call outside the library's thunks is found only when it has that shape; helper calls it can't
+  follow to a slot are listed.
+- Static: a referenced thunk may never run, and a reference through a computed address or from another module is
+  not seen.
+- "Served" means the shim has the class id. It doesn't say that each slot does more than log, nor that
+  `QueryApiImpl` accepts the interface id the thunk passes; the report marks each request whose interface id is not
+  the class id.
+- Names are as complete as xgameruntime-docs: an *unknown* entry keeps its slot unnamed, and a slot past an interface
+  without a documented layout is unknown.
 
 A title that calls `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` or `FreeLibrary` on one of the package's
 bundled DLLs (`Bink2Scarlett.dll`, `XboxBvhBuilder.dll`, the FidelityFX DLLs) is routed through `rt::Loader` instead of
