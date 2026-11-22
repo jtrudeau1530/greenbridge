@@ -875,8 +875,8 @@ The trace will enumerate them.
   `d3d12_uint_clear_test` compares full and rectangular D3D12 readbacks with WARP over seven input sets on all
   three formats; `clear_color_test` checks both replay paths without a GPU, including unchanged float values.
   This does not add typed-view reinterpretation of typeless resources or new integer formats.
-- **RGBA8 typeless RTV clears (phase 1):** explicit UNORM, SRGB and UINT RTVs on a
-  `R8G8B8A8_TYPELESS` 2D resource with one mip, one array layer and sample count 1.
+- **RGBA8 typeless RTV clears:** explicit UNORM, SRGB and UINT RTVs on a
+  `R8G8B8A8_TYPELESS` 2D resource with sample count 1, selecting a mip and a contiguous array-layer range.
   `TargetView` captures its format by value; copies and layout tracking keep the resource's base format.
   Reinterpreted full clears use dynamic rendering because `vkCmdClearColorImage` cannot select a view format.
   Rectangle clears use the same typed attachment view. The view-cache key includes the format, and views
@@ -884,9 +884,10 @@ The trace will enumerate them.
   Same-format image clears and legacy float-only replay clients retain their existing path.
   On an RX 5700 XT, 13 synthetic full/rectangle readbacks match Windows WARP (UINT exact, normalized
   channels within one byte), including descriptor rewrites, format switches and an SRGB RTV on a UAV resource.
-  The same tests fail without this change and when the cache ignores format. CPU replay covers 22 scenarios;
-  12 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
-  typed-resource casts, mips/array expansion, MSAA and 3D typeless RTVs are outside this phase.
+  The same tests fail without this change and when the cache ignores format. CPU replay covers 31 scenarios;
+  17 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
+  typed-resource casts, MSAA and 3D typeless RTVs remain unsupported.
+  Phase 2 adds 54 mip/array and 12 non-array higher-mip readbacks against WARP, including untouched sentinels.
 - **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For integer formats (`R8G8B8A8_UINT`,
   `R32_UINT`, `R32G32B32A32_UINT`, `R8G8B8A8_SINT`, `R32_SINT`) convert those values numerically into
   `VkClearColorValue` for both image and rectangle clears; copying float bits gives incorrect stored integers
