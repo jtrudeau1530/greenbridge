@@ -5469,13 +5469,20 @@ class Gen:
                 else:
                     self.mask_dst(d, r)
         elif op == "s_not_b32":
-            x = self.src_u(a[1])
-            r = self.tmp()
-            self.emit(f"{r} = OpNot %uint {x}")
-            self.dst(a[0], r)
-            z = self.tmp()
-            self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
-            self.emit(f"OpStore %scc {z}")
+            x_val = self.imm_val(a[1])
+            if x_val is not None:
+                val = (~x_val) & 0xFFFFFFFF
+                r = self.cu(val)
+                self.dst(a[0], r)
+                self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
+            else:
+                x = self.src_u(a[1])
+                r = self.tmp()
+                self.emit(f"{r} = OpNot %uint {x}")
+                self.dst(a[0], r)
+                z = self.tmp()
+                self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
+                self.emit(f"OpStore %scc {z}")
         elif op in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
             # 64-bit compare of masks/pointers: equal iff both halves are equal.
             m0, m1 = self.holds_lane_mask(a[0]), self.holds_lane_mask(a[1])
@@ -5719,6 +5726,16 @@ class Gen:
             self.cu(3), self.cu(4)
         elif op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_xor_b32", "s_andn2_b32",
                     "s_cselect_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
+            if op == "s_xor_b32":
+                x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+                writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
+                is_mask = not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2]))
+                if x_val is not None and y_val is not None and not is_mask:
+                    val = (x_val ^ y_val) & 0xFFFFFFFF
+                    r = self.cu(val)
+                    self.dst(a[0], r)
+                    self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
+                    return
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
             if op == "s_cselect_b32":
@@ -6484,6 +6501,28 @@ class Gen:
             self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
             self.dst(a[0], result)
         elif op in U2 or op in S2:
+            if op in S2:
+                x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+                writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
+                is_mask = not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2]))
+                if x_val is not None and y_val is not None and not is_mask:
+                    folded = None
+                    if op == "s_and_b32":
+                        folded = (x_val & y_val) & 0xFFFFFFFF
+                    elif op == "s_or_b32":
+                        folded = (x_val | y_val) & 0xFFFFFFFF
+                    elif op == "s_lshl_b32":
+                        folded = (x_val << (y_val & 31)) & 0xFFFFFFFF
+                    elif op == "s_lshr_b32":
+                        folded = (x_val >> (y_val & 31)) & 0xFFFFFFFF
+                    elif op == "s_mul_i32":
+                        folded = (x_val * y_val) & 0xFFFFFFFF
+                    if folded is not None:
+                        r = self.cu(folded)
+                        self.dst(a[0], r)
+                        if op in ("s_and_b32", "s_or_b32", "s_lshl_b32", "s_lshr_b32"):
+                            self.emit(f"OpStore %scc {self.cu(1 if folded != 0 else 0)}")
+                        return
             r = self.tmp()
             kind = U2.get(op) or S2.get(op)
             if kind == "mul24":
@@ -6694,8 +6733,12 @@ class Gen:
             except ValueError:
                 raise Unsupported(f"{op} offset:{inst[0]}") from None
         reg = None
+        off_val = self.imm_val(off)
         if off["k"] == "imm":
             imm = off["v"]                              # immediate-only form
+        elif off_val is not None:
+            off_trunc = off_val & ~3
+            imm = (imm & ~3) + off_trunc
         else:
             reg = self.src_u(off)
         if sbuf:
@@ -6726,21 +6769,36 @@ class Gen:
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
         self.uses_psb = True
         lim = None
+        lim_val = None
         if sbuf:
             # limit = NUM_RECORDS * stride, or NUM_RECORDS when stride is 0 (bytes, 64-bit so the product can't wrap)
-            stride, nr64, st64, prod, raw, lim = (self.tmp() for _ in range(6))
-            nr = self.load_reg("sgpr", base["r"] + 2)
-            self.emit(f"{stride} = OpBitFieldUExtract %uint {word1} {self.cu(16)} {self.cu(14)}")
-            self.emit(f"{nr64} = OpUConvert %ulong {nr}")
-            self.emit(f"{st64} = OpUConvert %ulong {stride}")
-            self.emit(f"{prod} = OpIMul %ulong {nr64} {st64}")
-            self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
-            self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
+            lit1 = self.sgpr_imm.get(base["r"] + 1)
+            lit2 = self.sgpr_imm.get(base["r"] + 2)
+            if lit1 is not None and lit2 is not None:
+                stride = (lit1 >> 16) & 0x3FFF
+                lim_val = lit2 if stride == 0 else lit2 * stride
+                lim = self.cl(lim_val)
+            else:
+                stride, nr64, st64, prod, raw, lim = (self.tmp() for _ in range(6))
+                nr = self.load_reg("sgpr", base["r"] + 2)
+                self.emit(f"{stride} = OpBitFieldUExtract %uint {word1} {self.cu(16)} {self.cu(14)}")
+                self.emit(f"{nr64} = OpUConvert %ulong {nr}")
+                self.emit(f"{st64} = OpUConvert %ulong {stride}")
+                self.emit(f"{prod} = OpIMul %ulong {nr64} {st64}")
+                self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
+                self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
         for i in range(n):
             p, v = self.tmp(), self.tmp()
             if lim is None:
                 self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
                 self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
+            elif lim_val is not None and reg is None:
+                end_val = imm + 4 * i + 4
+                if lim_val >= end_val:
+                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                    self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
+                else:
+                    v = self.cu(0)
             else:
                 # dword i is in range when off + 4*i + 4 <= limit; outside it memory is not read and the result is 0
                 end, ok, got = self.tmp(), self.tmp(), self.tmp()
