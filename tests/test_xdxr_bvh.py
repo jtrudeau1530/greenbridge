@@ -208,6 +208,29 @@ class ClosestHit(unittest.TestCase):
         self.assertGreater(hits, 50)
         self.assertGreater(rec, 0)
 
+    def test_tlas_bounds_and_inverse_use_the_stored_transform(self) -> None:
+        triangles = [[(1, 0, 0), (2, 0, 0), (1, 1, 0)]]
+        blas, info = X.build_blas(triangles)
+        mem = X.Memory()
+        blas_va = mem.place(0x100000, blas)
+        # The x scale rounds down in float32. Its translation then places
+        # the triangle's left edge at x = 0 rather than x = 1.
+        matrix = [[16777217, 0, 0, -16777216], [0, 1, 0, 0], [0, 0, 1, 0]]
+        instance = X.Instance(matrix, blas_va, info["root"], info["bounds"])
+        tlas, metadata = X.build_tlas([instance])
+        root = X.ptr_offset(metadata["root"])
+        instance_offset = X.ptr_offset(struct.unpack_from("<I", tlas, root)[0])
+        stored_x = struct.unpack_from("<4f", tlas, instance_offset)
+        self.assertEqual(stored_x, (16777216.0, 0.0, 0.0, -16777216.0))
+        self.assertEqual(struct.unpack_from("<6f", tlas, root + 16),
+                         (0.0, 0.0, 0.0, 16777216.0, 1.0, 0.0))
+        self.assertEqual(struct.unpack_from("<4f", tlas, instance_offset + 64),
+                         (2.0 ** -24, 0.0, 0.0, 1.0))
+        tlas_va = mem.place(0x200000, tlas)
+        hit = X.trace(mem, tlas_va, (0.25, 0.25, -1.0), (0.0, 0.0, 1.0))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["primitive"], 0)
+
     def test_instance_record(self):
         data, info = X.build_blas([TRI])
         inst = X.Instance([[1, 0, 0, 5], [0, 1, 0, 0], [0, 0, 1, 0]], 0x12300, info["root"], info["bounds"],

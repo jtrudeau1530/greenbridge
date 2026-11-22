@@ -362,7 +362,8 @@ class Instance:
 
     def __init__(self, transform, blas_va, blas_root, blas_bounds, instance_id=0, mask=0xFF, contribution=0,
                  flags=0):
-        self.transform = [[float(x) for x in row] for row in transform]
+        # Derive the inverse and bounds from the float32 matrix stored in the instance record.
+        self.transform = [[f32(x) for x in row] for row in transform]
         self.blas_va = blas_va
         self.blas_root = blas_root
         self.blas_bounds = blas_bounds
