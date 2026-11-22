@@ -56,8 +56,8 @@ class TestGFX10FormatMapping(unittest.TestCase):
             (14, 49, "R8G8_UNORM"),
             (22, 41, "R32_FLOAT"),
             (29, 34, "R16G16_FLOAT"),
-            (43, 26, "R11G11B10_FLOAT"),
-            (44, 24, "R10G10B10A2_UNORM"),
+            (36, 26, "R11G11B10_FLOAT"),
+            (50, 24, "R10G10B10A2_UNORM"),
             (56, 28, "R8G8B8A8_UNORM"),
             (130, 29, "R8G8B8A8_UNORM_SRGB"),
             (64, 16, "R32G32_FLOAT"),
@@ -69,6 +69,20 @@ class TestGFX10FormatMapping(unittest.TestCase):
                 dxgi_id, name = tex_headers.map_gfx10_format(gfx10_code)
                 self.assertEqual(dxgi_id, expected_dxgi)
                 self.assertEqual(name, expected_name)
+
+    def test_packed_formats_follow_top_bit_first_names(self):
+        # GFX10 names list widths from the top bit: 2_10_10_10 is R10G10B10A2, 10_11_11 is R11G11B10.
+        with open(os.path.join(TOOLS_DIR, "gfx10_formats.json"), encoding="utf-8") as f:
+            names = json.load(f)
+        for gfx10, dxgi, name in ((36, 26, "10_11_11_FLOAT"), (50, 24, "2_10_10_10_UNORM"),
+                                  (54, 25, "2_10_10_10_UINT")):
+            with self.subTest(gfx10=gfx10):
+                self.assertEqual(names[str(gfx10)], "GFX10_FORMAT_" + name)
+                self.assertEqual(tex_headers.map_gfx10_format(gfx10)[0], dxgi)
+                self.assertEqual(tex_headers.dxgi_to_gfx10(dxgi), gfx10)
+        for gfx10 in (43, 44, 48):   # 11_11_10_FLOAT, 10_10_10_2_*: no DXGI format has these layouts
+            with self.subTest(gfx10=gfx10), self.assertRaises(ValueError):
+                tex_headers.map_gfx10_format(gfx10)
 
     def test_unsupported_gfx10_raises(self):
         for invalid in [0, 9999, -1, 400]:
@@ -846,6 +860,19 @@ class CliInputTest(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "tex_headers.py"), *args],
                               capture_output=True, text=True, timeout=60)
+
+    def test_out_in_a_missing_folder_is_created(self):
+        # Before: main() opened --out directly after the scan, so this ended in a FileNotFoundError traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            out = os.path.join(tmp, "no", "such", "textures.json")
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), [])
 
     def test_bad_carve_folders_are_usage_errors(self):
         with tempfile.TemporaryDirectory() as tmp:

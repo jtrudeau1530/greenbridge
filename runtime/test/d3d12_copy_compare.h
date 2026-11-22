@@ -38,8 +38,21 @@ struct Ptr {
     T* operator->() const { return p; }
 };
 
+// True under Wine, where there is no host to compare with: the comparisons take Microsoft's d3d12.dll as the
+// reference, and Wine's (vkd3d) lays out depth-stencil formats in one plane, rejects R9G9B9E5 and BC footprints,
+// accepts descriptions Microsoft's runtime refuses and answers shader model 5.1. Its device also shares the process's
+// Vulkan with ours (winevulkan asserted in vkBindBufferMemory). Says so once.
+inline bool host_is_wine() {
+    static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    static bool said = false;
+    if (wine && !said) std::printf("host D3D12 is Wine's, not Microsoft's: comparisons with the host are skipped\n");
+    said = true;
+    return wine;
+}
+
 // An explicit adapter LUID takes precedence over LEONIDA_HOST_ADAPTER for same-adapter comparisons.
 inline bool try_create_host(Ptr<ID3D12Device>& host, std::string& name, const LUID* luid = nullptr) {
+    if (host_is_wine()) return false;
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!d3d12 || !dxgi) return false;
@@ -130,7 +143,6 @@ struct TexCase {
     bool floaty;  // bytes stay small so floats are finite
     bool ds;      // depth-stencil: whole-subresource copies only
     bool bc;
-    bool emulated = false;  // the layer stores the format as another one (D24 as D32S8): only bit-preserving copies
 };
 
 // One device with a direct queue, an allocator, a list and a fence.
@@ -149,11 +161,18 @@ struct Run {
         ours = is_ours;
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        return SUCCEEDED(d->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p))) &&
-               SUCCEEDED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) &&
-               SUCCEEDED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
-                                              IID_PPV_ARGS(&list.p))) &&
-               SUCCEEDED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)));
+        const auto check_setup = [is_ours](const char* call, HRESULT hr) {
+            if (SUCCEEDED(hr)) return true;
+            std::fprintf(stderr, "copy setup: %s %s failed (HRESULT 0x%08x)\n",
+                         is_ours ? "Vulkan" : "host", call, static_cast<unsigned>(hr));
+            return false;
+        };
+        return check_setup("CreateCommandQueue", d->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p))) &&
+               check_setup("CreateCommandAllocator",
+                           d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) &&
+               check_setup("CreateCommandList", d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p,
+                                                                     nullptr, IID_PPV_ARGS(&list.p))) &&
+               check_setup("CreateFence", d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)));
     }
     // Starts another scenario on the same queue: the list and allocator are reset (a list that failed at Close can be).
     bool used = false;
@@ -586,7 +605,7 @@ inline int compare(const char* name, const Outcome& ours, const Outcome& host) {
 }
 
 // Runs every case; returns the number of cases that differ, or -1 with no host device.
-inline int compare_copies(ID3D12Device* ours, bool bc_supported, bool d24_native) {
+inline int compare_copies(ID3D12Device* ours, bool bc_supported) {
     Ptr<ID3D12Device> host;
     std::string adapter;
     if (!create_host(host, adapter)) return -1;
@@ -623,10 +642,8 @@ inline int compare_copies(ID3D12Device* ours, bool bc_supported, bool d24_native
     depth("D16_UNORM", DXGI_FORMAT_D16_UNORM, false);
     depth("D32_FLOAT", DXGI_FORMAT_D32_FLOAT, true);
     depth("D24_UNORM_S8_UINT", DXGI_FORMAT_D24_UNORM_S8_UINT, false);
-    // Without a native D24 the layer stores D32_SFLOAT_S8_UINT and an upload or readback does not convert the 24-bit
-    // texels (docs/d3d12_vulkan.md, known gaps): only the copies that keep the bits are checked, on the layer alone.
-    cases.back().emulated = !d24_native;
-    cases.back().floaty = !d24_native;  // the layer's D32 holds floats: keep them normal and finite
+    // Without a native D24 the layer stores D32_SFLOAT_S8_UINT and converts the depth plane of an upload and a readback
+    // (depth24.h); the random 24-bit values here must come back exactly, as on the host.
     depth("D32_FLOAT_S8X24_UINT", DXGI_FORMAT_D32_FLOAT_S8X24_UINT, true);
     if (bc_supported) {
         const auto bc = [&](const char* name, DXGI_FORMAT f) {
@@ -666,49 +683,7 @@ inline int compare_copies(ID3D12Device* ours, bool bc_supported, bool d24_native
         bad += r;
         if (!r) std::printf("copy case %s: matches the host (%zu regions)\n", name, b.regions.size());
     };
-    // An emulated format: the readbacks of a CopyResource, a box copy and a copy into another slice must equal the
-    // readback of the source (bits kept), on the layer alone.
-    const auto bit_preserving = [&](const TexCase& tc) {
-        ++total;
-        Outcome a;
-        Run run;
-        if (!run.init(ours, true)) {
-            std::fprintf(stderr, "copy case %s: could not create the queue and list\n", tc.name);
-            ++bad;
-            return;
-        }
-        run_texture(run, host.p, tc, a);
-        if (!a.error.empty()) {
-            std::fprintf(stderr, "copy case %s: layer run failed: %s\n", tc.name, a.error.c_str());
-            ++bad;
-            return;
-        }
-        const size_t n = a.regions.size() / 6, layers = tc.depth_or_layers;
-        const auto same = [&](const Region& x, const Region& y) {
-            for (size_t row = 0; row < x.rows; ++row)
-                if (std::memcmp(&a.bytes[x.offset + row * x.pitch], &a.bytes[y.offset + row * y.pitch], x.row_bytes))
-                    return false;
-            return true;
-        };
-        int wrong = 0;
-        for (size_t i = 0; i < n; ++i) {
-            const size_t mip = i % tc.mips, slice = (i / tc.mips) % layers, plane = i / (tc.mips * layers);
-            const size_t other = mip + ((slice + 1) % layers) * tc.mips + plane * tc.mips * layers;
-            const Region& source = a.regions[4 * n + i];
-            if (!same(a.regions[i], source) || !same(a.regions[n + i], source) || !same(a.regions[2 * n + other], source)) {
-                if (wrong++ < 3)
-                    std::fprintf(stderr, "copy case %s: sub %zu: a copy did not keep the source's bits\n", tc.name, i);
-            }
-        }
-        bad += wrong ? 1 : 0;
-        if (!wrong)
-            std::printf("copy case %s: emulated format, CopyResource and box copies keep the source's bits "
-                        "(upload and readback are not compared)\n", tc.name);
-    };
-    for (const TexCase& tc : cases) {
-        if (tc.emulated) bit_preserving(tc);
-        else both(tc.name, [&](Run& r, Outcome& o) { run_texture(r, host.p, tc, o); });
-    }
+    for (const TexCase& tc : cases) both(tc.name, [&](Run& r, Outcome& o) { run_texture(r, host.p, tc, o); });
     both("buffers", [&](Run& r, Outcome& o) { run_buffers(r, o); });
 
     // Different mips of one texture. Both sides must refuse what does not fit; what the host copies the layer must

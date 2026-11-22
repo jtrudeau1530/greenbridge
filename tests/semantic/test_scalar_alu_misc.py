@@ -254,7 +254,7 @@ def run_cs_workgroup(lines: list[str], threads: int, subgroup_size: int) -> tupl
         threads,
         subgroup_size,
         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % subgroup_size},
-        push_constants=[0, 0, 0x1000, 0] + [0] * 28,
+        push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 28,
         memory=memory,
     )
     return spv, memory

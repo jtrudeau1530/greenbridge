@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 namespace leonida {
@@ -136,7 +138,8 @@ public:
         bool recorded = false;
         {
             // The back buffer's layout is tracked like any other texture; this holds the context while it is read.
-            std::lock_guard lock(context_.mutex_);
+            std::shared_lock resource_lock(context_.resource_mutex_);
+            std::lock_guard tracker_lock(context_.tracker_mutex_);
             const ResourceBinding* binding = context_.resolve(source);
             if (binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
                 record(frame.commands, *binding, source, image);
@@ -187,7 +190,7 @@ private:
 
     // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
     bool presentable(ResourceId source) {
-        std::lock_guard lock(context_.mutex_);
+        std::shared_lock lock(context_.resource_mutex_);
         const ResourceBinding* binding = context_.resolve(source);
         return binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT;
     }

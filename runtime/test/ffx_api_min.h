@@ -1,5 +1,6 @@
 // The subset of the public FidelityFX API that fsr_dispatch_test.cpp calls, written out from the FidelityFX SDK
-// v2.4.0 headers Kits/FidelityFX/api/include/ffx_api.h, api/include/dx12/ffx_api_dx12.h and
+// v2.4.0 headers Kits/FidelityFX/api/include/ffx_api.h, api/include/ffx_api_types.h,
+// api/include/dx12/ffx_api_dx12.h and
 // upscalers/include/ffx_upscale.h (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK). Those headers carry
 // the MIT license below. Only declarations are here: no AMD code, and nothing from the game's DLL.
 //
@@ -127,6 +128,66 @@ constexpr StructType CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12 = backend_sub_id(BACK
 struct CreateBackendDX12Desc {
     Header header;
     void* device;  // ID3D12Device*
+};
+
+// ffx_api_types.h: resources and the values used below.
+enum : uint32_t {
+    SURFACE_FORMAT_R16G16B16A16_FLOAT = 4,
+    SURFACE_FORMAT_R16G16_FLOAT = 18,
+    SURFACE_FORMAT_R32_FLOAT = 28,
+};
+enum : uint32_t { RESOURCE_TYPE_TEXTURE2D = 2 };
+enum : uint32_t { RESOURCE_USAGE_READ_ONLY = 0, RESOURCE_USAGE_UAV = 1u << 1, RESOURCE_USAGE_DEPTHTARGET = 1u << 2 };
+enum : uint32_t { RESOURCE_STATE_UNORDERED_ACCESS = 1u << 1, RESOURCE_STATE_COMPUTE_READ = 1u << 2 };
+
+struct ResourceDescription {
+    uint32_t type;
+    uint32_t format;
+    uint32_t width;   // or size, for a buffer
+    uint32_t height;  // or stride
+    uint32_t depth;   // or alignment
+    uint32_t mipCount;
+    uint32_t flags;
+    uint32_t usage;
+};
+
+struct Resource {
+    void* resource;  // ID3D12Resource*
+    ResourceDescription description;
+    uint32_t state;
+};
+
+struct FloatCoords2D {
+    float x;
+    float y;
+};
+
+// ffx_upscale.h
+constexpr StructType DISPATCH_DESC_TYPE_UPSCALE = effect_sub_id(EFFECT_ID_UPSCALE, 0x01);
+struct DispatchDescUpscale {
+    Header header;
+    void* commandList;
+    Resource color;
+    Resource depth;
+    Resource motionVectors;
+    Resource exposure;
+    Resource reactive;
+    Resource transparencyAndComposition;
+    Resource output;
+    FloatCoords2D jitterOffset;
+    FloatCoords2D motionVectorScale;
+    Dimensions2D renderSize;
+    Dimensions2D upscaleSize;
+    bool enableSharpening;
+    float sharpness;
+    float frameTimeDelta;
+    float preExposure;
+    bool reset;
+    float cameraNear;
+    float cameraFar;
+    float cameraFovAngleVertical;
+    float viewSpaceToMetersFactor;
+    uint32_t flags;
 };
 
 using PfnCreateContext = ReturnCode (*)(Context* context, Header* desc, const void* memCb);

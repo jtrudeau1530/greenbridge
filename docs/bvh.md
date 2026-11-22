@@ -280,8 +280,8 @@ and fill counts. It reads only headers and emits no payload bytes. The row's `ve
 `flags` as an integer; `flags` keeps the full 32-bit word.
 
 ```powershell
-python -I tools/bvh_index.py <archive.rpf> --out index.json --csv index.csv
-python -I tools/bvh_index.py <carve-dir> --out index.json
+python -I tools/bvh_index.py <archive.rpf> --out <temp>/index.json --csv <temp>/index.csv
+python -I tools/bvh_index.py <carve-dir> --out <temp>/index.json
 python -I tests/test_bvh_index.py
 ```
 

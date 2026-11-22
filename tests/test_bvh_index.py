@@ -180,6 +180,19 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(rows[1]["node_count"], 5)
         self.assertEqual(summary[0]["inflated"], 5000 + 0x140 + 5 * 64)
 
+    def test_fill_requires_all_bvh4_node_bytes(self):
+        path = os.path.join(self.dir, "one.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf([bvh_payload(1)]))
+        rows, _ = bvh_index.scan_rpf(path, max_inflate=384)
+        self.assertEqual(rows[0]["fill"], {"81": 64, "total": 64})
+        for cap in (320, 352):
+            with self.subTest(cap=cap):
+                rows, _ = bvh_index.scan_rpf(path, max_inflate=cap)
+                self.assertEqual(rows[0]["kind"], "bvh4")
+                self.assertEqual(rows[0]["node_bytes"], 64)
+                self.assertNotIn("fill", rows[0])
+
     def test_index_outputs(self):
         path = os.path.join(self.dir, "pack.rpf")
         with open(path, "wb") as f:
@@ -200,6 +213,17 @@ class ScanTest(unittest.TestCase):
         self.assertIn("signature", text.splitlines()[0])
         self.assertIn("root_node_invalid", text.splitlines()[0])
         self.assertIn("bvh4:0x81020006", text)
+
+    def test_cli_rejects_colliding_output_paths(self):
+        out = os.path.join(self.dir, "index.json")
+        alias = os.path.join(self.dir, ".", "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", out, "--csv", alias])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--out and --csv must use different paths", err.getvalue())
+        self.assertFalse(os.path.exists(out))
 
     def test_directory_of_payloads(self):
         for name, payload in (("a.bin", bvh_payload(4)), ("b.bin", instance_payload()), ("c.bin", b"z" * 80)):
@@ -271,6 +295,13 @@ class ScanTest(unittest.TestCase):
             self.assertIn("single archive", err.getvalue())
             self.assertEqual(so.getvalue(), "")
             self.assertFalse(os.path.exists(out))
+
+
+def setUpModule():
+    # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
 if __name__ == "__main__":

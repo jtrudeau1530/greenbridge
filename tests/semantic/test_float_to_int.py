@@ -36,7 +36,7 @@ class FloatToIntTest(unittest.TestCase):
                 memory = {}
                 support.run_fragment(
                     spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
-                    push_constants=[0, 0, 8, 0, bits] + [0] * 27, memory=memory)
+                    push_constants=[0, 0, 8, 0x31016FAC, bits] + [0] * 27, memory=memory)
                 self.assertEqual(memory, {0: unsigned, 4: signed})
 
 

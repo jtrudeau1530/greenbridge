@@ -284,6 +284,25 @@ class ExportBankTest(unittest.TestCase):
         self.assertIn("--limit must be non-negative", result.stderr)
         self.assertFalse((Path(self.out) / "first").exists())
 
+    def test_cli_rejects_bad_src_out_and_jobs(self):
+        bank, _, _ = self.make_bank()
+        out_file = os.path.join(self.tmp.name, "out_file")
+        with open(out_file, "wb") as f:
+            f.write(b"x")
+        cases = (
+            ([os.path.join(self.tmp.name, "missing.awc"), self.out], "does not exist"),
+            ([bank, out_file], "is a file, not a folder"),
+            ([bank, self.out, "--jobs", "0"], "--jobs must be at least 1"),
+            ([bank, self.out, "--jobs", "-2"], "--jobs must be at least 1"),
+        )
+        for args, expected in cases:
+            with self.subTest(args=args):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    awc.main(args)
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn(expected, err.getvalue())
+
     def test_single_bank_cli_keeps_flat_output(self):
         bank, pcm, _ = self.make_bank()
         subprocess.run([sys.executable, "-I", awc.__file__, bank, self.out, "--jobs", "1"],

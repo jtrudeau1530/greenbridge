@@ -141,5 +141,83 @@ class Mad64Tests(unittest.TestCase):
         self.assertEqual(got[0] >> 32, 42)
 
 
+class Mad64WaveMaskTests(unittest.TestCase):
+    """lane_masks.py must track v_mad_u64_u32 / v_mad_i64_i32 sdst as a lane mask across all 64 lanes."""
+
+    def run_wave64_cs(self, name: str, body_lines):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "disasm"))
+            os.mkdir(os.path.join(tmp, "fssm"))
+            s_path = os.path.join(tmp, "disasm", name + ".s")
+            with open(s_path, "w", encoding="utf-8") as f:
+                f.write(f"; {name}\n" + "".join(f"\t{ln}\n" for ln in body_lines) + "\ts_endpgm\n")
+            with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
+                f.write(STUB_DXBC)
+            # COMPUTE_PGM_RSRC2: 0x8088 -> 4 user SGPRs (s[0:3] = output V#), TGID_X, 64x1x1 threads.
+            with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
+                f.write(bytes(0x138) + struct.pack("<4I", 0x8088, 64, 1, 1))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv = rdna2spirv.translate(s_path)
+        pc = [0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28
+        mem = si.run_workgroup(
+            spv, 64, 64,
+            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=pc, memory={},
+        )
+        return mem
+
+    def test_mad_u64_carry_mask_ballot_wave64(self):
+        # Only lanes 3 and 40 carry out (v2=0xffffffff, v3=1, acc=0xffffffff_ffffffff -> carry=1);
+        # all other lanes have v3=0 -> carry=0. s_bcnt1_i32_b64 must return 2 and s_ff1_i32_b64 must return 3
+        # uniformly in every lane (without lane_masks tracking, lanes 3/40 saw 64 and the rest saw 0).
+        mem = self.run_wave64_cs("cs_mad_u64_mask", [
+            "s_mov_b64 exec, -1",
+            "v_cmp_eq_u32_e64 s[4:5], v0, 3",
+            "v_cmp_eq_u32_e64 s[6:7], v0, 40",
+            "s_or_b64 s[4:5], s[4:5], s[6:7]",
+            "v_cndmask_b32_e64 v3, 0, 1, s[4:5]",
+            "v_mov_b32 v2, 0xffffffff",
+            "v_mov_b32 v12, 0xffffffff",
+            "v_mov_b32 v13, 0xffffffff",
+            "v_mad_u64_u32 v[6:7], s[10:11], v2, v3, v[12:13]",
+            "s_bcnt1_i32_b64 s12, s[10:11]",
+            "s_ff1_i32_b64 s13, s[10:11]",
+            "v_mov_b32 v8, s12",
+            "v_mov_b32 v9, s13",
+            "v_lshlrev_b32 v10, 3, v0",
+            "buffer_store_dwordx2 v[8:9], v10, s[0:3], 0 offen",
+        ])
+        for lane in range(64):
+            self.assertEqual(mem[lane * 8], 2, f"lane {lane} bcnt1")
+            self.assertEqual(mem[lane * 8 + 4], 3, f"lane {lane} ff1")
+
+    def test_mad_i64_sign_mask_ballot_wave64(self):
+        # Only lanes 7, 35 and 63 get v2 = -1 (with v3 = 1, acc = 0 -> exact sum = -1, bit 64 = 1);
+        # all other lanes get v2 = 1 -> sum = +1, bit 64 = 0.
+        mem = self.run_wave64_cs("cs_mad_i64_mask", [
+            "s_mov_b64 exec, -1",
+            "v_cmp_eq_u32_e64 s[4:5], v0, 7",
+            "v_cmp_eq_u32_e64 s[6:7], v0, 35",
+            "s_or_b64 s[4:5], s[4:5], s[6:7]",
+            "v_cmp_eq_u32_e64 s[6:7], v0, 63",
+            "s_or_b64 s[4:5], s[4:5], s[6:7]",
+            "v_cndmask_b32_e64 v2, 1, -1, s[4:5]",
+            "v_mov_b32 v3, 1",
+            "v_mov_b32 v12, 0",
+            "v_mov_b32 v13, 0",
+            "v_mad_i64_i32 v[6:7], s[10:11], v2, v3, v[12:13]",
+            "s_bcnt1_i32_b64 s12, s[10:11]",
+            "s_ff1_i32_b64 s13, s[10:11]",
+            "v_mov_b32 v8, s12",
+            "v_mov_b32 v9, s13",
+            "v_lshlrev_b32 v10, 3, v0",
+            "buffer_store_dwordx2 v[8:9], v10, s[0:3], 0 offen",
+        ])
+        for lane in range(64):
+            self.assertEqual(mem[lane * 8], 3, f"lane {lane} bcnt1")
+            self.assertEqual(mem[lane * 8 + 4], 7, f"lane {lane} ff1")
+
+
 if __name__ == "__main__":
     unittest.main()

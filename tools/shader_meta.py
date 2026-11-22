@@ -28,7 +28,11 @@ NO_SGPR_DST = (
 )
 
 # Scalar instructions that read AND write a[0].
-SGPR_RMW = ("s_addk_i32", "s_mulk_i32", "s_cmovk_i32")
+SGPR_RMW = (
+    "s_addk_i32", "s_mulk_i32", "s_cmovk_i32",
+    "s_cmov_b32", "s_cmov_b64",
+    "s_bitset0_b32", "s_bitset1_b32", "s_bitset0_b64", "s_bitset1_b64",
+)
 
 # Image instructions whose fourth operand a[3] is a 4-dword sampler descriptor (S#).
 SAMPLER_IMAGE_OPS = ("image_sample", "image_gather4", "image_get_lod")
@@ -63,10 +67,16 @@ def base_op(op):
 def _imm_u32(a):
     """32-bit unsigned constant value of an imm/fimm operand, or None."""
     if a["k"] == "imm":
-        return a["v"] & 0xFFFFFFFF
-    if a["k"] == "fimm":
-        return struct.unpack("<I", struct.pack("<f", a["v"]))[0]
-    return None
+        v = a["v"] & 0xFFFFFFFF
+    elif a["k"] == "fimm":
+        v = struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+    else:
+        return None
+    if a.get("abs"):
+        v &= 0x7FFFFFFF
+    if a.get("neg"):
+        v ^= 0x80000000
+    return v
 
 
 def _sgpr_regs(a):
@@ -115,8 +125,10 @@ def _split_operands(ins):
     if op in SGPR_RMW:
         reads = [r for x in a for r in _sgpr_regs(x)]
         return reads, _sgpr_regs(a[0])
-    if (op.startswith("v_") and "_co_" in op) or op in ("v_mad_u64_u32", "v_mad_i64_i32"):
-        # vdst in a[0], scalar carry-out dst in a[1], sources in a[2:].
+    if (op.startswith("v_") and "_co_" in op) or op in (
+        "v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64",
+    ):
+        # vdst in a[0], scalar carry/scale-out dst in a[1], sources in a[2:].
         writes = _sgpr_regs(a[0]) + (_sgpr_regs(a[1]) if len(a) > 1 else [])
         reads = [r for x in a[2:] for r in _sgpr_regs(x)]
         return reads, writes

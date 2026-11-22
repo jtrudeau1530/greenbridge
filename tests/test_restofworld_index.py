@@ -247,6 +247,17 @@ class ArchiveTest(unittest.TestCase):
         self.assertGreater(summary["readable_fraction"], 0.5)
         self.assertEqual(summary["skipped_candidates"], 0)
 
+    def test_psin_longer_than_256_bytes_reads_the_whole_chain(self):
+        # Before: scan_rpf classified only the first 256 inflated bytes, so CHKS (at 0x140) was cut off.
+        data = (b"PSIN" + (16).to_bytes(4, "big") + struct.pack("<II", 22, 0)
+                + b"LSCH" + (8 + 300).to_bytes(4, "big") + bytes(300) + b"CHKS" + (16).to_bytes(4, "big") + bytes(8))
+        rpf = os.path.join(self.root, "long_psin.rpf")
+        with open(rpf, "wb") as f:
+            f.write(b"9FPR" + struct.pack("<I", 16) + bytes(8) + zlib.compress(data) + bytes(64))
+        (row,), _ = restofworld_index.scan_rpf(rpf)
+        self.assertEqual((row["signature"], row["count"], row["detail"]),
+                         ("psin", 2, "tags=LSCH,CHKS;field8=22;complete=1"))
+
     def test_scan_limit(self):
         limit = self.offsets[2] - 0x100 - 1
         rows, summary = restofworld_index.scan_rpf(self.rpf, limit=limit)
@@ -300,6 +311,21 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, proc.stderr)
             self.assertNotIn("Traceback", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
+
+    def test_cli_rejects_output_aliasing_source_archive(self):
+        with open(self.rpf, "rb") as f:
+            original = f.read()
+        output = os.path.join(os.path.dirname(self.rpf), ".", os.path.basename(self.rpf))
+
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.rpf, output],
+            capture_output=True, text=True,
+        )
+
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), original, "the source archive was overwritten")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("output must not overwrite the source archive", result.stderr)
 
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")

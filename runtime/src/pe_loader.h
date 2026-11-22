@@ -1,8 +1,8 @@
 // Native PE mapper for Xbox Series (x86-64) images.
 // Maps an image, applies relocations, binds every import through the shim registry, registers its unwind table and
 // installs static TLS for the calling thread.
-// Mapping never runs code from the image. Loader::initialise() is the one call that does: it sets up the module's TLS
-// (slot, template and callbacks) and calls a DLL's entry point as DllMain.
+// Mapping never runs code from the image. Loader::initialise() delivers process attach to TLS callbacks and DllMain;
+// ~Loader() delivers process detach before unmapping initialised modules. The TLS slot and template are set up by load().
 // gta6rt_tls_host.dll must sit next to the executable; the loader reuses the module TLS index the OS assigns it.
 #pragma once
 #include <cstdint>
@@ -65,8 +65,9 @@ public:
     explicit Loader(std::filesystem::path game_dir);
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
-    // Restores the TLS slot for the calling thread. Destroy the Loader on the thread
-    // that called load() while any mapped TLS module is still live.
+    // Delivers process detach to initialised modules in reverse dependency order before freeing any mappings or TLS.
+    // Restores the TLS slot for the calling thread. Destroy the Loader on the thread that called load() while any
+    // mapped TLS module is still live; all other threads executing mapped code must have finished first.
     ~Loader();
 
     // Loads an image and (recursively) the bundled modules it imports. Throws std::runtime_error on failure.
@@ -86,7 +87,7 @@ public:
     void initialise();
 
     // Calls the image's IMAGE_TLS_DIRECTORY64 callbacks in order with (base, reason, nullptr). This is opt-in:
-    // load() never runs image code, and initialise() is the only call inside the Loader that uses it. No-op for
+    // load() never runs image code; initialise() and ~Loader() use it for process attach/detach. No-op for
     // images without TLS callbacks. The loader does not deliver thread attach/detach events: install the thread's
     // TLS first, then call this with DLL_THREAD_ATTACH/DETACH, and uninstall after the detach callbacks.
     void run_tls_callbacks(Module& m, uint32_t reason);

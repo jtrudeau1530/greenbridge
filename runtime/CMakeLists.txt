@@ -175,6 +175,18 @@ if(WIN32)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
+  # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
+  add_executable(process_cmdline_test
+    test/process_cmdline_test.cpp
+    shims/process.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(process_cmdline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(process_cmdline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(process_cmdline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(process_cmdline_test PRIVATE shell32)
+
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
   add_executable(xgameruntime_test
@@ -198,7 +210,7 @@ if(WIN32)
   option(LEONIDA_SDL3 "Build the GameInput shim when SDL3 is available" ON)
   option(LEONIDA_SDL3_FETCH "Download the pinned SDL3 release if no installed SDL3 is found" OFF)
   if(LEONIDA_SDL3)
-    find_package(SDL3 3.2 CONFIG QUIET COMPONENTS SDL3-static)
+    find_package(SDL3 3.2 CONFIG QUIET COMPONENTS SDL3-static NO_SYSTEM_ENVIRONMENT_PATH)
     if(NOT TARGET SDL3::SDL3-static AND (LEONIDA_SDL3_FETCH OR FETCHCONTENT_SOURCE_DIR_SDL3))
       include(FetchContent)
       FetchContent_Declare(SDL3
@@ -254,6 +266,18 @@ if(BUILD_TESTING)
   # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
   add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
   add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
+  # LEONIDA_VK_DEVICE name matching (runtime/src/vulkan_device_filter.h): pure stdlib, no Vulkan instance.
+  add_executable(vulkan_device_filter_test test/vulkan_device_filter_test.cpp)
+  target_include_directories(vulkan_device_filter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
+  if(WIN32)
+    # Compile-time ABI checks (D3D12/XMem structure sizes, alignments and member offsets against the Windows SDK).
+    # The file existed but no target built it, so none of its static_asserts ever ran.
+    add_executable(runtime_types_test test/test_runtime_types.cpp)
+    target_include_directories(runtime_types_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    add_test(NAME runtime_types COMMAND runtime_types_test)
+  endif()
   if(WIN32)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
@@ -350,7 +374,7 @@ if(BUILD_TESTING)
     )
     target_compile_definitions(test_pe_loader_bounds PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(test_pe_loader_bounds PRIVATE /W4 /permissive- /utf-8)
-    target_link_options(test_pe_loader_bounds PRIVATE /OPT:NOREF)
+    target_link_options(test_pe_loader_bounds PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     target_link_libraries(test_pe_loader_bounds PRIVATE gta6rt_d3d12_xs_rootsig psapi)
     add_dependencies(test_pe_loader_bounds gta6rt_tls_host)
     add_test(NAME pe_loader_bounds COMMAND test_pe_loader_bounds)
@@ -411,11 +435,9 @@ if(BUILD_TESTING)
     add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
   endif()
 
-  if(WIN32 AND TARGET root_sig_test)
-    add_test(NAME root_sig_test COMMAND root_sig_test)
-  endif()
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
+    set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
@@ -494,6 +516,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
   endif()
+  if(WIN32 AND TARGET process_cmdline_test)
+    add_test(NAME process_cmdline COMMAND process_cmdline_test)
+  endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
   endif()
@@ -509,6 +534,16 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
     set_tests_properties(run_tiny_game_exit_code PROPERTIES WILL_FAIL TRUE)
+    # Two modes at once are refused before anything is mapped (#886). The stand-in game's own arguments are passed,
+    # so a gta6rt that ignored the conflict would run it, print "running" and exit 0.
+    foreach(modes "dry-run;run" "dry-run;init" "init;run")
+      string(REPLACE ";" "_" name "${modes}")
+      list(TRANSFORM modes PREPEND "--")
+      add_test(NAME gta6rt_rejects_${name} COMMAND gta6rt ${modes} $<TARGET_FILE:tiny_game> -- hello 42)
+      set_tests_properties(gta6rt_rejects_${name} PROPERTIES
+        PASS_REGULAR_EXPRESSION "usage: gta6rt"
+        FAIL_REGULAR_EXPRESSION "running |module\\(s\\) mapped")
+    endforeach()
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
@@ -534,10 +569,15 @@ if(LEONIDA_D3D12_SHIM_TESTS)
   target_link_options(d3d12_xs_root_signature_test PRIVATE /OPT:NOREF)
   target_link_libraries(d3d12_xs_root_signature_test PRIVATE gta6rt_d3d12_xs_rootsig d3d12 dxgi)
   add_test(NAME d3d12_xs_root_signature COMMAND d3d12_xs_root_signature_test)
+  set_tests_properties(d3d12_xs_root_signature PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
 endif()
 endif()
 
 # GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
+# Nothing is downloaded unless asked: set VULKAN_SDK, install the Vulkan headers, pass
+# -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time
+# (hash-checked), or pass -DFETCHCONTENT_SOURCE_DIR_VULKANHEADERS=<path> to use a local copy without downloading.
+option(LEONIDA_VULKAN_HEADERS_FETCH "Download the pinned Khronos Vulkan-Headers release if no Vulkan headers are found" OFF)
 find_package(Vulkan QUIET)
 if(NOT TARGET Vulkan::Headers)
   find_path(Vulkan_INCLUDE_DIR
@@ -549,33 +589,120 @@ if(NOT TARGET Vulkan::Headers)
     set_target_properties(Vulkan::Headers PROPERTIES
       INTERFACE_INCLUDE_DIRECTORIES "${Vulkan_INCLUDE_DIR}"
     )
+  elseif(LEONIDA_VULKAN_HEADERS_FETCH OR FETCHCONTENT_SOURCE_DIR_VULKANHEADERS)
+    include(FetchContent)
+    FetchContent_Declare(VulkanHeaders
+      # vulkan-sdk-1.4.363.0 (same commit pinned in .github/workflows/runtime.yml)
+      URL https://github.com/KhronosGroup/Vulkan-Headers/archive/6802bb4733b63ed5efd3adb308a6c885ef180ea1.tar.gz
+      URL_HASH SHA256=9044fbb356160e43201dc2094acb44c8a906722a63a35f48fc0f051579db9bb6
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    set(VULKAN_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(VULKAN_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(VULKAN_HEADERS_ENABLE_MODULE OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
 if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
-          vk_bindless_test vk_descriptor_bench)
+          vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  endif()
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    add_executable(vk_overlapping_occlusion_test test/vk_overlapping_occlusion_test.cpp)
+    target_link_libraries(vk_overlapping_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(vk_overlapping_occlusion_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    foreach(stage vert frag)
+      set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/overlapping_occlusion.${stage}")
+      set(output "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.${stage}.spv")
+      add_custom_command(OUTPUT "${output}"
+                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                                 -o "${output}" "${source}"
+                         DEPENDS "${source}" VERBATIM)
+      target_sources(vk_overlapping_occlusion_test PRIVATE "${output}")
+    endforeach()
+    if(BUILD_TESTING)
+      add_test(NAME vk_overlapping_occlusion COMMAND vk_overlapping_occlusion_test
+               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.vert.spv"
+               "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.frag.spv")
+      set_tests_properties(vk_overlapping_occlusion PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+  endif()
+  # CPU-only: the ranking that makes these harnesses prefer a native ICD over Mesa's Dozen (#915). No GPU needed.
+  add_executable(vk_device_pick_test test/vk_device_pick_test.cpp)
+  target_link_libraries(vk_device_pick_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
+  endif()
+  # CPU-only: the bindless set's array sizes from synthetic device limits.
+  add_executable(bindless_sizing_test test/bindless_sizing_test.cpp)
+  target_link_libraries(bindless_sizing_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME bindless_sizing COMMAND bindless_sizing_test)
+  endif()
+  if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  endif()
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    add_executable(vk_binary_occlusion_test test/vk_binary_occlusion_test.cpp)
+    target_link_libraries(vk_binary_occlusion_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(vk_binary_occlusion_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    foreach(stage vert frag)
+      set(source "${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/binary_occlusion.${stage}")
+      set(output "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.${stage}.spv")
+      add_custom_command(OUTPUT "${output}"
+                         COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.0
+                                 -o "${output}" "${source}"
+                         DEPENDS "${source}" VERBATIM)
+      target_sources(vk_binary_occlusion_test PRIVATE "${output}")
+    endforeach()
+    if(BUILD_TESTING)
+      add_test(NAME vk_binary_occlusion COMMAND vk_binary_occlusion_test
+               "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.vert.spv"
+               "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.frag.spv")
+      set_tests_properties(vk_binary_occlusion PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+  endif()
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
   find_package(Python3 COMPONENTS Interpreter QUIET)
-  if(WIN32 AND Python3_FOUND)
+  # The generator finds d3d12.h through INCLUDE, which a Developer Prompt sets. A cross build (for example
+  # runtime/cmake/clang-cl-xwin.cmake) has no such prompt, so it is handed the header CMake finds.
+  set(_stubs_header)
+  set(_stubs_header_ok TRUE)
+  if(WIN32 AND CMAKE_CROSSCOMPILING)
+    find_file(LEONIDA_D3D12_HEADER d3d12.h)
+    if(LEONIDA_D3D12_HEADER)
+      set(_stubs_header --header "${LEONIDA_D3D12_HEADER}")
+    else()
+      set(_stubs_header_ok FALSE)
+      message(STATUS "d3d12.h not found (set CMAKE_INCLUDE_PATH): the D3D12 COM objects are not built")
+    endif()
+  endif()
+  if(WIN32 AND Python3_FOUND AND _stubs_header_ok)
     set(LEONIDA_STUBS ${CMAKE_CURRENT_BINARY_DIR}/generated/d3d12_stubs.h)
     add_custom_command(
       OUTPUT ${LEONIDA_STUBS}
-      COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
+      COMMAND "${Python3_EXECUTABLE}" -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
+              ${_stubs_header}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
               ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12QueryHeap ID3D12RootSignature
-              ID3D12PipelineState
-      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
+              ID3D12PipelineState ID3D12CommandSignature
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp
-                ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
+                shims/dxgi_com.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -585,6 +712,16 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_com_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_com COMMAND d3d12_com_test)
+    set_tests_properties(d3d12_com PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Multi-threaded concurrent submissions across two D3D12 queues + resource creation/destruction churn.
+    add_executable(d3d12_multithread_test test/d3d12_multithread_test.cpp)
+    target_link_libraries(d3d12_multithread_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_multithread_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_multithread_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_multithread COMMAND d3d12_multithread_test)
+    set_tests_properties(d3d12_multithread PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
     add_executable(d3d12_gcl8_test test/d3d12_gcl8_test.cpp)
@@ -592,8 +729,14 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_gcl8_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_gcl8_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_gcl8 COMMAND d3d12_gcl8_test)
-    add_test(NAME d3d12_trace COMMAND Python3::Interpreter -I
-             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_gcl8_test>")
+    # Python runs on the host; a cross-compiled fixture runs through the emulator (Wine), which the script prepends.
+    # The interpreter is named by path, because ctest would put the emulator in front of an executable target.
+    set(_trace_runner)
+    foreach(_part IN LISTS CMAKE_CROSSCOMPILING_EMULATOR)
+      list(APPEND _trace_runner "--runner=${_part}")  # one word each, even one that starts with "-" (xvfb-run -a)
+    endforeach()
+    add_test(NAME d3d12_trace COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_gcl8_test>" ${_trace_runner})
 
     # The Vulkan device behind the Xbox-ABI proxy, end to end.
     add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp)
@@ -608,18 +751,51 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_uav_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_uav_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_uav_clear COMMAND d3d12_uav_clear_test)
+    set_tests_properties(d3d12_uav_clear PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
+    add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
+    target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_debug_markers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_debug_markers_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_debug_markers COMMAND d3d12_debug_markers_test)
+    set_tests_properties(d3d12_debug_markers PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
+    add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)
+    target_link_libraries(d3d12_fence_timing_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_fence_timing_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_fence_timing_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_timing COMMAND d3d12_fence_timing_test)
+    set_tests_properties(d3d12_fence_timing PROPERTIES SKIP_RETURN_CODE 77)
+    # Fence events the host runtime sets or refuses (released fences, no fences), compared with the host devices.
+    add_executable(d3d12_fence_events_test test/d3d12_fence_events_test.cpp)
+    target_link_libraries(d3d12_fence_events_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_fence_events_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_fence_events_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_events COMMAND d3d12_fence_events_test)
+    set_tests_properties(d3d12_fence_events PROPERTIES SKIP_RETURN_CODE 77)
+    # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
+    add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
+    target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_fence_waiter_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_waiter COMMAND d3d12_fence_waiter_test)
     # The 1/2/3 method variants (D3D-28) against the methods they wrap, on the Vulkan device directly.
     add_executable(d3d12_method_variants_test test/d3d12_method_variants_test.cpp)
     target_link_libraries(d3d12_method_variants_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_method_variants_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_method_variants_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_method_variants COMMAND d3d12_method_variants_test)
+    set_tests_properties(d3d12_method_variants PROPERTIES SKIP_RETURN_CODE 77)
 
     # CreateSampler2 (D3D-28) against CreateSampler, and its refusals against the host's PC runtime.
     add_executable(d3d12_sampler2_test test/d3d12_sampler2_test.cpp)
     target_link_libraries(d3d12_sampler2_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_sampler2_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_sampler2_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_sampler2 COMMAND d3d12_sampler2_test)
+    set_tests_properties(d3d12_sampler2 PROPERTIES SKIP_RETURN_CODE 77)
 
     # Descriptors through the proxy: copies between heaps, what texture views and samplers write into their slots,
     # and (where glslangValidator is found) a compute shader the test runs on the device's bindless set, which
@@ -628,20 +804,24 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_descriptor_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_descriptor_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_descriptor_test PRIVATE /W4 /permissive- /utf-8)
-    if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
-      find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
-    endif()
+    add_test(NAME d3d12_descriptor COMMAND d3d12_descriptor_test)
+    set_tests_properties(d3d12_descriptor PROPERTIES SKIP_RETURN_CODE 77)
     if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
-      set(LEONIDA_TEST_CS_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_sample.spv)
-      add_custom_command(
-        OUTPUT ${LEONIDA_TEST_CS_SAMPLE}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_SAMPLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sample.comp
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sample.comp
-        COMMENT "Compiling the descriptor test shader"
-        VERBATIM)
-      target_sources(d3d12_descriptor_test PRIVATE ${LEONIDA_TEST_CS_SAMPLE})
-      target_compile_definitions(d3d12_descriptor_test PRIVATE LEONIDA_TEST_CS_SAMPLE_SPV="${LEONIDA_TEST_CS_SAMPLE}")
+      function(descriptor_test_shader shader definition)
+        set(source ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader})
+        set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${definition}.spv)
+        add_custom_command(OUTPUT ${binary}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 ${ARGN} -o ${binary} ${source}
+          DEPENDS ${source} COMMENT "Compiling descriptor test shader ${shader}" VERBATIM)
+        target_sources(d3d12_descriptor_test PRIVATE ${binary})
+        target_compile_definitions(d3d12_descriptor_test PRIVATE ${definition}="${binary}")
+      endfunction()
+      descriptor_test_shader(cs_sample.comp LEONIDA_TEST_CS_SAMPLE_SPV)
+      descriptor_test_shader(cs_sample.comp LEONIDA_TEST_MS_FLOAT_SPV -DTEST_MS_FLOAT=1)
+      descriptor_test_shader(cs_sample.comp LEONIDA_TEST_MS_UINT_SPV -DTEST_MS_UINT=1)
+      descriptor_test_shader(cs_sample.comp LEONIDA_TEST_MS_SINT_SPV -DTEST_MS_SINT=1)
+      descriptor_test_shader(msaa_seed.vert LEONIDA_TEST_MSAA_VERT_SPV)
+      descriptor_test_shader(msaa_seed.frag LEONIDA_TEST_MSAA_FRAG_SPV)
     else()
       message(STATUS "glslangValidator not found: d3d12_descriptor_test skips its shader")
     endif()
@@ -651,18 +831,31 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_clear_test PRIVATE /W4 /permissive- /utf-8)
+    # Not in ctest yet: on NVIDIA it fails on the 0.5 tie rounding #521 fixes; register it once that lands.
 
     # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)
     target_link_libraries(d3d12_typeless_rtv_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_typeless_rtv_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_typeless_rtv COMMAND d3d12_typeless_rtv_test)
+    set_tests_properties(d3d12_typeless_rtv PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Depth/stencil ResolveSubresourceRegion against the host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_depth_resolve_test test/d3d12_depth_resolve_test.cpp)
+    target_link_libraries(d3d12_depth_resolve_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_depth_resolve_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_depth_resolve_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_depth_resolve COMMAND d3d12_depth_resolve_test)
+    set_tests_properties(d3d12_depth_resolve PROPERTIES SKIP_RETURN_CODE 77)
 
     # ID3D12Resource::GetDesc against the host runtime and WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_resource_desc_test test/d3d12_resource_desc_test.cpp)
     target_link_libraries(d3d12_resource_desc_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_resource_desc_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_resource_desc_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_resource_desc COMMAND d3d12_resource_desc_test)
+    set_tests_properties(d3d12_resource_desc PROPERTIES SKIP_RETURN_CODE 77)
 
     # Milestone M0: a window, 60 cleared frames presented through the proxy on Vulkan.
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
@@ -773,6 +966,72 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_node_mask_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_node_mask_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_node_mask_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_node_mask COMMAND d3d12_node_mask_test)
+    set_tests_properties(d3d12_node_mask PROPERTIES SKIP_RETURN_CODE 77)
+
+    # CopyResource / CopyTextureRegion between BC and its uncompressed equivalent (and depth <-> colour) against the
+    # host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_copy_xfmt_test test/d3d12_copy_xfmt_test.cpp)
+    target_link_libraries(d3d12_copy_xfmt_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_copy_xfmt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_copy_xfmt_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_copy_xfmt COMMAND d3d12_copy_xfmt_test)
+    set_tests_properties(d3d12_copy_xfmt PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Query heaps and query calls by list type (Close results, CreateQueryHeap node masks, timestamp heap kinds)
+    # against the host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_query_rules_test test/d3d12_query_rules_test.cpp)
+    target_link_libraries(d3d12_query_rules_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_query_rules_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_query_rules_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_query_rules COMMAND d3d12_query_rules_test)
+    set_tests_properties(d3d12_query_rules PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 presentation over a Win32 HWND.
+    add_executable(dxgi_swapchain_test test/dxgi_swapchain_test.cpp)
+    target_link_libraries(dxgi_swapchain_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(dxgi_swapchain_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_swapchain_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_swapchain COMMAND dxgi_swapchain_test)
+    set_tests_properties(dxgi_swapchain PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
+    add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)
+    target_link_libraries(d3d12_indirect_rt_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_indirect_rt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_indirect_rt_test PRIVATE /W4 /permissive- /utf-8)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_VS_TRI ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_tri.spv)
+      set(LEONIDA_TEST_FS_SOLID ${CMAKE_CURRENT_BINARY_DIR}/generated/fs_solid.spv)
+      set(LEONIDA_TEST_CS_RAYQUERY ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_rayquery.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_VS_TRI}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_VS_TRI}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_tri.vert
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_tri.vert
+        COMMENT "Compiling vs_tri.vert"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_FS_SOLID}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_FS_SOLID}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/fs_solid.frag
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/fs_solid.frag
+        COMMENT "Compiling fs_solid.frag"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_RAYQUERY}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_RAYQUERY}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_rayquery.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_rayquery.comp
+        COMMENT "Compiling cs_rayquery.comp"
+        VERBATIM)
+      target_sources(d3d12_indirect_rt_test PRIVATE
+                     ${LEONIDA_TEST_VS_TRI} ${LEONIDA_TEST_FS_SOLID} ${LEONIDA_TEST_CS_RAYQUERY})
+      target_compile_definitions(d3d12_indirect_rt_test PRIVATE
+        LEONIDA_TEST_VS_TRI_SPV="${LEONIDA_TEST_VS_TRI}"
+        LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}"
+        LEONIDA_TEST_CS_RAYQUERY_SPV="${LEONIDA_TEST_CS_RAYQUERY}")
+    endif()
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
@@ -785,7 +1044,7 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(bvh_builder_test PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
   else()
-    message(STATUS "Python 3 or Windows missing: the D3D12 COM objects and d3d12_com_test are not built")
+    message(STATUS "Python 3, Windows or d3d12.h missing: the D3D12 COM objects and d3d12_com_test are not built")
   endif()
 
   # Needs only the Vulkan headers, not a GPU.
@@ -805,16 +1064,35 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(clear_color_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME clear_color COMMAND clear_color_test)
+    # Replay refuses a list whose whole-view or implicit zero-clear needs an unset vkCmdClear*Image (no GPU).
+    add_executable(replay_clear_gate_test test/replay_clear_gate_test.cpp)
+    target_link_libraries(replay_clear_gate_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_clear_gate_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_clear_gate COMMAND replay_clear_gate_test)
     add_executable(d3d12_state_map_test test/d3d12_state_map_test.cpp)
     target_link_libraries(d3d12_state_map_test PRIVATE Vulkan::Headers)
     if(WIN32)
       target_compile_definitions(d3d12_state_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME d3d12_state_map COMMAND d3d12_state_map_test)
+    # A buffer UAV clear writes where its resource starts in a shared VkBuffer (no GPU).
+    add_executable(replay_uav_clear_offset_test test/replay_uav_clear_offset_test.cpp)
+    target_link_libraries(replay_uav_clear_offset_test PRIVATE Vulkan::Headers)
+    add_test(NAME replay_uav_clear_offset COMMAND replay_uav_clear_offset_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
+    # CPU cost of the D3D12 -> Vulkan replay per command (record, prepare, emit) with no-op Vulkan entry points:
+    # no GPU or driver. ctest runs its quick self-test; run it without arguments for the numbers.
+    add_executable(replay_cpu_bench test/replay_cpu_bench.cpp)
+    target_link_libraries(replay_cpu_bench PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_cpu_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_cpu_bench_selftest COMMAND replay_cpu_bench --self-test)
     add_test(NAME vk_descriptor_bench_selftest COMMAND vk_descriptor_bench --self-test)
     # The subgroup size a pipeline stage asks for, from synthetic index entries and device properties.
     add_executable(subgroup_size_test test/subgroup_size_test.cpp)
@@ -823,5 +1101,6 @@ if(TARGET Vulkan::Headers)
   endif()
 else()
   message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
-                 "gfx10_descriptors_test are not built")
+                 "gfx10_descriptors_test are not built. Set VULKAN_SDK, install Vulkan headers, or pass "
+                 "-DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release")
 endif()

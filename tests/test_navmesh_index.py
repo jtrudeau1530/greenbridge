@@ -118,6 +118,55 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_out_and_csv_in_missing_folders_are_created(self):
+        # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
+        # FileNotFoundError traceback and lost the index.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=5))
+        out = os.path.join(self.root, "no", "such", "index.json")
+        csv_path = os.path.join(self.root, "also", "missing", "index.csv")
+        self.run_tool(folder, "--out", out, "--csv", csv_path, "--pattern", "*.bin")
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["page_counts"], {"5": 1})
+        with open(csv_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("0DRP@16", lines[1])
+
+    def assert_output_collision(self, *args):
+        r = subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--out and --csv must refer to different files", r.stderr)
+
+    def test_explicit_output_collision_before_scan(self):
+        # A missing input would give a different error if the scan started.
+        self.assert_output_collision("missing.rpf", "--out", "new.json", "--csv", "./new.json")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "new.json")))
+
+    def test_default_output_collision_preserves_report(self):
+        make_rpf(os.path.join(self.root, "nav.rpf"))
+        report = os.path.join(self.root, "nav.navmesh-index.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        self.assert_output_collision("nav.rpf", "--csv", report)
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_hard_link_output_collision(self):
+        report = os.path.join(self.root, "out.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        try:
+            os.link(report, os.path.join(self.root, "out.csv"))
+        except OSError as exc:
+            self.skipTest(f"cannot create a hard link: {exc}")
+        self.assert_output_collision(self.root, "--out", "out.json", "--csv", "out.csv")
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
         with open(path, "wb") as f:

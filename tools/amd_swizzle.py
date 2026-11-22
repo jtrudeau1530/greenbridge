@@ -46,7 +46,8 @@ def _term(text, env):
 
 
 def load(path=HEADER):
-    text = open(path, encoding="utf-8", errors="replace").read()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
     env = _symbols()
     nibbles = {}
     for name in ("NIBBLE01", "NIBBLE2", "NIBBLE3", "NIBBLE4"):
@@ -139,7 +140,8 @@ def main():
     ap.add_argument("--out")
     a = ap.parse_args()
     nibbles, tables = load()
-    data = open(a.blob, "rb").read()[a.offset:]
+    with open(a.blob, "rb") as f:
+        data = f.read()[a.offset:]
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
     wb, hb = a.width // block, a.height // block

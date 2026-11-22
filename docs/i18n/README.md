@@ -1,0 +1,16 @@
+# Community quickstarts (other languages)
+
+The English documentation ([`README.md`](../../README.md), [`CONTRIBUTING.md`](../../CONTRIBUTING.md), and
+[`docs/`](../README.md)) is **authoritative**.
+
+Community translations live here and cover **stable onboarding text only** (what the project is, own-copy and
+no-game-data rules, prerequisites, build commands, stage order, and common troubleshooting). They intentionally
+omit the daily-moving project status table, format notes, and `docs/design.md` so copies do not drift out of
+date, and they require no build or CI changes.
+
+A language is added when a contributor volunteers to maintain it and keeps the synced commit below up to date.
+
+| Language | File | Synced commit | Maintainer |
+|---|---|---|---|
+| Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `d3841c0c` | `@Andretuta` |
+| 简体中文 (`zh-CN`) | [`zh-CN/quickstart.md`](zh-CN/quickstart.md) | `0d61c357` | `@liang-kai-shui` |

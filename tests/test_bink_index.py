@@ -65,6 +65,17 @@ class TestHeader(unittest.TestCase):
         self.assertEqual(row["audio_codecs"], ["binkaudio_dct", "binkaudio_dct"])
         self.assertEqual(row["audio_channels"], [2, 2])
 
+    def test_audio_descriptors_stay_within_declared_size(self):
+        stream = struct.pack("<4s10I", b"KB2a", 40, 1, 0, 1, 16, 16, 30, 1, 0, 1) + bytes(4)
+        prefix = b"archive prefix"
+        data = prefix + stream
+        row = bink.parse_header(data, len(prefix))
+        self.assertEqual(row["size"], 48)
+        self.assertEqual(row["audio_rates"], [])
+        self.assertEqual(row["audio_channels"], [])
+        self.assertEqual(bink.parse_header(data + struct.pack("<HHI", 44100, 0x2000, 17),
+                                           len(prefix)), row)
+
     def test_truncated_file_is_skipped(self):
         data = make_stream()[:-100]
         self.assertIsNone(bink.parse_header(data, 0))
@@ -109,6 +120,16 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(rows[0]["source"], "one.bk2")
         self.assertEqual(rows[0]["frames"], 7)
         self.assertEqual(summary["streams"], 1)
+
+    def test_short_file_bytes_are_accounted_for(self):
+        path = os.path.join(self.dir, "tiny.bk2")
+        with open(path, "wb") as fh:
+            fh.write(b"KB2a" + bytes(16))
+        rows, summary = bink.scan_target(path)
+        self.assertEqual(rows, [])
+        self.assertEqual(summary["span"], 20)
+        self.assertEqual(summary["unread_bytes"], 20)
+        self.assertEqual(summary["zero_padding"], 0)
 
     def test_fractional_rates_are_indexed(self):
         path = os.path.join(self.dir, "fractional.bk2")
@@ -187,6 +208,16 @@ class TestCommandLine(unittest.TestCase):
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(bink.main([missing]), 2)
         self.assertIn("no such file or directory", err.getvalue())
+
+    def test_output_write_failure_is_an_error(self):
+        for extension in ("csv", "json"):
+            with self.subTest(extension=extension):
+                path = os.path.join(self.tmp.name, "missing", f"index.{extension}")
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(bink.main([self.path, "--out", path]), 2)
+                self.assertEqual(out.getvalue(), "")
+                self.assertIn(f"cannot write {path}", err.getvalue())
 
 
 if __name__ == "__main__":

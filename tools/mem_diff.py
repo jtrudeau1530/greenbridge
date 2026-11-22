@@ -15,7 +15,7 @@ Addressing modelled (AMD RDNA2 ISA, buffer resource descriptor and MUBUF/SMEM ad
   * s_buffer_load = V# base + soffset + imm.
 
 Every generated access lies inside its buffer (index < num_records for structured buffers, the whole access
-below num_records for raw ones), is dword aligned, and uses a word3 with no format: out-of-bounds behaviour, the
+below num_records for raw ones), is dword aligned, and uses a word3 with no format (only OOB_SELECT: STRUCTURED with a stride, RAW without): out-of-bounds behaviour, the
 s_buffer_load alignment truncation and swizzling depend on descriptor fields docs/design.md lists as not modelled,
 so they are left to a GPU-confirmed follow-up instead of being guessed here.
 
@@ -352,7 +352,9 @@ def _soffset(rng, prog, budget):
 
 def _emit_vsharp(rng, prog, base, stride, num_records):
     word1 = (base >> 32) & 0xFFFF | (stride & 0x3FFF) << 16
-    for i, w in enumerate((base & MASK32, word1, num_records, 0)):
+    # word3: only OOB_SELECT (bits 29:28), the bounds check the accesses stay inside of: STRUCTURED for a stride,
+    # RAW without (the two RADV uses); every generated access is in range under either
+    for i, w in enumerate((base & MASK32, word1, num_records, OOB_STRUCTURED if stride else OOB_RAW)):
         prog.lines.append(f"s_mov_b32 s{VSHARP + i}, {w:#x}")
 
 
@@ -529,6 +531,7 @@ def gen_global(rng, prog):
 # The five formats tbuffer loads use in the 1.0.2.1 corpus (counted over all 26,503 shaders).
 TBUFFER_FORMATS = ("16_16_SNORM", "8_8_8_8_UNORM", "8_8_8_8_UINT", "2_10_10_10_UNORM", "16_16_16_16_UINT")
 XYZW = 4 | 5 << 3 | 6 << 6 | 7 << 9
+OOB_STRUCTURED, OOB_RAW = 1 << 28, 3 << 28       # V# word3 OOB_SELECT
 
 
 def _typed_codes():
@@ -560,14 +563,14 @@ def gen_buffer_format(rng, prog):
         records = REGION // stride
         index = rng.randrange(0, records)
         _emit_vsharp(rng, prog, base, stride, records)
-        prog.lines[-1] = f"s_mov_b32 s{VSHARP + 3}, {word3:#x}"
+        prog.lines[-1] = f"s_mov_b32 s{VSHARP + 3}, {word3 | OOB_STRUCTURED:#x}"
         prog.lines.append(f"v_mov_b32 v{VADDR}, {index:#x}")
         operands = f"v{VADDR}, s[{VSHARP}:{VSHARP + 3}], 0"
         addr_mods = "idxen"
     else:
         voff = rng.randrange(0, (REGION - 16) // size) * size
         _emit_vsharp(rng, prog, base, 0, REGION)
-        prog.lines[-1] = f"s_mov_b32 s{VSHARP + 3}, {word3:#x}"
+        prog.lines[-1] = f"s_mov_b32 s{VSHARP + 3}, {word3 | OOB_RAW:#x}"
         prog.lines.append(f"v_mov_b32 v{VADDR}, {voff:#x}")
         operands = f"v{VADDR}, s[{VSHARP}:{VSHARP + 3}], 0"
         addr_mods = "offen"
@@ -683,7 +686,7 @@ def self_test():
     """Canaries: a hand-written case matches, and a corrupted reference is caught."""
     prog = Program()
     prog.memory = {0x2000: 0x11111111, 0x2004: 0x22222222, 0x2008: 0x33333333, 0x200C: 0x44444444}
-    prog.lines = ["s_mov_b32 s0, 0x2000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x10", "s_mov_b32 s3, 0",
+    prog.lines = ["s_mov_b32 s0, 0x2000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x10", "s_mov_b32 s3, 0x30000000",
                   "v_mov_b32 v2, 4", "buffer_load_dwordx3 v[8:10], v2, s[0:3], 0 offen", "s_waitcnt vmcnt(0)",
                   "v_mov_b32 v11, 7"]
     status, detail = run_one("ps_mem_canary", prog)

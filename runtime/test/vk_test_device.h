@@ -5,6 +5,8 @@
 
 #include "vulkan_loader.h"
 #include "../src/subgroup_size.h"
+#include "../src/vulkan_device_filter.h"
+#include "vk_device_pick.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -72,6 +74,8 @@ public:
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
+    bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
+    bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
 
     Device() = default;
     Device(const Device&) = delete;
@@ -138,7 +142,7 @@ public:
 #endif
         validation = env && std::strcmp(env, "0") != 0;
         const char* layer = "VK_LAYER_KHRONOS_validation";
-        const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        const char* debug_utils_name = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
         VkDebugUtilsMessengerCreateInfoEXT messenger_info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
         messenger_info.messageSeverity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
@@ -173,7 +177,19 @@ public:
             instance_info.pNext = &validation_features;
             instance_info.enabledLayerCount = 1;
             instance_info.ppEnabledLayerNames = &layer;
-            instance_extensions.push_back(debug_utils);
+            debug_utils = true;  // the validation layer provides it
+        } else if (request_debug_utils) {
+            const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                instance_proc(nullptr, "vkEnumerateInstanceExtensionProperties"));
+            std::uint32_t count = 0;
+            enumerate(nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> extensions(count);
+            enumerate(nullptr, &count, extensions.data());
+            for (const auto& e : extensions)
+                debug_utils = debug_utils || std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+        }
+        if (debug_utils) {
+            instance_extensions.push_back(debug_utils_name);
         }
         instance_info.enabledExtensionCount = std::uint32_t(instance_extensions.size());
         instance_info.ppEnabledExtensionNames = instance_extensions.data();
@@ -197,25 +213,34 @@ public:
         });
         if (result != VK_SUCCESS) return failure("vkEnumeratePhysicalDevices", result);
         VkPhysicalDeviceProperties chosen{};
+        int best_rank = -1;
         for (auto candidate : devices) {
             VkPhysicalDeviceProperties props{};
             properties_of(candidate, &props);
-            if (props.apiVersion < VK_API_VERSION_1_3) continue;
+            if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
             std::uint32_t family_count = 0;
             families_of(candidate, &family_count, nullptr);
             std::vector<VkQueueFamilyProperties> families(family_count);
             families_of(candidate, &family_count, families.data());
             for (std::uint32_t i = 0; i < family_count; ++i) {
                 if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-                if (!physical || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                if (const int rank = leonida::vk_test::device_rank(props.deviceType, props.vendorID);
+                    rank > best_rank) {
                     physical = candidate;
                     family = i;
                     chosen = props;
+                    best_rank = rank;
                 }
                 break;
             }
         }
         if (!physical) {
+            if (const std::string filter = leonida::vulkan_device_filter(); !filter.empty()) {
+                // A filter that matches nothing fails the test instead of skipping it.
+                std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 device with a graphics queue matches\n",
+                             filter.c_str());
+                return DeviceStatus::failed;
+            }
             std::fprintf(stderr, "no Vulkan 1.3 device with a graphics queue\n");
             return DeviceStatus::unavailable;
         }
