@@ -947,7 +947,7 @@ if(TARGET Vulkan::Headers)
 
     # Milestone M0: a window, 60 cleared frames presented through the proxy on Vulkan.
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
-    target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32)
+    target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32 dxgi)
     target_compile_definitions(d3d12_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_present_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_present COMMAND d3d12_present_test)

@@ -2,11 +2,14 @@
 // Vulkan-backed device behind the Xbox-ABI proxy, with no Vulkan validation errors. Each frame resets the list,
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
 // The window is then resized, which recreates the swapchain and scales the blit. Last, the colour on screen is read
-// back with GDI when the window is in front (skipped otherwise, e.g. on a locked desktop). No shaders or game data.
+// back with GDI when the window is in front and the display is in SDR (skipped otherwise, e.g. in HDR
+// or on a locked desktop). No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+
+#include <dxgi1_6.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -32,6 +35,37 @@ struct Ref {
     }
     T* operator->() const { return p; }
 };
+
+// Returns true when the monitor containing the window is running with Windows HDR enabled
+// (DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020). On an HDR desktop, DWM scales SDR GDI reads
+// by the user's SDR white level, so fixed-tolerance on-screen colour checks do not hold (TEST-209).
+bool is_hdr_monitor(HWND window) {
+    const HMONITOR target = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    if (!target) return false;
+    Ref<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return false;
+    for (UINT i = 0;; ++i) {
+        Ref<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
+        if (!adapter.p) continue;
+        for (UINT j = 0;; ++j) {
+            Ref<IDXGIOutput> output;
+            if (adapter->EnumOutputs(j, &output.p) == DXGI_ERROR_NOT_FOUND) break;
+            if (!output.p) continue;
+            DXGI_OUTPUT_DESC desc{};
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target) {
+                Ref<IDXGIOutput6> output6;
+                if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6.p)))) {
+                    DXGI_OUTPUT_DESC1 desc1{};
+                    if (SUCCEEDED(output6->GetDesc1(&desc1)) &&
+                        desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     return DefWindowProcW(window, message, w, l);
@@ -299,18 +333,22 @@ int main() {
         Sleep(200);
         pump();
         if (GetForegroundWindow() == window && !IsIconic(window)) {
-            RECT client{};
-            GetClientRect(window, &client);
-            POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
-            ClientToScreen(window, &centre);
-            HDC screen = GetDC(nullptr);
-            const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
-            ReleaseDC(nullptr, screen);
-            const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
-            std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
-            EXPECT(pixel != CLR_INVALID);
-            EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
-            screen_checked = true;
+            if (is_hdr_monitor(window)) {
+                std::printf("the monitor is in HDR mode: on-screen colour check skipped\n");
+            } else {
+                RECT client{};
+                GetClientRect(window, &client);
+                POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
+                ClientToScreen(window, &centre);
+                HDC screen = GetDC(nullptr);
+                const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
+                ReleaseDC(nullptr, screen);
+                const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
+                std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
+                EXPECT(pixel != CLR_INVALID);
+                EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
+                screen_checked = true;
+            }
         } else {
             std::printf("the window is not in front: on-screen colour check skipped\n");
         }
