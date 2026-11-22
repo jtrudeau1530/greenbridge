@@ -238,6 +238,13 @@ def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True) -> tuple[
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
 
 
+def bary_fallback() -> bool:
+    """LEONIDA_BARY_FALLBACK=1: pixel shaders that read raw barycentrics are translated with --bary-fallback and drawn
+    through their pass-through geometry shader (tools/bary_fallback_gs.py), so they run on a device without
+    VK_KHR_fragment_shader_barycentric (NVIDIA Pascal, for one)."""
+    return (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def w64_emulated() -> bool:
     # Wave64 emulation on: the suite runs every wave64 check without asking for a 64-wide
     # subgroup, matching check.py (W64_EMULATED). Accepts "1"/"true"/"yes"/"on" and tolerates
@@ -580,11 +587,17 @@ def run_suite(a, work: str) -> int:
         cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", spirv_dir]
         if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
             cmd.append("--wave64-emulate")
+        if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
+            cmd.append("--bary-fallback")
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
     print(out)
     if rc != 0:
         return 1
+    if bary_fallback():
+        import bary_fallback_gs
+        for gs in bary_fallback_gs.build_for_index(spirv_dir):
+            print("bary fallback GS:", os.path.basename(gs))
 
     # 3. Build helper SPIR-V shaders
     vs_tri = os.path.join(spirv_dir, "vs_tri.spv")
@@ -840,6 +853,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
+            bary_gs = os.path.join(spirv_dir, f"{name}.bary_gs.spv")
+            if bary_fallback() and os.path.isfile(bary_gs):   # --bary-fallback PS: barycentrics from this GS
+                env = dict(env or os.environ, VKH_GS=bary_gs, VKH_GS_HELPER="1")
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
                 results.append((name, None, unsupported_skip(msg)))

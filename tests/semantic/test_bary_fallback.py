@@ -1,0 +1,145 @@
+"""rdna2spirv.py --bary-fallback: raw barycentric reads without VK_KHR_fragment_shader_barycentric.
+
+The input is the GPU test runtime/test/shaders/ps_bary (hand-written, no game data; fixture from regen_fixtures.py).
+It reads the raw barycentric pair (v0 = i, v1 = j) next to v_interp. By default the translator gives the pair as
+BaryCoordKHR.y / .z. With --bary-fallback the same values come from an ordinary vec3 input one location past the
+attributes; tools/bary_fallback_gs.py writes the pass-through geometry shader that fills it. On the GPU,
+run_gpu_tests.py / check.py with LEONIDA_BARY_FALLBACK=1 check ps_bary through that GS. Here:
+* the module declares neither the capability nor the extension nor the builtin, and the metadata names the input;
+* the shader reads i and j from the new input exactly as it reads them from BaryCoordKHR (one-lane interpreter);
+* a shader that doesn't read the pair translates to the same module with and without the flag;
+* the GS text has the vertex count, the one-hot weights and the locations the PS expects, and refuses a collision.
+"""
+import os
+import re
+import shutil
+import struct
+import subprocess
+import tempfile
+import unittest
+
+import support
+import rdna2spirv
+import bary_fallback_gs
+
+I, J = 0.3125, 0.4375          # exact in binary32, i + j < 1
+ATTR0 = (0.75, 0.5, 0.0, 1.0)
+
+
+def f32_bits(x):
+    return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+def translate(name, fallback):
+    old = rdna2spirv.BARY_FALLBACK
+    rdna2spirv.BARY_FALLBACK = fallback
+    try:
+        spv = support.translate_fixture(name)
+        meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+    finally:
+        rdna2spirv.BARY_FALLBACK = old
+    return spv, meta
+
+
+class BaryFallbackModule(unittest.TestCase):
+    def test_default_uses_the_builtin(self):
+        spv, meta = translate("ps_bary", False)
+        self.assertIn("OpDecorate %bary BuiltIn BaryCoordKHR", spv)
+        self.assertIn("OpCapability FragmentBarycentricKHR", spv)
+        self.assertIn('OpExtension "SPV_KHR_fragment_shader_barycentric"', spv)
+        self.assertNotIn("bary_fallback_input", meta)
+        self.assertIn("fragmentShaderBarycentric", meta["features"])
+
+    def test_fallback_is_a_plain_input_past_the_attributes(self):
+        spv, meta = translate("ps_bary", True)
+        self.assertNotIn("BaryCoordKHR", spv)
+        self.assertNotIn("FragmentBarycentricKHR", spv)
+        self.assertNotIn("SPV_KHR_fragment_shader_barycentric", spv)
+        self.assertNotIn("fragmentShaderBarycentric", meta["features"])
+        loc = meta["bary_fallback_input"]["location"]
+        self.assertEqual(loc, max(meta["inputs"]) + 1)
+        self.assertIn(f"OpDecorate %bary Location {loc}", spv)
+        # Perspective-correct like BaryCoordKHR: no Flat / NoPerspective on it.
+        self.assertIsNone(re.search(r"OpDecorate %bary (Flat|NoPerspective)", spv))
+        self.assertRegex(spv, r"%bary = OpVariable %_ptr_Input_v3f Input")
+
+    def test_same_values_from_either_source(self):
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                spv, _ = translate("ps_bary", fallback)
+                words = support.mrt0_words(spv, inputs={"%in_attr0": ATTR0, "%bary": (1.0 - I - J, I, J)})
+                # mrt0 = (attr0.x, attr0.y, raw i, raw j): the single-lane interpreter models v_interp as the
+                # attribute value itself, and the raw pair is BaryCoord .y / .z.
+                self.assertEqual(words, [f32_bits(ATTR0[0]), f32_bits(ATTR0[1]), f32_bits(I), f32_bits(J)])
+
+    def test_shaders_without_the_pair_are_unchanged(self):
+        for name in ("ps_ops", "ps_flat", "cs_bounds"):
+            with self.subTest(name=name):
+                fssm = None
+                if name == "cs_bounds":
+                    fssm = bytearray(0x148)
+                    struct.pack_into("<4I", fssm, 0x138, 0x8088, 64, 1, 1)
+                    fssm = bytes(fssm)
+                old = rdna2spirv.BARY_FALLBACK
+                try:
+                    rdna2spirv.BARY_FALLBACK = False
+                    off = support.translate_fixture(name, fssm=fssm)
+                    rdna2spirv.BARY_FALLBACK = True
+                    on = support.translate_fixture(name, fssm=fssm)
+                finally:
+                    rdna2spirv.BARY_FALLBACK = old
+                self.assertEqual(off, on)
+
+
+class BaryFallbackGeometryShader(unittest.TestCase):
+    def test_text(self):
+        text = bary_fallback_gs.gs_spvasm([2, 0], 3)
+        self.assertIn("OpExecutionMode %main Triangles", text)
+        self.assertIn("OpExecutionMode %main OutputVertices 3", text)
+        self.assertEqual(text.count("OpEmitVertex"), 3)
+        self.assertEqual(text.count("OpEndPrimitive"), 1)
+        for n in (0, 2):
+            self.assertIn(f"OpDecorate %in{n} Location {n}", text)
+            self.assertIn(f"OpDecorate %out{n} Location {n}", text)
+        self.assertIn("OpDecorate %out_bary Location 3", text)
+        # Vertex k gets weight 1 in component k, in emission order.
+        stores = re.findall(r"OpStore %out_bary %bary(\d)", text)
+        self.assertEqual(stores, ["0", "1", "2"])
+        self.assertIn("%bary0 = OpConstantComposite %v3float %f1 %f0 %f0", text)
+        self.assertIn("%bary1 = OpConstantComposite %v3float %f0 %f1 %f0", text)
+        self.assertIn("%bary2 = OpConstantComposite %v3float %f0 %f0 %f1", text)
+
+    def test_collision_is_refused(self):
+        with self.assertRaises(ValueError):
+            bary_fallback_gs.gs_spvasm([0, 1], 1)
+
+    def test_index_drives_the_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = {"ps_a": {"stage": "ps", "inputs": [0, 1], "bary_fallback_input": {"location": 2}},
+                     "ps_b": {"stage": "ps", "inputs": [0]},
+                     "cs_c": {"stage": "cs"}}
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                import json
+                json.dump(index, f)
+            written = bary_fallback_gs.write_for_index(tmp)
+            self.assertEqual([os.path.basename(p) for p in written], ["ps_a.bary_gs.spvasm"])
+            with open(written[0], encoding="utf-8") as f:
+                self.assertEqual(f.read(), bary_fallback_gs.gs_spvasm([0, 1], 2))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(bary_fallback_gs.write_for_index(tmp), [])     # no index: nothing to do
+
+    @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs spirv-as and spirv-val")
+    def test_assembles_and_validates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asm = os.path.join(tmp, "gs.spvasm")
+            with open(asm, "w", encoding="utf-8", newline="\n") as f:
+                f.write(bary_fallback_gs.gs_spvasm([0, 1, 5], 6))
+            spv = os.path.join(tmp, "gs.spv")
+            for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
+                        ["spirv-val", "--target-env", "vulkan1.2", spv]):
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

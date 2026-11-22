@@ -136,6 +136,15 @@ instruction"), which is why the second run is limited to compute. llvmpipe is no
 real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
 differences.
 
+## GPUs without fragment barycentrics (NVIDIA Pascal and older)
+
+`ps_bary`, `ps_uniform_branch` and `ps_scc_mask32` read raw barycentrics, which need
+`VK_KHR_fragment_shader_barycentric`. Where the device lacks it they're skipped; that's expected, not a failure. To
+test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`** (or
+for `run_gpu_tests.py`). The shaders are then translated with `--bary-fallback` and drawn through a pass-through
+geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric fallback"), so the device needs
+geometry shaders instead.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example

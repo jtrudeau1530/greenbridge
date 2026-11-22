@@ -38,6 +38,12 @@ import shader_meta as _shader_meta  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
+# --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
+# in the metadata as "bary_fallback_input") instead of BuiltIn BaryCoordKHR, for devices without
+# VK_KHR_fragment_shader_barycentric. Whatever feeds the stage before the PS (a pass-through geometry shader) writes
+# (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
+# barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
+BARY_FALLBACK = False
 
 # GFX10 buffer format codes (Mesa src/amd/registers/gfx10-rsrc.json, enum GFX10_FORMAT).
 import json as _json  # noqa: E402
@@ -6363,6 +6369,9 @@ def assemble(gen):
             iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"]
     bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values())
+    # --bary-fallback: %bary is a plain input one location past the attributes, so no capability or extension.
+    gen.bary_location = (max(gen.inputs.values(), default=-1) + 1) if bary and BARY_FALLBACK else None
+    bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs:
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
     for i in range(USER_SGPRS):          # index constants for the user-data copy at entry
@@ -6371,7 +6380,8 @@ def assemble(gen):
     caps = ["Shader"] + (["Int64", "PhysicalStorageBufferAddresses"] if psb else []) + \
         (["RuntimeDescriptorArray"] if tex else []) + (["GroupNonUniform", "GroupNonUniformShuffle"] if sg else []) + \
         (["ImageQuery"] if gen.uses_query else []) + (["Sampled1D"] if gen.uses_tex_1d else []) + \
-        (["MinLod"] if gen.uses_minlod else []) + (["ImageGatherExtended"] if gen.uses_img_offset else []) +         (["FragmentBarycentricKHR"] if bary else [])
+        (["MinLod"] if gen.uses_minlod else []) + (["ImageGatherExtended"] if gen.uses_img_offset else []) + \
+        (["FragmentBarycentricKHR"] if bary_builtin else [])
     if gen.uses_vote:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformVote") if c not in caps]
     if gen.uses_ballot:
@@ -6402,7 +6412,7 @@ def assemble(gen):
         caps.append("ShaderViewportIndex")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
-    if bary:
+    if bary_builtin:
         exts.append("SPV_KHR_fragment_shader_barycentric")
     if ms:
         exts.append("SPV_EXT_mesh_shader")
@@ -6697,7 +6707,9 @@ def assemble(gen):
             if not tex:
                 types += ["%v3float = OpTypeVector %float 3"]
             types += ["%_ptr_Input_v3f = OpTypePointer Input %v3float"]
-            dec += ["OpDecorate %bary BuiltIn BaryCoordKHR"]
+            # Default (smooth) interpolation is perspective-correct, matching BaryCoordKHR (not BaryCoordNoPerspKHR).
+            dec += ["OpDecorate %bary BuiltIn BaryCoordKHR" if bary_builtin
+                    else f"OpDecorate %bary Location {gen.bary_location}"]
             gvars += ["%bary = OpVariable %_ptr_Input_v3f Input"]
     if gen.vertex_inputs:
         types += ["%v4uint_in = OpTypeVector %uint 4", "%v4int_in = OpTypeVector %int 4",
@@ -7966,6 +7978,10 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["writes_depth"] = True
     if g.inputs:
         m["inputs"] = sorted(g.inputs.values())
+    if getattr(g, "bary_location", None) is not None:
+        # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
+        # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
+        m["bary_fallback_input"] = {"location": g.bary_location}
     if g.build_meta:
         m.update(g.build_meta)
     return m
@@ -8042,10 +8058,15 @@ def main():
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
+    ap.add_argument("--bary-fallback", action="store_true",
+                    help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
+                         "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
+                         "VK_KHR_fragment_shader_barycentric (e.g. NVIDIA Pascal)")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE
+    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
+    BARY_FALLBACK = a.bary_fallback
     if a.merge:
         import glob as _gl, json as _js
         merged = {}
