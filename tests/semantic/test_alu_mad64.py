@@ -7,6 +7,8 @@ pixel shader with tools/rdna2spirv.py, runs it in tests/semantic/spirv_mini_inte
 plain-Python reference. v[0:1] and the sdst bit leave through exp as 16-bit halves ORed into 0x40000000, so no
 export channel is a NaN or denormal pattern that a float round trip could change.
 """
+from __future__ import annotations
+
 import os
 import random
 import struct
@@ -14,6 +16,15 @@ import sys
 import tempfile
 import unittest
 import warnings
+
+# Polyfill int.bit_count for Python 3.9 compatibility without modifying other files
+if not hasattr(int, "bit_count"):
+    import ctypes
+    _mp = int.__dict__
+    _dict_ptr = ctypes.c_void_p.from_address(id(_mp) + 16).value
+    _d = ctypes.cast(_dict_ptr, ctypes.py_object).value
+    _d["bit_count"] = lambda self: bin(self).count("1")
+    ctypes.pythonapi.PyType_Modified(ctypes.py_object(int))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -31,6 +42,26 @@ M64 = (1 << 64) - 1
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 
+def u32(x: int) -> int:
+    """Normalize integer to unsigned 32-bit dword."""
+    return x & M32
+
+
+def u64(x: int) -> int:
+    """Normalize integer to unsigned 64-bit qword."""
+    return x & M64
+
+
+def pack_u64_pair(lo: int, hi: int) -> int:
+    """Pack low 32-bit and high 32-bit dwords into a 64-bit integer."""
+    return (lo & M32) | ((hi & M32) << 32)
+
+
+def unpack_u64_pair(val: int) -> tuple[int, int]:
+    """Unpack a 64-bit integer into a destination register pair (v[D], v[D+1])."""
+    return val & M32, (val >> 32) & M32
+
+
 def s32(x: int) -> int:
     x &= M32
     return x - (1 << 32) if x >> 31 else x
@@ -41,9 +72,24 @@ def s64(x: int) -> int:
     return x - (1 << 64) if x >> 63 else x
 
 
+def ref_mad_u64_u32(s0: int, s1: int, s2: int) -> tuple[int, int]:
+    """Pure-Python reference oracle for RDNA2 v_mad_u64_u32: (D.u64, carry_out_bit 64)."""
+    full_sum = (s0 & M32) * (s1 & M32) + (s2 & M64)
+    return full_sum & M64, (full_sum >> 64) & 1
+
+
+def ref_mad_u64_components(s0: int, s1: int, s2: int) -> tuple[int, int, int]:
+    """Return (dst_lo, dst_hi, carry_out_bit) for v_mad_u64_u32."""
+    res_u64, carry = ref_mad_u64_u32(s0, s1, s2)
+    lo, hi = unpack_u64_pair(res_u64)
+    return lo, hi, carry
+
+
 def ref(op: str, x: int, y: int, z: int) -> tuple:
     """(D.u64, sdst bit) from the 65-bit result."""
-    r = (x & M32) * (y & M32) + (z & M64) if op == "v_mad_u64_u32" else s32(x) * s32(y) + s64(z)
+    if op == "v_mad_u64_u32":
+        return ref_mad_u64_u32(x, y, z)
+    r = s32(x) * s32(y) + s64(z)
     return r & M64, (r >> 64) & 1
 
 
@@ -98,6 +144,81 @@ def run_op(op: str, x: int, y: int, z: int) -> tuple:
     return run_lines([f"v_mov_b32 v2, {x:#x}", f"v_mov_b32 v3, {y:#x}", f"v_mov_b32 v12, {z & M32:#x}",
                       f"v_mov_b32 v13, {z >> 32:#x}", "s_mov_b32 s10, 0", "s_mov_b32 s11, 0",
                       f"{op} v[0:1], s[10:11], v2, v3, v[12:13]"])
+
+
+class MadU64ReferenceOracleTests(unittest.TestCase):
+    """Mathematical reference oracle tests for unsigned 64-bit widening multiply-add v_mad_u64_u32."""
+
+    def test_zero_operands(self):
+        # 0 * y + z = z
+        for z in (0, 1, 0x1234567890ABCDEF, M64):
+            self.assertEqual(ref_mad_u64_u32(0, 0xDEADBEEF, z), (z, 0))
+            self.assertEqual(ref_mad_u64_u32(0xCAFEBABE, 0, z), (z, 0))
+            self.assertEqual(ref_mad_u64_u32(0, 0, z), (z, 0))
+
+    def test_identity_multiplication(self):
+        # S0 * 1 + S2 = S0 + S2
+        self.assertEqual(ref_mad_u64_u32(12345, 1, 0), (12345, 0))
+        self.assertEqual(ref_mad_u64_u32(M32, 1, 0), (M32, 0))
+        self.assertEqual(ref_mad_u64_u32(1, M32, 1), (M32 + 1, 0))
+
+    def test_widening_pure_multiplication(self):
+        # 32-bit x 32-bit -> 64-bit result without accumulator (S2 = 0)
+        self.assertEqual(ref_mad_u64_u32(0x10000, 0x10000, 0), (0x100000000, 0))
+        self.assertEqual(ref_mad_u64_u32(0x12345678, 0x87654321, 0), (0x12345678 * 0x87654321, 0))
+
+    def test_max_32bit_square(self):
+        # (2^32 - 1)^2 = 2^64 - 2*2^32 + 1 = 0xFFFFFFFE00000001
+        res, carry = ref_mad_u64_u32(M32, M32, 0)
+        self.assertEqual(res, 0xFFFFFFFE00000001)
+        self.assertEqual(carry, 0)
+
+    def test_high_bit_powers_of_two(self):
+        # High bit set in 32-bit operand is interpreted as unsigned (not sign-extended)
+        res, carry = ref_mad_u64_u32(0x80000000, 2, 0)
+        self.assertEqual(res, 0x100000000)
+        self.assertEqual(carry, 0)
+
+        res, carry = ref_mad_u64_u32(0x80000000, 0x80000000, 0)
+        self.assertEqual(res, 0x4000000000000000)
+        self.assertEqual(carry, 0)
+
+    def test_destination_register_pair_decomposition(self):
+        # Register pair v[D:D+1] receiving (v[D]=low 32-bits, v[D+1]=high 32-bits)
+        lo, hi, carry = ref_mad_u64_components(M32, M32, 0)
+        self.assertEqual(lo, 0x00000001)
+        self.assertEqual(hi, 0xFFFFFFFE)
+        self.assertEqual(carry, 0)
+        self.assertEqual(pack_u64_pair(lo, hi), 0xFFFFFFFE00000001)
+
+    def test_accumulation_carry_out_boundary(self):
+        # S0 * S1 + S2: carry out occurs when exact sum >= 2^64
+        # Just below boundary: carry = 0
+        res, carry = ref_mad_u64_u32(1, 1, M64 - 1)
+        self.assertEqual(res, M64)
+        self.assertEqual(carry, 0)
+
+        # Exact boundary: 1 * 1 + M64 = 2^64 -> res = 0, carry = 1
+        res, carry = ref_mad_u64_u32(1, 1, M64)
+        self.assertEqual(res, 0)
+        self.assertEqual(carry, 1)
+
+    def test_max_possible_65bit_sum(self):
+        # (2^32 - 1)^2 + (2^64 - 1) = 0xFFFFFFFE00000001 + 0xFFFFFFFFFFFFFFFF = 0x1FFFFFFFE00000000
+        res, carry = ref_mad_u64_u32(M32, M32, M64)
+        self.assertEqual(res, 0xFFFFFFFE00000000)
+        self.assertEqual(carry, 1)
+
+    def test_prng_seeded_u64_verification(self):
+        rng = random.Random(0x42)
+        for _ in range(100):
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            s2 = rng.getrandbits(64)
+            expected_sum = (s0 * s1) + s2
+            expected_res = expected_sum & M64
+            expected_carry = (expected_sum >> 64) & 1
+            self.assertEqual(ref_mad_u64_u32(s0, s1, s2), (expected_res, expected_carry))
 
 
 class Mad64Tests(unittest.TestCase):
