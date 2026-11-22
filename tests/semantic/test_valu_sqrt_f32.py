@@ -1,0 +1,1022 @@
+from __future__ import annotations
+
+import math
+import struct
+import unittest
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from fractions import Fraction
+from typing import List, Optional, Tuple, Union
+
+# IEEE 754 binary32 (single precision) architectural constants
+SIGN_MASK: int = 0x8000_0000
+EXP_MASK: int = 0x7F80_0000
+FRAC_MASK: int = 0x007F_FFFF
+QNAN_BIT: int = 0x0040_0000
+CANONICAL_QNAN: int = 0x7FC0_0000
+
+POS_ZERO: int = 0x0000_0000
+NEG_ZERO: int = 0x8000_0000
+POS_INF: int = 0x7F80_0000
+NEG_INF: int = 0xFF80_0000
+
+ONE_F32: int = 0x3F80_0000
+
+
+def f32_to_bits(val: float) -> int:
+    """Convert a Python float to 32-bit IEEE 754 single-precision integer bits."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Convert 32-bit integer bits to a Python float (IEEE 754 single precision)."""
+    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFF_FFFF))[0]
+
+
+def split_f32_bits(bits: int) -> Tuple[int, int, int]:
+    """Unpack bits into (sign, exponent, fraction) components."""
+    sign = (bits & SIGN_MASK) >> 31
+    exponent = (bits & EXP_MASK) >> 23
+    fraction = bits & FRAC_MASK
+    return sign, exponent, fraction
+
+
+def is_nan(bits: int) -> bool:
+    """Return True if bits represent an IEEE 754 single-precision NaN."""
+    return ((bits & EXP_MASK) == EXP_MASK) and ((bits & FRAC_MASK) != 0)
+
+
+def is_qnan(bits: int) -> bool:
+    """Return True if bits represent an IEEE 754 Quiet NaN."""
+    return is_nan(bits) and bool(bits & QNAN_BIT)
+
+
+def is_snan(bits: int) -> bool:
+    """Return True if bits represent an IEEE 754 Signaling NaN."""
+    return is_nan(bits) and not bool(bits & QNAN_BIT)
+
+
+def is_inf(bits: int) -> bool:
+    """Return True if bits represent IEEE 754 positive or negative infinity."""
+    return ((bits & EXP_MASK) == EXP_MASK) and ((bits & FRAC_MASK) == 0)
+
+
+def is_subnormal(bits: int) -> bool:
+    """Return True if bits represent a subnormal (denormal) single-precision float."""
+    return ((bits & EXP_MASK) == 0) and ((bits & FRAC_MASK) != 0)
+
+
+def is_zero(bits: int) -> bool:
+    """Return True if bits represent positive or negative zero."""
+    return (bits & ~SIGN_MASK) == 0
+
+
+def apply_f32_modifiers(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+    """Apply VOP3 input modifiers: abs clears sign bit; neg toggles sign bit."""
+    res = bits & 0xFFFF_FFFF
+    if abs_mod:
+        res &= ~SIGN_MASK
+    if neg_mod:
+        res ^= SIGN_MASK
+    return res
+
+
+def oracle_v_sqrt_f32(
+    src_bits: int,
+    abs_mod: bool = False,
+    neg_mod: bool = False,
+    clamp: bool = False,
+) -> int:
+    """Reference mathematical oracle for RDNA2 v_sqrt_f32 single-precision square root.
+
+    Computes D = sqrt(src) conforming to IEEE 754-2008 single precision (binary32)
+    with Round-to-Nearest-Even (RNE), applying input modifiers and clamp.
+    """
+    s = apply_f32_modifiers(src_bits, abs_mod, neg_mod)
+
+    # 1. NaN handling
+    if is_nan(s):
+        if clamp:
+            return POS_ZERO
+        return s | QNAN_BIT
+
+    # 2. Signed zero handling: sqrt(+0) = +0, sqrt(-0) = -0
+    if is_zero(s):
+        if s == NEG_ZERO:
+            return POS_ZERO if clamp else NEG_ZERO
+        return POS_ZERO
+
+    # 3. Negative values (< 0): Invalid operation -> Canonical Quiet NaN
+    if bool(s & SIGN_MASK):
+        return POS_ZERO if clamp else CANONICAL_QNAN
+
+    # 4. Positive infinity: sqrt(+inf) = +inf
+    if s == POS_INF:
+        return ONE_F32 if clamp else POS_INF
+
+    # 5. Finite positive values
+    f_val = bits_to_f32(s)
+    res_f = math.sqrt(f_val)
+    res = f32_to_bits(res_f)
+
+    # 6. Clamp modifier ([0.0, 1.0])
+    if clamp:
+        if res_f < 0.0 or res == NEG_ZERO:
+            res = POS_ZERO
+        elif res_f > 1.0 or res == POS_INF:
+            res = ONE_F32
+
+    return res
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg32:
+    """Represents an architectural 32-bit register (e.g., v0 or s4)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit literal or inline float constant."""
+    bits: int
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal32:
+        return cls(f32_to_bits(val))
+
+    @property
+    def float_value(self) -> float:
+        return bits_to_f32(self.bits)
+
+    @property
+    def name(self) -> str:
+        if self.bits == POS_ZERO:
+            return "0.0"
+        if self.bits == NEG_ZERO:
+            return "-0.0"
+        f = self.float_value
+        if math.isnan(f):
+            return "nan"
+        if math.isinf(f):
+            return "inf" if f > 0 else "-inf"
+        return f"{f:g}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand:
+    """Typed expression operand with optional input modifiers (abs, neg)."""
+    source: Union[Reg32, Literal32]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass(frozen=True)
+class VSqrtF32Instruction:
+    """Symbolic AST node representing a RDNA2 v_sqrt_f32 instruction."""
+    dst: Reg32
+    src: VOP3Operand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        s = f"v_sqrt_f32 {self.dst.name}, {self.src.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & 0xFFFF_FFFF
+
+    def set_vgpr(self, index: int, bits: int) -> None:
+        self.vgprs[index] = bits & 0xFFFF_FFFF
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & 0xFFFF_FFFF
+
+    def set_sgpr(self, index: int, bits: int) -> None:
+        self.sgprs[index] = bits & 0xFFFF_FFFF
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_sqrt_f32."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg32):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VSqrtF32Instruction, state: ScalarMachineState) -> int:
+        s_raw = self.resolve_operand(instr.src, state)
+
+        result_bits = oracle_v_sqrt_f32(
+            src_bits=s_raw,
+            abs_mod=instr.src.abs_mod,
+            neg_mod=instr.src.neg_mod,
+            clamp=instr.clamp,
+        )
+
+        state.set_vgpr(instr.dst.index, result_bits)
+        return result_bits
+
+
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def get_vgpr(self, lane: int, index: int) -> int:
+        return self.vgprs[lane][index] & 0xFFFF_FFFF
+
+    def set_vgpr(self, lane: int, index: int, bits: int) -> None:
+        self.vgprs[lane][index] = bits & 0xFFFF_FFFF
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & 0xFFFF_FFFF
+
+    def set_sgpr(self, index: int, bits: int) -> None:
+        self.sgprs[index] = bits & 0xFFFF_FFFF
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VOP3Operand, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, Reg32):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(lane, op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VSqrtF32Instruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+        s_vals = [
+            self.resolve_lane_operand(instr.src, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                res = oracle_v_sqrt_f32(
+                    src_bits=s_vals[lane],
+                    abs_mod=instr.src.abs_mod,
+                    neg_mod=instr.src.neg_mod,
+                    clamp=instr.clamp,
+                )
+                state.set_vgpr(lane, instr.dst.index, res)
+                results[lane] = res
+
+        return results
+
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_sqrt_f32_flags(
+    src_bits: int,
+    res_bits: int,
+    abs_mod: bool = False,
+    neg_mod: bool = False,
+    clamp: bool = False,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_sqrt_f32."""
+    s = apply_f32_modifiers(src_bits, abs_mod, neg_mod)
+
+    s_nan = is_nan(s)
+    s_snan = is_snan(s)
+    s_inf = is_inf(s)
+    s_neg = bool(s & SIGN_MASK)
+    s_zero = is_zero(s)
+
+    invalid = False
+    if s_snan:
+        invalid = True
+    elif (s_neg and not s_zero) or (s_inf and s_neg):
+        invalid = True
+
+    nan_flag = is_nan(res_bits)
+    inf_flag = is_inf(res_bits)
+    zero_flag = is_zero(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK)
+    denorm_flag = is_subnormal(res_bits)
+
+    overflow = False
+    underflow = False
+    if denorm_flag:
+        underflow = True
+
+    inexact = False
+    if not (s_nan or s_inf or nan_flag or inf_flag or invalid or s_zero):
+        f = bits_to_f32(s)
+        res_f = bits_to_f32(res_bits)
+        if not clamp:
+            if res_f * res_f != f:
+                inexact = True
+        else:
+            clamped_math = min(1.0, max(0.0, math.sqrt(f)))
+            if clamped_math != res_f or res_f * res_f != f:
+                inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def compute_f32_sqrt_borrow(src_bits: int, res_bits: int) -> Tuple[int, int]:
+    """Demonstrate non-restoring square root integer mantissa remainder and borrow generation."""
+    _, exp, frac = split_f32_bits(src_bits)
+    _, res_exp, res_frac = split_f32_bits(res_bits)
+    m_src = (1 << 23) | frac if exp != 0 else frac
+    m_res = (1 << 23) | res_frac if res_exp != 0 else res_frac
+    radicand = m_src << 23
+    squared = m_res * m_res
+    remainder = radicand - squared
+    borrow = 1 if remainder < 0 else 0
+    return remainder, borrow
+
+
+# ==============================================================================
+# Unit Tests
+# ==============================================================================
+
+class TestF32ModelAndOracle(unittest.TestCase):
+    """Unit tests for binary32 bit model, predicates, and reference oracle."""
+
+    def test_bit_representation_roundtrip(self) -> None:
+        values = [0.0, -0.0, 1.0, -1.0, 0.25, 4.0, 1e-10, 1e10, 3.1415927]
+        for val in values:
+            with self.subTest(val=val):
+                bits = f32_to_bits(val)
+                recovered = bits_to_f32(bits)
+                self.assertEqual(f32_to_bits(recovered), bits)
+                if not math.isnan(val):
+                    self.assertEqual(math.copysign(1.0, val), math.copysign(1.0, recovered))
+
+    def test_classification_predicates(self) -> None:
+        self.assertTrue(f32_to_bits(0.0) == POS_ZERO)
+        self.assertTrue(f32_to_bits(-0.0) == NEG_ZERO)
+        self.assertTrue(is_zero(POS_ZERO))
+        self.assertTrue(is_zero(NEG_ZERO))
+        self.assertFalse(is_zero(f32_to_bits(1.0)))
+
+        self.assertTrue(is_inf(POS_INF))
+        self.assertTrue(is_inf(NEG_INF))
+        self.assertFalse(is_inf(POS_ZERO))
+
+        snan_bits = 0x7F80_0001
+        qnan_bits = CANONICAL_QNAN
+        self.assertTrue(is_nan(snan_bits))
+        self.assertTrue(is_snan(snan_bits))
+        self.assertFalse(is_qnan(snan_bits))
+
+        self.assertTrue(is_nan(qnan_bits))
+        self.assertTrue(is_qnan(qnan_bits))
+        self.assertFalse(is_snan(qnan_bits))
+
+        subnorm_bits = 0x0000_0001
+        self.assertTrue(is_subnormal(subnorm_bits))
+        self.assertFalse(is_subnormal(POS_ZERO))
+        self.assertFalse(is_subnormal(f32_to_bits(1.0)))
+
+    def test_exact_finite_sqrt(self) -> None:
+        c4 = oracle_v_sqrt_f32(f32_to_bits(4.0))
+        self.assertEqual(bits_to_f32(c4), 2.0)
+
+        c9 = oracle_v_sqrt_f32(f32_to_bits(9.0))
+        self.assertEqual(bits_to_f32(c9), 3.0)
+
+        c025 = oracle_v_sqrt_f32(f32_to_bits(0.25))
+        self.assertEqual(bits_to_f32(c025), 0.5)
+
+        c100 = oracle_v_sqrt_f32(f32_to_bits(100.0))
+        self.assertEqual(bits_to_f32(c100), 10.0)
+
+    def test_signed_zero_rules(self) -> None:
+        self.assertEqual(oracle_v_sqrt_f32(POS_ZERO), POS_ZERO)
+        self.assertEqual(oracle_v_sqrt_f32(NEG_ZERO), NEG_ZERO)
+
+    def test_negative_values_produce_canonical_qnan(self) -> None:
+        self.assertEqual(oracle_v_sqrt_f32(f32_to_bits(-4.0)), CANONICAL_QNAN)
+        self.assertEqual(oracle_v_sqrt_f32(NEG_INF), CANONICAL_QNAN)
+
+    def test_input_modifiers_abs_neg(self) -> None:
+        val_neg = f32_to_bits(-16.0)
+        res_abs = oracle_v_sqrt_f32(val_neg, abs_mod=True)
+        self.assertEqual(bits_to_f32(res_abs), 4.0)
+
+        res_neg = oracle_v_sqrt_f32(val_neg, neg_mod=True)
+        self.assertEqual(bits_to_f32(res_neg), 4.0)
+
+        res_neg_pos = oracle_v_sqrt_f32(f32_to_bits(16.0), neg_mod=True)
+        self.assertEqual(res_neg_pos, CANONICAL_QNAN)
+
+        res_both = oracle_v_sqrt_f32(val_neg, abs_mod=True, neg_mod=True)
+        self.assertEqual(res_both, CANONICAL_QNAN)
+
+    def test_clamp_modifier(self) -> None:
+        res_hi = oracle_v_sqrt_f32(f32_to_bits(4.0), clamp=True)
+        self.assertEqual(res_hi, ONE_F32)
+
+        res_mid = oracle_v_sqrt_f32(f32_to_bits(0.25), clamp=True)
+        self.assertEqual(bits_to_f32(res_mid), 0.5)
+
+        res_nz = oracle_v_sqrt_f32(NEG_ZERO, clamp=True)
+        self.assertEqual(res_nz, POS_ZERO)
+
+        res_neg = oracle_v_sqrt_f32(f32_to_bits(-4.0), clamp=True)
+        self.assertEqual(res_neg, POS_ZERO)
+
+    def test_infinity_sqrt(self) -> None:
+        self.assertEqual(oracle_v_sqrt_f32(POS_INF), POS_INF)
+        self.assertEqual(oracle_v_sqrt_f32(POS_INF, clamp=True), ONE_F32)
+        self.assertEqual(oracle_v_sqrt_f32(NEG_INF), CANONICAL_QNAN)
+        self.assertEqual(oracle_v_sqrt_f32(NEG_INF, clamp=True), POS_ZERO)
+
+    def test_nan_quietening_and_propagation(self) -> None:
+        snan = 0x7F80_1234
+        res = oracle_v_sqrt_f32(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertEqual(res, snan | QNAN_BIT)
+
+        qnan = 0x7FC0_8765
+        res_q = oracle_v_sqrt_f32(qnan)
+        self.assertEqual(res_q, qnan)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg32_validation_and_naming(self) -> None:
+        v0 = Reg32(0, RegType.VGPR)
+        self.assertEqual(v0.name, "v0")
+
+        s8 = Reg32(8, RegType.SGPR)
+        self.assertEqual(s8.name, "s8")
+
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+
+    def test_operand_disassembly(self) -> None:
+        v = Reg32(2, RegType.VGPR)
+        op_plain = VOP3Operand(v)
+        self.assertEqual(op_plain.disassemble(), "v2")
+
+        op_abs = VOP3Operand(v, abs_mod=True)
+        self.assertEqual(op_abs.disassemble(), "|v2|")
+
+        op_neg = VOP3Operand(v, neg_mod=True)
+        self.assertEqual(op_neg.disassemble(), "-v2")
+
+        op_neg_abs = VOP3Operand(v, abs_mod=True, neg_mod=True)
+        self.assertEqual(op_neg_abs.disassemble(), "-|v2|")
+
+        lit = Literal32.from_float(4.0)
+        op_lit = VOP3Operand(lit)
+        self.assertEqual(op_lit.disassemble(), "4")
+
+    def test_v_sqrt_f32_ast_construction_and_validation(self) -> None:
+        dst = Reg32(0, RegType.VGPR)
+        src = VOP3Operand(Reg32(2, RegType.VGPR), neg_mod=True, abs_mod=True)
+        instr = VSqrtF32Instruction(dst=dst, src=src, clamp=True)
+
+        self.assertEqual(instr.disassemble(), "v_sqrt_f32 v0, -|v2| clamp")
+
+        # Invalid destination type (SGPR)
+        with self.assertRaises(TypeError):
+            VSqrtF32Instruction(dst=Reg32(0, RegType.SGPR), src=src)
+
+    def test_structural_equality(self) -> None:
+        i1 = VSqrtF32Instruction(
+            Reg32(0, RegType.VGPR),
+            VOP3Operand(Reg32(2, RegType.VGPR)),
+        )
+        i2 = VSqrtF32Instruction(
+            Reg32(0, RegType.VGPR),
+            VOP3Operand(Reg32(2, RegType.VGPR)),
+        )
+        self.assertEqual(i1, i2)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_source(self) -> None:
+        self.state.set_vgpr(2, f32_to_bits(25.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Reg32(2, RegType.VGPR)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f32(res_bits), 5.0)
+        self.assertEqual(self.state.get_vgpr(0), res_bits)
+
+    def test_scalar_sgpr_source(self) -> None:
+        self.state.set_sgpr(4, f32_to_bits(144.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(6, RegType.VGPR),
+            src=VOP3Operand(Reg32(4, RegType.SGPR)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f32(res_bits), 12.0)
+        self.assertEqual(self.state.get_vgpr(6), res_bits)
+
+    def test_scalar_literal_source(self) -> None:
+        instr = VSqrtF32Instruction(
+            dst=Reg32(8, RegType.VGPR),
+            src=VOP3Operand(Literal32.from_float(0.0625)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f32(res_bits), 0.25)
+        self.assertEqual(self.state.get_vgpr(8), res_bits)
+
+    def test_scalar_with_modifiers_and_clamp(self) -> None:
+        self.state.set_vgpr(0, f32_to_bits(-16.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(4, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR), abs_mod=True),
+            clamp=True,
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, ONE_F32)
+        self.assertEqual(self.state.get_vgpr(4), ONE_F32)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_vgpr(0, 0x40490FDB)  # pi
+            instr = VSqrtF32Instruction(
+                dst=Reg32(2, RegType.VGPR),
+                src=VOP3Operand(Reg32(0, RegType.VGPR)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD execution, lane divergence, and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_full_exec(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            val = float(lane * lane)
+            state.set_vgpr(lane, 0, f32_to_bits(val))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(2, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            self.assertIsNotNone(results[lane])
+            self.assertAlmostEqual(bits_to_f32(state.get_vgpr(lane, 2)), float(lane), places=5)
+
+    def test_wave32_divergent_masking(self) -> None:
+        sentinel = 0xDEAD_BEEF
+        state = SIMDState(num_lanes=32, exec_mask=0x5555_5555)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, f32_to_bits(float(lane * lane)))
+            state.set_vgpr(lane, 4, sentinel)
+
+        instr = VSqrtF32Instruction(
+            dst=Reg32(4, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertIsNotNone(results[lane])
+                self.assertAlmostEqual(bits_to_f32(state.get_vgpr(lane, 4)), float(lane), places=5)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 4), sentinel)
+
+    def test_wave64_full_exec(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFF_FFFF_FFFF_FFFF)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, f32_to_bits(float(lane * 4)))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(2, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        self.interp.step(instr, state)
+        for lane in range(64):
+            self.assertAlmostEqual(bits_to_f32(state.get_vgpr(lane, 2)), math.sqrt(float(lane * 4)), places=5)
+
+    def test_wave64_half_disabled(self) -> None:
+        sentinel = 0x1122_3344
+        state = SIMDState(num_lanes=64, exec_mask=0x0000_0000_FFFF_FFFF)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, f32_to_bits(64.0))
+            state.set_vgpr(lane, 4, sentinel)
+
+        instr = VSqrtF32Instruction(
+            dst=Reg32(4, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(64):
+            if lane < 32:
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(bits_to_f32(state.get_vgpr(lane, 4)), 8.0)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 4), sentinel)
+
+    def test_wave_exec_all_zero(self) -> None:
+        sentinel = 0xAA55_AA55
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Literal32.from_float(100.0)),
+        )
+        results = self.interp.step(instr, state)
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+    def test_simd_sgpr_uniform_broadcast(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        state.set_sgpr(10, f32_to_bits(10000.0))
+
+        instr = VSqrtF32Instruction(
+            dst=Reg32(2, RegType.VGPR),
+            src=VOP3Operand(Reg32(10, RegType.SGPR)),
+        )
+        self.interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(bits_to_f32(state.get_vgpr(lane, 2)), 100.0)
+
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src_inplace(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, f32_to_bits(16.0))
+        state.set_vgpr(1, f32_to_bits(999.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f32(state.get_vgpr(0)), 4.0)
+        self.assertEqual(bits_to_f32(state.get_vgpr(1)), 999.0)
+
+    def test_inplace_iterative_convergence(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, f32_to_bits(65536.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        for expected in [256.0, 16.0, 4.0, 2.0]:
+            self.scalar_interp.step(instr, state)
+            self.assertEqual(bits_to_f32(state.get_vgpr(0)), expected)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, f32_to_bits(float(lane * lane)))
+
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertAlmostEqual(bits_to_f32(state.get_vgpr(lane, 0)), float(lane), places=5)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry/borrow generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s = f32_to_bits(4.0)
+        res = oracle_v_sqrt_f32(s)
+        flags = evaluate_v_sqrt_f32_flags(s, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flag(self) -> None:
+        s = f32_to_bits(2.0)
+        res = oracle_v_sqrt_f32(s)
+        flags = evaluate_v_sqrt_f32_flags(s, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_invalid_operation_flag(self) -> None:
+        s_neg = f32_to_bits(-1.0)
+        res = oracle_v_sqrt_f32(s_neg)
+        flags = evaluate_v_sqrt_f32_flags(s_neg, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+        snan = 0x7F80_0001
+        res_snan = oracle_v_sqrt_f32(snan)
+        flags_snan = evaluate_v_sqrt_f32_flags(snan, res_snan)
+        self.assertTrue(flags_snan.invalid)
+        self.assertTrue(flags_snan.nan)
+
+        res_ninf = oracle_v_sqrt_f32(NEG_INF)
+        flags_ninf = evaluate_v_sqrt_f32_flags(NEG_INF, res_ninf)
+        self.assertTrue(flags_ninf.invalid)
+        self.assertTrue(flags_ninf.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        res_pz = oracle_v_sqrt_f32(POS_ZERO)
+        flags_pz = evaluate_v_sqrt_f32_flags(POS_ZERO, res_pz)
+        self.assertTrue(flags_pz.zero)
+        self.assertFalse(flags_pz.negative)
+
+        res_nz = oracle_v_sqrt_f32(NEG_ZERO)
+        flags_nz = evaluate_v_sqrt_f32_flags(NEG_ZERO, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertTrue(flags_nz.negative)
+
+    def test_infinite_flag(self) -> None:
+        res = oracle_v_sqrt_f32(POS_INF)
+        flags = evaluate_v_sqrt_f32_flags(POS_INF, res)
+        self.assertTrue(flags.infinite)
+        self.assertFalse(flags.invalid)
+
+    def test_sqrt_borrow_generation(self) -> None:
+        s4 = f32_to_bits(4.0)
+        res2 = oracle_v_sqrt_f32(s4)
+        rem, borrow = compute_f32_sqrt_borrow(s4, res2)
+        self.assertEqual(borrow, 0)
+
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_sqrt_transition_to_normal(self) -> None:
+        # Smallest positive subnormal in single-precision: 2^-149 (bits: 0x1)
+        # sqrt(2^-149) = sqrt(2 * 2^-150) = sqrt(2) * 2^-75
+        sub_min = 0x0000_0001
+        res = oracle_v_sqrt_f32(sub_min)
+        self.assertFalse(is_subnormal(res))
+        self.assertFalse(is_zero(res))
+        # Exponent: bias 127 - 75 = 52
+        sign, exp, _ = split_f32_bits(res)
+        self.assertEqual(sign, 0)
+        self.assertEqual(exp, 52)
+
+    def test_largest_subnormal_sqrt(self) -> None:
+        # Largest subnormal: 0x007F_FFFF = (1 - 2^-23) * 2^-126
+        # sqrt is just below 2^-63 -> exponent 127 - 64 = 63
+        max_sub = 0x007F_FFFF
+        res = oracle_v_sqrt_f32(max_sub)
+        self.assertFalse(is_subnormal(res))
+        sign, exp, _ = split_f32_bits(res)
+        self.assertEqual(sign, 0)
+        self.assertEqual(exp, 63)
+
+    def test_nan_signaling_to_quiet_conversion(self) -> None:
+        snan = 0x7F80_0005
+        self.assertTrue(is_snan(snan))
+        res = oracle_v_sqrt_f32(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertEqual(res, snan | QNAN_BIT)
+
+    def test_nan_payload_preservation(self) -> None:
+        payload = 0x0045_6789
+        qnan = EXP_MASK | payload
+        res = oracle_v_sqrt_f32(qnan)
+        self.assertEqual(res, qnan)
+
+    def test_nan_with_modifiers(self) -> None:
+        qnan = 0x7FC0_0001
+        res_abs = oracle_v_sqrt_f32(qnan | SIGN_MASK, abs_mod=True)
+        self.assertEqual(res_abs & SIGN_MASK, 0)
+        self.assertTrue(is_qnan(res_abs))
+
+        res_neg = oracle_v_sqrt_f32(qnan, neg_mod=True)
+        self.assertEqual(res_neg & SIGN_MASK, SIGN_MASK)
+
+    def test_nan_with_clamp(self) -> None:
+        qnan = CANONICAL_QNAN
+        res = oracle_v_sqrt_f32(qnan, clamp=True)
+        self.assertEqual(res, POS_ZERO)
+
+        snan = 0x7F80_0001
+        res_snan = oracle_v_sqrt_f32(snan, clamp=True)
+        self.assertEqual(res_snan, POS_ZERO)
+
+    def test_infinity_arithmetic_boundaries(self) -> None:
+        self.assertEqual(oracle_v_sqrt_f32(POS_INF), POS_INF)
+        self.assertEqual(oracle_v_sqrt_f32(NEG_INF), CANONICAL_QNAN)
+        self.assertEqual(oracle_v_sqrt_f32(POS_INF, clamp=True), ONE_F32)
+        self.assertEqual(oracle_v_sqrt_f32(NEG_INF, clamp=True), POS_ZERO)
+
+    def test_maximum_finite_f32(self) -> None:
+        max_f32 = 0x7F7F_FFFF
+        res = oracle_v_sqrt_f32(max_f32)
+        f_res = bits_to_f32(res)
+        self.assertAlmostEqual(f_res, 1.8446743e+19, delta=1e14)
+
+    def test_smallest_normal_f32(self) -> None:
+        # 2^-126 (0x0080_0000) -> sqrt is 2^-63 (0x2000_0000)
+        min_norm = 0x0080_0000
+        res = oracle_v_sqrt_f32(min_norm)
+        expected = 0x2000_0000
+        self.assertEqual(res, expected)
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(300, RegType.SGPR)
+
+    def test_syntax_rejection_invalid_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            VSqrtF32Instruction(
+                dst=Reg32(0, RegType.SGPR),
+                src=VOP3Operand(Reg32(2, RegType.VGPR)),
+            )
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=48)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_divergence(self) -> None:
+        s = f32_to_bits(16.0)
+        res = oracle_v_sqrt_f32(s)
+        self.assertNotEqual(res, f32_to_bits(5.0))
+        self.assertNotEqual(res, f32_to_bits(16.0))
+
+    def test_mutation_detection_identity_mutant(self) -> None:
+        def mutant_oracle(src: int) -> int:
+            return src
+
+        s = f32_to_bits(16.0)
+        golden = oracle_v_sqrt_f32(s)
+        mutant = mutant_oracle(s)
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_snan_unquieted(self) -> None:
+        def mutant_oracle(src: int) -> int:
+            return src
+
+        snan = 0x7F80_0001
+        golden = oracle_v_sqrt_f32(snan)
+        mutant = mutant_oracle(snan)
+        self.assertTrue(is_qnan(golden))
+        self.assertFalse(is_qnan(mutant))
+
+    def test_mutation_detection_neg_zero_to_pos_zero(self) -> None:
+        def mutant_oracle(src: int) -> int:
+            return POS_ZERO if is_zero(src) else oracle_v_sqrt_f32(src)
+
+        golden = oracle_v_sqrt_f32(NEG_ZERO)
+        mutant = mutant_oracle(NEG_ZERO)
+        self.assertEqual(golden, NEG_ZERO)
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_unclamped_mutant(self) -> None:
+        def mutant_oracle(src: int, clamp: bool = False) -> int:
+            return oracle_v_sqrt_f32(src, clamp=False)
+
+        s = f32_to_bits(4.0)
+        golden = oracle_v_sqrt_f32(s, clamp=True)
+        mutant = mutant_oracle(s, clamp=True)
+        self.assertEqual(golden, ONE_F32)
+        self.assertNotEqual(golden, mutant)
+
+    def test_mutation_detection_ignoring_abs_modifier(self) -> None:
+        def mutant_oracle(src: int, abs_mod: bool = False) -> int:
+            return oracle_v_sqrt_f32(src, abs_mod=False)
+
+        val = f32_to_bits(-9.0)
+        golden = oracle_v_sqrt_f32(val, abs_mod=True)
+        mutant = mutant_oracle(val, abs_mod=True)
+        self.assertEqual(bits_to_f32(golden), 3.0)
+        self.assertEqual(mutant, CANONICAL_QNAN)
+        self.assertNotEqual(golden, mutant)
+
+
+if __name__ == "__main__":
+    unittest.main()
