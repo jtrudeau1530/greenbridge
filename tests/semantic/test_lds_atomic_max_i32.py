@@ -836,5 +836,472 @@ class TestTranslatorMaxI32Integration(unittest.TestCase):
                     gen.lds_op("ds_max_i32", [{"r": 0}, {"r": 1}], [])
 
 
+class TestSimdMultiLaneAddressClash(unittest.TestCase):
+    """Verifies SIMD wavefront multi-lane concurrency, address clashes, and return ticket ordering."""
+
+    def test_multi_lane_shared_address_clash_signed_reduction(self):
+        # 32 lanes (a full wave) concurrently target LDS[0] with signed values spanning [-32, +30]
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%ticket = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpStore %out %ticket
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        seed_val = 0xFFFFFF9C  # -100
+        # Lane i inputs: -32, -30, -28, ..., +28, +30
+        lane_inputs = [{"%v_data": to_unsigned_u32(-32 + 2 * i)} for i in range(32)]
+        final_lds, lane_outs = interp.run(num_invocations=32, seed_lds={0: seed_val}, lane_inputs=lane_inputs)
+
+        # Final value in memory must be the global signed maximum (+30)
+        self.assertEqual(final_lds[0], 30)
+
+        # Returned tickets: lane 0 sees -100, and subsequent lanes see non-decreasing signed values
+        tickets = [to_signed_i32(o["%out"]) for o in lane_outs]
+        self.assertEqual(len(tickets), 32)
+        self.assertEqual(tickets[0], -100)
+        for i in range(1, 32):
+            self.assertGreaterEqual(tickets[i], tickets[i - 1])
+        # The last lane sees +28 because all prior values were smaller
+        self.assertEqual(tickets[-1], 28)
+
+    def test_multi_lane_clash_all_negative_values(self):
+        # 16 lanes all passing negative values to the same LDS slot
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 16 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c32 = OpConstant %uint 32
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c32
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%ticket = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpStore %out %ticket
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        # Seed with -1000
+        seed_val = to_unsigned_u32(-1000)
+        # Lane i provides -500 + 10 * i (from -500 up to -350)
+        lane_inputs = [{"%v_data": to_unsigned_u32(-500 + 10 * i)} for i in range(16)]
+        final_lds, lane_outs = interp.run(num_invocations=16, seed_lds={0: seed_val}, lane_inputs=lane_inputs)
+
+        # Signed maximum of negatives: -350 is the largest (closest to 0)
+        self.assertEqual(final_lds[0], to_unsigned_u32(-350))
+        tickets = [to_signed_i32(o["%out"]) for o in lane_outs]
+        self.assertEqual(tickets[0], -1000)
+        self.assertEqual(tickets[-1], -360)
+
+    def test_multi_lane_clash_with_interleaved_extremes(self):
+        # Even lanes pass large negative numbers; odd lanes pass small positive numbers
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%ticket = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpStore %out %ticket
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        seed_val = to_unsigned_u32(-2000)
+        lane_inputs = []
+        for i in range(32):
+            if i % 2 == 0:
+                val = -10000 - i  # large negative
+            else:
+                val = 5 * i       # positive: 5, 15, ..., 155
+            lane_inputs.append({"%v_data": to_unsigned_u32(val)})
+
+        final_lds, lane_outs = interp.run(num_invocations=32, seed_lds={0: seed_val}, lane_inputs=lane_inputs)
+        # Final maximum must be 5 * 31 = 155
+        self.assertEqual(final_lds[0], 155)
+
+        # Ensure that negative values never regress a previously stored higher value
+        signed_mem = to_signed_i32(seed_val)
+        for i, o in enumerate(lane_outs):
+            ret_ticket = to_signed_i32(o["%out"])
+            self.assertEqual(ret_ticket, signed_mem)
+            input_val = to_signed_i32(lane_inputs[i]["%v_data"])
+            signed_mem = max(signed_mem, input_val)
+
+    def test_multi_lane_arrival_order_permutation_invariance(self):
+        # 8 lanes with diverse signed values clashing on the same slot
+        # Verifies that any arrival scheduling yields the identical final signed maximum
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 8 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%dummy = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        raw_vals = [-100, 50, -200, 300, 0, -1, 250, 10]
+        lane_inputs = [{"%v_data": to_unsigned_u32(v)} for v in raw_vals]
+
+        permutations = [
+            list(range(8)),                  # Forward order
+            list(reversed(range(8))),        # Reverse order
+            [1, 3, 5, 7, 0, 2, 4, 6],        # Odd-then-even
+            [7, 0, 6, 1, 5, 2, 4, 3],        # In-out weave
+            [3, 0, 1, 2, 4, 5, 6, 7],        # Winner first
+        ]
+        expected_max = 300
+
+        for order in permutations:
+            with self.subTest(order=order):
+                final_lds, _ = interp.run(
+                    num_invocations=8,
+                    seed_lds={0: to_unsigned_u32(-500)},
+                    lane_inputs=lane_inputs,
+                    lane_order=order,
+                )
+                self.assertEqual(final_lds[0], expected_max)
+
+    def test_multi_lane_partial_active_mask_clash(self):
+        # Only even lanes are active; odd lanes hold tempting large positive values but must not execute
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 16 1 1
+%uint = OpTypeInt 32 0
+%bool = OpTypeBool
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%m_end = OpLabel
+%m_do = OpLabel
+OpSelectionMerge %m_end None
+OpBranchConditional %exec_active %m_do %m_end
+%m_do = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%dummy = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpBranch %m_end
+%m_end = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        # Active even lanes: +10, +20, +30, ... (+80 max)
+        # Inactive odd lanes: +9999 (must be ignored)
+        lane_inputs = []
+        for i in range(16):
+            if i % 2 == 0:
+                val = 10 * (i + 1)
+            else:
+                val = 9999
+            lane_inputs.append({"%v_data": to_unsigned_u32(val)})
+
+        # Exec mask: only even bits active: 0x5555 (bits 0, 2, 4, 6, 8, 10, 12, 14)
+        exec_mask = 0x5555
+        final_lds, _ = interp.run(num_invocations=16, seed_lds={0: 0}, lane_inputs=lane_inputs, exec_mask=exec_mask)
+        # The maximal active value is 10 * 15 = 150 (for lane 14)
+        self.assertEqual(final_lds[0], 150)
+
+
+class TestLdsBankConflictsAndStridePatterns(unittest.TestCase):
+    """Verifies 32-bank conflict patterns, stride strides, and workgroup tree reductions."""
+
+    def test_32_lane_stride32_bank0_conflict(self):
+        # 32 lanes each access dword (lane_id * 32), which all map to physical Bank 0 ((addr >> 2) % 32 == 0)
+        # Each lane must independently write its signed maximum to its dedicated slot without interference
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c1024 = OpConstant %uint 1024
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c1024
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %v_slot
+%old = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        # Seed dwords 0, 32, 64, ..., 992 with negative seed (-50)
+        seed_lds = {i * 32: to_unsigned_u32(-50) for i in range(32)}
+        lane_inputs = []
+        for i in range(32):
+            slot = i * 32
+            # Value varies: lane i passes signed (i - 16) -> spanning [-16, +15]
+            val = to_unsigned_u32(i - 16)
+            lane_inputs.append({"%v_slot": slot, "%v_data": val})
+
+        final_lds, lane_outs = interp.run(num_invocations=32, seed_lds=seed_lds, lane_inputs=lane_inputs)
+
+        for i in range(32):
+            slot = i * 32
+            # Each slot returned the seed (-50)
+            self.assertEqual(lane_outs[i]["%out"], to_unsigned_u32(-50))
+            # Memory contains max(-50, i - 16) = (i - 16)
+            expected = to_unsigned_u32(i - 16)
+            self.assertEqual(final_lds[slot], expected)
+
+    def test_32_lane_conflict_free_diagonal(self):
+        # 32 lanes each access dword i (Bank i % 32 == i) - fully conflict-free
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %v_slot
+%old = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        seed_lds = {i: to_unsigned_u32(-10 * (i + 1)) for i in range(32)}
+        lane_inputs = []
+        for i in range(32):
+            # Input is greater than seed for each lane
+            val = to_unsigned_u32(100 * (i + 1))
+            lane_inputs.append({"%v_slot": i, "%v_data": val})
+
+        final_lds, lane_outs = interp.run(num_invocations=32, seed_lds=seed_lds, lane_inputs=lane_inputs)
+
+        for i in range(32):
+            self.assertEqual(lane_outs[i]["%out"], seed_lds[i])
+            self.assertEqual(final_lds[i], to_unsigned_u32(100 * (i + 1)))
+
+    def test_multi_lane_2way_bank_conflict(self):
+        # 32 lanes targeting 16 banks (2 lanes per bank: lanes k and k+16 target bank k at dword k and k+32)
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 32 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %v_slot
+%dummy = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        seed_lds = {}
+        lane_inputs = []
+        for i in range(32):
+            bank = i % 16
+            row = i // 16
+            slot = bank + row * 32  # slots: 0..15 (bank 0..15) and 32..47 (bank 0..15)
+            seed_lds[slot] = to_unsigned_u32(-500)
+            lane_inputs.append({"%v_slot": slot, "%v_data": to_unsigned_u32(-100 + i * 10)})
+
+        final_lds, _ = interp.run(num_invocations=32, seed_lds=seed_lds, lane_inputs=lane_inputs)
+        for i in range(32):
+            bank = i % 16
+            row = i // 16
+            slot = bank + row * 32
+            self.assertEqual(final_lds[slot], to_unsigned_u32(-100 + i * 10))
+
+    def test_workgroup_tournament_tree_reduction(self):
+        # 32 elements reduced across workgroup tree passes into LDS[0]
+        elements = [
+            -150, 42, -999, 120, -5, 0, 77, -300,
+            12, -88, 500, -1, 33, -40, 89, -12,
+            -200, 310, -75, 4, -8, 99, -450, 16,
+            64, -2, -33, 108, -19, 256, -60, 499
+        ]
+        self.assertEqual(len(elements), 32)
+        true_max = max(elements)
+        self.assertEqual(true_max, 500)
+
+        # Step 1: 16 lanes reduce pairs [i] and [i + 16] using OpAtomicSMax
+        # In a tournament, lane i loads elements[i + stride] and atomically maxes into elements[i]
+        curr_lds = [to_unsigned_u32(x) for x in elements]
+
+        stride = 16
+        while stride >= 1:
+            spvasm = f"""
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize {stride} 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %v_dst_slot
+%dummy = OpAtomicSMax %uint %ptr %c2 %c0 %v_src_val
+OpReturn
+OpFunctionEnd
+"""
+            interp = LdsAtomicMaxI32Interp(spvasm)
+            seed = {idx: curr_lds[idx] for idx in range(len(curr_lds))}
+            lane_inputs = []
+            for lane in range(stride):
+                lane_inputs.append({
+                    "%v_dst_slot": lane,
+                    "%v_src_val": curr_lds[lane + stride],
+                })
+            curr_lds, _ = interp.run(num_invocations=stride, seed_lds=seed, lane_inputs=lane_inputs)
+            stride //= 2
+
+        self.assertEqual(to_signed_i32(curr_lds[0]), true_max)
+
+    def test_wave64_multi_lane_atomic_max_coordination(self):
+        # 64 lanes (Wave64) coordinate: 64 lanes each target (lane_id % 4), so 16 lanes clash per slot
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 64 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %v_slot
+%dummy = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        seed_lds = {0: to_unsigned_u32(-1000), 1: to_unsigned_u32(-1000),
+                    2: to_unsigned_u32(-1000), 3: to_unsigned_u32(-1000)}
+        lane_inputs = []
+        for i in range(64):
+            slot = i % 4
+            val = -500 + i * 15  # Spanning -500 up to +445
+            lane_inputs.append({"%v_slot": slot, "%v_data": to_unsigned_u32(val)})
+
+        final_lds, _ = interp.run(num_invocations=64, seed_lds=seed_lds, lane_inputs=lane_inputs)
+
+        # Expected maximum for each slot s in {0, 1, 2, 3}: max over i with i % 4 == s
+        for s in range(4):
+            expected = max(-500 + i * 15 for i in range(64) if i % 4 == s)
+            self.assertEqual(to_signed_i32(final_lds[s]), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
