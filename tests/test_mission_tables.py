@@ -110,6 +110,23 @@ class TestElement(unittest.TestCase):
         second = by_archetype[0x99887766]
         self.assertEqual([round(value, 4) for value in second["pos"]], [-10.0, 20.0, 30.0])
 
+    def test_resolves_later_slots_when_first_slot_is_missing(self) -> None:
+        blob = blob_with(
+            [(0x100, record(0x11111111, 7, 0x180, 2)),
+             (0x120, record(0x22222222, 7, 0x200, 1))],
+            [(0x1C0, good_element(archetype=0xAABBCCDD, pos=(10.0, 20.0, 30.0))),
+             (0x200, good_element(archetype=0x99887766))],
+        )
+
+        result = M.parse_blob(bytes(blob), "missing-first-slot.bin")
+
+        self.assertEqual((result["records"], result["entities"]), (2, 2))
+        self.assertEqual(result["skipped_slots"], 1)
+        self.assertEqual(result["unresolved_records"], 0)
+        first = result["entity_list"][0]
+        self.assertEqual((first["offset"], first["archetype"], first["pos"]),
+                         (0x1C0, 0xAABBCCDD, [10.0, 20.0, 30.0]))
+
     def test_mismatched_duplicated_position_is_not_an_entity(self):
         broken = bytearray(good_element(archetype=0xDEADBEEF, link=0x00000001))
         struct.pack_into("<I", broken, 0x1C, 0x7FC00000)  # pos.x copy no longer equals pos.x

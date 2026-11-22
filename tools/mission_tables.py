@@ -257,15 +257,10 @@ def resolve(record, elements, pool_base):
     count = record["count"]
     if count == 0:
         return [], "empty", 0
-    candidates = []
-    if record["poolOffset"] in elements:
-        candidates.append((record["poolOffset"], "absolute"))
+    candidates = [(record["poolOffset"], "absolute")]
     if pool_base is not None:
         address = pool_base + (record["poolOffset"] >> POOL_SHIFT)
-        if address in elements:
-            candidates.append((address, "pool"))
-    if not candidates:
-        return [], "unresolved", count
+        candidates.append((address, "pool"))
     best = None
     for base, mode in candidates:
         entities = []
