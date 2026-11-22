@@ -1682,7 +1682,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 | # | Question | How to resolve |
 |---|---|---|
 | 1 | The device entry point is now named `D3D12XboxCreateDevice(adapter, params, riid, out)`. What do its 24-word params and flag bits mean? | Public documentation and the executable's call sites. Log the words and accept any flag bits; do not treat a wrong params layout as fatal until the fields are understood. |
-| 2 | Which Xbox device/heap/queue/command-list slots differ? Prior art measured device slots 62 and 76 and descriptor-heap slots 9/10; slot 14 is the public `CreateDescriptorHeap`, with only the returned heap's start-handle return wrapped. Presentation, command-list, queue and fence slots remain unknown. | Trace every `QueryInterface` and every method slot with per-slot hit counters. A wrong slot shows as an immediate crash or wrong argument; compare against the SDK vtable. |
+| 2 | Which Xbox device/heap/queue/command-list slots differ? Prior art measured device slots 62 and 76 and descriptor-heap slots 9/10; slot 14 is the public `CreateDescriptorHeap`, with only the returned heap's start-handle return wrapped. **Partly measured** with the FSR DLL ([d3d12_command_objects.md §3.5a](d3d12_command_objects.md)): device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76 at their expected shapes (24 in the code, not called), slot 67 a console-only pipeline call; command-list slots 14, 15, 25 and 26 at their PC positions, then shifted (+4 from `SetDescriptorHeaps` at 32, +2 at `ExecuteIndirect` at 61), with console-only methods at 85 and 141. Presentation, queue and fence slots remain unknown. | Trace every `QueryInterface` and every method slot with per-slot hit counters. A wrong slot shows as an immediate crash or wrong argument; compare against the SDK vtable. |
 | 3 | How does the console map a root signature to `s0..s31` (order, per-stage visibility, spills above 32 dwords, static samplers, direct-heap base)? | Dump the game's root-signature blobs with the host deserializer; mask the `0x03000000` flag byte on a copy first; match against the per-shader user-SGPR read sets. If a signature exceeds 32 dwords, reverse the spill pointer from the shader. |
 | 4 | Are Xbox descriptor bytes GFX10 T#/S#, and what are the heap increments? Does the game use `Create*View` or build descriptors itself? | Dump a shader-visible heap after the first `CreateShaderResourceView` and after the first draw; compare the bytes the shader loads with the T# parser. The start-handle return ABI is known (RAX); the increment values still need measuring. |
 | 5 | What is the buffer/descriptor/code VA range, and what arena capacity is needed? | Log every `GetGPUVirtualAddress` and every descriptor base; track the high-water mark. Choose a capacity; grow at a frame boundary if needed. |
@@ -1871,10 +1871,50 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     `ffxCreateContextDescUpscaleVersion` in the chain; 4.1.2 is rejected as invalid, 4.1.1 and 4.0.0 are accepted.
   - With all of that, `ffxCreateContext` returns `FFX_API_RETURN_ERROR` with no message, no XMem allocation and no
     call on the device proxy, for the PC DX12 backend descriptor (`0x2`), for the same `{header, device}` layout
-    under the Xbox backend id (`0x02000000`, `0x02000001`, `0x02000002`), and with no backend descriptor at all. So
-    the build does not recognise the PC backend descriptor, and the Xbox one (`FFX_API_BACKEND_ID_XBOX` is declared
-    in the public `ffx_api.h`, its descriptors are not) is unknown. Hypothesis: it is the GDK's Xbox D3D12 backend
-    descriptor; the executable's `ffxCreateContext` call site would show its type and layout.
+    under `0x02000000`, `0x02000001` and `0x02000002`, and with no backend descriptor at all.
+- **The Xbox backend descriptor, measured from the DLL** (Ghidra 12.2 through REA; RVAs, image base `0x180000000`):
+  - `ffxCreateContext` (`0x11d0`) picks its one provider (`ffxProvider_FSR4_Int8` by RTTI) by finding a device in
+    the chain: type 4 (`GET_VERSIONS`) at `+0x18`, types `0x10009` and **`0x01000002`** at `+0x10`.
+  - The provider's create (`0xc9b0`) wants `CreateContextDescUpscale` (`0x10000`) first, checks the version
+    descriptor (`0x1000b`, 4.0.0 to 4.1.1), then walks `pNext` for **type `0x01000002`: `{header, device}`, the device
+    at `+0x10`**, the same layout as the PC DX12 descriptor. Two of them, or none, is `FFX_API_RETURN_ERROR`
+    without a message: that is what the ids above got. An optional type `0x01000003` sets function pointers: when the
+    one at `+0x20` is set (with `+0x28`), the backend calls it instead of `CreateHeap` (device slot 28, `0x7390`); what
+    its other fields do is open.
+  - The HRESULT checks at the calls seen here (`0x33d4`, `0x65b3`, `0x74a8`) go through one helper (`0x1c60`):
+    `FormatMessageW` of the code, then `throw 1`.
+- **Run with that descriptor** (`fsr_dispatch_test`, PC device on an RTX 2000 Ada, driver 597.06, behind the
+  Xbox-ABI proxy): the DLL creates its backend through the proxy. Device slots called: 14 `CreateDescriptorHeap` (5),
+  15 `GetDescriptorHandleIncrementSize`, 18 `CreateShaderResourceView`, 19 `CreateUnorderedAccessView` and **76** (4),
+  plus heap slot **9** `GetCPUDescriptorHandleForHeapStart` (Xbox RAX form). No earlier test in this repository
+  reached slot 76 or heap slot 9 with a real client; their measured shapes hold. Slot 76 is called with the 7
+  arguments of `CreateCommittedResource`
+  (heap properties, heap flags, resource desc, state, clear value, IID, out; call at `0x33cc`), the desc being the
+  56-byte `D3D12_RESOURCE_DESC` with layout `0x101` and the word 3 at `+0x34`.
+  - On that GPU it stops at its 4th slot-76 texture: 1920x1080 `DXGI_FORMAT_R9G9B9E5_SHAREDEXP` with
+    `ALLOW_UNORDERED_ACCESS`, which the NVIDIA driver refuses (`E_INVALIDARG`); WARP creates it. The console build
+    creates it, so the console takes that format as a UAV. On the same GPU Vulkan has no `STORAGE_IMAGE` support for
+    `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` either (vulkaninfo, driver 597.06), so the layer needs an emulation (32-bit
+    storage plus a pack/unpack) where a GPU lacks it.
+  - With that one texture created as `R32_UINT` instead (the test's PC stand-in, `standin_slot76`), or as is on
+    WARP, `ffxCreateContext` and `ffxDestroyContext` both return OK. Device slots called: 14 (5), 15 (26), 18 (10),
+    19 (16), **27
+    `CreateCommittedResource` (4)**, **38 `GetCopyableFootprints` (4)**, 76 (10); heap slot 9 (26). So the console
+    device also serves the PC `CreateCommittedResource` at slot 27, and slots 14, 15, 18, 19, 27 and 38 keep their PC
+    positions for this client. No compute pipeline or root signature is created at context creation.
+  - On that context, one `ffxDispatch` recorded into a logging command list measures the **console command list**:
+    slots 14, 15, 25 and 26 are at their PC positions, then `SetDescriptorHeaps` is at 32 (PC 28), the compute root
+    setters four slots later (33, 35, 41; two of them inferred from their shapes), `ExecuteIndirect` two slots later
+    (61), and there are console-only methods at 85 and 141. The list object also carries a write cursor and limits
+    (`+0x18`, `+0x28`, `+0x30`) the DLL writes commands through while there is room. Table and evidence:
+    [d3d12_command_objects.md §3.5a](d3d12_command_objects.md).
+    Device slot 67 is a console-only compute-pipeline call (a code blob in its desc), not the PC method at that
+    index; the proxy now refuses it. The dispatch stops where the PC runtime refuses the DLL's compute code at slot
+    62: the DLL's shaders carry an `ACCC` part instead of DXIL.
+  - Its `throw 1` reaches the caller: `_CxxThrowException` finds no image base for a manually mapped image, so the
+    DLL's own handlers cannot catch it (the loader gap `tiny_game`'s `LEONIDA_RUN_EH` check also shows).
+  - `xmem.dll!XMemGetWorkingSetStatistics` takes two arguments, `(0x20000001, stats*)`, at all seven call sites;
+    the one-argument shim wrote through the constant. Fixed in `runtime/shims/xmem.cpp`.
 
 ### A.4 Other DLLs and the executable
 
