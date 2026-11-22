@@ -7,6 +7,7 @@ Set LEONIDA_VK_PIPELINE_CHECK to use a binary elsewhere.
 """
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -72,5 +73,17 @@ class IndexTest(unittest.TestCase):
         self.assertIn("0 shaders in index", r.stderr)
 
 
+def main():
+    """unittest.main(), except that a file whose tests all skipped succeeds: unittest exits 5 for an empty run, and
+    CI runs each file as `python -I tests/test_*.py || exit 1`, so a runner without vk_pipeline_check would fail the
+    job here. A file that has no tests at all (not even skips) is still a failure."""
+    result = unittest.main(exit=False).result
+    if result.failures or result.errors or result.unexpectedSuccesses:
+        return 1
+    if result.testsRun == 0 and not result.skipped:
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(main())
