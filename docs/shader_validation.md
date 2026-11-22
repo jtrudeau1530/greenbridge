@@ -766,7 +766,10 @@ python -I tools/f32_fuzz.py --oracle hw --perturb mul_rtz --programs 500     # o
   `s_getreg_b32`). The primary mode, `flush`, is the state inferred for the game's shaders (IEEE off, f32 denormals
   flushed, DX10_CLAMP on: MODE `0x1c0`). Three more are run for what the model does not judge: `keep` (f32 denormals
   kept, `0x1f0`), `no_dx10` (`0x0c0`), `ieee` (`0x3c0`). The run reads MODE back in a kernel for each and fails if a
-  directive did not take. Rounding is always to nearest even.
+  directive did not take. Rounding is always to nearest even. On gfx1170+ (GFX11.7, GFX12) IEEE and DX10_CLAMP are
+  fixed and AMD clang rejects `.amdhsa_ieee_mode` / `.amdhsa_dx10_clamp` ("directive unsupported on gfx1170+"), so
+  `asm.mode_skip_reason` reports a kernel that sets either as not runnable there and the runner never assembles it;
+  the MODE probe then fails naming that reason instead of a whole chunk failing to assemble (FUZZ-43).
 - **GFX11 against GFX10, handled explicitly** (`tools/hw_oracle/asm.py`, checked by assembling every opcode for gfx1013,
   gfx1010, gfx1030, gfx1100, gfx1150 and gfx1200):
   - *Skipped, never substituted:* `v_mad_f32`, `v_mac_f32`, `v_madak_f32` and `v_mad_legacy_f32` exist on GFX10.1 only
