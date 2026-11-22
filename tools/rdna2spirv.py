@@ -8745,6 +8745,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["outputs"] = outs
     if g.stage == "vs" and g.uses_clip:
         m["clip_distance_count"] = g.clip_count
+    if g.stage == "vs" and g.uses_cull:
+        m["cull_distance_count"] = g.cull_count
     if g.writes_depth:
         m["writes_depth"] = True
     if g.inputs:
