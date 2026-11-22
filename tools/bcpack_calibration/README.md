@@ -1,6 +1,6 @@
 # Calibrated TTPF export
 
-The Python exporter can replay a locally measured reconstruction profile for 2D BC1, BC3, BC4, BC5, BC6H and BC7 textures and 2D arrays. Select it explicitly with `--calibration PROFILE.json`. The profile is data. The compiled library is loaded from this crate's release build directory.
+The Python exporter can replay a locally measured reconstruction profile for 2D BC1, BC3, BC4, BC5, BC6H and BC7 textures and 2D arrays. A single-entry export accepts `--calibration PROFILE.json`. The assets stage discovers `<work>/bcpack-calibration.json`. The profile is data. The compiled library is loaded from this crate's release build directory.
 
 From the repository root, build with Rust/Cargo and run in the Python environment where NumPy is installed:
 
@@ -12,6 +12,12 @@ python -I tools/ttpf_mips.py export path/to/pool.ttpf 0 output.dds --calibration
 ```
 
 The synthetic test constructs its own BC1 pool and profile, runs the CLI and compares the full mip payload with known blocks. A real profile requires the caller's calibrated tables. The exporter does not derive the tables automatically. A matching file hash verifies reproduction of a previous fitted export. Original pixel fidelity needs independent reference pixels.
+
+## Automatic asset export
+
+Run the ordinary build or `python -I make_game.py --game <package> --work <work> --stages assets`. The assets stage runs the C# exporter on each new pool and revisits existing pool manifests. It attempts full mip chains for missing and partial BCn entries whose allocation includes BCPack. With no profile, it uses the Python strict decoder. For calibrated 2D textures and arrays, install NumPy, build the library as above and place a matching profile at `<work>/bcpack-calibration.json` before running the stage.
+
+The DDS files and their manifest are under `<work>/assets/ttpf/<pool>/` or `<work>/assets/ttpf_pack/<pack>/<pool>/`. The manifest keeps the asset key for model lookup and records the new filename, mip count and decoder. A failed reconstruction keeps the previous file reference and records the reason in `BCPackLimitation`. The stage publishes each DDS before replacing the pool manifest. A completed pass skips decoding on the next build. Adding or changing the profile triggers another pass.
 
 ## Version 1 profile
 
