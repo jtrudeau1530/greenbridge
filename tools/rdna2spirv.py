@@ -345,6 +345,21 @@ class Gen:
         self.emit(f"{r} = OpBitwiseOr %uint {keep} {lo16}")
         self.dst(d, r)
 
+    def write_half16(self, d, lo16, dhi):
+        """Write a 16-bit result to the low half of VGPR ``d``, or to the high half when ``dhi`` (op_sel destination bit);
+        the other half is kept either way."""
+        if not dhi:
+            self.write_lo16(d, lo16)
+            return
+        if d["k"] != "vgpr":
+            raise Unsupported("op_sel destination")
+        old, keep, sh16, v = (self.tmp() for _ in range(4))
+        self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', d['r'])}")
+        self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+        self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo16} {self.cu(16)}")
+        self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+        self.dst(d, v)
+
     @staticmethod
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
@@ -5284,6 +5299,82 @@ class Gen:
                     self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
                     self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
                     self.dst(a[0], v)
+        elif op in ("v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_ldexp_f16"):
+            # The binary16 version of v_frexp_mant_f32 / v_frexp_exp_i32_f32 / v_ldexp_f32, bit-exact on the f16 word
+            # of the low half (op_sel picks the high half of a source; the last bit sends the result to the high half;
+            # the other half of the destination is kept). A normal f16 has a biased exponent of 1..30 (bias 15); zero and
+            # denormals are read as zero and exponent 31 (infinity, NaN) passes through. clamp and output multipliers
+            # are rejected rather than guessed.
+            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                raise Unsupported(op + " output modifier")
+            nsrc = 2 if op == "v_ldexp_f16" else 1
+            sel, dhi = self.opsel_bits(mods, nsrc)
+            u = self.src_h(a[1])
+            if sel[0]:
+                t = self.tmp()
+                self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+                u = t
+            x = self.tmp()
+            self.emit(f"{x} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+            if a[1].get("abs"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseAnd %uint {x} {self.cu(0x7FFF)}")
+                x = t
+            if a[1].get("neg"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseXor %uint {x} {self.cu(0x8000)}")
+                x = t
+            e, em1, isnorm, isden, sgn, other = (self.tmp() for _ in range(6))
+            self.emit(f"{e} = OpBitFieldUExtract %uint {x} {self.cu(10)} {self.cu(5)}")
+            self.emit(f"{em1} = OpISub %uint {e} {self.cu(1)}")
+            self.emit(f"{isnorm} = OpULessThan %bool {em1} {self.cu(30)}")             # exponent field 1..30
+            self.emit(f"{isden} = OpIEqual %bool {e} {self.cu(0)}")
+            self.emit(f"{sgn} = OpBitwiseAnd %uint {x} {self.cu(0x8000)}")
+            self.emit(f"{other} = OpSelect %uint {isden} {sgn} {x}")                   # zero/denormal -> +-0, inf/NaN -> S0
+            r = self.tmp()
+            if op == "v_frexp_exp_i16_f16":
+                ex = self.tmp()
+                self.emit(f"{ex} = OpISub %uint {e} {self.cu(14)}")                   # biased exponent - 15 + 1
+                self.emit(f"{r} = OpSelect %uint {isnorm} {ex} {self.cu(0)}")
+            elif op == "v_frexp_mant_f16":
+                keep, m = self.tmp(), self.tmp()
+                self.emit(f"{keep} = OpBitwiseAnd %uint {x} {self.cu(0x83FF)}")
+                self.emit(f"{m} = OpBitwiseOr %uint {keep} {self.cu(0x3800)}")        # biased exponent 14
+                self.emit(f"{r} = OpSelect %uint {isnorm} {m} {other}")
+            else:
+                # D = S0 * 2^S1, S1 a signed 16-bit integer clamped to [-64, 64] and added to the exponent field;
+                # above 30 the result is +-inf, at 0 or below +-0 (no denormal results).
+                n = self.src_u(a[2])
+                if sel[1]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpShiftRightLogical %uint {n} {self.cu(16)}")
+                    n = t
+                n16, nu, nb, small, neg, lim, nc = (self.tmp() for _ in range(7))
+                self.emit(f"{n16} = OpBitFieldSExtract %int {self.as_int(n)} {self.cu(0)} {self.cu(16)}")
+                self.emit(f"{nu} = OpBitcast %uint {n16}")
+                self.emit(f"{nb} = OpIAdd %uint {nu} {self.cu(64)}")
+                self.emit(f"{small} = OpULessThan %bool {nb} {self.cu(129)}")          # -64 <= n <= 64
+                self.emit(f"{neg} = OpBitFieldUExtract %uint {nu} {self.cu(31)} {self.cu(1)}")
+                self.emit(f"{lim} = OpSelect %uint {self.tmp_bool_nz(neg)} {self.cu(0xFFFFFFC0)} {self.cu(64)}")
+                self.emit(f"{nc} = OpSelect %uint {small} {nu} {lim}")
+                e2, e2m1, valid, pos, posb, over = (self.tmp() for _ in range(6))
+                self.emit(f"{e2} = OpIAdd %uint {e} {nc}")
+                self.emit(f"{e2m1} = OpISub %uint {e2} {self.cu(1)}")
+                self.emit(f"{valid} = OpULessThan %bool {e2m1} {self.cu(30)}")         # new exponent field 1..30
+                self.emit(f"{pos} = OpBitFieldUExtract %uint {e2} {self.cu(31)} {self.cu(1)}")
+                self.emit(f"{posb} = OpIEqual %bool {pos} {self.cu(0)}")
+                self.emit(f"{over} = OpLogicalAnd %bool {posb} {self.tmp_bool_nz(e2)}")
+                sh, keep, norm, inf, ov, scaled = (self.tmp() for _ in range(6))
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {e2} {self.cu(10)}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {x} {self.cu(0x83FF)}")
+                self.emit(f"{norm} = OpBitwiseOr %uint {keep} {sh}")
+                self.emit(f"{inf} = OpBitwiseOr %uint {sgn} {self.cu(0x7C00)}")
+                self.emit(f"{ov} = OpSelect %uint {over} {inf} {sgn}")
+                self.emit(f"{scaled} = OpSelect %uint {valid} {norm} {ov}")
+                self.emit(f"{r} = OpSelect %uint {isnorm} {scaled} {other}")
+            lo = self.tmp()
+            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            self.write_half16(a[0], lo, dhi)
         elif op == "v_cvt_f32_f16":
             u = self.src_h(a[1])
             v2, f = self.tmp(), self.tmp()
