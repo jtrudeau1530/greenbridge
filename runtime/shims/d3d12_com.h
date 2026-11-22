@@ -119,6 +119,9 @@ struct VulkanDeviceInfo {
     // instance (only meaningful with `presentation`): a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per
     // present, which PresentX's ImmediateThresholdPercent uses.
     bool swapchain_maintenance1 = false;
+    // VK_EXT_swapchain_colorspace is enabled on the instance (with `presentation`): the surface can list its HDR10
+    // (ST.2084) formats, which a PresentX plane in HDR10 uses. Without it HDR10 planes are clipped to SDR.
+    bool swapchain_colorspace = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
@@ -252,6 +255,9 @@ private:
     IUnknown* device_;
     std::unique_ptr<leonida::VulkanPresenter> presenter_;
 };
+
+// Whether `device` (from create_vulkan_device*) was created with VK_EXT_swapchain_colorspace on its instance.
+bool device_has_swapchain_colorspace(ID3D12Device* device);
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);

@@ -44,22 +44,28 @@ vec3 srgb_encode(vec3 c) {
     return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, greaterThan(c, vec3(0.0031308)));
 }
 
-vec4 fetch_texel(texture2D t, ivec2 i) { return texelFetch(t, i, 0); }
+// `pre`: straight-alpha data is filtered premultiplied (colour * alpha), else a transparent texel would drag the colour of its neighbours down.
+vec4 fetch_texel(texture2D t, ivec2 i, bool pre) {
+    vec4 c = texelFetch(t, i, 0);
+    return pre ? vec4(c.rgb * c.a, c.a) : c;
+}
 
 // The plane's value at output pixel `pixel` (its centre), in the plane's own encoding.
 vec4 fetch_plane(texture2D t, vec4 dest, vec4 src, uint flags, ivec2 pixel) {
     vec2 p = (vec2(pixel) + 0.5 - dest.xy) / (dest.zw - dest.xy);  // 0..1 across the destination rectangle
     vec2 s = src.xy + p * (src.zw - src.xy);                        // continuous texel coordinates
     vec2 lo = src.xy, hi = src.zw - 1.0;
+    bool pre = (flags & flag_straight_alpha) != 0u;
     vec4 c;
     if ((flags & flag_point) != 0u) {
-        c = fetch_texel(t, ivec2(clamp(floor(s), lo, hi)));
+        c = fetch_texel(t, ivec2(clamp(floor(s), lo, hi)), false);
     } else {
         vec2 f = clamp(s - 0.5, lo, hi);  // the texel whose centre is at or before the sample, clamped inside the rectangle
         vec2 base = floor(f), w = f - base;
         ivec2 i0 = ivec2(base), i1 = ivec2(min(base + 1.0, hi));
-        c = mix(mix(fetch_texel(t, ivec2(i0.x, i0.y)), fetch_texel(t, ivec2(i1.x, i0.y)), w.x),
-                mix(fetch_texel(t, ivec2(i0.x, i1.y)), fetch_texel(t, ivec2(i1.x, i1.y)), w.x), w.y);
+        c = mix(mix(fetch_texel(t, ivec2(i0.x, i0.y), pre), fetch_texel(t, ivec2(i1.x, i0.y), pre), w.x),
+                mix(fetch_texel(t, ivec2(i0.x, i1.y), pre), fetch_texel(t, ivec2(i1.x, i1.y), pre), w.x), w.y);
+        if (pre) c.rgb = c.a > 0.0 ? c.rgb / c.a : vec3(0.0);  // back to unassociated colour
     }
     if ((flags & flag_srgb_source) != 0u) c.rgb = srgb_encode(c.rgb);
     return c;
@@ -102,7 +108,7 @@ void main() {
 
     vec3 base = vec3(0.0);  // outside plane 0's rectangle: black
     if (all(greaterThanEqual(centre, pc.dest0.xy)) && all(lessThan(centre, pc.dest0.zw))) {
-        vec4 c = fetch_plane(plane0, pc.dest0, pc.src0, pc.flags0, pixel);
+        vec4 c = fetch_plane(plane0, pc.dest0, pc.src0, pc.flags0 & ~flag_straight_alpha, pixel);
         base = to_output(c.rgb, (pc.flags0 & flag_hdr10) != 0u);
     }
     if (pc.plane_count > 1u && all(greaterThanEqual(centre, pc.dest1.xy)) && all(lessThan(centre, pc.dest1.zw))) {

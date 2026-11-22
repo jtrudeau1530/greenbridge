@@ -2032,7 +2032,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   **clipping** to 0..1 and pow 1/2.2: there is no tone mapping, so highlights above SDR white clip (honest, not good looking).
   Blending is done in the output's encoded values (PQ for an HDR10 output), which is not light-linear; the console's
   blending space is unmeasured. A plane's own alpha in premultiplied form is divided out before a colour conversion and put
-  back after. Filtering (bilinear) of an HDR10 plane is done on its PQ-encoded values, not in linear light (an unmeasured
+  back after. Bilinear filtering of a straight-alpha plane is done on premultiplied colour (colour times alpha, then divided
+  by the filtered alpha), so a transparent texel adds no colour of its own (found in review by @Flyander; tested across a
+  transparent edge). The real runtime's instance (`create_vulkan_device_standalone`) enables `VK_EXT_swapchain_colorspace`
+  when the loader has it (it did not before; only the test device did), so the HDR10 surface formats can be listed there;
+  `xbox_present_test` checks this on the standalone path. Filtering (bilinear) of an HDR10 plane is done on its PQ-encoded values, not in linear light (an unmeasured
   choice; it darkens or brightens edges against a linear-light filter). Limited-range and YCbCr colour spaces are not modelled.
   *Verified* by `xbox_present_test` against a CPU model written from the above (not from the shader): point filtering
   between opaque SDR planes is byte exact; bilinear, alpha blending (premultiplied and straight, point and bilinear) are

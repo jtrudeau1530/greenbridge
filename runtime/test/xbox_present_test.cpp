@@ -146,9 +146,18 @@ std::array<double, 4> sample(const Ref_plane& p, int x, int y) {
     const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
     const int x1 = int(std::min(double(x0) + 1, p.src[2] - 1)), y1 = int(std::min(double(y0) + 1, p.src[3] - 1));
     const double wx = fx - x0, wy = fy - y0;
+    // Four texels with their bilinear weights. Straight-alpha colour is weighted by its alpha (filtering associated colour),
+    // then divided by the filtered alpha: a transparent texel contributes no colour of its own.
+    const double weight[4] = {(1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy};
+    const std::array<double, 4> texel[4] = {at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1)};
     std::array<double, 4> out{};
-    for (int c = 0; c < 4; ++c)
-        out[c] = (at(x0, y0)[c] * (1 - wx) + at(x1, y0)[c] * wx) * (1 - wy) + (at(x0, y1)[c] * (1 - wx) + at(x1, y1)[c] * wx) * wy;
+    for (int i = 0; i < 4; ++i) {
+        const double colour_weight = p.straight ? weight[i] * texel[i][3] : weight[i];
+        for (int c = 0; c < 3; ++c) out[c] += texel[i][c] * colour_weight;
+        out[3] += texel[i][3] * weight[i];
+    }
+    if (p.straight)
+        for (int c = 0; c < 3; ++c) out[c] = out[3] > 0.0 ? out[c] / out[3] : 0.0;
     return out;
 }
 V3 compose(const Ref_plane* planes, int count, bool out_hdr, double white, int x, int y) {
@@ -240,6 +249,33 @@ int main() {
     ShowWindow(window, SW_SHOWNORMAL);
     UpdateWindow(window);
     pump();
+
+    {
+        // The real runtime's instance path (create_vulkan_device_standalone, not the test device): it must enable
+        // VK_EXT_swapchain_colorspace when the loader has it, or the HDR10 surface formats can never be listed.
+        Ref<ID3D12Device> standalone;
+        if (SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone.p)))) {
+            const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                d.instance_proc(nullptr, "vkEnumerateInstanceExtensionProperties"));
+            std::uint32_t count = 0;
+            enumerate(nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> available(count);
+            enumerate(nullptr, &count, available.data());
+            bool loader_has = false;
+            for (const auto& e : available) loader_has = loader_has || !std::strcmp(e.extensionName, "VK_EXT_swapchain_colorspace");
+            auto standalone_presenter = rt::d3d12::create_window_presenter(standalone.p, window);
+            if (standalone_presenter) {
+                EXPECT(rt::d3d12::device_has_swapchain_colorspace(standalone.p) == loader_has);
+                EXPECT(standalone_presenter->enable_capture());
+                EXPECT(SUCCEEDED(standalone_presenter->present_blank(1)));
+                std::printf("standalone device (real instance path): VK_EXT_swapchain_colorspace %s on the instance (loader has it: %s)\n",
+                            rt::d3d12::device_has_swapchain_colorspace(standalone.p) ? "enabled" : "not enabled",
+                            loader_has ? "yes" : "no");
+            } else {
+                std::printf("standalone device: no window presenter (skipped the instance-extension check)\n");
+            }
+        }
+    }
 
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -715,6 +751,25 @@ int main() {
             refs[1] = model(ui, &middle_half, false);
             EXPECT(frame_matches(frame, refs, 2, false, 203.0, 1));
             std::printf("compose: 2 planes, bilinear overlay: within 1 level of the model\n");
+            // Straight alpha with bilinear filtering across a transparent edge: opaque white on the left, transparent black on the
+            // right. Colour is filtered premultiplied, so the edge is white at partial alpha, not grey (filtering the
+            // unassociated colour would also quarter the colour and quarter it again by the alpha). At output x=160 the sample
+            // is 0.75 of the way from the white texel to the transparent one: alpha 0.25, colour white:
+            // base 51 + 0.25 * (255 - 51) = 102.
+            Painted edge;
+            EXPECT(make_painted(edge, 80, 60));
+            EXPECT(paint(edge, {0, 0, 40, 60}, 255, 255, 255, 255) && paint(edge, {40, 0, 80, 60}, 0, 0, 0, 0));
+            pair[1] = parameters(edge.source, &middle_half, xbox_scale_filter_linear, 0,
+                                 rt::d3d12::xbox_plane_flag_overlay | rt::d3d12::xbox_plane_flag_straight_alpha);
+            EXPECT(present_planes(pair, 2) && composed_ok());
+            refs[1] = model(edge, &middle_half, false, nullptr, false, true);
+            EXPECT(frame_matches(frame, refs, 2, false, 203.0, 1));
+            {
+                const Px edge_px = frame.at(160, 120);
+                // red: 51 + 0.25 * 204 = 102 (blue: 230 + 0.25 * 25 = 236); the unfiltered-colour result would be near 54
+                EXPECT(std::abs(edge_px.r - 102) <= 1 && std::abs(edge_px.b - 236) <= 1);
+            }
+            std::printf("compose: straight alpha, bilinear across a transparent edge (premultiplied filtering): ok\n");
 
             // C: HDR10 (PQ, Rec.2020) planes. Plane 0 is 80x60 R10G10B10A2 (three bands: SDR white level, a bright
             // colour above it, and a dim colour), shown 4x on the whole output.

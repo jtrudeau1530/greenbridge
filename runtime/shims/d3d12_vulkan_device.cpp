@@ -5942,6 +5942,12 @@ bool WindowPresenter::read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* e
 VkExtent2D WindowPresenter::extent() const { return presenter_->extent(); }
 std::uint64_t WindowPresenter::presented() const { return presenter_->presented(); }
 
+bool device_has_swapchain_colorspace(ID3D12Device* device) {
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    return d && d->state().info.swapchain_colorspace;
+}
+
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window) {
     Device* d = Device::from<Device>(device);
     if (!d || !window) return nullptr;
@@ -6030,6 +6036,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         get(nullptr, "vkEnumerateInstanceExtensionProperties"));
     std::vector<const char*> inst_exts;
     bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;  // enabled on the instance
+    bool swapchain_colorspace_enabled = false;  // VK_EXT_swapchain_colorspace on the instance
     if (enum_inst_exts) {
         std::uint32_t ext_cnt = 0;
         enum_inst_exts(nullptr, &ext_cnt, nullptr);
@@ -6046,6 +6053,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         if (has_surface && has_win32) {
             inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
             inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+            // Lists the HDR10 (ST.2084) surface formats, which a PresentX plane in HDR10 can use (xbox_present.h); without it
+            // the surface only offers sRGB-nonlinear ones.
+            for (const auto& e : available)
+                if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+                    inst_exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                    swapchain_colorspace_enabled = true;
+                    break;
+                }
             // The surface half of VK_*_swapchain_maintenance1 (the present modes a swapchain can switch between).
             if (has_caps2 && (surface_maintenance1_khr || surface_maintenance1_ext)) {
                 inst_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
@@ -6433,6 +6448,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
     info.presentation = has_swapchain && instance_has_surface;
+    info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
