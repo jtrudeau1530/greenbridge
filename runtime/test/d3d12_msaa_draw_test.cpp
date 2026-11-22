@@ -131,7 +131,7 @@ int main() {
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&three.p)) == E_INVALIDARG && !three.p);
         pso_desc.SampleDesc = {samples, 1};  // past NumQualityLevels (1): D3D12 returns E_INVALIDARG
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&three.p)) == E_INVALIDARG && !three.p);
-        pso_desc.SampleDesc = {samples, UINT(D3D12_STANDARD_MULTISAMPLE_PATTERN)};  // accepted natively
+        pso_desc.SampleDesc = {samples, UINT(DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN)};  // accepted natively
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&three.p))));
         three.reset();
 

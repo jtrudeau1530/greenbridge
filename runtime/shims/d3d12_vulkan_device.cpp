@@ -8,6 +8,7 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #endif
 #include "d3d12_com.h"
+#include "d3d12_feature_compat.h"
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
@@ -2257,12 +2258,12 @@ public:
         // E_INVALIDARG, as NumQualityLevels is 1). The standard pattern is Vulkan's standard sample positions, so it
         // is quality 0 here. The centre pattern puts every sample at the pixel centre, which needs custom sample
         // locations: refused with a log until those are set.
-        if (desc.SampleDesc.Quality == UINT(D3D12_CENTER_MULTISAMPLE_PATTERN)) {
+        if (desc.SampleDesc.Quality == DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN) {
             log_once("D3D12_CENTER_MULTISAMPLE_PATTERN needs custom sample locations (not set yet); samples",
                      int(samples));
             return E_NOTIMPL;
         }
-        if (desc.SampleDesc.Quality != 0 && desc.SampleDesc.Quality != UINT(D3D12_STANDARD_MULTISAMPLE_PATTERN)) {
+        if (desc.SampleDesc.Quality != 0 && desc.SampleDesc.Quality != DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN) {
             log_once("invalid graphics pipeline sample quality:", int(desc.SampleDesc.Quality));
             return E_INVALIDARG;
         }
@@ -5626,12 +5627,10 @@ public:
         case D3D12_FEATURE_PREDICATION:
             return write_supported_feature<D3D12_FEATURE_DATA_PREDICATION>(
                 method, data, size, state_.info.conditional_rendering ? TRUE : FALSE);
-        case D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE:
-            return write_supported_feature<D3D12_FEATURE_DATA_APPLICATION_SPECIFIC_DRIVER_STATE>(
-                method, data, size, FALSE);
-        case D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED:
-            return write_supported_feature<D3D12_FEATURE_DATA_BYTECODE_BYPASS_HASH_SUPPORTED>(
-                method, data, size, FALSE);
+        case compat::kFeatureApplicationSpecificDriverState:
+            return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);
+        case compat::kFeatureBytecodeBypassHashSupported:
+            return write_supported_feature<compat::FeatureSupportFlag>(method, data, size, FALSE);
         default:
             // Not answered yet. The log above lists every query; answers are added as the trace asks for them.
             return d3d12_trace::result(method, E_INVALIDARG);

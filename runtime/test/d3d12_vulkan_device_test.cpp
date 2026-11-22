@@ -10,6 +10,7 @@
 // under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_feature_compat.h"
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
@@ -2161,8 +2162,8 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     D3D12_FEATURE_DATA_CROSS_NODE cross_node{};
     D3D12_FEATURE_DATA_DISPLAYABLE displayable{};
     D3D12_FEATURE_DATA_PREDICATION predication{};
-    D3D12_FEATURE_DATA_APPLICATION_SPECIFIC_DRIVER_STATE driver_state{};
-    D3D12_FEATURE_DATA_BYTECODE_BYPASS_HASH_SUPPORTED bypass_hash{};
+    rt::d3d12::compat::FeatureSupportFlag driver_state{};
+    rt::d3d12::compat::FeatureSupportFlag bypass_hash{};
     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT prot_support{};
     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT prot_count{};
     D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES prot_types{};
@@ -2174,9 +2175,12 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     query_ours(std::pair{"CROSS_NODE", D3D12_FEATURE_CROSS_NODE}, cross_node);
     query_ours(std::pair{"DISPLAYABLE", D3D12_FEATURE_DISPLAYABLE}, displayable);
     query_ours(std::pair{"PREDICATION", D3D12_FEATURE_PREDICATION}, predication);
-    query_ours(std::pair{"APPLICATION_SPECIFIC_DRIVER_STATE", D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE},
+    query_ours(std::pair{"APPLICATION_SPECIFIC_DRIVER_STATE",
+                         rt::d3d12::compat::kFeatureApplicationSpecificDriverState},
                driver_state);
-    query_ours(std::pair{"BYTECODE_BYPASS_HASH_SUPPORTED", D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED}, bypass_hash);
+    query_ours(std::pair{"BYTECODE_BYPASS_HASH_SUPPORTED",
+                         rt::d3d12::compat::kFeatureBytecodeBypassHashSupported},
+               bypass_hash);
     query_ours_input(std::pair{"PROTECTED_RESOURCE_SESSION_SUPPORT", D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT},
                      D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT{0, {}}, prot_support);
     query_ours_input(
@@ -2569,11 +2573,13 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "Supported", a.Supported, b.Supported);
                  });
-    compare_host("APPLICATION_SPECIFIC_DRIVER_STATE", D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE, driver_state,
+    compare_host("APPLICATION_SPECIFIC_DRIVER_STATE", rt::d3d12::compat::kFeatureApplicationSpecificDriverState,
+                 driver_state,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "Supported", a.Supported, b.Supported);
                  });
-    compare_host("BYTECODE_BYPASS_HASH_SUPPORTED", D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED, bypass_hash,
+    compare_host("BYTECODE_BYPASS_HASH_SUPPORTED", rt::d3d12::compat::kFeatureBytecodeBypassHashSupported,
+                 bypass_hash,
                  [&](const char* n, const auto& a, const auto& b) {
                      check_bool(n, "Supported", a.Supported, b.Supported);
                  });
