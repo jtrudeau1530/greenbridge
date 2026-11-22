@@ -204,7 +204,7 @@ def write_outputs(rows, summary, out_path, csv_path):
     if csv_path:
         _make_parent(csv_path)
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             w.writerows(rows)
         written.append(csv_path)
