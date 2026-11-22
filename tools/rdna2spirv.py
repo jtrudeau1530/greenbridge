@@ -3084,8 +3084,16 @@ class Gen:
                 self.emit(f"{r} = OpSelect %uint {ex} {sh} {self.cu(0)}")
                 self.uses_subgroup = self.uses_ballot = True
             else:
-                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {dat} {ln2}")
-                self.uses_subgroup = True
+                # Wave32: a source lane that is off in EXEC reads as 0 here too (RDNA ISA 10.4.4). Until
+                # 2026-11-21 the raw value was shuffled. GPU-checked with cs_bpermute32. A source lane that isn't
+                # running (a partial wave) reads 0 as well, through the same ballot as the wave64 path.
+                z, bal, ex, sh = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
+                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {ln2}")
+                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {ln2}")
+                self.emit(f"{r} = OpSelect %uint {ex} {sh} {self.cu(0)}")
+                self.uses_subgroup = self.uses_ballot = True
             self.dst(d, r)
         elif op == "ds_permute_b32":
             self.ds_permute(a, mods)
