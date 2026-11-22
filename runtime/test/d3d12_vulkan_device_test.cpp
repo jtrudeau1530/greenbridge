@@ -3945,7 +3945,7 @@ int main() {
         // RTX 5070 / 621.14 host answers, without requiring a host device for this regression.
         for (const UINT samples : {0u, 33u, 64u, UINT_MAX}) {
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{DXGI_FORMAT_R8G8B8A8_UNORM, samples,
-                                                               D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+                                                                D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
             EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
                                                sizeof(quality)) == E_FAIL);
             EXPECT(quality.NumQualityLevels == 0);
@@ -3955,7 +3955,7 @@ int main() {
                                (format <= 115 || (format >= 189 && format <= 191));
             for (const UINT samples : {1u, 3u, 31u}) {
                 D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{DXGI_FORMAT(format), samples,
-                                                                   D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+                                                                    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
                 EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
                                                    sizeof(quality)) == (known ? S_OK : E_FAIL));
                 EXPECT(quality.NumQualityLevels == (known ? UINT(samples == 1) : 99u));
