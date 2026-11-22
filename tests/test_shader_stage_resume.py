@@ -260,6 +260,22 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertGreater(os.path.getsize(listing), 0)
         self.assertEqual(self.run_stage(), [])
 
+    def test_deleting_every_listing_and_the_translation_disassembles_again(self):
+        # README.md, "Low disk space": deleting the .s files with spirv/index.json must not leave the stage
+        # looking finished with zero shaders.
+        self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
+        disasm = os.path.join(self.dxbc, "disasm")
+        for name in os.listdir(disasm):
+            if name.endswith(".s"):
+                os.remove(os.path.join(disasm, name))
+        os.remove(os.path.join(self.spirv, "index.json"))
+
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertTrue(os.path.isfile(os.path.join(disasm, "s0.s")))
+        self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), [])
+
     def test_translation_stopped_after_many_files_runs_again(self):
         self.run_stage()
         os.remove(os.path.join(self.spirv, "index.json"))   # stopped before --merge
