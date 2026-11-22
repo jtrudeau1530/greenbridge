@@ -1458,6 +1458,7 @@ public:
         binding.volume = volume;
         binding.samples = samples;
         binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+        binding.sampled = (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
         // With the bindless set, a view's descriptor has one layout for as long as it lives (bind_image).
@@ -5921,6 +5922,14 @@ std::uint64_t WindowPresenter::tear_presents() const { return presenter_->tear_p
 HRESULT WindowPresenter::present_blank(UINT sync_interval) {
     return present_result(presenter_->present_blank(sync_interval > 0));
 }
+
+HRESULT WindowPresenter::present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear) {
+    return present_result(presenter_->present_planes(planes, sync_interval > 0, tear));
+}
+
+bool WindowPresenter::hdr_active() const { return presenter_->hdr_active(); }
+void WindowPresenter::force_hdr_encoding(bool on) { presenter_->force_hdr_encoding(on); }
+std::uint64_t WindowPresenter::composed_presents() const { return presenter_->composed_presents(); }
 
 bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
 

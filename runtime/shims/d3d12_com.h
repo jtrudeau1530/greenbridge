@@ -29,6 +29,7 @@
 
 namespace leonida {
 class VulkanPresenter;
+struct PresentPlanes;
 }
 
 namespace rt::d3d12 {
@@ -229,6 +230,13 @@ public:
                     bool tear = false);
     // A black frame, nothing read (PresentX with no planes).
     HRESULT present_blank(UINT sync_interval);
+    // One or two planes composed (VulkanPresenter::present_planes); `planes` names the textures by ResourceId, so the
+    // caller fills it with resource_id(). DXGI_ERROR_UNSUPPORTED for a source the compose pass cannot read.
+    HRESULT present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear = false);
+    // The swapchain holds HDR10 (ST.2084) values; and a test hook (VulkanPresenter::force_hdr_encoding).
+    bool hdr_active() const;
+    void force_hdr_encoding(bool on);
+    std::uint64_t composed_presents() const;  // presents that went through the compose pass
     bool tear_supported() const;
     bool last_present_tore() const;
     std::uint64_t tear_presents() const;

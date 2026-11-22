@@ -37,12 +37,35 @@ inline constexpr std::uint32_t xbox_frame_interval_120hz_us = 8333;
 
 // Provisional (ours): D3D12XBOX_PRESENT_PLANE_PARAMETERS. The names are those the samples use; the layout, the
 // token width (64 bits here) and the fields the console has beyond these are unmeasured.
+//
+// The fields after ColorSpace exist in the console's struct (pDestPlacementBase, ScaleFilter, Flags; names seen in public
+// bindings) but their order, types, enum values and flag bits are unmeasured: ours below are placeholders that make
+// the composition (section 4.5) testable. Zero everything is the default and means "as before": the whole output,
+// bilinear when scaling, SDR, plane 1 premultiplied.
+struct XboxViewRect {  // D3D12XBOX_VIEW_RECT: four floats; as fractions 0..1 of the output (hypothesis, section 4.5)
+    float left, top, right, bottom;
+};
+// DXGI_COLOR_SPACE_TYPE values (documented DXGI numbers). Only these two are composed; any other is treated as the first.
+inline constexpr int xbox_color_space_g22_p709 = 0;       // DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: SDR
+inline constexpr int xbox_color_space_g2084_p2020 = 12;   // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: HDR10
+// Provisional (ours): ScaleFilter and Flags.
+inline constexpr int xbox_scale_filter_default = 0;  // bilinear (point when not scaled makes no difference)
+inline constexpr int xbox_scale_filter_point = 1;
+inline constexpr int xbox_scale_filter_linear = 2;
+// Plane 1 is composed over plane 0 as an overlay even when its colour space is not plane 0's (otherwise an SDR plane next
+// to an HDR10 plane 0 is the GameDVR copy of the same frame, as in the public HDR sample, and is not shown).
+inline constexpr UINT xbox_plane_flag_overlay = 1;
+inline constexpr UINT xbox_plane_flag_straight_alpha = 2;  // plane 1's colour is not premultiplied by its alpha
+
 struct XboxPresentPlaneParameters {
     std::uint64_t Token;                  // from WaitFrameEventX
     UINT ResourceCount;                   // 1 in the samples
     ID3D12Resource* const* ppResources;   // ResourceCount committed resources with ALLOW_DISPLAY, in PRESENT
     const D3D12_RECT* pSrcViewRects;      // null, or one rectangle per resource (the HDR sample sets it)
-    int ColorSpace;                       // a DXGI_COLOR_SPACE_TYPE; not used yet
+    int ColorSpace;                       // a DXGI_COLOR_SPACE_TYPE (see above)
+    const XboxViewRect* pDestPlacementBase = nullptr;  // null: the whole output
+    int ScaleFilter = xbox_scale_filter_default;
+    UINT Flags = 0;
 };
 
 // Provisional (ours): D3D12XBOX_PRESENT_PARAMETERS. The samples show at least this field.
@@ -81,9 +104,16 @@ public:
     //   0 planes: a black frame (what a title does before it releases its resources); no token is looked at.
     //   1 plane:  plane 0's first resource, which must be a single-sample 2D colour texture in the PRESENT state,
     //             is blitted to the window (format conversion by the blit; an sRGB format gets an sRGB swapchain),
-    //             limited to pSrcViewRects[0] when that is set.
-    //   2 planes: the two share one token; plane 0 is presented and plane 1 (the GameDVR/SDR copy) is dropped; the
-    //             missing composition (HDR, GameDVR) is logged once.
+    //             limited to pSrcViewRects[0] when that is set. This is the whole behaviour while the plane asks for
+    //             nothing else (SDR colour space, whole output, default filter).
+    //   Composed: a plane with pDestPlacementBase, a point or linear ScaleFilter, or the HDR10 colour space (and any
+    //             second plane that is an overlay) is composed by a compute pass (VulkanPresenter::present_planes): plane 0
+    //             from its source rectangle to its destination placement, plane 1 alpha-blended over it, colour spaces
+    //             converted to the swapchain's (HDR10 when the surface has it, else HDR10 is clipped to SDR). Needs sampled,
+    //             single-sample, non-integer sources; others give DXGI_ERROR_UNSUPPORTED.
+    //   2 planes: the two share one token. Plane 1 is an overlay when its colour space is plane 0's or
+    //             xbox_plane_flag_overlay is set; an SDR plane 1 next to an HDR10 plane 0 is the GameDVR copy of the frame
+    //             (public HDR sample) and is dropped, logged once.
     //   More than 2: E_INVALIDARG (the UMD limit, section 4.5).
     // Token: the one from WaitFrameEventX. Real behaviour for a null, repeated or out-of-order token is unmeasured and a
     // title must not freeze on it, so those are presented anyway and logged once per kind; only a token that was never
@@ -99,6 +129,10 @@ public:
     HRESULT SuspendX(UINT flags);
     HRESULT ResumeX();
 
+    // What SDR white is in nits when SDR and HDR10 planes meet (default 203, ITU-R BT.2408's reference white; hypothesis:
+    // the console's value is a user setting). Applies to the next PresentX.
+    void set_sdr_white_nits(float nits) { sdr_white_nits_ = nits > 0.0f ? nits : 203.0f; }
+
     leonida::FramePacer& pacer() { return pacer_; }
     WindowPresenter& presenter() { return *presenter_; }
     std::uint64_t presents() const { return presents_; }
@@ -111,7 +145,8 @@ private:
     leonida::FramePacer pacer_;
     std::mutex present_mutex_;  // PresentX, SuspendX and ResumeX one at a time
     std::atomic<std::uint64_t> presents_{0};
-    bool logged_planes_ = false, logged_threshold_ = false, logged_display_ = false;
+    bool logged_planes_ = false, logged_threshold_ = false, logged_display_ = false, logged_color_space_ = false;
+    float sdr_white_nits_ = 203.0f;
     bool logged_null_token_ = false, logged_stale_token_ = false, logged_repeated_token_ = false;
 };
 
