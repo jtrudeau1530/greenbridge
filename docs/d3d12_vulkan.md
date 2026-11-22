@@ -790,6 +790,16 @@ The trace will enumerate them.
   The same tests fail without this change and when the cache ignores format. CPU replay covers 22 scenarios;
   12 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
   typed-resource casts, mips/array expansion, MSAA and 3D typeless RTVs are outside this phase.
+- **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For integer formats (`R8G8B8A8_UINT`,
+  `R32_UINT`, `R32G32B32A32_UINT`, `R8G8B8A8_SINT`, `R32_SINT`) convert those values numerically into
+  `VkClearColorValue` for both image and rectangle clears; copying float bits gives incorrect stored integers
+  without a Vulkan validation error. **Measured:** Windows D3D12 on WARP clamps negatives/NaN to zero, positive
+  overflow/infinity to the component maximum (and signed below the minimum), and truncates fractions; signed formats
+  use `int32` with the same NaN/overflow rules. `d3d12_clear_test` compares full and rectangular D3D12 readbacks with
+  WARP across UNORM, SNORM, FLOAT, UINT and SINT render targets and depth/stencil; `clear_color_test` checks both
+  replay paths without a GPU, including unchanged float values. SRGB clears are omitted from the comparison: the
+  linear→sRGB encoding rounds differently at the `.5` boundary on WARP vs Vulkan (a 1-ulp driver difference).
+  This does not add typed-view reinterpretation of typeless resources.
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
   raw DCC metadata.

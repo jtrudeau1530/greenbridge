@@ -480,10 +480,10 @@ if(TARGET Vulkan::Headers)
     endif()
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
-    add_executable(d3d12_uint_clear_test test/d3d12_uint_clear_test.cpp)
-    target_link_libraries(d3d12_uint_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
-    target_compile_definitions(d3d12_uint_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(d3d12_uint_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
+    target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_clear_test PRIVATE /W4 /permissive- /utf-8)
 
     # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)

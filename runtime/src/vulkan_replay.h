@@ -362,7 +362,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return {1, 1};
     switch (format) {
     case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_R32G32B32A32_SINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
     case VK_FORMAT_R32G32_SFLOAT: return {8, 1};
@@ -370,12 +371,15 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_SNORM:
     case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R8G8B8A8_SINT:
     case VK_FORMAT_B8G8R8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_R16G16_SFLOAT:
     case VK_FORMAT_R32_SFLOAT:
     case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SINT:
     case VK_FORMAT_D32_SFLOAT:
     case VK_FORMAT_D32_SFLOAT_S8_UINT:  // depth aspect
     case VK_FORMAT_D24_UNORM_S8_UINT: return {4, 1};
@@ -603,21 +607,45 @@ struct Prepared {
 // the device, Windows D3D12 (WARP and AMD) clamps to the component range and truncates fractions. Vulkan
 // instead interprets the matching union member as an integer already; copying float bits changes the value.
 inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
-    std::uint32_t maximum = 0;
+    // Integer formats convert the float numerically: NaN maps to zero, negatives clamp to the low end, positive
+    // overflow to the high end, and fractions truncate toward zero. Unsigned uses uint32, signed uses int32.
+    std::uint32_t unsigned_maximum = 0;
+    std::int64_t signed_minimum = 0, signed_maximum = 0;
+    bool is_signed = false;
     switch (format) {
-    case VK_FORMAT_R8G8B8A8_UINT: maximum = 255; break;
+    case VK_FORMAT_R8G8B8A8_UINT: unsigned_maximum = 255; break;
     case VK_FORMAT_R32_UINT:
-    case VK_FORMAT_R32G32B32A32_UINT: maximum = std::numeric_limits<std::uint32_t>::max(); break;
+    case VK_FORMAT_R32G32B32A32_UINT: unsigned_maximum = std::numeric_limits<std::uint32_t>::max(); break;
+    case VK_FORMAT_R8G8B8A8_SINT: signed_minimum = -128; signed_maximum = 127; is_signed = true; break;
+    case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+        signed_minimum = std::numeric_limits<std::int32_t>::min();
+        signed_maximum = std::numeric_limits<std::int32_t>::max();
+        is_signed = true;
+        break;
     default: break;
     }
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
-        if (!maximum) {
+        if (is_signed) {
+            const double v = double(input[i]);
+            std::int32_t out;
+            if (v != v) {
+                out = 0;  // NaN
+            } else if (v <= double(signed_minimum)) {
+                out = static_cast<std::int32_t>(signed_minimum);
+            } else if (v >= double(signed_maximum)) {
+                out = static_cast<std::int32_t>(signed_maximum);
+            } else {
+                out = static_cast<std::int32_t>(v);  // truncates toward zero
+            }
+            value.int32[i] = out;
+        } else if (!unsigned_maximum) {
             value.float32[i] = input[i];
         } else if (!(input[i] > 0.0f)) {
             value.uint32[i] = 0; // NaN, negative values and either zero; no out-of-range float-to-int cast.
-        } else if (double(input[i]) >= double(maximum)) {
-            value.uint32[i] = maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
+        } else if (double(input[i]) >= double(unsigned_maximum)) {
+            value.uint32[i] = unsigned_maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
         } else {
             value.uint32[i] = static_cast<std::uint32_t>(input[i]);
         }
