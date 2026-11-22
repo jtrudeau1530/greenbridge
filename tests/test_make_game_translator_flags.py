@@ -88,6 +88,24 @@ class TranslateFallbacksTest(unittest.TestCase):
         self.assertEqual(len(again), 2, again)       # the parts were translated with other flags
 
 
+class FailedShardTest(unittest.TestCase):
+    def test_a_failed_shard_removes_the_previous_index(self):
+        with tempfile.TemporaryDirectory() as spirv:
+            index = os.path.join(spirv, "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump({"old": True}, f)
+
+            class FailingProc:
+                def wait(self):
+                    return 1
+
+            with mock.patch.object(make_game.subprocess, "Popen", lambda *a, **k: FailingProc()),                     mock.patch.object(make_game, "py"),                     mock.patch.object(make_game, "log", lambda *a: None),                     self.assertRaises(SystemExit) as cm:
+                make_game.translate("disasm", spirv, 2)
+            self.assertEqual(cm.exception.code, 1)
+            self.assertFalse(os.path.exists(index))
+            self.assertTrue(os.path.exists(os.path.join(spirv, make_game.SHARD_PLAN)))
+
+
 class RecordedFlagsTest(unittest.TestCase):
     """shaders() records the flags in spirv/translator_flags.txt and re-translates when they change."""
 
