@@ -180,6 +180,19 @@ class CvtNormF16Tests(unittest.TestCase):
         ])
         self.assertEqual(got3, (ref_norm16(float_to_f16(-0.75), True) << 16) | (SEED_DST & 0xFFFF))
 
+    def test_sdwa_word1_high_half_preserve(self):
+        # GFX10/LLVM rejects op_sel on v_cvt_norm_*_f16; high-half access uses SDWA WORD_1.
+        hi_h = float_to_f16(0.75)
+        packed = (hi_h << 16) | float_to_f16(-0.25)
+        for op, snorm in (("v_cvt_norm_i16_f16", True), ("v_cvt_norm_u16_f16", False)):
+            with self.subTest(op=op):
+                got = run_lines([
+                    f"v_mov_b32 v1, {packed:#x}",
+                    f"v_mov_b32 v0, {SEED_DST:#x}",
+                    f"{op}_sdwa v0, v1 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+                ])
+                self.assertEqual(got, (ref_norm16(hi_h, snorm) << 16) | (SEED_DST & 0xFFFF))
+
     def test_sgpr_inline_and_spirv_val(self):
         spv = translate_lines([
             f"s_mov_b32 s4, {float_to_f16(0.5):#x}",
