@@ -1,6 +1,8 @@
 Claimed in the coordination issue as: <!-- the item ID from the open "Coordinating who works on what" issue,
      for example TEST-17, or a link to your claim -->
 
+Depends on: <!-- #N for every pull request this one builds on (AGENTS.md); delete the line if there is none -->
+
 ### What and why
 
 <!-- What this changes and the problem it solves. -->
@@ -9,6 +11,8 @@ Claimed in the coordination issue as: <!-- the item ID from the open "Coordinati
 
 <!-- What you ran and on which GPU and driver (CONTRIBUTING.md). For the shader translator: how many shaders
      translate and pass spirv-val, before and after. -->
+
+AI-assisted: <!-- yes, and with which tool, or no (AGENTS.md asks a coding agent to say so) -->
 
 ### Checklist
 
