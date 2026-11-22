@@ -341,13 +341,19 @@ if(BUILD_TESTING)
 
     # `gta6rt --run` rehearsal: a stand-in game EXE (CRT startup, statics, heap, files, threads) that imports
     # xgameruntime.dll from a link-time stub; under --run the shim registry answers those imports instead.
-    add_library(xgameruntime_stub SHARED test/fixtures/xgameruntime_stub.cpp)
+    add_library(xgameruntime_stub SHARED test/fixtures/xgameruntime_stub.cpp test/fixtures/xgameruntime_stub.def)
+    target_include_directories(xgameruntime_stub PUBLIC ${XTASKQUEUE_DIR}/Include)
     target_compile_definitions(xgameruntime_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     set_target_properties(xgameruntime_stub PROPERTIES
       OUTPUT_NAME xgameruntime
       PREFIX ""
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
+    add_executable(tiny_async test/fixtures/tiny_async.cpp)
+    target_link_libraries(tiny_async PRIVATE xgameruntime_stub)
+    set_target_properties(tiny_async PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
     add_executable(tiny_game test/fixtures/tiny_game.cpp)
     target_link_libraries(tiny_game PRIVATE xgameruntime_stub)
@@ -528,6 +534,9 @@ if(BUILD_TESTING)
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    add_test(NAME run_tiny_async COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_async>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_async.cmake")
     # The stand-in game passes only with its own arguments; with others it exits 1, which --run passes through.
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
