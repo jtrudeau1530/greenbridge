@@ -378,6 +378,32 @@ class RigArchiveTest(unittest.TestCase):
         self.assertEqual(doc["skeletons"][0]["kind"], "plain-bone-table")
         self.assertEqual(doc["skeletons"][1]["hashes_present"], 1)
 
+    def test_cli_rigs_stored_name_hashes(self):
+        hashed = b"\x3b\x39\x77\x99"     # JOAAT32("anim/rig/a") = 0x9977393b, little-endian
+        base = bytearray(b"RBF0" + struct.pack("<H", 0xFFFB) + struct.pack("<I", 1)
+                         + _u16s(b"rage__crRigSetManager") + b"\x00")
+        base += b"\x03\x60" + _u16s(b"anim/rigset/synthetic/one")
+        base += _entry(b"canonical@source", b"anim/rig/a", b"pose") + b"\xff" * 6
+        base += bytes((1 - len(base)) % 4)
+        self.assertEqual(len(base) % 4, 1)
+        cases = {"absent": (hashed[::-1], 0),
+                 "unaligned": (hashed, 1),
+                 "duplicate": (hashed + bytes(3) + hashed, 1)}
+        for label, (tail, expected) in cases.items():
+            with self.subTest(label):
+                carved = os.path.join(self.root, label)
+                os.mkdir(carved)
+                with open(os.path.join(carved, "000000.bin"), "wb") as f:
+                    f.write(bytes(base) + tail)
+                out = os.path.join(self.root, label + "-index.json")
+                rigs = os.path.join(self.root, label + "-rigs.json")
+                p = subprocess.run([sys.executable, "-I", TOOL, carved, out, "--rigs", rigs, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with open(rigs, encoding="utf-8") as f:
+                    summary = json.load(f)["rbf0"]["summary"]
+                self.assertEqual((summary["distinct_names"], summary["stored_name_hashes"]), (2, expected))
+
 
 if __name__ == "__main__":
     unittest.main()
