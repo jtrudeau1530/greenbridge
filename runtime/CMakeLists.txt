@@ -1841,6 +1841,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_predication_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_predication COMMAND replay_query_predication_test)
+    # Query edge cases and queue ownership, with CPU mocks (no GPU or game data).
+    add_executable(replay_query_edges_test test/replay_query_edges_test.cpp)
+    target_link_libraries(replay_query_edges_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
