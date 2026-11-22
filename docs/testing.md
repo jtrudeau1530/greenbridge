@@ -61,6 +61,25 @@ failures on both an RTX 5070 Ti Laptop and a Radeon 610M with the `426023a` scri
 either matching pair is clean. If you cannot build locally, the `runtime-windows` artifact of the Runtime workflow
 belongs to the commit that built it; check that commit out as well.
 
+### Without a compiler: a CI-built runtime
+
+If you cannot build the test programs locally, the Runtime workflow publishes them as the `runtime-windows`
+artifact of its own commit. Open the run for that commit under Actions -> Runtime, download and unzip
+`runtime-windows`, and pass the unzipped folder to `--build`:
+
+```sh
+python -I scripts/run_gpu_tests.py --build ~/Downloads/runtime-windows
+```
+
+`build.py` and `check.py` take the same folder as their second argument:
+
+```sh
+python -I runtime/test/shaders/build.py <out dir>
+python -I runtime/test/shaders/check.py <out dir> ~/Downloads/runtime-windows
+```
+
+The artifact belongs to the commit that built it, so run the scripts from that commit as well (see the note above).
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
