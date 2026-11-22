@@ -1,8 +1,10 @@
 // End-to-end checks for the loader's static TLS, against locally built fixtures.
 //
 // tiny_tls.dll has a __declspec(thread) variable, a TLS callback in .CRT$XLB and a DllMain that counts calls. The test
-// proves that load() installs the TLS template and index without running any image code, and that the callbacks only
-// run through the opt-in run_tls_callbacks().
+// proves that load() installs the TLS template and index without running any image code, that the callbacks run only
+// through run_tls_callbacks() until initialise(), that every thread started after load() gets its own copy of the
+// template (and the thread events once the module is initialised), and that a thread which outlives its Loader
+// gives its copy back when it ends.
 //
 // The loader reserves its module TLS index with gta6rt_tls_host.dll, so that DLL must sit next to this EXE; CTest
 // builds and places both in the build directory. No game files are needed and no real package DLL is mapped.
@@ -205,6 +207,102 @@ void test_tls(const fs::path& dll) {
     check(VirtualQuery(block, &info, sizeof(info)) == 0 || info.State == MEM_FREE, "~Loader frees the TLS block");
 }
 
+// Starts a thread suspended, so the fixture can watch it before its DLL_THREAD_ATTACH runs.
+struct WatchedThread {
+    HANDLE handle = nullptr;
+    template <class Fn>
+    WatchedThread(void(__cdecl* watch)(DWORD), Fn* body) {
+        handle = CreateThread(
+            nullptr, 0, [](void* p) -> DWORD { (*static_cast<Fn*>(p))(); return 0; }, body, CREATE_SUSPENDED,
+            nullptr);
+        if (!handle) throw std::runtime_error("CreateThread failed");
+        watch(GetThreadId(handle));
+        ResumeThread(handle);
+    }
+    void join() {
+        WaitForSingleObject(handle, INFINITE);  // signalled after the thread's DLL_THREAD_DETACH
+        CloseHandle(handle);
+        handle = nullptr;
+    }
+    ~WatchedThread() {
+        if (handle) join();
+    }
+    WatchedThread(const WatchedThread&) = delete;
+    WatchedThread& operator=(const WatchedThread&) = delete;
+};
+
+void test_thread_events(const fs::path& dll) {
+    std::printf("\n-- thread events after initialise() --\n");
+    rt::Loader loader(dll.parent_path());
+    rt::Module& m = loader.load(dll);
+    const auto get = find_export<int(__cdecl*)()>(m, "tiny_tls_get");
+    const auto set = find_export<void(__cdecl*)(int)>(m, "tiny_tls_set");
+    const auto watch = find_export<void(__cdecl*)(DWORD)>(m, "tiny_tls_watch_thread");
+    const auto thread_attach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_attach_count");
+    const auto thread_detach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_detach_count");
+    const auto value_at_attach = find_export<int(__cdecl*)()>(m, "tiny_tls_value_at_thread_attach");
+
+    set(11);
+    loader.initialise();
+    check(m.initialised, "initialise() ran the module");
+
+    int seen = -1;
+    int attach_inside = -1;
+    int detach_inside = -1;
+    auto body = [&] {
+        seen = get();
+        attach_inside = thread_attach();
+        detach_inside = thread_detach();
+        set(3);
+    };
+    WatchedThread t(watch, &body);
+    t.join();
+    check(attach_inside == 1, "a new thread gets DLL_THREAD_ATTACH once, before its own code runs");
+    check(value_at_attach() == 7, "its TLS copy is in place when the callback runs (template value 7)");
+    check(seen == 7, "the thread reads the template value, not the main thread's 11");
+    check(detach_inside == 0 && thread_detach() == 1, "DLL_THREAD_DETACH runs once, when the thread ends");
+    check(get() == 11, "the main thread's value is unchanged");
+}
+
+void test_thread_outlives_loader(const fs::path& dll) {
+    std::printf("\n-- a thread that outlives its Loader --\n");
+    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    void* block = nullptr;
+    HANDLE thread = nullptr;
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        const uint32_t index = m.tls_index;
+        struct Ctx {
+            HANDLE go, ready;
+            uint32_t index;
+            void** block;
+        } ctx{go, ready, index, &block};
+        static Ctx s_ctx;
+        s_ctx = ctx;
+        thread = CreateThread(
+            nullptr, 0,
+            [](void*) -> DWORD {
+                *s_ctx.block = module_tls_slots()[s_ctx.index];
+                SetEvent(s_ctx.ready);
+                WaitForSingleObject(s_ctx.go, INFINITE);
+                return 0;  // the Loader is gone by now; its DLL_THREAD_DETACH must still give the slot back
+            },
+            nullptr, 0, nullptr);
+        WaitForSingleObject(ready, INFINITE);
+        check(block != nullptr && block != m.tls_block, "the thread got its own copy while the Loader was alive");
+    }
+    SetEvent(go);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    CloseHandle(go);
+    CloseHandle(ready);
+    MEMORY_BASIC_INFORMATION info{};
+    check(VirtualQuery(block, &info, sizeof(info)) == 0 || info.State == MEM_FREE,
+          "its copy is freed when it ends after the Loader (and the process carries on)");
+}
+
 void test_second_tls_module_rejected(const fs::path& dll, const fs::path& temp) {
     std::printf("\n-- one mapped TLS module at a time --\n");
     const fs::path copy = temp / "tiny_tls_second.dll";
@@ -266,6 +364,8 @@ int main(int argc, char** argv) {
 
         TempDir temp;
         test_tls(tls_dll);
+        test_thread_events(tls_dll);
+        test_thread_outlives_loader(tls_dll);
         test_second_tls_module_rejected(tls_dll, temp.path);
     } catch (const std::exception& e) {
         ++g_checks;
