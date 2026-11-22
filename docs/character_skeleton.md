@@ -234,6 +234,11 @@ python -I tools/anim_glb.py <package>\packs.rpf --coverage --skeleton <fragment 
 On 1.0.2.1, `--skeleton 0x45417010` names the `ambient_femalebody_head.#ft` fragment;
 `0x45449F70` in the section above is the name-table stream, not a fragment.
 
+`--clip` matches the full clip label or the dictionary hash. When the hash is the leaf-name hash,
+one value selects every path with that leaf: in dictionary `0xfc91b010`, `0xe61dc582` is
+`joaat32("move")` and selects all six `/move` clips. Pass the full label (for example
+`gameplay@locomotion@female_generic@normal@standing@walk@slope@up/move`) to export one clip.
+
 Offsets are zlib stream offsets (as `tools/skin_streams.py` and `rpf9dump` report them). The
 output is a standard glTF 2.0 file; Blender and the three.js editor play its animations. What
 it does and why:
