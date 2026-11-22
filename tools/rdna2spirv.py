@@ -3207,41 +3207,119 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
-    def cmp_class(self, a, exec_only=False):
+    def cmp_class(self, a, exec_only=False, ty="f32", mods=()):
         """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
-        Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
-        src, mask = a[-2], self.src_u(a[-1])
-        # Apply abs/neg as raw sign-bit moves on uint bits: RDNA2 (gfx1036, wave32/64, IEEE=0/1, denorm keep/flush)
-        # never quiets an sNaN or flushes a denormal on v_cmp(x)_class_f32, whereas SPIR-V FAbs/OpFNegate may quiet.
-        u = self.src_u({k: v for k, v in src.items() if k not in ("abs", "neg")})
-        if src.get("abs"):
-            g = self.tmp()
-            self.emit(f"{g} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
-            u = g
-        if src.get("neg"):
-            g = self.tmp()
-            self.emit(f"{g} = OpBitwiseXor %uint {u} {self.cu(0x80000000)}")
-            u = g
-        sign, absu = self.tmp(), self.tmp()
-        self.emit(f"{sign} = OpShiftRightLogical %uint {u} {self.cu(31)}")
-        self.emit(f"{absu} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
-        exp_, man = self.tmp(), self.tmp()
-        self.emit(f"{exp_} = OpShiftRightLogical %uint {absu} {self.cu(23)}")
-        self.emit(f"{man} = OpBitwiseAnd %uint {absu} {self.cu(0x7FFFFF)}")
-        neg = self.tmp_bool_nz(sign)
+        Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf.
+        Supports f32, f16 (with op_sel[0], abs/neg on raw 16-bit bits) and f64 (integer bitwise on lo/hi,
+        no OpCapability Float64 needed)."""
+        if ty != "f32" and any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+            raise Unsupported(f"v_cmp_class_{ty} output modifier")
+        mask = self.src_u(a[-1])
 
         def b(cond_line):
             t = self.tmp()
             self.emit(f"{t} = {cond_line}")
             return t
-        is_zero = b(f"OpIEqual %bool {absu} {self.cu(0)}")
-        exp0 = b(f"OpIEqual %bool {exp_} {self.cu(0)}")
-        expmax = b(f"OpIEqual %bool {exp_} {self.cu(255)}")
-        man0 = b(f"OpIEqual %bool {man} {self.cu(0)}")
+
+        if ty == "f32":
+            src = a[-2]
+            # Apply abs/neg as raw sign-bit moves on uint bits: RDNA2 (gfx1036, wave32/64, IEEE=0/1, denorm keep/flush)
+            # never quiets an sNaN or flushes a denormal on v_cmp(x)_class_f32, whereas SPIR-V FAbs/OpFNegate may quiet.
+            u = self.src_u({k: v for k, v in src.items() if k not in ("abs", "neg")})
+            if src.get("abs"):
+                g = self.tmp()
+                self.emit(f"{g} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
+                u = g
+            if src.get("neg"):
+                g = self.tmp()
+                self.emit(f"{g} = OpBitwiseXor %uint {u} {self.cu(0x80000000)}")
+                u = g
+            sign, absu = self.tmp(), self.tmp()
+            self.emit(f"{sign} = OpShiftRightLogical %uint {u} {self.cu(31)}")
+            self.emit(f"{absu} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
+            exp_, man = self.tmp(), self.tmp()
+            self.emit(f"{exp_} = OpShiftRightLogical %uint {absu} {self.cu(23)}")
+            self.emit(f"{man} = OpBitwiseAnd %uint {absu} {self.cu(0x7FFFFF)}")
+            neg = self.tmp_bool_nz(sign)
+            is_zero = b(f"OpIEqual %bool {absu} {self.cu(0)}")
+            exp0 = b(f"OpIEqual %bool {exp_} {self.cu(0)}")
+            expmax = b(f"OpIEqual %bool {exp_} {self.cu(255)}")
+            man0 = b(f"OpIEqual %bool {man} {self.cu(0)}")
+            quiet = b(f"OpUGreaterThanEqual %bool {man} {self.cu(0x400000)}")
+        elif ty == "f16":
+            sel, dhi = self.opsel_bits(mods, 2)
+            if sel[1] or dhi:
+                raise Unsupported("v_cmp_class_f16 op_sel")
+            sv = a[-2]
+            u = self.src_h(sv)
+            if sel[0]:
+                t = self.tmp()
+                self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+                u = t
+            h = self.tmp()
+            self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+            if sv.get("abs"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseAnd %uint {h} {self.cu(0x7FFF)}")
+                h = t
+            if sv.get("neg"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseXor %uint {h} {self.cu(0x8000)}")
+                h = t
+            sign, absu, exp_, man = (self.tmp() for _ in range(4))
+            self.emit(f"{sign} = OpShiftRightLogical %uint {h} {self.cu(15)}")
+            self.emit(f"{absu} = OpBitwiseAnd %uint {h} {self.cu(0x7FFF)}")
+            self.emit(f"{exp_} = OpShiftRightLogical %uint {absu} {self.cu(10)}")
+            self.emit(f"{man} = OpBitwiseAnd %uint {absu} {self.cu(0x3FF)}")
+            neg = self.tmp_bool_nz(sign)
+            is_zero = b(f"OpIEqual %bool {absu} {self.cu(0)}")
+            exp0 = b(f"OpIEqual %bool {exp_} {self.cu(0)}")
+            expmax = b(f"OpIEqual %bool {exp_} {self.cu(31)}")
+            man0 = b(f"OpIEqual %bool {man} {self.cu(0)}")
+            quiet = b(f"OpUGreaterThanEqual %bool {man} {self.cu(0x200)}")
+        else:  # f64
+            if any(m.startswith("op_sel") for m in mods):
+                raise Unsupported("v_cmp_class_f64 op_sel")
+            sv = a[-2]
+            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+            elif sv["k"] == "fimm":
+                bits = struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
+                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+            elif sv["k"] == "imm":
+                v = sv["v"]
+                if -16 <= v <= 64:
+                    v64 = v & 0xFFFFFFFFFFFFFFFF
+                    lo, hi = self.cu(v64 & 0xFFFFFFFF), self.cu(v64 >> 32)
+                else:
+                    # 32-bit literal dword on a 64-bit float operand occupies the upper 32 bits (RDNA2 ISA).
+                    lo, hi = self.cu(0), self.cu(v & 0xFFFFFFFF)
+            else:
+                raise Unsupported("v_cmp_class_f64 operand")
+            if sv.get("abs"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+                hi = t
+            if sv.get("neg"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+                hi = t
+            sign, absu, exp_, man_hi, man_or, all_or = (self.tmp() for _ in range(6))
+            self.emit(f"{sign} = OpShiftRightLogical %uint {hi} {self.cu(31)}")
+            self.emit(f"{absu} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{exp_} = OpShiftRightLogical %uint {absu} {self.cu(20)}")
+            self.emit(f"{man_hi} = OpBitwiseAnd %uint {absu} {self.cu(0xFFFFF)}")
+            self.emit(f"{man_or} = OpBitwiseOr %uint {man_hi} {lo}")
+            self.emit(f"{all_or} = OpBitwiseOr %uint {absu} {lo}")
+            neg = self.tmp_bool_nz(sign)
+            is_zero = b(f"OpIEqual %bool {all_or} {self.cu(0)}")
+            exp0 = b(f"OpIEqual %bool {exp_} {self.cu(0)}")
+            expmax = b(f"OpIEqual %bool {exp_} {self.cu(2047)}")
+            man0 = b(f"OpIEqual %bool {man_or} {self.cu(0)}")
+            quiet = b(f"OpUGreaterThanEqual %bool {man_hi} {self.cu(0x80000)}")
         man_nz = b(f"OpLogicalNot %bool {man0}")
         is_inf = b(f"OpLogicalAnd %bool {expmax} {man0}")
         is_nan = b(f"OpLogicalAnd %bool {expmax} {man_nz}")
-        quiet = b(f"OpUGreaterThanEqual %bool {man} {self.cu(0x400000)}")
         snan = b(f"OpLogicalAnd %bool {is_nan} " + b(f"OpLogicalNot %bool {quiet}"))
         qnan = b(f"OpLogicalAnd %bool {is_nan} {quiet}")
         denorm = b(f"OpLogicalAnd %bool {exp0} {man_nz}")
@@ -5680,8 +5758,9 @@ class Gen:
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
-        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32"):
-            self.cmp_class(a, exec_only=op == "v_cmpx_class_f32")
+        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32", "v_cmp_class_f16", "v_cmpx_class_f16",
+                    "v_cmp_class_f64", "v_cmpx_class_f64"):
+            self.cmp_class(a, exec_only=op.startswith("v_cmpx_"), ty=op.rsplit("_", 1)[1], mods=mods)
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
             x = self.src_u(a[1])
