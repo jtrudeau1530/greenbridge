@@ -3657,7 +3657,7 @@ public:
         return hand_out(signature, riid, out);
     }
 
-    // PC slot 11; the Xbox ABI reaches it through device slot 62 (the proxy forwards).
+    // PC slot 11; the Xbox ABI reaches it through device slots 62 and 67 (the proxy forwards).
     HRESULT STDMETHODCALLTYPE CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid,
                                                          void** out) override {
         if (!out) return E_POINTER;

@@ -981,6 +981,54 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
     return self->real->CreateComputePipelineState(desc, *riid, out);
 }
 
+// The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out). Measured on
+// amd_fidelityfx_upscaler_xbox.dll (call at RVA 0x56d9): the root signature is at +0x00, two metadata pointers
+// with sizes at +0x08..+0x20, and the shader code blob at +0x28 with its byte size at +0x30. Translates the
+// console description to a standard D3D12_COMPUTE_PIPELINE_STATE_DESC and routes it to CreateComputePipelineState
+// on the PC device (slot 11), which on the Vulkan device resolves through the translator. The PC slot 67 is
+// CreateProtectedResourceSession1, a different method.
+HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const void* desc,
+                                                       const IID* riid, void** out) {
+    note_slot(67);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
+    if (!riid) return E_POINTER;
+
+    struct XboxNativeComputePipelineStateDesc {
+        ID3D12RootSignature* root_signature;
+        const void* ptr1;
+        std::uint64_t size1;
+        const void* ptr2;
+        std::uint64_t size2;
+        const void* code;
+        std::uint64_t code_size;
+    };
+    const auto* xbox_desc = static_cast<const XboxNativeComputePipelineStateDesc*>(desc);
+
+    if (xbox_desc->ptr1 || xbox_desc->size1 || xbox_desc->ptr2 || xbox_desc->size2) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 67 metadata ptrs/sizes 0x%llx (0x%llx), 0x%llx (0x%llx)\n",
+                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->ptr1)),
+                         static_cast<unsigned long long>(xbox_desc->size1),
+                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(xbox_desc->ptr2)),
+                         static_cast<unsigned long long>(xbox_desc->size2));
+        }
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pc_desc{};
+    pc_desc.pRootSignature = xbox_desc->root_signature;
+    pc_desc.CS.pShaderBytecode = xbox_desc->code;
+    pc_desc.CS.BytecodeLength = static_cast<SIZE_T>(xbox_desc->code_size);
+    pc_desc.NodeMask = 0;
+    pc_desc.CachedPSO = {nullptr, 0};
+    pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    return self->real->CreateComputePipelineState(&pc_desc, *riid, out);
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -1044,18 +1092,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
             reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
     } else if constexpr (Slot == 67) {
-        // Measured in amd_fidelityfx_upscaler_xbox.dll (call at RVA 0x56d9): (desc, riid, out), named
-        // DeserializeComputePipelineStateX in the DLL's own messages. The desc is the root signature at +0x00, then
-        // pointer/size pairs for the shader's FSPX entries, with the native RDNA2 program at +0x28 (docs/fspx.md);
-        // the DLL falls back to slot 62 when it fails. The PC device's slot 67 is CreateProtectedResourceSession1, a
-        // different method, so it is refused here, not forwarded.
-        note_slot(67);
-        static std::atomic<bool> logged{false};
-        if (!logged.exchange(true, std::memory_order_relaxed))
-            std::fprintf(stderr,
-                         "[rt] d3d12_xs: device slot 67 (Xbox DeserializeComputePipelineStateX) -> E_NOTIMPL\n");
-        if (a3) *reinterpret_cast<void**>(a3) = nullptr;
-        return hr_to_u64(E_NOTIMPL);
+        return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
+            self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
+            reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),

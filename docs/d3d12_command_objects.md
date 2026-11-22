@@ -371,9 +371,10 @@ vtable pointer of a public object.
 - **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
   with `IID_ID3D12PipelineState`. The DLL's own messages name it `DeserializeComputePipelineStateX`. Its desc is the
   root signature at `+0x00`, then pointer and size pairs for the shader's `FSPX` entries: kind 0 at `+0x08`, kind 1
-  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy used to
-  forward it to the PC method at the same index; it now refuses it (`E_NOTIMPL`). When it fails, the DLL takes
-  slot 62; its message for that failure calls the fallback "NewBE".
+  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy maps the
+  console desc to `D3D12_COMPUTE_PIPELINE_STATE_DESC` and routes it to `CreateComputePipelineState` (PC slot 11). On a
+  PC device that call fails (`E_FAIL`) because the code is not a PC shader, so the DLL falls back to slot 62; its message
+  for that failure calls the fallback "NewBE".
 - **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
   runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
   `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
