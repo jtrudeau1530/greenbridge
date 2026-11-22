@@ -5422,6 +5422,61 @@ class Gen:
                 if F1[op] == "Fract":
                     r = self.fract_below_one(r)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op in ("v_frexp_mant_f32", "v_frexp_exp_i32_f32", "v_ldexp_f32"):
+            # Bit-exact on the binary32 word (no float arithmetic). A normal input has biased exponent 1..254;
+            # zero and denormals are read as zero (the f32 denormal mode is not modelled, as for the other float ops)
+            # and infinities and NaNs (exponent 255) pass through: frexp_mant and ldexp return S0 unchanged,
+            # frexp_exp returns 0 (RDNA2 ISA, V_FREXP_MANT_F32 / V_FREXP_EXP_I32_F32 / V_LDEXP_F32).
+            x = self.src_u(a[1])
+            e, em1, isnorm, isden, sgn, r = (self.tmp() for _ in range(6))
+            self.emit(f"{e} = OpBitFieldUExtract %uint {x} {self.cu(23)} {self.cu(8)}")
+            self.emit(f"{em1} = OpISub %uint {e} {self.cu(1)}")
+            self.emit(f"{isnorm} = OpULessThan %bool {em1} {self.cu(254)}")          # exponent field 1..254
+            self.emit(f"{isden} = OpIEqual %bool {e} {self.cu(0)}")
+            self.emit(f"{sgn} = OpBitwiseAnd %uint {x} {self.cu(0x80000000)}")
+            other = self.tmp()
+            self.emit(f"{other} = OpSelect %uint {isden} {sgn} {x}")                  # zero/denormal -> +-0, inf/NaN -> S0
+            if op == "v_frexp_exp_i32_f32":
+                # x = mant * 2^exp with mant in [0.5, 1): exp = biased exponent - 126.
+                ex = self.tmp()
+                self.emit(f"{ex} = OpISub %uint {e} {self.cu(126)}")
+                self.emit(f"{r} = OpSelect %uint {isnorm} {ex} {self.cu(0)}")
+                self.dst(a[0], r)
+            elif op == "v_frexp_mant_f32":
+                keep, m = self.tmp(), self.tmp()
+                self.emit(f"{keep} = OpBitwiseAnd %uint {x} {self.cu(0x807FFFFF)}")
+                self.emit(f"{m} = OpBitwiseOr %uint {keep} {self.cu(0x3F000000)}")   # biased exponent 126
+                self.emit(f"{r} = OpSelect %uint {isnorm} {m} {other}")
+                self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)))
+            else:
+                # D = S0 * 2^S1 with S1 a signed integer. The exponent is added in 32 bits after clamping S1 to
+                # [-512, 512] (enough to overflow or underflow any binary32), then the result saturates: above
+                # 254 it is +-inf, at 0 or below it is +-0 (no denormal results).
+                n = self.src_u(a[2])
+                nb, small, neg, lim, nc, e2, e2m1, valid, pos, over = (self.tmp() for _ in range(10))
+                self.emit(f"{nb} = OpIAdd %uint {n} {self.cu(512)}")
+                self.emit(f"{small} = OpULessThan %bool {nb} {self.cu(1025)}")        # -512 <= n <= 512
+                self.emit(f"{neg} = OpBitFieldUExtract %uint {n} {self.cu(31)} {self.cu(1)}")
+                negb = self.tmp_bool_nz(neg)
+                self.emit(f"{lim} = OpSelect %uint {negb} {self.cu(0xFFFFFE00)} {self.cu(512)}")
+                self.emit(f"{nc} = OpSelect %uint {small} {n} {lim}")
+                self.emit(f"{e2} = OpIAdd %uint {e} {nc}")
+                self.emit(f"{e2m1} = OpISub %uint {e2} {self.cu(1)}")
+                self.emit(f"{valid} = OpULessThan %bool {e2m1} {self.cu(254)}")      # new exponent field 1..254
+                self.emit(f"{pos} = OpBitFieldUExtract %uint {e2} {self.cu(31)} {self.cu(1)}")
+                posb = self.tmp()
+                self.emit(f"{posb} = OpIEqual %bool {pos} {self.cu(0)}")
+                self.emit(f"{over} = OpLogicalAnd %bool {posb} {self.tmp_bool_nz(e2)}")
+                sh, keep, norm, inf, ov = (self.tmp() for _ in range(5))
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {e2} {self.cu(23)}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {x} {self.cu(0x807FFFFF)}")
+                self.emit(f"{norm} = OpBitwiseOr %uint {keep} {sh}")
+                self.emit(f"{inf} = OpBitwiseOr %uint {sgn} {self.cu(0x7F800000)}")
+                self.emit(f"{ov} = OpSelect %uint {over} {inf} {sgn}")
+                scaled = self.tmp()
+                self.emit(f"{scaled} = OpSelect %uint {valid} {norm} {ov}")
+                self.emit(f"{r} = OpSelect %uint {isnorm} {scaled} {other}")
+                self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)))
         elif op in ("v_cvt_f32_u32", "v_cvt_f32_i32"):
             x = self.src_u(a[1])
             r = self.tmp()
