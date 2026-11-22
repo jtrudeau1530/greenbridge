@@ -60,6 +60,15 @@ if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
 }
 
+# -Keep (or an interrupted build) can leave sources from another -Version.
+# Refuse that checkout rather than silently rebuilding the wrong release or resetting user files.
+$versionError = "Cannot reuse '$src' for LLVM $Version. Choose a fresh -Temp directory for this version; existing files were kept."
+if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { throw $versionError }
+$wantedCommit = & git -C $src rev-parse --verify --quiet "refs/tags/llvmorg-$Version^{commit}"
+if ($LASTEXITCODE -ne 0 -or -not $wantedCommit) { throw $versionError }
+$sourceCommit = & git -C $src rev-parse --verify --quiet HEAD
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $wantedCommit) { throw $versionError }
+
 # DIA SDK off: its headers need ATL, which the C++ build tools don't always include, and llvm-mc doesn't use it.
 $body = @"
 "$cmake" -S "$src\llvm" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=Release ^
