@@ -913,10 +913,11 @@ def is_nan16(h):
 
 
 def hw_same(want, got, op=None):
-    """Model [v8, vcc] against the hardware's: NaN matches any NaN (an f16 NaN in a result half too), everything else
-    bit for bit."""
+    """Compare hardware v8 and VCC, requiring byte equality for packed u8 results."""
     if want[1] != got[1]:
         return False
+    if op == "v_cvt_pk_u8_f32":
+        return want[0] == got[0]
     halves = F16_HALVES.get(op)
     if halves is None:
         return same(want[0], got[0])

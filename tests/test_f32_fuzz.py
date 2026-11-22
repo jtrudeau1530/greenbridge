@@ -109,6 +109,12 @@ class HardwareOracle(unittest.TestCase):
         self.assertEqual(ff.hw_lines(c, "gfx1030")[-2], "global_store_dwordx2 v20, v[8:9], s[2:3]")
         self.assertEqual(len(ff.hw_lines(c, "gfx1150", guard=False)), len(lines) - 1)
 
+    def test_packed_u8_hardware_verdict_compares_raw_bytes(self) -> None:
+        case = self.case("v_cvt_pk_u8_f32", [0x43000000, 0, 0x7FC00000],
+                         [(0, {}), (1, {}), (2, {})], e64=True)
+        self.assertEqual(ff.hw_verdict(case, [0x7FC00080, 0]), ("match", [0x7FC00080, 0]))
+        self.assertEqual(ff.hw_verdict(case, [0x7FC00081, 0]), ("mismatch", [0x7FC00080, 0]))
+
     def test_removed_opcodes_are_skipped_not_substituted(self):
         from hw_oracle import asm
         for op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_mad_legacy_f32"):
