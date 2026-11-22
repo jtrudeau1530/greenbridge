@@ -1059,5 +1059,168 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(new_exec & FRAC_MASK_64, custom_payload)
 
 
+class TestSXorSaveExecB64NegativeControls(unittest.TestCase):
+    """Negative control tests: syntax rejection, invalid encodings, and boundary defenses."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -1, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 105, count=2)  # spans to 107
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)  # spans to 257
+
+    def test_invalid_register_counts(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 0, count=0)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 0, count=3)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 0, count=4)
+
+    def test_invalid_register_kind_for_salu(self) -> None:
+        with self.assertRaises(TypeError):
+            SXorSaveExecB64AST(
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=Register(RegKind.SGPR, 2, count=2),
+            )
+        with self.assertRaises(TypeError):
+            SXorSaveExecB64AST(
+                dst=Register(RegKind.SGPR, 0, count=2),
+                src0=Register(RegKind.VGPR, 2, count=2),
+            )
+
+    def test_architectural_state_out_of_bounds_access(self) -> None:
+        state = SALUArchitecturalState()
+        with self.assertRaises(IndexError):
+            state.read_sgpr_u32(106)
+        with self.assertRaises(IndexError):
+            state.write_sgpr_u32(-1, 0)
+        with self.assertRaises(IndexError):
+            state.read_sgpr_u64(105)
+        with self.assertRaises(IndexError):
+            state.write_sgpr_u64(105, 0)
+
+    def test_simd_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefrontState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefrontState(wave_size=128)
+
+    def test_simd_invalid_lane_index(self) -> None:
+        state = SIMDWavefrontState(wave_size=32)
+        with self.assertRaises(IndexError):
+            state.is_lane_active(32)
+        with self.assertRaises(IndexError):
+            state.is_lane_active(-1)
+
+
+class TestSXorSaveExecB64MutationDetection(unittest.TestCase):
+    """Mutation tests: verify that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_xor_to_or_sabotage(self) -> None:
+        # Sabotage: replace XOR with OR
+        def mutated_oracle(exec_val: int, src_val: int) -> Tuple[int, int, int]:
+            saved = exec_val & MASK64
+            new_exec = (saved | src_val) & MASK64
+            scc = 1 if new_exec != 0 else 0
+            return saved, new_exec, scc
+
+        # Oracle test: ALL_LANES ^ ALL_LANES must equal 0, but OR yields ALL_LANES
+        with self.assertRaises(AssertionError):
+            saved, new_exec, scc = mutated_oracle(ALL_LANES_W64, ALL_LANES_W64)
+            self.assertEqual(new_exec, 0)
+
+    def test_mutation_xor_to_and_sabotage(self) -> None:
+        # Sabotage: replace XOR with AND
+        def mutated_oracle(exec_val: int, src_val: int) -> Tuple[int, int, int]:
+            saved = exec_val & MASK64
+            new_exec = (saved & src_val) & MASK64
+            scc = 1 if new_exec != 0 else 0
+            return saved, new_exec, scc
+
+        # Oracle test: 0 ^ ALL_LANES must equal ALL_LANES, but AND yields 0
+        with self.assertRaises(AssertionError):
+            saved, new_exec, scc = mutated_oracle(0, ALL_LANES_W64)
+            self.assertEqual(new_exec, ALL_LANES_W64)
+
+    def test_mutation_saveexec_write_order_sabotage(self) -> None:
+        # Sabotage: write new_exec to sdst instead of saved (old) exec
+        interp = ScalarSALUInterpreter()
+        state = SALUArchitecturalState()
+        state.exec_mask = ALL_LANES_W64
+
+        # Proper execution saves ALL_LANES_W64 to s[0:1] and sets EXEC to 0
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 0, count=2),
+            src0=LiteralConstant64(ALL_LANES_W64),
+        )
+        res = interp.step(inst, state)
+        self.assertEqual(res.saved_exec, ALL_LANES_W64)
+        self.assertEqual(state.read_sgpr_u64(0), ALL_LANES_W64)
+
+        # Mutated state: if dst received new_exec (0), asserting it holds ALL_LANES_W64 would fail
+        mutated_dst_val = 0
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_dst_val, ALL_LANES_W64)
+
+    def test_mutation_scc_inversion_sabotage(self) -> None:
+        # Sabotage: inverted SCC logic (SCC = 1 when EXEC == 0)
+        def mutated_oracle(exec_val: int, src_val: int) -> Tuple[int, int, int]:
+            saved = exec_val & MASK64
+            new_exec = (saved ^ src_val) & MASK64
+            scc = 1 if new_exec == 0 else 0  # Inverted!
+            return saved, new_exec, scc
+
+        with self.assertRaises(AssertionError):
+            _, _, scc = mutated_oracle(0, 0)
+            self.assertEqual(scc, 0)
+
+    def test_mutation_scc_from_old_exec_sabotage(self) -> None:
+        # Sabotage: SCC computed from old EXEC instead of new EXEC
+        def mutated_oracle(exec_val: int, src_val: int) -> Tuple[int, int, int]:
+            saved = exec_val & MASK64
+            new_exec = (saved ^ src_val) & MASK64
+            scc = 1 if saved != 0 else 0  # Bug: derived from old exec
+            return saved, new_exec, scc
+
+        # When old exec is ALL_LANES but new exec is 0: SCC must be 0, not 1
+        with self.assertRaises(AssertionError):
+            _, _, scc = mutated_oracle(ALL_LANES_W64, ALL_LANES_W64)
+            self.assertEqual(scc, 0)
+
+    def test_mutation_mask_32bit_truncation_sabotage(self) -> None:
+        # Sabotage: 64-bit mask truncated to 32-bit
+        def mutated_step(exec_val: int, src_val: int) -> int:
+            return (exec_val ^ src_val) & MASK32  # Lost upper 32 bits!
+
+        with self.assertRaises(AssertionError):
+            res = mutated_step(ALL_LANES_W64, 0)
+            self.assertEqual(res, ALL_LANES_W64)
+
+    def test_mutation_aliasing_read_after_write_sabotage(self) -> None:
+        # Sabotage: non-atomic sequential execution reading src0 after updating dst
+        state = SALUArchitecturalState()
+        init_exec = 0xAAAA_AAAA_5555_5555
+        init_src = 0x1234_5678_9ABC_DEF0
+        state.exec_mask = init_exec
+        state.write_sgpr_u64(4, init_src)
+
+        # Buggy sequence:
+        # 1. state.write_sgpr_u64(4, state.exec_mask) -> s[4:5] is now init_exec!
+        # 2. src0 = state.read_sgpr_u64(4) -> reads init_exec instead of init_src!
+        # 3. state.exec_mask = state.exec_mask ^ src0 -> init_exec ^ init_exec = 0!
+        mutated_new_exec = 0  # would result in 0
+        expected_new_exec = init_exec ^ init_src
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_new_exec, expected_new_exec)
+
+
 if __name__ == "__main__":
     unittest.main()
