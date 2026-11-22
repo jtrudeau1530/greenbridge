@@ -256,10 +256,18 @@ def main(argv=None):
     ap.add_argument("--root", help="only documents with this root tag")
     ap.add_argument("--out", help="write one JSON file per document here (game data: keep it local)")
     a = ap.parse_args(argv)
+    if a.out and os.path.exists(a.out) and not os.path.isdir(a.out):
+        print(f"ERROR: --out {a.out} exists and is not a directory", file=sys.stderr)
+        return 2
     try:
         s = run(a.targets, a.root, a.out)
     except FileNotFoundError as e:
         print(f"ERROR: {e} does not exist", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        # an unreadable file, or a carve folder whose index.json is not JSON or not the rpf9_carve.py shape
+        where = getattr(e, "filename", None) or ", ".join(a.targets)
+        print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
         return 2
     print(f"{s['documents']} documents read, {s['roots']} roots, {s['not_well_formed']} not well-formed "
           f"{s['parse_errors'] or ''}".rstrip())
