@@ -398,6 +398,79 @@ class Program:
 
 
 # ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ConditionCodes:
+    """Architectural condition codes for double-precision float operations."""
+    equal: bool
+    less: bool
+    greater: bool
+    unordered: bool
+    zero: bool
+    negative: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class FPStatusFlags:
+    """IEEE 754 floating-point status flags."""
+    invalid: bool       # e.g., sNaN operand
+    denormal: bool      # e.g., subnormal operand
+    inexact: bool = False
+    overflow: bool = False
+    underflow: bool = False
+
+
+def compute_condition_codes(s0: int, s1: int, result: int) -> ConditionCodes:
+    """Computes condition codes evaluating relationship of s0 vs s1 and result attributes."""
+    s0 &= MASK64
+    s1 &= MASK64
+    result &= MASK64
+    nan0 = is_nan_f64(s0)
+    nan1 = is_nan_f64(s1)
+
+    if nan0 or nan1:
+        unordered = True
+        equal = False
+        less = False
+        greater = False
+    else:
+        unordered = False
+        f0 = bits_to_f64(s0)
+        f1 = bits_to_f64(s1)
+        k0 = zero_ordered_key(f0)
+        k1 = zero_ordered_key(f1)
+        equal = (k0 == k1)
+        less = (k0 < k1)
+        greater = (k0 > k1)
+
+    res_zero = (result in (POS_ZERO_F64, NEG_ZERO_F64))
+    res_negative = bool(result & SIGN_MASK_F64)
+    return ConditionCodes(
+        equal=equal,
+        less=less,
+        greater=greater,
+        unordered=unordered,
+        zero=res_zero,
+        negative=res_negative,
+    )
+
+
+def compute_fp_status_flags(s0: int, s1: int, result: int) -> FPStatusFlags:
+    """Computes IEEE 754 status flags for double-precision operations."""
+    invalid = is_snan_f64(s0) or is_snan_f64(s1)
+    denormal = is_subnormal_f64(s0) or is_subnormal_f64(s1) or is_subnormal_f64(result)
+    return FPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=False,
+        overflow=False,
+        underflow=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
@@ -407,6 +480,9 @@ class ScalarVALUInterpreter:
     def __init__(self) -> None:
         self.vgprs: list[int] = [0] * 256
         self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+        self.last_condition_codes: ConditionCodes | None = None
+        self.last_status_flags: FPStatusFlags | None = None
         self.trace: list[str] = []
 
     def read_reg_u32(self, kind: RegKind, idx: int) -> int:
@@ -457,6 +533,10 @@ class ScalarVALUInterpreter:
 
         final_res = inst.inst_mods.apply(res_raw)
         self.write_reg_u64(inst.dst.kind, inst.dst.index, final_res)
+        self.last_condition_codes = compute_condition_codes(s0_val, s1_val, final_res)
+        self.last_status_flags = compute_fp_status_flags(s0_val, s1_val, final_res)
+        # Note: In GFX10/RDNA2, VALU floating-point min/max instructions do NOT generate carry/borrow;
+        # VCC is preserved and never modified.
         self.trace.append(f"{inst.to_assembly()} => {final_res:#018x}")
         return final_res
 
@@ -481,6 +561,7 @@ class SIMDWavefrontInterpreter:
         self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
         # Wavefront-shared SGPR file: [106] 32-bit registers
         self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
 
     def set_exec_mask(self, mask: int) -> None:
         valid_mask = (1 << self.wave_size) - 1
@@ -1054,6 +1135,121 @@ class TestValuMinMaxF64RegisterAliasing(unittest.TestCase):
                 self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), POS_ONE_F64)
             else:
                 self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), POS_TEN_F64)
+
+
+class TestValuMinMaxF64ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_ordering(self) -> None:
+        interp = ScalarVALUInterpreter()
+        inst_lt = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(1.0),
+            src1=Immediate(2.0),
+        )
+        interp.step(inst_lt)
+        cc = interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.less)
+        self.assertFalse(cc.equal)
+        self.assertFalse(cc.greater)
+        self.assertFalse(cc.unordered)
+        self.assertFalse(cc.zero)
+        self.assertFalse(cc.negative)
+
+        inst_gt = Instruction(
+            opcode=Opcode.V_MAX_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(10.0),
+            src1=Immediate(2.0),
+        )
+        interp.step(inst_gt)
+        cc_gt = interp.last_condition_codes
+        self.assertIsNotNone(cc_gt)
+        assert cc_gt is not None
+        self.assertTrue(cc_gt.greater)
+        self.assertFalse(cc_gt.less)
+        self.assertFalse(cc_gt.equal)
+
+        inst_eq = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(-2.0),
+            src1=Immediate(-2.0),
+        )
+        interp.step(inst_eq)
+        cc_eq = interp.last_condition_codes
+        self.assertIsNotNone(cc_eq)
+        assert cc_eq is not None
+        self.assertTrue(cc_eq.equal)
+        self.assertTrue(cc_eq.negative)
+
+    def test_condition_codes_unordered_nan(self) -> None:
+        interp = ScalarVALUInterpreter()
+        inst_nan = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(0x7FF8000000000000),  # QNAN
+            src1=Immediate(1.0),
+        )
+        interp.step(inst_nan)
+        cc = interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.unordered)
+        self.assertFalse(cc.equal)
+        self.assertFalse(cc.less)
+        self.assertFalse(cc.greater)
+
+    def test_condition_codes_signed_zeros(self) -> None:
+        # -0.0 < +0.0 ordered key
+        cc = compute_condition_codes(NEG_ZERO_F64, POS_ZERO_F64, NEG_ZERO_F64)
+        self.assertTrue(cc.less)
+        self.assertFalse(cc.equal)
+        self.assertTrue(cc.zero)
+        self.assertTrue(cc.negative)
+
+        cc_rev = compute_condition_codes(POS_ZERO_F64, NEG_ZERO_F64, POS_ZERO_F64)
+        self.assertTrue(cc_rev.greater)
+        self.assertFalse(cc_rev.equal)
+        self.assertTrue(cc_rev.zero)
+        self.assertFalse(cc_rev.negative)
+
+    def test_status_flags_snan_invalid(self) -> None:
+        flags_snan = compute_fp_status_flags(SNAN_F64, POS_ONE_F64, POS_ONE_F64)
+        self.assertTrue(flags_snan.invalid)
+        self.assertFalse(flags_snan.denormal)
+
+        flags_qnan = compute_fp_status_flags(QNAN_F64, POS_ONE_F64, POS_ONE_F64)
+        self.assertFalse(flags_qnan.invalid)
+
+    def test_status_flags_denormal(self) -> None:
+        flags_sub = compute_fp_status_flags(SUBNORM_MIN_F64, POS_ONE_F64, SUBNORM_MIN_F64)
+        self.assertTrue(flags_sub.denormal)
+        self.assertFalse(flags_sub.invalid)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # Set VCC to arbitrary non-zero carry mask
+        canary_vcc = 0xFFFFFFFFFFFFFFFF
+        interp.vcc = canary_vcc
+
+        inst = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(1.0),
+            src1=Immediate(2.0),
+        )
+        interp.step(inst)
+        # In RDNA2 ISA, floating-point min/max NEVER writes or disturbs VCC
+        self.assertEqual(interp.vcc, canary_vcc)
+
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.vcc = canary_vcc
+        simd.step(inst)
+        self.assertEqual(simd.vcc, canary_vcc)
 
 
 if __name__ == "__main__":
