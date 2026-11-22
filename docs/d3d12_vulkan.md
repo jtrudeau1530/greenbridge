@@ -664,9 +664,11 @@ the game's present entry point (`PresentX`; the DXGI factory/swapchain and the p
     compute and mesh, the workgroup fits in size x `maxComputeWorkgroupSubgroups` (VUID-VkPipelineShaderStageCreateInfo-pNext-02755
     and -02756, VUID-VkPipelineShaderStageRequiredSubgroupSizeCreateInfo-requiredSubgroupSize-02760..02762).
     A compute stage also gets `VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT` when
-    `computeFullSubgroups` is enabled and local size X is a multiple of the size (-flags-02784, -flags-02785,
-    -pNext-02757). Wave32 shaders ask for 32 the same way. A device whose only size is the wanted one (NVIDIA,
-    wave32) needs no chain.
+    `computeFullSubgroups` is enabled and local size X is a multiple of the size (-flags-02785 for the feature,
+    -flags-08988 for the stage, -pNext-02757 for X). Wave32 shaders ask for 32 the same way. A device whose only size is the wanted one (NVIDIA,
+    wave32) needs no chain. Where the size cannot be required (stage not listed, feature off) but the device default is
+    the wanted one, the shader works as it is (`device_default`; nothing guarantees the default, so it is not logged
+    as inexact); any other size is `unavailable` and logged.
   - **Which stages can be required:** it is the driver's list, not a fixed rule. The AMD Windows driver reports
     FRAGMENT | COMPUTE | TASK | MESH (measured on a Radeon 880M, 26.11.2, sizes 32..64), so wave64 and wave32 pixel
     shaders run exact there; so does current Mesa RADV on GFX10+ (COMPUTE | FRAGMENT | task/mesh, Mesa main at
@@ -857,9 +859,18 @@ and any validation error fails them.
     PSO's request (`pipeline_subgroup_requests`) must equal the decision function's. The native wave64 shader
     must be exact where the device can give 64 (AMD: required size 64 plus full subgroups) and is reported, not
     judged, where it cannot (NVIDIA); the emulated one must be exact everywhere.
-  - **Control:** a second run with nothing requested is printed, not judged. On the Radeon 880M the default compute
-    subgroup is already 64, so the control is exact as well; the test shows that the chain is accepted (also under
-    validation) and the result exact, not that the request changed it.
+  - **Control:** a second run with nothing requested is printed. On the Radeon 880M the default compute subgroup is
+    already 64, so the wave64 controls are exact as well.
+  - **Probes:** GLSL shaders (`cs_sg_probe.comp`, `ps_sg_probe.frag`, `vs_sg_fullscreen.vert`) store `gl_SubgroupSize`,
+    so the size the driver used is observed for a wave64 entry, a wave32 entry and an emulated one. Where the PSO
+    required a size, the observed size must equal it. For a wave32 compute shader on a device whose default is not 32,
+    the control is asserted to differ (the request matters); a wave32 pixel shader on the 880M goes from 64-wide to
+    32-wide with the request.
+  - **Wave64 pixel shader:** `ps_w64x_readlane.asm` (`v_readlane` of lanes 40, 5, 33 and 63) is drawn over 64x64
+    pixels through a graphics PSO into a float target, and every pixel must carry the four values derived in the
+    .asm header where the PSO required 64: 4096 of 4096 on the 880M. The control is asserted to differ only where the
+    default pixel subgroup is not 64; the 880M runs pixel shaders 64-wide by default, so its control is exact too. On
+    the RTX 5070 the shader gets no 64 (0 of 4096 exact, not judged).
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
