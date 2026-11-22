@@ -5868,8 +5868,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     // Switching a vsync swapchain to IMMEDIATE or FIFO_RELAXED per present (PresentX's ImmediateThresholdPercent):
     // the KHR extension (promoted from the EXT one, same structures) with the surface extension of the same name
     // on the instance, else the EXT one. Only enabled where the instance has the surface half and the GPU the feature.
+#if defined(VK_KHR_swapchain_maintenance1).
     VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
+#endif
     const char* swapchain_m1_name = nullptr;
     if (has_swapchain && instance_has_surface) {
         const auto device_has = [&](const char* name) {
