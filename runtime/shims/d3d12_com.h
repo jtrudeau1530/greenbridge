@@ -15,6 +15,7 @@
 
 #include "../src/vulkan_backend.h"
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -126,6 +127,8 @@ public:
     HRESULT present_blank(UINT sync_interval);
     // Screenshot support for tests: every presented frame is also copied to host memory (call before presenting).
     bool enable_capture();
+    // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
+    void set_abort(std::function<bool()> abort);
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format);
     VkExtent2D extent() const;
     std::uint64_t presented() const;

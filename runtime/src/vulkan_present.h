@@ -22,6 +22,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <vector>
 
 namespace leonida {
@@ -70,6 +72,7 @@ public:
         LEONIDA_INSTANCE_FN(vkDestroySurfaceKHR)
         LEONIDA_INSTANCE_FN(vkGetDeviceProcAddr)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceMemoryProperties)
+        LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceFormatProperties)
 #undef LEONIDA_INSTANCE_FN
         if (!vkGetDeviceProcAddr_ || !vkDestroySurfaceKHR_) return;
         const VkDevice device = context.device();
@@ -110,7 +113,7 @@ public:
                 vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired) != VK_SUCCESS)
                 return;
         }
-        ok_ = recreate(true);
+        ok_ = recreate(true, false);
     }
 
     ~VulkanPresenter() {
@@ -160,7 +163,10 @@ public:
             if (!found || !found->image || found->aspects != VK_IMAGE_ASPECT_COLOR_BIT) return VK_ERROR_UNKNOWN;
             binding = *found;
         }
-        if (binding.samples > 1 || detail::blit_unsupported_format(binding.format))
+        // Multisampled sources (no resolve into a temporary yet), integer formats (a UNORM swapchain cannot take them)
+        // and anything the GPU cannot blit from are refused.
+        if (binding.samples > 1 || detail::blit_unsupported_format(binding.format) ||
+            !(format_features(binding.format) & VK_FORMAT_FEATURE_BLIT_SRC_BIT))
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (source_rect && (source_rect->left < 0 || source_rect->top < 0 || source_rect->left >= source_rect->right ||
                             source_rect->top >= source_rect->bottom ||
@@ -170,8 +176,12 @@ public:
         return submit(&binding, source, vsync, source_rect, detail::is_srgb_format(binding.format));
     }
 
+    // Polled while a present waits for a swapchain image (every 50 ms): when it returns true the present gives up with
+    // VK_NOT_READY, so a caller that is being suspended is never held by a window that stopped taking frames.
+    void set_abort(std::function<bool()> abort) { abort_ = std::move(abort); }
+
     // Presents a black frame: the swapchain image cleared, nothing read. PresentX with no planes.
-    VkResult present_blank(bool vsync) { return submit(nullptr, ResourceId{}, vsync, nullptr, want_srgb_); }
+    VkResult present_blank(bool vsync) { return submit(nullptr, ResourceId{}, vsync, nullptr, swapchain_srgb_); }
 
     // From now on every presented frame is also copied to host memory (the swapchain gets TRANSFER_SRC usage), for
     // read_back(). False when the surface cannot do it or its format is not 8 bits per channel with 4 channels.
@@ -180,7 +190,7 @@ public:
         if (!ok_) return false;
         capture_ = true;
         stale_ = true;
-        if (!recreate(vsync_) || (swapchain_ && !capture_buffer_)) {
+        if (!recreate(vsync_, swapchain_srgb_) || (swapchain_ && !capture_buffer_)) {
             capture_ = false;
             return false;
         }
@@ -203,15 +213,17 @@ public:
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                     bool srgb) {
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
-        if (vsync != vsync_ || stale_ || srgb != want_srgb_) {
-            want_srgb_ = srgb;
-            if (!recreate(vsync)) return VK_ERROR_OUT_OF_DATE_KHR;
+        if (vsync != vsync_ || stale_ || srgb != swapchain_srgb_) {
+            // The swapchain's colour encoding is only recorded once the new swapchain exists, so a failed
+            // recreate is tried again at the next present.
+            if (!recreate(vsync, srgb)) return VK_ERROR_OUT_OF_DATE_KHR;
         }
         if (!swapchain_) {  // minimised: try again next frame
             stale_ = true;
             return VK_SUCCESS;
         }
         if (binding && !presentable(source)) return VK_ERROR_UNKNOWN;  // checked before an image is acquired for it
+        if (binding && !(format_features(format_) & VK_FORMAT_FEATURE_BLIT_DST_BIT)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         Frame& frame = frames_[frame_index_ % frames_.size()];
@@ -219,11 +231,11 @@ public:
             return stop(waited);
 
         std::uint32_t image = 0;
-        VkResult acquired = vkAcquireNextImageKHR_(device, swapchain_, UINT64_MAX, frame.acquired, VK_NULL_HANDLE, &image);
+        VkResult acquired = acquire(frame.acquired, &image);
         if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
-            if (!recreate(vsync)) return acquired;
+            if (!recreate(vsync, swapchain_srgb_)) return acquired;
             if (!swapchain_) return VK_SUCCESS;
-            acquired = vkAcquireNextImageKHR_(device, swapchain_, UINT64_MAX, frame.acquired, VK_NULL_HANDLE, &image);
+            acquired = acquire(frame.acquired, &image);
         }
         if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
@@ -374,7 +386,7 @@ private:
         blit.dstOffsets[1] = {dw, dh, 1};
         vkCmdBlitImage_(commands, binding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[image],
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                        sw == dw && sh == dh ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+                        sw == dw && sh == dh ? VK_FILTER_NEAREST : blit_filter(binding.format));
 
         finish_image(commands, image);
         for (const auto& piece : pieces)
@@ -382,6 +394,29 @@ private:
                                   piece.layout, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any,
                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         vk.vkEndCommandBuffer(commands);
+    }
+
+    // vkGetPhysicalDeviceFormatProperties, optimal tiling, cached per format.
+    VkFormatFeatureFlags format_features(VkFormat format) {
+        const auto it = features_.find(format);
+        if (it != features_.end()) return it->second;
+        VkFormatProperties properties{};
+        if (vkGetPhysicalDeviceFormatProperties_) vkGetPhysicalDeviceFormatProperties_(physical_, format, &properties);
+        return features_[format] = properties.optimalTilingFeatures;
+    }
+    // Scaling blits filter bilinearly when the source format allows it, else take the nearest texel.
+    VkFilter blit_filter(VkFormat source) {
+        return (format_features(source) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR
+                                                                                              : VK_FILTER_NEAREST;
+    }
+
+    VkResult acquire(VkSemaphore semaphore, std::uint32_t* image) {
+        for (;;) {
+            const VkResult result = vkAcquireNextImageKHR_(context_.device(), swapchain_, 50'000'000, semaphore,
+                                                           VK_NULL_HANDLE, image);
+            if (result != VK_TIMEOUT && result != VK_NOT_READY) return result;
+            if (abort_ && abort_()) return VK_NOT_READY;
+        }
     }
 
     // Clears the swapchain image to opaque black.
@@ -477,7 +512,7 @@ private:
     // swapchain and is retried on the next present. Nothing is published until every piece exists: on any failure
     // the presenter is left with no swapchain and stale_ set, so the next present tries again, and no image is ever
     // acquired without its per-image semaphore.
-    bool recreate(bool vsync) {
+    bool recreate(bool vsync, bool srgb) {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         {
@@ -492,6 +527,7 @@ private:
         if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
             release(old);
             vsync_ = vsync;
+            swapchain_srgb_ = srgb;
             stale_ = false;
             return true;
         }
@@ -509,7 +545,7 @@ private:
         // wants UNORM (the bytes go through as they are). BGRA before RGBA, as the surface lists them.
         VkSurfaceFormatKHR chosen = formats[0];
         bool found = false;
-        for (const VkFormat wanted : want_srgb_ ? std::array<VkFormat, 2>{VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB}
+        for (const VkFormat wanted : srgb ? std::array<VkFormat, 2>{VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB}
                                                 : std::array<VkFormat, 2>{VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM}) {
             for (const auto& f : formats)
                 if (f.format == wanted && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
@@ -519,7 +555,7 @@ private:
                 }
             if (found) break;
         }
-        if (!found && want_srgb_) {
+        if (!found && srgb) {
             if (!warned_srgb_) std::fprintf(stderr, "[rt] present: the surface has no sRGB 8-bit format; an sRGB back buffer is shown darker\n");
             warned_srgb_ = true;
             for (const auto& f : formats)
@@ -595,6 +631,7 @@ private:
             if (!four_bytes || !make_capture_buffer()) return false;
         }
         vsync_ = vsync;
+        swapchain_srgb_ = srgb;
         stale_ = false;
         return true;
     }
@@ -626,7 +663,9 @@ private:
     bool vsync_ = true;
     bool stale_ = false;
     bool ok_ = false;
-    bool want_srgb_ = false;   // the swapchain format follows the source being presented
+    bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
+    std::function<bool()> abort_;
+    std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;
     VkBuffer capture_buffer_ = VK_NULL_HANDLE;
@@ -651,6 +690,7 @@ private:
     PFN_vkCmdBlitImage vkCmdBlitImage_ = nullptr;
     PFN_vkCmdClearColorImage vkCmdClearColorImage_ = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties_ = nullptr;
+    PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties_ = nullptr;
     PFN_vkCreateFence vkCreateFence_ = nullptr;
     PFN_vkDestroyFence vkDestroyFence_ = nullptr;
     PFN_vkWaitForFences vkWaitForFences_ = nullptr;
