@@ -30,7 +30,9 @@ TIMEOUT = 120
 def imports(path):
     """The module names `path` imports at top level, relative imports excluded."""
     names = set()
-    for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+    with open(path, encoding="utf-8") as source:
+        tree = ast.parse(source.read())
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names |= {alias.name.split(".")[0] for alias in node.names}
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:

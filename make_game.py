@@ -457,8 +457,12 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
         need_gb -= need["shaders"]
     if free_gb < need_gb:
+        hint = ""
+        if "assets" in stages and need.get("assets"):
+            hint = (" The assets stage is optional for running: use --stages check,shaders,runtime "
+                    "(about 30 GB; add pipelines if you need it).")
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
-             "Free some space or choose another drive with --work.")
+             "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
