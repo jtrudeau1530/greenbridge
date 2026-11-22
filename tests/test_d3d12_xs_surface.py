@@ -31,6 +31,13 @@ def test_iid_block_is_alphabetical():
     assert S.check_iid_order() == []
 
 
+def test_unrecovered_console_iids_stay_outside_the_table():
+    # SCARAB's provenance says the runtime does not export these; they must not acquire a
+    # guessed ordinal or GUID value from ordering.
+    assert len(S.UNRECOVERED_CONSOLE_IIDS) == 4
+    assert S.check_unrecovered_console_iids() == []
+
+
 def test_standard_iids_match_sdk():
     um, _shared = S.find_sdk_include()
     if not um:
@@ -99,6 +106,7 @@ if __name__ == "__main__":
     test_data_classes()
     test_guid_values()
     test_iid_block_is_alphabetical()
+    test_unrecovered_console_iids_stay_outside_the_table()
     test_sdk_include_override_accepts_a_trailing_separator()
     test_sdk_discovery_sorts_versions_numerically()
     um, _shared = S.find_sdk_include()
