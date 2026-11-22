@@ -1,6 +1,6 @@
 """Semantic tests for RDNA2 64-bit scalar bitwise ops on 64-bit data pairs vs lane masks.
 
-Covers s_and_b64, s_or_b64, s_xor_b64, s_andn2_b64, s_orn2_b64, and s_not_b64:
+Covers s_and_b64, s_or_b64, s_xor_b64, s_andn2_b64, s_orn2_b64, s_nand_b64, s_nor_b64, s_xnor_b64, and s_not_b64:
   * Distinct lo/hi 64-bit SGPR data pairs (verifying D.lo, D.hi, and SCC)
   * Positive/negative immediates (0xFE, -2, -16, 0x80000000, 0, -1) and null src/dst
   * SCC four-corner matrix: (lo==0, hi==0), (lo!=0, hi==0), (lo==0, hi!=0), (lo!=0, hi!=0)
@@ -108,6 +108,9 @@ BIN_OPS = {
     "s_xor_b64": lambda x, y: (x ^ y) & MASK64,
     "s_andn2_b64": lambda x, y: (x & (~y & MASK64)) & MASK64,
     "s_orn2_b64": lambda x, y: (x | (~y & MASK64)) & MASK64,
+    "s_nand_b64": lambda x, y: ~(x & y) & MASK64,
+    "s_nor_b64": lambda x, y: ~(x | y) & MASK64,
+    "s_xnor_b64": lambda x, y: ~(x ^ y) & MASK64,
 }
 
 
@@ -185,6 +188,24 @@ class DataPairBitwiseTests(unittest.TestCase):
                 (0x00000000_00000001, 0xFFFFFFFF_FFFFFFFF, 1),
                 (0x00000001_00000000, 0xFFFFFFFF_FFFFFFFF, 1),  # only hi non-zero!
                 (0x00000001_00000001, 0xFFFFFFFF_FFFFFFFF, 1),
+            ],
+            "s_nand_b64": [
+                (MASK64, MASK64, 0),
+                (0xFFFFFFFF_FFFFFFFE, MASK64, 1),
+                (0xFFFFFFFE_FFFFFFFF, MASK64, 1),  # only hi non-zero!
+                (0, 0, 1),
+            ],
+            "s_nor_b64": [
+                (0xFFFFFFFF_00000000, 0x00000000_FFFFFFFF, 0),
+                (0xFFFFFFFF_FFFFFFFE, 0, 1),
+                (0xFFFFFFFE_FFFFFFFF, 0, 1),  # only hi non-zero!
+                (0, 0, 1),
+            ],
+            "s_xnor_b64": [
+                (0x12345678_9ABCDEF0, 0xEDCBA987_6543210F, 0),
+                (0x12345678_9ABCDEF0, 0xEDCBA987_6543210E, 1),
+                (0x12345678_9ABCDEF0, 0xEDCBA986_6543210F, 1),  # only hi non-zero!
+                (0x12345678_9ABCDEF0, 0x12345678_9ABCDEF0, 1),
             ],
         }
         for op, items in cases.items():
@@ -503,6 +524,9 @@ class LaneMaskPreservationTests(unittest.TestCase):
             ("s_andn2_b64 s[6:7], s[2:3], s[4:5]", lambda l: 20 <= l <= 24, 5, 1),
             ("s_orn2_b64 s[6:7], s[2:3], s[4:5]", lambda l: l <= 29, 30, 1),
             ("s_not_b64 s[6:7], s[2:3]", lambda l: not (20 <= l <= 29), 22, 1),
+            ("s_nand_b64 s[6:7], s[2:3], s[4:5]", lambda l: not (25 <= l <= 29), 27, 1),
+            ("s_nor_b64 s[6:7], s[2:3], s[4:5]", lambda l: l <= 19, 20, 1),
+            ("s_xnor_b64 s[6:7], s[2:3], s[4:5]", lambda l: l <= 19 or 25 <= l <= 29, 25, 1),
         ]
         for insn, pred, want_cnt, want_scc in cases:
             with self.subTest(insn=insn):
@@ -553,6 +577,9 @@ class LaneMaskPreservationTests(unittest.TestCase):
             ("s_andn2_b64 s[6:7], vcc, s[4:5]", lambda l: 40 <= l <= 47, 8, 1),
             ("s_orn2_b64 s[6:7], vcc, s[4:5]", lambda l: l <= 55, 56, 1),
             ("s_not_b64 s[6:7], vcc", lambda l: not (40 <= l <= 55), 48, 1),
+            ("s_nand_b64 s[6:7], vcc, s[4:5]", lambda l: not (48 <= l <= 55), 56, 1),
+            ("s_nor_b64 s[6:7], vcc, s[4:5]", lambda l: l <= 39, 40, 1),
+            ("s_xnor_b64 s[6:7], vcc, s[4:5]", lambda l: l <= 39 or 48 <= l <= 55, 48, 1),
         ]
         for insn, pred, want_cnt, want_scc in cases:
             with self.subTest(insn=insn):
