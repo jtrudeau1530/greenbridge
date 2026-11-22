@@ -95,8 +95,8 @@ def scan_rpf(path, start=None, limit=None):
                 d = zlib.decompressobj()
                 chunks, p = [], s
                 try:
-                    while not d.eof and p < size:
-                        block = m[p:p + (1 << 20)]
+                    while not d.eof and p < end:
+                        block = m[p:min(p + (1 << 20), end)]
                         if not block:
                             break
                         chunks.append(d.decompress(block))
@@ -378,9 +378,14 @@ def main():
     a = ap.parse_args()
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .json or .csv file")
     ext = os.path.splitext(a.out)[1].lower()
     if ext not in (".json", ".csv"):   # checked before the scan, which can take minutes on a large archive
         ap.error("output must end in .json or .csv")
+    folder = os.path.dirname(os.path.abspath(a.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
 
     def progress(n, pages):
         print("streams=%d pages=%d" % (n, pages), file=sys.stderr, flush=True)

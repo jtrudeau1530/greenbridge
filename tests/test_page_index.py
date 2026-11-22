@@ -190,6 +190,8 @@ class PageIndexTest(unittest.TestCase):
             rpf = os.path.join(tmp, "a.rpf")
             make_rpf(rpf, [header(0x100)])
             cases = ((os.path.join(tmp, "out.txt"), (), "must end in .json or .csv"),
+                     (os.path.join(tmp, "no_such_folder", "out.json"), (), "is not a folder"),
+                     (tmp, (), "is a folder"),
                      (os.path.join(tmp, "out.json"), ("--limit", "0"), "must be at least 1"),
                      (os.path.join(tmp, "out.json"), ("--limit", "-5"), "must be at least 1"),
                      (os.path.join(tmp, "out.json"), ("--start", "-1"), "must be 0 or more"))
@@ -198,7 +200,29 @@ class PageIndexTest(unittest.TestCase):
                                       capture_output=True, text=True)
                 self.assertEqual(proc.returncode, 2, proc.stderr)
                 self.assertIn(message, proc.stderr)
-                self.assertFalse(os.path.exists(out))
+                if out != tmp:
+                    self.assertFalse(os.path.exists(out))
+
+    def test_scan_limit_excludes_crossing_stream(self):
+        page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(page, 0xC0, [(0x1234, 0x20, 0x60)])
+        stored = len(zlib.compress(page))
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "limit.rpf")
+            offsets = make_rpf(arc, [page])
+            exact = os.path.join(tmp, "exact.json")
+            run_tool(arc, exact, ("--start", str(offsets[0]), "--limit", str(stored)))
+            with open(exact, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["summary"]["pages"], 1)
+            self.assertEqual(doc["summary"]["streams"], 1)
+
+            short = os.path.join(tmp, "short.json")
+            run_tool(arc, short, ("--start", str(offsets[0]), "--limit", str(stored - 1)))
+            with open(short, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["summary"]["pages"], 0)
+            self.assertEqual(doc["summary"]["streams"], 0)
 
     def test_start_outside_the_archive_is_one_line(self):
         with tempfile.TemporaryDirectory() as tmp:
