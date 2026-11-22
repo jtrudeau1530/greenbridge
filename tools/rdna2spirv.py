@@ -2709,8 +2709,15 @@ class Gen:
             self.emit(f"{sc} = OpSelect %uint {nz} {self.cu(1)} {self.cu(0)}")
             self.dst(a[0], r)
             self.emit(f"OpStore %scc {sc}")
-        elif op == "v_ffbh_i32":
-            # bit position counted from the MSB of the first bit that differs from the sign bit; -1 if none
+        elif op in ("s_sext_i32_i8", "s_sext_i32_i16"):
+            # D = S0's low byte / half, sign-extended to 32 bits; SCC is not written.
+            x = self.src_u(a[1])
+            r = self.tmp()
+            self.emit(f"{r} = OpBitFieldSExtract %uint {x} {self.cu(0)} {self.cu(8 if op.endswith('i8') else 16)}")
+            self.dst(a[0], r)
+        elif op in ("v_ffbh_i32", "s_flbit_i32"):
+            # bit position counted from the MSB of the first bit that differs from the sign bit; -1 if none.
+            # s_flbit_i32 is the scalar form (it does not write SCC).
             x = self.as_int(self.src_u(a[1]))
             f, none, sub, r = (self.tmp() for _ in range(4))
             self.emit(f"{f} = OpExtInst %int %glsl FindSMsb {x}")
