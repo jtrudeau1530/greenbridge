@@ -1047,5 +1047,143 @@ class TestValuDot4IntConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(vcc_ge_16, expected_mask)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling Tests
+# ---------------------------------------------------------------------------
+
+# IEEE 754 binary32 architectural bit patterns for cross-format validation
+FLOAT_POS_ZERO: int = 0x0000_0000
+FLOAT_NEG_ZERO: int = 0x8000_0000
+FLOAT_ONE: int = 0x3F80_0000
+FLOAT_NEG_ONE: int = 0xBF80_0000
+FLOAT_POS_INF: int = 0x7F80_0000
+FLOAT_NEG_INF: int = 0xFF80_0000
+FLOAT_CANONICAL_QNAN: int = 0x7FC0_0000
+FLOAT_SNAN: int = 0x7F80_0001
+FLOAT_MIN_SUBNORMAL: int = 0x0000_0001
+FLOAT_MAX_SUBNORMAL: int = 0x007F_FFFF
+FLOAT_MAX_NORMAL: int = 0x7F7F_FFFF
+
+
+class TestValuDot4IntIEEE754BoundaryExtremes(unittest.TestCase):
+    """IEEE 754 floating-point boundary extremes, subnormals, and NaN handling tests for integer dot4."""
+
+    def test_ieee754_qnan_snan_treated_as_raw_bytes(self) -> None:
+        # FLOAT_CANONICAL_QNAN = 0x7FC00000 -> bytes: [0x00, 0x00, 0xC0, 0x7F]
+        # In unsigned u8: [0, 0, 192, 127]
+        # In signed i8:   [0, 0, -64, 127]
+        # Multiplied by identity vector [1, 1, 1, 1] = 0x01010101
+        ident = 0x0101_0101
+
+        # Unsigned dot4: 0*1 + 0*1 + 192*1 + 127*1 = 319
+        u_res = ref_dot4_u32_u8(FLOAT_CANONICAL_QNAN, ident, 0)
+        self.assertEqual(u_res, 319)
+
+        # Signed dot4: 0*1 + 0*1 + (-64)*1 + 127*1 = 63
+        i_res = ref_dot4_i32_i8(FLOAT_CANONICAL_QNAN, ident, 0)
+        self.assertEqual(i_res, 63)
+
+        # Signaling NaN: 0x7F800001 -> bytes: [0x01, 0x00, 0x80, 0x7F]
+        # Unsigned: 1*1 + 0*1 + 128*1 + 127*1 = 256
+        snan_u = ref_dot4_u32_u8(FLOAT_SNAN, ident, 0)
+        self.assertEqual(snan_u, 256)
+
+        # Signed: 1*1 + 0*1 + (-128)*1 + 127*1 = 0
+        snan_i = ref_dot4_i32_i8(FLOAT_SNAN, ident, 0)
+        self.assertEqual(snan_i, 0)
+
+    def test_ieee754_infinities_integer_dot_product(self) -> None:
+        # FLOAT_POS_INF = 0x7F800000 -> bytes: [0x00, 0x00, 0x80, 0x7F]
+        # FLOAT_NEG_INF = 0xFF800000 -> bytes: [0x00, 0x00, 0x80, 0xFF]
+        ident = 0x0101_0101
+
+        # Unsigned POS_INF dot [1,1,1,1] = 128 + 127 = 255
+        self.assertEqual(ref_dot4_u32_u8(FLOAT_POS_INF, ident, 0), 255)
+
+        # Unsigned NEG_INF dot [1,1,1,1] = 128 + 255 = 383
+        self.assertEqual(ref_dot4_u32_u8(FLOAT_NEG_INF, ident, 0), 383)
+
+        # Signed POS_INF dot [1,1,1,1] = (-128) + 127 = -1 (0xFFFFFFFF)
+        self.assertEqual(ref_dot4_i32_i8(FLOAT_POS_INF, ident, 0), 0xFFFF_FFFF)
+
+        # Signed NEG_INF dot [1,1,1,1] = (-128) + (-1) = -129
+        self.assertEqual(ref_dot4_i32_i8(FLOAT_NEG_INF, ident, 0), (-129) & MASK32)
+
+    def test_ieee754_subnormals_preservation_without_ftz(self) -> None:
+        # In floating-point units with Flush-To-Zero (FTZ), subnormals are forced to 0.
+        # In VALU integer dot4, subnormals MUST be preserved as their exact bit patterns!
+        # FLOAT_MIN_SUBNORMAL = 0x00000001 -> bytes: [1, 0, 0, 0]
+        # Multiplied by [5, 0, 0, 0]
+        s0 = FLOAT_MIN_SUBNORMAL
+        s1 = 0x0000_0005  # bytes: [5, 0, 0, 0]
+        res = ref_dot4_u32_u8(s0, s1, 0)
+        self.assertEqual(res, 5)
+
+        # FLOAT_MAX_SUBNORMAL = 0x007FFFFF -> bytes: [0xFF, 0xFF, 0x7F, 0x00]
+        # Unsigned: [255, 255, 127, 0] . [1, 1, 1, 1] = 255 + 255 + 127 + 0 = 637
+        res_max_sub = ref_dot4_u32_u8(FLOAT_MAX_SUBNORMAL, 0x0101_0101, 0)
+        self.assertEqual(res_max_sub, 637)
+
+    def test_ieee754_negative_zero_sign_bit_differentiation(self) -> None:
+        # In IEEE 754, +0.0 == -0.0.
+        # But in integer dot4:
+        # FLOAT_POS_ZERO = 0x00000000 -> bytes: [0, 0, 0, 0]
+        # FLOAT_NEG_ZERO = 0x80000000 -> bytes: [0, 0, 0, 0x80]
+        multiplier = 0x0101_0101  # [1, 1, 1, 1]
+
+        pos_zero_res = ref_dot4_u32_u8(FLOAT_POS_ZERO, multiplier, 0)
+        neg_zero_res = ref_dot4_u32_u8(FLOAT_NEG_ZERO, multiplier, 0)
+
+        # Unsigned: +0.0 gives 0, -0.0 gives 128
+        self.assertEqual(pos_zero_res, 0)
+        self.assertEqual(neg_zero_res, 128)
+        self.assertNotEqual(pos_zero_res, neg_zero_res)
+
+        # Signed: +0.0 gives 0, -0.0 gives -128
+        pos_zero_i = ref_dot4_i32_i8(FLOAT_POS_ZERO, multiplier, 0)
+        neg_zero_i = ref_dot4_i32_i8(FLOAT_NEG_ZERO, multiplier, 0)
+        self.assertEqual(pos_zero_i, 0)
+        self.assertEqual(neg_zero_i, (-128) & MASK32)
+
+    def test_ieee754_float_max_normal_byte_interaction(self) -> None:
+        # FLOAT_MAX_NORMAL = 0x7F7FFFFF -> bytes: [0xFF, 0xFF, 0x7F, 0x7F]
+        # Unsigned: [255, 255, 127, 127]
+        # Dot with itself: 255^2 + 255^2 + 127^2 + 127^2 = 65025 + 65025 + 16129 + 16129 = 162308
+        res = ref_dot4_u32_u8(FLOAT_MAX_NORMAL, FLOAT_MAX_NORMAL, 0)
+        self.assertEqual(res, 162308)
+
+        # Signed: [-1, -1, 127, 127]
+        # Dot with itself: (-1)^2 + (-1)^2 + 127^2 + 127^2 = 1 + 1 + 16129 + 16129 = 32260
+        res_signed = ref_dot4_i32_i8(FLOAT_MAX_NORMAL, FLOAT_MAX_NORMAL, 0)
+        self.assertEqual(res_signed, 32260)
+
+    def test_integer_extreme_min_max_signed_matrix(self) -> None:
+        # Extreme signed matrix:
+        # S_MIN = [-128, -128, -128, -128] = 0x80808080
+        # S_MAX = [ 127,  127,  127,  127] = 0x7F7F7F7F
+        s_min = 0x8080_8080
+        s_max = 0x7F7F_7F7F
+
+        # MIN . MIN = 4 * 16384 = +65536
+        self.assertEqual(ref_dot4_i32_i8(s_min, s_min, 0), 65536)
+
+        # MAX . MAX = 4 * 16129 = +64516
+        self.assertEqual(ref_dot4_i32_i8(s_max, s_max, 0), 64516)
+
+        # MIN . MAX = 4 * (-16256) = -65024
+        self.assertEqual(ref_dot4_i32_i8(s_min, s_max, 0), (-65024) & MASK32)
+
+    def test_integer_extreme_unsigned_overflow_and_saturation(self) -> None:
+        s_max_u = 0xFFFF_FFFF  # [255, 255, 255, 255]
+        # 4 * (255 * 255) = 260100
+        # Wrap at UINT32_MAX
+        res_wrap = ref_dot4_u32_u8(s_max_u, s_max_u, UINT32_MAX, clamp=False)
+        self.assertEqual(res_wrap, 260099)
+
+        # Saturation at UINT32_MAX
+        res_sat = ref_dot4_u32_u8(s_max_u, s_max_u, UINT32_MAX, clamp=True)
+        self.assertEqual(res_sat, UINT32_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()
