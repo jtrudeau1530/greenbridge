@@ -5,7 +5,7 @@
 // registers that T# -> image index 1 and the shader's literal S# -> sampler index 1, binds an 8x8 gradient at
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
-//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip]   (S# words as hex)
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint]   (S# words as hex)
 //   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
@@ -63,7 +63,8 @@ static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) 
 
 int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
-    const bool two_mip = argc == 10 && std::strcmp(argv[9], "--two-mip") == 0;
+    const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
+    const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
     const uint32_t texture_side = two_mip ? 2 * W : TW;
     const uint32_t levels = two_mip ? 2 : 1;
@@ -108,11 +109,12 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key.
-    const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
+        signed_mips ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
     uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44444444,
                           0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const uint32_t tsharp_va = 256;
@@ -303,6 +305,9 @@ int main(int argc, char** argv) {
                                          : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
         }
     }
+    // The signed two-mip fixture uses 0 or -128 in each channel, including the alpha channel.
+    if (signed_mips)
+        for (auto& texel : texels) texel &= 0x80808080u;
     if (dref) {   // same size as the 8x8 gradient: one 32-bit word a texel
         for (uint32_t y = 0; y < TW; y++)
             for (uint32_t x = 0; x < TW; x++) {

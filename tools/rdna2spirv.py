@@ -6812,7 +6812,8 @@ class Gen:
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
             self.emit(f"{smp} = OpLoad %smp {sp}")
-            typed_lz = op == "image_sample_lz" and dim == "dim:SQ_RSRC_IMG_2D"
+            typed_implicit = op == "image_sample" and self.stage == "ps" and dim == "dim:SQ_RSRC_IMG_2D"
+            typed_sample = typed_implicit or (op == "image_sample_lz" and dim == "dim:SQ_RSRC_IMG_2D")
 
             def sampled_image(image, cls):
                 sampled = self.tmp()
@@ -6820,7 +6821,7 @@ class Gen:
                 self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
                 return sampled
 
-            if not typed_lz and op not in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o"):
+            if not typed_sample and op not in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o"):
                 self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
             f = [self.tof(c) for c in coords]
             goff = None
@@ -7011,11 +7012,19 @@ class Gen:
             else:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-            if typed_lz:
+            if typed_sample:
+                operands = "Lod %f0"
+                if typed_implicit:
+                    # Compute the quad gradients before the per-image format branch.
+                    dx, dy = self.tmp(), self.tmp()
+                    self.emit(f"{dx} = OpDPdx %v2float {uv}")
+                    self.emit(f"{dy} = OpDPdy %v2float {uv}")
+                    operands = f"Grad {dx} {dy}"
+
                 def sample(image, cls, ty):
                     sampled = sampled_image(image, cls)
                     result = self.tmp()
-                    self.emit(f"{result} = OpImageSampleExplicitLod {ty} {sampled} {uv} Lod %f0")
+                    self.emit(f"{result} = OpImageSampleExplicitLod {ty} {sampled} {uv} {operands}")
                     return result
 
                 self.uses_int_sampler = True
