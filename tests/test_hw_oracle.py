@@ -310,7 +310,7 @@ class VcvarsScript(unittest.TestCase):
         out = os.path.join(work, "hw_oracle.exe")
         vcvars = os.path.join(work, "vcvars64.bat")
         argv = runner.build_command("vcvars", vcvars, src, out, work)
-        with open(argv[-1], "rb") as f:
+        with open(os.path.join(work, argv[-1]), "rb") as f:         # the script runs with cwd=work
             return argv, f.read(), (src, out, vcvars)
 
     def test_paths_outside_ascii_are_written_as_utf8(self):
@@ -337,7 +337,7 @@ class VcvarsScript(unittest.TestCase):
             work = os.path.join(tmp, "work")
             os.makedirs(work)
             argv = runner.build_command("vcvars", "vcvars64.bat", "hw_oracle.c", "hw_oracle.exe", work)
-            with open(argv[-1], "rb") as f:
+            with open(os.path.join(work, argv[-1]), "rb") as f:
                 lines = f.read().decode("ascii").split("\r\n")
         self.assertEqual(lines[3], 'call "vcvars64.bat" >nul || exit /b 1')
         self.assertTrue(lines[4].startswith("cl /nologo /O1 hw_oracle.c /Fehw_oracle.exe /Fo"))
@@ -350,6 +350,26 @@ class VcvarsScript(unittest.TestCase):
                              ["gcc", "-O1", "a.c", "-o", "a.exe"])
             self.assertEqual(runner.build_command("msvc", "cl.exe", "a.c", "a.exe", work)[0], "cl.exe")
             self.assertEqual(os.listdir(work), [])
+
+    @unittest.skipUnless(sys.platform == "win32", "runs the script through cmd.exe")
+    def test_the_script_runs_from_any_work_folder(self):
+        # A full path through `cmd.exe /c` loses its quotes when the folder holds & or ^, and a bare name is not
+        # found with NoDefaultCurrentDirectoryInExePath set. A stub vcvars shows the script got that far.
+        broken = []
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = os.path.join(tmp, "stub_vcvars.bat")
+            with open(stub, "wb") as f:
+                f.write(b'@echo off\r\necho reached> "%LEONIDA_TEST_MARKER%"\r\nexit /b 0\r\n')
+            for name in ("plain", "sp (x)", "a & b", "a&b", "x^y", self.NAME):
+                work = os.path.join(tmp, name)
+                os.makedirs(work)
+                marker = os.path.join(work, "reached.txt")
+                argv = runner.build_command("vcvars", stub, "hw_oracle.c", "hw_oracle.exe", work)
+                env = dict(os.environ, LEONIDA_TEST_MARKER=marker, NoDefaultCurrentDirectoryInExePath="1")
+                subprocess.run(argv, cwd=work, env=env, capture_output=True, timeout=60)   # cl itself is absent
+                if not os.path.exists(marker):
+                    broken.append(name)
+        self.assertEqual(broken, [], "build_hw_oracle.cmd did not run from these work folders")
 
 
 class Unavailable(unittest.TestCase):
@@ -399,7 +419,7 @@ class Unavailable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             argv = runner.build_command("vcvars", r"C:\VS 2022\vcvars64.bat", "a.c", "o.exe", tmp)
             self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
-            script = Path(argv[3]).read_text(encoding="ascii")
+            script = (Path(tmp) / argv[3]).read_text(encoding="ascii")
             self.assertIn('call "C:\\VS 2022\\vcvars64.bat"', script)          # quoted: the path has a space
             self.assertIn("cl /nologo /O1 a.c /Feo.exe", script)
             self.assertIn("Installer", script)                                 # vcvars needs vswhere on PATH
