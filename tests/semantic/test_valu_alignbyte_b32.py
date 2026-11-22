@@ -39,6 +39,8 @@ Python 3.9+ compatible (from __future__ import annotations).
 """
 from __future__ import annotations
 
+import dataclasses
+import enum
 import os
 import struct
 import sys
@@ -215,6 +217,192 @@ class TestValuAlignbyteB32Oracle(unittest.TestCase):
         self.assertEqual(b2, 0xAD)
         self.assertEqual(b3, 0xDE)
         self.assertEqual(pack_bytes(b0, b1, b2, b3), val)
+
+
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand representing a 32-bit vector or scalar register."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR and not (0 <= self.index < 256):
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+        if self.kind == RegKind.SGPR and not (0 <= self.index < 106):
+            raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+        if self.count != 1:
+            raise ValueError(f"Unsupported register count for 32-bit VALU instruction: {self.count}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate:
+    """Symbolic 32-bit immediate operand."""
+    bits: int
+
+    def __init__(self, val: int) -> None:
+        object.__setattr__(self, "bits", val & MASK32)
+
+    def format_asm(self) -> str:
+        if 0 <= self.bits <= 64:
+            return str(self.bits)
+        return f"{self.bits:#010x}"
+
+
+class Opcode(enum.Enum):
+    """VALU 32-bit alignment opcode."""
+    V_ALIGNBYTE_B32 = "v_alignbyte_b32"
+
+
+class Encoding(enum.Enum):
+    """Instruction encoding format."""
+    VOP3 = "e64"
+    VOP3A = "vop3a"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a VALU byte alignment instruction."""
+    opcode: Opcode
+    dst: Register
+    src0: Register | Immediate
+    src1: Register | Immediate
+    src2: Register | Immediate
+    encoding: Encoding = Encoding.VOP3
+
+    def __post_init__(self) -> None:
+        if not self.dst.is_vgpr:
+            raise ValueError(f"VALU instruction destination must be a VGPR: {self.dst}")
+        if self.dst.count != 1:
+            raise ValueError(f"VALU 32-bit instruction destination must have count=1: {self.dst}")
+
+    def to_assembly(self) -> str:
+        s0_str = self.src0.format_asm()
+        s1_str = self.src1.format_asm()
+        s2_str = self.src2.format_asm()
+        dst_str = self.dst.format_asm()
+        return f"{self.opcode.value} {dst_str}, {s0_str}, {s1_str}, {s2_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of VALU instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestValuAlignbyteB32AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_construction_and_formatting(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        v7 = Register(RegKind.VGPR, 7)
+        s4 = Register(RegKind.SGPR, 4)
+        self.assertTrue(v0.is_vgpr)
+        self.assertFalse(v0.is_sgpr)
+        self.assertTrue(s4.is_sgpr)
+        self.assertEqual(v0.format_asm(), "v0")
+        self.assertEqual(v7.format_asm(), "v7")
+        self.assertEqual(s4.format_asm(), "s4")
+
+    def test_immediate_construction(self) -> None:
+        imm2 = Immediate(2)
+        imm_hex = Immediate(0xDEADBEEF)
+        self.assertEqual(imm2.bits, 2)
+        self.assertEqual(imm2.format_asm(), "2")
+        self.assertEqual(imm_hex.bits, 0xDEADBEEF)
+        self.assertEqual(imm_hex.format_asm(), "0xdeadbeef")
+
+    def test_instruction_formatting(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Immediate(2),
+        )
+        self.assertEqual(inst.to_assembly(), "v_alignbyte_b32 v0, v1, v2, 2")
+
+    def test_instruction_with_sgpr_and_vgpr(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 5),
+            src0=Register(RegKind.SGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Register(RegKind.SGPR, 2),
+        )
+        self.assertEqual(inst.to_assembly(), "v_alignbyte_b32 v5, s0, v1, s2")
+
+    def test_instruction_validation_negative(self) -> None:
+        # Invalid destination kind (must be VGPR)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_ALIGNBYTE_B32,
+                dst=Register(RegKind.SGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+                src1=Register(RegKind.VGPR, 2),
+                src2=Immediate(0),
+            )
+
+        # Invalid register count
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=2)
+
+        # Out of bounds register index
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Immediate(1),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 3),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 4),
+            src2=Immediate(2),
+        ))
+        expected = (
+            "v_alignbyte_b32 v0, v1, v2, 1\n"
+            "v_alignbyte_b32 v3, v0, v4, 2"
+        )
+        self.assertEqual(prog.to_assembly(), expected)
 
 
 if __name__ == "__main__":
