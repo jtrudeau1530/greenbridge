@@ -811,5 +811,81 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 2)), 0.375)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr64(0, f64_to_bits(15.75))
+        instr = VFractF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f64(state.get_vgpr64(0)), 0.75)
+
+    def test_inplace_iterative_fract(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr64(0, f64_to_bits(100.125))
+        instr = VFractF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        for _ in range(10):
+            self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f64(state.get_vgpr64(0)), 0.125)
+
+    def test_partial_overlap_misaligned_alias_forward(self) -> None:
+        # Destination v[1:2] partially overlaps src0 v[0:1] (shares v[1])
+        state = ScalarMachineState()
+        bits_src0 = f64_to_bits(4.625)
+        state.set_vgpr64(0, bits_src0)
+        lo0, hi0 = f64_bits_to_words(bits_src0)
+
+        instr = VFractF64Instruction(
+            dst=RegPair(1, RegType.VGPR),
+            src0=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        res_bits = self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f64(res_bits), 0.625)
+        self.assertEqual(state.get_vgpr64(1), res_bits)
+        # v[0] (low word of src0) remains untouched
+        self.assertEqual(state.vgprs[0], lo0)
+
+    def test_partial_overlap_misaligned_alias_backward(self) -> None:
+        # Destination v[0:1] partially overlaps src0 v[1:2] (shares v[1])
+        state = ScalarMachineState()
+        bits_src0 = f64_to_bits(9.875)
+        state.set_vgpr64(1, bits_src0)
+        lo0, hi0 = f64_bits_to_words(bits_src0)
+
+        instr = VFractF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand(RegPair(1, RegType.VGPR)),
+        )
+        res_bits = self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f64(res_bits), 0.875)
+        self.assertEqual(state.get_vgpr64(0), res_bits)
+        # v[2] (high word of src0) remains untouched
+        self.assertEqual(state.vgprs[2], hi0)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr64(lane, 0, f64_to_bits(float(lane) + 0.3125))
+
+        instr = VFractF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 0)), 0.3125)
+
+
 if __name__ == "__main__":
     unittest.main()
