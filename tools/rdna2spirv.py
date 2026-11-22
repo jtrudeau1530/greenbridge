@@ -30,6 +30,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
+from report_paths import path_key, same_report_path  # noqa: E402
 from shader_ir import HDR, parse_file  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
@@ -15733,6 +15734,20 @@ def _shard_arg(text):
     return si, sn
 
 
+def _out_inside_input(src, out):
+    """True when --out is the input folder or a folder inside it: translating there writes among the inputs.
+
+    `src` is a .s file or the folder of them; a single file's folder is its input folder. `same_report_path`
+    covers the same spelling, `..`, links and (on Windows) case; `path_key` folds a case-insensitive macOS
+    volume for the containment test. Standard library only.
+    """
+    folder = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
+    if same_report_path(folder, out):
+        return True
+    root, target = path_key(folder), path_key(out)
+    return target.startswith(root.rstrip(os.sep) + os.sep)
+
+
 def main():
     global MAX_SHARED_BYTES
     ap = argparse.ArgumentParser()
@@ -15864,6 +15879,13 @@ def main():
         si, sn = a.shard
         files = files[si::sn]
         shard = si
+    # Writing translations into the input folder mixes them with the .s inputs (and a rerun then scans its
+    # own output); refuse it before mkdir, the index or any module is written. --merge above is exempt: its
+    # src is not read, and merging parts in place is how a shard run finishes.
+    if _out_inside_input(a.src, a.out):
+        print(f"ERROR: --out {a.out} is the input folder or inside it; choose a separate output folder",
+              file=sys.stderr)
+        return 2
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:  # a trailing separator on a file, or a symlink changed since the check above
