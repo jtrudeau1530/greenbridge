@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -380,6 +381,28 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("--out and --lights-out must use different paths", err.getvalue())
         self.assertFalse(os.path.exists(out))
+
+    def test_cli_rejects_case_alias_before_scan_on_a_case_insensitive_volume(self):
+        marker = os.path.join(self.tmp.name, "case-check")
+        with open(marker, "w", encoding="utf-8"):
+            pass
+        if not os.path.exists(os.path.join(self.tmp.name, "CASE-CHECK")):
+            self.skipTest("test directory is case-sensitive")
+        original_files = set(os.listdir(self.tmp.name))
+
+        out = os.path.join(self.tmp.name, "lights.json")
+        alias = os.path.join(self.tmp.name, "LIGHTS.JSON")
+        err = io.StringIO()
+        # Exercise case-insensitive lookup without Windows's lexical normalization.
+        with mock.patch.object(T.os.path, "normcase", side_effect=lambda path: path), \
+                mock.patch.object(T, "scan", side_effect=AssertionError("scan started before rejecting the alias")) as scan, \
+                contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as cm:
+            T.main([self.rpf, "--out", out, "--lights-out", alias])
+        scan.assert_not_called()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--out and --lights-out must use different paths", err.getvalue())
+        self.assertEqual(set(os.listdir(self.tmp.name)), original_files)
 
     def test_cli_writes_summary_and_placed_lights(self):
         out = os.path.join(self.tmp.name, "summary.json")
