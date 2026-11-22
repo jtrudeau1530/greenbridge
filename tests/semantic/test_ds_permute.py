@@ -88,7 +88,7 @@ class SwizzleExecTests(unittest.TestCase):
                     # Lane 0 reads disabled lane 1. Lane 1 keeps its destination. Lanes 2/3 exchange active data.
                     expected = [0, 0x3f000000, 0x3f400000, 0x3f400000] * 8
                     if lanes == 7:
-                        expected[6] = 0  # the last source, lane 7, does not exist
+                        expected[6] = 0  # translator's model for absent lane 7; unverified on hardware
                     self.assertEqual(run(spv, lanes, 32), expected[:lanes])
 
 
