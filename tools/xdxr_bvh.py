@@ -642,7 +642,9 @@ def validate(data, expect_bottom=None):
     errs = []
     if len(data) < HEADER_SIZE:
         return ["buffer shorter than the 64-byte header"]
-    (flags, units, _crc, n_el, *rest) = struct.unpack_from("<4I6fIiIIII", data, 0)
+    # offsetToParents is read signed: a console structure keeps it negative (the entries of its low units, the leaves,
+    # fall before the header and are not stored), a runtime build keeps it at 0x40.
+    (flags, units, _crc, n_el, *rest) = struct.unpack_from("<4I6fIiIIiI", data, 0)
     bounds = rest[0:6]
     nodes_off, _remap, root, elements_off, parents_off, _cp = rest[6:]
     bottom = bool(flags & FLAG_BOTTOM_LEVEL)
@@ -676,9 +678,13 @@ def validate(data, expect_bottom=None):
         seen.add(p)
         if parent is not None and kind > TRI3 and parents_off:
             u = (off - elements_off) // UNIT
-            stored = struct.unpack_from("<I", data, parents_off + 4 * u)[0]
-            if stored != parent:
-                errs.append(f"parent table entry of {p:#x} is {stored:#x}, expected {parent:#x}")
+            entry = parents_off + 4 * u
+            # Only the entries that lie between the header and offsetToElements are stored in the structure; the
+            # others (the low units) are not, so there is nothing to compare (docs/bvh.md 3.1).
+            if HEADER_SIZE <= entry and entry + 4 <= elements_off:
+                stored = struct.unpack_from("<I", data, entry)[0]
+                if stored != parent:
+                    errs.append(f"parent table entry of {p:#x} is {stored:#x}, expected {parent:#x}")
         if kind <= TRI3:
             if not bottom:
                 errs.append(f"triangle node {p:#x} in a top-level BVH")
