@@ -17,6 +17,7 @@ from conftest import EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, make_dxbc,
 pytestmark = requires_tools
 
 SAMPLES = sorted(glob.glob(os.path.join(ROOT, "runtime", "test", "shaders", "*.asm")))
+SAMPLES += sorted(glob.glob(os.path.join(ROOT, "tests", "semantic", "fixtures", "ps_*.asm")))
 
 # One minimal pixel shader per instruction family listed in the "Supported" section of rdna2spirv.py's docstring.
 # Each body is wrapped in a program that exports its result so nothing is optimised away.
@@ -51,7 +52,7 @@ def program(body):
 
 @pytest.mark.parametrize("path", SAMPLES, ids=[os.path.basename(p) for p in SAMPLES])
 def test_gpu_samples_translate_and_validate(path, make_shader):
-    """The hand-written GPU-harness samples must translate to SPIR-V that passes spirv-val."""
+    """The hand-written GPU-harness and semantic shader samples must translate to valid SPIR-V."""
     stem = os.path.splitext(os.path.basename(path))[0]
     name = stem if stem.startswith(("vs_", "ps_", "cs_", "gs_", "ms_")) else "ps_" + stem   # the prefix selects the stage
     if name.startswith(("gs_", "ms_")) and stem not in SAMPLE_DXBC:
