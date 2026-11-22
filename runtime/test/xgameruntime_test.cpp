@@ -374,13 +374,13 @@ void check_run_time_load() {
                   reinterpret_cast<IdQuery>(slot(sy, 5))(sy, 45, nullptr, &used) == E_INVALIDARG,
               "slot 5 (XSystemGetAppSpecificDeviceId): 45 bytes; a short or null buffer is refused");
         using Track = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
-        using IsValid = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
-        using Bandwidth = HRESULT(STDMETHODCALLTYPE*)(void*, bool);
+        using IsValid = bool(STDMETHODCALLTYPE*)(void*, void*);  // bool, per Microsoft's reference page
+        using Bandwidth = void(STDMETHODCALLTYPE*)(void*, bool);
         int ctx = 0;
+        reinterpret_cast<Bandwidth>(slot(sy, 8))(sy, true);
         check(reinterpret_cast<Track>(slot(sy, 6))(sy, &ctx, &ctx) == S_OK &&
-                  reinterpret_cast<IsValid>(slot(sy, 7))(sy, &ctx) == S_OK &&
-                  reinterpret_cast<IsValid>(slot(sy, 7))(sy, nullptr) == E_INVALIDARG &&
-                  reinterpret_cast<Bandwidth>(slot(sy, 8))(sy, true) == S_OK,
+                  reinterpret_cast<IsValid>(slot(sy, 7))(sy, &ctx) &&
+                  !reinterpret_cast<IsValid>(slot(sy, 7))(sy, nullptr),
               "slots 6-8 (handle tracking, handle check, download bandwidth) answer offline");
         release(sy);
     }

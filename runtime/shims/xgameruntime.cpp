@@ -444,8 +444,10 @@ HRESULT STDMETHODCALLTYPE sys_app_device_id(void*, size_t size, char* out, size_
 // XSystemHandleTrack(callback, context): the GDK reports handle creation and destruction to it. Offline nothing is
 // tracked, so the callback is accepted and never called.
 HRESULT STDMETHODCALLTYPE sys_handle_track(void*, void*, void*) { return S_OK; }
-HRESULT STDMETHODCALLTYPE sys_is_handle_valid(void*, void* handle) { return handle ? S_OK : E_INVALIDARG; }
-HRESULT STDMETHODCALLTYPE sys_allow_full_download_bandwidth(void*, bool) { return S_OK; }
+// bool XSystemIsHandleValid(XSystemHandle) and void XSystemAllowFullDownloadBandwidth(bool), as Microsoft documents
+// them: a bool, not an HRESULT (S_OK would read as false).
+bool STDMETHODCALLTYPE sys_is_handle_valid(void*, void* handle) { return handle != nullptr; }
+void STDMETHODCALLTYPE sys_allow_full_download_bandwidth(void*, bool) {}
 
 const void* const kSystemVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
