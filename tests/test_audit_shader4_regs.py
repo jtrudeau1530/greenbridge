@@ -128,5 +128,12 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(rep["gs"]["s3_rbw_op_patterns"], {"s_bfe_u32 D, s3, 0x80008": 1})
 
 
+def setUpModule():
+    # The tools' main() prints its report; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
+
+
 if __name__ == "__main__":
     unittest.main()

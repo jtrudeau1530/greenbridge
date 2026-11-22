@@ -344,5 +344,12 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual((stats["entities"], stats["unique_hashes"], stats["unresolved_hashes"]), (1, 1, 1))
 
 
+def setUpModule():
+    # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
+
+
 if __name__ == "__main__":
     unittest.main()
