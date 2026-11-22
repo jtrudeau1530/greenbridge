@@ -3686,6 +3686,49 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpIAdd %uint {total} {acc}")
             self.dst(a[0], r)
+        elif op == "v_mqsad_u32_u8":
+            # Four masked byte-SADs with full 32-bit accumulators (RDNA ISA pseudocode): for k = 0..3,
+            # D[k] = S2[k] + v_msad_u8 of the 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1, wrapping at
+            # 32 bits; a byte where S1's byte is 0 adds nothing. S2 and D are 128-bit (four VGPRs).
+            # clamp is not modelled: rejected rather than guessed.
+            if a[0].get("n") != 4 or "clamp" in mods:
+                raise Unsupported(op + " operands")
+            s0, s2 = a[1], a[3]
+            if s0["k"] in ("vgpr", "sgpr") and s0.get("n") == 2:
+                x_lo, x_hi = self.load_reg(s0["k"], s0["r"]), self.load_reg(s0["k"], s0["r"] + 1)
+            elif s0["k"] == "imm":
+                v = s0["v"] & 0xFFFFFFFFFFFFFFFF                  # 64-bit inline/literal constant: sign-extended
+                x_lo, x_hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " operands")
+            if s2["k"] == "vgpr" and s2.get("n") == 4:
+                accs = [self.load_reg("vgpr", s2["r"] + k) for k in range(4)]
+            else:
+                raise Unsupported(op + " operands")
+            y = self.src_u(a[2])
+            outs = []
+            for k in range(4):
+                if k == 0:
+                    win = x_lo
+                else:
+                    t1, t2, win = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{t1} = OpShiftRightLogical %uint {x_lo} {self.cu(8 * k)}")
+                    self.emit(f"{t2} = OpShiftLeftLogical %uint {x_hi} {self.cu(32 - 8 * k)}")
+                    self.emit(f"{win} = OpBitwiseOr %uint {t1} {t2}")
+                total = accs[k]
+                for off in (0, 8, 16, 24):
+                    xb, yb, hi_, lo_, d, md, t = (self.tmp() for _ in range(7))
+                    self.emit(f"{xb} = OpBitFieldUExtract %uint {win} {self.cu(off)} {self.cu(8)}")
+                    self.emit(f"{yb} = OpBitFieldUExtract %uint {y} {self.cu(off)} {self.cu(8)}")
+                    self.emit(f"{hi_} = OpExtInst %uint %glsl UMax {xb} {yb}")
+                    self.emit(f"{lo_} = OpExtInst %uint %glsl UMin {xb} {yb}")
+                    self.emit(f"{d} = OpISub %uint {hi_} {lo_}")
+                    self.emit(f"{md} = OpSelect %uint {self.tmp_bool_nz(yb)} {d} {self.cu(0)}")
+                    self.emit(f"{t} = OpIAdd %uint {total} {md}")
+                    total = t
+                outs.append(total)
+            for k in range(4):               # every source is read before the first write
+                self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, outs[k])
         elif op == "v_xad_u32":
             x, y, z = (self.src_u(t) for t in a[1:4])
             t, r = self.tmp(), self.tmp()

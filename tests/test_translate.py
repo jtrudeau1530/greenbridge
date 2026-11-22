@@ -72,7 +72,7 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sat_pk_u8_i16 v0, v1"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
 
