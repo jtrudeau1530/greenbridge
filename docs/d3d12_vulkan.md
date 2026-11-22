@@ -1303,7 +1303,7 @@ Reproduce: `rea.inspect_native_exports` and `rea.inspect_pe_imports` on the DLL,
 little-endian GUIDs from `d3d12.h`.
 
 Constructed by `runtime/test/bvh_builder_test.cpp` (1.0.2.1: `rt::Loader`, `Loader::initialise()` for TLS and
-`DllMain`, `.pdata` registered by the test while the loader doesn't, then `XboxBvhBuilder(ID3D12Device11*, bool)`
+`DllMain`, `.pdata` registered by the loader (#176), then `XboxBvhBuilder(ID3D12Device11*, bool)`
 on a PC device behind the Xbox-ABI proxy). Measured:
 
 - 0 unimplemented imports; `D3D12SerializeVersionedRootSignature` and `XMemVirtualQuery` bind to shims. The constructor writes 24 bytes of the object (`sizeof(XboxBvhBuilder)` >= 24;
@@ -1331,7 +1331,7 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   `IID_ID3D12CommandSignature` (0x047300). Again, presence ≠ use.
 - Run through the public FidelityFX API by `runtime/test/fsr_dispatch_test.cpp` (1.0.2.1: `rt::Loader` and
   `Loader::initialise()`, with #93's static TLS, which the DLL's thread-safe statics need, and `.pdata` registered by
-  the test while the loader doesn't; PC D3D12 device on an RTX 4090 behind the Xbox-ABI proxy). Measured:
+  the loader (#176); PC D3D12 device on an RTX 4090 behind the Xbox-ABI proxy). Measured:
   - It maps with 0 unimplemented imports: `D3D12CreateRootSignatureDeserializer` and `XMemAlloc` /
     `XMemFree` / `XMemGetWorkingSetStatistics` bind to the shims, 82 imports to host DLLs. Its TLS template is
     8 bytes with no callbacks. `DllMain(DLL_PROCESS_ATTACH)` returns TRUE.
