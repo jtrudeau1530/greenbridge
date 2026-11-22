@@ -402,8 +402,9 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
     UINT64 cursor = 0;
     const auto readback_layout = place(device, dst.p, 0, cursor);
     RESOLVE_CHECK(cursor != 0 && readback_layout.Footprint.RowPitch >= dst_width * pixel_size);
+    const D3D12_RESOURCE_DESC readback_desc = buffer_desc(cursor);
     RESOLVE_CHECK(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE,
-                                                             &buffer_desc(cursor), D3D12_RESOURCE_STATE_COPY_DEST,
+                                                             &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST,
                                                              nullptr, IID_PPV_ARGS(&readback.p))));
 
     const FLOAT green[4] = {0, 1, 0, 1};
@@ -528,6 +529,10 @@ int compare_resolves(ID3D12Device* ours) {
     }
     std::printf("Resolve comparison: %u matched cases, %u unsupported format/sample combinations skipped, "
                 "%d mismatches\\n", comparisons, skipped, mismatches);
+    if (comparisons == 0) {
+        std::fprintf(stderr, "Resolve comparison: no common supported format/sample combination was exercised\\n");
+        ++mismatches;
+    }
     return mismatches;
 }
 
