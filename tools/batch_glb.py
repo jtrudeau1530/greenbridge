@@ -186,14 +186,18 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     t0 = time.monotonic()
-    stats = batch_convert(
-        args.in_dir,
-        args.out_dir,
-        up_axis=args.up,
-        jobs=args.jobs,
-        texture_dir=args.textures,
-        max_tex_size=args.max_tex_size,
-    )
+    try:
+        stats = batch_convert(
+            args.in_dir,
+            args.out_dir,
+            up_axis=args.up,
+            jobs=args.jobs,
+            texture_dir=args.textures,
+            max_tex_size=args.max_tex_size,
+        )
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     elapsed = time.monotonic() - t0
 
     print(

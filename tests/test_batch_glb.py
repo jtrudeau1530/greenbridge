@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -37,6 +38,27 @@ def _create_minimal_bc1_dds() -> bytes:
 
 
 class TestBatchGlb(unittest.TestCase):
+    def test_cli_reports_directory_setup_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            missing = os.path.join(root, "missing")
+            blocked = os.path.join(root, "blocked")
+            with open(blocked, "wb"):
+                pass
+
+            for source, output, error in [
+                (missing, os.path.join(root, "out"), "Input directory does not exist"),
+                (root, blocked, "blocked"),
+            ]:
+                with self.subTest(source=source, output=output):
+                    result = subprocess.run(
+                        [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"), source, output],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertTrue(result.stderr.startswith("ERROR: "), result.stderr)
+                    self.assertIn(error, result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+
     def test_batch_convert_synthetic(self) -> None:
         with tempfile.TemporaryDirectory() as in_dir, tempfile.TemporaryDirectory() as out_dir:
             for i in range(3):
