@@ -3,14 +3,16 @@
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
 render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears, and query heaps)
 runs behind the Xbox-ABI device proxy, and a presenter puts back buffers in a window (section 3.2). The M0
-milestone passes in a synthetic test (section 6). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
+milestone passes in a synthetic test (section 6), and M1 and M1.5 in `d3d12_draw_test` and
+`d3d12_translated_draw_test`. `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
 set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
 PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
 and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
 pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
-mesh shaders and ray tracing are reported as not supported.** This is the plan for replacing the console's
-`d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
-exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
+mesh shaders are reported as not supported. The device reports `RaytracingTier` as `NOT_SUPPORTED`, yet
+`BuildRaytracingAccelerationStructure` builds XDXR BVH4 structures on the GPU (section 4.8).** This is the plan for
+replacing the console's `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on
+Vulkan, while producing exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
 
 The document is deliberately conservative about what is known. Every claim is marked:
@@ -441,10 +443,10 @@ What is implemented (all of it testable without the game):
   `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
 - **Presentation** (`leonida::VulkanPresenter` in `runtime/src/vulkan_present.h`, which
   `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part every
-  present front end needs; DXGI or `PresentX` is still open (question 6). It takes a back buffer, an ordinary
-  texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image, scaling when the window
-  size differs. The blit goes on the same `VkQueue` after the application's work, so the frame contains everything
-  submitted before the present. Details:
+  present front end needs; which of DXGI or `PresentX` the game uses is still open (question 6). It takes a back
+  buffer, an ordinary texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image,
+  scaling when the window size differs. The blit goes on the same `VkQueue` after the application's work, so the
+  frame contains everything submitted before the present. Details:
   - two frames in flight, and a present semaphore per swapchain image;
   - FIFO when vsync is asked for, otherwise MAILBOX or IMMEDIATE; with `VK_KHR/EXT_swapchain_maintenance1` the FIFO
     swapchain can also present one frame in IMMEDIATE or FIFO_RELAXED (`present(..., tear)`, section 4.5);
@@ -1492,8 +1494,9 @@ have; add the content hash to the index.
 
 Pipeline creation:
 
-- `D3D12_GRAPHICS_PIPELINE_STATE_DESC` and the `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects are both supported.
-  Parse the stream subobjects in order; unknown types are a hard error with the type number logged.
+- `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is supported today (`CreateGraphicsPipelineState`), as is the compute desc. The
+  `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects (`CreatePipelineState`) are not implemented yet. The plan: parse the
+  stream subobjects in order; unknown types are a hard error with the type number logged.
 - Build `VkPipelineShaderStageCreateInfo` from the translated module and the index entry. Mesh shaders use
   `VK_EXT_mesh_shader` (`AS`/`MS` subobjects → task/mesh stages); geometry uses the geometry stage; compute uses a
   compute pipeline.
@@ -2073,9 +2076,10 @@ That import must be shimmed. The shim provides:
 - `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
 
 **What exists.** The back end of this path is `leonida::VulkanPresenter` (section 3.2): surface, swapchain,
-blit, present, resize. A DXGI shim's `Present` and a `PresentX` implementation would both end in its `present()`.
-`GetBuffer(i)` therefore does not need to wrap swapchain images: the buffers can be ordinary committed textures,
-blitted at present time, which also frees the game's buffer count and format from the surface's.
+blit, present, resize. The DXGI shim's `Present` (`runtime/shims/dxgi_com.cpp`) and `PresentX`
+(`runtime/shims/xbox_present.cpp`) are both implemented over it. `GetBuffer(i)` therefore does not need to wrap
+swapchain images: the buffers can be ordinary committed textures, blitted at present time, which also frees the
+game's buffer count and format from the surface's.
 
 **PresentX and frame events (GDKX).** Public Microsoft samples present on Xbox without a DXGI swapchain. Facts
 below come from MIT/zlib-licensed code and docs, read directly; none is from the game or the SDK. Sources:
