@@ -276,6 +276,18 @@ int main() {
     scd.BufferCount = 2;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
+    for (const UINT count : {0u, 1u, DXGI_MAX_SWAP_CHAIN_BUFFERS + 1u}) {
+        DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+        invalid.BufferCount = count;
+        IDXGISwapChain1* rejected = nullptr;
+        const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd, &invalid, nullptr, nullptr, &rejected);
+        if (rejected) {
+            rejected->Release();
+            return fail("CreateSwapChainForHwnd returned a swapchain for an invalid buffer count");
+        }
+        if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd invalid buffer count HRESULT");
+    }
+
     IDXGISwapChain1* sc1 = nullptr;
     if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &scd, nullptr, nullptr, &sc1)) || !sc1)
         return fail("CreateSwapChainForHwnd");
@@ -420,6 +432,25 @@ int main() {
         if (FAILED(sc->Present(0, 0))) return fail("Present");
         return 0;
     };
+
+    // Invalid counts must leave the initial back buffers usable for the first frame.
+    {
+        DXGI_SWAP_CHAIN_DESC1 before_resize{};
+        if (FAILED(sc->GetDesc1(&before_resize))) return fail("GetDesc1 before invalid resizes");
+        const std::vector<UINT> node_masks(DXGI_MAX_SWAP_CHAIN_BUFFERS + 1, 1);
+        const std::vector<IUnknown*> present_queues(DXGI_MAX_SWAP_CHAIN_BUFFERS + 1, queue);
+        for (const UINT count : {1u, DXGI_MAX_SWAP_CHAIN_BUFFERS + 1u}) {
+            if (sc->ResizeBuffers(count, 64, 64, DXGI_FORMAT_UNKNOWN, 0) != E_INVALIDARG)
+                return fail("ResizeBuffers invalid buffer count HRESULT");
+            if (sc->ResizeBuffers1(count, 64, 64, DXGI_FORMAT_UNKNOWN, 0, node_masks.data(), present_queues.data()) !=
+                E_INVALIDARG)
+                return fail("ResizeBuffers1 invalid buffer count HRESULT");
+        }
+        DXGI_SWAP_CHAIN_DESC1 after_resize{};
+        if (FAILED(sc->GetDesc1(&after_resize)) || after_resize.BufferCount != before_resize.BufferCount ||
+            after_resize.Width != before_resize.Width || after_resize.Height != before_resize.Height)
+            return fail("Invalid resize changed swapchain buffers");
+    }
 
     // Frame 1: 128x128 clear to (64, 128, 255, 255), read back all 16,384 pixels, Present.
     const float blue_ish[4] = {64.0f / 255.0f, 128.0f / 255.0f, 1.0f, 1.0f};
@@ -747,6 +778,8 @@ int main() {
     // Zero width or height means the window's client area, in ResizeBuffers (the usual WM_SIZE call) and at
     // creation; host DXGI: ResizeBuffers(0, 0, 0) after resizing the window gives the new client size.
     {
+        DXGI_SWAP_CHAIN_DESC1 before_zero{};
+        if (FAILED(sc->GetDesc1(&before_zero))) return fail("GetDesc1 before zero-count resize");
         RECT wr{0, 0, 300, 200};
         AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
         SetWindowPos(hwnd, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
@@ -754,7 +787,8 @@ int main() {
         GetClientRect(hwnd, &cr);
         if (FAILED(sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers(0, 0, 0)");
         DXGI_SWAP_CHAIN_DESC1 d{};
-        sc->GetDesc1(&d);
+        if (FAILED(sc->GetDesc1(&d)) || d.BufferCount != before_zero.BufferCount)
+            return fail("ResizeBuffers(0, 0, 0) changed the buffer count");
         if (d.Width != UINT(cr.right) || d.Height != UINT(cr.bottom)) {
             std::fprintf(stderr, "FAIL: ResizeBuffers(0, 0, 0) gave %ux%u, client area is %ldx%ld\n", d.Width, d.Height,
                          cr.right, cr.bottom);

@@ -22,6 +22,10 @@ void stub(const char* method) {
     if (seen.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
 }
 
+bool valid_flip_buffer_count(UINT count) {
+    return count >= 2 && count <= DXGI_MAX_SWAP_CHAIN_BUFFERS;
+}
+
 VkFormat dxgi_to_vk_format(DXGI_FORMAT fmt) {
     switch (fmt) {
     case DXGI_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
@@ -128,14 +132,13 @@ public:
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
-        const std::uint32_t count = desc.BufferCount ? desc.BufferCount : 2u;
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (desc.Format != DXGI_FORMAT_UNKNOWN) {
             vk_fmt = dxgi_to_vk_format(desc.Format);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return false;
         }
         const bool allow_tearing = (flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-        if (!swapchain_.create(hwnd, w, h, vk_fmt, count, allow_tearing)) return false;
+        if (!swapchain_.create(hwnd, w, h, vk_fmt, desc.BufferCount, allow_tearing)) return false;
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
             // DXGI: waitable swapchains default to maximum frame latency 1.
             max_frame_latency_.store(1, std::memory_order_relaxed);
@@ -234,6 +237,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags) override {
+        if (count != 0 && !valid_flip_buffer_count(count)) return E_INVALIDARG;
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (fmt != DXGI_FORMAT_UNKNOWN) {
             vk_fmt = dxgi_to_vk_format(fmt);
@@ -782,6 +786,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
+        if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
         if (!sc->init(hwnd, *desc)) {
             sc->Release();
