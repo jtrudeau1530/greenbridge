@@ -8,7 +8,7 @@ Nothing below reproduces game data; every number is a count.
 ## 1. What runs
 
 `tools/sandbox.py` packs the props around a point (`tools/sandbox_scene.py`), picks one translated VS/PS pair from
-the work folder and runs `runtime/test/vk_sandbox`, which draws every prop with that pair: vertex buffers at
+the work folder and runs `vk_sandbox` (`runtime/test/vk_sandbox.cpp`), which draws every prop with that pair: vertex buffers at
 locations 0–2 (position, normal, UV), a D32 depth buffer, one indexed draw per mesh and one descriptor table per
 draw. `--window` opens a window to fly, walk or drive through the scene; `--check` renders one frame headless and
 prints only counts.
