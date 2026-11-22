@@ -26,8 +26,9 @@ Checks per tag (each one a count over vertices or triangle edges; no value leave
                   the log ratio within a block) is lower for the reading that maps the surface evenly.
     4-byte tags   per byte: share of blocks where the byte is constant, share of vertices with byte 3 = 0 or 255,
                   edge smoothness (mean |difference| over triangle edges / mean |difference| over random vertex
-                  pairs; < 1 means the value follows the surface), and unit length read as snorm8 xyz and as
-                  10:10:10:2 snorm.
+                  pairs; < 1 means the value follows the surface), unit length read as snorm8 xyz and as
+                  10:10:10:2 snorm, and each NORMAL_CANDIDATES decoding against the face normals. Tag 0x21 is
+                  the octahedral normal of normal_0x21 (the mesh shaders' decode, chosen by bit 31).
 
 Usage:
     python -I tools/vertex_types.py <archive.rpf|dir> [...] [--limit N] [--json out.json]
@@ -195,6 +196,17 @@ def _oct(x, y):
     return _norm(x, y, z)
 
 
+def normal_0x21(w):
+    """Unit normal from one tag-0x21 u32, decoded as the mesh shaders decode it (docs/restofworld.md).
+
+    Bit 31 set: octahedral x = bits 0-9, y = bits 10-19, each unorm10 remapped by v * 2 / 1023 - 1.
+    Bit 31 clear: octahedral x = byte 0, y = byte 1, each unorm8 remapped by v / 127.5 - 1.
+    The other bits are not part of the normal."""
+    if w >> 31:
+        return _oct((w & 1023) * 2 / 1023 - 1, ((w >> 10) & 1023) * 2 / 1023 - 1)
+    return _oct((w & 255) / 127.5 - 1, ((w >> 8) & 255) / 127.5 - 1)
+
+
 def _s8(b):
     return max((b - 256 if b > 127 else b) / 127.0, -1.0)
 
@@ -216,14 +228,19 @@ def _qt(x, y, z, w, col):
     return (1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y))
 
 
+def _snorm10_components(word: int) -> tuple[float, float, float]:
+    channels = [(word >> shift) & 0x3FF for shift in (0, 10, 20)]
+    x, y, z = (max(-1.0, (v - 1024 if v >= 512 else v) / 511.0) for v in channels)
+    return x, y, z
+
+
 NORMAL_CANDIDATES = {
     **{f"qtan_snorm8_col{c}": (lambda c: lambda r, v: _qt(_s8(r[4 * v]), _s8(r[4 * v + 1]), _s8(r[4 * v + 2]), _s8(r[4 * v + 3]), c))(c) for c in (0, 1, 2)},
     **{f"qtan_unorm8_col{c}": (lambda c: lambda r, v: _qt(_u8(r[4 * v]), _u8(r[4 * v + 1]), _u8(r[4 * v + 2]), _u8(r[4 * v + 3]), c))(c) for c in (0, 1, 2)},
     **{f"qtan_10102_col{c}": (lambda c: lambda r, v: (lambda w: _qt(*[((w >> s) & 1023) / 511.5 - 1 for s in (0, 10, 20)], ((w >> 30) & 3) / 1.5 - 1, c))(struct.unpack_from("<I", r, 4 * v)[0]))(c) for c in (0, 1, 2)},
     "snorm8_xyz": lambda r, v: _norm(_s8(r[4 * v]), _s8(r[4 * v + 1]), _s8(r[4 * v + 2])),
     "unorm8_xyz": lambda r, v: _norm(_u8(r[4 * v]), _u8(r[4 * v + 1]), _u8(r[4 * v + 2])),
-    "snorm10_xyz": lambda r, v: _norm(*[((w - 1024 if w > 511 else w) / 511.0) for w in
-                                        (((struct.unpack_from("<I", r, 4 * v)[0]) >> s) & 1023 for s in (0, 10, 20))]),
+    "snorm10_xyz": lambda r, v: _norm(*_snorm10_components(struct.unpack_from("<I", r, 4 * v)[0])),
     "unorm10_xyz": lambda r, v: _norm(*[(w / 511.5 - 1) for w in
                                         (((struct.unpack_from("<I", r, 4 * v)[0]) >> s) & 1023 for s in (0, 10, 20))]),
     "oct_snorm8_b01": lambda r, v: _oct(_s8(r[4 * v]), _s8(r[4 * v + 1])),
@@ -232,6 +249,7 @@ NORMAL_CANDIDATES = {
     "oct_unorm8_b23": lambda r, v: _oct(_u8(r[4 * v + 2]), _u8(r[4 * v + 3])),
     "oct_snorm16": lambda r, v: _oct(*[max(x / 32767.0, -1.0) for x in struct.unpack_from("<2h", r, 4 * v)]),
     "oct_unorm16": lambda r, v: _oct(*[x / 32767.5 - 1 for x in struct.unpack_from("<2H", r, 4 * v)]),
+    "oct_bit31_10_or_8": lambda r, v: normal_0x21(struct.unpack_from("<I", r, 4 * v)[0]),
 }
 
 
@@ -361,8 +379,7 @@ def measure_block(data, at, T, rng, found=None):
                 x, y, z = (b - 256 if b > 127 else b for b in raw[4 * v:4 * v + 3])
                 unit8 += abs(math.sqrt(x * x + y * y + z * z) / 127.0 - 1) < 0.03
                 w = struct.unpack_from("<I", raw, 4 * v)[0]
-                c = [((w >> s) & 1023) for s in (0, 10, 20)]
-                c = [(x - 1024 if x > 511 else x) / 511.0 for x in c]
+                c = _snorm10_components(w)
                 unit10 += abs(math.sqrt(sum(x * x for x in c)) - 1) < 0.03
             add(tt, "unit_snorm8", unit8)
             add(tt, "unit_snorm10", unit10)

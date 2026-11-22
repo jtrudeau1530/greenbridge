@@ -32,9 +32,9 @@ def tag(typ, offset, size):
 
 
 def build_music_bank(toc, samples, rate=48000):
-    """One 0x48 stream with one descriptor channel and one 2048-byte block."""
+    """One 0x48 stream with a header subblock and a data subblock for one channel."""
     desc = bytearray(28)
-    struct.pack_into("<III", desc, 0, 1, 2048, 1)
+    struct.pack_into("<III", desc, 0, 1, 4096, 1)
     struct.pack_into("<II", desc, 12, 0x1234, samples)
     struct.pack_into("<H", desc, 22, rate)
     desc[24] = 0x0B

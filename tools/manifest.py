@@ -107,7 +107,12 @@ def walk(game_dir: str, *, exclude=None):
             if contains_manifest and os.path.normcase(name) == excluded_name:
                 continue
             p = os.path.join(root, name)
-            yield os.path.relpath(p, game_dir).replace("\\", "/"), p
+            rel = os.path.relpath(p, game_dir)
+            if os.sep != "/":
+                rel = rel.replace(os.sep, "/")
+            if os.altsep and os.altsep != "/":
+                rel = rel.replace(os.altsep, "/")
+            yield rel, p
 
 
 def create(game_dir: str, out: str, jobs: int = 1) -> int:
