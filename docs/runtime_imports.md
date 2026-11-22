@@ -187,6 +187,16 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 | `XSystemImpl` (`IXSystemImpl5`, slots 3-8 known) | 3-8 (`libHttpClient.GDK.dll`) | 3-5 `XSystemGetConsoleId` / `GetXboxLiveSandboxId` / `GetAppSpecificDeviceId` (size, pointer, pointer each), 6 `XSystemHandleTrack` (two pointers, IXSystemImpl3), 7 `XSystemIsHandleValid` (pointer), 8 `XSystemAllowFullDownloadBandwidth` (bool, IXSystemImpl4); IXSystemImpl2 and 5 add no known method. Served offline |
 | `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Not served yet |
 
+**Two layout sources, and where they differ.** Besides xgameruntime-docs (GPL; facts only), the LGPL
+`include/*.idl` of xodus-gaming/xgameruntime (from the Wine project) declares each interface with its methods in
+order. Compared class by class, the two agree exactly wherever the docs list no `_unknown_` slot: `XGameSaveImpl`'s 30
+methods, `XGameImpl`'s 3, `XStoreImpl`'s 81 (to `IXStoreImpl6`). Where the docs list one, the IDL is not consistent:
+for `XErrorImpl` it keeps the slot as `HRESULT __PADDING__()`, so the two still line up, but for `XUserImpl` (the
+docs' slot 15) and `XDisplayImpl` (slot 3) it has no entry at all, and every later method sits one slot earlier than
+the docs put it. Take a layout from the IDL only where it matches the docs' slot count, and read an IDL interface that
+skips one of the docs' unknown slots as missing it, not as proof the slot doesn't exist. The measured slots in the
+table above all follow the docs.
+
 `XThreadingImpl` forwards each slot to `third_party/xtaskqueue`, the same implementation the named exports use;
 `XThreadSetTimeSensitive`/`XThreadIsTimeSensitive` keep a per-thread flag and the two private slots log once and
 answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetCallback` set.
