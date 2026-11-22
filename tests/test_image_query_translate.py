@@ -1,8 +1,9 @@
 """Translation and SPIR-V structure tests for image_get_resinfo and image_get_lod in tools/rdna2spirv.py.
 
 spirv_mini_interp.py does not yet implement OpImageQuerySizeLod, OpImageQueryLevels, or OpImageQueryLod,
-so this suite validates the real translator output (capabilities, image/sampler types, query opcodes,
-dmask VGPR compaction, and negative/mutation controls) using the Python standard library only:
+so this suite characterizes current translator output (capabilities, image/sampler types, query opcodes,
+dmask VGPR compaction, and negative/mutation controls) rather than pinning hardware-measured rules
+(such as 2D resinfo depth=0 in docs/shader_validation.md), using the Python standard library only:
     python -I tests/test_image_query_translate.py -v
 """
 import gc
@@ -98,11 +99,15 @@ class ImageGetResinfoTranslateTests(unittest.TestCase):
         stores = [(idx, unwrap_dst_value(defs, sid)) for idx, sid in vgpr_stores(spv) if idx in (4, 5, 6, 7)]
         self.assertEqual([idx for idx, _ in stores], [4, 5, 6, 7])
         # v4 <- width (extract 0 of SizeLod), v5 <- height (extract 1 of SizeLod),
-        # v6 <- 1 (depth fallback for 2D), v7 <- levels (OpImageQueryLevels).
+        # v6 <- constant 1 (current translator output; note: measured RDNA2 hardware rule is 0 per
+        # docs/shader_validation.md and tests/test_image_query_probe.py — this test characterizes
+        # current translator output and does not pin the hardware depth rule),
+        # v7 <- levels (OpImageQueryLevels).
         src_ops = [defs[defs[sid][1][1]][0] for _, sid in stores]
         self.assertEqual(src_ops[0], "OpCompositeExtract")
         self.assertEqual(src_ops[1], "OpCompositeExtract")
         self.assertEqual(src_ops[2], "OpBitcast")  # as_int(cu(1)) -> Bitcast %uint
+        self.assertEqual(defs[defs[stores[2][1]][1][1]][1][1], "%c1")
         self.assertEqual(src_ops[3], "OpImageQueryLevels")
 
     def test_2d_array_uses_v3int_and_images_arr(self):
