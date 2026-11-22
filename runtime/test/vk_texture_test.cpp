@@ -23,6 +23,7 @@
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "vk_pc_tail.h"
 
 #include <algorithm>
 #include <cmath>
@@ -155,7 +156,10 @@ int main(int argc, char** argv) {
         }
     }
     constexpr uint32_t push_words = 36;
-    constexpr uint32_t push_bytes = push_words * sizeof(uint32_t);
+    // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only; the heap base is in a uniform block at set 1
+    // (vk_pc_tail.h), so a 128-byte device runs these tests too.
+    const bool pc_tail = leonida::vk_test::pc_tail_requested();
+    const uint32_t push_bytes = pc_tail ? 128u : push_words * uint32_t(sizeof(uint32_t));
     if (properties.limits.maxPushConstantsSize < push_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n",
                      push_bytes, properties.limits.maxPushConstantsSize);
@@ -417,12 +421,15 @@ int main(int argc, char** argv) {
     wr[3].dstBinding = 3; wr[3].descriptorCount = 2; wr[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[3].pImageInfo = ai2;
     vkUpdateDescriptorSets(dev, 4, wr, 0, nullptr);
     // Pipeline.
+    bool tail_block = false;   // a stage reads the --pc-tail-ubo block (declares set 1)
     auto module = [&](const char* p, VkShaderModule* m) {
         auto code = read_spv(p);
         if (code.empty()) {
             std::fprintf(stderr, "failed to read shader module: %s\n", p);
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+        if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
+            tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; smi.codeSize = code.size() * 4; smi.pCode = code.data();
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
@@ -433,6 +440,14 @@ int main(int argc, char** argv) {
     VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, push_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1; pli.pSetLayouts = &dsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+    leonida::vk_test::PcTail tail;
+    if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, properties.limits.minUniformBufferOffsetAlignment,
+                                   VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 1)) {
+        std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");
+        return 1;
+    }
+    const VkDescriptorSetLayout set_layouts[] = {dsl, tail.set_layout};
+    if (tail_block) { pli.setLayoutCount = 2; pli.pSetLayouts = set_layouts; }
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO}; ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -485,7 +500,13 @@ int main(int argc, char** argv) {
     uint32_t pc[push_words] = {};
     pc[ptr_sgpr] = tsharp_va;               // pointer to the T# (low dword; the shader forces the high dword to 0)
     pc[32] = uint32_t(heap_base); pc[33] = uint32_t(heap_base >> 32);
-    vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), pc);
+    vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, push_bytes, pc);
+    if (tail_block) {
+        tail.write(0, pc, 4);
+        const uint32_t offset = tail.offset(0);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, leonida::vk_test::pc_tail_set, 1, &tail.set,
+                                1, &offset);
+    }
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rc{}; rc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; rc.imageExtent = {W, H, 1};
