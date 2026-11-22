@@ -105,6 +105,22 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "fail")
         self.assertIn("exit 3", detail)
 
+    def test_a_disabled_test_is_skipped_without_launching(self) -> None:
+        built = self.command_for(self.exiting(0))
+        missing = self.command_for(self.artifact / "missing.exe")
+        for command in (built, missing, None):
+            with self.subTest(command=command), \
+                    mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                status, detail = self.run_entry(ctest_entry("disabled", command, {"DISABLED": True}))
+                launch.assert_not_called()
+                self.assertEqual(status, "skip", detail)
+                self.assertIn("disabled by CTest", detail)
+
+    def test_a_false_disabled_property_still_runs_the_test(self) -> None:
+        command = self.command_for(self.exiting(0))
+        status, detail = self.run_entry(ctest_entry("enabled", command, {"DISABLED": "0"}))
+        self.assertEqual(status, "pass", detail)
+
     def test_a_test_without_a_command_fails(self):
         status, detail = self.run_entry(ctest_entry("unbuilt", None))
         self.assertEqual(status, "fail")
