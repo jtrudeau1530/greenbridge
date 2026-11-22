@@ -118,6 +118,18 @@ class True16(unittest.TestCase):
                      "v_cvt_f32_f16 v8, v4.h", "v_mov_b32 v8, v4"):
             self.assertEqual(asm.true16_spelling(same), same)
 
+    def test_the_non_returning_compare_and_store_is_respelled_and_swapped_on_gfx11(self):
+        """GFX11 has no ds_cmpst_b32, and ds_cmpstore_b32 takes the store value before the compare value."""
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2", "gfx1150"),
+                         "ds_cmpstore_b32 v0, v2, v1")
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2 offset:8", "gfx1100"),
+                         "ds_cmpstore_b32 v0, v2, v1 offset:8")
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2", "gfx1030"),
+                         "ds_cmpst_b32 v0, v1, v2")
+        # Both changes are needed together: the rename alone would compare v2 and store v1.
+        with self.assertRaises(ValueError):
+            asm.ds_line("ds_cmpst_b32 v0, v1", "gfx1150")
+
     def test_error_lines_still_map_back(self):
         text = "v_mov_b32 v1, 0\nv_cvt_f32_f16 v8, 0x3c00\nv_cvt_f16_f32 v8, v1\nv_mov_b32 v9, 0\n"
         out = asm.true16_spelling(text)
