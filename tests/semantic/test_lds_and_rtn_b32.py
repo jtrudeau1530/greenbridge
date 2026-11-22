@@ -1029,5 +1029,146 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(5), 0x40000000)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_opcodes_and_operands(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_and_b32 v0, v1",
+            "ds_and_b64 v0, v1",
+            "ds_or_b32 v0, v1",
+            "ds_min_u32 v0, v1",
+            "ds_and_b32",
+            "ds_and_rtn_b32 v0, v1",
+            "ds_and_b32 v0, v1, v2",
+            "ds_and_b32 r0, v1",
+            "ds_and_b32 v0, s1",
+            "ds_and_b32 v256, v1",
+            "ds_and_b32 v0, v1 offset:70000",
+            "ds_and_b32 v0, v1 offset:-1",
+            "ds_and_b32 v0, v1 offset:",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSAndB32Instruction.parse(asm)
+
+    def test_ast_and_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(1000)
+        with self.assertRaises(ValueError):
+            LDSMemory(-64)
+        with self.assertRaises(ValueError):
+            LDSMemory(0)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+        # Post-init violations
+        with self.assertRaises(ValueError):
+            DSAndB32Instruction(opcode=DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(0), vdata=VGPR(1), vdst=None)
+        with self.assertRaises(ValueError):
+            DSAndB32Instruction(opcode=DSOpcode.DS_AND_B32, vaddr=VGPR(0), vdata=VGPR(1), vdst=VGPR(2))
+
+    def test_mutation_detection_bitwise_or_mutant(self) -> None:
+        def mutant_or(a: int, b: int) -> int:
+            return (a | b) & MASK32
+
+        self.assertNotEqual(mutant_or(0xFF00, 0x00FF), oracle_and_b32(0xFF00, 0x00FF))
+
+    def test_mutation_detection_bitwise_xor_mutant(self) -> None:
+        def mutant_xor(a: int, b: int) -> int:
+            return (a ^ b) & MASK32
+
+        self.assertNotEqual(mutant_xor(0xFFFF, 0xFFFF), oracle_and_b32(0xFFFF, 0xFFFF))
+
+    def test_mutation_detection_arithmetic_add_mutant(self) -> None:
+        def mutant_add(a: int, b: int) -> int:
+            return (a + b) & MASK32
+
+        self.assertNotEqual(mutant_add(0x10, 0x20), oracle_and_b32(0x10, 0x20))
+
+    def test_mutation_detection_destructive_aliasing(self) -> None:
+        class DestructiveMutantInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSAndB32Instruction) -> Optional[int]:
+                if inst.opcode.is_return:
+                    assert inst.vdst is not None
+                    state.set_vgpr(inst.vdst, 0xDEAD0000)
+                return super().execute(state, inst)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(2, 0xFFFFFFFF)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 8)  # dword 2
+        state.set_vgpr(VGPR(2), 0x0000FFFF)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_RTN_B32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(1))
+        mutant = DestructiveMutantInterpreter()
+        mutant.execute(state, inst)
+
+        # Destructive mutant clobbers VGPR(1) before address read in super().execute, causing wrong behavior
+        self.assertNotEqual(lds.read_dword(2), 0x0000FFFF)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSAndB32Instruction) -> Dict[int, int]:
+                saved_mask = state.exec_mask
+                state.exec_mask = (1 << state.wave_size) - 1
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved_mask
+
+        lds = LDSMemory(65536)
+        lds.write_dword(5, 0xFFFFFFFF)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)
+        for l in range(32):
+            wave.set_vgpr(l, VGPR(1), 20)
+            wave.set_vgpr(l, VGPR(2), 0x00000000)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_B32, vaddr=VGPR(1), vdata=VGPR(2))
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+
+        # Mutant modified LDS despite exec_mask == 0
+        self.assertEqual(lds.read_dword(5), 0x00000000)
+
+        # Correct interpreter preserves memory
+        lds.write_dword(5, 0xFFFFFFFF)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_dword(5), 0xFFFFFFFF)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSAndB32Instruction) -> Optional[int]:
+                no_off_inst = DSAndB32Instruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vdata=inst.vdata,
+                    vdst=inst.vdst,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off_inst)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(1, 0xFFFFFFFF)
+        lds.write_dword(2, 0xFFFFFFFF)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 4)  # dword 1
+        state.set_vgpr(VGPR(2), 0x00000000)
+
+        inst = DSAndB32Instruction(DSOpcode.DS_AND_B32, vaddr=VGPR(1), vdata=VGPR(2), offset=OffsetImmediate(4))
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+
+        # Mutant targeted dword 1 instead of dword 2
+        self.assertEqual(lds.read_dword(1), 0x00000000)
+        self.assertEqual(lds.read_dword(2), 0xFFFFFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
