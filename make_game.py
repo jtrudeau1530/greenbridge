@@ -22,6 +22,7 @@ Stages, in order (each skips work that is already done, so a stopped build conti
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
 """
 import argparse
+import functools
 import json
 import os
 import re
@@ -503,19 +504,18 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False) -> None
 # ---------------------------------------------------------------- assets
 def rpf9dump(work: str) -> str:
     exe = os.path.join(work, "tools", "rpf9dump", "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
-    if not os.path.isfile(exe):
-        core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
-        if not os.path.isdir(core):
-            fail("third_party/rpf9-explorer is empty. Run: git submodule update --init")
-        need("dotnet", "Install the .NET 8 SDK.")
-        log("assets: building rpf9dump")
-        run(["dotnet", "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
-             "-o", os.path.dirname(exe), "--nologo", "-v", "q"])
+    core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
+    if not os.path.isdir(core):
+        fail("third_party/rpf9-explorer is empty. Run: git submodule update --init")
+    need("dotnet", "Install the .NET 8 SDK.")
+    log("assets: building rpf9dump")
+    run(["dotnet", "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
+         "-o", os.path.dirname(exe), "--nologo", "-v", "q"])
     return exe
 
 
 def assets(game: str, work: str, wav: bool, jobs: int) -> None:
-    exe = rpf9dump(work)
+    get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
     for rel in MODEL_ARCHIVES:
         src = os.path.join(game, rel)
@@ -524,7 +524,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
             if os.path.isfile(os.path.join(out, name, mode, "manifest.json")):
                 continue
             log(f"assets: {mode} from {rel}")
-            run([exe, mode, src, out])
+            run([get_exporter(work), mode, src, out])
     # Texture pools: data/ttdb/** and each pack's own pack/<name>/data/ttdb/** (pool names repeat across packs,
     # so pack pools go under ttpf_pack/<pack>/).
     pools = []
@@ -537,10 +537,10 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         if os.path.isfile(os.path.join(dest, name, "manifest.json")):
             continue
         log(f"assets: texture pool {os.path.relpath(p, game)}")
-        run([exe, "ttpf", p, dest])
+        run([get_exporter(work), "ttpf", p, dest])
     if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):
         log("assets: audio banks")
-        run([exe, "audio", os.path.join(game, "audio.rpf"), out])
+        run([get_exporter(work), "audio", os.path.join(game, "audio.rpf"), out])
     # The two audio steps below count as finished only by a marker written after they succeed: their folders are
     # created first and exist after a stopped run too.
     ogg = os.path.join(out, "audio", "ogg")
@@ -560,7 +560,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     xma_done = os.path.join(out, "audio", "xma.done")
     if not os.path.isfile(xma_done):
         log("assets: XMA2 streams")
-        run([exe, "xma", os.path.join(game, "audio.rpf"), out])
+        run([get_exporter(work), "xma", os.path.join(game, "audio.rpf"), out])
         mark(xma_done, "rpf9dump xma")
     # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
     ff = shutil.which("ffmpeg")
