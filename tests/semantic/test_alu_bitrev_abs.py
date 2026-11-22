@@ -44,6 +44,7 @@ if HERE not in sys.path:
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import spirv_wave_interp as wi  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -161,8 +162,8 @@ def tearDownModule():
         _TMP_DIR = None
 
 
-def run_lines(lines: list[str]) -> tuple[int, ...]:
-    """Assemble and run synthetic pixel shader lines, returning (out_mrt0.x, out_mrt0.y)."""
+def translate_lines(lines: list[str]) -> str:
+    """Assemble synthetic shader lines with rdna2spirv and return the SPIR-V assembly text."""
     if _TMP_DIR is None:
         setUpModule()
     asm = "; test_bitrev_abs\n" + "".join(f"\t{ln}\n" for ln in lines) + "\texp mrt0 v0, v1, v0, v0 done vm\n\ts_endpgm\n"
@@ -170,7 +171,12 @@ def run_lines(lines: list[str]) -> tuple[int, ...]:
         f.write(asm)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
-        spv = rdna2spirv.translate(_SRC_PATH)
+        return rdna2spirv.translate(_SRC_PATH)
+
+
+def run_lines(lines: list[str]) -> tuple[int, ...]:
+    """Assemble and run synthetic pixel shader lines, returning (out_mrt0.x, out_mrt0.y)."""
+    spv = translate_lines(lines)
     return tuple(si.run_fragment(spv)["%out_mrt0"][:2])
 
 
@@ -647,6 +653,244 @@ class AbsTests(unittest.TestCase):
                 got = run_lines([f"s_mov_b32 s2, {x:#x}", "s_abs_i32 s0, s2", "s_cselect_b32 s1, 1, 0",
                                  "v_mov_b32 v0, s0", "v_mov_b32 v1, s1"])
                 self.assertEqual(got, (want, int(want != 0)))
+
+    def test_s_absdiff_i32_and_scc(self):
+        test_pairs = [
+            (0, 0),
+            (5, 12),
+            (12, 5),
+            (10, 10),
+            (0xFFFFFFFF, 1),
+            (1, 0xFFFFFFFF),
+            (0x7FFFFFFF, 0x80000000),
+            (0x80000000, 0x7FFFFFFF),
+            (0x80000000, 0),
+            (0, 0x80000000),
+            (0x12345678, 0x12345678),
+            (0x12345678, 0x87654321),
+        ]
+        for x, y in test_pairs:
+            with self.subTest(x=hex(x), y=hex(y)):
+                want = ref_absdiff32(x, y)
+                got = run_lines([f"s_mov_b32 s2, {x:#x}", f"s_mov_b32 s3, {y:#x}",
+                                 "s_absdiff_i32 s0, s2, s3", "s_cselect_b32 s1, 1, 0",
+                                 "v_mov_b32 v0, s0", "v_mov_b32 v1, s1"])
+                self.assertEqual(got, (want, int(want != 0)))
+
+
+class SpirvEmissionTests(unittest.TestCase):
+    """Verify that tools/rdna2spirv emits expected SPIR-V instructions and structures."""
+
+    def test_v_bfrev_b32_emission(self):
+        spv = translate_lines(["v_mov_b32 v2, 0x12345678", "v_bfrev_b32_e32 v0, v2"])
+        self.assertIn("OpBitReverse %uint", spv)
+
+    def test_s_brev_b32_emission(self):
+        spv = translate_lines(["s_mov_b32 s2, 0x12345678", "s_brev_b32 s0, s2", "v_mov_b32 v0, s0"])
+        self.assertIn("OpBitReverse %uint", spv)
+
+    def test_s_abs_i32_emission(self):
+        spv = translate_lines(["s_mov_b32 s2, -42", "s_abs_i32 s0, s2", "v_mov_b32 v0, s0"])
+        self.assertIn('OpExtInstImport "GLSL.std.450"', spv)
+        self.assertIn("SAbs", spv)
+        self.assertIn("OpStore %scc", spv)
+
+    def test_s_absdiff_i32_emission(self):
+        spv = translate_lines(["s_mov_b32 s2, 10", "s_mov_b32 s3, 20", "s_absdiff_i32 s0, s2, s3", "v_mov_b32 v0, s0"])
+        self.assertIn("OpISub %uint", spv)
+        self.assertIn("SAbs", spv)
+        self.assertIn("OpStore %scc", spv)
+
+
+class DirectSpirvInterpreterEdgeCaseTests(unittest.TestCase):
+    """Direct verification of SPIR-V OpBitReverse and SAbs via mini-interpreter and wave-interpreter."""
+
+    def test_spirv_opbitreverse_all_single_bits(self):
+        for bit in range(32):
+            val = 1 << bit
+            expected = 1 << (31 - bit)
+            spv = f"""OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out_mrt0
+OpExecutionMode %main OriginUpperLeft
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v4uint = OpTypeVector %uint 4
+%_ptr_Output_v4uint = OpTypePointer Output %v4uint
+%out_mrt0 = OpVariable %_ptr_Output_v4uint Output
+%val = OpConstant %uint {val}
+%c0 = OpConstant %uint 0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%rev = OpBitReverse %uint %val
+%out = OpCompositeConstruct %v4uint %rev %c0 %c0 %c0
+OpStore %out_mrt0 %out
+OpReturn
+OpFunctionEnd
+"""
+            out = si.run_fragment(spv)["%out_mrt0"]
+            self.assertEqual(out[0], expected)
+
+    def test_spirv_sabs_two_complement_wrap(self):
+        spv = """OpCapability Shader
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out_mrt0
+OpExecutionMode %main OriginUpperLeft
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%uint = OpTypeInt 32 0
+%v4uint = OpTypeVector %uint 4
+%_ptr_Output_v4uint = OpTypePointer Output %v4uint
+%out_mrt0 = OpVariable %_ptr_Output_v4uint Output
+%int_min = OpConstant %uint 2147483648
+%c0 = OpConstant %uint 0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%i = OpBitcast %int %int_min
+%ab = OpExtInst %int %glsl SAbs %i
+%res = OpBitcast %uint %ab
+%out = OpCompositeConstruct %v4uint %res %c0 %c0 %c0
+OpStore %out_mrt0 %out
+OpReturn
+OpFunctionEnd
+"""
+        out = si.run_fragment(spv)["%out_mrt0"]
+        self.assertEqual(out[0], 0x80000000)
+
+    def test_spirv_wave_bitreverse_all_lanes(self):
+        spv = """OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %lane %out
+OpDecorate %lane BuiltIn SubgroupLocalInvocationId
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v4uint = OpTypeVector %uint 4
+%pin = OpTypePointer Input %uint
+%pout = OpTypePointer Output %v4uint
+%lane = OpVariable %pin Input
+%out = OpVariable %pout Output
+%c0 = OpConstant %uint 0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%l = OpLoad %uint %lane
+%rev = OpBitReverse %uint %l
+%v = OpCompositeConstruct %v4uint %rev %c0 %c0 %c0
+OpStore %out %v
+OpReturn
+OpFunctionEnd
+"""
+        res = wi.run_wave(spv, wave=32)
+        outputs = res["outputs"]
+        for lane in range(32):
+            self.assertEqual(outputs[lane]["%out"][0], ref_brev32(lane))
+
+    def test_spirv_wave_sabs_all_lanes(self):
+        spv = """OpCapability Shader
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %lane %out
+OpDecorate %lane BuiltIn SubgroupLocalInvocationId
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%uint = OpTypeInt 32 0
+%v4uint = OpTypeVector %uint 4
+%pin = OpTypePointer Input %uint
+%pout = OpTypePointer Output %v4uint
+%lane = OpVariable %pin Input
+%out = OpVariable %pout Output
+%c0 = OpConstant %uint 0
+%c0_i = OpConstant %int 0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%l = OpLoad %uint %lane
+%i = OpBitcast %int %l
+%neg = OpISub %int %c0_i %i
+%ab = OpExtInst %int %glsl SAbs %neg
+%u = OpBitcast %uint %ab
+%v = OpCompositeConstruct %v4uint %u %c0 %c0 %c0
+OpStore %out %v
+OpReturn
+OpFunctionEnd
+"""
+        res = wi.run_wave(spv, wave=32)
+        outputs = res["outputs"]
+        for lane in range(32):
+            self.assertEqual(outputs[lane]["%out"][0], lane)
+
+
+class NegativeMutationControlTests(unittest.TestCase):
+    """Negative controls verifying that mutated or corrupt behaviors are strictly detected."""
+
+    def test_mutation_bitrev_shift_rejected(self):
+        def bad_brev32_shift(x: int) -> int:
+            return (ref_brev32(x) >> 1) & MASK32
+
+        self.assertNotEqual(bad_brev32_shift(1), ref_brev32(1))
+        self.assertNotEqual(bad_brev32_shift(0x12345678), ref_brev32(0x12345678))
+
+    def test_mutation_bitrev_inverted_rejected(self):
+        def bad_brev32_invert(x: int) -> int:
+            return (~ref_brev32(x)) & MASK32
+
+        self.assertNotEqual(bad_brev32_invert(0), ref_brev32(0))
+        self.assertNotEqual(bad_brev32_invert(0xFFFFFFFF), ref_brev32(0xFFFFFFFF))
+
+    def test_mutation_abs_unwrapped_overflow_rejected(self):
+        def bad_abs32(x: int) -> int:
+            return 0 if x == 0x80000000 else ref_abs32(x)
+
+        self.assertNotEqual(bad_abs32(0x80000000), 0x80000000)
+
+    def test_mutation_simd_inactive_lanes_written_rejected(self):
+        class MutatedInterpreterNoMask(VectorAluInterpreter):
+            def is_lane_active(self, lane: int) -> bool:
+                return True
+
+        interp = MutatedInterpreterNoMask(wave_size=32, initial_exec=0x00000000)
+        sentinel = 0xDEADBEEF
+        for lane in range(32):
+            interp.vgprs[lane][0] = sentinel
+            interp.vgprs[lane][1] = 100
+
+        interp.execute_instruction("v_abs_i32", "v0", "v1")
+
+        overwritten_lanes = [lane for lane in range(32) if interp.vgprs[lane][0] != sentinel]
+        self.assertEqual(len(overwritten_lanes), 32)
+
+    def test_mutation_absdiff_unsigned_sub_rejected(self):
+        def bad_absdiff_unsigned(x: int, y: int) -> int:
+            return abs(u32(x) - u32(y)) & MASK32
+
+        self.assertNotEqual(bad_absdiff_unsigned(0xFFFFFFFF, 1), ref_absdiff32(0xFFFFFFFF, 1))
+
+    def test_mutation_spirv_opcode_corruption_rejected(self):
+        corrupted_spv = """OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out_mrt0
+OpExecutionMode %main OriginUpperLeft
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v4uint = OpTypeVector %uint 4
+%_ptr_Output_v4uint = OpTypePointer Output %v4uint
+%out_mrt0 = OpVariable %_ptr_Output_v4uint Output
+%val = OpConstant %uint 1
+%c0 = OpConstant %uint 0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%res = OpInvalidNonExistentOpcode %uint %val
+%out = OpCompositeConstruct %v4uint %res %c0 %c0 %c0
+OpStore %out_mrt0 %out
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(si.UnsupportedConstruct):
+            si.run_fragment(corrupted_spv)
 
 
 if __name__ == "__main__":
