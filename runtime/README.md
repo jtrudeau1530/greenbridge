@@ -161,8 +161,9 @@ Current limits, by design:
   the measured-slot Xbox-ABI proxy: the host PC `ID3D12Device` by default, or the Vulkan-backed device
   (`shims/d3d12_vulkan_device.cpp`) when `LEONIDA_D3D12=vulkan` is set and the runtime was built with the
   Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
-  depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
-  section 3.2 for what is missing.
+  depth views, committed resources and copies (uploads, readbacks, BC textures), root signatures, graphics and
+  compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
+  missing.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
@@ -285,6 +286,21 @@ The game does not boot yet. The missing executable blocks the import-driven work
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
 D3D12-to-Vulkan design and the measured console ABI are in
+The game does not boot yet, and none of this has been measured against the real executable. The missing executable
+blocks the import-driven work:
+
+- The device entry point: `D3D12XboxCreateDevice` exists and wraps the PC or the Vulkan-backed device in the
+  measured-slot proxy, but its parameter and flag layout is unmeasured and so is the Xbox device vtable beyond
+  slots 62, 67 and 76.
+- The command-queue and fence extensions: the proxies forward the public slots, and the console's own methods past
+  them (`PresentX`, `SuspendX`, `ResumeX`) have unknown slots, so they are refused with a log.
+  `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`) but
+  nothing reaches them yet: their queue and device slots are unmeasured.
+- Most of the `xgameruntime` surface: an offline shim covers `XGameRuntimeInitialize`, device/console queries,
+  `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` and
+  `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
+
+The D3D12-to-Vulkan design and the measured console ABI are in
 [docs/d3d12_vulkan.md](../docs/d3d12_vulkan.md); the shader translator and its GPU checks are described
 in [docs/design.md](../docs/design.md), and the differential-validation design is in the shader-validation
 work.
