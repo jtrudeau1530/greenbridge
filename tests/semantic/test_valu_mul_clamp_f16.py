@@ -24,10 +24,11 @@ import re
 import struct
 import unittest
 from fractions import Fraction
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
 
 # IEEE 754 binary16 bit constants
 SIGN_MASK_F16 = 0x8000
@@ -224,6 +225,30 @@ def ref_mul_clamp_f16_rational(s0_bits: int, s1_bits: int) -> int:
         return POS_ONE_F16
 
     return f16_to_bits(float(frac_prod))
+
+
+def ref_simd_mul_clamp_f16(
+    s0_wave: List[int],
+    s1_wave: List[int],
+    *,
+    wave_size: int = 32,
+    exec_mask: int = 0xFFFFFFFF,
+    prev_dst: Optional[List[int]] = None,
+    omod: str = "none",
+) -> List[int]:
+    """Reference multi-lane SIMD vector clamped multiplication under EXEC mask."""
+    result: List[int] = []
+    for lane in range(wave_size):
+        mask_bit = (exec_mask >> lane) & 1
+        if mask_bit:
+            s0 = s0_wave[lane]
+            s1 = s1_wave[lane]
+            val = ref_mul_clamp_f16(s0, s1, omod=omod)
+            result.append(val)
+        else:
+            old_val = prev_dst[lane] if prev_dst is not None else 0
+            result.append(old_val & MASK16)
+    return result
 
 
 class RegisterFile:
@@ -575,6 +600,112 @@ class TestScalarInterpreter(unittest.TestCase):
         interp.execute_asm("v_mul_f16 v5.l, v1.l, v2.l clamp")
         self.assertEqual(interp.reg_file.get_vgpr_half(5, hi=True), 0xBEEF)
         self.assertEqual(interp.reg_file.get_vgpr_half(5, hi=False), f16_to_bits(0.25))
+
+
+class SIMDWavefront:
+    """Vectorized SIMD wavefront model supporting Wave32/Wave64 divergence and EXEC masking."""
+
+    def __init__(self, wave_size: int = 32):
+        if wave_size not in (32, 64):
+            raise ValueError("Wave size must be 32 or 64")
+        self.wave_size = wave_size
+        self.exec_mask = MASK32 if wave_size == 32 else MASK64
+        self.lanes = [RegisterFile() for _ in range(wave_size)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        """Return True if the specified lane index is active under the current EXEC mask."""
+        return bool((self.exec_mask >> lane) & 1)
+
+    def load_vgpr_half_wave(self, reg_idx: int, hi: bool) -> List[int]:
+        """Read 16-bit values from all lanes in the wavefront for the specified VGPR halfword."""
+        return [self.lanes[i].get_vgpr_half(reg_idx, hi=hi) for i in range(self.wave_size)]
+
+    def store_vgpr_half_wave(self, reg_idx: int, hi: bool, values: List[int]) -> None:
+        """Store 16-bit values to all lanes in the wavefront for the specified VGPR halfword."""
+        for i in range(min(len(values), self.wave_size)):
+            self.lanes[i].set_vgpr_half(reg_idx, hi=hi, val=values[i])
+
+    def step_v_mul_clamp_f16(
+        self,
+        dst_reg: int,
+        dst_hi: bool,
+        src0_reg: int,
+        src0_hi: bool,
+        src1_reg: int,
+        src1_hi: bool,
+        omod: str = "none",
+    ) -> List[int]:
+        """Execute a SIMD v_mul_clamp_f16 step across all lanes adhering to EXEC masking."""
+        results: List[int] = []
+        for lane in range(self.wave_size):
+            if self.is_lane_active(lane):
+                s0 = self.lanes[lane].get_vgpr_half(src0_reg, hi=src0_hi)
+                s1 = self.lanes[lane].get_vgpr_half(src1_reg, hi=src1_hi)
+                res = ref_mul_clamp_f16(s0, s1, omod=omod)
+                self.lanes[lane].set_vgpr_half(dst_reg, hi=dst_hi, val=res)
+                results.append(res)
+            else:
+                old_val = self.lanes[lane].get_vgpr_half(dst_reg, hi=dst_hi)
+                results.append(old_val)
+        return results
+
+
+class TestSIMDExecution(unittest.TestCase):
+    """Unit tests for SIMD wavefront multi-lane execution, divergence, and EXEC masking."""
+
+    def test_wave32_uniform_execution(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        s0_vals = [f16_to_bits(0.5)] * 32
+        s1_vals = [f16_to_bits(float(i) * 0.1) for i in range(32)]
+        sim.store_vgpr_half_wave(1, hi=False, values=s0_vals)
+        sim.store_vgpr_half_wave(2, hi=False, values=s1_vals)
+
+        results = sim.step_v_mul_clamp_f16(dst_reg=0, dst_hi=False, src0_reg=1, src0_hi=False, src1_reg=2, src1_hi=False)
+        for i in range(32):
+            expected = min(max(0.5 * (float(i) * 0.1), 0.0), 1.0)
+            self.assertAlmostEqual(bits_to_f16(results[i]), expected, places=3)
+            self.assertAlmostEqual(bits_to_f16(sim.lanes[i].get_vgpr_half(0, hi=False)), expected, places=3)
+
+    def test_wave32_divergence_mask(self) -> None:
+        sim = SIMDWavefront(wave_size=32)
+        prev_dst = [0x5555] * 32
+        sim.store_vgpr_half_wave(0, hi=False, values=prev_dst)
+
+        s0_vals = [f16_to_bits(0.5)] * 32
+        s1_vals = [f16_to_bits(0.5)] * 32
+        sim.store_vgpr_half_wave(1, hi=False, values=s0_vals)
+        sim.store_vgpr_half_wave(2, hi=False, values=s1_vals)
+
+        sim.exec_mask = 0xAAAAAAAA
+        results = sim.step_v_mul_clamp_f16(dst_reg=0, dst_hi=False, src0_reg=1, src0_hi=False, src1_reg=2, src1_hi=False)
+
+        for i in range(32):
+            if i % 2 == 1:
+                self.assertEqual(bits_to_f16(results[i]), 0.25)
+                self.assertEqual(bits_to_f16(sim.lanes[i].get_vgpr_half(0, hi=False)), 0.25)
+            else:
+                self.assertEqual(results[i], 0x5555)
+                self.assertEqual(sim.lanes[i].get_vgpr_half(0, hi=False), 0x5555)
+
+    def test_wave64_divergence_and_oracle_cross_check(self) -> None:
+        sim = SIMDWavefront(wave_size=64)
+        exec_mask = 0x00000000FFFFFFFF
+        sim.exec_mask = exec_mask
+
+        prev_dst = [u16(0x7000 + i) for i in range(64)]
+        sim.store_vgpr_half_wave(0, hi=True, values=prev_dst)
+
+        s0_vals = [f16_to_bits(float(i + 1) * 0.1) for i in range(64)]
+        s1_vals = [f16_to_bits(0.5) for _ in range(64)]
+        sim.store_vgpr_half_wave(3, hi=False, values=s0_vals)
+        sim.store_vgpr_half_wave(4, hi=True, values=s1_vals)
+
+        expected = ref_simd_mul_clamp_f16(
+            s0_vals, s1_vals, wave_size=64, exec_mask=exec_mask, prev_dst=prev_dst
+        )
+
+        results = sim.step_v_mul_clamp_f16(dst_reg=0, dst_hi=True, src0_reg=3, src0_hi=False, src1_reg=4, src1_hi=True)
+        self.assertEqual(results, expected)
 
 
 if __name__ == "__main__":
