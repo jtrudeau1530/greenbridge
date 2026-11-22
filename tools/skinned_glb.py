@@ -37,7 +37,8 @@ jacket 7      WEIGHTS_1                       235,760   0x26        39,272
 Slots 8/9 may also use the packed layout, format ``0x8C``: 16 bytes per vertex,
 four little-endian u32 words whose low 12 bits are the joint index. The reader
 converts each vertex to the same 4 x u8 row as ``0x25`` and rejects an index
-above 255.
+above 255. Only ``0x8C`` is accepted: no ``0x8B`` joint layout has been measured,
+so ``0x8B`` is rejected rather than guessed.
 
 The joint index is local to the drawable model's own palette: a sorted ``u32``
 joaat32 array at ``grmModel + 0x20`` with its length at ``grmModel + 0x0C``. The
@@ -569,9 +570,13 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
             if int(weighted.max()) >= local_bones:
                 raise SkinError("a weighted joint index is outside the local palette")
         weights /= totals[:, None]
+        # A zero-weight component may carry any index; clear it before the palette lookup
+        # so an out-of-palette value cannot raise where the stdlib path returns zeros.
+        zero = weights == 0
+        indices[zero] = 0
         mapping = _np.asarray(local_to_joint, dtype=_np.uint16)
         indices = mapping[indices]
-        indices[weights == 0] = 0
+        indices[zero] = 0
         if joint_count is not None and bool((indices >= joint_count).any()):
             raise SkinError("remapped joint index is invalid")
         return {

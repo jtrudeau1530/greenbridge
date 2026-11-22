@@ -69,10 +69,11 @@ def _skin_buffer(j0, j1, w0, w1, *, omit_slot=None, formats=None, offsets=None, 
 def _packed_indices(rows):
     """Pack four u8 joint indices per vertex into the 0x8C four-u32 layout.
 
-    Bits 12-31 get a recognisable pattern so a decoder that reads them fails.
+    Bits 12-31 get a recognisable pattern, including bits 12-15, so a decoder
+    that masks 16 bits instead of 12 fails instead of passing.
     """
     return b"".join(
-        struct.pack("<4I", *(0xA5CF0000 | index for index in row)) for row in rows
+        struct.pack("<4I", *(0xA5CFF000 | index for index in row)) for row in rows
     )
 
 
@@ -112,7 +113,7 @@ def _streams():
     return j0, j1, w0, w1
 
 
-def _component(root, *, own_skeleton=None, omit_slot=None, buffer=None):
+def _component(root, *, own_skeleton=None, omit_slot=None, buffer=None, mesh_blob=None):
     directory = os.path.join(root, "component")
     os.makedirs(os.path.join(directory, "buffers"))
     if buffer is None:
@@ -143,6 +144,8 @@ def _component(root, *, own_skeleton=None, omit_slot=None, buffer=None):
     }
     if own_skeleton is not None:
         model["drawable"]["skeleton"] = own_skeleton
+    if mesh_blob is not None:
+        model["drawable"]["buffers"][0]["mesh_blob"] = mesh_blob
     _write_json(os.path.join(directory, "model.json"), model)
     return directory
 
@@ -288,17 +291,25 @@ class SkinnedGlbTest(unittest.TestCase):
             for actual, wanted in zip(result, point):
                 self.assertAlmostEqual(actual, wanted, places=5)
 
-    def test_stdlib_weight_path_agrees_with_optional_numpy(self):
+    def test_numpy_and_stdlib_weight_paths_agree(self):
+        if skinned_glb._np is None:
+            self.skipTest("numpy is not importable, so the optional path cannot be compared")
         j0, j1, w0, w1 = _streams()
+        j0 = bytearray(j0)
+        j0[2] = 200  # zero-weight component outside the two-entry palette
+        j0 = bytes(j0)
+        with_numpy = skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [1, 3], 4)
         saved = skinned_glb._np
         try:
             skinned_glb._np = None
-            result = skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [1, 3], 4)
+            without_numpy = skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [1, 3], 4)
         finally:
             skinned_glb._np = saved
-        self.assertEqual(result["sum_min"], 1.0)
-        self.assertEqual(result["sum_max"], 1.0)
-        self.assertAlmostEqual(struct.unpack_from("<4f", result["w0"], 0)[0], 64 / 255, delta=1e-6)
+        for key in ("j0", "j1", "w0", "w1"):
+            self.assertEqual(with_numpy[key], without_numpy[key], key)
+        self.assertEqual(with_numpy["sum_min"], without_numpy["sum_min"])
+        self.assertEqual(with_numpy["sum_max"], without_numpy["sum_max"])
+        self.assertAlmostEqual(struct.unpack_from("<4f", with_numpy["w0"], 0)[0], 64 / 255, delta=1e-6)
 
     def test_full_export_without_numpy(self):
         skeleton = _skeleton_dir(self.root)
@@ -353,6 +364,26 @@ class SkinnedGlbTest(unittest.TestCase):
         skeleton = _skeleton_dir(self.root)
         with self.assertRaises(skinned_glb.SkinError):
             skinned_glb.build_skinned_glb(skeleton, [component])
+
+    def test_mesh_blob_sections_supply_the_stream_offsets(self):
+        j0, j1, w0, w1 = _streams()
+        buffer = bytearray(_skin_buffer(j0, j1, w0, w1))
+        for slot in (6, 7, 8, 9):
+            struct.pack_into("<I", buffer, slot * 4, 0)  # no usable header words
+        sections = [[6, 0x100, 0x26], [7, 0x110, 0x26], [8, 0x120, 0x25], [9, 0x130, 0x25]]
+        component = _component(self.root, buffer=bytes(buffer),
+                               mesh_blob={"sections": sections})
+        model = _read_model(component)
+        streams = skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+        self.assertEqual(streams["sections"], {6: (0x100, 0x26), 7: (0x110, 0x26),
+                                               8: (0x120, 0x25), 9: (0x130, 0x25)})
+        self.assertEqual(streams["j0"], j0)
+        self.assertEqual(streams["j1"], j1)
+
+    def test_empty_component_list_is_rejected(self):
+        skeleton = _skeleton_dir(self.root)
+        with self.assertRaisesRegex(skinned_glb.SkinError, "at least one --component"):
+            skinned_glb.build_skinned_glb(skeleton, [])
 
     def test_zero_weight_vertex_is_rejected(self):
         j0, j1, w0, w1 = _streams()

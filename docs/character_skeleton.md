@@ -300,11 +300,13 @@ section offsets are also in `drawable.buffers[vertex_buffer].mesh_blob.sections`
 | jacket | 9 | `JOINTS_1` | 314,304 | `0x25` | 39,272 |
 | jacket | 6 | `WEIGHTS_0` | 196,488 | `0x26` | 39,272 |
 | jacket | 7 | `WEIGHTS_1` | 235,760 | `0x26` | 39,272 |
+| *packed layout* | 8, 9 | `JOINTS_0/1`, 4 x u32 | section entry | `0x8C` | 16 x vertices |
 
 Joint slots may also use the packed `R32G32B32A32_UINT` layout, format `0x8C`: 16 bytes
 per vertex, four little-endian u32 words whose low 12 bits are the joint index (bits
-12–31 are ignored). The exporter converts it to the same 4 x u8 row as `0x25` and rejects
-an index above 255.
+12–31 are a separate unidentified field). The exporter converts it to the same 4 x u8 row
+as `0x25` and rejects an index above 255. Only `0x8C` is accepted: no `0x8B` joint layout
+has been measured, so `0x8B` is rejected rather than guessed.
 
 The output has one skin. Its joints are the full ped skeleton plus any drawable-local helper
 joints named by the palette; a palette hash that resolves nowhere is emitted as
