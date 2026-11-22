@@ -381,6 +381,12 @@ struct DeviceState {
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
     // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
     bool r9g9b9e5_uav_emulated = false;
+    // D3D-219: VK_EXT_image_view_min_lod may select levels with minLodInteger = floor(minLod), the spec's
+    // "alternative", while D3D12's ResourceMinLODClamp is fractional. Intel's integrated GPUs on Windows do: a 0.75
+    // clamp sampled at LOD 0 with point mip filtering reads mip 0 (UHD 770 101.7092, Arrow Lake Xe-LPG; #1015).
+    // bind_image gives such a driver the clamp rounded to the nearest level, which point mip filtering selects
+    // exactly. LEONIDA_MIN_LOD_INTEGER=1 or 0 forces it either way.
+    bool min_lod_integer = false;
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
@@ -790,6 +796,9 @@ struct DeviceState {
                     log_once("SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
                     return false;
                 }
+                // A driver that floors the clamp (min_lod_integer) gets the level point mip filtering picks:
+                // nearest(d') = ceil(d' + 0.5) - 1, the spec's preferred rounding. It stays within the mip range.
+                if (min_lod_integer) clamp.minLod = std::ceil(clamp.minLod + 0.5f) - 1.0f;
                 clamp.pNext = view_info.pNext;
                 view_info.pNext = &clamp;
             }
@@ -3037,6 +3046,15 @@ public:
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
+        {
+            constexpr std::uint32_t kIntelVendorId = 0x8086;
+            state_.min_lod_integer = properties.vendorID == kIntelVendorId &&
+                                     properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+            char text[4] = {};
+            size_t length = 0;
+            if (getenv_s(&length, text, "LEONIDA_MIN_LOD_INTEGER") == 0 && length > 1)
+                state_.min_lod_integer = text[0] != '0';
+        }
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -3081,7 +3099,19 @@ public:
             get_properties(state_.info.physical, &properties);
             features.ms_samples = {VK_SAMPLE_COUNT_4_BIT, state_.ms_fallback_samples(VK_FORMAT_R32_UINT),
                                    state_.ms_fallback_samples(VK_FORMAT_R32_SINT)};
-            if (!leonida::bindless::size_bindings(features, properties.properties.limits, v11, indexed))
+            // Past maxPerSetDescriptors, ask the driver about the grown layout (D3D-219: Intel's Xe-LP reports 6159).
+            const auto layout_support = reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(
+                get_device(state_.info.device, "vkGetDescriptorSetLayoutSupport"));
+            std::function<bool(const leonida::BindlessFeatures&)> layout_supported;
+            if (layout_support)
+                layout_supported = [&](const leonida::BindlessFeatures& candidate) {
+                    const leonida::bindless::SetLayout layout(candidate);
+                    VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
+                    layout_support(state_.info.device, &layout.info, &support);
+                    return support.supported == VK_TRUE;
+                };
+            if (!leonida::bindless::size_bindings(features, properties.properties.limits, v11, indexed,
+                                                  layout_supported))
                 std::fprintf(stderr, "[rt] d3d12: the device's descriptor limits are below the bindless set's default "
                                      "sizes; it holds less\n");
         }
