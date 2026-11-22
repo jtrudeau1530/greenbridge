@@ -905,7 +905,9 @@ and any validation error fails them.
     the 43 rows: an exact half-level LOD, or a fractional ResourceMinLODClamp. LOD 1.49 reads level 1 on both. The
     AMD driver does not follow it. Through the runtime's own path (`vk_sampler_test`, `vulkan_sampler(decode(S#))`),
     an S# LOD_BIAS of +0.5 on `image_sample_lz` reads level 1, like the console, on the same gfx1036 and on an RX 7800
-    XT (both AMD 26.10.1). So on AMD hosts the S# case matches. Other hosts (NVIDIA, Intel, Mesa) are not measured
+    XT (both AMD 26.10.1). So on AMD hosts the S# case matches. On an Apple M2 (macOS 26.4, MoltenVK 1.4.2) the
+    same `vk_sampler_test` S# with LOD_BIAS +0.5 reads level 0, following the spec's nearest rule; bias 0 and -0.5
+    also read level 0 and the implicit sample reads level 1. The other hosts (NVIDIA, Intel, Mesa) are not measured
     here.
   - **Layout.** gfx1036 lays a linear mip chain out smallest level first, each row padded to 256 bytes. Levels 6..0
     of the 64-wide R32 chain start at dwords 0, 64, 192, 448, 960, 1984 and 4032.
