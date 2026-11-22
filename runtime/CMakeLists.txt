@@ -255,6 +255,14 @@ if(BUILD_TESTING)
   add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
   add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
   if(WIN32)
+    # Compile-time ABI checks (D3D12/XMem structure sizes, alignments and member offsets against the Windows SDK).
+    # The file existed but no target built it, so none of its static_asserts ever ran.
+    add_executable(runtime_types_test test/test_runtime_types.cpp)
+    target_include_directories(runtime_types_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    add_test(NAME runtime_types COMMAND runtime_types_test)
+  endif()
+  if(WIN32)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
       test/loader_test.cpp
