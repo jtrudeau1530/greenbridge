@@ -8,10 +8,13 @@
 // D3D12 lets placed buffers alias, so ranges may overlap. A lookup then returns the containing range that starts
 // closest below the VA (the larger ID on a tie): the walk goes down from the nearest start and stops once no range can
 // still reach the VA, which `longest_` bounds. Without overlaps the first range it looks at is the answer, or none is.
+// `longest_` is the longest range indexed now, not the longest ever: a large buffer that is freed stops lengthening
+// later misses. A miss still walks every start within the longest live range below the VA.
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <utility>
 
 namespace leonida {
@@ -22,14 +25,22 @@ public:
     // Registers [va, va + size). A null VA or an empty range is not indexed (no lookup can land in it).
     void insert(std::uint64_t va, std::uint64_t size, Id id) {
         if (!va || !size) return;
-        ranges_[{va, id}] = size;
-        if (size > longest_) longest_ = size;
+        const auto [it, added] = ranges_.try_emplace({va, id}, size);
+        if (!added) {  // the same (va, id) again: its new size replaces the old one
+            drop_size(it->second);
+            it->second = size;
+        }
+        sizes_.insert(size);
+        longest_ = *sizes_.rbegin();
     }
 
     // Forgets what insert(va, size, id) registered; nothing when it was not indexed.
     void erase(std::uint64_t va, Id id) {
-        ranges_.erase({va, id});
-        if (ranges_.empty()) longest_ = 0;  // otherwise kept: a bound that is too large only lengthens a miss
+        const auto it = ranges_.find({va, id});
+        if (it == ranges_.end()) return;
+        drop_size(it->second);
+        ranges_.erase(it);
+        longest_ = sizes_.empty() ? 0 : *sizes_.rbegin();
     }
 
     struct Hit {
@@ -55,12 +66,16 @@ public:
     }
 
     std::size_t size() const { return ranges_.size(); }
+    std::uint64_t longest() const { return longest_; }
 
 private:
     static constexpr Id max_id() { return ~Id(0); }
 
+    void drop_size(std::uint64_t size) { sizes_.erase(sizes_.find(size)); }  // one copy, not every range of that size
+
     std::map<std::pair<std::uint64_t, Id>, std::uint64_t> ranges_;  // (first VA, id) -> bytes
-    std::uint64_t longest_ = 0;  // no indexed range is longer
+    std::multiset<std::uint64_t> sizes_;  // the size of every indexed range, so the longest is known after an erase
+    std::uint64_t longest_ = 0;  // the longest indexed range, 0 when none is
 };
 
 } // namespace leonida

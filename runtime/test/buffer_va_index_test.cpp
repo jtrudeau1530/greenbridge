@@ -83,6 +83,21 @@ void fixed_cases() {
     check(alias.size() == 0 && at(alias, 0x10000) == 0, "everything erased");
     alias.insert(0x40000, 0x10, 30);  // the bound restarts from an empty index
     check(at(alias, 0x40008) == 30 && at(alias, 0x40010) == 0, "an index refilled after it emptied");
+
+    // The bound follows the live ranges: freeing the longest one brings it down to the next longest.
+    Index bound;
+    bound.insert(0x10000, 0x100, 1);
+    bound.insert(0x20000, 0x100, 2);  // the same size twice: dropping one keeps the other's
+    bound.insert(0x30000, 0x40000000, 3);
+    check(bound.longest() == 0x40000000, "the bound is the longest range");
+    bound.erase(0x30000, 3);
+    check(bound.longest() == 0x100, "freeing the longest range lowers the bound");
+    bound.erase(0x10000, 1);
+    check(bound.longest() == 0x100 && at(bound, 0x20080) == 2, "a range of the same size keeps the bound");
+    bound.insert(0x20000, 0x40, 2);  // re-registered with a smaller size: the old size goes
+    check(bound.longest() == 0x40 && at(bound, 0x20040) == 0, "re-registering replaces the size");
+    bound.erase(0x20000, 2);
+    check(bound.longest() == 0 && bound.size() == 0, "an empty index has no bound");
 }
 
 // The rule BufferVaIndex follows, by a scan: among the ranges that hold va, the greatest (start, id).
@@ -122,6 +137,14 @@ void random_tables() {
             index.erase(ranges[k].start, ranges[k].id);
             ranges.erase(ranges.begin() + std::ptrdiff_t(k));
             if (ranges.empty()) break;
+        }
+        std::uint64_t longest = 0;
+        for (const Range& r : ranges) longest = r.size > longest ? r.size : longest;
+        if (index.longest() != longest) {
+            std::printf("FAIL: round %d: bound %llu, longest live range %llu\n", round,
+                        (unsigned long long)index.longest(), (unsigned long long)longest);
+            ++failures;
+            return;
         }
         for (int q = 0; q < 2000; ++q) {
             const std::uint64_t va = 0x8000 + rng() % (next + 0x20000);
@@ -181,11 +204,44 @@ void time_lookups(std::size_t resources) {
                 indexed, linear / (indexed > 0 ? indexed : 1), sink ? "" : " ");
 }
 
+// A miss past the last of many small buffers, once a large buffer has come and gone (found in review of #2823): the
+// index that held it must be as fast as one that never did.
+void time_miss_after_free() {
+    constexpr std::uint64_t count = 20000, stride = 256;
+    Index fresh, churned;
+    for (std::uint64_t i = 0; i < count; ++i) {
+        fresh.insert(0x10000 + i * stride, stride, i + 1);
+        churned.insert(0x10000 + i * stride, stride, i + 1);
+    }
+    churned.insert(0x10000, std::uint64_t(1) << 30, count + 1);  // 1 GiB over all of them
+    churned.erase(0x10000, count + 1);
+    check(churned.longest() == stride, "the bound comes back down after a large buffer is freed");
+
+    const std::uint64_t miss = 0x10000 + count * stride + stride;
+    constexpr int lookups = 20000;
+    using clock = std::chrono::steady_clock;
+    std::uint64_t sink = 0;
+    double ns[2];
+    const Index* indexes[2] = {&fresh, &churned};
+    for (int k = 0; k < 2; ++k) {
+        const auto t0 = clock::now();
+        for (int i = 0; i < lookups; ++i) sink += at(*indexes[k], miss + std::uint64_t(i % 64));
+        ns[k] = std::chrono::duration<double, std::nano>(clock::now() - t0).count() / lookups;
+    }
+    std::printf("miss past %llu buffers: fresh index %.1f ns, after a freed 1 GiB buffer %.1f ns%s\n",
+                (unsigned long long)count, ns[0], ns[1], sink ? " (hit?)" : "");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     fixed_cases();
     random_tables();
+    if (failures) {
+        std::printf("%d failure(s)\n", failures);
+        return 1;
+    }
+    time_miss_after_free();
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;
