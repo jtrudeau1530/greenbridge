@@ -7,6 +7,7 @@ Every byte here is built by the test. No game file, value or name is used.
 import contextlib
 import io
 import json
+import math
 import os
 import pathlib
 import random
@@ -137,6 +138,25 @@ class BlockTests(unittest.TestCase):
     def test_mapping_spread_is_zero_on_an_even_grid(self):
         _, out = measure(block())
         self.assertEqual(out["mapping_spread"]["s16"]["median"], 0.0)
+
+    def test_packed_snorm10_normal_clamps_both_negative_endpoint_codes(self) -> None:
+        decode = vt.NORMAL_CANDIDATES["snorm10_xyz"]
+        values = struct.pack("<2I", 512 | (511 << 10), 513 | (511 << 10))
+        diagonal = 1.0 / math.sqrt(2.0)
+        expected = (-diagonal, diagonal, 0.0)
+        self.assertEqual(decode(values, 0), expected)
+        self.assertEqual(decode(values, 1), expected)
+
+    def test_normal_probe_uses_clamped_snorm10_direction_for_face_agreement(self) -> None:
+        mesh = bytearray(block(grid=2))
+        slots, _, _ = vt.parse_slots(mesh)
+        struct.pack_into("<4Q", mesh, slots[0][1], pack_position(0, 0, 0), pack_position(31, 218, 0),
+                         pack_position(0, 0, 100), pack_position(31, 218, 100))
+        struct.pack_into("<4I", mesh, slots[2][1], *([512 | (511 << 10)] * 4))
+        _, report = measure(bytes(mesh))
+        # Without the clamp, the packed normal's absolute dot product
+        # crosses the 0.8 face-agreement threshold.
+        self.assertEqual(report["tags"]["slot2:21"]["facenormal_snorm10_xyz_median"], 0.0)
 
     def test_constant_colour_and_known_normal(self):
         _, out = measure(block())
