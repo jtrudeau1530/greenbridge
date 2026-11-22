@@ -4,6 +4,7 @@
 """
 import os
 import random
+import subprocess
 import sys
 import unittest
 
@@ -87,6 +88,96 @@ class HarnessTests(unittest.TestCase):
         status, detail = ff.check("v_add_f32", vals, [(0, {}), (1, {})], False, [])
         self.assertEqual(status, "skip")
         self.assertIn("denormal", detail)
+
+
+class HardwareOracle(unittest.TestCase):
+    """--oracle hw: kernel text, verdicts, GFX11 skips and the exit-77 contract (no GPU needed), plus a run on the
+    GPU when the oracle tools are present."""
+    TOOL = os.path.join(ROOT, "tools", "f32_fuzz.py")
+
+    def case(self, op, vals, srcs, mods=(), e64=False):
+        return ff.Case(op, list(vals) + [0] * (9 - len(vals)), srcs, e64, list(mods))
+
+    def test_kernel_body(self):
+        c = self.case("v_add_f32", [ff.bits(1.0), ff.bits(2.0)], [(0, {}), (1, {})], ["mul:2", "clamp"], True)
+        lines = ff.hw_lines(c, "gfx1150")
+        self.assertIn("v_add_f32_e64 v8, v0, v1 clamp mul:2", lines)       # GFX11 wants clamp before omod
+        self.assertEqual(lines[-3:], ["v_mov_b32 v20, 0", "global_store_b64 v20, v[8:9], s[2:3]", "s_endpgm"])
+        self.assertEqual(ff.hw_lines(c, "gfx1030")[-2], "global_store_dwordx2 v20, v[8:9], s[2:3]")
+        self.assertEqual(len(ff.hw_lines(c, "gfx1150", guard=False)), len(lines) - 1)
+
+    def test_removed_opcodes_are_skipped_not_substituted(self):
+        from hw_oracle import asm
+        for op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_mad_legacy_f32"):
+            self.assertIn(op, asm.valu_skip_reason(op, "gfx1150"))
+            self.assertIn(op, asm.valu_skip_reason(op, "gfx1030"))
+            self.assertIsNone(asm.valu_skip_reason(op, "gfx1013"))
+        self.assertIsNone(asm.valu_skip_reason("v_mul_legacy_f32", "gfx1150"))
+
+    def test_mode_words(self):
+        self.assertEqual(ff.mode_word(ff.HW_MODES["flush"]), 0x1C0)
+        self.assertEqual(ff.mode_word(ff.HW_MODES["keep"]), 0x1F0)
+        self.assertEqual(ff.mode_word(ff.HW_MODES["ieee"]), 0x3C0)
+        self.assertFalse(ff.omod_active("keep", "v_add_f32"))
+        self.assertTrue(ff.omod_active("keep", "v_rcp_f32"))
+
+    def test_verdicts(self):
+        a = self.case("v_add_f32", [ff.bits(1.0), ff.bits(2.0)], [(0, {}), (1, {})])
+        self.assertEqual(ff.hw_verdict(a, [ff.bits(3.0), 0])[0], "match")
+        self.assertEqual(ff.hw_verdict(a, [ff.bits(3.0) ^ 1, 0])[0], "mismatch")
+        d = self.case("v_ceil_f32", [ff.bits(-0.75)], [(0, {})], ["mul:2"], True)
+        self.assertEqual(ff.hw_verdict(d, [0, 0])[0], "deviation:omod_neg_zero")     # omod: -0 becomes +0
+        self.assertEqual(ff.hw_verdict(d, [0x80000000, 0])[0], "match")
+        self.assertEqual(ff.hw_verdict(d, [ff.bits(1.0), 0])[0], "mismatch")
+        dn = self.case("v_add_f32", [1, ff.bits(1.0)], [(0, {}), (1, {})])
+        self.assertEqual(ff.hw_verdict(dn, [ff.bits(1.0), 0])[0], "skip")
+
+    def test_f16_nan_halves_compare_as_nan(self):
+        self.assertTrue(ff.hw_same([0x7E00, 0], [0x7E06, 0], "v_cvt_f16_f32"))
+        self.assertFalse(ff.hw_same([0x7E00, 0], [0x3C00, 0], "v_cvt_f16_f32"))
+        self.assertFalse(ff.hw_same([0x00007E00, 0], [0x00017E00, 0], "v_cvt_f16_f32"))   # high half is kept exactly
+
+    def test_negative_control_detects_each_perturbation(self):
+        self.assertTrue(ff.hw_self_test())
+
+    def test_denormal_variants_distinguish_flush_from_keep(self):
+        m = self.case("v_mul_f32", [1, ff.bits(1048576.0)], [(0, {}), (1, {})])
+        self.assertEqual(ff.denorm_label(m, [0, 0]), ("operand", "ftz|ftz_in|ftz_out"))
+        self.assertEqual(ff.denorm_label(m, [ff.bits(2.0 ** -129), 0]), ("operand", "keep"))
+
+    def test_hardware_only_ops_stay_out_of_the_translator_run(self):
+        self.assertTrue(set(ff.HW_ONLY_OPS).isdisjoint(ff.OPS))
+        r = subprocess.run([sys.executable, "-I", self.TOOL, "--ops", "v_min_f32"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
+    def test_exit_77_without_the_oracle_tools(self):
+        env = dict(os.environ, LEONIDA_AMD_CLANG=os.path.join(ROOT, "tools", "no-such-clang.exe"))
+        r = subprocess.run([sys.executable, "-I", self.TOOL, "--oracle", "hw", "--programs", "2"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
+        self.assertIn("unavailable", r.stdout)
+
+    def test_unknown_oracle_is_a_usage_error(self):
+        r = subprocess.run([sys.executable, "-I", self.TOOL, "--oracle", "gpu"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
+    def test_on_hardware(self):
+        from hw_oracle import runner
+        try:
+            oracle = runner.open_oracle()
+        except runner.Unavailable as e:
+            self.skipTest(f"hardware oracle unavailable: {e}")
+        try:
+            ff.hw_probe_modes(oracle)
+            cases = ff.gen_cases(300, 21, tuple(ff.ALL_OPS)) + ff.gen_probes(2, 21, tuple(ff.ALL_OPS))
+            rep = ff.hw_suite(oracle, cases, info_modes=("keep",))
+        finally:
+            oracle.close()
+        self.assertEqual([(c.op, c.index) for c, _, _ in rep.mismatches], [])
+        self.assertGreater(sum(r["match"] for r in rep.per_op.values()), 150)
+        for name, (n, bad) in ff.negative_control(rep).items():
+            if n >= 20 and name in ("add_lsb", "mul_rtz", "rndne_floor", "min_ieee_nan"):
+                self.assertGreater(bad, 0, name)
 
 
 if __name__ == "__main__":
