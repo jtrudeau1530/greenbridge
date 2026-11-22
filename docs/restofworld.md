@@ -367,8 +367,46 @@ group's count and the recurring widths fits zero of the 311 blocks. Padding
 after the final stream cannot change the earlier spans. In three blocks, the
 four candidate final lengths lead to more than one distinct validated group
 offset. The original first-match rule is retained for the counts above.
-Group association remains open; the survey establishes neither an alternate
-per-tag format nor a parser rule for selecting the owner.
+The page-only survey supplies no reason to introduce an alternate per-tag format.
+
+**Draw ownership from system metadata.** A geometry record supplies two independent
+resource-relative addresses. Following the pinned `RageModelDecoder.ReadMesh` layout,
+geometry +8 points to the vertex buffer and geometry +64 points to the meshlet
+descriptor, whose first pointer selects the index buffer. Each buffer's +24 pointer
+addresses the complete inflated graphics segment, including when its target is in
+another compressed stream. The vertex layout supplies the count separately. The
+descriptor supplies meshlet, triangle and reference counts that must agree with the
+pointed-to group's header. This check also validates the packed triangles, vertex
+reference bounds and padded index-buffer length.
+
+All 311 target blocks have one distinct validated group address under this check.
+Geometry records reached through resource-root model lists account for 303. For
+the other eight, a search of aligned system records found the same pointer layout
+and a primary-LOD geometry list containing the record. The path from the resource
+root to that list is still unknown. The pointer search reproduced the addresses
+without selecting on the proposed vertex count. The layout count and the group's
+dense range subsequently agreed in all 311. This includes the six uniquely paired
+page walks and seven walks with a repeated target block count.
+
+| Pointed-to group start relative to the target stream | Blocks |
+|---|---:|
+| Preceding stream | 68 |
+| Same stream | 228 |
+| Following stream | 15 |
+
+Two of the 230 same-stream count matches have their descriptor-selected group
+in the preceding stream. A count-only association would therefore choose a
+different group even with an exact match in hand.
+
+For an already separated system/graphics resource pair, the following command
+walks the primary LOD from the drawable offset reported by the model manifest.
+Use `--geometry-offset` for a known individual geometry record. Both offsets
+are relative to the start of the system segment. Unsupported or inconsistent
+bindings are reported as unresolved.
+
+```powershell
+python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
+```
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` payloads, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
@@ -416,7 +454,7 @@ The only UI-adjacent evidence is content-manifest XML and text; there is no UI c
    a page-graph rule.
 7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths;
    decoding vertex values still requires component types, final-stream widths and a way to
-   associate each block with its meshlet groups. Texture identification also remains open:
+   locate the owning geometry when only a graphics page is available. Texture identification also remains open:
    the stream-start scan found no DDS, `TXTR`, DXT or BC signature.
 8. An XML content-definition reader. The roots are content change sets, content definitions and
    `SSetupData`; this is configuration, not UI layout.
