@@ -1109,5 +1109,127 @@ class TestValuCvtF32F64SIMD(unittest.TestCase):
             self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), POS_TEN_F32)
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestValuCvtF32F64RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_aliasing_cvt_f32_f64_dst_equals_src_low_dword(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # v[0:1] = 2.0 (lo=0, hi=0x40000000)
+        interp.write_reg_u64(RegKind.VGPR, 0, POS_TWO_F64)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 0x40000000)
+
+        # v0 = (float)v[0:1]
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 0, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_TWO_F32)
+        # Low dword v0 now holds f32 2.0f
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), POS_TWO_F32)
+        # High dword v1 remains undisturbed
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 0x40000000)
+
+    def test_aliasing_cvt_f32_f64_dst_equals_src_high_dword(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # v[0:1] = 10.0 (lo=0, hi=0x40240000)
+        interp.write_reg_u64(RegKind.VGPR, 0, POS_TEN_F64)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 0x40240000)
+
+        # v1 = (float)v[0:1]
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 1, count=1),
+            src0=Register(RegKind.VGPR, 0, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_TEN_F32)
+        # High dword v1 now holds f32 10.0f
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), POS_TEN_F32)
+        # Low dword v0 remains undisturbed
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0)
+
+    def test_aliasing_cvt_f64_f32_dst_low_equals_src(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # v0 = 2.0f, v1 = canary
+        interp.write_reg_u32(RegKind.VGPR, 0, POS_TWO_F32)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0xAAAAAAAA)
+
+        # v[0:1] = (double)v0
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_TWO_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 0), POS_TWO_F64)
+
+    def test_aliasing_cvt_f64_f32_dst_high_equals_src(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # v1 = 1.0f, v0 = canary
+        interp.write_reg_u32(RegKind.VGPR, 1, POS_ONE_F32)
+        interp.write_reg_u32(RegKind.VGPR, 0, 0xBBBBBBBB)
+
+        # v[0:1] = (double)v1
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 1, count=1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_ONE_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 0), POS_ONE_F64)
+
+    def test_unmodified_registers_preserved(self) -> None:
+        interp = ScalarVALUInterpreter()
+        for idx in range(10, 20):
+            interp.write_reg_u32(RegKind.VGPR, idx, 0x22220000 + idx)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(1.0, is_64bit=True),
+        )
+        interp.step(inst)
+
+        for idx in range(10, 20):
+            self.assertEqual(interp.read_reg_u32(RegKind.VGPR, idx), 0x22220000 + idx)
+
+    def test_simd_aliasing_with_divergent_exec_mask(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        exec_mask = 0x0000000F  # First 4 lanes active
+        simd.set_exec_mask(exec_mask)
+
+        # All lanes: v[0:1] = 10.0
+        for lane in range(32):
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 0, POS_TEN_F64)
+
+        # v0 = (float)v[0:1]
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 0, count=2),
+        )
+        simd.step(inst)
+
+        for lane in range(32):
+            if lane < 4:
+                # Active lane wrote f32 10.0f to v0
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), POS_TEN_F32)
+            else:
+                # Inactive lane preserved low dword of POS_TEN_F64 (which is 0)
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 0)
+            # High dword v1 remains undisturbed in all lanes
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), 0x40240000)
+
+
 if __name__ == "__main__":
     unittest.main()
