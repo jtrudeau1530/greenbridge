@@ -524,7 +524,7 @@ def decode_resource(path, segments, budget=None):
     for pack in d["packs"]:
         for anim in pack["animations"]:
             stats["animations"] += 1
-            if budget is not None and time.monotonic() - started > budget:
+            if budget is not None and time.monotonic() - started >= budget:  # >=: a coarse clock (Windows) reads 0.0 for short spans
                 skipped += 1
                 continue
             stats["sequences"] += len(anim["sequences"])
