@@ -38,6 +38,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   (10 cases): sentinels in v1..v8, M0 set by `s_mov_b32`, then the indexed register and its neighbours are
   exported, so a write must land only in `VGPR[D.addr + M0]`. A plain-Python register-file model checks the
   hand-written constants. `v_movrelsd_2_b32` is covered by `test_alu_movrelsd_2.py`.
+- `test_andn2_exec_b64.py` runs `s_andn2_saveexec_b64` and `s_andn2_wrexec_b64` on all 64 lanes of a wave64
+  (12 pairs of S0 and EXEC for each): every lane stores whether the instruction left it on, and lane 0 stores SCC
+  and the population count and lowest lane of D, against the ISA's two lines written as integers. Results in the
+  low half only, the high half only, both and neither are all in the table. It also runs the GPU test
+  `cs_w64x_andn2_exec`.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
@@ -48,6 +53,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_float_nan_fract.py` runs float min/max/min3/max3/med3 with a quiet NaN and `v_fract` next to 1.0 (f32 and
   f16) with inputs from memory, and the GPU fixtures `ps_fnan_med3` and `ps_fnan_fract`; the expected words were
   measured on an AMD Radeon RX 6800 (gfx1030). A NaN result is asserted as "a NaN", not by its bits.
+- `test_rule_gpu_fixtures.py` runs the GPU fixtures for the `docs/design.md` rules that used to be CPU-only (TEST-175:
+  `v_cmp(x)_nlg`, `v_cvt_off_f32_i4`, the `v_fmac_f16` / `v_interp_p2/mov_f32` output modifiers and VOP3 modifiers on
+  constants) through the interpreter, and checks that the words each `.asm` header derives are the ones `check.py`
+  and `scripts/run_gpu_tests.py` expect. The two interp fixtures get the constants their vertex shader,
+  `vs_interp_consts`, exports.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.

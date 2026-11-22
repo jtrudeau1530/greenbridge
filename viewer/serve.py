@@ -141,10 +141,20 @@ def main():
                     help="0 asks the OS for a free port; the bound port is printed")
     a = ap.parse_args()
     Handler.world = a.world if os.path.isdir(a.world) else None
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
+    try:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
+    except OSError as e:
+        # The usual cause is a viewer that is still running on the port; this ended in a traceback.
+        ap.error(f"can't listen on port {a.port}: {e.strerror or e}. Is a viewer already running? "
+                 "--port 0 asks the OS for a free port")
     print(f"viewer: http://127.0.0.1:{srv.server_address[1]}/  world: {Handler.world or '(none: test terrain)'}",
           flush=True)
-    srv.serve_forever()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:      # Ctrl+C is how the viewer is stopped
+        print("viewer: stopped", flush=True)
+    finally:
+        srv.server_close()
 
 
 if __name__ == "__main__":

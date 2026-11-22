@@ -246,6 +246,36 @@ class TbufferDefaultFormat(unittest.TestCase):
                 self.assertEqual(got[0], 0x3F800000)
                 self.assertEqual(got, self.tload(0, ncomp, self.EXPLICIT)[:ncomp])
 
+    def test_packed_load_uses_instruction_format(self):
+        # The V# declares one u32. The instruction specifies four u8s at byte 4: EF BE AD DE.
+        expected = ((0x123400EF,), (0x00BE00EF,), (0x00BE00EF, 0xA9BC00AD), (0x00BE00EF, 0x00DE00AD))
+        for ncomp, want in enumerate(expected, 1):
+            with self.subTest(ncomp=ncomp):
+                got = load_format(FMT_U32, 4, ncomp, d16=True, op="tbuffer_load_format",
+                                  mods=" format:[BUF_FMT_8_8_8_8_UINT]")
+                self.assertEqual(got[:len(want)], want)
+
+    def test_fixed_format_identity_ignores_descriptor_selectors(self):
+        # Descriptor selectors are 0,0,0,1. MTBUF supplies its own X000, XY00 or XYZW.
+        for fmt, source, want in (("32_UINT", 0x44, (0x44, 0, 0, 0)),
+                                  ("16_16_UINT", 0x00330044, (0x44, 0x33, 0, 0)),
+                                  ("8_8_8_8_UINT", 0x11223344, (0x44, 0x33, 0x22, 0x11))):
+            for d16 in (False, True):
+                with self.subTest(fmt=fmt, d16=d16):
+                    got = load_format(FMT_U32, 0, 4, dst_sel=1 << 9, memory={BASE: source},
+                                      d16=d16, op="tbuffer_load_format",
+                                      mods=f" format:[BUF_FMT_{fmt}]")
+                    if d16:
+                        self.assertEqual(got[:2], (want[0] | want[1] << 16, want[2] | want[3] << 16))
+                    else:
+                        self.assertEqual(got, want)
+        self.assertEqual(load_format(FMT_UINT8X4, 0, 4, dst_sel=1 << 9), (0, 0, 0, 1))
+
+    def test_packed_default_8_unorm(self):
+        # The first byte is 0xff: 1.0 in f16 is 0x3c00. Preserve the upper destination half.
+        got = load_format(FMT_U32, 0, 1, memory=self.MEM, d16=True, op="tbuffer_load_format")
+        self.assertEqual(got[0], 0x12343C00)
+
     def test_explicit_invalid_still_rejected(self):
         with self.assertRaises(rdna2spirv.Unsupported):
             self.tload(0, 1, " format:[BUF_FMT_INVALID]")

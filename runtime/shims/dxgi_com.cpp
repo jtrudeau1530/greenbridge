@@ -4,9 +4,12 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace rt::dxgi {
@@ -112,11 +115,13 @@ public:
 
     ~SwapChain() {
         unregister_buffers();
+        if (waitable_) CloseHandle(waitable_);
         if (parent_) parent_->Release();
     }
 
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc) {
         hwnd_ = hwnd;
+        flags_ = desc.Flags;
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
@@ -126,7 +131,14 @@ public:
             vk_fmt = dxgi_to_vk_format(desc.Format);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return false;
         }
-        if (!swapchain_.create(hwnd, w, h, vk_fmt, count)) return false;
+        const bool allow_tearing = (flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+        if (!swapchain_.create(hwnd, w, h, vk_fmt, count, allow_tearing)) return false;
+        if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+            // DXGI: waitable swapchains default to maximum frame latency 1.
+            max_frame_latency_.store(1, std::memory_order_relaxed);
+            waitable_ = CreateSemaphoreW(nullptr, 1, 16, nullptr);
+            if (!waitable_) return false;
+        }
         register_buffers();
         std::uint32_t idx = 0;
         return swapchain_.acquire_next_image(idx);
@@ -169,12 +181,17 @@ public:
     // IDXGISwapChain
     HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override {
         if (sync > 4) return DXGI_ERROR_INVALID_CALL;
+        if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
+            (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
+            return DXGI_ERROR_INVALID_CALL;
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
         ++present_count_;
         std::uint32_t next = 0;
-        return swapchain_.acquire_next_image(next) ? S_OK : E_FAIL;
+        if (!swapchain_.acquire_next_image(next)) return E_FAIL;
+        if (waitable_) ReleaseSemaphore(waitable_, 1, nullptr);
+        return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT buffer, REFIID riid, void** surface) override {
@@ -203,10 +220,11 @@ public:
         desc->OutputWindow = hwnd_;
         desc->Windowed = TRUE;
         desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc->Flags = flags_;
         return S_OK;
     }
 
-    HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT) override {
+    HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags) override {
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (fmt != DXGI_FORMAT_UNKNOWN) {
             vk_fmt = dxgi_to_vk_format(fmt);
@@ -219,7 +237,11 @@ public:
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
-        if (!swapchain_.resize(w, h, vk_fmt, count)) return E_FAIL;
+        const UINT waitable_bit = flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        const UINT next_flags = (flags ? flags : flags_) | waitable_bit;
+        const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+        if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
+        flags_ = next_flags;
         register_buffers();
         std::uint32_t next = 0;
         return swapchain_.acquire_next_image(next) ? S_OK : E_FAIL;
@@ -247,6 +269,7 @@ public:
         desc->Scaling = DXGI_SCALING_STRETCH;
         desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        desc->Flags = flags_;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC*) override { return E_NOTIMPL; }
@@ -274,7 +297,9 @@ public:
     }
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
         if (max_latency == 0 || max_latency > 16) return E_INVALIDARG;
-        max_frame_latency_.store(max_latency, std::memory_order_relaxed);
+        const UINT prev = max_frame_latency_.exchange(max_latency, std::memory_order_relaxed);
+        if (waitable_ && max_latency > prev)
+            ReleaseSemaphore(waitable_, static_cast<LONG>(max_latency - prev), nullptr);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* n) override {
@@ -282,7 +307,14 @@ public:
         *n = max_frame_latency_.load(std::memory_order_relaxed);
         return S_OK;
     }
-    HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override { return nullptr; }
+    HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override {
+        if (!waitable_) return nullptr;
+        HANDLE dup = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), waitable_, GetCurrentProcess(), &dup, 0, FALSE,
+                             DUPLICATE_SAME_ACCESS))
+            return nullptr;
+        return dup;
+    }
     HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F*) override { return E_NOTIMPL; }
 
@@ -320,10 +352,12 @@ private:
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        const VkImageLayout initial_layout =
+            swapchain_.is_offscreen() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         buffers_.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
             auto* bb = new BackBufferResource(desc);
-            context_.add_resource(bb->resource_id(), swapchain_.resource_binding(i), VK_IMAGE_LAYOUT_UNDEFINED);
+            context_.add_resource(bb->resource_id(), swapchain_.resource_binding(i), initial_layout);
             buffers_.push_back(bb);
         }
     }
@@ -341,10 +375,49 @@ private:
     leonida::VulkanContext& context_;
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
+    UINT flags_ = 0;
+    HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
     std::atomic<UINT> present_count_{0};
     std::atomic<UINT> max_frame_latency_{2};
 };
+
+struct ReservationState {
+    std::atomic<UINT64> local{0};
+    std::atomic<UINT64> non_local{0};
+};
+
+// Video-memory reservations are scoped per physical adapter in the process (matching native DXGI,
+// where separate IDXGIAdapter3 handles opened for the same LUID observe each other's reservations).
+std::shared_ptr<ReservationState> adapter_reservation_state(LUID luid, VkPhysicalDevice physical) {
+    static std::mutex mutex;
+    static std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>> table;
+    const bool has_luid = (luid.LowPart != 0 || luid.HighPart != 0);
+    const auto key =
+        has_luid ? std::make_tuple(std::uint32_t(luid.LowPart), std::int32_t(luid.HighPart), std::uintptr_t(0))
+                 : std::make_tuple(std::uint32_t(0), std::int32_t(0), reinterpret_cast<std::uintptr_t>(physical));
+    std::lock_guard lock(mutex);
+    auto& entry = table[key];
+    if (!entry) entry = std::make_shared<ReservationState>();
+    return entry;
+}
+
+// On discrete GPUs without Resizable BAR, Vulkan exposes a second smaller DEVICE_LOCAL heap for the
+// CPU-visible BAR1 aperture (typically 256 MiB) that aliases the same physical VRAM as the primary heap.
+// Pick the largest DEVICE_LOCAL heap so DedicatedVideoMemory and LOCAL budget/usage match Windows DXGI
+// instead of double-counting BAR1.
+std::uint32_t primary_device_local_heap(const VkPhysicalDeviceMemoryProperties& mem) {
+    std::uint32_t best = UINT32_MAX;
+    VkDeviceSize best_size = 0;
+    for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
+        if (best == UINT32_MAX || mem.memoryHeaps[i].size > best_size) {
+            best = i;
+            best_size = mem.memoryHeaps[i].size;
+        }
+    }
+    return best;
+}
 
 // Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
@@ -354,6 +427,7 @@ public:
         : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical) {
         if (parent_) parent_->AddRef();
         populate_desc();
+        reservations_ = adapter_reservation_state(desc_.AdapterLuid, physical_);
     }
 
     ~Adapter() {
@@ -462,11 +536,18 @@ public:
                 VkPhysicalDeviceMemoryProperties2 mem2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
                 get_mem2(physical_, &mem2);
                 const auto& mem = mem2.memoryProperties;
-                for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
-                    const bool is_local = (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
-                    if (is_local == want_local) {
-                        info->Budget += budget.heapBudget[i];
-                        info->CurrentUsage += budget.heapUsage[i];
+                if (want_local) {
+                    const std::uint32_t local_heap = primary_device_local_heap(mem);
+                    if (local_heap != UINT32_MAX) {
+                        info->Budget = budget.heapBudget[local_heap];
+                        info->CurrentUsage = budget.heapUsage[local_heap];
+                    }
+                } else {
+                    for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+                        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+                            info->Budget += budget.heapBudget[i];
+                            info->CurrentUsage += budget.heapUsage[i];
+                        }
                     }
                 }
             }
@@ -475,19 +556,19 @@ public:
             info->Budget = want_local ? desc_.DedicatedVideoMemory : desc_.SharedSystemMemory;
         }
         info->AvailableForReservation = info->Budget / 2;
-        info->CurrentReservation = want_local ? local_reservation_.load(std::memory_order_relaxed)
-                                              : non_local_reservation_.load(std::memory_order_relaxed);
+        info->CurrentReservation = want_local ? reservations_->local.load(std::memory_order_relaxed)
+                                              : reservations_->non_local.load(std::memory_order_relaxed);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetVideoMemoryReservation(UINT node_index, DXGI_MEMORY_SEGMENT_GROUP group,
                                                         UINT64 reservation) override {
         if (node_index != 0) return E_INVALIDARG;
         if (group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL) {
-            local_reservation_.store(reservation, std::memory_order_relaxed);
+            reservations_->local.store(reservation, std::memory_order_relaxed);
             return S_OK;
         }
         if (group == DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) {
-            non_local_reservation_.store(reservation, std::memory_order_relaxed);
+            reservations_->non_local.store(reservation, std::memory_order_relaxed);
             return S_OK;
         }
         return E_INVALIDARG;
@@ -535,12 +616,11 @@ private:
                 gipa_(instance_, "vkGetPhysicalDeviceMemoryProperties"))) {
             VkPhysicalDeviceMemoryProperties mem{};
             get_mem(physical_, &mem);
-            std::uint64_t dedicated = 0;
+            const std::uint32_t local_heap = primary_device_local_heap(mem);
+            const std::uint64_t dedicated = (local_heap != UINT32_MAX) ? mem.memoryHeaps[local_heap].size : 0;
             std::uint64_t shared = 0;
             for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
-                if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                    dedicated += mem.memoryHeaps[i].size;
-                else
+                if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0)
                     shared += mem.memoryHeaps[i].size;
             }
             desc_.DedicatedVideoMemory = static_cast<SIZE_T>(dedicated);
@@ -571,11 +651,10 @@ private:
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     DXGI_ADAPTER_DESC2 desc_{};
     bool has_memory_budget_ = false;
-    std::atomic<UINT64> local_reservation_{0};
-    std::atomic<UINT64> non_local_reservation_{0};
+    std::shared_ptr<ReservationState> reservations_;
 };
 
-class Factory final : public IDXGIFactory4 {
+class Factory final : public IDXGIFactory5 {
 public:
     Factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
             VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
@@ -593,8 +672,9 @@ public:
         *out = nullptr;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIFactory) ||
             riid == __uuidof(IDXGIFactory1) || riid == __uuidof(IDXGIFactory2) ||
-            riid == __uuidof(IDXGIFactory3) || riid == __uuidof(IDXGIFactory4)) {
-            *out = static_cast<IDXGIFactory4*>(this);
+            riid == __uuidof(IDXGIFactory3) || riid == __uuidof(IDXGIFactory4) ||
+            riid == __uuidof(IDXGIFactory5)) {
+            *out = static_cast<IDXGIFactory5*>(this);
             AddRef();
             return S_OK;
         }
@@ -689,6 +769,19 @@ public:
         return hr;
     }
     HRESULT STDMETHODCALLTYPE EnumWarpAdapter(REFIID, void**) override { return DXGI_ERROR_NOT_FOUND; }
+
+    // IDXGIFactory5
+    HRESULT STDMETHODCALLTYPE CheckFeatureSupport(DXGI_FEATURE feature, void* data, UINT size) override {
+        if (!data) return E_INVALIDARG;
+        if (feature == DXGI_FEATURE_PRESENT_ALLOW_TEARING) {
+            if (size != sizeof(BOOL)) return E_INVALIDARG;
+            const auto present_modes = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(
+                gipa_ ? gipa_(instance_, "vkGetPhysicalDeviceSurfacePresentModesKHR") : nullptr);
+            *static_cast<BOOL*>(data) = present_modes ? TRUE : FALSE;
+            return S_OK;
+        }
+        return E_INVALIDARG;
+    }
 
 private:
     std::atomic<ULONG> refs_{1};

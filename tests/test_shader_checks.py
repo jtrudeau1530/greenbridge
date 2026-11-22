@@ -15,6 +15,7 @@ import check
 
 
 GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
+GOOD_XY_XYZ = struct.pack("<192I", *check.FMT_XY_XYZ_WORDS, *[0xEEEEEEEE] * 108)
 FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
              (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
 
@@ -26,10 +27,10 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the three
+# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, cs_fmt_xy_xyz, the dumps (#73, #152 cross-half, partial), the three
 # vk_store_test checks (cs_imgstore, cs_imgload, cs_imgload_d16), pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
 # does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
+TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + 8)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat and ps_gather_wrap
@@ -54,6 +55,10 @@ class Wave64Checks(unittest.TestCase):
                 if fmt[1] is not None:
                     dump.write_bytes(fmt[1])
                 return fmt[0], "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
+            if name == "cs_fmt_xy_xyz":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
+                Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ)
+                return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
@@ -297,6 +302,39 @@ class PixelDeviceLimits(unittest.TestCase):
         problem = self.run_pixel("ps_bitmask_perm", 0, "ok 64x64\n", data=self.bitmask_pixels(32))
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("no subgroup width", problem)
+
+    def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
+        out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
+        for width in (8, 16):
+            with self.subTest(width=width):
+                # In SIMD8/SIMD16, "10p0i" targets lanes >= 16 (out of bounds), returning 0 or wrapped values.
+                data = b"".join(struct.pack("<4I", i % width, (i % width) ^ 9, 0, 0) for i in range(64 * 64))
+                problem = self.run_pixel("ps_bitmask_perm", 0, out, data=data)
+                self.assertIsInstance(problem, check.Skip)
+                self.assertIn(f"{width} lanes", problem)
+
+    def test_bitmask_perm_judges_variable_device_at_32_lanes(self):
+        out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
+        bad = b"".join(struct.pack("<4I", i % 32, (i % 32) ^ 9, 0, 0) for i in range(64 * 64))
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)
+
+    def test_bitmask_perm_fails_broken_lanes_instead_of_skipping(self):
+        # Fixed 32..32 device producing only lanes 0..15, or 8..32 device producing incomplete/too-narrow lanes.
+        simd16 = b"".join(struct.pack("<4I", i % 16, (i % 16) ^ 9, 0, 0) for i in range(64 * 64))
+        problem = self.run_pixel("ps_bitmask_perm", 0, "device: fake (subgroup 32..32)\nok 64x64\n", data=simd16)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)
+
+        out = "device: fake (subgroup 8..32)\nok 64x64\n"
+        for lanes in (1, 4, 15):
+            with self.subTest(lanes=lanes):
+                bad = b"".join(struct.pack("<4I", i % lanes, (i % lanes) ^ 9, 0, 0) for i in range(64 * 64))
+                problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
+                self.assertNotIsInstance(problem, check.Skip)
+                self.assertIn("wrong", problem)
 
 
 class SeededPixelTests(unittest.TestCase):

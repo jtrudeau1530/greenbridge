@@ -158,6 +158,21 @@ class LoadOnlyShaders(unittest.TestCase):
             self.assertEqual((op, source[1]), ("OpAccessChain", "%vgpr"))
             self.assertEqual(m.value(source[2], 0, 0), 6)
 
+    def test_2d_explicit_mip_d16_packs_only_selected_components(self):
+        listing = ["image_load_mip v0, v[4:6], s[0:7] dmask:0x9 dim:SQ_RSRC_IMG_2D d16",
+                   "s_waitcnt vmcnt(0)"]
+        m = Module(translate(listing))
+        self.assertEqual({image[0] for _, _, image in m.fetches()}, {"%float", "%uint", "%int"})
+        for rid, _, _ in m.fetches():
+            bits, = (r for r, op, args in m.order if op == "OpBitcast" and args[1] == rid)
+            components = [int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits]
+            self.assertEqual(components, [0, 3])
+        # All three branches write just v0: R in the low half and A in the high half.
+        writes = [m.defs[ptr][1] for ptr in re.findall(r"^\s*OpStore (%\w+) ", m.text, re.MULTILINE)]
+        vgprs = [m.value(pointer[2], 0, 0) for pointer in writes if len(pointer) > 2 and pointer[1] == "%vgpr"]
+        self.assertEqual(vgprs.count(0), 3)
+        self.assertNotIn(1, vgprs)
+
     def test_no_storage_image_capability_and_no_storage_binding(self):
         for dim in DIMS:
             with self.subTest(dim=dim):
@@ -203,6 +218,73 @@ class LoadOnlyShaders(unittest.TestCase):
             comps = sorted(int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits)
             self.assertEqual(comps, [0, 3], "dmask 0x9: R into v0, A into v1")
 
+    def test_d16_odd_dmask_preserves_trailing_vgpr_high_half(self):
+        # Odd component counts (1 or 3) must keep the trailing destination VGPR's high 16 bits via write_lo16
+        # in all three typed branches (sint, uint, float), while even counts overwrite the whole register.
+        for dmask, dest_reg, expect_preserve in ((0x1, 0, True), (0x7, 1, True), (0x3, 0, False), (0xF, 1, False)):
+            with self.subTest(dmask=hex(dmask)):
+                reg = "v0" if dest_reg == 0 else "v[0:1]"
+                m = Module(translate([
+                    "v_mov_b32 v0, 0x5a5a0000",
+                    "v_mov_b32 v1, 0x5a5a0000",
+                    "v_mov_b32 v4, 1",
+                    "v_mov_b32 v5, 2",
+                    f"image_load {reg}, v[4:5], s[0:7] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_2D unorm d16",
+                    "s_waitcnt vmcnt(0)",
+                ]))
+                # write_lo16 emits: OpBitwiseAnd %uint <copy_of_old_vgpr> %uint_0xFFFF0000.
+                hi_masks = 0
+                for _, op, args in m.order:
+                    if op != "OpBitwiseAnd":
+                        continue
+                    rhs = m.defs.get(args[2])
+                    if not rhs or rhs[0] != "OpConstant" or int(rhs[1][1], 0) != 0xFFFF0000:
+                        continue
+                    copy = m.defs.get(args[1])
+                    if not copy or copy[0] != "OpCopyObject":
+                        continue
+                    load = m.defs.get(copy[1][1])
+                    if not load or load[0] != "OpLoad":
+                        continue
+                    ptr = m.defs.get(load[1][1])
+                    if ptr and ptr[0] == "OpAccessChain" and ptr[1][1] == "%vgpr" and m.value(ptr[1][2], 0, 0) == dest_reg:
+                        hi_masks += 1
+                self.assertEqual(hi_masks, 3 if expect_preserve else 0)
+
+
+class TypedGatherShaders(unittest.TestCase):
+    def test_2d_gather_picks_the_sampled_type_and_selected_component(self):
+        for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
+            with self.subTest(modifier=modifier):
+                m = Module(translate([f"image_gather4_lz {dst}, v[4:5], s[0:7], s[8:11] "
+                                      f"dmask:0x2 dim:SQ_RSRC_IMG_2D{modifier}", "s_waitcnt vmcnt(0)"]))
+                types = set()
+                for rid, op, args in m.order:
+                    if op != "OpImageGather":
+                        continue
+                    types.add(args[0])
+                    self.assertEqual(m.value(args[3], 0, 0), 1)  # green
+                    sampled_op, sampled = m.defs[args[1]]
+                    self.assertEqual(sampled_op, "OpSampledImage")
+                    image_load, image = m.defs[sampled[1]]
+                    self.assertEqual(image_load, "OpLoad")
+                    _, chain = m.defs[image[1]]
+                    self.assertEqual(m.binding[chain[1]], 0)
+                    if modifier and args[0] != "%v4float":
+                        def uses(opcode, operand):
+                            return [(r, a) for r, op, a in m.order if op == opcode and operand in a[1:]]
+                        ((raw, _),) = uses("OpBitcast", rid)
+                        taps = {int(a[2]): r for r, a in uses("OpCompositeExtract", raw)}
+                        self.assertEqual(set(taps), {0, 1, 2, 3})
+                        for tap in (0, 2):
+                            ((lo, mask),) = uses("OpBitwiseAnd", taps[tap])
+                            ((hi, shift),) = uses("OpShiftLeftLogical", taps[tap + 1])
+                            self.assertEqual(m.value(mask[2], 0, 0), 0xffff)
+                            self.assertEqual(m.value(shift[2], 0, 0), 16)
+                            self.assertTrue(any(hi in a for _, a in uses("OpBitwiseOr", lo)))
+
+                self.assertEqual(types, {"%v4uint_st", "%v4int_st", "%v4float"})
+
 
 class StoreAndLoad(unittest.TestCase):
     def test_a_shader_that_also_stores_needs_only_the_write_feature(self):
@@ -225,6 +307,24 @@ class Validation(unittest.TestCase):
                     sa, sv = os.path.join(tmp, f"{dim}.spvasm"), os.path.join(tmp, f"{dim}.spv")
                     with open(sa, "w", encoding="utf-8") as f:
                         f.write(load_shader(dim))
+                    result = rdna2spirv.assemble_spirv(sa, sv)
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_spirv_val_accepts_d16_odd_dmask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for dmask, reg in ((0x1, "v0"), (0x7, "v[0:1]")):
+                with self.subTest(dmask=hex(dmask)):
+                    sa = os.path.join(tmp, f"d16_{dmask:x}.spvasm")
+                    sv = os.path.join(tmp, f"d16_{dmask:x}.spv")
+                    with open(sa, "w", encoding="utf-8") as f:
+                        f.write(translate([
+                            "v_mov_b32 v0, 0x5a5a0000",
+                            "v_mov_b32 v1, 0x5a5a0000",
+                            "v_mov_b32 v4, 1",
+                            "v_mov_b32 v5, 2",
+                            f"image_load {reg}, v[4:5], s[0:7] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_2D unorm d16",
+                            "s_waitcnt vmcnt(0)",
+                        ]))
                     result = rdna2spirv.assemble_spirv(sa, sv)
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 

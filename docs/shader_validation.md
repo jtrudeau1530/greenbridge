@@ -164,15 +164,44 @@ Setup on Windows, about 800 MB and no admin rights:
   `py -m venv .venv` then `.venv\Scripts\python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm-sdk-core==10.0.0"`;
   `clang.exe` ends up in `.venv\Lib\site-packages\_rocm_sdk_core\lib\llvm\bin`. A `.venv` in the working
   directory or repository is found by itself; otherwise set `LEONIDA_AMD_CLANG` to that `clang.exe`.
-- **Linux/ROCm is not supported yet:** `hw_oracle.c` is Windows-only (it loads the driver's DLL).
+- **Linux** has a launcher of its own, without ROCm: see the next list. `hw_oracle.c` is the Windows one (it loads
+  the driver's DLL).
 - **Host C compiler.** `tools/hw_oracle/hw_oracle.c` is built once into the temp folder by MinGW gcc (on PATH or in
   `C:\msys64`), else by MSVC: a `cl` on PATH (a Developer shell), else the Visual Studio that `vswhere` finds, through
   its `vcvars64.bat`. The Visual Studio the runtime needs is therefore enough. `LEONIDA_HOST_CC` overrides the choice
   (gcc or `cl.exe`). By hand: `gcc -O1 tools/hw_oracle/hw_oracle.c -o hw_oracle.exe` or `cl /O1 tools\hw_oracle\hw_oracle.c`.
 - `LEONIDA_HW_ARCH` overrides the detected architecture (`amdgpu-arch`, else `gfx1150`). GFX10 spellings
   (`s_load_dwordx2`, `global_store_dwordx4`) are used for `gfx10xx`, so the same kernels assemble for an RDNA2 card
-  (checked by assembling for gfx1030 with clang and gfx1013 with `llvm-mc`; not run on one). `gfx12xx` (RDNA4) uses
-  the GFX11 spellings. An architecture outside gfx10, gfx11 and gfx12 is `unavailable` (exit 77), like a missing tool.
+  (checked by assembling for gfx1030 with clang and gfx1013 with `llvm-mc`, and run on gfx1036 on Linux).
+  `gfx12xx` (RDNA4) uses the GFX11 spellings. An architecture outside gfx10, gfx11 and gfx12 is `unavailable`
+  (exit 77), like a missing tool.
+
+Setup on Linux, without ROCm. `tools/hw_oracle/hw_oracle_drm.c` submits each kernel as a raw compute dispatch
+through the kernel driver (`libdrm_amdgpu`), so nothing sits between the instructions and the GPU:
+
+- **GPU.** GFX10 only, which is RDNA1 and RDNA2 (compute engine version 10); the launcher answers anything else
+  with exit 77. Name the render node, for example `LEONIDA_HW_DRM_NODE=/dev/dri/renderD129`
+  (`ls -l /dev/dri/by-path` shows which node is which PCI device). There is no default device, so a raw command
+  stream never goes to a GPU by accident.
+- **Not the GPU you are looking at.** A raw stream bypasses the Vulkan driver, and a kernel that hangs makes the
+  kernel driver reset that GPU. A node with a display connected is refused unless
+  `LEONIDA_HW_DRM_ALLOW_DISPLAY=1`. An integrated GPU next to a discrete card is the convenient case.
+- **Tools.** `clang` with the amdgcn target (the distribution's LLVM has it; `LEONIDA_AMD_CLANG` overrides), `gcc`
+  and the libdrm headers. The launcher is built once into the temp folder. By hand:
+  `gcc -O1 tools/hw_oracle/hw_oracle_drm.c -o hw_oracle_drm $(pkg-config --cflags --libs libdrm_amdgpu)`.
+- **Access.** Your user must be able to open the render node (the `render` or `video` group on most
+  distributions).
+- **The command stream** is libdrm's own compute dispatch test for GFX10 (`amdgpu_test_dispatch_memset`), with what
+  belongs to the kernel put in: its entry point, its group size, and what its kernel descriptor says.
+  - `COMPUTE_PGM_RSRC1`, `COMPUTE_PGM_RSRC2` and the wave size are read out of the descriptor in the assembled
+    object, so the `.amdhsa_*` directives take effect as they do under the HIP runtime: register counts, float
+    rounding and denormal modes, IEEE mode, DX10 clamp. A test checks that an f32 rounding mode set there changes
+    a sum on the hardware.
+  - A descriptor that asks for something the launcher does not provide (LDS, scratch memory, more than the
+    kernarg pointer in the user SGPRs) is refused instead of being run differently.
+  - Every submission gets command memory of its own. While one buffer was rewritten in place, the second kernel of
+    a process ran the first one's commands, every time; `tests/test_hw_oracle.py` runs 300 distinct kernels to
+    catch that.
 
 How it works: each program becomes one kernel (`tools/hw_oracle/asm.py`: load the output pointer, run the program,
 store `v[8:11]`), 500 kernels per code object. The code object needs an `.amdgpu_metadata` block; without it the HIP
@@ -202,7 +231,20 @@ the hardware stops the field at bit 31 (`width = min(width, 32 - offset)`) and s
 control words, including bits 23 to 31 of the control word (ignored), fit that rule exactly. The translator already
 did this (0 of 600 differ), so the reference was the one that was wrong, and it now follows the measured rule. The
 rule rests on that gfx1150 measurement (4000 control words). LLVM's `constantFoldBFE` does the same for the VOP3
-`v_bfe` nodes, but with a 5-bit width, so it is only analogous; RDNA2 is unmeasured.
+`v_bfe` nodes, but with a 5-bit width, so it is only analogous.
+
+Result on RDNA2 (the integrated GPU of a Ryzen 9 7950X3D, Raphael, gfx1036; the Linux launcher, Linux 7.3.5,
+libdrm 2.4.134, clang 23.1.5 from the distribution): 70,000 seeded programs, 0 mismatches.
+
+| Run | Programs | Match | Mismatch | Skipped (two literals) |
+|---|---|---|---|---|
+| seeds 1 to 8 | 40,000 | 39,439 | 0 | 561 |
+| seeds 1 to 4, `--bfe-any` | 20,000 | 19,727 | 0 | 273 |
+| seeds 1 and 2, `--inline64` | 10,000 | 9,855 | 0 | 145 |
+
+So the reference, the `s_bfe_i32` rule above included, holds on RDNA2 as measured, and GFX10's `s_ff0_i32_b32` and
+`s_ff0_i32_b64`, which gfx1150 cannot run, are covered. As a control, a reference whose `s_min_i32` sets SCC for
+equal operands too (`<=` for `<`) gave 2 mismatches in 5,000 programs, minimized to that instruction.
 
 RDNA4 (Radeon RX 9070, gfx1201, driver 26.11.2, `rocm-sdk-core` 10.0.0 clang): 10,000 programs (seeds 1, 2, 3 and
 500, 2000 each, and seed 500 with `--bfe-any`) gave 0 mismatches, so gfx1201 follows the same `s_bfe` rule. With
@@ -296,9 +338,88 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
   under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
   native and emulated) match.
 - **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
-- **Not covered.** The fuzzer does not generate `ds_permute_b32` yet (FUZZ-10); the translator supports it since
-  SHADER-90. The 8-bit d16 reads (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`) are translated since SHADER-85
-  (`cs_w32_lds_u8_d16`) and the fuzzer generates them.
+- **Not in the default mix.** `ds_permute_b32` is generated with `--permute` (below). The 8-bit d16 reads
+  (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`) are translated since SHADER-85 (`cs_w32_lds_u8_d16`) and the
+  fuzzer generates them.
+
+#### Hardware oracle for the LDS programs (`--oracle hw`)
+
+`--oracle hw` runs each program natively on an AMD GPU through `tools/hw_oracle/` (setup: "Hardware oracle" under
+FUZZ-4) and compares every stored word, 16 result registers per thread and all 1,024 LDS dwords, with the model;
+`--oracle translator,hw` does both and prints what the translator did with each program the hardware disagrees
+with. It tests the **model**, not the translator. Without the tools it prints `hardware oracle unavailable: ...` and
+exits 77.
+
+```
+python -I tools/lds_fuzz.py --oracle hw --programs 2000 --seed 1
+python -I tools/lds_fuzz.py --oracle hw --extended --programs 2000 --seed 1 --negative-control
+python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 1,18,20,24 --minimize
+```
+
+- **What runs.** The program's real group size (`--threads 32|64|128|256|mix`: one partial wave, one wave, or several
+  waves joined by `s_barrier`), wave32 and native wave64 (`.amdhsa_wavefront_size32 0`), its EXEC masks (the entry
+  EXEC is saved in `s10` and restored, so a partial wave keeps its missing lanes off), and the LDS size in the
+  kernel descriptor and metadata (`.amdhsa_group_segment_fixed_size`; without it the group gets no LDS). Results go
+  out with `global_store_b32` through the output pointer.
+- **GFX11 spellings** (`hw_oracle/asm.py`, checked by assembling every mnemonic with AMD clang for gfx1030 and
+  gfx1150): `ds_read_*` is `ds_load_*`, `ds_write_*` is `ds_store_*`, `ds_read2[st64]_b32` is
+  `ds_load_2addr[_stride64]_b32`, `ds_write2[st64]_b32` is `ds_store_2addr[_stride64]_b32`, `ds_wrxchg_rtn_b32` is
+  `ds_storexchg_rtn_b32`. The assembler still takes the old names on gfx1150 except `ds_cmpst_rtn_b32`.
+  **`ds_cmpstore_rtn_b32` takes the value to store before the compare value**, the reverse of GFX10's
+  `ds_cmpst_rtn_b32 vdst, vaddr, cmp, store`; llvm-mc encodes both spellings of the same text identically, so only
+  the operand order says which. Unswapped, every program with a `cmpst` failed on gfx1150 (each minimized to that one
+  op); swapped, none does. This is measured on GFX11 only: on gfx12xx the programs with a `cmpst` are skipped with
+  that reason. The model keeps the GFX10 order. Nothing else the generator emits is missing on GFX11, so no other
+  program is skipped for its semantics; an assembler rejection is counted as `rejected`, never as a pass.
+- **Wider op mix**, opt-in so that a seed keeps its programs: `--permute` (`ds_permute_b32`), `--swizzle-exec`
+  (`ds_swizzle_b32` under EXEC masks), `--threads`, `--extended` (all three). `ds_permute_b32` and a masked
+  `ds_swizzle_b32` carry a hypothesis (the model's reading of the ISA text); on the hardware a failing one is a
+  mismatch like any other and counted in `hyp_only`, on the translator it is reported apart as `HYPOTHESIS MISMATCH`.
+  The swizzle hypothesis was falsified at first ("an active lane reads its source lane's register whether or not
+  that lane is on"): gfx1150 returns 0 when the source lane is off in EXEC, as `ds_bpermute` does. The model now
+  says that.
+- **Negative controls.** `--perturb NAME` judges the hardware against a deliberately wrong model (mismatches must
+  appear); `--negative-control` re-judges the words of the run with all 15 (`max_i32` unsigned, `min_u32` signed,
+  swapped `cmpst`, zero-extended `i8`/`i16`, d16 reads clearing the other half, `b16_d16_hi` shift, swapped
+  `write2`, `st64` unit, bpermute reading off lanes or crossing the wave64 halves, reversed quad permute, swapped
+  swizzle or/xor, permute writing no zero) and exits 1 if one goes unnoticed. `--minimize` drops ops while a
+  program still differs, `--keep DIR` writes the native kernel of each mismatch, `--only I,J` runs chosen indices.
+
+Results on a Radeon 880M (gfx1150, RDNA3.5, driver 26.11.2, AMD clang 23.0.0git), `--oracle hw`:
+
+| Programs | Count (wave32 + wave64) | Mismatches |
+| --- | --- | --- |
+| default mix, seeds 1, 2, 3, 11, 21, 31, 41, 100, 200, 2,000 each | 36,000 | 0 |
+| `--extended`, seeds 1, 2, 3, 11, 21, 31, 2,000 each (permute, masked swizzle, groups of 32 to 256) | 24,000 | 0 |
+| seed 1, `--only` the twelve wave32 programs SHADER-105 names (1 18 20 23 24 26 29 30 32 33 34 38) | 12 | 0 |
+
+Negative control (1,000 extended programs): each of the 15 wrong models mismatches on 126 to 547 programs, none goes
+unnoticed. gfx1150 is RDNA3.5,
+not RDNA2: the match supports the model, and RDNA2 itself rests on the ISA text and the translator results on RDNA2
+cards.
+
+With `--oracle translator,hw` on the same Radeon 880M (Vulkan, subgroup 64), seed 1, 100 programs per run: the
+default mix matches the model on the translator, native and emulated (200/200 each). With `--extended` the
+translator differs from the hardware in 22 of 177 programs (native and emulated alike), all in a `ds_swizzle_b32`
+under an EXEC mask whose source lane is off: the translator hands the active lane the source lane's register, the
+hardware gives 0 (the swizzle hypothesis above). So the translator differs from gfx1150 for a masked
+`ds_swizzle_b32` with an off source lane; RDNA2 is unverified. Not fixed here. Partial-wave programs (`--threads` 32
+in wave64) are skipped for the translator, which cannot launch them. NVIDIA was not run.
+
+**Other backends.** The Linux libdrm launcher of #1265 (`tools/hw_oracle/drm.py`) does not run these programs yet:
+it refuses a kernel with LDS and caps the output at 4096 words, and `lds_fuzz` turns that refusal into exit 77
+("unavailable"). RDNA2 results need LDS and a larger word count in that backend first. The numbers above are gfx1150
+only.
+
+**Overlap with #789.** #789 adds `ds_permute_b32` to the default op mix of `lds_fuzz.py`; here it is opt-in
+(`--permute`) so that existing seeds keep their programs. Whichever lands second reconciles the two.
+
+**SHADER-105** (Intel `lds_fuzz` mismatches in DS atomics `max_i32`/`max_u32`, `ds_cmpst`, small reads, and
+registers that kept their initial value): the model matches gfx1150 for every one of those families, under EXEC
+masks, in wave32 and wave64, and in multi-wave groups. The Intel mismatches went away with #820's constant-EXEC fix
+(50/50 native and 100/100 emulated for seeds 1 to 3). `ds_bpermute` (SHADER-31, #253) matches the model on gfx1150
+too, including "an off source lane reads 0" in both wave sizes.
+
 ### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
 
 `cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`
@@ -450,8 +571,13 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   only on both (the generator never uses the `_e64` form, whose GFX10 SDST the assembler no longer takes either);
   `v_mbcnt_*` is VOP3-only on both; `s_ff1_i32_*` is the GFX10 name of GFX11's `s_ctz_i32_*` (an accepted alias);
   `v_readlane_b32` with a lane select of 32 and up in wave32 uses select bits [4:0] on gfx1150 too. Nothing
-  needed a skip, so `hw_skip_reason` returns none and the only skips are assembler rejections (none seen). It is
-  still gfx1150, not RDNA2.
+  needed a skip, so `hw_skip_reason` returns none and the only skips are assembler rejections (none seen). That
+  was gfx1150.
+  On RDNA2 (gfx1036, through the Linux launcher of the FUZZ-4 section): 24,000 programs (seeds 1 to 6) match in
+  both wave sizes, 12,000 each, 6,586 of them `hyp_permlane`; with `--dpp` (seeds 1 and 2) 8,000 more match,
+  972 of them `hyp_dpp`. As a control, `--permlane-fetch-inactive` there mismatches in 239 of 1,000 programs. A
+  GFX10 assembler has no `global_store_b32`, so `asm.raw_kernel_text` puts the GFX10 name (`global_store_dword`)
+  back for `gfx10xx`; nothing else the generator emits needed a change.
   First results (Radeon 880M, driver 26.11.2): 24,000 programs on the hardware, half wave32 and half native
   wave64, seeds 11 to 16 (4,000 programs each), with and without `--dpp`, 12 to 60 ops, with and without
   `--no-maskdata` and `--no-hw-guard`: match 24,000, mismatch 0, hyp_only 0, rejected 0. 7,652 of them contained
@@ -546,13 +672,19 @@ Negative control: `--negative-control` re-judges the same hardware words with a 
 `v_rndne_f32` as floor, `v_min_f32` NaN rule changed); every one produced mismatches (1 to 112 per run; the `v_fma_f32` one only after the `cancel` probes were added, a plain random sweep missed it in seed 2;
 the legacy multiply is the weakest, 1 to 4 in seeds 1 to 6, because `0 * inf` is rare in random programs; the `zero_inf` probes (a zero against inf, NaN or a normal number, DX9 multiply) were added afterwards and catch it at small sizes). The `cancel` probes (seeds 2, 7, 8) give 72 of 72 fused-FMA matches. Seeds 1 to 6 ran without them.
 
-What the hardware answered where the model does not judge (gfx1150; RDNA2 is not measured by these runs):
+On RDNA2 (gfx1036, through the Linux launcher of the FUZZ-4 section, the same seeds 1 to 6): 38,858 programs,
+**28,671 match, 0 mismatch, 56 known deviation**, 4,224 skipped (the four mad opcodes are GFX10.1-only), 3,097
+denormal, 2,810 other not judged. The four MODE settings read back in the kernels as `0x1c0`, `0x1f0`, `0xc0` and
+`0x3c0`, so the float mode of the kernel descriptor reaches the hardware through that launcher as well.
+`--negative-control` catches all six wrong models there (3 to 25 mismatches each).
+
+What the hardware answered where the model does not judge (gfx1150; the RDNA2 run above agrees where it is cited):
 
 - **No model error found.** The model was right wherever it had an answer, in 30,577 programs; the min/max/med3
   rules measured on RDNA2 in #634 (one NaN gives the other operand, both NaN give src0, -0 < +0, med3 with a NaN is min3)
   also hold on gfx1150 for quiet and signalling NaNs with IEEE off.
 - **On gfx1150 output modifiers turn a -0 result into +0** (`mul:2`, `mul:4`, `div:2`; 57 programs, every seed; a flushed
-  denormal result, which is a -0, too). RDNA2 is unmeasured. LLVM notes that omod mishandles signed zeros
+  denormal result, which is a -0, too). RDNA2 does the same: 56 programs in the same seeds on gfx1036. LLVM notes that omod mishandles signed zeros
   (`SIFoldOperands.cpp`) and D30209 describes -0 being forced to +0 before the modifier, which points the same way. The
   model and the translator both keep -0, so on that evidence the translator likely differs from the hardware
   (`translator,hw`: all 6 deviations of 2,000 programs are "matches the model, so it shares the model's answer"). Not
@@ -576,6 +708,81 @@ What the hardware answered where the model does not judge (gfx1150; RDNA2 is not
   mode and op, never `0x7fc00000`. `v_cvt_f16_f32` and `v_cvt_pkrtz_f16_f32` turn a NaN into an f16 NaN with the top 10
   payload bits and the quiet bit set (not the canonical `0x7e00` the model writes; payload not judged, quietness is).
   `v_cvt_f32_f16` keeps the f16 payload shifted left by 13 and does not quiet it (the model agrees).
+
+
+### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
+
+The `16-bit results` row of `docs/design.md` listed `v_exp_f16`/`v_log_f16` and the NaN and denormal operands as
+unverified. f16 has only 65,536 bit patterns, so instead of sampling, this tool runs every one of them through
+`v_exp_f16`, `v_log_f16`, `v_rcp_f16`, `v_rsq_f16`, `v_sqrt_f16`, `v_sin_f16` and `v_cos_f16` on the hardware
+oracle (setup above; exit 77 without it). Each op is 8 raw kernels of 1,024 threads. Each thread computes 8 inputs
+and stores them packed two to a dword, which is 4,096 words per kernel, the launcher's limit. The op runs in wave32
+and wave64 and under five MODEs, and MODE is read back with `s_getreg_b32` first:
+
+| Mode | IEEE | f16 denormals | f16 rounding |
+|---|---|---|---|
+| `keep16` | 0 | kept (3) | nearest |
+| `flush16` | 0 | flushed (0) | nearest |
+| `ieee_keep16` | 1 | kept | nearest |
+| `ieee_flush16` | 1 | flushed | nearest |
+| `keep16_rtz` | 0 | kept | toward zero |
+
+All modes have DX10_CLAMP 1 and f32 denormals flushed.
+
+```
+python -I tools/f16_trans_sweep.py                                  # all ops and modes, about 5 minutes
+python -I tools/f16_trans_sweep.py --ops v_exp_f16 --modes keep16 --json out.json
+python -I tools/f16_trans_sweep.py --self-test                      # the reference, no GPU
+```
+
+The reference is the exact result correctly rounded to f16, computed with `decimal` at 60 digits: for sin/cos that is
+sin/cos(2πx), reduced in turns. That reference is the translator's rule (widen, the GLSL.std.450 function in f32,
+round to nearest even) with an exact f32 function, the best a driver can do. Inputs where the translated SPIR-V is
+undefined are tabulated, not judged. For each mode the tool counts:
+- bit-exact results, 1 ulp and more than 1 ulp;
+- denormal operands that give the hardware's own word for a zero of the same sign, and denormal results written as zero;
+- NaN results, with signalling NaNs kept, quieted or changed.
+
+It also counts the inputs on which each mode differs from `keep16`, and lists the word for 23 special inputs. For
+sin/cos a second table compares the hardware with Sin/Cos of the f32 product 6.2831855 · x, by |x| band.
+
+Result on an RX 6700 XT (gfx1031, Navi 22; the Linux launcher from #1265, Linux 7.3.5, amdgpu, clang 23.1.5).
+wave32 and wave64 gave the same word for every input of every op in every mode. There was no GPU fault, timeout or
+reset in the kernel log.
+
+| Op (`keep16`) | Inputs that are not NaN | Bit-exact | 1 ulp | Undefined in SPIR-V |
+|---|---|---|---|---|
+| `v_exp_f16` | 63,490 | 63,490 | 0 | 0 |
+| `v_log_f16` | 63,490 | 31,744 | 0 | 31,746 (≤ 0) |
+| `v_rcp_f16` | 63,490 | 63,488 | 0 | 2 (±0) |
+| `v_rsq_f16` | 63,490 | 31,744 | 0 | 31,746 (≤ 0) |
+| `v_sqrt_f16` | 63,490 | 31,746 | 0 | 31,744 (< 0, -0 excluded) |
+| `v_sin_f16` | 63,490 | 63,474 | 14 | 2 (±inf) |
+| `v_cos_f16` | 63,490 | 63,484 | 4 | 2 (±inf) |
+
+- **Correctly rounded.** The five non-trigonometric ops never differ from the correctly rounded result. sin/cos differ
+  by 1 ulp on 14 and 4 inputs, all with |x| ≤ 1. For |x| > 1 every result is bit-exact, up to 65,504 turns: the f16
+  ops have no ±256 domain limit.
+- **The f32 product loses the turn.** Against Sin/Cos(f32 6.2831855 · x), which is what the translator computes before
+  #594 is fixed, 16,366 sin and 2,036 cos inputs are more than 1 ulp off, up to 9,944 ulp. Nearly all of them have
+  |x| > 1 (sin: 1,010 inputs at 1 < |x| ≤ 256 and 15,354 above 256). Reducing in turns first, as #1283 and #616
+  propose, is what the hardware does; for f16 the reduction must not stop at ±256.
+- **f16 denormals follow `denorm_mode_16_64`, for operands and results alike.** With 0, a denormal operand gives the
+  word of a zero of its sign (`v_log_f16` -inf, `v_rcp_f16` and `v_rsq_f16` ±inf, `v_sqrt_f16` and `v_sin_f16` ±0).
+  Denormal results become ±0 (831 for `v_exp_f16`, 4,094 for `v_rcp_f16`). With 3, both are kept. The f32
+  transcendentals behave differently: they flush in both modes.
+- **The f16 field of FP_ROUND is ignored.** Under round toward zero every op gives the same word as under round to
+  nearest, on all 65,536 inputs.
+- **IEEE only changes signalling NaNs.** With IEEE 0, all 1,022 f16 signalling NaNs pass through unchanged. With IEEE 1
+  they are quieted (bit 9 set) with payload and sign kept. Quiet NaNs pass through unchanged in every mode. This is the
+  f32 behaviour of the previous section.
+- **Undefined in SPIR-V, defined on the hardware.** log(±0) = -inf; rcp(±0) = ±inf; rsq(+0) = +inf; rsq(-0) = -inf;
+  sqrt(-0) = -0. log, rsq and sqrt of a negative (-inf included), and sin/cos(±inf), give `0xfe00`, the negative quiet
+  NaN (`0xffc00000` in f32).
+- **Controls.** `keep16_rtz` also judges against a round-toward-zero reference, so it shows what a wrong rounding
+  model produces: about half the results 1 ulp off. The kernel layout is checked without a GPU: each of the 65,536
+  inputs is computed once and stored in its own half (`tests/test_f16_trans_sweep.py`). On a GPU the test checks
+  exp2 of integers and wave32 = wave64.
 
 ## Coverage plan and cost
 

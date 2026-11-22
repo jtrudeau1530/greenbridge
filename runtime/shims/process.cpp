@@ -41,29 +41,30 @@ std::atomic<bool> g_exited{false};
 std::atomic<int> g_exit_code{0};
 HANDLE g_done = nullptr;
 
-std::string quote(const std::string& a) {
-    if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
-    std::string out = "\"";
+std::wstring quote(const std::wstring& a) {
+    if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
+    std::wstring out = L"\"";
     size_t slashes = 0;  // CommandLineToArgvW: backslashes are literal unless they precede a quote
-    for (char c : a) {
-        if (c == '\\') {
+    for (wchar_t c : a) {
+        if (c == L'\\') {
             ++slashes;
         } else {
-            if (c == '"') out.append(slashes + 1, '\\');
+            if (c == L'"') out.append(slashes + 1, L'\\');
             slashes = 0;
         }
         out += c;
     }
-    return out.append(slashes, '\\') + "\"";  // a trailing run is doubled before the closing quote
+    return out.append(slashes, L'\\') + L"\"";  // a trailing run is doubled before the closing quote
 }
 
-// The narrow arguments are ANSI code page text (main.cpp passes std::filesystem::path::string(), and the CRT's
-// narrow argv is ACP too); under a UTF-8 activeCodePage CP_ACP is UTF-8 anyway.
-std::wstring widen(const std::string& s) {
-    int n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring w(n > 0 ? n - 1 : 0, L'\0');
-    if (n > 1) MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w.data(), n);
-    return w;
+// The narrow arguments are ANSI code page text, like the CRT's narrow argv; under a UTF-8 activeCodePage CP_ACP is
+// UTF-8 anyway. A character the code page has no mapping for becomes the code page's default character (or a
+// best-fit one), as in the CRT, instead of failing: std::filesystem::path::string() throws there (RT-84).
+std::string narrow(const std::wstring& w) {
+    int n = WideCharToMultiByte(CP_ACP, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, '\0');
+    if (n > 1) WideCharToMultiByte(CP_ACP, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+    return s;
 }
 
 [[noreturn]] void end_run(int code) {
@@ -134,18 +135,18 @@ DWORD WINAPI game_thread(void* p) {
 
 }  // namespace
 
-void set_command_line(const std::string& program, const std::vector<std::string>& args) {
-    g_args.clear();
-    g_args.push_back(program);
-    g_args.insert(g_args.end(), args.begin(), args.end());
+void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args) {
     g_wargs.clear();
-    g_cmdline.clear();
-    for (auto& a : g_args) {
-        g_wargs.push_back(widen(a));
-        if (!g_cmdline.empty()) g_cmdline += ' ';
-        g_cmdline += quote(a);
+    g_wargs.push_back(program);
+    g_wargs.insert(g_wargs.end(), args.begin(), args.end());
+    g_args.clear();
+    g_wcmdline.clear();
+    for (auto& a : g_wargs) {
+        g_args.push_back(narrow(a));
+        if (!g_wcmdline.empty()) g_wcmdline += L' ';
+        g_wcmdline += quote(a);
     }
-    g_wcmdline = widen(g_cmdline);
+    g_cmdline = narrow(g_wcmdline);
     g_argv.clear();
     g_wargv.clear();
     for (auto& a : g_args) g_argv.push_back(a.data());

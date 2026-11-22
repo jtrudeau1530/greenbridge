@@ -591,6 +591,18 @@ int main() {
             return fail("Adapter desc did not match Vulkan physical device");
         if (desc1.DedicatedVideoMemory + desc1.SharedSystemMemory == 0)
             return fail("Adapter reported zero total memory");
+        if (const auto get_mem = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+                gipa(instance, "vkGetPhysicalDeviceMemoryProperties"))) {
+            VkPhysicalDeviceMemoryProperties mem{};
+            get_mem(physical, &mem);
+            VkDeviceSize max_local = 0;
+            for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+                if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mem.memoryHeaps[i].size > max_local)
+                    max_local = mem.memoryHeaps[i].size;
+            }
+            if (desc1.DedicatedVideoMemory != static_cast<SIZE_T>(max_local))
+                return fail("DedicatedVideoMemory should match the primary DEVICE_LOCAL heap (without double-counting BAR1)");
+        }
         if (desc0.VendorId != desc1.VendorId || desc2.DeviceId != desc1.DeviceId)
             return fail("Adapter desc mismatch between GetDesc/GetDesc1/GetDesc2");
 
@@ -605,7 +617,10 @@ int main() {
         if (factory->EnumAdapterByLuid(bogus, IID_PPV_ARGS(&by_luid)) != DXGI_ERROR_NOT_FOUND || by_luid != nullptr)
             return fail("EnumAdapterByLuid(bogus) should return DXGI_ERROR_NOT_FOUND");
 
-        // QueryVideoMemoryInfo + SetVideoMemoryReservation.
+        // QueryVideoMemoryInfo + SetVideoMemoryReservation (shared across distinct handles for the same LUID).
+        IDXGIAdapter3* by_luid_b = nullptr;
+        if (FAILED(factory->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&by_luid_b))) || !by_luid_b)
+            return fail("EnumAdapterByLuid(second handle) failed");
         DXGI_QUERY_VIDEO_MEMORY_INFO local_info{};
         if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info)) ||
             local_info.Budget == 0)
@@ -614,10 +629,25 @@ int main() {
             return fail("SetVideoMemoryReservation(LOCAL) failed");
         if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info)) ||
             local_info.CurrentReservation != 64u * 1024u * 1024u)
-            return fail("SetVideoMemoryReservation did not reflect in QueryVideoMemoryInfo");
+            return fail("SetVideoMemoryReservation did not reflect on handle A");
+        DXGI_QUERY_VIDEO_MEMORY_INFO local_info_b{};
+        if (FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info_b)) ||
+            local_info_b.CurrentReservation != 64u * 1024u * 1024u)
+            return fail("SetVideoMemoryReservation(LOCAL) did not reflect across second IDXGIAdapter3 handle");
+
         DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info{};
-        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info)))
-            return fail("QueryVideoMemoryInfo(NON_LOCAL) failed");
+        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, 32u * 1024u * 1024u)) ||
+            FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info)) ||
+            nonlocal_info.CurrentReservation != 32u * 1024u * 1024u)
+            return fail("SetVideoMemoryReservation(NON_LOCAL) did not reflect across second IDXGIAdapter3 handle");
+        // Restore reservations to 0 and verify both handles see 0.
+        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, 0)) ||
+            FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, 0)) ||
+            FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info_b)) ||
+            local_info_b.CurrentReservation != 0)
+            return fail("Restoring SetVideoMemoryReservation to 0 failed");
+        by_luid_b->Release();
+
         if (adapter3->QueryVideoMemoryInfo(1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info) != E_INVALIDARG ||
             adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, nullptr) != E_INVALIDARG)
             return fail("QueryVideoMemoryInfo invalid args should return E_INVALIDARG");
@@ -673,6 +703,62 @@ int main() {
                          cr.bottom);
             return 1;
         }
+    }
+
+    // IDXGIFactory5::CheckFeatureSupport, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, and waitable frame-latency swapchains.
+    {
+        IDXGIFactory5* factory5 = nullptr;
+        if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory5))) || !factory5)
+            return fail("QueryInterface(IDXGIFactory5) failed");
+        BOOL allow_tearing = FALSE;
+        if (FAILED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
+                                                 sizeof(allow_tearing))) ||
+            !allow_tearing)
+            return fail("IDXGIFactory5::CheckFeatureSupport(ALLOW_TEARING) failed");
+        if (factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, nullptr, sizeof(BOOL)) != E_INVALIDARG ||
+            factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, 2) != E_INVALIDARG)
+            return fail("CheckFeatureSupport should reject null data or wrong size with E_INVALIDARG");
+        factory5->Release();
+
+        // Non-waitable, non-tearing swapchain: GetFrameLatencyWaitableObject is null and ALLOW_TEARING is rejected.
+        if (sc->GetFrameLatencyWaitableObject() != nullptr)
+            return fail("Non-waitable swapchain should return nullptr from GetFrameLatencyWaitableObject");
+        if (sc->Present(0, DXGI_PRESENT_ALLOW_TEARING) != DXGI_ERROR_INVALID_CALL)
+            return fail("Present(ALLOW_TEARING) on non-tearing swapchain should return DXGI_ERROR_INVALID_CALL");
+
+        HWND hwnd3 = create_test_window(128, 96);
+        if (!hwnd3) return fail("CreateWindowExW (third)");
+        DXGI_SWAP_CHAIN_DESC1 wdesc = scd;
+        wdesc.Width = 128;
+        wdesc.Height = 96;
+        wdesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;  // also tests presenting an untouched offscreen backbuffer
+        wdesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        IDXGISwapChain1* wsc1 = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd3, &wdesc, nullptr, nullptr, &wsc1)) || !wsc1)
+            return fail("CreateSwapChainForHwnd (tearing + waitable)");
+        IDXGISwapChain3* wsc = nullptr;
+        if (FAILED(wsc1->QueryInterface(IID_PPV_ARGS(&wsc))) || !wsc) return fail("QI IDXGISwapChain3 (waitable)");
+        wsc1->Release();
+
+        DXGI_SWAP_CHAIN_DESC1 got_desc{};
+        if (FAILED(wsc->GetDesc1(&got_desc)) || got_desc.Flags != wdesc.Flags)
+            return fail("Waitable swapchain GetDesc1 did not preserve Flags");
+        UINT lat = 0;
+        if (FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 1)
+            return fail("Waitable swapchain default GetMaximumFrameLatency should be 1");
+        HANDLE waitable = wsc->GetFrameLatencyWaitableObject();
+        if (!waitable) return fail("Waitable swapchain returned null handle");
+        if (WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
+            return fail("Initial WaitForSingleObject on waitable swapchain failed");
+        if (wsc->Present(1, DXGI_PRESENT_ALLOW_TEARING) != DXGI_ERROR_INVALID_CALL)
+            return fail("Present(1, ALLOW_TEARING) should return DXGI_ERROR_INVALID_CALL");
+        if (FAILED(wsc->Present(0, DXGI_PRESENT_ALLOW_TEARING)))
+            return fail("Present(0, ALLOW_TEARING) on untouched 10-bit offscreen swapchain failed");
+        if (WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
+            return fail("Post-Present WaitForSingleObject on waitable swapchain failed");
+        CloseHandle(waitable);
+        wsc->Release();
+        DestroyWindow(hwnd3);
     }
 
     rtv_heap->Release();

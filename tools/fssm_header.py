@@ -9,8 +9,9 @@ table of 8-byte input records starts at offset 0x138.  A record is present while
     byte 3      running index (same semantic id, next index)
     bytes 4-5   unused here
     byte 6      parameter slot
-    byte 7      flags; bits 0-1 the interpolation mode (1 = constant/flat, 2 = linear, i.e.
-                perspective-correct at the pixel centre), bit 4 (0x10) marks a 16-bit interpolant
+    byte 7      flags, the read method: bit 0 (0x01) read through v_interp_mov_f32 (flat),
+                bit 1 (0x02) through v_interp_p1/p2 or the f16 forms (interpolated), bit 3
+                (0x08) a Float16-typed parameter (#1256), bit 4 (0x10) a 16-bit interpolant
 
 The record's position in the table is the `v_interp attr<N>` number the code uses, not byte 6 - 1.
 
@@ -32,15 +33,13 @@ opcodes in 12,067/12,101 (99.7%).  `rdna2spirv.py` consumes it in the PS input p
 every table position declared as a fragment input, 16-bit-flagged positions
 rounded f32->f16->f32 on 32-bit reads).
 
-Interpolation mode (SHADER-181).  On the same corpus the mode bits are 2 in 51,191 records and 1 in
-4,600; 0 and 3 never occur.  They agree with the code in all 12,101 PS: every position with mode 1
-is read only by `v_interp_mov_f32` (4,295 read positions), every position with mode 2 only by
-`v_interp_p1/p2` or the f16 forms (49,594), and no position is read both ways.  On the DXBC side
-PSV0's per-input InterpolationMode is `linear` (79,577 inputs) or `constant` (6,333) for every PS
-attribute; no centroid, sample or noperspective attribute exists, and ISG1 has no mode field.  The
-FSSM stores no SPI_PS_INPUT_ENA/ADDR word: no header field, code-section header or tail record
-tracks the enabled inputs.  Bit 3 (0x08) is set in 11,619 records, always with mode 1 or 2; its
-meaning is not identified.
+Read method (SHADER-181).  Bits 0-1 say how the compiled code reads each input, not the D3D
+interpolation mode (that is PSV0's, decoded by `tools/ps_interp_modes.py`, #1256).  On the same
+corpus exactly one of the two is set: bit 1 in 51,191 records, bit 0 in 4,600, neither or both in
+none.  They agree with the code in all 12,101 PS: every bit-0 position the code reads is read only
+by `v_interp_mov_f32` (4,295 read positions), every bit-1 position only by `v_interp_p1/p2` or the
+f16 forms (49,594), and no position is read both ways.  The FSSM stores no SPI_PS_INPUT_ENA/ADDR
+word.  Bit 3 (0x08) is set in 11,619 records.
 
 The post-`code_end` tail carries a binding table.  After 16 bytes of `0xBF9F0000` filler and an
 8-byte header, 20-byte records run until a `0xFFFFFFFF` sentinel; then `u32 0`, `u16 0`, `u16`
@@ -65,10 +64,10 @@ TABLE_OFFSET = 0x138
 RECORD_SIZE = 8
 RECORD_KIND = 6
 FLAG_FP16 = 0x10
-MODE_MASK = 0x03
-MODE_FLAT = 1
-MODE_LINEAR = 2
-MODE_NAMES = {MODE_FLAT: "flat", MODE_LINEAR: "linear"}
+READ_MASK = 0x03
+READ_MOV = 0x01      # v_interp_mov_f32: flat
+READ_INTERP = 0x02   # v_interp_p1/p2 and the f16 forms: interpolated with the v0/v1 pair
+READ_NAMES = {READ_MOV: "mov", READ_INTERP: "interp"}
 DIRECTORY_OFFSET = 0x120
 DIRECTORY_SIZE = 0x12C
 DIRECTORY_NEXT = 0x130
@@ -123,18 +122,18 @@ def interpolants(blob):
     return len(inputs), mask
 
 
-def interpolation_modes(blob):
-    """Return the interpolation mode (flags bits 0-1) of each pixel input, in table order.
+def read_methods(blob):
+    """Return the read method (flags bits 0-1) of each pixel input, in table order.
 
-    MODE_FLAT (1) is a constant input read through v_interp_mov; MODE_LINEAR (2) is interpolated
-    perspective-correct at the pixel centre through v_interp_p1/p2.  0 and 3 never occur in the
-    corpus and have no known meaning.
+    READ_MOV (1): read through v_interp_mov_f32, a flat input.  READ_INTERP (2): read through
+    v_interp_p1/p2 or the f16 forms, interpolated with the v0/v1 pair.  0 and 3 (neither or both
+    bits) never occur in the corpus.
     """
-    return [entry["flags"] & MODE_MASK for entry in pixel_inputs(blob)]
+    return [entry["flags"] & READ_MASK for entry in pixel_inputs(blob)]
 
 
-def mode_name(mode):
-    return MODE_NAMES.get(mode, f"mode{mode}")
+def read_name(method):
+    return READ_NAMES.get(method, f"read{method}")
 
 
 def directory_ok(blob):
@@ -266,7 +265,7 @@ def tally(rows, stages_known):
         # and must not show up as a 0:N bucket in the reported corpus counts.
         counts = Counter(row["entries"] for row in ps)
         scope = "all"
-    modes = Counter(mode_name(entry["flags"] & MODE_MASK) for row in ps for entry in row["inputs"])
+    methods = Counter(read_name(entry["flags"] & READ_MASK) for row in ps for entry in row["inputs"])
     return {
         "files": len(rows),
         "directory_ok": sum(row["directory_ok"] for row in rows),
@@ -274,7 +273,7 @@ def tally(rows, stages_known):
         "entries": sum(row["entries"] for row in ps),
         "entry_counts": dict(sorted(counts.items())),
         "entry_counts_scope": scope,
-        "modes": dict(sorted(modes.items())),
+        "read_methods": dict(sorted(methods.items())),
         "stage_source": "index.json" if stages_known else "table-only",
     }
 
@@ -335,8 +334,8 @@ def main(argv=None):
     total = summary
     print(f"{total['files']} files, directory_ok {total['directory_ok']}, "
           f"PS with table {total['ps_with_table']}, entries {total['entries']}")
-    if total["modes"]:
-        print("interpolation modes: " + ", ".join(f"{k}:{v}" for k, v in total["modes"].items()))
+    if total["read_methods"]:
+        print("read methods: " + ", ".join(f"{k}:{v}" for k, v in total["read_methods"].items()))
     label = "PS entry counts" if total["entry_counts_scope"] == "ps" else "entry counts"
     print(label + ": " + ", ".join(f"{k}:{v}" for k, v in total["entry_counts"].items()))
     if total["stage_source"] == "table-only":

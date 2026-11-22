@@ -89,6 +89,7 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
           ("cs_dpp8", [7, 6, 5, 4, 3, 2, 1, 0]),
           ("cs_dpp_ops", [100, 10, 11, 12, 13, 14, 15, 16]),
+          ("cs_dpp_bound", [10, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
           ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
@@ -136,6 +137,20 @@ CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
+# cs_fmt_xy_xyz.asm (TEST-185): 12 xy/xyz loads, then the 9 store regions read back, as a Radeon 680M (gfx1035) gives
+# them natively. Layout and rules in the .asm header.
+FMT_XY_XYZ_WORDS = [
+    0x3F800000, 0x40000000, 0x5A5A0008, 0x5A5A000C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A001C,
+    0x3F800000, 0x40000000, 0x5A5A0028, 0x5A5A002C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A003C,
+    0x3F800000, 0x40000000, 0x3F800000, 0x5A5A004C, 0x3F800000, 0x3F800000, 0x5A5A0058, 0x5A5A005C,
+    0x3F800000, 0x40000000, 0x5A5A0068, 0x5A5A006C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A007C,
+    0x00000000, 0x00000000, 0x5A5A0088, 0x5A5A008C, 0x00000000, 0x00000000, 0x00000000, 0x5A5A009C,
+    0x3F800000, 0x40000000, 0x5A5A00A8, 0x5A5A00AC, 0x00000000, 0x00000000, 0x00000000, 0x5A5A00BC,
+    0x3F800000, 0x40000000, 0x00000000, 0x00000000, 0x3F800000, 0x40000000, 0x40400000, 0x00000000,
+    0x40003C00, 0x00000000, 0xA5A50268, 0xA5A5026C, 0x40003C00, 0x00004200, 0xA5A50278, 0xA5A5027C,
+    0x3F800000, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0x0000FFFF, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
+    0x00030201, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
+    0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
@@ -174,7 +189,9 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_lds_raw", [132, 137, 100, 108, 131, 101, 149, 118]),
               ("cs_w64x_lds_war", [1032, 1063, 1000, 1031, 2032, 2063, 2000, 2031]),
               ("cs_w64x_sbarrier", [605, 605, 686, 686, 3032, 3013, 3032, 3031]),         # 128-thread group
-              ("cs_w64x_load_ballot_load", [43, 74, 75, 42, 42, 18, 41, 32])]
+              ("cs_w64x_load_ballot_load", [43, 74, 75, 42, 42, 18, 41, 32]),
+              # s_andn2_saveexec_b64 / s_andn2_wrexec_b64: EXEC = S0 & ~EXEC over both halves, D old / new EXEC, SCC
+              ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
@@ -204,7 +221,14 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
-              "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000)}
+              "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
+              # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
+              "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
+              "ps_cvt_off": (0xbf000000, 0x3ee00000, 0xbe800000, 0x3f800000),
+              "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
+              "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
+              "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
+              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
@@ -223,7 +247,8 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
-PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack"}
+PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
+                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 GATHER_LOD_TEST = "ps_gather_sampler_lod"
@@ -263,12 +288,13 @@ def gpu_test_timeout():
     text = (os.environ.get("LEONIDA_GPU_TEST_TIMEOUT") or "").strip()
     if not text:
         return DEFAULT_GPU_TEST_TIMEOUT
+    error = f"LEONIDA_GPU_TEST_TIMEOUT must be a finite number of seconds (0 = no limit), not {text!r}"
     try:
         limit = float(text)
     except ValueError:
-        sys.exit(f"LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not {text!r}")
-    if math.isnan(limit):
-        sys.exit("LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not nan")
+        sys.exit(error)
+    if not math.isfinite(limit):
+        sys.exit(error)
     return None if limit <= 0 else limit
 
 
@@ -284,11 +310,12 @@ def run(*cmd, env=None):
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:
-        if not isinstance(e, FileNotFoundError):
-            return 1, start_failure(cmd[0], e)
-        tools = os.path.abspath(os.path.dirname(cmd[0]))
-        missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
-        sys.exit(not_found_message(tools, missing))
+        if isinstance(e, FileNotFoundError):
+            tools = os.path.abspath(os.path.dirname(cmd[0]))
+            missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
+            if missing:
+                sys.exit(not_found_message(tools, missing))
+        return 1, start_failure(cmd[0], e)
     return r.returncode, r.stdout + r.stderr
 
 
@@ -297,26 +324,37 @@ def failure(code, output, lines):
     return f"exit {code}: {details or 'no test output'}"
 
 
-def fmt_1010102_test(tools, spirv, env=None):
-    """Check both packed stores and the untouched tail. The console dump stops at word 7."""
-    want = FMT_1010102_WORDS + [0xEEEEEEEE] * 48
+def dump_test(tools, spirv, name, want, words, env=None):
+    """Run one group with a heap of `words` words and compare the first len(want) words of the whole dump. The
+    console dump stops at word 7."""
     with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
         dump = Path(tmp) / "out.bin"
-        # VKC_OUT_WORDS sets a minimum. Pin this dispatch to a single group's 64 words.
-        child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS="64")
-        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, "cs_fmt_1010102.spv"),
+        # VKC_OUT_WORDS sets a minimum. Pin this dispatch to exactly `words` words.
+        child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS=str(words))
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"),
                         "1", "dump", env=child)
         if code:
             return failure(code, out, 3)
         if not dump.is_file():
             return "no VKC_DUMP file written"
         data = dump.read_bytes()
-    if len(data) != 4 * len(want):
-        return f"expected {4 * len(want)} dump bytes, got {len(data)}"
-    for i, (expected, got) in enumerate(zip(want, struct.unpack("<64I", data))):
+    if len(data) != 4 * words:
+        return f"expected {4 * words} dump bytes, got {len(data)}"
+    for i, (expected, got) in enumerate(zip(want, struct.unpack(f"<{words}I", data))):
         if got != expected:
             return f"word {i}: expected {expected:#010x}, got {got:#010x}"
     return ""
+
+
+def fmt_1010102_test(tools, spirv, env=None):
+    """Check both packed stores and the untouched tail of a single group's 64 words."""
+    return dump_test(tools, spirv, "cs_fmt_1010102", FMT_1010102_WORDS + [0xEEEEEEEE] * 48, 64, env)
+
+
+def fmt_xy_xyz_test(tools, spirv, env=None):
+    """TEST-185: the 84 result words and the untouched words after them, up to the inputs at 0x200. The heap needs
+    0x2d0 bytes, so it is 192 words."""
+    return dump_test(tools, spirv, "cs_fmt_xy_xyz", FMT_XY_XYZ_WORDS + [0xEEEEEEEE] * 44, 192, env)
 
 
 class Skip(str):
@@ -427,6 +465,22 @@ def unpinned_subgroup_skip(out):
 def wave32_lane_skip(out):
     """The skip rule for WAVE32_LANE_DUMPS, shared with run_gpu_tests.py."""
     return narrow_subgroup_skip(out) or unpinned_subgroup_skip(out)
+
+
+def bitmask_perm_narrow_skip(out, px):
+    """A Skip when ps_bitmask_perm ran narrower than 32 lanes on a device whose subgroup range permits it (#618).
+    Requires every lane 0..width-1 of a power-of-two width in [min, 32), so a broken v_mbcnt still fails."""
+    m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
+    if not m or len(px) != 64 * 64:
+        return None
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if lo >= 32:
+        return None
+    lanes = {p[0] for p in px}
+    width = max(lanes) + 1
+    if lo <= width < 32 and width & (width - 1) == 0 and lanes == set(range(width)):
+        return Skip(f"SKIP (fragment subgroup ran at {width} lanes on {lo}..{hi} device; needs 32)")
+    return None
 
 
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
@@ -785,6 +839,8 @@ def pixel_test(tools, spirv, name):
     if name == "ps_interp_f16_high":
         return interp_f16_high_problem(px)
     if name == "ps_bitmask_perm":
+        if skip := bitmask_perm_narrow_skip(out, px):
+            return skip
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"
@@ -848,6 +904,7 @@ def main():
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
+    results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",

@@ -634,6 +634,23 @@ class NavmeshDecodeTest(unittest.TestCase):
             with open(out_csv, newline="", encoding="utf-8") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 1)
 
+    def test_cli_refuses_to_overwrite_its_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_0drp())
+            with open(archive, "rb") as f:
+                original = f.read()
+            for flag in ("--out", "--csv"):
+                result = subprocess.run(
+                    [sys.executable, "-I", TOOL, archive, flag, archive, "--quiet"],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite the input", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                with open(archive, "rb") as f:
+                    self.assertEqual(f.read(), original, f"{flag} touched the input")
+
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty.rpf")
