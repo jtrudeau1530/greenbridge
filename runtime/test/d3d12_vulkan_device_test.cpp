@@ -2972,6 +2972,14 @@ bool host_ray_tracing(ID3D12Device* host) {
            o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
 }
 
+// A host runtime newer than Windows 10's, whose argument rules the layer follows. Windows 10's (no ID3D12Device10)
+// still checks a buffer's initial state and refuses a HARDWARE_PROTECTED heap, so those cases have nothing to match
+// there (measured on Windows 10 22H2 build 19045.5737).
+bool host_device10(ID3D12Device* host) {
+    Ref<ID3D12Device10> newer;
+    return SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&newer.p)));
+}
+
 int compare_invalid_arguments(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
@@ -3089,13 +3097,15 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"committed: texture in RESOLVE_DEST state", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_RESOLVE_DEST);
          }},
+        // A buffer's initial state: Windows 10's runtime (no ID3D12Device10) refuses these two, newer ones accept
+        // them, as the layer does.
         {"committed: buffer in state 0x80000000", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, buffer_desc(256), D3D12_RESOURCE_STATES(0x80000000u));
-         }},
+         }, +device10},
         {"committed: buffer in RENDER_TARGET | UNORDERED_ACCESS state", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, buffer_desc(256),
                               D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-         }},
+         }, +device10},
         {"committed: buffer in RAYTRACING_ACCELERATION_STRUCTURE state", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, buffer_desc(256),
                               D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
@@ -4069,6 +4079,7 @@ int compare_heap_neighbours(ID3D12Device* ours) {
     struct Case {
         const char* name;
         InvalidCase call;
+        bool (*comparable)(ID3D12Device*) = nullptr;
     };
     static const Case cases[] = {
         {"heap: alignment 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0)); }},
@@ -4095,15 +4106,20 @@ int compare_heap_neighbours(ID3D12Device* ours) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
          }},
         // The D3D12_HEAP_FLAGS documentation calls it unsupported, but the host accepts it (RTX 4070 SUPER and
-        // UHD 770, @CowBoYdu76).
+        // UHD 770, @CowBoYdu76). Windows 10's runtime refuses it, as it refuses the committed case above.
         {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
-         }},
+         }, host_device10},
     };
     int mismatches = 0;
     for (const Case& c : cases) {
         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
         if (a == b) continue;
+        if (c.comparable && !c.comparable(host.p)) {
+            std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
+                        a, b);
+            continue;
+        }
         ++mismatches;
         std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
     }
@@ -4334,7 +4350,7 @@ int compare_placed_reserved(ID3D12Device* ours) {
              a.heap.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
              a.state = D3D12_RESOURCE_STATE_COPY_DEST;
              return placed(d, buffer_desc(256), a);
-         }},
+         }, host_device10},
         {"placed: upload buffer with ALLOW_UNORDERED_ACCESS", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -4354,12 +4370,12 @@ int compare_placed_reserved(ID3D12Device* ours) {
              a.heap.Properties.Type = D3D12_HEAP_TYPE_READBACK;
              a.state = D3D12_RESOURCE_STATE_GENERIC_READ;
              return placed(d, buffer_desc(256), a);
-         }},
+         }, host_device10},
         {"placed: default buffer in state 0x80000000", [](ID3D12Device* d) {
              PlacedArgs a;
              a.state = D3D12_RESOURCE_STATES(0x80000000u);
              return placed(d, buffer_desc(256), a);
-         }},
+         }, host_device10},
         {"placed: depth texture in DEPTH_WRITE", [](ID3D12Device* d) {
              PlacedArgs a;
              a.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
@@ -4455,7 +4471,7 @@ int compare_placed_reserved(ID3D12Device* ours) {
          }},
         {"reserved: buffer in state 0x80000000", [](ID3D12Device* d) {
              return reserved(d, buffer_desc(64 * 1024), D3D12_RESOURCE_STATES(0x80000000u));
-         }},
+         }, host_device10},
         {"reserved: texture", [](ID3D12Device* d) {
              return reserved(d, tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)));
          }},
