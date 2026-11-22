@@ -1527,7 +1527,14 @@ int main() {
             lod_keys[i].first = i * texels;
         }
         EXPECT(sample_through_set(d, set0, set0_layout, lod_keys, lod_pixels.data()));
-        std::array<UINT, std::size(lod_views)> lod_errors{};
+        // A fractional image-view minimum LOD is not exact on every driver: Vulkan defines the view's minimum as
+        // minLodFloat (preferred) or minLodInteger = floor(minLodFloat) (alternative), and an implementation may use
+        // either (Vulkan spec, "Image Level(s) Selection" and VkImageViewMinLodCreateInfoEXT). The UHD 770 floors it.
+        // So a view with a fractional clamp inside its mip range passes if all of its texels follow one of the two
+        // rules; the rest of the views have one answer either way.
+        std::array<UINT, std::size(lod_views)> lod_errors{}, lod_errors_floored{};
+        std::array<bool, std::size(lod_views)> lod_fractional{};
+        char lod_first[std::size(lod_views)][160]{};
         for (UINT i = 0; i < texels; ++i) {
             using Pixel = std::array<std::uint8_t, 4>;
             const Pixel expected[] = {
@@ -1536,18 +1543,34 @@ int main() {
                 d.image_view_min_lod ? mip_colors[1] : Pixel{},
                 {}, mip_colors[0], {0, 0, 0, 255}
             };
+            // The same views with the minimum floored where the extension is used (views 1 and 2: 0.75 -> 0, 1.75 -> 1).
+            const Pixel floored[] = {
+                expected[0], d.image_view_min_lod ? texel(i % size, i / size) : Pixel{},
+                d.image_view_min_lod ? mip_colors[0] : Pixel{}, expected[3], expected[4], expected[5]
+            };
             static_assert(std::size(expected) == std::size(lod_views));
+            lod_fractional[1] = lod_fractional[2] = d.image_view_min_lod;
             for (UINT view = 0; view < std::size(lod_views); ++view) {
                 const auto* sample = &lod_pixels[view * bytes + 4 * i];
+                if (std::memcmp(sample, floored[view].data(), 4)) ++lod_errors_floored[view];
                 if (std::memcmp(sample, expected[view].data(), 4) && lod_errors[view]++ == 0) {
-                    std::fprintf(stderr, "minimum LOD view %u texel %u: got %u %u %u %u, expected %u %u %u %u\n",
-                                 view, i, sample[0], sample[1], sample[2], sample[3],
-                                 expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
+                    std::snprintf(lod_first[view], sizeof(lod_first[view]),
+                                  "minimum LOD view %u texel %u: got %u %u %u %u, expected %u %u %u %u\n", view, i,
+                                  sample[0], sample[1], sample[2], sample[3], expected[view][0], expected[view][1],
+                                  expected[view][2], expected[view][3]);
                 }
             }
         }
         for (UINT view = 0; view < lod_errors.size(); ++view) {
-            if (lod_errors[view]) std::fprintf(stderr, "2D LOD view %u: %u/%u mismatched\n", view, lod_errors[view], texels);
+            if (lod_fractional[view] && lod_errors[view] && !lod_errors_floored[view]) {
+                std::printf("2D LOD view %u: the driver floors the fractional minimum LOD (%.2f), as Vulkan allows\n",
+                            view, lod_views[view].clamp);
+                lod_errors[view] = 0;
+            }
+            if (lod_errors[view]) {
+                std::fputs(lod_first[view], stderr);
+                std::fprintf(stderr, "2D LOD view %u: %u/%u mismatched\n", view, lod_errors[view], texels);
+            }
             lod_mismatches += lod_errors[view];
         }
 
@@ -1559,26 +1582,37 @@ int main() {
         }
         std::array<std::uint8_t, std::size(array_keys) * bytes> array_pixels{};
         EXPECT(sample_through_set(d, set0, set0_layout, array_keys, array_pixels.data()));
-        std::array<UINT, std::size(array_clamps)> array_errors{};
+        std::array<UINT, std::size(array_clamps)> array_errors{}, array_errors_floored{};
+        char array_first[std::size(array_clamps)][160]{};
         for (UINT i = 0; i < texels; ++i) {
             const UINT layer = 1 + i / 32;
             const std::array<std::uint8_t, 4> zero{};
             const auto mip2 = d.image_view_min_lod ? array_color(layer, 2) : zero;
             const std::array expected{array_color(layer, 1), mip2, mip2, zero};
+            // View 1 (minimum 1.75) floors to mip 1 where the driver uses minLodInteger; see the 2D views above.
+            const std::array floored{array_color(layer, 1), d.image_view_min_lod ? array_color(layer, 1) : zero, mip2, zero};
             static_assert(expected.size() == std::size(array_clamps));
             for (UINT view = 0; view < expected.size(); ++view) {
                 const auto* got = array_pixels.data() + view * bytes + i * 4;
+                if (std::memcmp(got, floored[view].data(), 4)) ++array_errors_floored[view];
                 if (std::memcmp(got, expected[view].data(), 4) && array_errors[view]++ == 0) {
-                    std::fprintf(stderr, "array LOD %.2f, layer %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
-                                 array_clamps[view], layer, got[0], got[1], got[2], got[3],
-                                 expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
+                    std::snprintf(array_first[view], sizeof(array_first[view]),
+                                  "array LOD %.2f, layer %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
+                                  array_clamps[view], layer, got[0], got[1], got[2], got[3], expected[view][0],
+                                  expected[view][1], expected[view][2], expected[view][3]);
                 }
             }
         }
+        if (d.image_view_min_lod && array_errors[1] && !array_errors_floored[1]) {
+            std::printf("array LOD %.2f: the driver floors the fractional minimum LOD, as Vulkan allows\n", array_clamps[1]);
+            array_errors[1] = 0;
+        }
         UINT array_mismatches = 0;
         for (UINT view = 0; view < array_errors.size(); ++view) {
-            if (array_errors[view]) std::fprintf(stderr, "array LOD %.2f: %u/%u mismatched\n",
-                                                array_clamps[view], array_errors[view], texels);
+            if (array_errors[view]) {
+                std::fputs(array_first[view], stderr);
+                std::fprintf(stderr, "array LOD %.2f: %u/%u mismatched\n", array_clamps[view], array_errors[view], texels);
+            }
             array_mismatches += array_errors[view];
         }
         lod_mismatches += array_mismatches;
