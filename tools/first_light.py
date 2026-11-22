@@ -72,13 +72,14 @@ def ensure_carve(game: str, work: str) -> str:
 def choose(index_path: str, vs: str, ps: str) -> list[dict]:
     with open(index_path, encoding="utf-8") as f:
         entries = json.load(f)
-    by_name = {e["name"]: e for e in entries}
-    missing = [n for n in (vs, ps) if n not in by_name]
+    by_stage_and_name = {(entry["stage"], entry["name"]): entry for entry in entries}
+    requested = (("vs", vs), ("ps", ps))
+    missing = [f"{stage} {name}" for stage, name in requested if (stage, name) not in by_stage_and_name]
     if missing:
         raise SystemExit(
             f"shader not in the carve index: {', '.join(missing)} (use --list)"
         )
-    return [by_name[vs], by_name[ps]]
+    return [by_stage_and_name[key] for key in requested]
 
 
 def translate(work: str, picked: list[dict]) -> dict:
@@ -121,12 +122,10 @@ def translate(work: str, picked: list[dict]) -> dict:
         meta = json.load(f)
     result = {}
     for entry in picked:
-        key = entry["name"]
-        item = meta.get(key)
-        if item is None:  # a duplicate name gets a ~1 suffix
-            item = next((v for k, v in meta.items() if k.startswith(key)), None)
+        stem = os.path.splitext(entry["file"])[0]
+        item = meta.get(stem)
         if item is None or item.get("stage") != entry["stage"]:
-            raise SystemExit(f"translator has no {entry['stage']} result for {key}")
+            raise SystemExit(f"translator has no {entry['stage']} result for {stem}")
         result[entry["stage"]] = item
     return result
 
@@ -454,14 +453,13 @@ def main(argv=None) -> int:
     picked = choose(index, a.vs, a.ps)
     meta = translate(work, picked)
     os.makedirs(out_dir, exist_ok=True)
-    shutil.copy(
-        os.path.join(work, "first_light", "spirv", f"{picked[0]['name']}.spv"),
-        os.path.join(out_dir, "vs.spv"),
-    )
-    shutil.copy(
-        os.path.join(work, "first_light", "spirv", f"{picked[1]['name']}.spv"),
-        os.path.join(out_dir, "ps.spv"),
-    )
+    for entry in picked:
+        stem = os.path.splitext(entry["file"])[0]
+        stage = entry["stage"]
+        shutil.copy(
+            os.path.join(work, "first_light", "spirv", f"{stem}.spv"),
+            os.path.join(out_dir, f"{stage}.spv"),
+        )
     vertices, indices = read_obj(a.obj) if a.obj else ([], [])
     obj_sha256 = None
     if a.obj:

@@ -11,17 +11,23 @@ all-opaque and swapped-UV negatives stay red.
 The image is written to the directory as image_first_light.raw/.ppm; no game data is in the repository.
 """
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
+from pathlib import Path
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import first_light as fl
+from spirv_stubs import build_ps_stub, build_vs_stub
 
 CLEAR = fl.CLEAR
 check_image = fl.check_image
@@ -119,6 +125,48 @@ class FirstLightTests(unittest.TestCase):
             self.assertTrue(
                 os.path.isfile(os.path.join(self.out, self.manifest["files"][key]))
             )
+
+
+class ShaderPreparationTests(unittest.TestCase):
+    def test_same_display_name_keeps_both_stage_files(self) -> None:
+        modules = {"vs": build_vs_stub([0]), "ps": build_ps_stub([0])}
+        entries = [
+            {"name": "shared", "file": "shared.dxbc", "stage": "vs"},
+            {"name": "shared", "file": "shared~1.dxbc", "stage": "ps"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            dxbc = work / "shaders" / "dxbc"
+            dxbc.mkdir(parents=True)
+            (dxbc / "index.json").write_text(json.dumps(entries), encoding="utf-8", newline="\n")
+            for entry in entries:
+                (dxbc / entry["file"]).write_bytes(entry["stage"].encode("ascii"))
+
+            def write_translation(argv: list[str]) -> None:
+                if Path(argv[0]).name != "rdna2spirv.py":
+                    return
+                staged = work / "first_light" / "dxbc"
+                picked = json.loads((staged / "index.json").read_text(encoding="utf-8"))
+                self.assertEqual(picked, entries)
+                spirv = Path(argv[argv.index("--out") + 1])
+                spirv.mkdir()
+                index = {}
+                for entry in picked:
+                    stage = entry["stage"]
+                    self.assertEqual((staged / entry["file"]).read_bytes(), stage.encode("ascii"))
+                    stem = Path(entry["file"]).stem
+                    (spirv / f"{stem}.spv").write_bytes(modules[stage])
+                    index[stem] = {"stage": stage, "fssm_sha256": stage + "-fixture"}
+                (spirv / "index.json").write_text(json.dumps(index), encoding="utf-8", newline="\n")
+
+            with patch.object(fl, "run", side_effect=write_translation), redirect_stdout(io.StringIO()):
+                self.assertEqual(fl.main(["--game", tmp, "--work", tmp, "--no-fit",
+                                          "--vs", "shared", "--ps", "shared"]), 0)
+            out = work / "first_light" / "out"
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            for stage, module in modules.items():
+                self.assertEqual((out / manifest["files"][stage]).read_bytes(), module)
+                self.assertEqual(manifest[stage]["fssm_sha256"], stage + "-fixture")
 
 
 class OracleTests(unittest.TestCase):
