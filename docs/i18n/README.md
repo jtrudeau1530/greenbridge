@@ -20,6 +20,6 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Русский (`ru`) | [`ru/quickstart.md`](ru/quickstart.md) | `a0acd33` | `@DmitryBykov-ISPO` |
 | 日本語 (`ja`) | [`ja/quickstart.md`](ja/quickstart.md) | `003e781` | `@bingll123` |
 | Español (`es`) | [`es/quickstart.md`](es/quickstart.md) | `003e7812` | `@NolanCotter` |
-| Deutsch (`de`) | [`de/quickstart.md`](de/quickstart.md) | `4eb6155d` | `@zGLados` |
+| Deutsch (`de`) | [`de/quickstart.md`](de/quickstart.md) | `aa2988cc` | `@zGLados` |
 | Italiano (`it`) | [`it/quickstart.md`](it/quickstart.md) | `49475796` | `@MeNoSkills` |
 | العربية (`ar`) | [`ar/quickstart.md`](ar/quickstart.md) | `ec8ec4c9` | `@Mohamed-Leo` |
