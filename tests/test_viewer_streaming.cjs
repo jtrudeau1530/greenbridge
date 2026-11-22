@@ -221,6 +221,36 @@ test('successful chunks unload and can load again with a fresh attempt budget', 
     assert.equal(f.state.live.get('chunk_0').attempts, 1);
 });
 
+test('stale and evicted chunks close each shared bitmap once', async t => {
+    const f = fixture();
+    class Bitmap { close = t.mock.fn(); }
+    f.context.ImageBitmap = Bitmap;
+    vm.runInContext('clay = true', f.context);
+    const otherClose = t.mock.fn();
+    function chunk() {
+        const bitmap = new Bitmap();
+        const texture = image => ({ isTexture: true, image, dispose: t.mock.fn() });
+        const textures = [texture(bitmap), texture(bitmap), texture({ close: otherClose })];
+        const material = { map: textures[0], normalMap: textures[1], alphaMap: textures[2], dispose() {} };
+        const mesh = { isMesh: true, material, userData: {} };
+        return { bitmap, textures, traverse: visit => visit(mesh) };
+    }
+
+    const stale = chunk(), live = chunk();
+    f.frame(); await f.receive(0);
+    f.state.drop('chunk_0'); f.frame();
+    await f.succeed(1, live);
+    await f.finish(0, stale);
+    assert.equal(stale.bitmap.close.mock.callCount(), 1);
+    assert.equal(live.bitmap.close.mock.callCount(), 0);
+    assert.equal(f.state.live.get('chunk_0').obj, live);
+
+    f.context.camera.position.x = 10000; f.frame();
+    assert.equal(live.bitmap.close.mock.callCount(), 1);
+    assert.equal(otherClose.mock.callCount(), 0);
+    for (const tex of [...stale.textures, ...live.textures]) assert.equal(tex.dispose.mock.callCount(), 1);
+});
+
 test('stale parses retain their slot, then dispose success or ignore failure', async () => {
     const f = fixture();
     f.frame(); await f.receive(0); f.state.drop('chunk_0'); f.frame();

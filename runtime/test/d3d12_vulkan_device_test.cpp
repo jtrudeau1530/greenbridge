@@ -340,6 +340,18 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(8, 8, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), 1},
         {texture_desc(8, 8, DXGI_FORMAT_D16_UNORM, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 4), 4},
         {texture_desc(6, 6, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_NONE), 1},
+        {texture_desc(16, 16, DXGI_FORMAT_R32G32_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R32G32_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R32G32_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R10G10B10A2_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R16G16_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R16G16_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R16G16_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R8G8_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R8G8_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R8G8_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
     };
     int mismatches = 0;
     for (const Case& c : cases) {
@@ -423,11 +435,26 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"8x8 array of 6", texture_desc(8, 8, rgba8, none, 4, 6), 8 * 8 * 4 * 6},
         {"32x32x8 volume", big_volume, 32 * 32 * 8 * 4},
         {"64x64 4x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 4), 64 * 64 * 4 * 4},
+        {"64x64 32x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 32), 64 * 64 * 4 * 32},
+        {"64x64 64x MSAA (invalid)", with(texture_desc(64, 64, rgba8, rt), 0, 64), 0},
+        {"64x64 zero sample count (invalid)", with(texture_desc(64, 64, rgba8, rt), 0, 0), 0},
         {"64x64 4x MSAA small", with(texture_desc(64, 64, rgba8, rt), k64, 4), 64 * 64 * 4 * 4},
         {"1024x1024 4x MSAA small", with(texture_desc(1024, 1024, rgba8, rt), k64, 4), 1024 * 1024 * 4 * 4},
         {"zero width", texture_desc(0, 16, rgba8, none), 0},
         {"alignment 12345", with(texture_desc(16, 16, rgba8, none), 12345), 0},
         {"4x MSAA with 2 mips", with(texture_desc(64, 64, rgba8, rt, 2), 0, 4), 0},
+        {"16x16 R32G32_UINT", texture_desc(16, 16, DXGI_FORMAT_R32G32_UINT, none, 1), 16 * 16 * 8},
+        {"16x16 R32G32_SINT", texture_desc(16, 16, DXGI_FORMAT_R32G32_SINT, none, 1), 16 * 16 * 8},
+        {"16x16 R32G32_TYPELESS", texture_desc(16, 16, DXGI_FORMAT_R32G32_TYPELESS, none, 1), 16 * 16 * 8},
+        {"16x16 R16G16B16A16_UINT", texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_UINT, none, 1), 16 * 16 * 8},
+        {"16x16 R16G16B16A16_SINT", texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_SINT, none, 1), 16 * 16 * 8},
+        {"16x16 R10G10B10A2_UINT", texture_desc(16, 16, DXGI_FORMAT_R10G10B10A2_UINT, none, 1), 16 * 16 * 4},
+        {"16x16 R16G16_TYPELESS", texture_desc(16, 16, DXGI_FORMAT_R16G16_TYPELESS, none, 1), 16 * 16 * 4},
+        {"16x16 R16G16_UINT", texture_desc(16, 16, DXGI_FORMAT_R16G16_UINT, none, 1), 16 * 16 * 4},
+        {"16x16 R16G16_SINT", texture_desc(16, 16, DXGI_FORMAT_R16G16_SINT, none, 1), 16 * 16 * 4},
+        {"16x16 R8G8_TYPELESS", texture_desc(16, 16, DXGI_FORMAT_R8G8_TYPELESS, none, 1), 16 * 16 * 2},
+        {"16x16 R8G8_UINT", texture_desc(16, 16, DXGI_FORMAT_R8G8_UINT, none, 1), 16 * 16 * 2},
+        {"16x16 R8G8_SINT", texture_desc(16, 16, DXGI_FORMAT_R8G8_SINT, none, 1), 16 * 16 * 2},
     };
     int mismatches = 0;
     const auto mismatch = [&](const char* name, const D3D12_RESOURCE_ALLOCATION_INFO& a,
@@ -761,6 +788,51 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
     return true;
 }
 
+// Compare D3D12 multisample quality queries for depth/stencil formats with the host runtime. The Vulkan
+// backend has one standard sample pattern, so every supported count reports one quality level (index 0).
+int compare_depth_multisample_quality_levels(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+
+    constexpr DXGI_FORMAT formats[] = {
+        DXGI_FORMAT_D32_FLOAT,
+        DXGI_FORMAT_D16_UNORM,
+        DXGI_FORMAT_D24_UNORM_S8_UINT,
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+    };
+    constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
+    unsigned compared = 0, skipped = 0;
+    int mismatches = 0;
+    for (DXGI_FORMAT format : formats) {
+        for (UINT samples : sample_counts) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS host_levels{};
+            host_levels.Format = format;
+            host_levels.SampleCount = samples;
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS our_levels = host_levels;
+            const HRESULT host_hr = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                               &host_levels, sizeof(host_levels));
+            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0) {
+                ++skipped;
+                continue;
+            }
+            ++compared;
+            const HRESULT our_hr = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                             &our_levels, sizeof(our_levels));
+            if (FAILED(our_hr) || our_levels.NumQualityLevels != 1) {
+                std::fprintf(stderr,
+                             "depth MSAA quality mismatch: format %d samples %u (host %u quality levels, Vulkan "
+                             "HRESULT 0x%08lx / %u levels)\n",
+                             int(format), samples, host_levels.NumQualityLevels,
+                             static_cast<unsigned long>(our_hr), our_levels.NumQualityLevels);
+                ++mismatches;
+            }
+        }
+    }
+    std::printf("Depth/stencil MSAA quality queries: %u compared, %u host-unsupported skipped, %d mismatches\n",
+                compared, skipped, mismatches);
+    return mismatches;
+}
+
 // Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
 // sample count and region form. A host-unsupported combination is a deliberate skip; a mismatch in advertised
 // support or in the resulting pixels is a failure.
@@ -775,7 +847,7 @@ int compare_resolves(ID3D12Device* ours) {
         DXGI_FORMAT_R16G16B16A16_FLOAT,
         DXGI_FORMAT_R32G32B32A32_FLOAT,
     };
-    constexpr UINT sample_counts[] = {2, 4, 8, 16};
+    constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
     constexpr UINT required =
         UINT(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) | UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) |
         UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
@@ -918,8 +990,45 @@ int main() {
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
 
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_sample_count{};
+        invalid_sample_count.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        invalid_sample_count.SampleCount = D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT * 2;
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
+                                           sizeof(invalid_sample_count)) == E_INVALIDARG);
+        EXPECT(invalid_sample_count.NumQualityLevels == 0);
+        invalid_sample_count.SampleCount = 0;
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
+                                           sizeof(invalid_sample_count)) == E_INVALIDARG);
+
+        D3D12_RESOURCE_DESC unsupported_quality =
+            texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        unsupported_quality.SampleDesc.Count = 4;
+        unsupported_quality.SampleDesc.Quality = 1;
+        EXPECT(device->GetResourceAllocationInfo(0, 1, &unsupported_quality).SizeInBytes == UINT64_MAX);
+
         D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
         EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
+
+        // D3D-60: CheckFeatureSupport and committed resource creation for integer and typeless formats
+        {
+            const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+            for (DXGI_FORMAT f : {
+                     DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_SINT,
+                     DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R16G16B16A16_SINT,
+                     DXGI_FORMAT_R10G10B10A2_UINT, DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_UINT,
+                     DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UINT,
+                     DXGI_FORMAT_R8G8_SINT}) {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{f};
+                EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))));
+                EXPECT(fs.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+                Ref<ID3D12Resource> tex;
+                const D3D12_RESOURCE_DESC desc = texture_desc(16, 16, f, D3D12_RESOURCE_FLAG_NONE, 1);
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(
+                    &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                    IID_PPV_ARGS(&tex.p))));
+                EXPECT(tex.p != nullptr);
+            }
+        }
 
         // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
         EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);
@@ -962,6 +1071,11 @@ int main() {
             std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
                         "skipped\n");
         EXPECT(tiling_mismatches <= 0);
+
+        const int depth_quality_mismatches = compare_depth_multisample_quality_levels(device.p);
+        if (depth_quality_mismatches < 0)
+            std::printf("Depth/stencil MSAA quality queries: no host D3D12 device to compare with, skipped\n");
+        EXPECT(depth_quality_mismatches <= 0);
 
         const int resolve_mismatches = compare_resolves(device.p);
         if (resolve_mismatches < 0)
@@ -1080,6 +1194,16 @@ int main() {
             return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
                                                    IID_PPV_ARGS(&out.p));
         };
+        Ref<ID3D12Resource> refused_buffer;
+        D3D12_RESOURCE_DESC invalid_buffer_samples = buffer_desc(256);
+        invalid_buffer_samples.SampleDesc.Count = 0;
+        EXPECT(create(default_heap, invalid_buffer_samples, D3D12_RESOURCE_STATE_COPY_DEST, refused_buffer) ==
+               E_INVALIDARG && !refused_buffer.p);
+        invalid_buffer_samples.SampleDesc.Count = 1;
+        invalid_buffer_samples.SampleDesc.Quality = 1;
+        EXPECT(create(default_heap, invalid_buffer_samples, D3D12_RESOURCE_STATE_COPY_DEST, refused_buffer) ==
+               E_INVALIDARG && !refused_buffer.p);
+
         Ref<ID3D12Resource> rt_resource, ds, untouched, upload, readback, volume;
         D3D12_RESOURCE_DESC xbox_rt =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
@@ -1358,6 +1482,14 @@ int main() {
             shape.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             shape.SampleDesc.Count = 3;
             EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.SampleDesc.Count = D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT * 2;
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.SampleDesc.Count = 0;
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.SampleDesc.Count = 4;
+            shape.SampleDesc.Quality = 1;  // The Vulkan backend exposes only quality level 0.
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.SampleDesc.Quality = 0;
             shape = volume_desc(1);
             shape.SampleDesc.Count = 4;
             EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
