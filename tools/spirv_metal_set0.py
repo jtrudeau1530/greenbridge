@@ -77,13 +77,12 @@ def rewrite(text, counts):
             raise SystemExit(f"{v}: binding {b} isn't in vulkan_bindless.h")
 
     defs = {}       # result id -> instruction text
-    ptr_pos = {}    # OpTypePointer result id -> line index, so shared capacities emit at the earliest pointer
+    definition_positions: dict[str, int] = {}
     for idx, ln in enumerate(lines):
         m = re.match(r"\s*(%\S+) = (.*)$", ln)
         if m:
             defs[m.group(1)] = m.group(2)
-            if re.match(r"OpTypePointer\b", m.group(2)):
-                ptr_pos[m.group(1)] = idx
+            definition_positions[m.group(1)] = idx
     uint = next((r for r, d in defs.items() if d == "OpTypeInt 32 0"), None)
 
     candidates = []
@@ -96,9 +95,16 @@ def rewrite(text, counts):
         rt = re.match(r"OpTypeRuntimeArray (%\S+)$", defs.get(ptr.group(1), "")) if ptr else None
         if not rt:
             continue
+        candidates.append((b, definition_positions[old_ptr], order, v, old_ptr, rt.group(1)))
+
+    if candidates:
         if uint is None:
             raise SystemExit("module has no 32-bit uint type for the array lengths")
-        candidates.append((b, ptr_pos.get(old_ptr, len(lines)), order, v, old_ptr, rt.group(1)))
+        first_pointer = min(candidate[1] for candidate in candidates)
+        uint_position = definition_positions[uint]
+        if uint_position > first_pointer:
+            # The generated length may precede an original declaration of its integer type.
+            lines.insert(first_pointer, lines.pop(uint_position))
 
     used_ids = set(defs) | set(sets) | set(binds)
     cap_by_bind = {}    # binding -> OpConstant id (emitted once per binding)
