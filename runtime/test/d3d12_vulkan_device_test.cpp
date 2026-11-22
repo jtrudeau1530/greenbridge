@@ -10,6 +10,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -232,6 +233,9 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"8x8 array of 6", texture_desc(8, 8, rgba8, none, 4, 6), 8 * 8 * 4 * 6},
         {"32x32x8 volume", big_volume, 32 * 32 * 8 * 4},
         {"64x64 4x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 4), 64 * 64 * 4 * 4},
+        {"64x64 32x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 32), 64 * 64 * 4 * 32},
+        {"64x64 64x MSAA (invalid)", with(texture_desc(64, 64, rgba8, rt), 0, 64), 0},
+        {"64x64 zero sample count (invalid)", with(texture_desc(64, 64, rgba8, rt), 0, 0), 0},
         {"64x64 4x MSAA small", with(texture_desc(64, 64, rgba8, rt), k64, 4), 64 * 64 * 4 * 4},
         {"1024x1024 4x MSAA small", with(texture_desc(1024, 1024, rgba8, rt), k64, 4), 1024 * 1024 * 4 * 4},
         {"zero width", texture_desc(0, 16, rgba8, none), 0},
@@ -426,6 +430,244 @@ int compare_tiling(ID3D12Device* ours) {
     return compared ? mismatches : -1;
 }
 
+
+enum class ResolveScenario { full, rectangle, null_rectangle };
+
+const char* resolve_scenario_name(ResolveScenario scenario) {
+    switch (scenario) {
+    case ResolveScenario::full: return "ResolveSubresource";
+    case ResolveScenario::rectangle: return "ResolveSubresourceRegion(rect)";
+    case ResolveScenario::null_rectangle: return "ResolveSubresourceRegion(null rect)";
+    }
+    return "unknown";
+}
+
+UINT resolve_pixel_size(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return 4;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+    default: return 0;
+    }
+}
+
+// Runs one deterministic resolve on either the host D3D12 device or the Vulkan-backed proxy and returns only
+// packed texel bytes (row-pitch padding is discarded). The source/destination are cleared to solid colours so
+// every format and sample count exercises the resolve path without requiring a shader or game data.
+bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, ResolveScenario scenario,
+                     std::vector<std::uint8_t>& pixels) {
+#define RESOLVE_CHECK(condition) do { \
+    if (!(condition)) { \
+        std::fprintf(stderr, "resolve capture failed at line %d: %s (format %d, samples %u, %s)\n", \
+                     __LINE__, #condition, int(format), samples, resolve_scenario_name(scenario)); \
+        return false; \
+    } \
+} while (false)
+
+    const bool proxy = rt::d3d12_xs::is_device_proxy(device);
+    const UINT src_width = 8, src_height = 8;
+    const UINT dst_width = scenario == ResolveScenario::full ? src_width : 12;
+    const UINT dst_height = scenario == ResolveScenario::full ? src_height : 10;
+    const UINT pixel_size = resolve_pixel_size(format);
+    RESOLVE_CHECK(pixel_size != 0);
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC src_desc =
+        texture_desc(src_width, src_height, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    src_desc.SampleDesc.Count = samples;
+    D3D12_RESOURCE_DESC dst_desc =
+        texture_desc(dst_width, dst_height, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+
+    Ref<ID3D12Resource> src, dst, readback;
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &src_desc,
+                                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                             IID_PPV_ARGS(&src.p))));
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &dst_desc,
+                                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                             IID_PPV_ARGS(&dst.p))));
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    Ref<ID3D12DescriptorHeap> rtv_heap;
+    RESOLVE_CHECK(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
+    D3D12_CPU_DESCRIPTOR_HANDLE src_rtv{}, dst_rtv{};
+    if (proxy) {
+        const std::uint64_t start =
+            reinterpret_cast<XboxHeapHandleFn>(slot(rtv_heap.p, 9))(rtv_heap.p);
+        const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        RESOLVE_CHECK(start != 0 && increment >= sizeof(leonida::TargetView));
+        src_rtv = {SIZE_T(start)};
+        dst_rtv = {SIZE_T(start + increment)};
+    } else {
+        src_rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        dst_rtv = {src_rtv.ptr + device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+    }
+    D3D12_RENDER_TARGET_VIEW_DESC msaa_view{};
+    msaa_view.Format = format;
+    msaa_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+    device->CreateRenderTargetView(src.p, &msaa_view, src_rtv);
+    device->CreateRenderTargetView(dst.p, nullptr, dst_rtv);
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12GraphicsCommandList7> list7;
+    Ref<ID3D12Fence> fence;
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                       IID_PPV_ARGS(&list.p))));
+    RESOLVE_CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list7.p))));
+    RESOLVE_CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+    UINT64 cursor = 0;
+    const auto readback_layout = place(device, dst.p, 0, cursor);
+    RESOLVE_CHECK(cursor != 0 && readback_layout.Footprint.RowPitch >= dst_width * pixel_size);
+    const D3D12_RESOURCE_DESC readback_desc = buffer_desc(cursor);
+    RESOLVE_CHECK(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE,
+                                                             &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                             nullptr, IID_PPV_ARGS(&readback.p))));
+
+    const FLOAT green[4] = {0, 1, 0, 1};
+    const FLOAT red[4] = {1, 0, 0, 1};
+    // Use a rectangle even for the full source: multisampled images are cleared as rendering attachments,
+    // not with vkCmdClearColorImage (which is for single-sample transfer clears).
+    const D3D12_RECT full_source{0, 0, LONG(src_width), LONG(src_height)};
+    list->ClearRenderTargetView(src_rtv, green, 1, &full_source);
+    list->ClearRenderTargetView(dst_rtv, red, 0, nullptr);
+    const D3D12_RESOURCE_BARRIER before_resolve[] = {
+        transition(src.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+        transition(dst.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST)};
+    list->ResourceBarrier(2, before_resolve);
+    if (scenario == ResolveScenario::full) {
+        list->ResolveSubresource(dst.p, 0, src.p, 0, format);
+    } else {
+        D3D12_RECT rectangle{2, 1, 6, 5};
+        list7->ResolveSubresourceRegion(dst.p, 0, 3, 2, src.p, 0,
+                                        scenario == ResolveScenario::rectangle ? &rectangle : nullptr,
+                                        format, D3D12_RESOLVE_MODE_AVERAGE);
+    }
+    const auto to_copy = transition(dst.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &to_copy);
+    const auto readback_location = footprint(readback.p, readback_layout);
+    const auto resolved_location = subresource(dst.p, 0);
+    list->CopyTextureRegion(&readback_location, 0, 0, 0, &resolved_location, nullptr);
+    RESOLVE_CHECK(list->Close() == S_OK);
+
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    if (proxy)
+        RESOLVE_CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    RESOLVE_CHECK(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+
+    D3D12_RANGE read_range{0, SIZE_T(cursor)};
+    std::uint8_t* mapped = nullptr;
+    RESOLVE_CHECK(SUCCEEDED(readback->Map(0, &read_range, reinterpret_cast<void**>(&mapped))) && mapped);
+    pixels.resize(size_t(dst_width) * dst_height * pixel_size);
+    for (UINT row = 0; row < dst_height; ++row)
+        std::memcpy(pixels.data() + size_t(row) * dst_width * pixel_size,
+                    mapped + readback_layout.Offset + size_t(row) * readback_layout.Footprint.RowPitch,
+                    size_t(dst_width) * pixel_size);
+    const D3D12_RANGE written{0, 0};
+    readback->Unmap(0, &written);
+#undef RESOLVE_CHECK
+    return true;
+}
+
+// Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
+// sample count and region form. A host-unsupported combination is a deliberate skip; a mismatch in advertised
+// support or in the resulting pixels is a failure.
+int compare_resolves(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+
+    constexpr DXGI_FORMAT formats[] = {
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R32G32B32A32_FLOAT,
+    };
+    constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
+    constexpr UINT required =
+        UINT(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) | UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) |
+        UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
+    constexpr ResolveScenario scenarios[] = {
+        ResolveScenario::full, ResolveScenario::rectangle, ResolveScenario::null_rectangle};
+    int mismatches = 0;
+    unsigned compared = 0, matched = 0, skipped = 0;
+
+    for (DXGI_FORMAT format : formats) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT host_format{format}, our_format{format};
+        const HRESULT host_format_hr =
+            host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &host_format, sizeof(host_format));
+        const HRESULT our_format_hr =
+            ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &our_format, sizeof(our_format));
+        if (FAILED(host_format_hr) || (UINT(host_format.Support1) & required) != required) {
+            std::printf("resolve format %d: host does not advertise multisample colour resolve, skipped\n", int(format));
+            ++skipped;
+            continue;
+        }
+        if (FAILED(our_format_hr) || (UINT(our_format.Support1) & required) != required) {
+            std::fprintf(stderr, "resolve format %d: Vulkan device does not match host multisample format support\n",
+                         int(format));
+            ++mismatches;
+            continue;
+        }
+
+        for (UINT samples : sample_counts) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS host_levels{};
+            host_levels.Format = format;
+            host_levels.SampleCount = samples;
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS our_levels = host_levels;
+            const HRESULT host_hr = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                               &host_levels, sizeof(host_levels));
+            const HRESULT our_hr = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                              &our_levels, sizeof(our_levels));
+            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0) {
+                ++skipped;
+                continue;
+            }
+            if (FAILED(our_hr) || our_levels.NumQualityLevels == 0) {
+                std::fprintf(stderr, "resolve format %d samples %u: Vulkan reports unsupported, host supports it\n",
+                             int(format), samples);
+                ++mismatches;
+                continue;
+            }
+
+            for (ResolveScenario scenario : scenarios) {
+                std::vector<std::uint8_t> host_pixels, our_pixels;
+                if (!capture_resolve(host.p, format, samples, scenario, host_pixels) ||
+                    !capture_resolve(ours, format, samples, scenario, our_pixels)) {
+                    ++mismatches;
+                    continue;
+                }
+                ++compared;
+                if (host_pixels != our_pixels) {
+                    std::fprintf(stderr, "resolve mismatch: format %d samples %u %s (host %zu bytes, Vulkan %zu)\n",
+                                 int(format), samples, resolve_scenario_name(scenario),
+                                 host_pixels.size(), our_pixels.size());
+                    ++mismatches;
+                } else {
+                    ++matched;
+                }
+            }
+        }
+    }
+    std::printf("Resolve comparison: %u compared, %u matched, %u unsupported format/sample combinations skipped, "
+                "%d mismatches\n", compared, matched, skipped, mismatches);
+    if (compared == 0) {
+        std::fprintf(stderr, "Resolve comparison: no common supported format/sample combination was exercised\n");
+        ++mismatches;
+    }
+    return mismatches;
+}
+
+
 }  // namespace
 
 int main() {
@@ -493,6 +735,16 @@ int main() {
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
 
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_sample_count{};
+        invalid_sample_count.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        invalid_sample_count.SampleCount = D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT * 2;
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
+                                           sizeof(invalid_sample_count)) == E_INVALIDARG);
+        EXPECT(invalid_sample_count.NumQualityLevels == 0);
+        invalid_sample_count.SampleCount = 0;
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
+                                           sizeof(invalid_sample_count)) == E_INVALIDARG);
+
         D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
         EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
 
@@ -529,6 +781,11 @@ int main() {
             std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
                         "skipped\n");
         EXPECT(tiling_mismatches <= 0);
+
+        const int resolve_mismatches = compare_resolves(device.p);
+        if (resolve_mismatches < 0)
+            std::printf("Resolve comparison: no host D3D12 device to compare with, skipped\n");
+        EXPECT(resolve_mismatches <= 0);
 
         // Command objects; their GetDevice is the proxy, never the inner device.
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -920,6 +1177,14 @@ int main() {
             shape.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             shape.SampleDesc.Count = 3;
             EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.SampleDesc.Count = D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT * 2;
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.SampleDesc.Count = 0;
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.SampleDesc.Count = 4;
+            shape.SampleDesc.Quality = 1;  // The Vulkan backend exposes only quality level 0.
+            EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
+            shape.SampleDesc.Quality = 0;
             shape = volume_desc(1);
             shape.SampleDesc.Count = 4;
             EXPECT(create(default_heap, shape, D3D12_RESOURCE_STATE_COMMON, refused) == E_INVALIDARG && !refused.p);
