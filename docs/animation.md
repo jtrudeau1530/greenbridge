@@ -569,7 +569,7 @@ dictionary in `story000.rpf`. None of its 9,188 distinct dictionary hashes is a 
 one of the 1,902 hashes anim.rpf refers to without having them.
 
 ```
-python -I tools/anim_clips.py <package>/pack/story000/story000.rpf <work>/story000-clips.json --jobs 20
+python -I tools/anim_clips.py <package>\pack\story000\story000.rpf <work>\story000-clips.json --jobs 20
 ```
 
 ## Readable, compressed and still opaque
