@@ -2,8 +2,6 @@
 
 #include <windows.h>
 #include <intrin.h>
-#include <psapi.h>
-#include <tlhelp32.h>
 
 #include <algorithm>
 #include <array>
@@ -85,15 +83,19 @@ IMAGE_TLS_DIRECTORY64* tls_directory(Module& m) {
 // A mapped executable is different: MSVC code built with /GA (an EXE-only optimisation) skips _tls_index and reads
 // TEB->ThreadLocalStoragePointer[0] directly (mov rax, gs:[58h]; mov rax, [rax]), because Windows always gives the
 // process executable module TLS index 0. Measured with a `thread_local int v = 42;` EXE built /O2 /GA /MD: natively
-// tls_index=0 value=42; mapped with a helper index (6) the code still read slot 0 and printed value=0. Index 0 belongs to
-// the runtime's own EXE (gta6rt.exe has a TLS block, 1350 bytes when measured, and no TLS callbacks; each test EXE
-// that links this file has one too), and every TLS read in its disassembly goes through _tls_index (the only direct gs:[58h] read is
-// module_tls_slots below, which wants the array itself). So index 0 is freed by moving the owner:
-// move_index0_owner swaps slots 0 and H of every thread, H being the index of a further helper clone that exists for
-// this, and writes H into the owner's _tls_index. The owner then finds its block through H, and slot 0 holds the
-// helper's spare block, which the mapped executable's copy replaces (kMainImageSlot) exactly as a DLL's copy replaces
-// a helper's. The swap is permanent: both pointers are blocks the OS allocated for this thread, and at thread exit it
-// frees every slot by index whatever block each holds, so nothing has to be swapped back.
+// tls_index=0 value=42; mapped with a helper index (6) the code still read slot 0 and printed value=0. Index 0
+// belongs to the runtime's own EXE (gta6rt.exe: a 1398-byte template when measured, no TLS callbacks; so does each
+// test EXE that links this file), and every TLS read in its disassembly goes through _tls_index (the only direct
+// gs:[58h] read is module_tls_slots below, which wants the array itself). reserve_tls_index0 therefore moves the owner
+// off index 0, once, at process start: it loads the home clone (make_home_clone_image), whose TLS template is a copy of
+// the owner's, and on the calling thread swaps slots 0 and home and writes home into the owner's _tls_index. From then on every thread the OS
+// starts has a fresh copy of the owner's template at home, which is where the owner looks, from its first instruction:
+// nothing has to run on a new thread first. Slot 0 holds a block nobody reads, which the mapped executable's copy
+// replaces (kMainImageSlot) exactly as a DLL's copy replaces a helper's, and the OS frees both slots at thread exit.
+// It has to happen before any other thread has run the owner's code: MSVC keeps &ThreadLocalStoragePointer[_tls_index]
+// across calls (zlib_inflate in shader_library.h saves it at [rbp-80h] across memset, push_back and inflate_codes, then
+// reads _Init_thread_epoch through it), so a running thread cannot be moved safely, wherever it is stopped. Such a
+// thread's TLS would also stay where it was, at index 0.
 constexpr DWORD kMaxModuleTlsSlots = 64;
 constexpr size_t kMaxMappedTlsModules = 16;
 // The slot for a mapped executable, which reads module TLS index 0 (see above). Only one at a time; a second
@@ -107,6 +109,7 @@ void __cdecl on_host_thread_event(DWORD reason);
 struct TlsHostModule {
     HMODULE module = nullptr;
     DWORD index = TLS_OUT_OF_INDEXES;
+    bool hooked = false;  // its DllMain reports thread events to on_host_thread_event
 };
 
 std::filesystem::path tls_host_base_path() {
@@ -144,13 +147,16 @@ std::array<std::atomic<uint64_t>, kTlsSlotCount> g_tls_slot_generations{};
 std::atomic<uint64_t> g_next_tls_generation{1};
 std::vector<TlsCloneRecord> g_tls_clones;
 
-// The move of module TLS index 0 (see kMainImageSlot), done at most once per process. `moved` is written under both
-// g_tls_alloc_mutex and an exclusive g_tls_lock, so thread events read it under the shared lock; the other fields are
-// set before it and never change after.
+// The move of module TLS index 0 (see kMainImageSlot): done at most once, by reserve_tls_index0 under
+// g_tls_alloc_mutex. `why` is the reason it was not done, for the executable that then maps with a helper index.
+// Constant-initialized only (no std::string): gta6rt reserves from a CRT initializer that runs before the dynamic
+// initializers of this file, which would otherwise reset what it wrote.
 struct Index0Move {
     bool moved = false;
-    TlsHostModule home;                // the clone whose index now holds the owner's block; never freed
-    DWORD mark = TLS_OUT_OF_INDEXES;   // TlsAlloc slot, non-zero on a thread whose slots 0 and home are swapped
+    bool traced = false;    // the startup trace opens after the move; the first executable map reports it
+    TlsHostModule home;     // the clone whose index holds the owner's TLS from now on; never freed
+    char owner[260] = {};   // UTF-8 file name of the image that held index 0
+    char why[160] = "reserve_tls_index0 was not called at process start";
 };
 Index0Move g_index0;
 
@@ -244,8 +250,11 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
     if (hook_thread_events) {
         // Only the primary helper reports thread attach/detach events; on_host_thread_event iterates all active slots.
         using SetThreadEvent = void(__cdecl*)(void(__cdecl*)(DWORD));
-        if (auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(host.module, "gta6rt_tls_host_set_thread_event")))
+        auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(host.module, "gta6rt_tls_host_set_thread_event"));
+        if (set) {
             set(&on_host_thread_event);
+            host.hooked = true;
+        }
     }
     return host;
 }
@@ -253,18 +262,26 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
 // The primary helper: slot 0's index, and the only helper whose DllMain reports thread events (on_host_thread_event
 // covers every slot). Must be called with g_tls_alloc_mutex held and WITHOUT g_tls_lock held (LoadLibraryExW takes the
 // Windows loader lock).
+// A helper without the thread-event export is refused: no thread started later would get its copies.
 bool ensure_primary_tls_host() {
     if (g_tls_hosts[0].index != TLS_OUT_OF_INDEXES) return true;
     const std::filesystem::path primary = tls_host_base_path();
     if (primary.empty()) return false;
-    g_tls_hosts[0] = load_tls_host_image(primary, true);
-    return g_tls_hosts[0].index != TLS_OUT_OF_INDEXES;
+    TlsHostModule host = load_tls_host_image(primary, true);
+    if (host.index != TLS_OUT_OF_INDEXES && !host.hooked) {
+        FreeLibrary(host.module);
+        return false;
+    }
+    g_tls_hosts[0] = host;
+    return host.index != TLS_OUT_OF_INDEXES;
 }
 
-// Copies gta6rt_tls_host.dll to "leonida_tls_host_<pid>_<tag>.dll" in the clone directory and loads it, so the OS
-// gives the copy an index of its own. On failure the file is gone again and the result has no index. The caller
-// records the clone (g_tls_clones) if it is to be freed at exit. Same locking rule as ensure_primary_tls_host.
-TlsHostModule load_tls_host_clone(const std::wstring& tag, std::filesystem::path& clone_path) {
+// Copies gta6rt_tls_host.dll (or writes `image`, a changed copy of it) to "leonida_tls_host_<pid>_<tag>.dll" in the
+// clone directory and loads it, so the OS gives the copy an index of its own. On failure the file is gone again and
+// the result has no index. The caller records the clone (g_tls_clones) if it is to be freed at exit. Same locking rule
+// as ensure_primary_tls_host.
+TlsHostModule load_tls_host_clone(const std::wstring& tag, std::filesystem::path& clone_path,
+                                  const std::vector<uint8_t>* image = nullptr) {
     const std::filesystem::path primary = tls_host_base_path();
     if (primary.empty()) return {};
     // Clone gta6rt_tls_host.dll to a distinct path using CopyFileW (Wine 9 lacks CopyFile2 used by std::filesystem).
@@ -279,7 +296,21 @@ TlsHostModule load_tls_host_clone(const std::wstring& tag, std::filesystem::path
     clone_path = dir / name;
     // The staging name must not match the sweep pattern, which only covers final clone names ending in .dll.
     const std::filesystem::path staging = clone_path.wstring() + L".new";
-    if (!CopyFileW(primary.c_str(), staging.c_str(), FALSE)) return {};
+    if (image) {
+        HANDLE out =
+            CreateFileW(staging.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (out == INVALID_HANDLE_VALUE) return {};
+        DWORD written = 0;
+        const bool ok = WriteFile(out, image->data(), static_cast<DWORD>(image->size()), &written, nullptr) &&
+                        written == image->size();
+        CloseHandle(out);
+        if (!ok) {
+            DeleteFileW(staging.c_str());
+            return {};
+        }
+    } else if (!CopyFileW(primary.c_str(), staging.c_str(), FALSE)) {
+        return {};
+    }
 
     // Open the guard before the clone exists under its final name and hold it across LoadLibraryExW: the rename
     // below needs DELETE access, which the handle's FILE_SHARE_DELETE grants, and no purge can remove the clone
@@ -314,7 +345,7 @@ TlsHostModule ensure_tls_host(size_t slot) {
     std::filesystem::path clone_path;
     TlsHostModule loaded = load_tls_host_clone(std::to_wstring(slot), clone_path);
     if (loaded.index == TLS_OUT_OF_INDEXES) return {};
-    // Index 0 is the runtime EXE's, and after the move the home clone's index holds that EXE's block.
+    // Index 0 is the runtime EXE's, and after the move the home clone's index holds that EXE's TLS.
     bool taken = loaded.index == 0 || loaded.index == g_index0.home.index;
     for (size_t i = 0; i < kMaxMappedTlsModules; ++i) taken |= i != slot && g_tls_hosts[i].index == loaded.index;
     if (taken) {
@@ -340,8 +371,7 @@ thread_local std::array<ThreadTlsSlot, kTlsSlotCount> g_thread_tls_slots{};
 
 // Orders the TLS owners' publication, their `initialised` flags and their retirement against the thread events. Shared
 // in on_host_thread_event, exclusive only for those short writes (no allocation and no call that takes the Windows
-// loader lock, which the events run under) and for the one-time index-0 move, which lists and stops threads under it
-// with the loader lock already held.
+// loader lock, which the events run under).
 SRWLOCK g_tls_lock = SRWLOCK_INIT;
 struct SharedTlsLock {
     SharedTlsLock() { AcquireSRWLockShared(&g_tls_lock); }
@@ -356,19 +386,92 @@ struct ExclusiveTlsLock {
     ExclusiveTlsLock& operator=(const ExclusiveTlsLock&) = delete;
 };
 
-// x64 TEB fields the move reads and writes on other threads (the same offsets on Wine): ThreadLocalStoragePointer,
-// and TlsSlots[64], the array TlsGetValue reads for an index below 64.
-constexpr size_t kTebTlsPointer = 0x58;
-constexpr size_t kTebTlsSlots = 0x1480;
+// gta6rt_tls_host.dll's exports that the home clone's TLS directory is pointed at (tls_host.cpp): a zero array in its
+// .rdata and that array's size.
+constexpr char kHomeTemplateExport[] = "gta6rt_tls_home_template";
+constexpr char kHomeTemplateSizeExport[] = "gta6rt_tls_home_template_size";
 
-// The image that owns module TLS index 0: the one whose TLS directory's AddressOfIndex holds 0. Only images the
-// Windows loader mapped are listed, so their headers are read unchecked.
-struct Index0Owner {
-    const uint8_t* base = nullptr;
-    size_t size = 0;
-    DWORD* index = nullptr;  // the owner's _tls_index
-    std::string name;        // UTF-8 file name, for the trace and messages
-};
+// File offset of `len` bytes at `rva` in an image file held in memory, or SIZE_MAX when they are not all inside one
+// section's raw data.
+size_t file_offset(const std::vector<uint8_t>& file, const IMAGE_NT_HEADERS64* nt, uint64_t rva, uint64_t len) {
+    const auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (reinterpret_cast<const uint8_t*>(sec + 1) > file.data() + file.size()) break;
+        if (rva < sec->VirtualAddress || rva + len > static_cast<uint64_t>(sec->VirtualAddress) + sec->SizeOfRawData)
+            continue;
+        const uint64_t off = sec->PointerToRawData + (rva - sec->VirtualAddress);
+        return off + len <= file.size() ? static_cast<size_t>(off) : SIZE_MAX;
+    }
+    return SIZE_MAX;
+}
+
+// The RVA of a named export in an image file held in memory, 0 when it has none.
+uint32_t file_export(const std::vector<uint8_t>& file, const IMAGE_NT_HEADERS64* nt, const char* wanted) {
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
+    const size_t ed_off = file_offset(file, nt, dir.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY));
+    if (!dir.Size || ed_off == SIZE_MAX) return 0;
+    const auto* ed = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(file.data() + ed_off);
+    const size_t names = file_offset(file, nt, ed->AddressOfNames, uint64_t{4} * ed->NumberOfNames);
+    const size_t ords = file_offset(file, nt, ed->AddressOfNameOrdinals, uint64_t{2} * ed->NumberOfNames);
+    const size_t funcs = file_offset(file, nt, ed->AddressOfFunctions, uint64_t{4} * ed->NumberOfFunctions);
+    if (names == SIZE_MAX || ords == SIZE_MAX || funcs == SIZE_MAX) return 0;
+    const size_t wanted_len = std::strlen(wanted) + 1;
+    for (uint32_t i = 0; i < ed->NumberOfNames; ++i) {
+        uint32_t name_rva, func_rva;
+        uint16_t ord;
+        std::memcpy(&name_rva, file.data() + names + 4 * i, 4);
+        std::memcpy(&ord, file.data() + ords + 2 * i, 2);
+        const size_t name = file_offset(file, nt, name_rva, wanted_len);
+        if (name == SIZE_MAX || std::memcmp(file.data() + name, wanted, wanted_len) != 0) continue;
+        if (ord >= ed->NumberOfFunctions) return 0;
+        std::memcpy(&func_rva, file.data() + funcs + 4 * ord, 4);
+        return func_rva;
+    }
+    return 0;
+}
+
+// Turns gta6rt_tls_host.dll's bytes into the home clone: its TLS directory now covers gta6rt_tls_home_template, which
+// starts with a copy of the owner's template (taken from the mapped owner, so its pointers are already relocated; the
+// array itself has no relocations), and takes the owner's alignment. The OS then gives every thread, at the home
+// index, a block that is a fresh copy of the owner's TLS. The zero fill goes into the covered range too:
+// LdrpAllocateTls allocates and copies End - Start only (Windows 11 26300) and ignores SizeOfZeroFill. The directory's
+// Start and End have base relocations, so they follow the clone wherever it loads. Empty on success, else why not.
+std::string make_home_clone_image(std::vector<uint8_t>& file, const IMAGE_TLS_DIRECTORY64& owner) {
+    if (file.size() < sizeof(IMAGE_DOS_HEADER)) return "gta6rt_tls_host.dll is truncated";
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(file.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+        static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > file.size())
+        return "gta6rt_tls_host.dll has no PE header";
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(file.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return "gta6rt_tls_host.dll is not a 64-bit image";
+    const uint32_t array_rva = file_export(file, nt, kHomeTemplateExport);
+    const uint32_t size_rva = file_export(file, nt, kHomeTemplateSizeExport);
+    const size_t size_off = file_offset(file, nt, size_rva, sizeof(uint32_t));
+    if (!array_rva || !size_rva || size_off == SIZE_MAX)
+        return "gta6rt_tls_host.dll has no gta6rt_tls_home_template";
+    uint32_t capacity;
+    std::memcpy(&capacity, file.data() + size_off, sizeof(capacity));
+    const uint64_t raw = owner.EndAddressOfRawData - owner.StartAddressOfRawData;
+    const uint64_t total = raw + owner.SizeOfZeroFill;
+    if (owner.EndAddressOfRawData < owner.StartAddressOfRawData || total > capacity)
+        return "the owner's TLS (" + std::to_string(total) + " bytes) does not fit gta6rt_tls_home_template (" +
+               std::to_string(capacity) + " bytes)";
+    const size_t array_off = file_offset(file, nt, array_rva, capacity);
+    const auto tls_dir = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
+    const size_t tls_off = file_offset(file, nt, tls_dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64));
+    if (array_off == SIZE_MAX || !tls_dir.Size || tls_off == SIZE_MAX)
+        return "gta6rt_tls_host.dll's TLS directory or home template lies outside its file";
+    std::memcpy(file.data() + array_off, reinterpret_cast<const void*>(owner.StartAddressOfRawData), raw);
+    std::memset(file.data() + array_off + raw, 0, capacity - raw);
+    auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(file.data() + tls_off);
+    tls->StartAddressOfRawData = nt->OptionalHeader.ImageBase + array_rva;
+    tls->EndAddressOfRawData = tls->StartAddressOfRawData + total;
+    tls->SizeOfZeroFill = 0;
+    tls->Characteristics =
+        (tls->Characteristics & ~IMAGE_SCN_ALIGN_MASK) | (owner.Characteristics & IMAGE_SCN_ALIGN_MASK);
+    return {};
+}
 
 std::string module_file_name(HMODULE module) {
     wchar_t path[MAX_PATH];
@@ -384,241 +487,75 @@ std::string module_file_name(HMODULE module) {
     return out;
 }
 
-// Empty on success, else why index 0 has no single movable owner.
-std::string find_index0_owner(Index0Owner& owner) {
-    std::vector<HMODULE> modules(256);
-    DWORD needed = 0;
-    for (;;) {
-        const DWORD bytes = static_cast<DWORD>(modules.size() * sizeof(HMODULE));
-        if (!EnumProcessModules(GetCurrentProcess(), modules.data(), bytes, &needed))
-            return "the process's modules cannot be listed";
-        if (needed <= bytes) break;
-        modules.resize(needed / sizeof(HMODULE) + 16);  // a DLL loaded in between needs room too
-    }
-    modules.resize(needed / sizeof(HMODULE));
-    int found = 0;
-    HMODULE owner_module = nullptr;
-    for (HMODULE module : modules) {
-        auto* base = reinterpret_cast<uint8_t*>(module);
-        auto* nt = at<IMAGE_NT_HEADERS64>(base, reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
-        const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
-        if (!dir.Size || !dir.VirtualAddress) continue;
-        auto* tls = at<IMAGE_TLS_DIRECTORY64>(base, dir.VirtualAddress);
-        if (!tls->AddressOfIndex || *reinterpret_cast<DWORD*>(tls->AddressOfIndex) != 0) continue;
-        ++found;
-        owner_module = module;
-        owner.base = base;
-        owner.size = nt->OptionalHeader.SizeOfImage;
-        owner.index = reinterpret_cast<DWORD*>(tls->AddressOfIndex);
-    }
-    if (found == 0) return "no module holds it";
-    if (found > 1) return "more than one module reports it";
-    owner.name = module_file_name(owner_module);
-    // The helpers are loaded after the EXE, so one of them holds index 0 only in a process whose EXE has no TLS; DLL
-    // slot 0 then already maps DLLs there.
-    for (const auto& host : g_tls_hosts)
-        if (host.module == owner_module) return "it belongs to gta6rt_tls_host.dll";
-    return {};
+// The move on the calling thread, kept apart so that no frame of reserve_index0 holds a slot address across it. After
+// it the owner's live block is at `home` and slot 0 holds the home clone's fresh copy, which nothing reads.
+__declspec(noinline) void move_index0_on_this_thread(DWORD* owner_index, DWORD home) {
+    void** slots = module_tls_slots();
+    std::swap(slots[0], slots[home]);
+    *owner_index = home;
 }
 
-using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
-using LdrLockLoaderLockFn = LONG(NTAPI*)(ULONG, ULONG*, ULONG_PTR*);
-using LdrUnlockLoaderLockFn = LONG(NTAPI*)(ULONG, ULONG_PTR);
+// See reserve_tls_index0. Empty on success, else why not; nothing has changed then. g_tls_alloc_mutex held. It reads
+// no thread_local data and runs no code that does, before or after the move.
+std::string reserve_index0() {
+    // Windows gives index 0 to the process executable when it has TLS; a DLL can only hold it in a process whose EXE
+    // has none, and a DLL that is still loading or was loaded without its references resolved shows 0 too.
+    const HMODULE exe = GetModuleHandleW(nullptr);
+    auto* base = reinterpret_cast<uint8_t*>(exe);
+    auto* nt = at<IMAGE_NT_HEADERS64>(base, reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
+    if (!dir.Size || !dir.VirtualAddress) return "the process executable has no TLS, so index 0 is not its";
+    const IMAGE_TLS_DIRECTORY64 owner = *at<IMAGE_TLS_DIRECTORY64>(base, dir.VirtualAddress);
+    auto* owner_index = reinterpret_cast<DWORD*>(owner.AddressOfIndex);
+    if (!owner_index) return "the process executable's TLS directory has no index";
+    if (*owner_index != 0) return "the process executable's _tls_index is " + std::to_string(*owner_index) + ", not 0";
+    if (!module_tls_slots()) return "this thread has no TLS array";
+    if (!ensure_primary_tls_host())
+        return "gta6rt_tls_host.dll is missing, has no module TLS index or lacks gta6rt_tls_host_set_thread_event";
 
-struct ThreadBasicInformation {  // THREAD_BASIC_INFORMATION (NtQueryInformationThread class 0)
-    LONG exit_status;
-    PVOID teb;
-    PVOID process_id;
-    PVOID thread_id;
-    ULONG_PTR affinity;
-    LONG priority;
-    LONG base_priority;
-};
+    std::vector<uint8_t> image;
+    try {
+        image = read_file(tls_host_base_path());
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    if (std::string why = make_home_clone_image(image, owner); !why.empty()) return why;
+    std::filesystem::path path;
+    const TlsHostModule home = load_tls_host_clone(L"home", path, &image);
+    if (home.index == TLS_OUT_OF_INDEXES) return "the home clone of gta6rt_tls_host.dll cannot be loaded";
+    auto drop = [&](std::string why) {
+        FreeLibrary(home.module);  // safe until the move below: nothing lives at its index yet
+        DeleteFileW(path.c_str());
+        return why;
+    };
+    bool taken = home.index == 0 || home.index >= kMaxModuleTlsSlots;
+    for (const auto& host : g_tls_hosts) taken |= host.index == home.index;
+    if (taken) return drop("the home clone got an unusable module TLS index");
+    // The OS must have taken the changed directory: the mapped clone's template is the owner's, at full size.
+    auto* home_base = reinterpret_cast<uint8_t*>(home.module);
+    auto* home_nt = at<IMAGE_NT_HEADERS64>(home_base, reinterpret_cast<IMAGE_DOS_HEADER*>(home_base)->e_lfanew);
+    const auto* home_tls =
+        at<IMAGE_TLS_DIRECTORY64>(home_base, directory(home_nt, IMAGE_DIRECTORY_ENTRY_TLS).VirtualAddress);
+    const uint64_t raw = owner.EndAddressOfRawData - owner.StartAddressOfRawData;
+    if (home_tls->EndAddressOfRawData - home_tls->StartAddressOfRawData != raw + owner.SizeOfZeroFill ||
+        std::memcmp(reinterpret_cast<const void*>(home_tls->StartAddressOfRawData),
+                    reinterpret_cast<const void*>(owner.StartAddressOfRawData), raw) != 0)
+        return drop("the home clone's mapped TLS template is not the owner's");
 
-struct OtherThread {
-    HANDLE handle = nullptr;
-    uint8_t* teb = nullptr;
-    bool suspended = false;
-};
-
-enum class SwapResult { Done, Busy, Failed };
-
-// One attempt at the swap, with every other thread of the process stopped. The exclusive g_tls_lock keeps every
-// thread event out, and with it the adoption on threads that start meanwhile. Busy: a thread was stopped inside the
-// owner's code, perhaps between its load of _tls_index and its read of the slot, so the caller resumes everything and
-// tries again. Measured in ntdll (Windows 11 26300): a starting thread fills its whole TLS array before it stores it in
-// its TEB (LdrpAllocateTls), an ending one clears that TEB field before it frees the blocks (LdrpFreeTls), and
-// LoadLibrary of a DLL with TLS has the kernel update every thread's array in one system call (NtSetInformationProcess,
-// class 0x23), which GetThreadContext below waits out on the calling thread. So an array seen here is complete and
-// still owned; a thread with none yet gets one with the owner's block at 0 and adopts the swap in DLL_THREAD_ATTACH.
-// Wine builds a starting thread's array and grows every thread's array for LoadLibrary in user mode, both under its
-// loader lock, so the Windows loader lock is held as well; it comes before g_tls_lock, the order the thread events
-// (run under it) take them in.
-SwapResult swap_index0_on_all_threads(const Index0Owner& owner, DWORD home, DWORD mark, std::string& error) {
-    static const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    static const auto query =
-        reinterpret_cast<NtQueryInformationThreadFn>(GetProcAddress(ntdll, "NtQueryInformationThread"));
-    static const auto lock_loader = reinterpret_cast<LdrLockLoaderLockFn>(GetProcAddress(ntdll, "LdrLockLoaderLock"));
-    static const auto unlock_loader =
-        reinterpret_cast<LdrUnlockLoaderLockFn>(GetProcAddress(ntdll, "LdrUnlockLoaderLock"));
-    if (!query || !lock_loader || !unlock_loader) {
-        error = "ntdll lacks NtQueryInformationThread or the loader lock calls";
-        return SwapResult::Failed;
-    }
-    ULONG disposition = 0;
-    ULONG_PTR cookie = 0;
-    if (lock_loader(0, &disposition, &cookie) < 0) {
-        error = "the Windows loader lock cannot be taken";
-        return SwapResult::Failed;
-    }
-    struct LoaderUnlock {
-        ULONG_PTR cookie;
-        ~LoaderUnlock() { unlock_loader(0, cookie); }
-    } loader_unlock{cookie};
-    ExclusiveTlsLock lock;
-
-    // Listed under the lock: a thread that starts later runs its DLL_THREAD_ATTACH after the swap and adopts it there
-    // (adopt_index0_move_on_this_thread).
-    std::vector<OtherThread> threads;
-    {
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) {
-            error = "the process's threads cannot be listed";
-            return SwapResult::Failed;
-        }
-        THREADENTRY32 entry{};
-        entry.dwSize = sizeof(entry);
-        const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
-        for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
-            if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
-            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | SYNCHRONIZE,
-                                  FALSE, entry.th32ThreadID);
-            if (!h) continue;  // ended since the snapshot
-            ThreadBasicInformation info{};
-            if (query(h, 0, &info, sizeof(info), nullptr) < 0 || !info.teb) {
-                CloseHandle(h);
-                continue;
-            }
-            threads.push_back({h, static_cast<uint8_t*>(info.teb)});
-        }
-        CloseHandle(snapshot);
-    }
-
-    // From the first SuspendThread to the last ResumeThread nothing below allocates or takes a lock: a stopped thread
-    // can hold the heap lock.
-    bool busy = false;
-    for (auto& t : threads) {
-        if (SuspendThread(t.handle) == static_cast<DWORD>(-1)) {
-            if (WaitForSingleObject(t.handle, 0) == WAIT_OBJECT_0) continue;  // it ended; its TEB is gone
-            busy = true;  // a live thread left unswapped would read the helper's block for the owner's
-            break;
-        }
-        t.suspended = true;
-        // SuspendThread only asks; GetThreadContext returns once the thread has stopped.
-        CONTEXT context{};
-        context.ContextFlags = CONTEXT_CONTROL;
-        if (!GetThreadContext(t.handle, &context)) {
-            if (WaitForSingleObject(t.handle, 0) == WAIT_OBJECT_0) continue;  // it ended; its TEB is gone
-            busy = true;
-            break;
-        }
-        if (context.Rip - reinterpret_cast<uint64_t>(owner.base) < owner.size) {
-            busy = true;
-            break;
-        }
-    }
-    if (!busy) {
-        for (auto& t : threads) {
-            if (!t.suspended || WaitForSingleObject(t.handle, 0) == WAIT_OBJECT_0) continue;
-            // No array yet: the thread is still starting, and its DLL_THREAD_ATTACH adopts the swap.
-            auto** slots = *reinterpret_cast<void***>(t.teb + kTebTlsPointer);
-            if (!slots) continue;
-            std::swap(slots[0], slots[home]);
-            reinterpret_cast<void**>(t.teb + kTebTlsSlots)[mark] = reinterpret_cast<void*>(1);
-        }
-        // The owner's code reads the new index from here on, this thread's included.
-        void** own = module_tls_slots();
-        std::swap(own[0], own[home]);
-        TlsSetValue(mark, reinterpret_cast<void*>(1));
-        *owner.index = home;
-        g_index0.moved = true;
-    }
-    for (auto& t : threads) {
-        if (t.suspended) ResumeThread(t.handle);
-        CloseHandle(t.handle);
-    }
-    return busy ? SwapResult::Busy : SwapResult::Done;
-}
-
-// Frees module TLS index 0 for a mapped executable (see kMainImageSlot): loads the home clone, then swaps slots 0
-// and home on every thread and writes home into the owner's _tls_index. Empty on success (also when it was done
-// before), else why not; nothing has changed then. Must be called with g_tls_alloc_mutex held and WITHOUT g_tls_lock
-// held. Never inlined, so the caller reads its own thread_local data through the new index once this returns.
-__declspec(noinline) std::string move_index0_owner() {
-    if (g_index0.moved) return {};
-    if (!ensure_primary_tls_host()) return "gta6rt_tls_host.dll is missing or has no module TLS index";
-    Index0Owner owner;
-    if (std::string why = find_index0_owner(owner); !why.empty()) return "module TLS index 0: " + why;
-    if (g_index0.home.index == TLS_OUT_OF_INDEXES) {
-        // Kept loaded for the process lifetime: FreeLibrary would make the OS free every thread's slot at its index,
-        // which holds the owner's block from now on. Not in g_tls_clones for that reason; the sweep of a later run
-        // deletes the file once this process has ended.
-        std::filesystem::path path;
-        TlsHostModule home = load_tls_host_clone(L"home", path);
-        if (home.index == TLS_OUT_OF_INDEXES) return "the TLS helper clone for index 0 cannot be loaded";
-        bool taken = home.index == 0 || home.index >= kMaxModuleTlsSlots;
-        for (const auto& host : g_tls_hosts) taken |= host.index == home.index;
-        if (taken) {
-            FreeLibrary(home.module);
-            DeleteFileW(path.c_str());
-            return "the TLS helper clone for index 0 got an unusable index";
-        }
-        g_index0.home = home;
-    }
-    if (g_index0.mark == TLS_OUT_OF_INDEXES) {
-        const DWORD mark = TlsAlloc();
-        if (mark == TLS_OUT_OF_INDEXES) return "no TlsAlloc slot is free";
-        if (mark >= 64) {  // another thread's TlsSlots can only be written for the first 64
-            TlsFree(mark);
-            return "no TlsAlloc slot below 64 is free";
-        }
-        g_index0.mark = mark;
-    }
     // _tls_index sits in .data; made writable first in case a linker merged it into a read-only section.
     DWORD old_protect = 0;
-    if (!VirtualProtect(owner.index, sizeof(DWORD), PAGE_READWRITE, &old_protect))
-        return "the owner's _tls_index cannot be written";
-    // A thread caught in the owner's code usually leaves it within microseconds; one that keeps computing there for
-    // the whole budget makes the move give up (the executable then maps with a helper index), and a later executable
-    // tries again.
-    std::string error;
-    SwapResult result = SwapResult::Busy;
-    const ULONGLONG give_up = GetTickCount64() + 250;
-    for (bool first = true; result == SwapResult::Busy && (first || GetTickCount64() < give_up); first = false) {
-        if (!first) Sleep(1);
-        result = swap_index0_on_all_threads(owner, g_index0.home.index, g_index0.mark, error);
-    }
-    VirtualProtect(owner.index, sizeof(DWORD), old_protect, &old_protect);
-    if (result == SwapResult::Busy) return "a thread kept running inside " + owner.name;
-    if (result == SwapResult::Failed) return error;
-    if (startup_trace::enabled())
-        startup_trace::event("tls_index0", "\"owner\":" + startup_trace::quote(owner.name) +
-                                               ",\"moved_to\":" + std::to_string(g_index0.home.index));
-    return {};
-}
+    if (!VirtualProtect(owner_index, sizeof(DWORD), PAGE_READWRITE, &old_protect))
+        return drop("the owner's _tls_index cannot be written");
+    move_index0_on_this_thread(owner_index, home.index);
+    VirtualProtect(owner_index, sizeof(DWORD), old_protect, &old_protect);
 
-// Puts a thread started after the move in the same state as the threads the move swapped. Called first in this
-// thread's DLL_THREAD_ATTACH, under the shared lock, before anything reads the runtime's own thread_local data: the
-// OS built this thread's array with the owner's block at 0 and the home clone's at home. DLLs loaded before the
-// helper get their DLL_THREAD_ATTACH earlier, and the EXE's TLS callbacks run later (measured on Windows 11 26300:
-// DllMain of every DLL, then the EXE's callbacks, for attach and for detach), so only runtime code a vectored
-// exception handler runs in that window would read the home clone's block in place of its own.
-void adopt_index0_move_on_this_thread() {
-    if (!g_index0.moved || TlsGetValue(g_index0.mark)) return;
-    void** slots = module_tls_slots();
-    if (!slots) return;
-    std::swap(slots[0], slots[g_index0.home.index]);
-    TlsSetValue(g_index0.mark, reinterpret_cast<void*>(1));
+    // Kept loaded for the process lifetime: FreeLibrary would make the OS free every thread's block at its index, the
+    // owner's from now on. Not in g_tls_clones for that reason; a later run's sweep deletes the file.
+    g_index0.home = home;
+    const std::string name = module_file_name(exe);
+    std::snprintf(g_index0.owner, sizeof(g_index0.owner), "%s", name.c_str());
+    g_index0.moved = true;
+    return {};
 }
 
 // Puts the helper DLL's own block back in this thread's slot and frees the copy that replaced it. Uses only this
@@ -711,24 +648,38 @@ void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
     }
 }
 
-// The body of on_host_thread_event, called with the shared lock held. A new thread gets its own copy of each active
-// TLS owner's template; an ending one gives each helper's block back before the Windows loader frees it. TLS callbacks
-// get the thread events only after the module's DLL_PROCESS_ATTACH (initialise()), as the Windows loader orders them.
-// The mapped executable comes last both ways, as Windows runs an EXE's TLS callbacks after every DllMain for attach
-// and for detach (measured on Windows 11 26300); kMainImageSlot is the highest slot, so attach runs in slot order and
-// detach runs the DLL slots in reverse and that slot after them.
-__declspec(noinline) void deliver_thread_event(DWORD reason) {
+// Runs in gta6rt_tls_host.dll's DllMain for each thread the process starts or ends once the helper is loaded, under
+// the Windows loader lock, on that thread. A new thread gets its own copy of each active TLS owner's template; an
+// ending one gives each helper's block back before the Windows loader frees it. TLS callbacks get the thread events
+// only after the module's DLL_PROCESS_ATTACH (initialise()), as the Windows loader orders them. Windows allocates
+// every module's block before the first DllMain of a new thread, and runs an EXE's TLS callbacks after every DllMain,
+// for attach and for detach (measured on Windows 11 26300). So attach installs all copies first and then runs the
+// callbacks, the DLL slots in order and the executable's last; detach runs the DLL slots in reverse and then the
+// executable's slot, each releasing its copy after its callbacks.
+void __cdecl on_host_thread_event(DWORD reason) {
+    SharedTlsLock lock;
     // The try/catch is per slot: a throw from one module's install or callbacks must not take the thread events
     // away from the other slots. Nothing may leave DllMain.
     if (reason == DLL_THREAD_ATTACH) {
+        std::array<Module*, kTlsSlotCount> installed{};
         for (size_t slot = 0; slot < kTlsSlotCount; ++slot) {
             Module* m = g_tls_slot_owners[slot].load();
             if (!m) continue;
             try {
                 install_thread_block(*m);
-                if (m->initialised) run_callbacks(*m, DLL_THREAD_ATTACH);
+                installed[slot] = m;
             } catch (const std::exception& e) {
-                // The thread runs on without this module's TLS; later slots still get theirs.
+                // The thread runs on without this module's TLS (and its callbacks); later slots still get theirs.
+                std::fprintf(stderr, "[rt] loader: thread attach, slot %zu (%s): %s\n", slot, m->name.c_str(),
+                             e.what());
+            }
+        }
+        for (size_t slot = 0; slot < kTlsSlotCount; ++slot) {
+            Module* m = installed[slot];
+            if (!m || !m->initialised) continue;
+            try {
+                run_callbacks(*m, DLL_THREAD_ATTACH);
+            } catch (const std::exception& e) {
                 std::fprintf(stderr, "[rt] loader: thread attach, slot %zu (%s): %s\n", slot, m->name.c_str(),
                              e.what());
             }
@@ -753,15 +704,6 @@ __declspec(noinline) void deliver_thread_event(DWORD reason) {
             }
         }
     }
-}
-
-// Runs in gta6rt_tls_host.dll's DllMain for each thread the process starts or ends once the helper is loaded, under
-// the Windows loader lock, on that thread. It reads no thread_local data itself: on a new thread the index-0 move has
-// to be adopted before the runtime's own TLS is where its _tls_index says (deliver_thread_event is not inlined).
-void __cdecl on_host_thread_event(DWORD reason) {
-    SharedTlsLock lock;
-    if (reason == DLL_THREAD_ATTACH) adopt_index0_move_on_this_thread();
-    deliver_thread_event(reason);
 }
 
 // The Xbox builds of the MSVC runtime import the same CRT the desktop does, so the host's own copies are used.
@@ -841,6 +783,18 @@ void redirect_pc_to_file_header_at(const void* resolved) {
 
 // Declared in pe_loader.h; the body needs the internal clone registry above.
 void cleanup_tls_clones() { cleanup_tls_clones_internal(); }
+
+bool reserve_tls_index0(std::string* why) {
+    std::lock_guard alloc_lock(g_tls_alloc_mutex);
+    static bool attempted = false;  // once: a later attempt could meet threads that already run this EXE's code
+    if (!attempted) {
+        attempted = true;
+        const std::string reason = reserve_index0();
+        std::snprintf(g_index0.why, sizeof(g_index0.why), "%s", reason.c_str());
+    }
+    if (why) *why = g_index0.moved ? std::string() : std::string(g_index0.why);
+    return g_index0.moved;
+}
 
 namespace {
 bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t& rva) {
@@ -1261,18 +1215,22 @@ void Loader::initialize_tls(Module& m) {
     {
         std::lock_guard alloc_lock(g_tls_alloc_mutex);
         if (executable) {
-            // Load/clone OUTSIDE ExclusiveTlsLock, as below; the move takes that lock itself.
-            std::string why = move_index0_owner();
-            if (why.empty() && g_tls_slot_owners[kMainImageSlot].load() == nullptr) {
+            if (g_index0.moved && g_tls_slot_owners[kMainImageSlot].load() == nullptr) {
                 slot = kMainImageSlot;
                 index = 0;
+                if (!g_index0.traced && startup_trace::enabled()) {
+                    g_index0.traced = true;
+                    startup_trace::event("tls_index0", "\"owner\":" + startup_trace::quote(g_index0.owner) +
+                                                           ",\"moved_to\":" + std::to_string(g_index0.home.index));
+                }
             } else {
-                // Mapped on as a DLL is: code that reads _tls_index works, /GA code reads another image's slot 0.
-                if (why.empty()) why = "another mapped executable holds it";
+                // Mapped on as a DLL is: its code that reads _tls_index works, but its /GA code would read and write
+                // the block in slot 0, which is the runtime's own TLS or the other executable's. gta6rt refuses to
+                // run such an image (main.cpp); a Loader user must not run its code either.
                 std::fprintf(stderr,
-                             "[rt] loader: %s does not get module TLS index 0 (%s); its code built with /GA will not "
-                             "find its TLS\n",
-                             m.name.c_str(), why.c_str());
+                             "[rt] loader: %s does not get module TLS index 0 (%s); its code built with /GA would use "
+                             "another module's TLS\n",
+                             m.name.c_str(), g_index0.moved ? "another mapped executable holds it" : g_index0.why);
             }
         }
         if (slot == kTlsSlotCount) {

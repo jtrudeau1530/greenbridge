@@ -49,8 +49,9 @@ struct Module {
     // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves distinct indices by loading
     // gta6rt_tls_host.dll (and cloning it on demand for additional simultaneous TLS modules, up to 16 at a time).
     // An executable gets index 0, as Windows gives the process EXE, because code built with /GA reads slot 0 without
-    // _tls_index: the first time one is mapped, the runtime's own EXE moves its block to a helper clone's index on
-    // every thread. Only one executable holds index 0 at a time; another one mapped meanwhile gets a helper index.
+    // _tls_index. That needs reserve_tls_index0() at process start; without it, and for a second executable mapped
+    // while one holds index 0, the executable gets a helper index and a note on stderr, and its /GA code would use
+    // another module's TLS, so its code must not run (gta6rt refuses).
     // Every thread started after load() gets its own copy through the helper's DLL_THREAD_ATTACH, and gives it back
     // at DLL_THREAD_DETACH; install_tls_for_thread() is for threads that already existed.
     uint32_t tls_index = kNoTlsIndex;
@@ -138,6 +139,14 @@ private:
 // registers this with atexit; a caller that ends with ExitProcess must invoke it directly, because ExitProcess
 // skips the atexit table. Call it when no mapped code can run again: it unmaps the helper images.
 void cleanup_tls_clones();
+
+// Moves the runtime's own EXE off module TLS index 0, which Windows gave it, so that a mapped executable can have it
+// (Module::tls_index): its TLS moves to the index of one more helper clone, whose template is a copy of the EXE's.
+// Call it once at process start, before any other thread has run this EXE's code (gta6rt does it from a CRT
+// initializer): MSVC code keeps the address of its TLS slot across calls, so a thread that is already running cannot
+// be moved, and its TLS would stay at index 0. Returns false, with the reason in *why, when it cannot; later calls
+// return the first result.
+bool reserve_tls_index0(std::string* why = nullptr);
 
 std::string lower(std::string s);
 

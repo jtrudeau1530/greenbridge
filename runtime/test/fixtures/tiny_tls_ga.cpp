@@ -3,7 +3,7 @@
 // Built /GA (CMakeLists.txt), the EXE-only option that lets the compiler assume the image is the process executable
 // and so has module TLS index 0: every thread_local access below reads TEB->ThreadLocalStoragePointer[0] directly
 // (mov rax, gs:[58h]; mov rax, [rax]) and never loads _tls_index. Mapped with any other index, the getter reads
-// whatever block sits in slot 0. loader_main_tls_test calls the exports on threads of its own; under
+// whatever block sits in slot 0. loader_tls_index0_test calls the exports on threads of its own; under
 // `gta6rt --run` (run_tiny_tls_ga) main() checks the value on the game thread and on a second thread and returns 0
 // only when both read the template value 42.
 #include <cstdio>
