@@ -201,6 +201,7 @@ class Gen:
         self.lds_dwords = 16384        # CS: set from RSRC2 LDS_SIZE (power of two, covers every offset used)
         self.lds_need = 0              # CS: dwords the program needs (LDS_SIZE, largest constant offset)
         self.lds_declared = 0          # CS: dwords RSRC2 LDS_SIZE allocates (the hardware allocation, unclipped)
+        self.lds_bound = None          # CS: bounds-checked LDS (dwords): out of range reads 0, writes are dropped
         self.cs = None             # CS: user SGPR count, enabled workgroup ids, thread-id VGPR count, group size
         self.ms = None             # MS: {"maxv", "maxp", "threads"} from PSV0
         self.ms_params = set()     # MS: param export indices used
@@ -2584,12 +2585,55 @@ class Gen:
         s1, i, m, p = self.tmp(), self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{s1} = OpIAdd %uint {addr} {self.cu(byte_off)}")
         self.emit(f"{i} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
-        if self.lds_dwords & (self.lds_dwords - 1):     # shrunk to fit the limit (fit_shared_memory)
-            self.emit(f"{m} = OpUMod %uint {i} {self.cu(self.lds_dwords)}")
-        else:
-            self.emit(f"{m} = OpBitwiseAnd %uint {i} {self.cu(self.lds_dwords - 1)}")
+        self.emit(f"{m} = OpBitwiseAnd %uint {i} {self.cu(self.lds_dwords - 1)}")
         self.emit(f"{p} = OpAccessChain %_ptr_WG_uint %lds {m}")
         return p
+
+    def lds_access(self, addr, byte_off, fn):
+        """One LDS dword access: fn(pointer) emits it and returns its uint result id (a load, an atomic's old value)
+        or None (a store). Without lds_bound this is fn(lds_ptr(...)), the wrapped access shaders always had. With
+        it (SHADER-309: the program reaches past its RSRC2 allocation, or the array was shrunk to it), the dword
+        index is checked: RDNA2 LDS does not wrap, an access outside the allocation reads 0 and its write is dropped
+        (RDNA2 ISA sections 3.6.1 and 3.6.6), so the access runs only in range and the result is 0 otherwise."""
+        if self.lds_bound is None:
+            return fn(self.lds_ptr(addr, byte_off))
+        s1, i, ok, p = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        pre, do, end = self.tmp() + "_lb", self.tmp() + "_lin", self.tmp() + "_lend"
+        self.emit(f"{s1} = OpIAdd %uint {addr} {self.cu(byte_off)}")
+        self.emit(f"{i} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
+        self.emit(f"{ok} = OpULessThan %bool {i} {self.cu(self.lds_bound)}")
+        self.emit(f"OpBranch {pre}")
+        self.emit(f"{pre} = OpLabel")
+        self.emit(f"OpSelectionMerge {end} None")
+        self.emit(f"OpBranchConditional {ok} {do} {end}")
+        self.emit(f"{do} = OpLabel")
+        self.emit(f"{p} = OpAccessChain %_ptr_WG_uint %lds {i}")
+        r = fn(p)
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
+        if r is None:
+            return None
+        v = self.tmp()
+        self.emit(f"{v} = OpPhi %uint {r} {do} {self.cu(0)} {pre}")
+        return v
+
+    def lds_load(self, addr, byte_off):
+        def f(p):
+            v = self.tmp()
+            self.emit(f"{v} = OpLoad %uint {p}")
+            return v
+        return self.lds_access(addr, byte_off, f)
+
+    def lds_store(self, addr, byte_off, val):
+        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val}"))
+
+    def lds_atomic(self, addr, byte_off, rest):
+        """`rest` is the atomic instruction after its result id, with {p} where the pointer goes."""
+        def f(p):
+            v = self.tmp()
+            self.emit(f"{v} = " + rest.replace("{p}", p))
+            return v
+        return self.lds_access(addr, byte_off, f)
 
     def lds_op(self, op, a, mods):
         """LDS (GFX10 DS encoding). Addresses are bytes. offset:N is bytes; read2/write2 offset0/offset1 count
@@ -2611,14 +2655,13 @@ class Gen:
         if op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
             addr = self.src_u(a[1])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
-                v = self.tmp()
-                self.emit(f"{v} = OpLoad %uint {self.lds_ptr(addr, off + 4 * k)}")
+                v = self.lds_load(addr, off + 4 * k)
                 self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, v)
         elif op in ("ds_write_b32", "ds_write_b64", "ds_write_b96", "ds_write_b128"):
             addr = self.src_u(a[0])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
                 v = self.load_reg("vgpr", a[1]["r"] + k)
-                self.emit(f"OpStore {self.lds_ptr(addr, off + 4 * k)} {v}")
+                self.lds_store(addr, off + 4 * k, v)
         elif op in ("ds_read2_b32", "ds_read2st64_b32", "ds_write2_b32", "ds_write2st64_b32",
                     "ds_read2_b64", "ds_read2st64_b64", "ds_write2_b64", "ds_write2st64_b64"):
             # Two elements at ADDR + offset0 * unit and ADDR + offset1 * unit; unit = element size (4 or 8 bytes),
@@ -2632,9 +2675,7 @@ class Gen:
                 vals = []
                 for o in offs:
                     for w in range(words):
-                        v = self.tmp()
-                        self.emit(f"{v} = OpLoad %uint {self.lds_ptr(addr, o + 4 * w)}")
-                        vals.append(v)
+                        vals.append(self.lds_load(addr, o + 4 * w))
                 for k, v in enumerate(vals):         # every load before the first write (vdst may alias vaddr)
                     self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, v)
             else:
@@ -2648,7 +2689,7 @@ class Gen:
                             v = self.load_reg("vgpr", data["r"] + w)
                         else:
                             raise Unsupported(op + " data")
-                        self.emit(f"OpStore {self.lds_ptr(addr, o + 4 * w)} {v}")
+                        self.lds_store(addr, o + 4 * w, v)
         elif op in ("ds_read_u16", "ds_read_i16", "ds_read_u8", "ds_read_i8", "ds_read_u16_d16_hi", "ds_read_u16_d16",
                     "ds_read_u8_d16", "ds_read_u8_d16_hi", "ds_read_i8_d16", "ds_read_i8_d16_hi"):
             bits = 16 if "16" in op.split("_")[2] else 8
@@ -2657,7 +2698,7 @@ class Gen:
             self.emit(f"{s1} = OpIAdd %uint {addr} {self.cu(off)}")
             self.emit(f"{sh} = OpShiftLeftLogical %uint {s1} {self.cu(3)}")     # byte address -> bit offset
             self.emit(f"{sh2} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
-            self.emit(f"{w} = OpLoad %uint {self.lds_ptr(addr, off)}")
+            w = self.lds_load(addr, off)
             f = "OpBitFieldSExtract" if op.split("_")[2].startswith("i") else "OpBitFieldUExtract"
             self.emit(f"{v} = {f} %uint {w} {sh2} {self.cu(bits)}")
             d = a[0]
@@ -2686,15 +2727,16 @@ class Gen:
             self.emit(f"{pos} = OpShiftLeftLogical %uint {fld} {sh2}")
             self.emit(f"{msk} = OpShiftLeftLogical %uint {self.cu((1 << bits) - 1)} {sh2}")
             self.emit(f"{inv} = OpNot %uint {msk}")
-            p = self.lds_ptr(addr, off)
-            t1, t2 = self.tmp(), self.tmp()
-            self.emit(f"{t1} = OpAtomicAnd %uint {p} {sc} {sem} {inv}")
-            self.emit(f"{t2} = OpAtomicOr %uint {p} {sc} {sem} {pos}")
+
+            def sub_dword(p):
+                t1, t2 = self.tmp(), self.tmp()
+                self.emit(f"{t1} = OpAtomicAnd %uint {p} {sc} {sem} {inv}")
+                self.emit(f"{t2} = OpAtomicOr %uint {p} {sc} {sem} {pos}")
+            self.lds_access(addr, off, sub_dword)
         elif name in self.LDS_ATOMICS:
             d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
-            p = self.lds_ptr(self.src_u(ad), off)
-            old = self.tmp()
-            self.emit(f"{old} = {self.LDS_ATOMICS[name]} %uint {p} {sc} {sem} {self.src_u(dat)}")
+            old = self.lds_atomic(self.src_u(ad), off,
+                                  f"{self.LDS_ATOMICS[name]} %uint {{p}} {sc} {sem} {self.src_u(dat)}")
             if d is not None:
                 self.dst(d, old)
         elif op in ("ds_wrxchg2_rtn_b32", "ds_wrxchg2st64_rtn_b32"):
@@ -2707,9 +2749,8 @@ class Gen:
             addr = self.src_u(a[1])
             olds = []
             for k, name in enumerate(("offset0", "offset1")):
-                p = self.lds_ptr(addr, self.mod_int(mods, name, 0) * unit)
-                old = self.tmp()
-                self.emit(f"{old} = OpAtomicExchange %uint {p} {sc} {sem} {self.src_u(a[2 + k])}")
+                old = self.lds_atomic(addr, self.mod_int(mods, name, 0) * unit,
+                                      f"OpAtomicExchange %uint {{p}} {sc} {sem} {self.src_u(a[2 + k])}")
                 olds.append(old)
             for k, old in enumerate(olds):           # both exchanges before the first write (vdst may alias)
                 self.dst({"k": "vgpr", "r": d["r"] + k, "n": 1}, old)
@@ -2734,8 +2775,7 @@ class Gen:
             olds = []
             for o, val in zip(offs, vals):
                 for w in range(2):
-                    old = self.tmp()
-                    self.emit(f"{old} = OpAtomicExchange %uint {self.lds_ptr(addr, o + 4 * w)} {sc} {sem} {val[w]}")
+                    old = self.lds_atomic(addr, o + 4 * w, f"OpAtomicExchange %uint {{p}} {sc} {sem} {val[w]}")
                     olds.append(old)
             for k, old in enumerate(olds):           # every exchange before the first write (vdst may alias)
                 self.dst({"k": "vgpr", "r": d["r"] + k, "n": 1}, old)
@@ -2753,8 +2793,7 @@ class Gen:
             vals = [self.load_reg("vgpr", dat["r"] + w) for w in range(2)]
             olds = []
             for w in range(2):
-                old = self.tmp()
-                self.emit(f"{old} = {k} %uint {self.lds_ptr(addr, off + 4 * w)} {sc} {sem} {vals[w]}")
+                old = self.lds_atomic(addr, off + 4 * w, f"{k} %uint {{p}} {sc} {sem} {vals[w]}")
                 olds.append(old)
             if d is not None:
                 for w in range(2):
@@ -2762,9 +2801,8 @@ class Gen:
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
             # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
-            p = self.lds_ptr(self.src_u(ad), off)
-            old = self.tmp()
-            self.emit(f"{old} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {self.src_u(src)} {self.src_u(cmp_)}")
+            old = self.lds_atomic(self.src_u(ad), off, f"OpAtomicCompareExchange %uint {{p}} {sc} {sem} {sem} "
+                                  f"{self.src_u(src)} {self.src_u(cmp_)}")
             if d is not None:
                 self.dst(d, old)
         else:
@@ -2843,14 +2881,15 @@ class Gen:
         """SHADER-309: a compute shader's Workgroup memory, the LDS array plus %x_buf, must fit in MAX_SHARED_BYTES
         (#1721: RADV dies on a module 4 bytes over 64 KiB; the device's own limit is the runtime's check). Called before any code is generated. The LDS array is a
         power of two at least the program's need; when that plus %x_buf is over the limit but the need still fits,
-        the array shrinks to what is left (lds_ptr then wraps with OpUMod; addresses below the need are unchanged).
-        %x_buf is already sized to the workgroup, so when even the need does not fit, assemble refuses the shader."""
+        the array shrinks to the RSRC2 allocation and its accesses are bounds-checked (lds_access), as hardware checks
+        them. %x_buf is already sized to the workgroup, so when even the allocation does not fit, assemble refuses
+        the shader."""
         if not self.cs:
             return
         room = (MAX_SHARED_BYTES - self.x_buf_bytes()) // 4
-        if self.lds_dwords > room >= max(self.lds_need, 1):
-            self.lds_dwords = room
-            self.cu(room)
+        if self.lds_bound is None and self.lds_dwords > room >= max(self.lds_declared, 1):
+            self.lds_dwords = self.lds_bound = self.lds_declared
+            self.cu(self.lds_declared)
 
     def x_split(self):
         """End the current segment here: the rest of the block runs as a new segment in the next round."""
@@ -9554,13 +9593,13 @@ def assemble(gen):
         types += ["%v3uint = OpTypeVector %uint 3", "%_ptr_Input_v3u = OpTypePointer Input %v3uint"]
         gvars += ["%wg_id = OpVariable %_ptr_Input_v3u Input", "%local_id = OpVariable %_ptr_Input_v3u Input"]
         if gen.uses_lds:
-            types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
+            types += [f"%lds_arr = OpTypeArray %uint {gen.cu(max(gen.lds_dwords, 1))}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
             gvars += ["%lds = OpVariable %_ptr_WG_lds Workgroup"]
         # SHADER-309: what fit_shared_memory could not shrink. The LDS counts at its RSRC2 allocation when that is
         # larger than the array (clipped to 16384 dwords): a declared allocation over the cap is refused, not cut.
-        # A constant ds offset past 64 KiB is not counted: on hardware it is out of range (reads 0, writes dropped).
-        lds_b = 4 * max(gen.lds_dwords, gen.lds_declared) if gen.uses_lds else 0
+        # An access past the allocation is out of range on hardware (reads 0, writes dropped; lds_access).
+        lds_b = 4 * max(gen.lds_dwords, gen.lds_declared, 1) if gen.uses_lds else 0
         wg = lds_b + gen.x_buf_bytes()
         if wg > MAX_SHARED_BYTES:
             raise Unsupported(f"CS workgroup memory {wg} B (LDS {lds_b} B + "
@@ -10597,6 +10636,20 @@ def native_blob(path, name):
         return f.read()
 
 
+def ds_const_extent(op, key, value):
+    """Dwords from LDS address 0 to the end of the access a DS instruction's constant offset field `key` makes with
+    vaddr 0: `offset` counts bytes; read2/write2/wrxchg2 offset0/offset1 count elements (x64 for st64). The access
+    width is the instruction's (b8 1 byte ... b128 16), so an access ending at a 64 KiB allocation counts 16384."""
+    if key == "offset":
+        size = (16 if "b128" in op else 12 if "b96" in op else 8 if "b64" in op else
+                2 if re.search(r"_[uib]16", op) else 1 if re.search(r"_[uib]8", op) else 4)
+        start = value
+    else:
+        size = 8 if op.endswith("_b64") else 4
+        start = value * size * (64 if "st64" in op else 1)
+    return (start + size - 1) // 4 + 1
+
+
 def cs_dispatch_state(path, name):
     """(COMPUTE_PGM_RSRC2, group x, y, z): FSSM header words 0x138..0x144, or an FSPX program's kind-0 entry."""
     fssm, _, meta = native_paths(path, name)
@@ -10724,7 +10777,7 @@ def translate(path):
         g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
                 "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
         # LDS_SIZE [23:15] in 512-byte units (470 of 486 LDS-using CS stay below it; the rest index past it with
-        # constant offsets, so the array also covers the largest offset in the code).
+        # constant offsets, which RDNA2 treats as out of range: bounds-checked below, SHADER-309).
         need = ((rsrc2 >> 15) & 0x1FF) * 128
         for ins in insns:
             if not ins["op"].startswith("ds_") or ins["op"].startswith(("ds_swizzle", "ds_bpermute", "ds_permute")):
@@ -10733,18 +10786,23 @@ def translate(path):
                 k, _, v = m.partition(":")
                 if not v[:1].isdigit():
                     continue
-                if k == "offset":
-                    need = max(need, int(v, 0) // 4 + 4)
-                elif k in ("offset0", "offset1"):
-                    need = max(need, int(v, 0) * (64 if "st64" in ins["op"] else 1) * 2 + 4)
-        n = 16
-        while n < need:
-            n *= 2
-        g.lds_dwords = min(n, 16384)
-        g.lds_need = need
+                if k in ("offset", "offset0", "offset1"):
+                    need = max(need, ds_const_extent(ins["op"], k, int(v, 0)))
         g.lds_declared = ((rsrc2 >> 15) & 0x1FF) * 128
-        g.cu(g.lds_dwords)
-        g.cu(g.lds_dwords - 1)
+        g.lds_need = need
+        if need > g.lds_declared:
+            # SHADER-309: a constant offset reaches past the RSRC2 allocation. RDNA2 reads 0 and drops the write
+            # there instead of wrapping (ISA 3.6.1, 3.6.6), so the array is the allocation and every access is
+            # bounds-checked (lds_access). Shaders that stay inside it keep the wrapped power-of-two array.
+            g.lds_dwords = g.lds_bound = g.lds_declared
+            g.cu(g.lds_bound)
+        else:
+            n = 16
+            while n < need:
+                n *= 2
+            g.lds_dwords = min(n, 16384)
+        g.cu(max(g.lds_dwords, 1))
+        g.cu(max(g.lds_dwords, 1) - 1)
         for i in range(user, user + 3):
             g.cu(i)
     if stage == "ps":
