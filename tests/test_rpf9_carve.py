@@ -181,3 +181,60 @@ class LimitWindowTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def adat_archive(with_bank=True):
+    """Config streams, a raw `METADATA` decoy, then (optionally) a zero-stream AWC bank and a stream after it."""
+    cfg = [zlib.compress(b"config-%d " % i * 300) for i in range(2)]
+    after = zlib.compress(b"after the bank " * 200)
+    data = bytearray(b"9FPR" + struct.pack("<I", 0x40) + bytes(0x38))
+    for c in cfg:
+        data += c
+    data += b"\x00" * 16 + b"<METADATA>" + bytes(6)   # ADAT inside METADATA, its "header" is text and zeros
+    bank = len(data) + (-len(data)) % 0x10
+    data += bytes(bank - len(data))
+    if with_bank:
+        data += b"ADAT" + struct.pack("<III", 0, 0, 16)   # flags 0, no streams, a 16-byte header: a valid bank
+    data += bytes(64) + after + bytes(64)
+    return bytes(data), bank
+
+
+def carve_args(test, data, *args):
+    with tempfile.TemporaryDirectory() as tmp:
+        arc = os.path.join(tmp, "a.rpf")
+        out = os.path.join(tmp, "out")
+        with open(arc, "wb") as f:
+            f.write(data)
+        p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only", *args], capture_output=True,
+                           text=True)
+        test.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+            return json.load(f), p.stdout
+
+
+class CarveUntilAdatTest(unittest.TestCase):
+    """--until-adat: the audio config at the start of audio.rpf, ended by the first real AWC bank."""
+
+    def test_stops_at_the_first_valid_bank_not_at_metadata(self):
+        data, bank = adat_archive()
+        doc, out = carve_args(self, data, "--until-adat")
+        self.assertEqual(doc["summary"]["first_adat_bank"], bank)
+        self.assertEqual(doc["summary"]["files"], 2, "the stream after the bank must not be carved")
+        self.assertEqual(doc["summary"]["span"], bank - 0x40)
+        self.assertIn(f"first AWC bank at {bank:#x}", out)
+        whole, _ = carve_args(self, data)
+        self.assertEqual(whole["summary"]["files"], 3, "without the option the stream after the bank is carved")
+        self.assertNotIn("first_adat_bank", whole["summary"])
+
+    def test_no_bank_scans_the_whole_window(self):
+        data, _ = adat_archive(with_bank=False)
+        doc, out = carve_args(self, data, "--until-adat")
+        self.assertIsNone(doc["summary"]["first_adat_bank"])
+        self.assertEqual(doc["summary"]["files"], 3)
+        self.assertIn("no AWC bank", out)
+
+    def test_a_limit_before_the_bank_wins(self):
+        data, bank = adat_archive()
+        doc, _ = carve_args(self, data, "--until-adat", "--limit", str(0x20))
+        self.assertIsNone(doc["summary"]["first_adat_bank"])
+        self.assertEqual(doc["summary"]["span"], 0x20)
