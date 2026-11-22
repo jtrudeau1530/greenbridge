@@ -205,6 +205,84 @@ class ScalarInterpreter:
         return old0, old1
 
 
+class SIMDState:
+    """Models multi-lane SIMD wave state with shared Workgroup LDS."""
+
+    def __init__(
+        self,
+        num_lanes: int = 32,
+        exec_mask: int = MASK32,
+        lds_size_bytes: int = LDS_DEFAULT_SIZE_BYTES,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"SIMD num_lanes must be 32 or 64, got: {num_lanes}")
+        self.num_lanes: int = num_lanes
+        self.exec_mask: int = exec_mask & (MASK64 if num_lanes == 64 else MASK32)
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(num_lanes)]
+        self.lds_mem: bytearray = bytearray(lds_size_bytes)
+
+    def is_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx] & MASK32
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.vgprs[lane][reg_idx] = val & MASK32
+
+    def get_vgpr64(self, lane: int, pair: RegPair) -> int:
+        lo = self.get_vgpr(lane, pair.index)
+        hi = self.get_vgpr(lane, pair.index + 1)
+        return combine_u32s_to_u64(lo, hi)
+
+    def set_vgpr64(self, lane: int, pair: RegPair, val: int) -> None:
+        lo, hi = split_u64_to_u32s(val)
+        self.set_vgpr(lane, pair.index, lo)
+        self.set_vgpr(lane, pair.index + 1, hi)
+
+    def set_vgpr128(self, lane: int, quad: RegQuad, w0: int, w1: int, w2: int, w3: int) -> None:
+        self.set_vgpr(lane, quad.index, w0)
+        self.set_vgpr(lane, quad.index + 1, w1)
+        self.set_vgpr(lane, quad.index + 2, w2)
+        self.set_vgpr(lane, quad.index + 3, w3)
+
+
+class SIMDInterpreter:
+    """SIMD multi-lane execution interpreter respecting 32/64-bit EXEC masking."""
+
+    def step(
+        self, instr: DSWrxchg2B64Instruction, state: SIMDState
+    ) -> List[Optional[Tuple[int, int]]]:
+        """Execute ds_wrxchg2_b64 across all lanes in the wave."""
+        results: List[Optional[Tuple[int, int]]] = []
+        for lane in range(state.num_lanes):
+            if not state.is_active(lane):
+                results.append(None)
+                continue
+
+            vaddr = state.get_vgpr(lane, instr.vaddr.index)
+            data0 = state.get_vgpr64(lane, instr.data0)
+            data1 = state.get_vgpr64(lane, instr.data1)
+
+            old0, old1 = oracle_ds_wrxchg2_b64(
+                state.lds_mem,
+                vaddr=vaddr,
+                data0=data0,
+                data1=data1,
+                offset0=instr.offset0,
+                offset1=instr.offset1,
+                is_st64=instr.is_st64,
+            )
+
+            if instr.is_rtn and instr.vdst is not None:
+                w0, w1 = split_u64_to_u32s(old0)
+                w2, w3 = split_u64_to_u32s(old1)
+                state.set_vgpr128(lane, instr.vdst, w0, w1, w2, w3)
+
+            results.append((old0, old1))
+        return results
+
+
 def split_u64_to_u32s(val: int) -> Tuple[int, int]:
     """Split 64-bit unsigned integer into (lo, hi) 32-bit words."""
     val &= MASK64
@@ -581,6 +659,7 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
         struct.pack_into("<Q", self.interp.lds_mem, addr0, 0x0123_4567_89AB_CDEF)
         struct.pack_into("<Q", self.interp.lds_mem, addr1, 0xFEDC_BA98_7654_3210)
 
+        self.interp.rf.set_u2 = vaddr
         self.interp.rf.set_u32(2, vaddr)
         self.interp.rf.set_u64(RegPair(12), 0x9999_8888_7777_6666)
         self.interp.rf.set_u64(RegPair(14), 0x5555_4444_3333_2222)
@@ -659,6 +738,197 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
         self.assertEqual(res1, res2)
         self.assertEqual(bytes(interp1.lds_mem), bytes(interp2.lds_mem))
         self.assertEqual(interp1.rf.regs, interp2.rf.regs)
+
+
+class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_wave32_full_exec(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=MASK32)
+        simd = SIMDInterpreter()
+
+        # Seed distinct LDS addresses for each lane (each lane uses 16 bytes: 2 x 8-byte elements)
+        for lane in range(32):
+            base_addr = lane * 32
+            struct.pack_into("<Q", state.lds_mem, base_addr, 0x1000 + lane)
+            struct.pack_into("<Q", state.lds_mem, base_addr + 8, 0x2000 + lane)
+            state.set_vgpr(lane, 1, base_addr)
+            state.set_vgpr64(lane, RegPair(2), 0xAAAA_0000 + lane)
+            state.set_vgpr64(lane, RegPair(4), 0xBBBB_0000 + lane)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(instr, state)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertIsNotNone(results[lane])
+            old0, old1 = results[lane]  # type: ignore
+            self.assertEqual(old0, 0x1000 + lane)
+            self.assertEqual(old1, 0x2000 + lane)
+            self.assertEqual(state.get_vgpr64(lane, RegPair(8)), 0x1000 + lane)
+            self.assertEqual(state.get_vgpr64(lane, RegPair(10)), 0x2000 + lane)
+
+            base_addr = lane * 32
+            self.assertEqual(
+                struct.unpack_from("<Q", state.lds_mem, base_addr)[0],
+                0xAAAA_0000 + lane,
+            )
+            self.assertEqual(
+                struct.unpack_from("<Q", state.lds_mem, base_addr + 8)[0],
+                0xBBBB_0000 + lane,
+            )
+
+    def test_simd_wave64_full_exec(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=MASK64)
+        simd = SIMDInterpreter()
+
+        for lane in range(64):
+            base_addr = lane * 16
+            struct.pack_into("<Q", state.lds_mem, base_addr, 0x3000 + lane)
+            struct.pack_into("<Q", state.lds_mem, base_addr + 8, 0x4000 + lane)
+            state.set_vgpr(lane, 1, base_addr)
+            state.set_vgpr64(lane, RegPair(2), 0x5000 + lane)
+            state.set_vgpr64(lane, RegPair(4), 0x6000 + lane)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(16),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(instr, state)
+        self.assertEqual(len(results), 64)
+        for lane in range(64):
+            self.assertIsNotNone(results[lane])
+            self.assertEqual(state.get_vgpr64(lane, RegPair(16)), 0x3000 + lane)
+            self.assertEqual(state.get_vgpr64(lane, RegPair(18)), 0x4000 + lane)
+
+    def test_simd_checkerboard_mask(self) -> None:
+        # Even lanes active (0x5555_5555), odd lanes inactive
+        mask = 0x5555_5555
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        simd = SIMDInterpreter()
+
+        sentinel = 0xCAFE_BABE_DEAD_BEEF
+        for lane in range(32):
+            base_addr = lane * 32
+            struct.pack_into("<Q", state.lds_mem, base_addr, 0x7000 + lane)
+            struct.pack_into("<Q", state.lds_mem, base_addr + 8, 0x8000 + lane)
+            state.set_vgpr(lane, 1, base_addr)
+            state.set_vgpr64(lane, RegPair(2), 0x9000 + lane)
+            state.set_vgpr64(lane, RegPair(4), 0xA000 + lane)
+            state.set_vgpr64(lane, RegPair(8), sentinel)
+            state.set_vgpr64(lane, RegPair(10), sentinel)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(instr, state)
+        for lane in range(32):
+            base_addr = lane * 32
+            if lane % 2 == 0:
+                # Active lane
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(state.get_vgpr64(lane, RegPair(8)), 0x7000 + lane)
+                self.assertEqual(state.get_vgpr64(lane, RegPair(10)), 0x8000 + lane)
+                self.assertEqual(
+                    struct.unpack_from("<Q", state.lds_mem, base_addr)[0], 0x9000 + lane
+                )
+            else:
+                # Inactive lane: untouched registers and untouched LDS memory
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr64(lane, RegPair(8)), sentinel)
+                self.assertEqual(state.get_vgpr64(lane, RegPair(10)), sentinel)
+                self.assertEqual(
+                    struct.unpack_from("<Q", state.lds_mem, base_addr)[0], 0x7000 + lane
+                )
+                self.assertEqual(
+                    struct.unpack_from("<Q", state.lds_mem, base_addr + 8)[0], 0x8000 + lane
+                )
+
+    def test_simd_all_lanes_inactive(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        simd = SIMDInterpreter()
+
+        # Seed memory and registers
+        for lane in range(32):
+            struct.pack_into("<Q", state.lds_mem, lane * 16, 0x1234)
+            state.set_vgpr(lane, 1, lane * 16)
+            state.set_vgpr64(lane, RegPair(2), 0x9999)
+            state.set_vgpr64(lane, RegPair(4), 0x8888)
+            state.set_vgpr64(lane, RegPair(8), 0x0)
+            state.set_vgpr64(lane, RegPair(10), 0x0)
+
+        initial_lds = bytes(state.lds_mem)
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(instr, state)
+        self.assertTrue(all(r is None for r in results))
+        self.assertEqual(bytes(state.lds_mem), initial_lds)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr64(lane, RegPair(8)), 0)
+            self.assertEqual(state.get_vgpr64(lane, RegPair(10)), 0)
+
+    def test_simd_multi_lane_lds_address_contention(self) -> None:
+        # First 4 active lanes access the same base address (0x100)
+        state = SIMDState(num_lanes=32, exec_mask=0xF)
+        simd = SIMDInterpreter()
+
+        struct.pack_into("<Q", state.lds_mem, 0x100, 0x0)
+        struct.pack_into("<Q", state.lds_mem, 0x108, 0x0)
+
+        for lane in range(4):
+            state.set_vgpr(lane, 1, 0x100)
+            # Each lane writes (lane + 1) to slot 0 and (lane + 1) * 10 to slot 1
+            state.set_vgpr64(lane, RegPair(2), lane + 1)
+            state.set_vgpr64(lane, RegPair(4), (lane + 1) * 10)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(instr, state)
+        # Sequential atomicity across lanes:
+        # Lane 0 sees old=0, writes 1 and 10
+        # Lane 1 sees old=1 and 10, writes 2 and 20
+        # Lane 2 sees old=2 and 20, writes 3 and 30
+        # Lane 3 sees old=3 and 30, writes 4 and 40
+        self.assertEqual(results[0], (0, 0))
+        self.assertEqual(results[1], (1, 10))
+        self.assertEqual(results[2], (2, 20))
+        self.assertEqual(results[3], (3, 30))
+
+        # Final memory holds values from last lane (lane 3)
+        self.assertEqual(struct.unpack_from("<Q", state.lds_mem, 0x100)[0], 4)
+        self.assertEqual(struct.unpack_from("<Q", state.lds_mem, 0x108)[0], 40)
 
 
 if __name__ == "__main__":
