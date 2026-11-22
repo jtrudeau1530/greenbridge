@@ -1,7 +1,8 @@
-"""Semantic interpreter tests for AMD RDNA2 floating-point quotient fixup: v_div_fixup_f32.
+"""Semantic interpreter tests for AMD RDNA2 floating-point quotient fixup: v_div_fixup_f32 and v_div_fixup_f16.
 
-RDNA2 VALU floating-point division fixup instruction:
+RDNA2 VALU floating-point division fixup instructions:
   v_div_fixup_f32  vdst, s0, s1, s2
+  v_div_fixup_f16  vdst, s0, s1, s2  [op_sel:[s0_hi, s1_hi, s2_hi, dst_hi]]
 
 Arguments:
   s0: quotient estimate (computed from preliminary reciprocal / Newton-Raphson sequence)
@@ -9,11 +10,11 @@ Arguments:
   s2: numerator (x in x / y)
 
 Exact AMD RDNA2 fixup truth table:
-  1. If s1 is NaN, return quiet NaN (quiet_f32(s1)).
-  2. If s2 is NaN, return quiet NaN (quiet_f32(s2)).
-  3. If s1 == 0 and s2 == 0, return NaN (canonical QNaN: 0x7FC00000).
+  1. If s1 is NaN, return quiet NaN (quiet_f32(s1) or quiet_f16(s1)).
+  2. If s2 is NaN, return quiet NaN (quiet_f32(s2) or quiet_f16(s2)).
+  3. If s1 == 0 and s2 == 0, return NaN (canonical QNaN: 0x7FC00000 for f32, 0x7E00 for f16).
   4. If s1 == 0 and s2 != 0, return sign(s1 ^ s2) * inf.
-  5. If s1 == +-inf and s2 == +-inf, return NaN (canonical QNaN: 0x7FC00000).
+  5. If s1 == +-inf and s2 == +-inf, return NaN.
   6. If s1 == +-inf and s2 != +-inf, return sign(s1 ^ s2) * 0.0.
   7. If s2 == 0, return sign(s1 ^ s2) * 0.0.
   8. Otherwise return s0.
@@ -22,10 +23,12 @@ Zero game data; standard library Python only; Python 3.9+ compatible.
 """
 from __future__ import annotations
 
+import itertools
 import math
 import struct
 import unittest
 
+MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
 
 # IEEE-754 binary32 bit constants
@@ -46,6 +49,25 @@ F32_NORM_MIN = 0x00800000
 F32_NORM_MAX = 0x7F7FFFFF
 F32_SUB_MIN = 0x00000001
 F32_SUB_MAX = 0x007FFFFF
+
+# IEEE-754 binary16 bit constants
+F16_POS_ZERO = 0x0000
+F16_NEG_ZERO = 0x8000
+F16_POS_INF = 0x7C00
+F16_NEG_INF = 0xFC00
+F16_QNAN = 0x7E00
+F16_NEG_QNAN = 0xFE00
+F16_SNAN = 0x7C01
+F16_NEG_SNAN = 0xFC01
+
+F16_ONE = 0x3C00
+F16_NEG_ONE = 0xBC00
+F16_TWO = 0x4000
+F16_HALF = 0x3800
+F16_NORM_MIN = 0x0400
+F16_NORM_MAX = 0x7BFF
+F16_SUB_MIN = 0x0001
+F16_SUB_MAX = 0x03FF
 
 OLD_VGPR_SENTINEL = 0xDEADBEEF
 
@@ -132,6 +154,95 @@ def ref_v_div_fixup_f32(s0: int, s1: int, s2: int) -> int:
     return s0
 
 
+def f16_to_bits(val: float) -> int:
+    try:
+        return struct.unpack("<H", struct.pack("<e", val))[0]
+    except OverflowError:
+        return F16_NEG_INF if val < 0 else F16_POS_INF
+
+
+def bits_to_f16(bits: int) -> float:
+    return struct.unpack("<e", struct.pack("<H", bits & MASK16))[0]
+
+
+def f16_sign(bits: int) -> int:
+    return (bits >> 15) & 1
+
+
+def is_f16_nan(bits: int) -> bool:
+    return ((bits & 0x7C00) == 0x7C00) and ((bits & 0x03FF) != 0)
+
+
+def is_f16_snan(bits: int) -> bool:
+    return is_f16_nan(bits) and ((bits & 0x0200) == 0)
+
+
+def is_f16_qnan(bits: int) -> bool:
+    return is_f16_nan(bits) and ((bits & 0x0200) != 0)
+
+
+def is_f16_zero(bits: int) -> bool:
+    return (bits & 0x7FFF) == 0
+
+
+def is_f16_inf(bits: int) -> bool:
+    return (bits & 0x7FFF) == 0x7C00
+
+
+def is_f16_subnormal(bits: int) -> bool:
+    return ((bits & 0x7C00) == 0) and ((bits & 0x03FF) != 0)
+
+
+def is_f16_normal(bits: int) -> bool:
+    exp = (bits >> 10) & 0x1F
+    return 0 < exp < 31
+
+
+def quiet_f16(bits: int) -> int:
+    """Ensure quiet NaN bit (bit 9) is set on half-precision NaN while preserving payload."""
+    if not is_f16_nan(bits):
+        return F16_QNAN
+    return (bits & MASK16) | 0x0200
+
+
+def ref_v_div_fixup_f16(s0: int, s1: int, s2: int) -> int:
+    """Exact IEEE half-precision division fixup reference oracle for RDNA2 v_div_fixup_f16.
+
+    s0 = quotient estimate
+    s1 = denominator
+    s2 = numerator
+    """
+    s0 &= MASK16
+    s1 &= MASK16
+    s2 &= MASK16
+
+    sign_xor = f16_sign(s1) ^ f16_sign(s2)
+    sign_bit = 0x8000 if sign_xor else 0x0000
+
+    if is_f16_nan(s1):
+        return quiet_f16(s1)
+    if is_f16_nan(s2):
+        return quiet_f16(s2)
+    if is_f16_zero(s1) and is_f16_zero(s2):
+        return F16_QNAN
+    if is_f16_zero(s1):
+        return sign_bit | F16_POS_INF
+    if is_f16_inf(s1) and is_f16_inf(s2):
+        return F16_QNAN
+    if is_f16_inf(s1):
+        return sign_bit | F16_POS_ZERO
+    if is_f16_zero(s2):
+        return sign_bit | F16_POS_ZERO
+    return s0
+
+
+def merge_half(old_val: int, half_val: int, dst_hi: int) -> int:
+    """Write 16-bit half to VGPR word while preserving the unwritten 16-bit half."""
+    h = half_val & MASK16
+    old = old_val & MASK32
+    return ((h << 16) | (old & 0xFFFF)) if dst_hi else ((old & 0xFFFF0000) | h)
+
+
 class WaveDivFixupInterpreter:
     """Multi-lane SIMD wave reference interpreter modeling RDNA2 Wave32/Wave64 VALU execution."""
 
@@ -154,6 +265,30 @@ class WaveDivFixupInterpreter:
                 s1 = self.get_lane_vgpr(lane, s1_reg)
                 s2 = self.get_lane_vgpr(lane, s2_reg)
                 self.vgprs[lane][vdst] = ref_v_div_fixup_f32(s0, s1, s2)
+
+    def v_div_fixup_f16(
+        self,
+        vdst: int,
+        s0_reg: int,
+        s1_reg: int,
+        s2_reg: int,
+        op_sel: tuple[int, int, int, int] = (0, 0, 0, 0),
+    ) -> None:
+        """Executes v_div_fixup_f16 with op_sel across all lanes conditioned on exec mask."""
+        s0_hi, s1_hi, s2_hi, dst_hi = op_sel
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                r0 = self.get_lane_vgpr(lane, s0_reg)
+                r1 = self.get_lane_vgpr(lane, s1_reg)
+                r2 = self.get_lane_vgpr(lane, s2_reg)
+
+                s0 = (r0 >> 16) & MASK16 if s0_hi else (r0 & MASK16)
+                s1 = (r1 >> 16) & MASK16 if s1_hi else (r1 & MASK16)
+                s2 = (r2 >> 16) & MASK16 if s2_hi else (r2 & MASK16)
+
+                res = ref_v_div_fixup_f16(s0, s1, s2)
+                curr = self.get_lane_vgpr(lane, vdst)
+                self.vgprs[lane][vdst] = merge_half(curr, res, dst_hi)
 
 
 class TestF32Classification(unittest.TestCase):
@@ -283,7 +418,6 @@ class TestDivFixupF32NaNCases(unittest.TestCase):
 
 class TestDivFixupF32NormalPassThrough(unittest.TestCase):
     def test_regular_quotient_estimate_passes_through_intact(self):
-        # When neither denominator nor numerator is 0, inf, or NaN, s0 is returned directly
         s0_estimates = [
             f32_to_bits(1.0),
             f32_to_bits(0.5),
@@ -304,13 +438,11 @@ class TestDivFixupF32NormalPassThrough(unittest.TestCase):
 class TestDivFixupF32SimdWaveExecution(unittest.TestCase):
     def test_wave32_divergence_under_exec_mask(self):
         wave = WaveDivFixupInterpreter(wave_size=32)
-        # Enable only even lanes (0, 2, 4, ...)
         wave.exec_mask = 0x55555555
 
         vdst, s0_reg, s1_reg, s2_reg = 0, 1, 2, 3
         for lane in range(32):
             wave.set_lane_vgpr(lane, s0_reg, F32_HALF)
-            # Even lanes do 1 / 0 -> +inf; odd lanes do 0 / 1 -> 0.0
             if lane % 2 == 0:
                 wave.set_lane_vgpr(lane, s1_reg, F32_POS_ZERO)
                 wave.set_lane_vgpr(lane, s2_reg, F32_ONE)
@@ -330,13 +462,13 @@ class TestDivFixupF32SimdWaveExecution(unittest.TestCase):
 
     def test_wave64_execution(self):
         wave = WaveDivFixupInterpreter(wave_size=64)
-        wave.exec_mask = 0x00000000FFFFFFFF  # lower 32 lanes active, upper 32 inactive
+        wave.exec_mask = 0x00000000FFFFFFFF
 
         vdst, s0_reg, s1_reg, s2_reg = 10, 11, 12, 13
         for lane in range(64):
             wave.set_lane_vgpr(lane, s0_reg, F32_ONE)
             wave.set_lane_vgpr(lane, s1_reg, F32_POS_ZERO)
-            wave.set_lane_vgpr(lane, s2_reg, F32_POS_ZERO)  # 0 / 0 -> QNaN
+            wave.set_lane_vgpr(lane, s2_reg, F32_POS_ZERO)
             wave.set_lane_vgpr(lane, vdst, 0x11223344)
 
         wave.v_div_fixup_f32(vdst, s0_reg, s1_reg, s2_reg)
@@ -347,6 +479,187 @@ class TestDivFixupF32SimdWaveExecution(unittest.TestCase):
                 self.assertEqual(val, F32_QNAN)
             else:
                 self.assertEqual(val, 0x11223344)
+
+
+class TestF16Classification(unittest.TestCase):
+    def test_zero_classification(self):
+        self.assertTrue(is_f16_zero(F16_POS_ZERO))
+        self.assertTrue(is_f16_zero(F16_NEG_ZERO))
+        self.assertFalse(is_f16_zero(F16_ONE))
+        self.assertEqual(f16_sign(F16_POS_ZERO), 0)
+        self.assertEqual(f16_sign(F16_NEG_ZERO), 1)
+
+    def test_inf_classification(self):
+        self.assertTrue(is_f16_inf(F16_POS_INF))
+        self.assertTrue(is_f16_inf(F16_NEG_INF))
+        self.assertFalse(is_f16_inf(F16_QNAN))
+        self.assertEqual(f16_sign(F16_POS_INF), 0)
+        self.assertEqual(f16_sign(F16_NEG_INF), 1)
+
+    def test_nan_classification_and_quieting(self):
+        self.assertTrue(is_f16_nan(F16_QNAN))
+        self.assertTrue(is_f16_nan(F16_SNAN))
+        self.assertTrue(is_f16_qnan(F16_QNAN))
+        self.assertTrue(is_f16_snan(F16_SNAN))
+        self.assertFalse(is_f16_qnan(F16_SNAN))
+        self.assertFalse(is_f16_snan(F16_QNAN))
+
+        quieted = quiet_f16(F16_SNAN)
+        self.assertTrue(is_f16_qnan(quieted))
+        self.assertEqual(quieted, F16_SNAN | 0x0200)
+
+        # Custom payload preservation
+        custom_snan = 0x7C15
+        self.assertTrue(is_f16_snan(custom_snan))
+        custom_qnan = quiet_f16(custom_snan)
+        self.assertTrue(is_f16_qnan(custom_qnan))
+        self.assertEqual(custom_qnan & 0x01FF, 0x0015)
+
+
+class TestDivFixupF16ZeroAndInfCases(unittest.TestCase):
+    def test_zero_divided_by_zero_produces_qnan(self):
+        for s1 in (F16_POS_ZERO, F16_NEG_ZERO):
+            for s2 in (F16_POS_ZERO, F16_NEG_ZERO):
+                with self.subTest(s1=hex(s1), s2=hex(s2)):
+                    res = ref_v_div_fixup_f16(F16_ONE, s1, s2)
+                    self.assertTrue(is_f16_qnan(res))
+                    self.assertEqual(res, F16_QNAN)
+
+    def test_finite_divided_by_zero_produces_signed_inf(self):
+        test_cases = [
+            (F16_POS_ZERO, F16_ONE, F16_POS_INF),       # (+1) / (+0) = +inf
+            (F16_NEG_ZERO, F16_ONE, F16_NEG_INF),       # (+1) / (-0) = -inf
+            (F16_POS_ZERO, F16_NEG_ONE, F16_NEG_INF),   # (-1) / (+0) = -inf
+            (F16_NEG_ZERO, F16_NEG_ONE, F16_POS_INF),   # (-1) / (-0) = +inf
+            (F16_POS_ZERO, F16_TWO, F16_POS_INF),       # (+2) / (+0) = +inf
+            (F16_NEG_ZERO, F16_TWO, F16_NEG_INF),       # (+2) / (-0) = -inf
+        ]
+        for s1, s2, expected in test_cases:
+            with self.subTest(s1=hex(s1), s2=hex(s2)):
+                res = ref_v_div_fixup_f16(0x5678, s1, s2)
+                self.assertEqual(res, expected)
+
+    def test_inf_divided_by_inf_produces_qnan(self):
+        for s1 in (F16_POS_INF, F16_NEG_INF):
+            for s2 in (F16_POS_INF, F16_NEG_INF):
+                with self.subTest(s1=hex(s1), s2=hex(s2)):
+                    res = ref_v_div_fixup_f16(F16_ONE, s1, s2)
+                    self.assertTrue(is_f16_qnan(res))
+                    self.assertEqual(res, F16_QNAN)
+
+    def test_finite_divided_by_inf_produces_signed_zero(self):
+        test_cases = [
+            (F16_POS_INF, F16_ONE, F16_POS_ZERO),       # (+1) / (+inf) = +0.0
+            (F16_NEG_INF, F16_ONE, F16_NEG_ZERO),       # (+1) / (-inf) = -0.0
+            (F16_POS_INF, F16_NEG_ONE, F16_NEG_ZERO),   # (-1) / (+inf) = -0.0
+            (F16_NEG_INF, F16_NEG_ONE, F16_POS_ZERO),   # (-1) / (-inf) = +0.0
+            (F16_POS_INF, F16_TWO, F16_POS_ZERO),       # (+2) / (+inf) = +0.0
+            (F16_NEG_INF, F16_TWO, F16_NEG_ZERO),       # (+2) / (-inf) = -0.0
+        ]
+        for s1, s2, expected in test_cases:
+            with self.subTest(s1=hex(s1), s2=hex(s2)):
+                res = ref_v_div_fixup_f16(0xBABE, s1, s2)
+                self.assertEqual(res, expected)
+
+    def test_zero_divided_by_finite_produces_signed_zero(self):
+        test_cases = [
+            (F16_ONE, F16_POS_ZERO, F16_POS_ZERO),       # (+0.0) / (+1) = +0.0
+            (F16_NEG_ONE, F16_POS_ZERO, F16_NEG_ZERO),   # (+0.0) / (-1) = -0.0
+            (F16_ONE, F16_NEG_ZERO, F16_NEG_ZERO),       # (-0.0) / (+1) = -0.0
+            (F16_NEG_ONE, F16_NEG_ZERO, F16_POS_ZERO),   # (-0.0) / (-1) = +0.0
+            (F16_TWO, F16_POS_ZERO, F16_POS_ZERO),       # (+0.0) / (+2) = +0.0
+            (f16_to_bits(-4.0), F16_POS_ZERO, F16_NEG_ZERO),
+        ]
+        for s1, s2, expected in test_cases:
+            with self.subTest(s1=hex(s1), s2=hex(s2)):
+                res = ref_v_div_fixup_f16(0x7766, s1, s2)
+                self.assertEqual(res, expected)
+
+
+class TestDivFixupF16NaNCases(unittest.TestCase):
+    def test_denominator_nan_propagates_quiet_nan(self):
+        snan = 0x7C05
+        qnan = 0x7E12
+        res_snan = ref_v_div_fixup_f16(F16_ONE, snan, F16_ONE)
+        self.assertTrue(is_f16_qnan(res_snan))
+        self.assertEqual(res_snan, snan | 0x0200)
+
+        res_qnan = ref_v_div_fixup_f16(F16_ONE, qnan, F16_ONE)
+        self.assertEqual(res_qnan, qnan)
+
+    def test_numerator_nan_propagates_quiet_nan_when_denom_not_nan(self):
+        snan = 0x7C2B
+        qnan = 0x7E5A
+        res_snan = ref_v_div_fixup_f16(F16_ONE, F16_ONE, snan)
+        self.assertTrue(is_f16_qnan(res_snan))
+        self.assertEqual(res_snan, snan | 0x0200)
+
+        res_qnan = ref_v_div_fixup_f16(F16_ONE, F16_ONE, qnan)
+        self.assertEqual(res_qnan, qnan)
+
+    def test_denominator_nan_takes_precedence_over_numerator_nan(self):
+        s1_nan = 0x7C11
+        s2_nan = 0x7C22
+        res = ref_v_div_fixup_f16(F16_ONE, s1_nan, s2_nan)
+        self.assertEqual(res, s1_nan | 0x0200)
+
+
+class TestDivFixupF16OpSelAndHalfPreservation(unittest.TestCase):
+    def test_op_sel_all_combinations_and_half_preservation(self):
+        # Pack distinct halves into registers:
+        # r0: (hi: 0.5, lo: 1.0)
+        # r1: (hi: 0.0, lo: 2.0)
+        # r2: (hi: 4.0, lo: 0.0)
+        r0 = (F16_HALF << 16) | F16_ONE
+        r1 = (F16_POS_ZERO << 16) | F16_TWO
+        r2 = (F16_TWO << 16) | F16_POS_ZERO
+
+        wave = WaveDivFixupInterpreter(wave_size=1)
+        wave.set_lane_vgpr(0, 1, r0)
+        wave.set_lane_vgpr(0, 2, r1)
+        wave.set_lane_vgpr(0, 3, r2)
+
+        for s0_hi, s1_hi, s2_hi, dst_hi in itertools.product((0, 1), repeat=4):
+            with self.subTest(op_sel=(s0_hi, s1_hi, s2_hi, dst_hi)):
+                initial_vdst = 0xBEEFCAFE
+                wave.set_lane_vgpr(0, 0, initial_vdst)
+                wave.v_div_fixup_f16(0, 1, 2, 3, op_sel=(s0_hi, s1_hi, s2_hi, dst_hi))
+
+                s0 = (r0 >> 16) & MASK16 if s0_hi else (r0 & MASK16)
+                s1 = (r1 >> 16) & MASK16 if s1_hi else (r1 & MASK16)
+                s2 = (r2 >> 16) & MASK16 if s2_hi else (r2 & MASK16)
+                expected_h = ref_v_div_fixup_f16(s0, s1, s2)
+
+                res = wave.get_lane_vgpr(0, 0)
+                if dst_hi:
+                    self.assertEqual(res >> 16, expected_h)
+                    self.assertEqual(res & 0xFFFF, 0xCAFE, "Low half clobbered when writing high half")
+                else:
+                    self.assertEqual(res & 0xFFFF, expected_h)
+                    self.assertEqual(res >> 16, 0xBEEF, "High half clobbered when writing low half")
+
+
+class TestDivFixupF16SimdWaveExecution(unittest.TestCase):
+    def test_wave32_divergence_f16(self):
+        wave = WaveDivFixupInterpreter(wave_size=32)
+        wave.exec_mask = 0xAAAAAAAA  # Odd lanes active
+
+        vdst, s0_reg, s1_reg, s2_reg = 0, 1, 2, 3
+        for lane in range(32):
+            wave.set_lane_vgpr(lane, s0_reg, F16_HALF)
+            wave.set_lane_vgpr(lane, s1_reg, F16_POS_ZERO)
+            wave.set_lane_vgpr(lane, s2_reg, F16_ONE)  # 1 / 0 -> +inf
+            wave.set_lane_vgpr(lane, vdst, 0x12345678)
+
+        wave.v_div_fixup_f16(vdst, s0_reg, s1_reg, s2_reg, op_sel=(0, 0, 0, 0))
+
+        for lane in range(32):
+            val = wave.get_lane_vgpr(lane, vdst)
+            if lane % 2 == 1:
+                self.assertEqual(val & 0xFFFF, F16_POS_INF)
+                self.assertEqual(val >> 16, 0x1234)
+            else:
+                self.assertEqual(val, 0x12345678)
 
 
 if __name__ == "__main__":
