@@ -22,6 +22,29 @@ class DocsTableRowsTest(unittest.TestCase):
                     continue  # this is a table header followed by its separator
                 self.fail(f"{path.relative_to(ROOT)}:{i + 1}: table row without a table header")
 
+    def test_no_duplicate_rows_in_one_table(self):
+        for path in DOCS:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            block = []
+
+            def check(rows):
+                seen = {}
+                for lineno, row in rows:
+                    if row in seen:
+                        self.fail(
+                            f"{path.relative_to(ROOT)}:{seen[row]} and {lineno}: "
+                            "duplicate row in the same table"
+                        )
+                    seen[row] = lineno
+
+            for i, line in enumerate(lines, 1):
+                if line.startswith("|"):
+                    block.append((i, line))
+                elif block:
+                    check(block)
+                    block = []
+            check(block)
+
 
 if __name__ == "__main__":
     unittest.main()
