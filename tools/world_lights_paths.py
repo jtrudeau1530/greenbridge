@@ -770,6 +770,9 @@ def main(argv=None):
     if a.jobs < 1:
         print("ERROR: --jobs must be at least 1", file=sys.stderr)
         return 2
+    if a.start is not None and a.start < 0:
+        print("ERROR: --start must be non-negative", file=sys.stderr)
+        return 2
     if a.limit is not None and a.limit < 1:
         print("ERROR: --limit must be at least 1", file=sys.stderr)
         return 2
