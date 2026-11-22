@@ -885,5 +885,151 @@ class TestValuSadHiU32IEEE754Boundaries(unittest.TestCase):
                     self.assertEqual(hi, expected)
 
 
+class TestValuSadHiU32NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadHiU32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = 0xFFFF_FFFF
+        s1 = 0
+        s2 = 1
+        correct = ref_sad_hi_u32(s0, s1, s2)
+        self.assertEqual(correct, 1)
+        corrupted = correct ^ 1
+        self.assertEqual(corrupted, 0)
+        self.assertNotEqual(correct, corrupted)
+
+    def test_mutation_signed_difference_detected(self) -> None:
+        """Mutant: Interprets 32-bit operands as signed integers for difference."""
+        def mutant_sad_hi(s0: int, s1: int, s2: int) -> int:
+            # Bug: signed cast
+            def to_s32(x: int) -> int:
+                x &= MASK32
+                return x - (1 << 32) if (x & 0x8000_0000) else x
+            diff = abs(to_s32(s0) - to_s32(s1))
+            return ((diff + u32(s2)) >> 32) & MASK32
+
+        s0 = 0
+        s1 = 0xFFFF_FFFF  # unsigned 4294967295, signed -1
+        s2 = 0x8000_0000
+
+        oracle_res = ref_sad_hi_u32(s0, s1, s2)
+        mutant_res = mutant_sad_hi(s0, s1, s2)
+
+        # Unsigned diff: 0xFFFFFFFF + 0x80000000 = 0x17FFFFFFF -> hi = 1
+        self.assertEqual(oracle_res, 1)
+        # Signed diff: |0 - (-1)| = 1. 1 + 0x80000000 = 0x80000001 -> hi = 0
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_low_32_instead_of_high_32_detected(self) -> None:
+        """Mutant: Returns low 32 bits (v_sad_u32) instead of high 32 bits."""
+        def mutant_sad_hi(s0: int, s1: int, s2: int) -> int:
+            # Bug: returns low 32 bits
+            return (ref_abs_diff_u32(s0, s1) + u32(s2)) & MASK32
+
+        s0 = 10
+        s1 = 4
+        s2 = 5
+
+        oracle_res = ref_sad_hi_u32(s0, s1, s2)
+        mutant_res = mutant_sad_hi(s0, s1, s2)
+
+        # |10 - 4| + 5 = 11 -> hi = 0, lo = 11
+        self.assertEqual(oracle_res, 0)
+        self.assertEqual(mutant_res, 11)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_inverted_carry_condition_detected(self) -> None:
+        """Mutant: Inverts carry bit condition."""
+        def mutant_sad_hi(s0: int, s1: int, s2: int) -> int:
+            diff = ref_abs_diff_u32(s0, s1)
+            full = diff + u32(s2)
+            # Bug: inverted condition
+            return 0 if (full >= 0x1_0000_0000) else 1
+
+        s0 = 0xFFFF_FFFF
+        s1 = 0
+        s2 = 1
+
+        oracle_res = ref_sad_hi_u32(s0, s1, s2)
+        mutant_res = mutant_sad_hi(s0, s1, s2)
+
+        self.assertEqual(oracle_res, 1)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_omitted_accumulator_detected(self) -> None:
+        """Mutant: Fails to add accumulator src2 (computing diff >> 32)."""
+        def mutant_sad_hi(s0: int, s1: int, s2: int) -> int:
+            diff = ref_abs_diff_u32(s0, s1)
+            # Bug: forgets src2, diff >> 32 is always 0
+            return (diff >> 32) & MASK32
+
+        s0 = 0xFFFF_FFFF
+        s1 = 0
+        s2 = 0xFFFF_FFFF
+
+        oracle_res = ref_sad_hi_u32(s0, s1, s2)
+        mutant_res = mutant_sad_hi(s0, s1, s2)
+
+        self.assertEqual(oracle_res, 1)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_ignore_simd_exec_mask_detected(self) -> None:
+        """Mutant: Overwrites inactive SIMD lanes ignoring EXEC mask."""
+        sentinel = 0xCAFEBABE
+        state = SIMDState(num_lanes=32, exec_mask=0x00000000)
+        for lane in range(32):
+            state.vgprs[lane][0] = sentinel
+
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VSadHiU32Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: no exec mask check
+                    res = ref_sad_hi_u32(0xFFFF_FFFF, 0, 1)
+                    state.write_lane(instr.dst, lane, res)
+                    results.append(res)
+                return results
+
+        buggy = BuggySIMDInterpreter()
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(0xFFFF_FFFF),
+            src1=Operand.literal(0),
+            src2=Operand.literal(1),
+        )
+        buggy.step(instr, state)
+
+        corrupted = [lane for lane in range(32) if state.vgprs[lane][0] != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
