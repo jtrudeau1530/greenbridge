@@ -159,6 +159,71 @@ class Cli(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("cube", r.stderr)
 
+    def test_bad_json_paths_rejected_before_open_oracle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing_dir = os.path.join(tmp, "dir")
+            os.mkdir(existing_dir)
+            file_ancestor = os.path.join(tmp, "file_ancestor")
+            with open(file_ancestor, "w", encoding="utf-8") as f:
+                f.write("x")
+
+            bad_paths = [
+                "",
+                "   ",
+                "bad\x00out.json",
+                existing_dir,
+                os.path.join(tmp, "trailing") + os.sep,
+                os.path.join(file_ancestor, "sub", "out.json"),
+            ]
+            for bad in bad_paths:
+                with self.subTest(json_path=bad):
+                    stderr = io.StringIO()
+                    with mock.patch.object(runner, "open_oracle") as open_mock, \
+                         mock.patch.object(sys, "stderr", stderr):
+                        rc = pr.main(["--json", bad])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("error:", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    open_mock.assert_not_called()
+
+    def test_valid_nested_json_does_not_create_dirs_when_oracle_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nested_dir = os.path.join(tmp, "a", "b")
+            json_path = os.path.join(nested_dir, "report.json")
+            stdout = io.StringIO()
+            with mock.patch.object(runner, "open_oracle", side_effect=runner.Unavailable("no gpu")), \
+                 mock.patch.object(sys, "stdout", stdout):
+                rc = pr.main(["--json", json_path])
+            self.assertEqual(rc, 77)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "a")))
+
+    def test_write_json_report_creates_parents_and_writes_lf_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "nested", "dir", "report.json")
+            payload = {"device": "fake", "arch": "gfx1036", "cases": {}}
+            err = pr.write_json_report(out_path, payload)
+            self.assertIsNone(err)
+            with open(out_path, "rb") as f:
+                raw = f.read()
+            self.assertNotIn(b"\r\n", raw)
+            self.assertEqual(json.loads(raw.decode("utf-8")), payload)
+
+    def test_write_json_oserror_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "report.json")
+            with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+                err = pr.write_json_report(out_path, {"ok": True})
+            self.assertIsNotNone(err)
+            self.assertIn("cannot write --json", err)
+
+            stderr = io.StringIO()
+            with mock.patch("builtins.open", side_effect=OSError("disk full")), \
+                 mock.patch.object(sys, "stderr", stderr):
+                rc, _ = run_main(FakeOracle(), "--dims", "1d", "--formats", "r32_uint", "--json", out_path)
+            self.assertEqual(rc, 2)
+            self.assertIn("error:", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
 
 class OnHardware(unittest.TestCase):
     @classmethod
