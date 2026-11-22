@@ -378,6 +378,13 @@ What is implemented (all of it testable without the game):
   `ID3D12ResourceStubs`) registered directly with `VulkanContext`, supporting `CreateSwapChainForHwnd`,
   `GetCurrentBackBufferIndex`, `GetBuffer`, `CreateRenderTargetView`, `Present`, and `ResizeBuffers` (preserving
   explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path).
+  The factory answers up to `IDXGIFactory7` (D3D-2). `EnumAdapterByGpuPreference` returns the one Vulkan adapter
+  at index 0 for every preference. It accepts a preference outside the enum, as the host does, and gives
+  `DXGI_ERROR_INVALID_CALL` for a null `out` and `DXGI_ERROR_NOT_FOUND` past the end. The adapter list never
+  changes, so `RegisterAdaptersChangedEvent` never signals its event. It still gives the host's answers: a null
+  event or cookie, or an event that is already registered, is `DXGI_ERROR_INVALID_CALL`. Cookies start at 1 and
+  are separate from the occlusion cookies, and an unknown cookie is `DXGI_ERROR_NOT_FOUND`. All of these were
+  measured on the host's `dxgi.dll` (Windows 11, RTX 3070) and are checked in `dxgi_swapchain_test`.
 
     | Argument | Answer |
     |---|---|

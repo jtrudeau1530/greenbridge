@@ -708,7 +708,7 @@ private:
     std::shared_ptr<ReservationState> reservations_;
 };
 
-class Factory final : public IDXGIFactory5 {
+class Factory final : public IDXGIFactory7 {
 public:
     Factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
             VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
@@ -727,8 +727,9 @@ public:
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIFactory) ||
             riid == __uuidof(IDXGIFactory1) || riid == __uuidof(IDXGIFactory2) ||
             riid == __uuidof(IDXGIFactory3) || riid == __uuidof(IDXGIFactory4) ||
-            riid == __uuidof(IDXGIFactory5)) {
-            *out = static_cast<IDXGIFactory5*>(this);
+            riid == __uuidof(IDXGIFactory5) || riid == __uuidof(IDXGIFactory6) ||
+            riid == __uuidof(IDXGIFactory7)) {
+            *out = static_cast<IDXGIFactory7*>(this);
             AddRef();
             return S_OK;
         }
@@ -870,6 +871,39 @@ public:
         return E_INVALIDARG;
     }
 
+    // IDXGIFactory6. The factory has one adapter, so every preference orders the same list. Measured on the host's
+    // dxgi.dll (Windows 11, RTX 3070): a preference outside the enum is accepted, a null `out` is
+    // DXGI_ERROR_INVALID_CALL, and an index past the end is DXGI_ERROR_NOT_FOUND with *out cleared.
+    HRESULT STDMETHODCALLTYPE EnumAdapterByGpuPreference(UINT index, DXGI_GPU_PREFERENCE, REFIID riid,
+                                                         void** out) override {
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        *out = nullptr;
+        if (index != 0) return DXGI_ERROR_NOT_FOUND;
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        const HRESULT hr = adapter->QueryInterface(riid, out);
+        adapter->Release();
+        return hr;
+    }
+
+    // IDXGIFactory7. The adapter list never changes, so a registered event is never signalled; the registry only
+    // keeps the host's answers (same measurement): a null event or cookie and an event registered twice are
+    // DXGI_ERROR_INVALID_CALL, cookies start at 1 and are separate from the occlusion cookies, and an unknown
+    // cookie is DXGI_ERROR_NOT_FOUND.
+    HRESULT STDMETHODCALLTYPE RegisterAdaptersChangedEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return DXGI_ERROR_INVALID_CALL;
+        std::lock_guard lock(adapters_changed_mutex_);
+        for (const auto& [registered_cookie, registered_event] : adapters_changed_events_)
+            if (registered_event == event) return DXGI_ERROR_INVALID_CALL;
+        const DWORD next = next_adapters_changed_cookie_++;
+        adapters_changed_events_.emplace(next, event);
+        *cookie = next;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE UnregisterAdaptersChangedEvent(DWORD cookie) override {
+        std::lock_guard lock(adapters_changed_mutex_);
+        return adapters_changed_events_.erase(cookie) ? S_OK : DXGI_ERROR_NOT_FOUND;
+    }
+
 private:
     bool probe_immediate_present_mode() const {
         if (!gipa_ || !instance_ || !physical_) return false;
@@ -919,6 +953,9 @@ private:
     mutable std::once_flag tearing_once_;
     bool tearing_supported_ = false;
     std::atomic<DWORD> next_occlusion_cookie_{1};
+    std::mutex adapters_changed_mutex_;
+    std::map<DWORD, HANDLE> adapters_changed_events_;
+    DWORD next_adapters_changed_cookie_ = 1;
 };
 
 }  // namespace

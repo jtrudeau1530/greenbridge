@@ -1,4 +1,4 @@
-// Real Win32 HWND GPU test for the Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 COM shim
+// Real Win32 HWND GPU test for the Vulkan-backed IDXGIFactory7 / IDXGISwapChain3 COM shim
 // (runtime/shims/dxgi_swapchain.h, runtime/shims/dxgi_com.{h,cpp}).
 // No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation
 // (Core + Synchronization Validation); any validation error fails the test.
@@ -885,6 +885,90 @@ int main() {
             factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, 2) != E_INVALIDARG)
             return fail("CheckFeatureSupport should reject null data or wrong size with E_INVALIDARG");
         factory5->Release();
+
+        // IDXGIFactory6/7 (D3D-2). Every answer below is the host dxgi.dll's (Windows 11, RTX 3070).
+        IDXGIFactory6* factory6 = nullptr;
+        IDXGIFactory7* factory7 = nullptr;
+        if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory6))) || !factory6 ||
+            FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory7))) || !factory7)
+            return fail("QueryInterface(IDXGIFactory6/7) failed");
+        IDXGIFactory7* created7 = nullptr;
+        if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&created7))) || !created7)
+            return fail("create_dxgi_factory(IID_IDXGIFactory7) failed");
+        created7->Release();
+
+        DXGI_ADAPTER_DESC1 enum_desc{};
+        {
+            IDXGIAdapter1* first = nullptr;
+            if (FAILED(factory->EnumAdapters1(0, &first)) || !first || FAILED(first->GetDesc1(&enum_desc)))
+                return fail("EnumAdapters1(0) for the preference comparison");
+            first->Release();
+        }
+        // The host accepts a preference outside the enum, so -1 and 3 are checked as well.
+        for (const int preference : {0, 1, 2, 3, -1}) {
+            const auto pref = static_cast<DXGI_GPU_PREFERENCE>(preference);
+            IDXGIAdapter1* by_pref = nullptr;
+            DXGI_ADAPTER_DESC1 pref_desc{};
+            if (FAILED(factory6->EnumAdapterByGpuPreference(0, pref, IID_PPV_ARGS(&by_pref))) || !by_pref ||
+                FAILED(by_pref->GetDesc1(&pref_desc)))
+                return fail("EnumAdapterByGpuPreference(0) failed");
+            by_pref->Release();
+            if (pref_desc.AdapterLuid.LowPart != enum_desc.AdapterLuid.LowPart ||
+                pref_desc.AdapterLuid.HighPart != enum_desc.AdapterLuid.HighPart)
+                return fail("EnumAdapterByGpuPreference(0) is not EnumAdapters1(0)'s adapter");
+            void* missing = reinterpret_cast<void*>(1);
+            if (factory6->EnumAdapterByGpuPreference(1, pref, __uuidof(IDXGIAdapter1), &missing) !=
+                    DXGI_ERROR_NOT_FOUND || missing != nullptr)
+                return fail("EnumAdapterByGpuPreference past the last adapter should be DXGI_ERROR_NOT_FOUND");
+        }
+        if (factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_UNSPECIFIED, __uuidof(IDXGIAdapter1),
+                                                 nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("EnumAdapterByGpuPreference(out = null) should be DXGI_ERROR_INVALID_CALL");
+        {
+            void* wrong = reinterpret_cast<void*>(1);
+            if (factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_UNSPECIFIED, __uuidof(IDXGIFactory),
+                                                     &wrong) != E_NOINTERFACE || wrong != nullptr)
+                return fail("EnumAdapterByGpuPreference with a non-adapter riid should be E_NOINTERFACE");
+        }
+
+        HANDLE changed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE changed2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!changed || !changed2) return fail("CreateEventW (adapters changed)");
+        DWORD c_null = 0xDEAD, c1 = 0, c2 = 0, c3 = 0;
+        if (factory7->RegisterAdaptersChangedEvent(nullptr, &c_null) != DXGI_ERROR_INVALID_CALL || c_null != 0xDEAD)
+            return fail("RegisterAdaptersChangedEvent(null event) should be DXGI_ERROR_INVALID_CALL");
+        if (factory7->RegisterAdaptersChangedEvent(changed, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterAdaptersChangedEvent(null cookie) should be DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed, &c1)) || c1 != 1)
+            return fail("RegisterAdaptersChangedEvent should succeed with cookie 1");
+        if (factory7->RegisterAdaptersChangedEvent(changed, &c2) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterAdaptersChangedEvent with an event already registered should be DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed2, &c3)) || c3 == c1)
+            return fail("RegisterAdaptersChangedEvent with a second event should get its own cookie");
+        if (WaitForSingleObject(changed, 0) != WAIT_TIMEOUT)
+            return fail("registering must not signal the adapters-changed event");
+        DWORD occlusion = 0;
+        if (FAILED(factory7->RegisterOcclusionStatusEvent(changed, &occlusion)))
+            return fail("RegisterOcclusionStatusEvent (cookie space check)");
+        if (occlusion != c1 && occlusion != c3 &&
+            factory7->UnregisterAdaptersChangedEvent(occlusion) != DXGI_ERROR_NOT_FOUND)
+            return fail("an occlusion cookie should not unregister an adapters-changed event");
+        factory7->UnregisterOcclusionStatus(occlusion);
+        if (FAILED(factory7->UnregisterAdaptersChangedEvent(c1)) ||
+            factory7->UnregisterAdaptersChangedEvent(c1) != DXGI_ERROR_NOT_FOUND ||
+            factory7->UnregisterAdaptersChangedEvent(0) != DXGI_ERROR_NOT_FOUND ||
+            factory7->UnregisterAdaptersChangedEvent(12345) != DXGI_ERROR_NOT_FOUND)
+            return fail("UnregisterAdaptersChangedEvent: a cookie unregisters once, an unknown one is NOT_FOUND");
+        // After unregistering, the same event can be registered again.
+        DWORD c4 = 0;
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed, &c4)) ||
+            FAILED(factory7->UnregisterAdaptersChangedEvent(c4)) ||
+            FAILED(factory7->UnregisterAdaptersChangedEvent(c3)))
+            return fail("re-registering an unregistered event");
+        CloseHandle(changed);
+        CloseHandle(changed2);
+        factory7->Release();
+        factory6->Release();
 
         constexpr UINT tearing_flag = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         constexpr UINT waitable_flag = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
