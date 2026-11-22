@@ -1471,5 +1471,97 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(clamp_f32(SNAN_DEFAULT), POS_ZERO)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Negative controls, architectural syntax rejection, and mutation detection tests."""
+
+    def test_syntax_rejection_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegPair(255, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            RegPair(-1, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            RegPair(105, RegKind.SGPR)
+        with self.assertRaises(ValueError):
+            RegPair(-1, RegKind.SGPR)
+
+    def test_syntax_rejection_instruction_dst(self) -> None:
+        with self.assertRaises(TypeError):
+            VPkMinMaxF32Instruction(
+                opcode=Opcode.V_PK_MIN_F32,
+                dst=RegPair(0, RegKind.SGPR),
+                src0=VOP3POperand(RegPair(2, RegKind.VGPR)),
+                src1=VOP3POperand(RegPair(4, RegKind.VGPR)),
+            )
+
+    def test_syntax_rejection_op_sel(self) -> None:
+        with self.assertRaises(ValueError):
+            VOP3POperand(RegPair(0, RegKind.VGPR), op_sel=(0, 2))
+        with self.assertRaises(ValueError):
+            VOP3POperand(RegPair(0, RegKind.VGPR), op_sel=(-1, 1))
+
+    def test_syntax_rejection_literal_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Literal64(-1)
+        with self.assertRaises(ValueError):
+            Literal64(0x1_0000_0000_0000_0000)
+
+    def test_syntax_rejection_simd_lanes(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_syntax_rejection_lane_reg_type(self) -> None:
+        state = SIMDState(num_lanes=32)
+        with self.assertRaises(TypeError):
+            state.set_lane_reg64(0, RegPair(0, RegKind.SGPR), 0)
+
+    def test_mutation_detection_opcode_inversion(self) -> None:
+        s0 = pack_pk_f32(POS_ONE, POS_TWO)
+        s1 = pack_pk_f32(POS_HALF, POS_HALF)
+
+        correct_min = oracle_pk_min_f32(s0, s1)
+        mutated_max = oracle_pk_max_f32(s0, s1)
+
+        self.assertNotEqual(correct_min, mutated_max)
+        self.assertEqual(correct_min, pack_pk_f32(POS_HALF, POS_HALF))
+        self.assertEqual(mutated_max, pack_pk_f32(POS_ONE, POS_TWO))
+
+    def test_mutation_detection_signed_zero_tiebreak(self) -> None:
+        got = oracle_min_f32(NEG_ZERO, POS_ZERO)
+        self.assertEqual(got, NEG_ZERO)
+        self.assertNotEqual(got, POS_ZERO)
+
+        got_max = oracle_max_f32(NEG_ZERO, POS_ZERO)
+        self.assertEqual(got_max, POS_ZERO)
+        self.assertNotEqual(got_max, NEG_ZERO)
+
+    def test_mutation_detection_nan_suppression(self) -> None:
+        got = oracle_min_f32(QNAN_CANONICAL, POS_TWO)
+        self.assertEqual(got, POS_TWO)
+        self.assertFalse(is_nan32(got))
+
+    def test_mutation_detection_clamp_bypass(self) -> None:
+        val = POS_TWO
+        clamped = clamp_f32(val)
+        self.assertEqual(clamped, POS_ONE)
+        self.assertNotEqual(clamped, val)
+
+    def test_mutation_detection_op_sel_tampering(self) -> None:
+        s0 = pack_pk_f32(POS_ONE, POS_TWO)
+        s1 = pack_pk_f32(f32_to_bits(1.5), f32_to_bits(3.0))
+
+        std_res = oracle_pk_min_f32(s0, s1, op_sel=(0, 0, 1, 1))
+        tampered_res = oracle_pk_min_f32(s0, s1, op_sel=(1, 0, 0, 1))
+
+        self.assertNotEqual(std_res, tampered_res)
+        self.assertEqual(std_res, pack_pk_f32(POS_ONE, POS_TWO))
+        self.assertEqual(tampered_res, pack_pk_f32(f32_to_bits(1.5), POS_ONE))
+
+
 if __name__ == "__main__":
     unittest.main()
