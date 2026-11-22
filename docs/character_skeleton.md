@@ -185,6 +185,47 @@ recovery with the bone-palette pull requests applied, was posted in
 #634](https://github.com/ItsNotRexed/Leonida/issues/634#issuecomment-7074504326); the counts there
 are higher because that recovery also walks nested archives.
 
+## Skinned GLB export
+
+`tools/skinned_glb.py` writes one skinned glTF 2.0 binary from a decoded ped skeleton
+`model.json` and one or more decoded drawable directories. It reads the drawable's palette
+(`grmModel + 0x20`), maps each palette hash through the drawable's own skeleton/string table
+and then the ped table, and reads the 8-influence streams from the graphics buffer. The
+section offsets are also in `drawable.buffers[vertex_buffer].mesh_blob.sections` as
+`[semantic, offset, format]`; the 23-word mesh-block header encodes
+`offset = (word >> 8) * 2`, `format = word & 0xFF`.
+
+| Component | Slot | Stream | Offset | Format | Bytes |
+|---|---|---:|---:|---:|---:|
+| head | 8 | `JOINTS_0`, 4 x u8 | 215,720 | `0x25` | 35,932 |
+| head | 9 | `JOINTS_1`, 4 x u8 | 251,652 | `0x25` | 35,932 |
+| head | 6 | `WEIGHTS_0`, 4 x u8 UNORM | 143,856 | `0x26` | 35,932 |
+| head | 7 | `WEIGHTS_1`, 4 x u8 UNORM | 179,788 | `0x26` | 35,932 |
+| jacket | 8 | `JOINTS_0` | 275,032 | `0x25` | 39,272 |
+| jacket | 9 | `JOINTS_1` | 314,304 | `0x25` | 39,272 |
+| jacket | 6 | `WEIGHTS_0` | 196,488 | `0x26` | 39,272 |
+| jacket | 7 | `WEIGHTS_1` | 235,760 | `0x26` | 39,272 |
+
+The output has one skin. Its joints are the full ped skeleton plus any drawable-local helper
+joints named by the palette; a palette hash that resolves nowhere is emitted as
+`bone_0x........`, never given an invented name. Every vertex keeps all eight influences as
+`JOINTS_0`/`JOINTS_1` and `WEIGHTS_0`/`WEIGHTS_1`. The source u8 weights sum to 255 and are
+normalised to 1.0. Bind and inverse-bind matrices use the same Z-up to Y-up conversion as
+positions, `(x, y, z) -> (x, z, -y)`.
+
+```bash
+python -I tools/skinned_glb.py out.glb \
+    --skeleton <ped>/model.json \
+    --component <head>/model.json \
+    --component <jacket>/model.json
+```
+
+The measured head/jacket export uses 596 ped joints plus 107 garment helper joints (703
+total). This is a static-export skip: only the components named on the command line are
+exported, and no body or other unrequested component is assembled. No game data or generated
+GLB is stored in the repository; `tests/test_skinned_glb.py` builds its own skeleton, skin
+buffer and GLB.
+
 ## Texture parameter split
 
 The character material blocks carry several 32-bit parameter hashes before each 64-bit asset

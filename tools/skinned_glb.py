@@ -807,7 +807,9 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                 "source_weight_sum_max": round(normalised["sum_max"] * 255.0, 6),
                 "local_bones": streams["local_bones"],
             })
-        records[-1]["component_local_joints"] = component_joints
+        component_joints = joints.count - component_joint_start
+        for record in records[component_record_start:]:
+            record["component_local_joints"] = component_joints
 
     if joints.count > 0x10000:
         raise SkinError("a skin may address at most 65,536 joints with UNSIGNED_SHORT indices")
