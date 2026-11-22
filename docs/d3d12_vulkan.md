@@ -674,6 +674,46 @@ Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeli
 therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
 multisampled pipelines, several viewports, primitive restart; `requiredSubgroupSize = 64` for wave64 compute;
 the game's present entry point (`PresentX`; the DXGI factory/swapchain and the presenter above are what it
+- **Subgroup size (compute and graphics PSOs).** A translated shader assumes one subgroup size, and a GPU whose
+  default differs runs it inexact: a wave64 shader reads lanes 32-63 of a 32-wide subgroup, and a wave32 pixel
+  shader on a 64-wide default reads the other half's lanes (AnyPS5 #487 on RDNA4). `runtime/src/subgroup_size.h`
+  decides, per stage, from the shader's index entry and what the device offers; the PSO chains the result.
+  - **Index fields:** `wave64`, `subgroup_size` (64 for wave64, 32 otherwise, `null` when emulated) and
+    `wave64_exchange` (present: translated with `--wave64-emulate`, exact on any size).
+  - **Device:** `subgroupSizeControl` and `computeFullSubgroups` are enabled where supported;
+    `minSubgroupSize`, `maxSubgroupSize`, `maxComputeWorkgroupSubgroups`, `requiredSubgroupSizeStages` (from
+    `VkPhysicalDeviceSubgroupSizeControlProperties`) and the default `subgroupSize` are kept in
+    `VulkanDeviceInfo::subgroup` and printed at device creation.
+  - **Emulated shaders:** nothing is required.
+  - **Native shaders:** `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo{subgroup_size}` when the feature is
+    enabled, the stage is in `requiredSubgroupSizeStages`, the size is a power of two in [min, max] and, for
+    compute and mesh, the workgroup fits in size x `maxComputeWorkgroupSubgroups` (VUID-VkPipelineShaderStageCreateInfo-pNext-02755
+    and -02756, VUID-VkPipelineShaderStageRequiredSubgroupSizeCreateInfo-requiredSubgroupSize-02760..02762).
+    A compute stage also gets `VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT` when
+    `computeFullSubgroups` is enabled and local size X is a multiple of the size (-flags-02785 for the feature,
+    -flags-08988 for the stage, -pNext-02757 for X). Wave32 shaders ask for 32 the same way. A device whose only size is the wanted one (NVIDIA,
+    wave32) needs no chain. Where the size cannot be required (stage not listed, feature off) but the device default is
+    the wanted one, the shader works as it is (`device_default`; nothing guarantees the default, so it is not logged
+    as inexact); any other size is `unavailable` and logged.
+  - **Which stages can be required:** it is the driver's list, not a fixed rule. The AMD Windows driver reports
+    FRAGMENT | COMPUTE | TASK | MESH (measured on a Radeon 880M, 26.11.2, sizes 32..64), so wave64 and wave32 pixel
+    shaders run exact there; so does current Mesa RADV on GFX10+ (COMPUTE | FRAGMENT | task/mesh, Mesa main at
+    152b9cde, `src/amd/vulkan/radv_physical_device.c`, `requiredSubgroupSizeStages`; older Mesa reported compute only).
+    NVIDIA lists every stage but only size 32, so a native wave64 shader cannot get 64 there. Vertex and geometry
+    stages are in neither list.
+  - **A size the device cannot give** is logged once per stage with the first shader's name (and again at 10, 100,
+    1000 shaders of that stage): `[rt] d3d12: <name> (<stage>) is a 64-wide shader but this device cannot require that
+    subgroup size ...`. For compute and mesh the fix is the build, `--wave64-emulate` (`make_game.py
+    --wave64-emulate auto` picks it for this GPU); a wave64 vertex, geometry or pixel shader has no emulation yet
+    (the ~10,000 wave64 pixel shaders are the open case on NVIDIA, SHADER-10).
+  - **Test:** `subgroup_size_test` (CPU) checks the decision against AMD-like, NVIDIA-like and old-RADV
+    properties and the resulting create-info chain; `d3d12_subgroup_test` (GPU) runs `cs_w64x_readlane` natively
+    and with `--wave64-emulate`, and `cs_wqm_w32`, through D3D12 PSOs and compares the read-back words.
+
+Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
+therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
+multisampled pipelines, several viewports, primitive restart; subgroup size for mesh pipelines (the decision covers them, no mesh PSO exists to chain it into), and for wave64 vertex, geometry and, on a GPU that cannot require 64 for pixel shaders (NVIDIA), pixel shaders, which have no emulation (SHADER-10);
+the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what either
 calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do
 not wait on view creation), typeless volume RTVs, depth-stencil resolves to a destination offset other than
 the source rectangle's;
@@ -684,8 +724,6 @@ depth SRVs are sampled next to a read-only DSV, M2); the index buffer is bound w
 (`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one).
 
 Known gaps found in review, not fixed here:
-- **Wave64:** a wave64 compute shader runs at whatever subgroup size the driver picks, because no
-  `requiredSubgroupSize` is requested (claimed as a follow-up in #313).
 - **Queues:** every D3D12 queue submits to one `VkQueue`, which runs batches in order. So a queue that waits on a
   fence another queue signals later (`B->Wait(f, n)` recorded before `A->Signal(f, n)`) holds back that signal,
   and the GPU never progresses (woreksami's probe). Queues on separate Vulkan queues (#306 for copy and compute)
@@ -704,6 +742,10 @@ CPU tests:
 - `gfx10_descriptors_test` covers the T#, S# and V#: every field alone at its bit position, round trips, what
   decoding refuses and ignores, the T#s the image test shaders build, sampler words as radv writes them, and the
   format table. `tests/test_gfx10_descriptors.py` compares that table with `tools/gfx10_formats.json`.
+- `subgroup_size_test` covers the subgroup-size decision of section 3.2 without a GPU: synthetic index entries
+  (native and emulated wave64, wave32; compute, pixel, mesh, vertex) against AMD-like (32..64, FRAGMENT | COMPUTE |
+  TASK | MESH), NVIDIA-like (32 only, every stage) and old-RADV (COMPUTE only) properties, the limits (feature off,
+  `maxComputeWorkgroupSubgroups`, a size that is not a power of two), and the create-info chain.
 
 The GPU tests read their results back. With `LEONIDA_VK_VALIDATION=1` they run under `VK_LAYER_KHRONOS_validation`,
 and any validation error fails them.
@@ -864,6 +906,25 @@ and any validation error fails them.
 - `xbox_present_test`: `PresentX` and the frame events (section 4.5, "what is implemented"), checked on swapchain pixels.
     there is one. A host that reports no non-normalized samplers is compared only on the 3 cases without the
     flag. The other 19 are then checked against their recorded answers only.
+- `d3d12_subgroup_test`: subgroup size control through D3D12 PSOs, on the PSOs of the device proxy.
+  - **Shaders:** `cs_w64x_readlane` (a `v_readlane` across both halves of a wave64) translated natively and with
+    `--wave64-emulate`, and `cs_wqm_w32`, built by `test/shaders/build.py` (needs `llvm-mc`: `LLVM_MC`).
+  - **Check:** each is dispatched through a PSO found by FSSM hash and the eight words it stores are compared. The
+    PSO's request (`pipeline_subgroup_requests`) must equal the decision function's. The native wave64 shader
+    must be exact where the device can give 64 (AMD: required size 64 plus full subgroups) and is reported, not
+    judged, where it cannot (NVIDIA); the emulated one must be exact everywhere.
+  - **Control:** a second run with nothing requested is printed. On the Radeon 880M the default compute subgroup is
+    already 64, so the wave64 controls are exact as well.
+  - **Probes:** GLSL shaders (`cs_sg_probe.comp`, `ps_sg_probe.frag`, `vs_sg_fullscreen.vert`) store `gl_SubgroupSize`,
+    so the size the driver used is observed for a wave64 entry, a wave32 entry and an emulated one. Where the PSO
+    required a size, the observed size must equal it. For a wave32 compute shader on a device whose default is not 32,
+    the control is asserted to differ (the request matters); a wave32 pixel shader on the 880M goes from 64-wide to
+    32-wide with the request.
+  - **Wave64 pixel shader:** `ps_w64x_readlane.asm` (`v_readlane` of lanes 40, 5, 33 and 63) is drawn over 64x64
+    pixels through a graphics PSO into a float target, and every pixel must carry the four values derived in the
+    .asm header where the PSO required 64: 4096 of 4096 on the 880M. The control is asserted to differ only where the
+    default pixel subgroup is not 64; the 880M runs pixel shaders 64-wide by default, so its control is exact too. On
+    the RTX 5070 the shader gets no 64 (0 of 4096 exact, not judged).
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
@@ -1266,8 +1327,8 @@ Pipeline creation:
   `InputSlotClass`/`InstanceDataStepRate`. The index entry needs the semantic map (section 3.5).
 - Enable the features the index entry lists: barycentrics, fragment interlock, mesh, geometry, Float64, Int64,
   buffer device address, storage image without format, maintenance8.
-- Request `requiredSubgroupSize = 64` for wave64 shaders when `VK_EXT_subgroup_size_control` offers it (AMD).
-  Otherwise use the translator's 32-wide approximation and say so in the log.
+- Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
+  in `requiredSubgroupSizeStages`, and say so in the log where it cannot (section 3.2, "Subgroup size").
 - Pipeline caches: use a `VkPipelineCache` keyed by driver/pipeline-cache UUID; the `pipelines` build stage already
   produces one. D3D12 `CachedPSO` blobs are driver-specific and are ignored (the PSO is rebuilt from its
   descriptors). `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan cache.
@@ -2180,7 +2241,7 @@ store, load, mesh, geometry and BVH tests; this layer is the other half.
 | PS system inputs | `FragCoord` (xy/z/w), `FrontFacing`, barycentrics; enable `fragmentShaderBarycentric` and `fragmentShaderPixelInterlock` when the index entry asks. |
 | Mesh/geometry stages | `VK_EXT_mesh_shader`; the index's max vertices/primitives size the SPIR-V output arrays and are checked against the device's mesh properties; geometry stage for the 195 voxelize shaders; `DispatchMesh` → `vkCmdDrawMeshTasksEXT`. |
 | POPS collision | The runtime puts 0 (no collision, bit 31 clear) in the POPS collision SGPR; the translator uses fragment-shader interlock for ordering. **Open:** the exact SGPR location is a translator/driver detail not named in the current contract. |
-| Wave size | `requiredSubgroupSize = 64` when supported (AMD); otherwise the translator's 32-wide approximation is explicit in the log. |
+| Wave size | The PSO asks for the size the shader was translated for (`requiredSubgroupSize` 64 or 32, section 3.2 "Subgroup size") where the stage is in `requiredSubgroupSizeStages`; a shader translated with `--wave64-emulate` asks for nothing. A size the device cannot give is named in the log. |
 | Code-embedded data | The whole FSSM blob is in the arena; `s_getpc_b64` becomes `code_base + next-instruction offset`. |
 
 ### 5.1 Descriptor hash table details
@@ -2523,6 +2584,12 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 - **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). **The runtime now keeps that table in `DEVICE_LOCAL` memory** and uploads only the slots that changed, from a mapped staging copy, with the copy and its barrier in the command buffer that will read it (D3D-76; 46.2x on a divergent miss at 100k on an RTX 2060 SUPER). Improving slot placement within the 8-probe window is the open optimisation (SHADER-100); Intel, RTX 5070 Ti Laptop and AMD RDNA3 are measured in section 5.1; Apple numbers remain open via `vk_descriptor_bench`.
 - **Wave64.** On NVIDIA, wave64 shaders use the translator's 32-wide approximation; cross-half ops are approximate.
   AMD GPUs with 64-wide subgroups are exact. This is a known fidelity gap, not specific to the layer.
+- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). **The runtime now keeps that table in `DEVICE_LOCAL` memory** and uploads only the slots that changed, from a mapped staging copy, with the copy and its barrier in the command buffer that will read it (D3D-76; 46.2x on a divergent miss at 100k on an RTX 2060 SUPER). Improving slot placement within the 8-probe window is the open optimisation (SHADER-100); AMD/Intel/Apple numbers remain open via `vk_descriptor_bench`.
+- **Wave64.** A native wave64 shader needs a 64-wide subgroup in its stage: AMD (Windows driver, RADV on GFX10+) can require
+  it for compute, mesh and pixel shaders, NVIDIA cannot (32 only). There, compute and mesh shaders translated with
+  `--wave64-emulate` are exact; wave64 pixel, vertex and geometry shaders have no emulation and keep the
+  translator's 32-wide approximation (cross-half ops are approximate). This is a known fidelity gap, not specific to
+  the layer.
 - **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain
   unknown. If the game assumes console tiling or compression metadata, the layer needs a detile/repack step.
 - **BVH builder DXIL.** 44 of the builder's 53 Xbox DXIL shaders fail the PC compiler; 22 have been lowered to

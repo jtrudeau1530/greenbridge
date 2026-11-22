@@ -6,6 +6,7 @@
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
 #include "vk_device_pick.h"
+#include "../src/subgroup_size.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -101,6 +102,8 @@ public:
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
+    // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
+    leonida::SubgroupSizeCaps subgroup;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -328,6 +331,15 @@ public:
                                                   conditional_rendering ? &enable_conditional : nullptr};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
+        enable13.subgroupSizeControl = features13.subgroupSizeControl;
+        enable13.computeFullSubgroups = features13.computeFullSubgroups;
+        leonida::query_subgroup_size_caps(instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2"),
+                                          physical, features13.subgroupSizeControl, features13.computeFullSubgroups,
+                                          subgroup);
+        std::printf("subgroup sizes: %u..%u (default %u), requirable in stages 0x%x, subgroupSizeControl %s, "
+                    "computeFullSubgroups %s\n",
+                    subgroup.min_size, subgroup.max_size, subgroup.default_size, unsigned(subgroup.required_stages),
+                    subgroup.subgroup_size_control ? "on" : "off", subgroup.compute_full_subgroups ? "on" : "off");
         // shaderDrawParameters, where available: translated vertex shaders will read BaseVertex and BaseInstance once PR 436
         // (zero-based VS ids) is in; harmless before.
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
@@ -364,6 +376,7 @@ public:
         queue_info.pQueuePriorities = &priority;
         VkPhysicalDeviceFeatures enable{};
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
+        enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;

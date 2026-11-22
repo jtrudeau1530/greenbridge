@@ -1283,6 +1283,61 @@ if(TARGET Vulkan::Headers)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test and d3d12_draw_test are not built")
     endif()
+
+    # Subgroup size control in PSOs, end to end: runtime/test/shaders/cs_w64x_readlane.asm translated natively and with
+    # --wave64-emulate, and cs_wqm_w32.asm, built here with tools/rdna2spirv.py through test/shaders/build.py. Needs
+    # llvm-mc with the AMDGPU target (LLVM_MC in the environment, as for the other shader tests, or llvm-mc on PATH)
+    # and the Vulkan SDK's spirv tools; without them the test is not built.
+    if(DEFINED ENV{LLVM_MC})
+      set(LEONIDA_LLVM_MC "$ENV{LLVM_MC}")
+    else()
+      find_program(LEONIDA_LLVM_MC llvm-mc HINTS "C:/msys64/ucrt64/bin")
+    endif()
+    if(LEONIDA_LLVM_MC AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_SG_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/subgroup_shaders)
+      set(LEONIDA_SG_INDEXES "")
+      foreach(case "w64_native;cs_w64x_readlane;0" "w64_emulated;cs_w64x_readlane;1" "w32_native;cs_wqm_w32;0"
+                       "ps_w64_native;ps_w64x_readlane;0")
+        list(GET case 0 folder)
+        list(GET case 1 shader)
+        list(GET case 2 emulate)
+        set(index ${LEONIDA_SG_DIR}/${folder}/spirv/index.json)
+        add_custom_command(
+          OUTPUT ${index}
+          COMMAND ${CMAKE_COMMAND} -E env LLVM_MC=${LEONIDA_LLVM_MC} LEONIDA_W64_EMULATE=${emulate}
+                  $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                  ${LEONIDA_SG_DIR}/${folder} ${shader}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/${shader}.asm
+                  ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+          COMMENT "Translating ${shader} for the subgroup size test (${folder})"
+          VERBATIM)
+        list(APPEND LEONIDA_SG_INDEXES ${index})
+      endforeach()
+      # The probe shaders that store the subgroup size the driver ran them with, and a one-triangle vertex shader.
+      foreach(source cs_sg_probe.comp ps_sg_probe.frag vs_sg_fullscreen.vert)
+        set(output ${LEONIDA_SG_DIR}/glsl/${source}.spv)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${CMAKE_COMMAND} -E make_directory ${LEONIDA_SG_DIR}/glsl
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling ${source}"
+          VERBATIM)
+        list(APPEND LEONIDA_SG_INDEXES ${output})
+      endforeach()
+      add_executable(d3d12_subgroup_test test/d3d12_subgroup_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_SG_INDEXES})
+      target_link_libraries(d3d12_subgroup_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_subgroup_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_SUBGROUP_SHADERS="${LEONIDA_SG_DIR}")
+      target_compile_options(d3d12_subgroup_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_subgroup COMMAND d3d12_subgroup_test)
+      set_tests_properties(d3d12_subgroup PROPERTIES SKIP_RETURN_CODE 77)
+    else()
+      message(STATUS "llvm-mc (set LLVM_MC) or glslangValidator not found: d3d12_subgroup_test is not built")
+    endif()
+
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
@@ -1392,6 +1447,10 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME replay_cpu_bench_selftest COMMAND replay_cpu_bench --self-test)
     add_test(NAME vk_descriptor_bench_selftest COMMAND vk_descriptor_bench --self-test)
+    # The subgroup size a pipeline stage asks for, from synthetic index entries and device properties.
+    add_executable(subgroup_size_test test/subgroup_size_test.cpp)
+    target_link_libraries(subgroup_size_test PRIVATE Vulkan::Headers)
+    add_test(NAME subgroup_size COMMAND subgroup_size_test)
   endif()
 else()
   message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "

@@ -33,7 +33,6 @@
 #include <iterator>
 #include <map>
 #include <cstring>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -65,6 +64,37 @@ void log_once(const char* what, int value) {
     static std::set<std::pair<std::string, int>> seen;
     std::lock_guard lock(mutex);
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+}
+
+// A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
+// for a wave32 shader on a 64-wide default, reads lanes that are not its own). Logged once per stage with the first
+// shader's name, then again at 10, 100, 1000... of that stage so a whole corpus stays readable.
+void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonida::SubgroupRequest& request,
+                                 const leonida::SubgroupSizeCaps& caps) {
+    static std::mutex mutex;
+    static std::map<std::string, std::pair<std::set<std::string>, unsigned>> seen;  // stage -> names, next report
+    std::lock_guard lock(mutex);
+    auto& [names, next_report] = seen[entry.stage];
+    if (!names.insert(entry.name).second) return;
+    if (names.size() == 1) next_report = 10;
+    else if (names.size() != next_report) return;
+    else next_report *= 10;
+    const bool emulable = entry.stage == "cs" || entry.stage == "ms";
+    const std::string so_far =
+        names.size() > 1 ? " (shaders of this stage so far: " + std::to_string(names.size()) + ")" : "";
+    std::fprintf(stderr,
+                 "[rt] d3d12: %s (%s) is a %u-wide shader but this device cannot require that subgroup size for the "
+                 "stage (device sizes %u..%u, default %u, subgroupSizeControl %s); it runs at the device's size and "
+                 "is inexact where lanes of the other half matter%s\n",
+                 entry.name.c_str(), entry.stage.c_str(), request.wanted, caps.min_size, caps.max_size,
+                 caps.default_size, caps.subgroup_size_control ? "on" : "off",
+                 so_far.c_str());
+    if (emulable && request.wanted == 64)
+        std::fprintf(stderr, "[rt] d3d12: translate wave64 %s shaders with --wave64-emulate for this GPU "
+                             "(make_game.py --wave64-emulate auto does)\n", entry.stage.c_str());
+    else if (request.wanted == 64)
+        std::fprintf(stderr, "[rt] d3d12: no emulation exists for wave64 %s shaders yet (docs/d3d12_vulkan.md, "
+                             "subgroup size)\n", entry.stage.c_str());
 }
 
 struct Format {
@@ -1989,9 +2019,22 @@ public:
         return false;
     }
 
+    // Asks for the subgroup size the shader was translated for, where the device allows (src/subgroup_size.h): the
+    // stage gets VkPipelineShaderStageRequiredSubgroupSizeCreateInfo in `storage` (which must outlive pipeline
+    // creation) and, for compute, REQUIRE_FULL_SUBGROUPS. A size the device cannot give is reported, not hidden.
+    void subgroup_size_for(const leonida::ShaderEntry& entry, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo& storage,
+                           VkPipelineShaderStageCreateInfo& stage) {
+        const leonida::SubgroupRequest request = leonida::decide_subgroup_size(entry, device_.info.subgroup);
+        if (request.outcome == leonida::SubgroupOutcome::unavailable)
+            report_subgroup_unavailable(entry, request, device_.info.subgroup);
+        leonida::apply_subgroup_request(request, storage, stage);
+        subgroup_requests_.push_back(request);
+    }
+
     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
     bool compute() const { return registered_ && !is_graphics_; }
     bool graphics() const { return registered_ && is_graphics_; }
+    const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
 
     // A VS (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the VS's
     // input signature by semantic name and index: location = the element's register, the translator's rule
@@ -2033,6 +2076,8 @@ public:
         Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
+        // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
+        auto& required_sizes = recipe_.required_sizes;
         const Stage* code_stage = nullptr;
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
@@ -2080,6 +2125,7 @@ public:
             info.stage = stage.bit;
             info.module = module;
             info.pName = "main";
+            subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
 
@@ -2327,7 +2373,6 @@ public:
                          entry->name.c_str());
             return E_NOTIMPL;
         }
-        if (entry->wave64) log_once("wave64 compute shader runs 32-wide (subgroup size control not requested yet)", 0);
         const std::vector<std::uint32_t> words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
@@ -2355,6 +2400,8 @@ public:
         pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipeline_info.stage.module = module_;
         pipeline_info.stage.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+        subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
         if (vk.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
             VK_SUCCESS)
@@ -2376,6 +2423,7 @@ private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[2]{};  // what `stages` chain
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
@@ -2471,6 +2519,7 @@ private:
     VkDeviceSize code_bytes_ = 0;
     bool registered_ = false;
     bool is_graphics_ = false;
+    std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
 };
 
 // A view of a texture as Create*View describes it, before the resource's own shape is applied.
@@ -5319,6 +5368,11 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     return p && p->graphics() ? p->id() : 0;
 }
 
+const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
+}
+
 VkImage vulkan_image(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->image() : VK_NULL_HANDLE;
@@ -5667,6 +5721,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
+    LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties2);
     LEONIDA_INSTANCE(vkEnumerateDeviceExtensionProperties);
     LEONIDA_INSTANCE(vkCreateDevice);
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
@@ -5684,6 +5739,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
+    VkPhysicalDeviceVulkan13Features chosen13{};
     bool chosen_draw_params = false;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
@@ -5712,6 +5768,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 chosen_bc = bc;
                 chosen_features = features.features;
                 chosen12 = f12;
+                chosen13 = f13;
                 chosen_draw_params = draw_params;
             }
             break;
@@ -5795,6 +5852,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, ext_chain};
     enable13.dynamicRendering = VK_TRUE;
     enable13.synchronization2 = VK_TRUE;
+    // Subgroup size control: a pipeline stage asks for the size its shader was translated for (src/subgroup_size.h).
+    enable13.subgroupSizeControl = chosen13.subgroupSizeControl;
+    enable13.computeFullSubgroups = chosen13.computeFullSubgroups;
+    leonida::query_subgroup_size_caps(vkGetPhysicalDeviceProperties2, info.physical, chosen13.subgroupSizeControl,
+                                      chosen13.computeFullSubgroups, info.subgroup);
     // Translated vertex shaders read BaseVertex / BaseInstance (SPIR-V DrawParameters) to give v0 / v3 the
     // hardware's zero-based vertex and instance ids (docs/design.md, Inputs and outputs).
     VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
@@ -5997,6 +6059,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,
                  chosen.limits.maxPushConstantsSize);
+    std::fprintf(stderr,
+                 "[rt] d3d12: subgroup sizes %u..%u (default %u), requirable in stages 0x%x, subgroupSizeControl %s, "
+                 "computeFullSubgroups %s\n",
+                 info.subgroup.min_size, info.subgroup.max_size, info.subgroup.default_size,
+                 unsigned(info.subgroup.required_stages), info.subgroup.subgroup_size_control ? "on" : "off",
+                 info.subgroup.compute_full_subgroups ? "on" : "off");
     if (info.push_constants_need_fallback) {
         std::fprintf(stderr,
                      "[rt] d3d12: WARNING: GPU maxPushConstantsSize (%u bytes) is below the 144 bytes required by "
