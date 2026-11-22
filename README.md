@@ -111,7 +111,10 @@ python -I make_game.py --wave64-emulate off            # auto (default), on or o
 (see "Wave64 emulation" in [docs/design.md](docs/design.md)). NVIDIA and Intel GPUs have 32-wide subgroups and need
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns it on unless every GPU reports 64-wide
 subgroups, or when it can't tell; it also turns it on when the GPU the runtime would use can't be made to run
-compute and mesh shaders 64-wide. The mode is saved next to the translated shaders, and changing it translates them
+compute and mesh shaders 64-wide. One exception keeps it off: when the runtime's GPU is an RDNA2 card or iGPU
+(RX 6000, Ryzen 6000/7000/9000 graphics) on AMD's Windows driver and runs wave64 natively, because that driver's
+shader compiler crashes on emulated LDS code (#857); an Intel iGPU next to an RX 6000 card would otherwise turn it on.
+The mode is saved next to the translated shaders, and changing it translates them
 again. With `auto`, a work folder that previously used emulation keeps it for later translations and retries, even if
 the current GPU supports native wave64. Use `--wave64-emulate off` to translate it natively.
 
