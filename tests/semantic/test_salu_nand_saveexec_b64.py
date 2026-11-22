@@ -24,9 +24,12 @@ Wavefront control-flow contract:
     - De Morgan duality: ~(S0 & EXEC) == (~S0 | ~EXEC).
 """
 
+import re
 import sys
 import unittest
-from typing import Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional, Tuple
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -265,6 +268,192 @@ class TestSaluNandSaveexecB64Oracle(unittest.TestCase):
         self.assertEqual(scc.value, 1)
         scc.update(0x0)
         self.assertEqual(scc.value, 0)
+
+
+# --- Symbolic AST Definitions and Typed Expressions ---
+
+class OperandKind(Enum):
+    SGPR_PAIR = auto()     # 64-bit SGPR pair s[N:N+1]
+    SGPR_SINGLE = auto()   # 32-bit SGPR sN (invalid for 64-bit SOP1, used in type checking)
+    LITERAL_U64 = auto()   # 64-bit literal constant
+    INLINE_CONST = auto()  # Small inline integer constant (-16 to 64)
+    SPECIAL_REG = auto()   # Special 64-bit register (e.g. exec, vcc)
+
+
+@dataclass
+class Operand:
+    """Symbolic operand for RDNA2 SALU instructions."""
+    kind: OperandKind
+    reg_index: Optional[int] = None
+    literal_val: Optional[int] = None
+    name: Optional[str] = None
+
+    def validate(self, is_dst: bool = False) -> None:
+        if is_dst:
+            if self.kind != OperandKind.SGPR_PAIR:
+                raise TypeError(f"Destination must be a 64-bit SGPR pair, got {self.kind}")
+            if self.reg_index is None or not (0 <= self.reg_index <= 104):
+                raise ValueError(f"Invalid SGPR pair index: {self.reg_index}")
+            if self.reg_index % 2 != 0:
+                raise ValueError(f"64-bit SGPR pair must be even-aligned, got s[{self.reg_index}:{self.reg_index+1}]")
+        else:
+            if self.kind == OperandKind.SGPR_PAIR:
+                if self.reg_index is None or not (0 <= self.reg_index <= 104):
+                    raise ValueError(f"Invalid SGPR pair index: {self.reg_index}")
+                if self.reg_index % 2 != 0:
+                    raise ValueError(f"64-bit SGPR pair must be even-aligned, got s[{self.reg_index}:{self.reg_index+1}]")
+            elif self.kind == OperandKind.LITERAL_U64:
+                if self.literal_val is None or not (0 <= self.literal_val <= MASK64):
+                    raise ValueError(f"Literal 64-bit value out of range: {self.literal_val}")
+            elif self.kind == OperandKind.INLINE_CONST:
+                if self.literal_val is None:
+                    raise ValueError("Inline constant value required")
+            elif self.kind == OperandKind.SPECIAL_REG:
+                if self.name not in ("exec", "vcc"):
+                    raise ValueError(f"Unsupported special register: {self.name}")
+            elif self.kind == OperandKind.SGPR_SINGLE:
+                raise TypeError("Single 32-bit SGPR cannot be used directly as 64-bit operand")
+
+    def to_asm(self) -> str:
+        if self.kind == OperandKind.SGPR_PAIR:
+            return f"s[{self.reg_index}:{self.reg_index + 1}]"
+        elif self.kind == OperandKind.SGPR_SINGLE:
+            return f"s{self.reg_index}"
+        elif self.kind == OperandKind.LITERAL_U64:
+            return f"{self.literal_val:#018x}"
+        elif self.kind == OperandKind.INLINE_CONST:
+            return str(self.literal_val)
+        elif self.kind == OperandKind.SPECIAL_REG:
+            return str(self.name)
+        return "unknown"
+
+
+@dataclass
+class InstructionAST:
+    """Symbolic Abstract Syntax Tree node for s_nand_saveexec_b64."""
+    opcode: str
+    dst: Operand
+    src0: Operand
+
+    def validate(self) -> None:
+        if self.opcode != "s_nand_saveexec_b64":
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        self.dst.validate(is_dst=True)
+        self.src0.validate(is_dst=False)
+
+    def to_asm(self) -> str:
+        return f"{self.opcode} {self.dst.to_asm()}, {self.src0.to_asm()}"
+
+
+RE_PAIR = re.compile(r"^s\[(\d+):(\d+)\]$")
+RE_SINGLE = re.compile(r"^s(\d+)$")
+RE_HEX = re.compile(r"^0x[0-9a-fA-F]+$")
+RE_INT = re.compile(r"^-?\d+$")
+
+
+def parse_sop1_nand_saveexec_b64(asm: str) -> InstructionAST:
+    """Parse assembly string into symbolic InstructionAST."""
+    line = asm.strip()
+    if not line:
+        raise ValueError("Empty assembly statement")
+    tokens = line.split(None, 1)
+    if len(tokens) != 2:
+        raise ValueError(f"Invalid instruction syntax: '{line}'")
+    opcode, operands_str = tokens
+    if opcode != "s_nand_saveexec_b64":
+        raise ValueError(f"Unexpected opcode: '{opcode}', expected 's_nand_saveexec_b64'")
+
+    parts = [p.strip() for p in operands_str.split(",")]
+    if len(parts) != 2:
+        raise ValueError(f"s_nand_saveexec_b64 requires exactly 2 operands (dst, src0), got {len(parts)}")
+
+    # Parse dst
+    m_dst = RE_PAIR.match(parts[0])
+    if not m_dst:
+        m_s = RE_SINGLE.match(parts[0])
+        if m_s:
+            dst = Operand(OperandKind.SGPR_SINGLE, reg_index=int(m_s.group(1)))
+        else:
+            raise ValueError(f"Invalid destination format: '{parts[0]}'")
+    else:
+        lo, hi = int(m_dst.group(1)), int(m_dst.group(2))
+        if hi != lo + 1:
+            raise ValueError(f"Destination SGPR pair must be contiguous s[N:N+1], got s[{lo}:{hi}]")
+        dst = Operand(OperandKind.SGPR_PAIR, reg_index=lo)
+
+    # Parse src0
+    src_str = parts[1]
+    m_src_pair = RE_PAIR.match(src_str)
+    if m_src_pair:
+        lo, hi = int(m_src_pair.group(1)), int(m_src_pair.group(2))
+        if hi != lo + 1:
+            raise ValueError(f"Source SGPR pair must be contiguous s[N:N+1], got s[{lo}:{hi}]")
+        src0 = Operand(OperandKind.SGPR_PAIR, reg_index=lo)
+    elif src_str.lower() in ("exec", "vcc"):
+        src0 = Operand(OperandKind.SPECIAL_REG, name=src_str.lower())
+    elif RE_HEX.match(src_str):
+        val = int(src_str, 16) & MASK64
+        src0 = Operand(OperandKind.LITERAL_U64, literal_val=val)
+    elif RE_INT.match(src_str):
+        val = int(src_str)
+        if -16 <= val <= 64:
+            src0 = Operand(OperandKind.INLINE_CONST, literal_val=val)
+        else:
+            src0 = Operand(OperandKind.LITERAL_U64, literal_val=val & MASK64)
+    elif RE_SINGLE.match(src_str):
+        src0 = Operand(OperandKind.SGPR_SINGLE, reg_index=int(RE_SINGLE.match(src_str).group(1)))
+    else:
+        raise ValueError(f"Unrecognized source operand: '{src_str}'")
+
+    ast = InstructionAST(opcode=opcode, dst=dst, src0=src0)
+    ast.validate()
+    return ast
+
+
+class TestSaluNandSaveexecB64SymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_parse_valid_sgpr_operands(self):
+        ast = parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s[0:1], s[2:3]")
+        self.assertEqual(ast.opcode, "s_nand_saveexec_b64")
+        self.assertEqual(ast.dst.kind, OperandKind.SGPR_PAIR)
+        self.assertEqual(ast.dst.reg_index, 0)
+        self.assertEqual(ast.src0.kind, OperandKind.SGPR_PAIR)
+        self.assertEqual(ast.src0.reg_index, 2)
+        self.assertEqual(ast.to_asm(), "s_nand_saveexec_b64 s[0:1], s[2:3]")
+
+    def test_parse_literal_and_inline_constants(self):
+        ast_lit = parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s[4:5], 0x123456789ABCDEF0")
+        self.assertEqual(ast_lit.src0.kind, OperandKind.LITERAL_U64)
+        self.assertEqual(ast_lit.src0.literal_val, 0x123456789ABCDEF0)
+
+        ast_inline = parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s[6:7], -1")
+        self.assertEqual(ast_inline.src0.kind, OperandKind.INLINE_CONST)
+        self.assertEqual(ast_inline.src0.literal_val, -1)
+
+    def test_parse_special_registers(self):
+        ast = parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s[8:9], exec")
+        self.assertEqual(ast.src0.kind, OperandKind.SPECIAL_REG)
+        self.assertEqual(ast.src0.name, "exec")
+        self.assertEqual(ast.to_asm(), "s_nand_saveexec_b64 s[8:9], exec")
+
+    def test_ast_validation_rejects_unaligned_pair(self):
+        with self.assertRaises(ValueError):
+            parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s[1:2], s[2:3]")
+
+    def test_ast_validation_rejects_single_sgpr_dst(self):
+        with self.assertRaises(TypeError):
+            parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s0, s[2:3]")
+
+    def test_ast_validation_rejects_non_contiguous_pair(self):
+        with self.assertRaises(ValueError):
+            parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s[0:2], s[2:3]")
+
+    def test_ast_structural_equality_and_repr(self):
+        ast1 = parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s[0:1], s[2:3]")
+        ast2 = parse_sop1_nand_saveexec_b64("s_nand_saveexec_b64 s[0:1], s[2:3]")
+        self.assertEqual(ast1, ast2)
+        self.assertIn("s_nand_saveexec_b64", repr(ast1))
 
 
 if __name__ == "__main__":
