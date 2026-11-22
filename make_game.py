@@ -228,6 +228,13 @@ def default_out() -> str:
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
 
+def pipeline_check_prerequisite() -> str:
+    """Why the pipelines stage can't run yet. Kept here so preflight can fail before a long shader build;
+    pipelines() prints its own, more detailed message when the stage is reached."""
+    return ("vk_pipeline_check (needed by the pipelines stage; run the runtime stage on Windows, or build it "
+            "with CMake as described in README.md)")
+
+
 def preflight(stages: list, work: str, wav: bool = False) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if os.name != "nt":
@@ -258,6 +265,10 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
         ensure_submodule()
     if "runtime" in stages and not visual_cpp_tools_ok():
         missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+    # The pipelines stage needs a checker the runtime stage builds. Without this check a build with
+    # --stages shaders,pipelines spends hours translating shaders only to fail at the very end.
+    if "pipelines" in stages and "runtime" not in stages and not pipeline_check_exe():
+        missing.append(pipeline_check_prerequisite())
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
