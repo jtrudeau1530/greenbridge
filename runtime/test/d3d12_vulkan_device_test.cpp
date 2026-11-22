@@ -797,6 +797,18 @@ int compare_allocation_info(ID3D12Device* ours) {
     for (const Case& c : cases) {
         const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 1, &c.desc);
         const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 1, &c.desc);
+        if (c.top_mip_bytes && b.SizeInBytes == UINT64_MAX && c.desc.SampleDesc.Count > 1 &&
+            c.desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS ms{
+                c.desc.Format, c.desc.SampleDesc.Count, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, 0};
+            if (SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms, sizeof(ms))) &&
+                ms.NumQualityLevels == 0) {
+                if (a.SizeInBytes == UINT64_MAX || a.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+                    mismatch(c.name, a, b);
+                std::printf("allocation info %s: host unsupported (NumQualityLevels=0), skipped\n", c.name);
+                continue;
+            }
+        }
         if (b.SizeInBytes == UINT64_MAX || !c.top_mip_bytes) {
             if (a.SizeInBytes != b.SizeInBytes || (b.SizeInBytes != UINT64_MAX && a.Alignment != b.Alignment))
                 mismatch(c.name, a, b);
@@ -4922,15 +4934,15 @@ int main() {
                         tiled_3d_desc,
                     };
                     for (int idx = 0; idx < int(std::size(host_cases)); ++idx) {
-                        const D3D12_RESOURCE_DESC& d = host_cases[idx];
-                        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+                        const D3D12_RESOURCE_DESC& host_desc = host_cases[idx];
+                        if (host_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                             host_opts.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_3)
                             continue;
                         Ref<ID3D12Resource> our_r, host_r;
                         const HRESULT our_hr = standalone->CreatePlacedResource(
-                            tiled_heap.p, 0, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&our_r.p));
+                            tiled_heap.p, 0, &host_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&our_r.p));
                         const HRESULT host_hr = host_dev->CreatePlacedResource(
-                            host_heap.p, 0, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&host_r.p));
+                            host_heap.p, 0, &host_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&host_r.p));
                         if (FAILED(host_hr)) continue;
                         EXPECT(SUCCEEDED(our_hr));
                         EXPECT(our_r->GetDesc().Layout == host_r->GetDesc().Layout);
