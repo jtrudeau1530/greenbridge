@@ -371,6 +371,16 @@ class ScanTest(unittest.TestCase):
         two = T.summarize(T.scan(self.rpf, jobs=2))
         self.assertEqual(one, two)
 
+    def test_cli_rejects_shared_report_destination(self):
+        out = os.path.join(self.tmp.name, "lights.json")
+        alias = os.path.join(self.tmp.name, ".", "lights.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            T.main([self.rpf, "--out", out, "--lights-out", alias])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--out and --lights-out must use different paths", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
     def test_cli_writes_summary_and_placed_lights(self):
         out = os.path.join(self.tmp.name, "summary.json")
         lights = os.path.join(self.tmp.name, "lights.jsonl")

@@ -108,6 +108,7 @@ PERTURBATIONS = {
     "swizzle_quad_reversed": ("swizzle", "the quad-permute selectors are taken in reverse lane order"),
     "swizzle_or_xor_swapped": ("swizzle", "the bit-mask or and xor fields are swapped"),
     "permute_no_zero": ("permute", "ds_permute_b32 leaves an unwritten lane's register alone instead of writing 0"),
+    "permute_lowest_wins": ("permute", "ds_permute_b32 lets the lowest active source lane win a collision"),
 }
 PERTURB = set()
 
@@ -382,13 +383,13 @@ class Program:
                     "offset": rng.choice([0, 0, 4 * rng.randrange(0, 64)]), "src": rng.choice(POOL),
                     "dst": rng.choice(POOL), "exec": self.exec_mask()}
         if kind == "permute":
-            # an odd multiplier makes the lane -> lane map a bijection in a 32- and in a 64-lane group, so no two
-            # lanes send to the same lane and the result doesn't depend on which write wins
-            return {"kind": kind, "mul": rng.randrange(1, 64, 2), "add": rng.randrange(0, 64),
+            # allow both odd (bijective) and even (colliding) multipliers; RDNA2 hw (gfx1030, SHADER-133) and gfx1150
+            # confirm the highest active source lane wins a collision, unaddressed active lanes get 0, halves separate
+            return {"kind": kind, "mul": rng.randrange(0, 64), "add": rng.randrange(0, 64),
                     "offset": rng.choice([0, 0, 4 * rng.randrange(0, 64)]), "src": rng.choice(POOL),
                     "dst": rng.choice(POOL), "exec": self.exec_mask(),
-                    "hyp": "the ISA text: only active lanes send, a lane nobody sends to gets 0, each 32-lane half "
-                           "is separate"}
+                    "hyp": "only active lanes send, highest active sender wins collisions, a lane nobody sends to "
+                           "gets 0, each 32-lane half is separate (measured on gfx1030 SHADER-133 and gfx1150)"}
         raise ValueError(kind)
 
     # ---- the program text ----
@@ -681,11 +682,12 @@ class Program:
             for t, v in new.items():
                 regs[t][op["dst"]] = v
         elif k == "permute":
-            # forward permute: an active lane sends its data to lane (addr + offset) / 4 of its 32-lane group, an
-            # active lane gets what was sent to it, or 0
+            # forward scatter within each 32-lane half: active lanes send to lane (addr + offset) / 4 of their 32-lane
+            # group; highest-numbered active source wins collisions; active destination lanes nobody targets get 0
             src = [regs[t][op["src"]] for t in range(T)]
             sent = {}
-            for t in range(T):
+            lanes = range(T - 1, -1, -1) if "permute_lowest_wins" in PERTURB else range(T)
+            for t in lanes:
                 if act[t]:
                     word = ((t * op["mul"] + op["add"]) * 4 + op["offset"]) >> 2
                     sent[(t & ~31) | (word & 31)] = src[t]
@@ -739,7 +741,7 @@ def translate(progs, work, emulate):
     for p in progs:
         text = p.asm()
         asm_path = work / (p.name + ".asm")
-        asm_path.write_text(text, encoding="utf-8")
+        asm_path.write_text(text, encoding="utf-8", newline="\n")
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
@@ -747,7 +749,7 @@ def translate(progs, work, emulate):
         if r.returncode or "error:" in r.stderr:
             raise RuntimeError(f"{p.name} did not assemble:\n{r.stderr}")
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-        (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8")
+        (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8", newline="\n")
         (fssm / (p.name + ".fssm")).write_bytes(compute_header(asm_path))
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
@@ -943,7 +945,7 @@ def run_hw(oracle, progs, a, tally, results):
                 print(f"    {ops[i]}" + ("   ; hypothesis op" if ops[i].get("hyp") else ""))
         if a.keep:
             os.makedirs(a.keep, exist_ok=True)
-            Path(a.keep, f"{p.name}_hw.s").write_text("\n".join(p.hw_lines(oracle.arch)) + "\n", encoding="utf-8")
+            Path(a.keep, f"{p.name}_hw.s").write_text("\n".join(p.hw_lines(oracle.arch)) + "\n", encoding="utf-8", newline="\n")
     print("hardware summary:")
     for key, st in sorted(stats.items()):
         print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))

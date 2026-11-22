@@ -316,7 +316,7 @@ def summarise(pages, mode, source):
 
 
 def write_json(path, pages, summary):
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "pages": pages}, f, indent=1)
 
 

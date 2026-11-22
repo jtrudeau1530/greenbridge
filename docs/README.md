@@ -17,8 +17,8 @@ method, scope and caveats. No game data is included.
 
 | Document | Measured content |
 |---|---|
+| [models.md](models.md) | 382,781 models (0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children; the other archives measure 4,686 fragments, 30,343 bone-bound and 126,301,454 triangles, while the `levels.rpf` geometry cells are not independently reproduced; the re-count table is in models.md. |
 | [models.md](models.md) | 382,781 models (2.64 billion triangles, 0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children and 55,417 fragments; the re-count table is in models.md. |
-| [models.md](models.md) | 350,251 models at the `917e9b9` pin, including 159,486 drawable-dictionary children; the `e293917` re-count adds 3,203 rows outside `levels.rpf`, almost all recovered fragments; `levels.rpf` recovers 343,327 models (+29,327) but was not fully exported. The per-archive table is in models.md. |
 | [character_models.md](character_models.md) | `packs.rpf` character parts at `e293917`: 26,585 rows / 11,335 unique names, 2,865 fragments (all a flat 25-vertex / 32-triangle 5x5 bounds grid at z=0), Lucia's 22 named records and the decoded 13-part export, the `player_story000_00` drawable set, slot-name token counts, texture coverage (184/215), and what is not decoded (fragment children, ped variation, hair, bind pose). |
 | [character_skeleton.md](character_skeleton.md) | Character `.#ft` fragments: the 597-name shared skeleton table (596 `joaat32` hashes), the 597-record instance tree with 580 measured parents, the model-side bone-hash mapping, and the measured vertex joint-index/skin-weight layouts (`tools/skin_streams.py`); the reference TRS is not the bind pose. |
 | [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
@@ -46,8 +46,6 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [audio.md](audio.md) | AWC banks: Opus, PCM and XMA2; lossless Ogg Opus repack and WAV paths; stream names from dictionary hits with a salted control; names and subtitles written into the Ogg Opus tags. |
-| [rsc8_audio.md](rsc8_audio.md) | 641,428 `RSC8` v8001 resources across 4 archives: 100% AWC tag `0x5c` facial/lip-sync `crClipDictionary` paired with 48 kHz mono Opus dialogue, 0 hidden audio containers. |
-| [audio.md](audio.md) | AWC banks: Opus, PCM and XMA2; lossless Ogg Opus repack and WAV paths. |
 | [rsc8_audio.md](rsc8_audio.md) | 641,428 `RSC8` v8001 resources across 4 archives: 100% AWC tag `0x5c` facial/lip-sync `crClipDictionary` paired with 48 kHz mono Opus dialogue, 0 hidden audio containers; the undocumented `0x5a`/`0xd9` companion tags (1,185 `audio.rpf` streams) decoded structurally. |
 | [awc_shorts.md](awc_shorts.md) | Export short streamed-music idents/stings by duration; stereo-aware, no re-encode. |
 | [audio_config.md](audio_config.md) | The music/radio record table: 1,589 records, exact durations, AWC stream ids; no start offsets. |
@@ -73,9 +71,10 @@ method, scope and caveats. No game data is included.
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |
 | [fspx.md](fspx.md) | `FSPX`, the FidelityFX DLL's native compute programs (its shaders' `ACCC` part): directory as the DLL reads it, kind-0 dispatch state, the hash prologue, `gfx1030` for its `v_dot4` code; 13 of 29 translate with `tools/fspx_unpack.py`. |
+| [embedded_shaders.md](embedded_shaders.md) | DXBC containers embedded in the package's DLLs: 52 in `XboxBvhBuilder.dll` (console `FSSM` via the `XDAT`/`XBCH` record; 42/52 pass `spirv-val` today) and 29 `ACCC`/`FSPX` in the FidelityFX upscaler; the scan/extract tool and the four rules still missing. |
 | [coder.md](coder.md) | The compressed mass in `story000_script.rpf`: entry framing (`align16(entry+8)` payload), the 32-value tag alphabet, deflate-shaped but proprietary, variable-length 7/8-bit LSB-first codes with no stored table, and the `n7 = 116..127` search that finishes it. |
 | [mission_logic.md](mission_logic.md) | Mission state tables: 0x20 record layout (band counter, byte offsets), the 64-byte pool element with world transforms, case-folding joaat keys, 53.5 % of states named, 113 state-set clusters covering 82.4 % of files. |
 
 ## Other languages
 
-Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`fr`, `pt-BR`, `zh-CN`, `pl-PL`, `tr`).
+Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`fr`, `pt-BR`, `zh-CN`, `pl-PL`, `tr`, `ru`, `ja`).

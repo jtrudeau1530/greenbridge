@@ -902,7 +902,7 @@ int main(int argc, char** argv) {
         // 2. Without its key the T# is a miss: index 0, the fallback image of zeros.
         const float zeros[4] = {0, 0, 0, 0};
         EXPECT(set.erase_key(tsharp) && !set.erase_key(tsharp));
-        EXPECT(set.flush_needs_idle());  // erasing may move the keys behind it; nothing is running here
+        EXPECT(!set.flush_needs_idle());  // erasing empties its slot only: the three keys ahead stay where they are
         EXPECT(flush() && !set.flush_needs_idle());
         CHECK(draw());
         compare("2 miss", zeros);

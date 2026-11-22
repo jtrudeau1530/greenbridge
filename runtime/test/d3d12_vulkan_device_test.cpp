@@ -3571,6 +3571,68 @@ int main() {
             std::printf("invalid arguments: no host D3D12 device to compare with, skipped\n");
         EXPECT(argument_mismatches <= 0);
 
+        // D3D-236: CreateCommandQueue with D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME requires
+        // SeIncreaseBasePriorityPrivilege enabled in the token, matching the Windows D3D12 runtime.
+        {
+            const D3D12_COMMAND_QUEUE_DESC rt_desc{
+                D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME,
+                D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+            struct RestoreOverride {
+                ~RestoreOverride() { rt::d3d12::set_global_realtime_privilege_override_for_test(-1); }
+            } restore_override;
+
+            rt::d3d12::set_global_realtime_privilege_override_for_test(0);
+            EXPECT(!rt::d3d12::has_global_realtime_privilege());
+            Ref<ID3D12CommandQueue> denied_q;
+            EXPECT(device->CreateCommandQueue(&rt_desc, IID_PPV_ARGS(&denied_q.p)) == DXGI_ERROR_ACCESS_DENIED);
+            EXPECT(!denied_q.p);
+            EXPECT(device->CreateCommandQueue(&rt_desc, __uuidof(ID3D12CommandQueue), nullptr) ==
+                   DXGI_ERROR_ACCESS_DENIED);
+
+            rt::d3d12::set_global_realtime_privilege_override_for_test(1);
+            EXPECT(rt::d3d12::has_global_realtime_privilege());
+            EXPECT(device->CreateCommandQueue(&rt_desc, __uuidof(ID3D12CommandQueue), nullptr) == E_UNEXPECTED);
+            Ref<ID3D12CommandQueue> granted_q;
+            EXPECT(SUCCEEDED(device->CreateCommandQueue(&rt_desc, IID_PPV_ARGS(&granted_q.p))) && granted_q.p);
+            if (granted_q.p) {
+                EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+            }
+            granted_q.reset();
+            rt::d3d12::set_global_realtime_privilege_override_for_test(-1);
+
+            // When the process token holds SeIncreaseBasePriorityPrivilege (e.g. an elevated session), toggle the
+            // real token privilege and verify both states against the host D3D12 runtime.
+            HANDLE token = nullptr;
+            LUID luid{};
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+                if (LookupPrivilegeValueW(nullptr, L"SeIncreaseBasePriorityPrivilege", &luid)) {
+                    TOKEN_PRIVILEGES tp{}, prev{};
+                    DWORD prev_len = 0;
+                    tp.PrivilegeCount = 1;
+                    tp.Privileges[0].Luid = luid;
+                    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                    if (AdjustTokenPrivileges(token, FALSE, &tp, sizeof(prev), &prev, &prev_len) &&
+                        GetLastError() == ERROR_SUCCESS) {
+                        EXPECT(rt::d3d12::has_global_realtime_privilege());
+                        EXPECT(command_queue(device.p, rt_desc) == S_OK);
+                        Ref<ID3D12Device> host;
+                        if (create_host_device(host)) {
+                            EXPECT(command_queue(host.p, rt_desc) == S_OK);
+                        }
+                        tp.Privileges[0].Attributes = 0;
+                        if (AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
+                            GetLastError() == ERROR_SUCCESS) {
+                            EXPECT(!rt::d3d12::has_global_realtime_privilege());
+                            EXPECT(command_queue(device.p, rt_desc) == DXGI_ERROR_ACCESS_DENIED);
+                            if (host.p) EXPECT(command_queue(host.p, rt_desc) == DXGI_ERROR_ACCESS_DENIED);
+                        }
+                        AdjustTokenPrivileges(token, FALSE, &prev, 0, nullptr, nullptr);
+                    }
+                }
+                CloseHandle(token);
+            }
+        }
+
         const int depth_quality_mismatches = compare_depth_multisample_quality_levels(device.p, depth_sample_counts);
         if (depth_quality_mismatches < 0)
             std::printf("Depth/stencil MSAA quality queries: no host D3D12 device to compare with, skipped\n");
@@ -5265,6 +5327,7 @@ int main() {
                 {msaa_heap.p, msaa_heap_desc.SizeInBytes - 65536, msaa_unk_small_desc},
                 {upload_placed_heap.p, 0, msaa_unk_small_desc},
                 {deny_rt_heap.p, 0, msaa_unk_small_desc},
+                {deny_rt_heap.p, 0, tiled_rt_desc},
                 {msaa_heap.p, 0,
                  msaa_desc(256, 256, 4, 0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE)},
                 {msaa_heap.p, 0,
@@ -5278,6 +5341,18 @@ int main() {
             for (const BadMsaaCase& bad : bad_msaa) {
                 Ref<ID3D12Resource> fail;
                 EXPECT(standalone->CreatePlacedResource(bad.heap, bad.offset, &bad.desc, D3D12_RESOURCE_STATE_COMMON,
+                                                        nullptr, IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
+                EXPECT(!fail.p);
+            }
+            D3D12_HEAP_DESC only_rt_desc = tiled_heap_desc;
+            only_rt_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+            Ref<ID3D12Heap> only_rt_heap;
+            EXPECT(SUCCEEDED(standalone->CreateHeap(&only_rt_desc, IID_PPV_ARGS(&only_rt_heap.p))));
+            for (const D3D12_RESOURCE_DESC& bad_only_rt :
+                 {texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1),
+                  buffer_desc(4096)}) {
+                Ref<ID3D12Resource> fail;
+                EXPECT(standalone->CreatePlacedResource(only_rt_heap.p, 0, &bad_only_rt, D3D12_RESOURCE_STATE_COMMON,
                                                         nullptr, IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
                 EXPECT(!fail.p);
             }
