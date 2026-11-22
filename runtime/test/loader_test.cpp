@@ -184,6 +184,28 @@ void expect_rejects(const char* what, const std::vector<uint8_t>& bytes) {
 
 void test_valid_image() { expect_loads("a valid image maps with its section intact", make_image()); }
 
+void test_entry_bounds() {
+    for (bool is_dll : {false, true}) {
+        for (uint32_t entry : {0u, 0x1000u, 0x1FFFu, 0x2000u, 0x2001u}) {
+            auto img = make_image();
+            if (is_dll) nt_of(img)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+            nt_of(img)->OptionalHeader.AddressOfEntryPoint = entry;
+            const std::string what = std::string(is_dll ? "DLL" : "EXE") + " entry RVA " + std::to_string(entry);
+            if (entry < nt_of(img)->OptionalHeader.SizeOfImage) {
+                expect_loads(what.c_str(), img);
+            } else {
+                std::string error;
+                if (load(write_image(img), error) == 0)
+                    failed(what.c_str(), "the image loaded");
+                else if (error.find("the entry point is outside the image") == std::string::npos)
+                    failed(what.c_str(), "unexpected error: " + error);
+                else
+                    pass(what.c_str());
+            }
+        }
+    }
+}
+
 void test_header_bounds() {
     {
         auto img = make_image();
@@ -1106,6 +1128,7 @@ int main() {
             return 1;
         }
         test_valid_image();
+        test_entry_bounds();
         test_header_bounds();
         test_section_bounds();
         test_truncation();
