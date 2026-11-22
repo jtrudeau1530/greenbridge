@@ -335,5 +335,154 @@ class TestSymbolicAST(unittest.TestCase):
             )
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 SALU instructions with carry/borrow in."""
+
+    def resolve_operand(self, op: SOP2Operand, state: ScalarModel) -> int:
+        if isinstance(op, SGPROperand):
+            return state.read_sgpr(op.index)
+        elif isinstance(op, LiteralU32):
+            return op.value & MASK_U32
+        elif isinstance(op, InlineConstant):
+            return op.value & MASK_U32
+        else:
+            raise TypeError(f"Unsupported operand type: {type(op).__name__}")
+
+    def step(self, instr: SAddSubbCoCiU32Instruction, state: ScalarModel) -> Tuple[int, int]:
+        # Atomic read phase
+        s0_val = self.resolve_operand(instr.src0, state)
+        s1_val = self.resolve_operand(instr.src1, state)
+        cin = state.scc
+
+        # Computation phase
+        if instr.opcode in (SOPOpcode.S_ADDC_U32, SOPOpcode.S_ADD_CO_CI_U32):
+            res, cc_out = oracle_s_addc_u32(s0_val, s1_val, cin=cin)
+        elif instr.opcode in (SOPOpcode.S_SUBB_U32, SOPOpcode.S_SUB_CO_CI_U32):
+            res, cc_out = oracle_s_subb_u32(s0_val, s1_val, bin_val=cin)
+        else:
+            raise ValueError(f"Unsupported opcode: {instr.opcode}")
+
+        # Update condition code and destination SGPR
+        state.set_scc(cc_out)
+        state.write_sgpr(instr.dst.index, res)
+        return res, cc_out
+
+    def run_program(
+        self, program: List[SAddSubbCoCiU32Instruction], state: ScalarModel
+    ) -> List[Tuple[int, int]]:
+        results: List[Tuple[int, int]] = []
+        for instr in program:
+            results.append(self.step(instr, state))
+        return results
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Verification of deterministic scalar instruction interpretation with SCC carry-in/out."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarModel()
+
+    def test_scalar_addc_with_zero_scc(self) -> None:
+        self.state.set_scc(0)
+        self.state.write_sgpr(1, 100)
+        self.state.write_sgpr(2, 200)
+        instr = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, 300)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(0), 300)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_scalar_addc_with_one_scc(self) -> None:
+        self.state.set_scc(1)
+        self.state.write_sgpr(1, 100)
+        self.state.write_sgpr(2, 200)
+        instr = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, 301)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(0), 301)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_scalar_addc_carry_out_propagation(self) -> None:
+        self.state.set_scc(1)
+        self.state.write_sgpr(1, MAX_U32)
+        self.state.write_sgpr(2, 0)
+        instr = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0)
+        self.assertEqual(cc, 1)
+        self.assertEqual(self.state.read_sgpr(0), 0)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_scalar_subb_with_zero_scc(self) -> None:
+        self.state.set_scc(0)
+        self.state.write_sgpr(1, 50)
+        self.state.write_sgpr(2, 20)
+        instr = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_SUBB_U32,
+            dst=SGPROperand(3),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, 30)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(3), 30)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_scalar_subb_with_one_scc(self) -> None:
+        self.state.set_scc(1)
+        self.state.write_sgpr(1, 50)
+        self.state.write_sgpr(2, 20)
+        instr = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_SUBB_U32,
+            dst=SGPROperand(3),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, 29)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(3), 29)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_scalar_subb_borrow_out_propagation(self) -> None:
+        self.state.set_scc(1)
+        self.state.write_sgpr(1, 10)
+        self.state.write_sgpr(2, 10)
+        instr = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_SUBB_U32,
+            dst=SGPROperand(3),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, MAX_U32)
+        self.assertEqual(cc, 1)
+        self.assertEqual(self.state.read_sgpr(3), MAX_U32)
+        self.assertEqual(self.state.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
