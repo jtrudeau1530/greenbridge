@@ -270,6 +270,18 @@ int main() {
     if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return fail("QI IDXGISwapChain3");
     sc1->Release();
 
+    ID3D12CommandQueue* got_queue = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_queue))) || got_queue != queue) {
+        if (got_queue) got_queue->Release();
+        return fail("GetDevice");
+    }
+    got_queue->Release();
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen{};
+    if (FAILED(sc->GetFullscreenDesc(&fullscreen)) || !fullscreen.Windowed ||
+        fullscreen.Scaling != DXGI_MODE_SCALING_UNSPECIFIED ||
+        fullscreen.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED)
+        return fail("GetFullscreenDesc");
+
     D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ID3D12DescriptorHeap* rtv_heap = nullptr;
     if (FAILED(dev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&rtv_heap)))) return fail("CreateDescriptorHeap");
