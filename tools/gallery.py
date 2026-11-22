@@ -319,12 +319,14 @@ def start_server(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Leonida 3D Asset Studio local web gallery.")
-    parser.add_argument("--port", type=int, default=8080, help="HTTP port (default 8080)")
+    parser.add_argument("--port", type=int, default=8080, help="HTTP port from 0 to 65535 (default 8080)")
     parser.add_argument("--models-dir", type=str, default=None, help="Directory containing .glb models")
     parser.add_argument("--textures-dir", type=str, default=None, help="Directory containing textures")
     parser.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
 
     args = parser.parse_args(argv)
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535")
     start_server(
         port=args.port,
         models_dir=args.models_dir,

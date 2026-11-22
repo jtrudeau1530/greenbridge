@@ -1,5 +1,6 @@
 """Unit tests for tools/gallery.py standalone 3D Studio & Asset Gallery server."""
 import json
+import io
 import os
 import sys
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -102,6 +104,30 @@ class TestGalleryServer(unittest.TestCase):
         with urllib.request.urlopen(f"{base}/textures/test_tex.png", timeout=3) as r:
             self.assertEqual(r.status, 200)
             self.assertTrue(r.read().startswith(b"\x89PNG"))
+
+
+class TestGalleryCommandLine(unittest.TestCase):
+    def test_rejects_out_of_range_ports_before_starting_server(self) -> None:
+        for port in (-1, 65536):
+            with (
+                self.subTest(port=port),
+                mock.patch.object(gallery, "start_server") as start_server,
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    gallery.main(["--port", str(port), "--no-browser"])
+
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("--port must be between 0 and 65535", stderr.getvalue())
+                start_server.assert_not_called()
+
+    def test_passes_default_and_boundary_ports_to_server(self) -> None:
+        for args, port in (([], 8080), (["--port", "0"], 0), (["--port", "65535"], 65535)):
+            with self.subTest(port=port), mock.patch.object(gallery, "start_server") as start_server:
+                self.assertEqual(gallery.main([*args, "--no-browser"]), 0)
+                start_server.assert_called_once_with(
+                    port=port, models_dir=None, textures_dir=None, open_browser=False,
+                )
 
 
 if __name__ == "__main__":
