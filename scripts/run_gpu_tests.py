@@ -26,9 +26,9 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test
 from compute_fixture import compute_header
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST,
-                   USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message, pick_build_dir,
-                   start_failure, texture_gradient_a16_test, texture_mip_test)
+from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+                   TEXTURE_MIP_TEST, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
+                   pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import WAVE32_LANE_DUMPS, narrow_subgroup_skip   # wave32 lane-mask dumps skip below 32 lanes, as in check.py
 
@@ -427,9 +427,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
-              "ps_texture_grad_a16": "vs_ids.asm",
-              "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm",
-              "vs_clip": "ps_ops.asm"}
+              "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
+              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm"}
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -744,17 +743,20 @@ def run_suite(a, work: str) -> int:
             problem = texture_mip_test(a.build, spirv_dir)
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
-        elif name == "ps_texture_grad_a16":
-            problem = texture_gradient_a16_test(a.build, spirv_dir)
-            results.append((name, not problem, problem or "4096 RGBA pixels matched"))
-        elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16", "ps_sample_c_lz"):
+        elif name in GRADIENT_TESTS:
+            problem = texture_gradient_a16_test(a.build, spirv_dir, name)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "4096 RGBA pixels matched"))
+        elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16", "ps_sample_c_lz",
+                      "ps_sample_c_lz_a16"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
                 cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
             else:
-                mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"]}.get(name, [])
+                mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
+                        "ps_sample_c_lz_a16": ["dref_a16"]}.get(name, [])
                 cmd = [tool, *mode, raw]
             try:
                 p = subprocess.run(cmd, capture_output=True, text=True, cwd=spirv_dir)

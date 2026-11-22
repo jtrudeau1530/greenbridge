@@ -12,11 +12,13 @@
 //   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
 //   (x + 0.5) / 8) and a LESS_OR_EQUAL compare sampler at index 1; both of its results, f32 and d16, must be the
 //   1.0 or 0.0 the reference 0.5 gives against the texel each pixel reads.
+//   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
-// VK_KHR_maintenance8 and shaderImageGatherExtended (a non-constant gather Offset) are enabled when the device has
-// them.
+// VK_KHR_maintenance8, shaderImageGatherExtended (a non-constant gather Offset) and shaderResourceMinLod (the MinLod
+// clamp of image_sample_d_cl) are enabled when the device has them. A fragment shader that declares the MinLod
+// capability on a device without shaderResourceMinLod prints "unsupported: ..." and exits 77.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 
@@ -47,6 +49,13 @@ static std::vector<uint32_t> read_spv(const char* p) {
     return w;
 }
 
+// Whether the module declares capability `cap` (OpCapability comes first, right after the 5-word header).
+static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) {
+    for (size_t i = 5; i + 1 < spv.size() && spv[i] == (2u << 16 | 17u); i += 2)   // OpCapability, 2 words
+        if (spv[i + 1] == cap) return true;
+    return false;
+}
+
 #include "../src/descriptor_table.h"
 
 int main(int argc, char** argv) {
@@ -58,7 +67,8 @@ int main(int argc, char** argv) {
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
-    const bool dref = argc >= 2 && !std::strcmp(argv[1], "dref");
+    const bool dref_a16 = argc >= 2 && !std::strcmp(argv[1], "dref_a16");
+    const bool dref = dref_a16 || (argc >= 2 && !std::strcmp(argv[1], "dref"));
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
@@ -87,14 +97,15 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
+        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref_a16 ? "ps_sample_c_lz_a16.spv"
+                           : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
         const int out_arg = cube || dref ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
         return 2;
     }
     uint32_t tsharp[8] = {0x11111111, 0x22222222, 0x33333333, 0x44444444,
@@ -159,6 +170,11 @@ int main(int argc, char** argv) {
                  pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
     VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
+    f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
+    if (declares_capability(read_spv(fs_path.c_str()), 42) && !have.shaderResourceMinLod) {   // 42 = MinLod
+        std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
+        return 77;
+    }
     std::vector<const char*> enable;
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
