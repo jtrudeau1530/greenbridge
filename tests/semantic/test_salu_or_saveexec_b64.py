@@ -227,5 +227,286 @@ class TestSOrSaveExecB64Oracle(unittest.TestCase):
             self.assertEqual(popcount64(new_exec), 1)
 
 
+
+# ==============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    SGPR = auto()
+    EXEC = auto()
+    VCC = auto()
+    TTMP = auto()
+    SPECIAL = auto()
+
+
+@dataclass(frozen=True)
+class RegPair64:
+    """Architectural 64-bit scalar register pair (e.g. s[0:1], exec, vcc)."""
+    index: int
+    reg_type: RegType = RegType.SGPR
+    custom_name: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 104):
+                raise ValueError(f"SGPR index {self.index} out of bounds [0, 104]")
+            if self.index % 2 != 0:
+                raise ValueError(f"64-bit SGPR pair base index must be even-aligned, got {self.index}")
+        elif self.reg_type == RegType.TTMP:
+            if not (0 <= self.index <= 14):
+                raise ValueError(f"TTMP index {self.index} out of bounds [0, 14]")
+            if self.index % 2 != 0:
+                raise ValueError(f"64-bit TTMP pair base index must be even-aligned, got {self.index}")
+
+    @property
+    def lo_reg(self) -> int:
+        return self.index
+
+    @property
+    def hi_reg(self) -> int:
+        return self.index + 1
+
+    @property
+    def is_aligned(self) -> bool:
+        return (self.index % 2) == 0
+
+    @property
+    def is_exec(self) -> bool:
+        return self.reg_type == RegType.EXEC
+
+    @property
+    def is_vcc(self) -> bool:
+        return self.reg_type == RegType.VCC
+
+    @property
+    def name(self) -> str:
+        if self.custom_name is not None:
+            return self.custom_name
+        if self.reg_type == RegType.SGPR:
+            return f"s[{self.index}:{self.index + 1}]"
+        elif self.reg_type == RegType.EXEC:
+            return "exec"
+        elif self.reg_type == RegType.VCC:
+            return "vcc"
+        elif self.reg_type == RegType.TTMP:
+            return f"ttmp[{self.index}:{self.index + 1}]"
+        return f"reg64_{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal64:
+    """64-bit scalar literal or inline integer constant."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bits", u64(self.bits))
+
+    @classmethod
+    def from_int(cls, val: int) -> Literal64:
+        return cls(u64(val))
+
+    @property
+    def is_inline_constant(self) -> bool:
+        # AMD RDNA2 inline constants: -16 to 64 or float constants like 0.0, 1.0, -1.0
+        return self.bits == 0 or self.bits == MASK64 or (1 <= self.bits <= 64)
+
+    @property
+    def name(self) -> str:
+        if self.bits == 0:
+            return "0"
+        elif self.bits == MASK64:
+            return "-1"
+        elif 1 <= self.bits <= 64:
+            return str(self.bits)
+        return f"0x{self.bits:016X}"
+
+
+@dataclass(frozen=True)
+class SaluOperand:
+    """Typed SALU expression operand (Register Pair or 64-bit Literal)."""
+    source: Union[RegPair64, Literal64]
+
+    @property
+    def is_reg(self) -> bool:
+        return isinstance(self.source, RegPair64)
+
+    @property
+    def is_literal(self) -> bool:
+        return isinstance(self.source, Literal64)
+
+    def disassemble(self) -> str:
+        return self.source.name
+
+
+@dataclass(frozen=True)
+class SOrSaveExecB64Instruction:
+    """Symbolic AST node for S_OR_SAVEEXEC_B64."""
+    dst: RegPair64
+    src: SaluOperand
+
+    def disassemble(self) -> str:
+        return f"s_or_saveexec_b64 {self.dst.name}, {self.src.disassemble()}"
+
+    def validate(self) -> None:
+        if not self.dst.is_aligned and self.dst.reg_type in (RegType.SGPR, RegType.TTMP):
+            raise ValueError(f"Unaligned destination register pair: {self.dst.name}")
+        if self.src.is_reg:
+            src_reg = self.src.source  # type: ignore[union-attr]
+            if not src_reg.is_aligned and src_reg.reg_type in (RegType.SGPR, RegType.TTMP):
+                raise ValueError(f"Unaligned source register pair: {src_reg.name}")
+
+    @classmethod
+    def parse(cls, line: str) -> SOrSaveExecB64Instruction:
+        """Parse assembly text into typed AST instruction node."""
+        cleaned = line.strip()
+        if ";" in cleaned:
+            cleaned = cleaned.split(";", 1)[0].strip()
+        if not cleaned:
+            raise ValueError("Empty instruction line")
+
+        parts = cleaned.split(None, 1)
+        mnemonic = parts[0].lower()
+        if mnemonic != "s_or_saveexec_b64":
+            raise ValueError(f"Unexpected mnemonic {mnemonic}, expected s_or_saveexec_b64")
+        if len(parts) < 2:
+            raise ValueError(f"Missing operands in: {line}")
+
+        raw_ops = [op.strip() for op in parts[1].split(",")]
+        if len(raw_ops) != 2:
+            raise ValueError(f"Instruction requires exactly 2 operands, got {len(raw_ops)} in: {line}")
+
+        dst_str, src_str = raw_ops[0], raw_ops[1]
+
+        # Parse destination register
+        dst_reg = cls._parse_reg(dst_str)
+
+        # Parse source operand (reg or literal)
+        src_op = cls._parse_operand(src_str)
+
+        inst = cls(dst=dst_reg, src=src_op)
+        inst.validate()
+        return inst
+
+    @classmethod
+    def _parse_reg(cls, token: str) -> RegPair64:
+        tok = token.lower()
+        if tok == "exec":
+            return RegPair64(index=126, reg_type=RegType.EXEC, custom_name="exec")
+        if tok == "vcc":
+            return RegPair64(index=106, reg_type=RegType.VCC, custom_name="vcc")
+        if tok.startswith("s[") and tok.endswith("]"):
+            inner = tok[2:-1]
+            if ":" not in inner:
+                raise ValueError(f"64-bit SGPR must specify range s[lo:hi], got {token}")
+            lo_str, hi_str = inner.split(":", 1)
+            lo, hi = int(lo_str), int(hi_str)
+            if hi != lo + 1:
+                raise ValueError(f"SGPR range must span 2 dwords s[lo:lo+1], got {token}")
+            return RegPair64(index=lo, reg_type=RegType.SGPR)
+        if tok.startswith("ttmp[") and tok.endswith("]"):
+            inner = tok[5:-1]
+            lo_str, hi_str = inner.split(":", 1)
+            lo, hi = int(lo_str), int(hi_str)
+            if hi != lo + 1:
+                raise ValueError(f"TTMP range must span 2 dwords, got {token}")
+            return RegPair64(index=lo, reg_type=RegType.TTMP)
+        raise ValueError(f"Unrecognized register syntax: {token}")
+
+    @classmethod
+    def _parse_operand(cls, token: str) -> SaluOperand:
+        tok = token.strip().lower()
+        try:
+            reg = cls._parse_reg(tok)
+            return SaluOperand(source=reg)
+        except ValueError:
+            pass
+
+        # Parse as integer literal
+        if tok.startswith("0x") or tok.startswith("-0x"):
+            val = int(tok, 16)
+        else:
+            val = int(tok, 10)
+        return SaluOperand(source=Literal64.from_int(val))
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Verifies typed AST node creation, parsing, validation, and disassembly."""
+
+    def test_reg_pair_creation_and_properties(self) -> None:
+        r_sgpr = RegPair64(index=4, reg_type=RegType.SGPR)
+        self.assertEqual(r_sgpr.name, "s[4:5]")
+        self.assertEqual(r_sgpr.lo_reg, 4)
+        self.assertEqual(r_sgpr.hi_reg, 5)
+        self.assertTrue(r_sgpr.is_aligned)
+        self.assertFalse(r_sgpr.is_exec)
+        self.assertFalse(r_sgpr.is_vcc)
+
+        r_exec = RegPair64(index=126, reg_type=RegType.EXEC, custom_name="exec")
+        self.assertEqual(r_exec.name, "exec")
+        self.assertTrue(r_exec.is_exec)
+
+        r_vcc = RegPair64(index=106, reg_type=RegType.VCC, custom_name="vcc")
+        self.assertEqual(r_vcc.name, "vcc")
+        self.assertTrue(r_vcc.is_vcc)
+
+    def test_reg_pair_alignment_validation(self) -> None:
+        """Odd base index for 64-bit pair raises ValueError."""
+        with self.assertRaises(ValueError):
+            RegPair64(index=5, reg_type=RegType.SGPR)
+        with self.assertRaises(ValueError):
+            RegPair64(index=106, reg_type=RegType.SGPR)  # Out of SGPR bounds [0, 104]
+
+    def test_literal64_formatting(self) -> None:
+        lit_zero = Literal64.from_int(0)
+        self.assertEqual(lit_zero.name, "0")
+        self.assertTrue(lit_zero.is_inline_constant)
+
+        lit_neg1 = Literal64.from_int(-1)
+        self.assertEqual(lit_neg1.name, "-1")
+        self.assertTrue(lit_neg1.is_inline_constant)
+
+        lit_val = Literal64.from_int(0x1234_5678_9ABC_DEF0)
+        self.assertEqual(lit_val.name, "0x123456789ABCDEF0")
+        self.assertFalse(lit_val.is_inline_constant)
+
+    def test_ast_disassembly_roundtrip(self) -> None:
+        dst = RegPair64(index=10, reg_type=RegType.SGPR)
+        src = SaluOperand(source=RegPair64(index=12, reg_type=RegType.SGPR))
+        inst = SOrSaveExecB64Instruction(dst=dst, src=src)
+        dis = inst.disassemble()
+        self.assertEqual(dis, "s_or_saveexec_b64 s[10:11], s[12:13]")
+
+        reparsed = SOrSaveExecB64Instruction.parse(dis)
+        self.assertEqual(reparsed, inst)
+
+    def test_ast_parse_various_operands(self) -> None:
+        lines = [
+            ("s_or_saveexec_b64 s[0:1], s[2:3]", "s[0:1]", "s[2:3]"),
+            ("s_or_saveexec_b64 s[4:5], vcc", "s[4:5]", "vcc"),
+            ("s_or_saveexec_b64 s[8:9], exec", "s[8:9]", "exec"),
+            ("s_or_saveexec_b64 s[12:13], 0", "s[12:13]", "0"),
+            ("s_or_saveexec_b64 s[14:15], -1", "s[14:15]", "-1"),
+            ("s_or_saveexec_b64 s[16:17], 0x5555555555555555", "s[16:17]", "0x5555555555555555"),
+        ]
+        for line, exp_dst, exp_src in lines:
+            inst = SOrSaveExecB64Instruction.parse(line)
+            self.assertEqual(inst.dst.name, exp_dst)
+            self.assertEqual(inst.src.disassemble(), exp_src)
+
+    def test_invalid_syntax_rejection_in_ast(self) -> None:
+        invalid_cases = [
+            "s_and_saveexec_b64 s[0:1], s[2:3]",
+            "s_or_saveexec_b64 s[0:1]",
+            "s_or_saveexec_b64 s[0:1], s[2:3], s[4:5]",
+            "s_or_saveexec_b64 s[1:2], s[4:5]",
+            "s_or_saveexec_b64 v[0:1], s[2:3]",
+        ]
+        for inv in invalid_cases:
+            with self.assertRaises(ValueError):
+                SOrSaveExecB64Instruction.parse(inv)
+
+
 if __name__ == "__main__":
     unittest.main()
+
