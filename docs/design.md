@@ -29,6 +29,7 @@ tools/       Python analysis tools (no game data inside)
   pe_inspect.py   PE headers, sections, entropy, imports sorted by where they resolve, .pdata, TLS
   rpf_probe.py    RPF header survey of a game folder
   manifest.py     SHA-256 manifest of a game folder, plus a --verify mode
+  inline_scan.py  inline command-list writes in an image, and whether each checks the cursor limit first
 scripts/
   first_look.ps1  run once the exe arrives: the full report set for it
 runtime/     C++ native loader (CMake + Ninja, MSVC)
@@ -51,6 +52,11 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
 2. **Import table.** Each DLL is marked `bundled` (in the game folder), `system` (present on this Windows), or
    `shim` (needs a reimplementation). The `shim` list is the real to-do list.
 3. **.pdata function count.** This gives function boundaries for patching and later analysis.
+4. **Inline command-list writes.** `python -I tools/inline_scan.py <game>\game_scarlett_master.exe --sites` (a few
+   minutes; it streams `dumpbin /disasm`). "UNCHECKED 0" means every inline write checks the cursor limit, so a
+   layer that keeps the cursor at the limit receives every command through the vtable; any unchecked site is a
+   write that layer never sees. The package's DLLs check at every site
+   ([d3d12_command_objects.md](d3d12_command_objects.md), "Every inline write in the package's DLLs checks first").
 
 Then `runtime\build\gta6rt.exe --dry-run <exe>` maps the image and binds every import to the shim table without
 running any game code. It reports what it couldn't bind.
