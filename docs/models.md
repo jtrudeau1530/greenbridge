@@ -443,9 +443,22 @@ records. No unhandled layout tag appears:
 - **Sentinels.** On each surface, 11 entries have every estimate 0 and 10 more have zero speeds with an
   infinite time (`inf`). `inf` occurs in 38 road and 99 offroad blocks overall, so a parser must accept `inf`
   in these fields (it reads as "never reaches the test speed or distance").
+- **`fOverallRating` is a weighted mean of the other four ratings** (measured, confirmed to float noise). Over the
+  504 rating blocks, `fOverallRating` = 0.21 `fSpeedRating` + 0.38 `fHandlingRating` + 0.40
+  `fAccelerationRating` + 0.01 `fBrakesRating`: the four weights sum to 1, so handling and acceleration weigh
+  about twice speed and brakes is 1%. The residual is at most 7e-5 on the 345 rating blocks whose four parts are
+  all above 10, and differencing a key's road and offroad blocks gives the same 0.2100 / 0.3800 / 0.4000 /
+  0.0100 on the 139 keys that are above 10 on both surfaces, so the weights do not depend on the surface.
+- **The same 10 floor is on the overall** (likely). 24 blocks whose four parts run 10.0 to 11.97 carry an
+  `fOverallRating` of exactly 10; and the other 159 rating blocks, which have at least one part at exactly 10,
+  sit up to 4.1 below the weighted mean, as parts raised to 10 from a lower value would, while no block without
+  a part at 10 deviates.
+- **Scale.** The ratings are continuous floats, not a 0-1 or 0-100 score: 342 to 451 distinct values per field
+  over the 504 blocks, a floor of exactly 10, and `fAccelerationRating` the only field past 1,000 (22 blocks,
+  maximum 1,327).
 
-Not measured here (hypothesis): the rating scale and how `fOverallRating` weights its parts, and whether the
-estimates are precomputed from handling data or measured by simulation.
+Not measured here (hypothesis): whether the estimates are precomputed from handling data or measured by
+simulation, and what fixes the top of the rating scale.
 
 ## Character skeletons
 
