@@ -2018,10 +2018,22 @@ int main() {
         };
         constexpr PackedFormat packed_formats[] = {
             {DXGI_FORMAT_B4G4R4A4_UNORM, VK_FORMAT_A4R4G4B4_UNORM_PACK16, "B4G4R4A4"},
+            {DXGI_FORMAT_A4B4G4R4_UNORM, VK_FORMAT_R4G4B4A4_UNORM_PACK16, "A4B4G4R4"},
             {DXGI_FORMAT_B5G5R5A1_UNORM, VK_FORMAT_A1R5G5B5_UNORM_PACK16, "B5G5R5A1"}
         };
         UINT64 packed_signal = 2;
         for (const auto& format : packed_formats) {
+            // Vulkan requires sampling A4R4G4B4 (1.3) and A1R5G5B5 but not R4G4B4A4: skip A4B4G4R4 where the Vulkan
+            // driver can't sample it (the driver's answer, not the layer's, so a dropped mapping still fails).
+            if (format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM) {
+                VkFormatProperties props{};
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                    d.physical, format.vk, &props);
+                if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+                    std::printf("%s: the Vulkan driver can't sample it, skipped\n", format.name);
+                    continue;
+                }
+            }
             D3D12_RESOURCE_DESC format_desc = texture_desc;
             format_desc.Format = format.dxgi;
             Ref<ID3D12Resource> format_texture;
@@ -2048,7 +2060,10 @@ int main() {
                         rgba = b5_rgba[i];
                     } else {
                         const UINT r = x, g = y + 8, b = (x + y) & 15, a = 15 - x;
-                        word = std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
+                        // B4G4R4A4 keeps blue in bits 0-3 and alpha in 12-15, A4B4G4R4 alpha in 0-3 and red in 12-15.
+                        word = format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM
+                                   ? std::uint16_t(a | (b << 4) | (g << 8) | (r << 12))
+                                   : std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
                         rgba = {std::uint8_t(r * 17), std::uint8_t(g * 17), std::uint8_t(b * 17), std::uint8_t(a * 17)};
                     }
                     std::memcpy(static_cast<std::uint8_t*>(mapped) + format_footprint.Offset +
@@ -2077,6 +2092,7 @@ int main() {
             EXPECT(image_at(null_slot, packed_image));
             EXPECT(packed_image.format == g::format_from_vulkan(format.vk) && packed_image.format != 0);
             if (format.dxgi == DXGI_FORMAT_B5G5R5A1_UNORM) EXPECT(packed_image.swizzle == g::channels_bgra);
+            if (format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM) EXPECT(packed_image.swizzle == g::channels_abgr);
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
             SampleKeys packed_keys{};
             std::memcpy(packed_keys.tsharp, view_bytes(null_slot), sizeof(packed_keys.tsharp));
