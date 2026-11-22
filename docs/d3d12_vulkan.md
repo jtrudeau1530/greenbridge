@@ -268,8 +268,19 @@ What is implemented (all of it testable without the game):
   - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
     and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
     elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an
-    element range `[left, right)` on row 0. A view with unaligned ends and less than one whole aligned word between
-    them (a few bytes of an 8- or 16-bit format) is refused as `unsupported`.
+    element range `[left, right)` on row 0. If a range contains no complete aligned word, prepare reserves eight
+    transfer-scratch bytes, retained until submission completion. Replay fills that scratch with the repeated
+    element and copies only the requested bytes, preserving neighbouring bytes even at resource boundaries.
+    Rectangles within one clear reuse that pattern with transfer dependencies between them. Ownerless replay
+    callers without `copy_scratch` still refuse these short ranges before emitting anything.
+    `d3d12_short_uav_clear_test` compares Uint/Float whole-view and clipped/overlapping rectangle clears against
+    WARP (CTest) or `LEONIDA_HOST_ADAPTER` (manual runs), checking the entire buffer against literal patterns.
+    Portable native comparisons keep rectangles on row 0. Out-of-row controls run separately against WARP:
+    NVIDIA D3D12 was observed to ignore Y where WARP and AMD preserve the buffer, so those controls do not assert
+    that native drivers behave uniformly. This test distinction does not change the replay policy.
+    Portable UNORM Float clears use `0.25f` (R8: `0x40`, R16: `0x4000`), away from a conversion midpoint;
+    `0.5f` remains covered by separate WARP-only midpoint controls. Native NVIDIA was observed to clear that
+    midpoint to `0x7f`/`0x7fff` where WARP and AMD give `0x80`/`0x8000`. All comparisons remain byte-exact.
   - Textures: the values become one element of the view's format, and that element is cleared into the image as
     the value that decodes it in the image's own format, so a typeless texture viewed as UINT gets exactly the bits
     asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)

@@ -956,6 +956,8 @@ struct Prepared {
     uav_clear::Element element;                      // unordered-access clears: one element of the view's format
     VkClearColorValue clear_color{};                 // ... the value that writes it into the image
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
+    VkBuffer fill_scratch = VK_NULL_HANDLE;         // short buffer clears: one repeated 8-byte pattern
+    VkDeviceSize fill_scratch_offset = 0;
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
@@ -1431,8 +1433,13 @@ inline bool indirect_range(const ResourceBinding& binding, VkDeviceSize offset, 
 
 // The bytes of a buffer UAV clear, and whether the transfer commands can write them. Elements of up to 4 bytes
 // repeat in every aligned word, so vkCmdFillBuffer writes the aligned middle and copies from it the unaligned ends
-// (vkCmdCopyBuffer has no alignment rule); that needs one whole word in the middle. Wider elements are written
+// (vkCmdCopyBuffer has no alignment rule); ranges without that word use transfer scratch. Wider elements are written
 // with vkCmdUpdateBuffer and doubled with copies, which needs a word-aligned range.
+inline bool buffer_fill_needs_scratch(const uav_clear::Element& element, VkDeviceSize offset, VkDeviceSize size) {
+    const VkDeviceSize prefix = (4 - offset % 4) % 4;
+    return element.size <= 4 && size && size < prefix + 4;
+}
+
 inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, Prepared& p) {
     const UavView& view = clear.view;
     if (!p.binding.buffer || p.binding.image) return ReplayResult::invalid_clear;
@@ -1450,11 +1457,10 @@ inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, 
     const auto add = [&](std::uint64_t offset, std::uint64_t bytes) {
         if (!bytes) return ReplayResult::success;
         if (offset % std::min(e, 4u)) return ReplayResult::invalid_clear;
+        if (offset > UINT64_MAX - p.binding.buffer_offset ||
+            bytes > UINT64_MAX - (p.binding.buffer_offset + offset)) return ReplayResult::invalid_clear;
         offset += p.binding.buffer_offset;  // the view is relative to the resource, which starts at buffer_offset
-        if (e <= 4) {
-            const std::uint64_t a0 = (offset + 3) / 4 * 4, a1 = (offset + bytes) / 4 * 4;
-            if ((a0 != offset || a1 != offset + bytes) && a1 < a0 + 4) return ReplayResult::unsupported;
-        } else if (bytes % 4) {
+        if (e > 4 && bytes % 4) {
             return ReplayResult::unsupported;
         }
         p.fills.push_back({offset, bytes});
@@ -1477,7 +1483,8 @@ inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, 
 
 // Writes one prepared range; the caller has made the buffer writable by transfers.
 inline void emit_buffer_fill(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkBuffer buffer,
-                             const uav_clear::Element& element, VkDeviceSize offset, VkDeviceSize size) {
+                             const uav_clear::Element& element, VkDeviceSize offset, VkDeviceSize size,
+                             VkBuffer scratch = VK_NULL_HANDLE, VkDeviceSize scratch_offset = 0) {
     const auto transfer_barrier = [&] {
         memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1485,6 +1492,15 @@ inline void emit_buffer_fill(const ReplayFunctions& vk, VkCommandBuffer command_
     if (element.size <= 4) {
         std::uint32_t word = 0;
         for (unsigned i = 0; i < 4; ++i) word |= std::uint32_t(element.bytes[i % element.size]) << (8 * i);
+        if (buffer_fill_needs_scratch(element, offset, size)) {
+            // At most six bytes lack a complete aligned word. Fill eight scratch bytes, then copy just the
+            // requested range: never borrow a word from the application's neighbouring bytes.
+            vk.fill_buffer(command_buffer, scratch, scratch_offset, 8, word);
+            transfer_barrier();
+            const VkBufferCopy region{scratch_offset, offset, size};
+            vk.copy_buffer(command_buffer, scratch, buffer, 1, &region);
+            return;
+        }
         const VkDeviceSize a0 = (offset + 3) / 4 * 4, a1 = (offset + size) / 4 * 4;
         if (a1 > a0) vk.fill_buffer(command_buffer, buffer, a0, a1 - a0, word);
         VkBufferCopy ends[2]{};
@@ -2411,6 +2427,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
                 if (predicated) ++out.unpredicated_copies;  // fills and copies are transfer commands
                 if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) return r;
+                const bool short_fill = std::any_of(p.fills.begin(), p.fills.end(), [&](const auto& fill) {
+                    return detail::buffer_fill_needs_scratch(p.element, fill[0], fill[1]);
+                });
+                if (short_fill && (!vk.copy_scratch ||
+                    !vk.copy_scratch(8, p.fill_scratch, p.fill_scratch_offset) || !p.fill_scratch ||
+                    p.fill_scratch_offset % 4 || p.fill_scratch_offset > UINT64_MAX - 8))
+                    return ReplayResult::unsupported;
                 if (!p.skip && !p.fills.empty() && p.binding.host_readable) {
                     out.wrote_readback = true;
                     out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -3256,10 +3279,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                        VK_PIPELINE_STAGE_TRANSFER_BIT);
                 for (std::size_t f = 0; f < p.fills.size(); ++f) {
                     if (f)  // rectangles may overlap
-                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                                                VK_PIPELINE_STAGE_TRANSFER_BIT, transfer, VK_PIPELINE_STAGE_TRANSFER_BIT);
                     detail::emit_buffer_fill(vk, command_buffer, p.binding.buffer, p.element, p.fills[f][0],
-                                             p.fills[f][1]);
+                                             p.fills[f][1], p.fill_scratch, p.fill_scratch_offset);
                 }
                 detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        state.access, state.stages);
