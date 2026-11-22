@@ -298,6 +298,39 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("no subgroup width", problem)
 
+    def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
+        out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
+        for width in (8, 16):
+            with self.subTest(width=width):
+                # In SIMD8/SIMD16, "10p0i" targets lanes >= 16 (out of bounds), returning 0 or wrapped values.
+                data = b"".join(struct.pack("<4I", i % width, (i % width) ^ 9, 0, 0) for i in range(64 * 64))
+                problem = self.run_pixel("ps_bitmask_perm", 0, out, data=data)
+                self.assertIsInstance(problem, check.Skip)
+                self.assertIn(f"{width} lanes", problem)
+
+    def test_bitmask_perm_judges_variable_device_at_32_lanes(self):
+        out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_bitmask_perm", 0, out, data=self.bitmask_pixels(32)), "")
+        bad = b"".join(struct.pack("<4I", i % 32, (i % 32) ^ 9, 0, 0) for i in range(64 * 64))
+        problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)
+
+    def test_bitmask_perm_fails_broken_lanes_instead_of_skipping(self):
+        # Fixed 32..32 device producing only lanes 0..15, or 8..32 device producing incomplete/too-narrow lanes.
+        simd16 = b"".join(struct.pack("<4I", i % 16, (i % 16) ^ 9, 0, 0) for i in range(64 * 64))
+        problem = self.run_pixel("ps_bitmask_perm", 0, "device: fake (subgroup 32..32)\nok 64x64\n", data=simd16)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)
+
+        out = "device: fake (subgroup 8..32)\nok 64x64\n"
+        for lanes in (1, 4, 15):
+            with self.subTest(lanes=lanes):
+                bad = b"".join(struct.pack("<4I", i % lanes, (i % lanes) ^ 9, 0, 0) for i in range(64 * 64))
+                problem = self.run_pixel("ps_bitmask_perm", 0, out, data=bad)
+                self.assertNotIsInstance(problem, check.Skip)
+                self.assertIn("wrong", problem)
+
 
 class SeededPixelTests(unittest.TestCase):
     """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""

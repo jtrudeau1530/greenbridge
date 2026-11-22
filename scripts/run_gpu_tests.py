@@ -34,7 +34,8 @@ from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
-from check import WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, narrow_subgroup_skip, wave32_lane_skip   # as in check.py
+from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
+                   wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem   # ps_interp_f16_high's producers and check
 
 
@@ -79,7 +80,8 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
 
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
-    raw = open(asm_path, encoding="utf-8").read()
+    with open(asm_path, encoding="utf-8") as source:
+        raw = source.read()
     cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
     for ln in raw.splitlines():
         s = ln.strip()
@@ -210,13 +212,15 @@ def make_fs_passthru(loc: int) -> str:
 
 
 def read_raw_rgba32f(path: str) -> list[tuple[float, float, float, float]]:
-    data = open(path, "rb").read()
+    with open(path, "rb") as source:
+        data = source.read()
     n = len(data) // 16
     return [struct.unpack_from("<4f", data, 16 * i) for i in range(n)]
 
 
 def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
-    data = open(path, "rb").read()
+    with open(path, "rb") as source:
+        data = source.read()
     n = len(data) // 16
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
@@ -323,8 +327,10 @@ def check_bary(raw_path: str) -> tuple[bool, str]:
     return (bad == 0), (first if bad else "4096/4096 pixels exact")
 
 
-def check_bitmask_perm(raw_path: str) -> tuple[bool, str]:
+def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
     px = read_raw_u32(raw_path)
+    if skip := bitmask_perm_narrow_skip(msg, px):
+        return None, str(skip)
     bad = 0
     first = ""
     judged = 0
@@ -354,7 +360,8 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
 
 def check_flat(raw_path: str) -> tuple[bool, str]:
     """ps_flat with vs_ids: the integer IDs come from the first (provoking) vertex, the UVs still interpolate."""
-    data = open(raw_path, "rb").read()
+    with open(raw_path, "rb") as source:
+        data = source.read()
     px = list(struct.iter_unpack("<2I2f", data))
     w = int(len(px) ** 0.5)
     wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
@@ -485,7 +492,8 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_gather_wrap": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm",
-              "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm"}
+              "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
+              "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm"}
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -657,7 +665,8 @@ def run_suite(a, work: str) -> int:
     index = {}
     idx_path = os.path.join(spirv_dir, "index.json")
     if os.path.isfile(idx_path):
-        index = json.load(open(idx_path, encoding="utf-8"))
+        with open(idx_path, encoding="utf-8") as source:
+            index = json.load(source)
 
     ext = ".exe" if os.name == "nt" else ""
     vk_compute = os.path.join(a.build, "vk_compute_test" + ext)
@@ -751,7 +760,7 @@ def run_suite(a, work: str) -> int:
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_exec_const", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
-                      "cs_dpp_w64",
+                      "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
@@ -779,6 +788,7 @@ def run_suite(a, work: str) -> int:
                 "cs_dpp_mask": [1, 0, 3, 2, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE],
                 "cs_dpp8": [7, 6, 5, 4, 3, 2, 1, 0],
                 "cs_dpp_ops": [100, 10, 11, 12, 13, 14, 15, 16],
+                "cs_dpp_bound": [10, 10, 11, 12, 13, 14, 15, 16],
                 "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
                 "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
                 "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
@@ -832,7 +842,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp",
                                   "cs_exec_const", "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
@@ -932,7 +942,7 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             if name in PIXEL_VERTEX:
-                if bary_fallback():   # no PerVertexKHR inputs under --bary-fallback (docs/design.md)
+                if bary_fallback() and name == "ps_interp_f16_high":   # no PerVertexKHR inputs under --bary-fallback
                     results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
                     continue
                 vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
@@ -978,6 +988,13 @@ def run_suite(a, work: str) -> int:
                 "ps_sff_imm": (2, 1, 20, 16),                  # SHADER-46: s_ff0/s_ff1 of an immediate
                 "ps_fnan_med3": (0x40A00000, 0xC0200000, 0xC0200000, 0x40600000),   # measured on RDNA2 hardware
                 "ps_fnan_fract": (0x3F7FFFFF, 0x00003BFF, 0xC0200000, 0xC0200000),
+                # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
+                "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3F800000),
+                "ps_cvt_off": (0xBF000000, 0x3EE00000, 0xBE800000, 0x3F800000),
+                "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3E00, 0xAAAA0000, 0xAAAA4000),
+                "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
+                "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
+                "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
@@ -988,7 +1005,7 @@ def run_suite(a, work: str) -> int:
                 if m and int(m.group(1)) < 32:
                     ok, detail = None, f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)"
                 else:
-                    ok, detail = check_bitmask_perm(raw)
+                    ok, detail = check_bitmask_perm(raw, msg)
             elif name in ("ps_uniform_branch", "ps_scc_mask32"):   # same expected pattern (see the .asm headers)
                 ok, detail = check_uniform_branch(raw)
             elif name == "ps_wqm":
@@ -996,7 +1013,8 @@ def run_suite(a, work: str) -> int:
             elif name == "ps_flat":
                 ok, detail = check_flat(raw)
             elif name == "ps_interp_f16_high":
-                problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", open(raw, "rb").read())))
+                with open(raw, "rb") as source:
+                    problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
                 ok, detail = not problem, problem or "f16 low/high halves and f32 control within 2e-3"
             else:
                 ok, detail = False, "no checker defined"
@@ -1050,7 +1068,8 @@ def run_suite(a, work: str) -> int:
             elif rc != 0:
                 results.append((name, False, msg))
             else:
-                problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", open(raw, "rb").read())))
+                with open(raw, "rb") as source:
+                    problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
                 results.append((name, not problem, problem or "f16 low/high halves and f32 control within 2e-3"))
         elif name == "ms_clip":
             raw = os.path.join(raw_dir, f"{name}.raw")
