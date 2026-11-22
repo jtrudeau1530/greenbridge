@@ -361,11 +361,17 @@ def import_saves(args):
     out, maps, with_packed, force, dry = None, {}, False, False, False
     folders = []
     it = iter(args)
+
+    def value(flag):
+        v = next(it, None)
+        if v is None:
+            raise ValueError(f'import: {flag} needs a value')
+        return v
     for a in it:
         if a == '--out':
-            out = next(it)
+            out = value(a)
         elif a == '--map':
-            k, v = next(it).split('=', 1)
+            k, v = value(a).split('=', 1)
             c, _, b = v.partition('/')
             maps[k] = (c, b or None)
         elif a == '--with-packed':

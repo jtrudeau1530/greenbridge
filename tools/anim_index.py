@@ -517,8 +517,11 @@ def main():
             # Parse before opening --rigs, so a failed parse leaves an existing file as it was.
             print(f"{a.source}: RBF0 stream: {e}", file=sys.stderr)
             return 2
-        with open(a.rigs, "w", encoding="utf-8") as f:
-            json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
+        try:
+            with open(a.rigs, "w", encoding="utf-8") as f:
+                json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
+        except OSError as e:
+            sys.exit(f"{a.rigs}: cannot write: {e.strerror or e}")
     top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
     print(json.dumps({k: summary[k] for k in
                       ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",
