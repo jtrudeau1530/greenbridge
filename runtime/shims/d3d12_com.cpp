@@ -311,7 +311,10 @@ public:
     }
 
     // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
-    void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override { reset_state(state); }
+    void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        reset_state(state);
+    }
 
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
@@ -340,6 +343,7 @@ public:
 
     // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!count) {
             viewport_ = {};
             return;
@@ -351,6 +355,7 @@ public:
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!count || !rects) return;
         if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
         scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
@@ -359,6 +364,7 @@ public:
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
         render_targets_.fill({});
         render_target_count_ = count;

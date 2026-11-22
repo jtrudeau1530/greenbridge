@@ -288,6 +288,13 @@ int main(int argc, char** argv) {
         EXPECT(invalid_bundle_call([&](auto* b) {
             b->ClearUnorderedAccessViewFloat({}, uav_view, rt_resource, uav_float, 0, nullptr); }));
         EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
+        // Measured on the PC runtime (default adapter and WARP, d3d12_bundle_forbidden_test): these fail a bundle's Close.
+        const D3D12_VIEWPORT bundle_viewport{0, 0, 4, 4, 0, 1};
+        const D3D12_RECT bundle_scissor{0, 0, 4, 4};
+        EXPECT(invalid_bundle_call([&](auto* b) { b->RSSetViewports(1, &bundle_viewport); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->RSSetScissorRects(1, &bundle_scissor); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->ClearState(nullptr); }));
         // D3D-26: DiscardResource and the atomic copies are not allowed in a bundle; WriteBufferImmediate is
         // ("Recording command lists and bundles", the bundle restrictions and the API restrictions table).
         EXPECT(invalid_bundle_call([&](auto* b) { b->DiscardResource(rt_resource, nullptr); }));
