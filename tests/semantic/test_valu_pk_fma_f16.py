@@ -729,5 +729,173 @@ class TestPkFmaF16SymbolicAST(unittest.TestCase):
         self.assertEqual(const_expr.eval(env), pack_pk_f16(POS_ONE, POS_ONE))
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_pk_fma_f16."""
+
+    def resolve_operand(self, op: VOP3POperand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg32):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VPkFmaF16Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0 = self.resolve_operand(instr.src0, state)
+        s1 = self.resolve_operand(instr.src1, state)
+        s2 = self.resolve_operand(instr.src2, state)
+
+        # Computation phase
+        res = oracle_v_pk_fma_f16(
+            s0, s1, s2,
+            op_sel=instr.op_sel,
+            op_sel_hi=instr.op_sel_hi,
+            neg_lo=instr.neg_lo,
+            neg_hi=instr.neg_hi,
+            clamp=instr.clamp,
+        )
+
+        # Write-back phase
+        state.set_vgpr(instr.dst.index, res)
+        return res
+
+
+class TestPkFmaF16ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_sources(self) -> None:
+        # v1: lo=1.0, hi=2.0
+        # v2: lo=3.0, hi=4.0
+        # v3: lo=0.5, hi=1.0
+        self.state.set_vgpr(1, pack_pk_f16(POS_ONE, POS_TWO))
+        self.state.set_vgpr(2, pack_pk_f16(f16_to_bits(3.0), f16_to_bits(4.0)))
+        self.state.set_vgpr(3, pack_pk_f16(POS_HALF, POS_ONE))
+
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(2, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(3, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        # lo: 1*3 + 0.5 = 3.5
+        # hi: 2*4 + 1.0 = 9.0
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, f16_to_bits(3.5))
+        self.assertEqual(hi, f16_to_bits(9.0))
+        self.assertEqual(self.state.get_vgpr(0), res)
+
+    def test_scalar_mixed_sources(self) -> None:
+        # src0 from VGPR, src1 from SGPR, src2 from Literal
+        self.state.set_vgpr(5, pack_pk_f16(POS_TWO, POS_TWO))
+        self.state.set_sgpr(10, pack_pk_f16(f16_to_bits(3.0), f16_to_bits(5.0)))
+        lit = Literal32.from_floats(1.0, -2.0)
+
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(4, RegType.VGPR),
+            src0=VOP3POperand(Reg32(5, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(10, RegType.SGPR)),
+            src2=VOP3POperand(lit),
+        )
+        res = self.interp.step(instr, self.state)
+        # lo: 2*3 + 1.0 = 7.0
+        # hi: 2*5 + (-2.0) = 8.0
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, f16_to_bits(7.0))
+        self.assertEqual(hi, f16_to_bits(8.0))
+
+    def test_scalar_half_selection_and_negation(self) -> None:
+        self.state.set_vgpr(1, pack_pk_f16(POS_ONE, POS_TWO))
+        self.state.set_vgpr(2, pack_pk_f16(f16_to_bits(3.0), f16_to_bits(4.0)))
+        self.state.set_vgpr(3, pack_pk_f16(f16_to_bits(5.0), f16_to_bits(6.0)))
+
+        # lo uses op_sel (1, 0, 0) -> (s0.hi * s1.lo + s2.lo) = 2*3 + 5 = 11
+        # neg_lo (1, 0, 0) -> -(2)*3 + 5 = -1
+        # hi uses op_sel_hi (0, 1, 1) -> (s0.lo * s1.hi + s2.hi) = 1*4 + 6 = 10
+        # neg_hi (0, 1, 0) -> 1*(-4) + 6 = 2
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(2, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(3, RegType.VGPR)),
+            op_sel=(1, 0, 0),
+            op_sel_hi=(0, 1, 1),
+            neg_lo=(1, 0, 0),
+            neg_hi=(0, 1, 0),
+        )
+        res = self.interp.step(instr, self.state)
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, f16_to_bits(-1.0))
+        self.assertEqual(hi, f16_to_bits(2.0))
+
+    def test_scalar_clamp_execution(self) -> None:
+        # lo: 1.0 * 2.0 + 0.0 = 2.0 -> clamp -> 1.0
+        # hi: -1.0 * 2.0 + 0.0 = -2.0 -> clamp -> 0.0
+        self.state.set_vgpr(1, pack_pk_f16(POS_ONE, NEG_ONE))
+        self.state.set_vgpr(2, pack_pk_f16(POS_TWO, POS_TWO))
+        self.state.set_vgpr(3, pack_pk_f16(POS_ZERO, POS_ZERO))
+
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(2, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(3, RegType.VGPR)),
+            clamp=True,
+        )
+        res = self.interp.step(instr, self.state)
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, POS_ONE)
+        self.assertEqual(hi, POS_ZERO)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(100):
+            st = ScalarMachineState()
+            st.set_vgpr(1, 0x3C004000)
+            st.set_vgpr(2, 0x38003C00)
+            st.set_vgpr(3, 0x00003800)
+            instr = VPkFmaF16Instruction(
+                dst=Reg32(0, RegType.VGPR),
+                src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+                src1=VOP3POperand(Reg32(2, RegType.VGPR)),
+                src2=VOP3POperand(Reg32(3, RegType.VGPR)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
+
+
 if __name__ == "__main__":
     unittest.main()
