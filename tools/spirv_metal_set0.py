@@ -156,14 +156,42 @@ def main(argv):
     if len(argv) != 3:
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 2
-    dis = os.environ.get("SPIRV_DIS", "spirv-dis")
-    asm = os.environ.get("SPIRV_AS", "spirv-as")
-    text = subprocess.run([dis, argv[1]], check=True, capture_output=True, text=True).stdout
+    dis, asm = _tools()
+    text = _run([dis, argv[1]], capture_output=True, text=True).stdout
     env = re.search(r"; Version: (\d+)\.(\d+)", text)
     target = f"spv{env.group(1)}.{env.group(2)}" if env else "vulkan1.2"
-    subprocess.run([asm, "--target-env", target, "-", "-o", argv[2]],
-                   input=rewrite(text, counts), check=True, text=True)
+    _run([asm, "--target-env", target, "-", "-o", argv[2]], input=rewrite(text, counts), text=True)
     return 0
+
+
+def _tools():
+    return os.environ.get("SPIRV_DIS", "spirv-dis"), os.environ.get("SPIRV_AS", "spirv-as")
+
+
+def _run(cmd, **kwargs):
+    """subprocess.run(check=True). Windows does not name the program it could not start, so name it here."""
+    try:
+        return subprocess.run(cmd, check=True, **kwargs)
+    except OSError as e:
+        if e.filename is None:
+            e.filename = cmd[0]
+        raise
+
+
+def cli(argv):
+    """main() for the command line: a SPIRV-Tools program that cannot be started, or that rejects its input, is
+    one ERROR line and exit 1 instead of a traceback. main() itself still raises, for callers that catch it."""
+    try:
+        return main(argv)
+    except subprocess.CalledProcessError as e:
+        program = e.cmd[0] if isinstance(e.cmd, (list, tuple)) else e.cmd
+        said = next((line.strip() for line in (e.stderr or "").splitlines() if line.strip()), "")
+        print(f"ERROR: {program} failed with exit status {e.returncode}" + (f": {said}" if said else ""),
+              file=sys.stderr)
+    except OSError as e:
+        hint = " (SPIRV-Tools must be on PATH, or set SPIRV_DIS / SPIRV_AS)" if e.filename in _tools() else ""
+        print(f"ERROR: {e.filename or 'spirv_metal_set0.py'}: {e.strerror or e}{hint}", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
@@ -171,4 +199,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    sys.exit(main(sys.argv))
+    sys.exit(cli(sys.argv))
