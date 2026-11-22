@@ -11,7 +11,7 @@ Families:
         16-bit integer ops and v_pack_b32_f16, in the encodings GFX10 has (VOP2, VOP3, op_sel where llvm-mc
         -mcpu=gfx1013 accepts it). Which forms keep the other half of the destination follows the 16-bit row of the
         contract in docs/design.md (from Mesa ACO), so a mismatch means the translator disagrees with that contract.
-  mem   memory: buffer loads and stores of every width (dword..dwordx4, ubyte/sbyte/ushort/sshort, short_d16[_hi]),
+  mem   memory: buffer loads and stores of dword, dwordx2, dwordx3 and dwordx4 (the byte and short forms are not generated),
         offen/idxen/offset addressing, a V# built in SGPRs with a small num_records (out-of-range loads read 0 and
         out-of-range stores are dropped), and s_load_dword / s_buffer_load_dword of what earlier stores wrote.
 
