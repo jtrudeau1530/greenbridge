@@ -1773,6 +1773,8 @@ The trace will enumerate them.
   tiled value from slot 76. Row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a staging
   copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. If the game uploads console-tiled data,
   the layer needs a detile step or a matching tiled image. **Open**; the ABI value is known, the data layout is not.
+  `runtime/src/gfx10_tiling.h` provides single-level GFX10/RbPlus SW_4KB_S and SW_64KB_D tile/detile,
+  tested synthetically by `gfx10_tiling_test`. Which mode `0x101` uses, the mip tail and upload wiring remain **Open**.
 - Formats: a `DXGI_FORMAT` → `VkFormat` table, including sRGB and typeless variants. Typeless resources get a
   concrete image format plus `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and a `VK_KHR_image_format_list` when views cast
   within the family; unsupported casts are logged and fall back to the resource format. `CreateCommittedResource3`'s
