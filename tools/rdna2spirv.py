@@ -49,6 +49,31 @@ BARY_FALLBACK = False
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
+# --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
+# VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
+# counts, each lane's vertex and each lane's primitive into this workgroup's slot of a buffer whose device address is
+# in push-constant dwords 36..37 (the block grows from 144 to 152 bytes). The slot layout is mesh_compute_layout();
+# the index records it as "mesh_compute". tools/mesh_compute_vs.py writes the vertex shader that draws the slots.
+MESH_COMPUTE = False
+
+
+def mesh_compute_layout(maxv, maxp, clip_count, cull_count, params):
+    """Byte layout of one workgroup's slot in the --mesh-compute output buffer. Everything is 16-byte aligned:
+    header (vertex count, primitive count, 2 unused dwords), then maxv vertices of `vertex_stride` bytes
+    (position xyzw; the clip distances, then the cull distances, each padded to whole vec4s; one vec4 per param
+    location in ascending order), then maxp primitives of 16 bytes (three vertex indices, then 1 if culled)."""
+    clip_vec4 = -(-clip_count // 4)
+    cull_vec4 = -(-cull_count // 4)
+    params = sorted(params)
+    stride = 16 * (1 + clip_vec4 + cull_vec4 + len(params))
+    vertices = 16
+    primitives = vertices + maxv * stride
+    return {"slot_bytes": primitives + maxp * 16, "vertices": vertices, "vertex_stride": stride,
+            "primitives": primitives, "primitive_stride": 16, "max_vertices": maxv, "max_primitives": maxp,
+            "clip_count": clip_count, "clip_offset": 16, "cull_count": cull_count,
+            "cull_offset": 16 * (1 + clip_vec4),
+            "params": {n: 16 * (1 + clip_vec4 + cull_vec4 + k) for k, n in enumerate(params)},
+            "push_constant_bytes": 4 * USER_SGPRS + 24, "address_dwords": [USER_SGPRS + 4, USER_SGPRS + 5]}
 
 # GFX10 buffer format codes (Mesa src/amd/registers/gfx10-rsrc.json, enum GFX10_FORMAT).
 import json as _json  # noqa: E402
@@ -6654,11 +6679,119 @@ def dedupe_types(text):
     return "\n".join(_ID_REF.sub(lambda t: alias.get(t.group(0), t.group(0)), l) for l in out)
 
 
+def mesh_compute_epilogue(gen):
+    """--mesh-compute: the mesh epilogue as buffer stores. Same barrier and counts as the mesh path; then lane 0
+    writes the header, lane i < vertex count its vertex and lane i < primitive count its primitive, at the offsets
+    of gen.msc_layout in this workgroup's slot (linear workgroup index x + y*nx + z*nx*ny)."""
+    c, lay = gen.cu, gen.msc_layout
+    L = [f"OpControlBarrier {c(2)} {c(2)} " + c(0x108),
+         "%msc = OpLoad %uint %ms_counts",
+         f"%msv0 = OpBitwiseAnd %uint %msc {c(0xFFF)}", f"%msp1 = OpShiftRightLogical %uint %msc {c(12)}",
+         f"%msp0 = OpBitwiseAnd %uint %msp1 {c(0xFFF)}",
+         f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
+         f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
+         "%mli = OpLoad %uint %local_index",
+         # Slot base = output address (push-constant dwords 36..37) + linear workgroup index * slot bytes.
+         f"%moa_lo_p = OpAccessChain %_ptr_PC_uint %user_data {c(5)}",
+         f"%moa_hi_p = OpAccessChain %_ptr_PC_uint %user_data {c(6)}",
+         "%moa_lo = OpLoad %uint %moa_lo_p", "%moa_hi = OpLoad %uint %moa_hi_p",
+         "%moa_l64 = OpUConvert %ulong %moa_lo", "%moa_h64 = OpUConvert %ulong %moa_hi",
+         "%moa_sh = OpShiftLeftLogical %ulong %moa_h64 %c64_32", "%moa = OpBitwiseOr %ulong %moa_sh %moa_l64",
+         "%mwg = OpLoad %v3uint %wg_id", "%mnw = OpLoad %v3uint %num_wg",
+         "%mwx = OpCompositeExtract %uint %mwg 0", "%mwy = OpCompositeExtract %uint %mwg 1",
+         "%mwz = OpCompositeExtract %uint %mwg 2", "%mnx = OpCompositeExtract %uint %mnw 0",
+         "%mny = OpCompositeExtract %uint %mnw 1",
+         "%mnxy = OpIMul %uint %mnx %mny", "%mwyx = OpIMul %uint %mwy %mnx", "%mwzxy = OpIMul %uint %mwz %mnxy",
+         "%mwl0 = OpIAdd %uint %mwx %mwyx", "%mwl = OpIAdd %uint %mwl0 %mwzxy",
+         "%mwl64 = OpUConvert %ulong %mwl", f"%mso = OpIMul %ulong %mwl64 {gen.cl(lay['slot_bytes'])}",
+         "%msb = OpIAdd %ulong %moa %mso"]
+    n = [0]
+
+    def store(off_u32, word):
+        """Store uint `word` at byte offset `off_u32` (a uint id) of the slot."""
+        k = n[0]
+        n[0] += 1
+        L.extend([f"%mo{k} = OpUConvert %ulong {off_u32}", f"%ma{k} = OpIAdd %ulong %msb %mo{k}",
+                  f"%mp{k} = OpConvertUToPtr %_ptr_PSB_uint %ma{k}", f"OpStore %mp{k} {word} Aligned 4"])
+
+    def at(base, extra):
+        """uint id for base + a constant byte offset."""
+        if not extra:
+            return base
+        k = n[0]
+        n[0] += 1
+        L.append(f"%mx{k} = OpIAdd %uint {base} {c(extra)}")
+        return f"%mx{k}"
+
+    def store_floats(base, values):
+        for i, f in enumerate(values):
+            k = n[0]
+            n[0] += 1
+            L.append(f"%mf{k} = OpBitcast %uint {f}")
+            store(at(base, 4 * i), f"%mf{k}")
+
+    # Header, lane 0.
+    L += ["%mh0 = OpIEqual %bool %mli %c0", "OpSelectionMerge %msc_hend None",
+          "OpBranchConditional %mh0 %msc_hdo %msc_hend", "%msc_hdo = OpLabel"]
+    store("%c0", "%msv")
+    store(c(4), "%msp")
+    L += ["OpBranch %msc_hend", "%msc_hend = OpLabel"]
+    # Vertex mli.
+    L += ["%mhv = OpLoad %bool %ms_has_vtx", "%mvi = OpULessThan %bool %mli %msv",
+          "%mwv = OpLogicalAnd %bool %mhv %mvi",
+          "OpSelectionMerge %msc_vend None", "OpBranchConditional %mwv %msc_vdo %msc_vend", "%msc_vdo = OpLabel",
+          f"%mvs = OpIMul %uint %mli {c(lay['vertex_stride'])}", f"%mvb = OpIAdd %uint %mvs {c(lay['vertices'])}",
+          "%mpv = OpLoad %v4float %ms_pos"]
+    comps = []
+    for i in range(4):
+        L.append(f"%mpv{i} = OpCompositeExtract %float %mpv {i}")
+        comps.append(f"%mpv{i}")
+    store_floats("%mvb", comps)
+    for var, count, off in (("%ms_clip", lay["clip_count"], lay["clip_offset"]),
+                            ("%ms_cull_dist", lay["cull_count"], lay["cull_offset"])):
+        vals = []
+        for i in range(count):
+            k = n[0]
+            n[0] += 1
+            L += [f"%mdp{k} = OpAccessChain %_ptr_Function_float {var} {c(i)}", f"%mdv{k} = OpLoad %float %mdp{k}"]
+            vals.append(f"%mdv{k}")
+        if vals:
+            store_floats(at("%mvb", off), vals)
+    for loc, off in sorted(lay["params"].items()):
+        L.append(f"%mq{loc} = OpLoad %v4float %ms_param{loc}")
+        vals = []
+        for i in range(4):
+            L.append(f"%mq{loc}_{i} = OpCompositeExtract %float %mq{loc} {i}")
+            vals.append(f"%mq{loc}_{i}")
+        store_floats(at("%mvb", off), vals)
+    L += ["OpBranch %msc_vend", "%msc_vend = OpLabel"]
+    # Primitive mli: three 9-bit indices and the null-primitive bit (bit 31), as in the mesh path.
+    L += ["%mhp = OpLoad %bool %ms_has_prim", "%mpi = OpULessThan %bool %mli %msp",
+          "%mwp = OpLogicalAnd %bool %mhp %mpi",
+          "OpSelectionMerge %msc_pend None", "OpBranchConditional %mwp %msc_pdo %msc_pend", "%msc_pdo = OpLabel",
+          f"%mps = OpIMul %uint %mli {c(16)}", f"%mpb = OpIAdd %uint %mps {c(lay['primitives'])}",
+          "%mpr = OpLoad %uint %ms_prim",
+          f"%mi0 = OpBitwiseAnd %uint %mpr {c(0x1FF)}",
+          f"%mr1 = OpShiftRightLogical %uint %mpr {c(10)}", f"%mi1 = OpBitwiseAnd %uint %mr1 {c(0x1FF)}",
+          f"%mr2 = OpShiftRightLogical %uint %mpr {c(20)}", f"%mi2 = OpBitwiseAnd %uint %mr2 {c(0x1FF)}",
+          f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}"]
+    for i, w in enumerate(("%mi0", "%mi1", "%mi2", "%mnb")):
+        store(at("%mpb", 4 * i), w)
+    L += ["OpBranch %msc_pend", "%msc_pend = OpLabel"]
+    return "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L)
+
+
 def assemble(gen):
     vs = gen.stage == "vs"
     cs = gen.stage == "cs"
     ms = gen.stage == "ms"
     gsx = gen.stage == "gs"
+    msc = ms and MESH_COMPUTE
+    if msc:
+        gen.msc_layout = mesh_compute_layout(gen.ms["maxv"], gen.ms["maxp"], gen.clip_count if gen.uses_clip else 0,
+                                             gen.cull_count if gen.uses_cull else 0, gen.ms_params)
+        # Built here, before any constant is emitted, so every constant it asks for gets declared.
+        gen.msc_epilogue = mesh_compute_epilogue(gen)
     if gen.emulate:
         # No subgroup operation is left (x_round does them through %x_buf), so none of their capabilities.
         if any("OpGroupNonUniform" in l or "%sg_lane" in l for b in gen.blocks + list(gen.x_segs.values()) for l in b):
@@ -6682,11 +6815,12 @@ def assemble(gen):
         sx, sy, _ = gen.cs["size"]
         for v in (0, 1, 2, 3, 0x108, sx, sx * sy):
             gen.cu(v)
-    model = "Vertex" if vs else "GLCompute" if cs else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
-    ms_blk = ms and (gen.uses_clip or gen.uses_cull)
+    model = "Vertex" if vs else "GLCompute" if cs or msc else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
+    ms_blk = ms and not msc and (gen.uses_clip or gen.uses_cull)
     iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
-        (["%wg_id", "%num_wg", "%local_index", "%ms_counts", ("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
-         [f"%ms_out_param{n}" for n in sorted(gen.ms_params)]) if ms else []) + (
+        (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
+         [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
+         [f"%ms_out_param{n}" for n in sorted(gen.ms_params)])) if ms else []) + (
         ["%x_buf"] if gen.emulate or gen.bar_rounds else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         ((["%fmt_uint_mask", "%fmt_sint_mask"] +
@@ -6747,11 +6881,11 @@ def assemble(gen):
             caps.append("StorageImageReadWithoutFormat")     # shaderStorageImageReadWithoutFormat
     if gsx:
         caps.append("Geometry")
-    if ms:
+    if ms and not msc:
         caps.append("MeshShadingEXT")
-    if gen.uses_clip:
+    if gen.uses_clip and not msc:       # --mesh-compute: the distances go to the buffer, not to a builtin
         caps.append("ClipDistance")
-    if gen.uses_cull:
+    if gen.uses_cull and not msc:
         caps.append("CullDistance")
     if gen.uses_layer:
         caps.append("ShaderLayer")
@@ -6761,7 +6895,7 @@ def assemble(gen):
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if bary_builtin:
         exts.append("SPV_KHR_fragment_shader_barycentric")
-    if ms:
+    if ms and not msc:
         exts.append("SPV_EXT_mesh_shader")
     if pops:
         caps.append("FragmentShaderPixelInterlockEXT")
@@ -6775,7 +6909,9 @@ def assemble(gen):
     if gsx:
         hdr += ["OpExecutionMode %main Triangles", "OpExecutionMode %main Invocations 1",
                 "OpExecutionMode %main OutputTriangleStrip", f"OpExecutionMode %main OutputVertices {gen.gs['maxv']}"]
-    if ms:
+    if msc:
+        hdr.append("OpExecutionMode %main LocalSize {} {} {}".format(*gen.ms["size"]))
+    elif ms:
         hdr += ["OpExecutionMode %main LocalSize {} {} {}".format(*gen.ms["size"]),
                 f"OpExecutionMode %main OutputVertices {gen.ms['maxv']}",
                 f"OpExecutionMode %main OutputPrimitivesEXT {gen.ms['maxp']}",
@@ -6801,7 +6937,9 @@ def assemble(gen):
     if ms:
         dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %num_wg BuiltIn NumWorkgroups",
                 "OpDecorate %local_index BuiltIn LocalInvocationIndex"]
-        if ms_blk:
+        if msc:
+            pass                            # no mesh outputs: the epilogue stores to the --mesh-compute buffer
+        elif ms_blk:
             dec += ["OpDecorate %ms_vtx_blk Block", "OpMemberDecorate %ms_vtx_blk 0 BuiltIn Position"]
             mi = 1
             if gen.uses_clip:
@@ -6814,14 +6952,15 @@ def assemble(gen):
                 mi += 1
         else:
             dec.append("OpDecorate %ms_out_pos BuiltIn Position")
-        # CullPrimitiveEXT as Block+bool member (VUID-07036): array-of-bool is also legal, but
-        # SPIRV-Tools ≤2025.1 falsely rejects it (#5980); the Block form passes both old and new validators.
-        # PerPrimitiveEXT is a MemberDecorate on the bool (glslang / SPIRV-Tools MeshEXT tests).
-        dec += ["OpDecorate %ms_prim_idx BuiltIn PrimitiveTriangleIndicesEXT",
-                "OpDecorate %ms_cull_blk Block",
-                "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT",
-                "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT"]
-        dec += [f"OpDecorate %ms_out_param{n} Location {n}" for n in sorted(gen.ms_params)]
+        if not msc:
+            # CullPrimitiveEXT as Block+bool member (VUID-07036): array-of-bool is also legal, but
+            # SPIRV-Tools ≤2025.1 falsely rejects it (#5980); the Block form passes both old and new validators.
+            # PerPrimitiveEXT is a MemberDecorate on the bool (glslang / SPIRV-Tools MeshEXT tests).
+            dec += ["OpDecorate %ms_prim_idx BuiltIn PrimitiveTriangleIndicesEXT",
+                    "OpDecorate %ms_cull_blk Block",
+                    "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT",
+                    "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT"]
+            dec += [f"OpDecorate %ms_out_param{n} Location {n}" for n in sorted(gen.ms_params)]
     if vs:
         if gen.uses_clip:
             dec.append("OpDecorate %out_clip BuiltIn ClipDistance")
@@ -6940,14 +7079,16 @@ def assemble(gen):
     gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" for n in gen.outputs]
     # Push constants: s0..s31 user data, then the 64-bit host address of the Xbox GPU VA window (heap base).
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
-              "%UserData = OpTypeStruct %arr_ud %uint %uint %uint %uint",
+              "%UserData = OpTypeStruct %arr_ud %uint %uint %uint %uint" + (" %uint %uint" if msc else ""),
               "%_ptr_PC_UserData = OpTypePointer PushConstant %UserData",
               "%_ptr_PC_uint = OpTypePointer PushConstant %uint"]
     dec += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %UserData Block", "OpMemberDecorate %UserData 0 Offset 0",
             f"OpMemberDecorate %UserData 1 Offset {4 * USER_SGPRS}",
             f"OpMemberDecorate %UserData 2 Offset {4 * USER_SGPRS + 4}",
             f"OpMemberDecorate %UserData 3 Offset {4 * USER_SGPRS + 8}",
-            f"OpMemberDecorate %UserData 4 Offset {4 * USER_SGPRS + 12}"]
+            f"OpMemberDecorate %UserData 4 Offset {4 * USER_SGPRS + 12}"] + (
+            [f"OpMemberDecorate %UserData 5 Offset {4 * USER_SGPRS + 16}",
+             f"OpMemberDecorate %UserData 6 Offset {4 * USER_SGPRS + 20}"] if msc else [])
     gvars += ["%user_data = OpVariable %_ptr_PC_UserData PushConstant"]
     if gen.uses_fhalf:
         types += ["%fhalf_g = OpConstant %float 0.5"]
@@ -7002,7 +7143,7 @@ def assemble(gen):
                   "%_ptr_Function_v4_ms = OpTypePointer Function %v4float",
                   "%_ptr_Function_bool_ms = OpTypePointer Function %bool",
                   "%null_v4_ms = OpConstantNull %v4float"]
-        if ms_blk:
+        if ms and (gen.uses_clip or gen.uses_cull):     # staging arrays; the Output block only without msc
             types += ["%_ptr_Function_float = OpTypePointer Function %float"]
             blk_fields = ["%v4float"]
             if gen.uses_clip:
@@ -7022,12 +7163,13 @@ def assemble(gen):
                       "%_ptr_Out_ms_arr_vtx_blk = OpTypePointer Output %ms_arr_vtx_blk"]
         gvars += ["%wg_id = OpVariable %_ptr_Input_v3u Input", "%num_wg = OpVariable %_ptr_Input_v3u Input",
                   "%local_index = OpVariable %_ptr_Input_uint_ms Input",
-                  "%ms_counts = OpVariable %_ptr_WG_uint_ms Workgroup",
-                  ("%ms_out_vtx = OpVariable %_ptr_Out_ms_arr_vtx_blk Output" if ms_blk else
-                   "%ms_out_pos = OpVariable %_ptr_Out_ms_arr_v4 Output"),
-                  "%ms_prim_idx = OpVariable %_ptr_Out_ms_arr_idx Output",
-                  "%ms_cull = OpVariable %_ptr_Out_ms_arr_cull Output"]
-        gvars += [f"%ms_out_param{n} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in sorted(gen.ms_params)]
+                  "%ms_counts = OpVariable %_ptr_WG_uint_ms Workgroup"]
+        if not msc:
+            gvars += [("%ms_out_vtx = OpVariable %_ptr_Out_ms_arr_vtx_blk Output" if ms_blk else
+                       "%ms_out_pos = OpVariable %_ptr_Out_ms_arr_v4 Output"),
+                      "%ms_prim_idx = OpVariable %_ptr_Out_ms_arr_idx Output",
+                      "%ms_cull = OpVariable %_ptr_Out_ms_arr_cull Output"]
+            gvars += [f"%ms_out_param{n} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in sorted(gen.ms_params)]
         if gen.uses_lds:
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
@@ -7311,7 +7453,9 @@ def assemble(gen):
         out = hdr + dec + types + gvars + (gen.desc_fn or []) + (gen.fmt_fn or []) + fn
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
-    if ms:
+    if msc:
+        end_lock = gen.msc_epilogue + end_lock
+    elif ms:
         # All invocations reach the end: wait for the ALLOC_REQ write, declare the counts once (uniform), then each
         # thread writes the vertex and primitive it exported (index = LocalInvocationIndex).
         c = gen.cu
@@ -8397,6 +8541,12 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if g.cs:
         m["local_size"] = list(g.cs["size"])
         m["user_sgprs"] = g.cs["user"]
+    if getattr(g, "msc_layout", None):
+        # --mesh-compute: dispatch it as compute (same grid), then draw the slots with tools/mesh_compute_vs.py.
+        lay = dict(g.msc_layout)
+        lay["params"] = {str(k): v for k, v in lay["params"].items()}
+        m["mesh_compute"] = lay
+        m["push_constant_bytes"] = lay["push_constant_bytes"]
     if g.ms:
         m["local_size"] = list(g.ms["size"])
         m["max_vertices"], m["max_primitives"] = g.ms["maxv"], g.ms["maxp"]
@@ -8529,12 +8679,17 @@ def main():
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
+    ap.add_argument("--mesh-compute", action="store_true",
+                    help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
+                         "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
+                         "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK
+    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
+    MESH_COMPUTE = a.mesh_compute
     if a.merge:
         import glob as _gl, json as _js
         merged = {}

@@ -33,6 +33,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PRO
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
+from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, narrow_subgroup_skip, wave32_lane_skip   # as in check.py
 
 
@@ -607,6 +608,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--bary-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
+        if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
+            cmd.append("--mesh-compute")
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
     print(out)
@@ -616,6 +619,11 @@ def run_suite(a, work: str) -> int:
         import bary_fallback_gs
         for gs in bary_fallback_gs.build_for_index(spirv_dir):
             print("bary fallback GS:", os.path.basename(gs))
+
+    if MESH_COMPUTE:
+        import mesh_compute_vs
+        for vs_spv in mesh_compute_vs.build_for_index(spirv_dir):
+            print("mesh compute VS:", os.path.basename(vs_spv))
 
     # 3. Build helper SPIR-V shaders
     vs_tri = os.path.join(spirv_dir, "vs_tri.spv")
@@ -979,7 +987,7 @@ def run_suite(a, work: str) -> int:
                             problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
             raw = os.path.join(raw_dir, f"{name}.raw")
-            env = dict(gfx_env or os.environ, VKH_MESH="1")
+            env = mesh_env(spirv_dir, name, gfx_env)
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
             # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
             # the wave64 compute dumps are.
@@ -996,7 +1004,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, ok, detail))
         elif name == "ms_clip":
             raw = os.path.join(raw_dir, f"{name}.raw")
-            env = dict(gfx_env or os.environ, VKH_MESH="1")
+            env = mesh_env(spirv_dir, name, gfx_env)
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
