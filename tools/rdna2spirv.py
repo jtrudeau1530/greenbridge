@@ -354,8 +354,9 @@ class Gen:
     def write_lo16(self, d, lo16, preserve_high=True):
         """Write a 16-bit result into the low half of VGPR d. On GFX10, f16 VOP1/VOP2 ops and opsel-capable VOP3
         ops are partial writes that keep the high half (Mesa ACO aco_ir.cpp: instr_is_16bit / can_use_opsel);
-        non-opsel VOP2 16-bit integer ops define the whole register (high half modelled as zero)."""
-        if not preserve_high or d["k"] != "vgpr":
+        non-opsel VOP2 16-bit integer ops define the whole register (high half modelled as zero). An SDWA destination
+        never keeps it: dst_sel:DWORD writes the result zero-extended whatever dst_unused says (gfx1036, sdwa_diff)."""
+        if not preserve_high or d["k"] != "vgpr" or d.get("sdwa_dst"):
             self.dst(d, lo16)
             return
         old, keep, r = self.tmp(), self.tmp(), self.tmp()
@@ -3681,8 +3682,8 @@ class Gen:
             j = first + i
             if j < len(args) and (kv.get(key, "DWORD") != "DWORD" or args[j].get("sext")):
                 args[j]["sdwa_sel"] = kv.get(key, "DWORD")
-        if not op.startswith("v_cmp") and args and (kv.get("dst_sel", "DWORD") != "DWORD"):
-            args[0]["sdwa_dst"] = (kv["dst_sel"], kv.get("dst_unused", "UNUSED_PAD"))
+        if not op.startswith("v_cmp") and args:    # DWORD too: a 16-bit result then zeroes the high half (write_lo16)
+            args[0]["sdwa_dst"] = (kv.get("dst_sel", "DWORD"), kv.get("dst_unused", "UNUSED_PAD"))
         return self._insn({**ins, "args": args})
 
     def sdwa_src(self, v, a):

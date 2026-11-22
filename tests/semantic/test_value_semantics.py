@@ -36,6 +36,10 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
   v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
   v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
+  16-bit SDWA ops       with dst_sel:DWORD the 16-bit result is written zero-extended: the high half of D is
+    (v_add/mul_f16,       cleared whatever dst_unused says (measured on gfx1036, ps_sdwa_dword_hi.asm).
+    v_cvt_u16_f16,
+    v_cvt_f16_u16)
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -65,6 +69,7 @@ EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
 EXPECTED_OPS8 = [0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
+EXPECTED_SDWA_DWORD_HI = [0x00004000, 0x00000003, 0x00004700, 0x0000C000]   # hardware-measured (gfx1036)
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
 EXPECTED_SCC_MINMAX = [0x00030205, 0x00030207, 0x00030209, 0x00030203]
 EXPECTED_FMA_LITERAL = [0x41B80000, 0x41800000, 0x40E00000, 0x41A40000]
@@ -287,6 +292,13 @@ def reference_valu16_mad():
             _mad_32_16(True, v5, v6, 5, sel=(1, 1))]
 
 
+def reference_sdwa_dword_hi():
+    # Low/high halves of the sources: v2.lo 1.0, v4.lo 3.0, v4.hi -2.0, v6.hi 7. Each result is the 16-bit value
+    # alone; nothing of the destinations' 0xdeadbeef is left.
+    one, three, m_two = _unhalf(0x3C00), _unhalf(0x4200), _unhalf(0xC000)
+    return [_half(one + one), int(three) & 0xFFFF, _half(7.0), _half(one * m_two)]
+
+
 def reference_valu16_subrev():
     a, b, d = _unhalf(0x3E00), _unhalf(0x3800), _unhalf(0x3C00)        # low halves: v0 1.5, v1 0.5, v5 1.0
     return [0xAAAA0000 | _half(b - a), 0xAAAA0000 | _half(-b - a), 0xAAAA0000 | _half(min(1.0, b + a)),
@@ -334,6 +346,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_ops8(), EXPECTED_OPS8)
         self.assertEqual(reference_vcc_x2(), EXPECTED_VCC_X2)
         self.assertEqual(reference_f16_vop2(), EXPECTED_F16_VOP2)
+        self.assertEqual(reference_sdwa_dword_hi(), EXPECTED_SDWA_DWORD_HI)
         self.assertEqual(reference_flat(), EXPECTED_FLAT)
         self.assertEqual(reference_scc_minmax(), EXPECTED_SCC_MINMAX)
         self.assertEqual(reference_fma_literal(), EXPECTED_FMA_LITERAL)
@@ -393,6 +406,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # Low halves in (the high halves hold other values), low half out, the destination's high half kept;
         # v_fmac_f16 accumulates into the low half of its destination.
         self.check("ps_f16_vop2", EXPECTED_F16_VOP2)
+
+    def test_sdwa_16bit_result_dst_sel_dword_zeroes_high_half(self):
+        # v_add_f16 / v_cvt_u16_f16 / v_cvt_f16_u16 / v_mul_f16 SDWA into 0xdeadbeef with dst_sel:DWORD and
+        # dst_unused PRESERVE, PAD, PRESERVE, SEXT: the high half is zero in each, unlike the plain VOP1/VOP2 forms.
+        self.check("ps_sdwa_dword_hi", EXPECTED_SDWA_DWORD_HI)
 
     def test_mad_u32_u16_i32_i16_wrap_and_sign_extend(self):
         # The u16 product plus S2 wraps at 32 bits; i16 sign-extends both halves (also the op_sel-selected high
