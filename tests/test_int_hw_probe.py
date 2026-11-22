@@ -22,11 +22,11 @@ from hw_oracle import runner as hw_runner  # noqa: E402
 class IntHwProbeTests(unittest.TestCase):
     def test_cases_unique_and_nonempty(self):
         cases = probe.build_cases()
-        self.assertGreaterEqual(len(cases), 80)
+        self.assertGreaterEqual(len(cases), 95)
         names = [c.name for c in cases]
         self.assertEqual(len(names), len(set(names)))
         groups = {c.group for c in cases}
-        self.assertGreaterEqual(len(groups), 19)
+        self.assertGreaterEqual(len(groups), 23)
         for key in probe.KNOWN_DIVERGENCES:
             self.assertIn(key, names)
 
