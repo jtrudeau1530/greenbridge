@@ -938,5 +938,249 @@ class TestFmaF16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res1, res2)
 
 
+class SIMDWaveState:
+    """Architectural model of a SIMD wavefront (Wave32 or Wave64) with EXEC masking."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self._exec_mask = (1 << wave_size) - 1
+        self.vgprs = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs = [0] * 106
+
+    @property
+    def exec_mask(self) -> int:
+        return self._exec_mask
+
+    @exec_mask.setter
+    def exec_mask(self, val: int) -> None:
+        mask_limit = (1 << self.wave_size) - 1
+        self._exec_mask = val & mask_limit
+
+    @property
+    def exec_lo(self) -> int:
+        return self._exec_mask & MASK32
+
+    @exec_lo.setter
+    def exec_lo(self, val: int) -> None:
+        self._exec_mask = (self._exec_mask & ~MASK32) | (val & MASK32)
+
+    @property
+    def exec_hi(self) -> int:
+        return (self._exec_mask >> 32) & MASK32
+
+    @exec_hi.setter
+    def exec_hi(self, val: int) -> None:
+        if self.wave_size == 32:
+            raise ValueError("Cannot set exec_hi on Wave32")
+        self._exec_mask = (self._exec_mask & MASK32) | ((val & MASK32) << 32)
+
+    def set_lane_vgpr_half_u16(self, lane: int, idx: int, half: HalfSel, val: int) -> None:
+        current = self.vgprs[lane][idx]
+        u16 = val & MASK16
+        if half == HalfSel.HI:
+            self.vgprs[lane][idx] = (current & 0x0000FFFF) | (u16 << 16)
+        else:
+            self.vgprs[lane][idx] = (current & 0xFFFF0000) | u16
+
+    def get_lane_vgpr_half_u16(self, lane: int, idx: int, half: HalfSel) -> int:
+        dword = self.vgprs[lane][idx]
+        return (dword >> 16) & MASK16 if half == HalfSel.HI else (dword & MASK16)
+
+    def set_lane_vgpr_half_f16(self, lane: int, idx: int, half: HalfSel, val: float) -> None:
+        self.set_lane_vgpr_half_u16(lane, idx, half, f16_to_u16(val))
+
+    def get_lane_vgpr_half_f16(self, lane: int, idx: int, half: HalfSel) -> float:
+        return u16_to_f16(self.get_lane_vgpr_half_u16(lane, idx, half))
+
+    def set_sgpr_half_u16(self, idx: int, half: HalfSel, val: int) -> None:
+        current = self.sgprs[idx]
+        u16 = val & MASK16
+        if half == HalfSel.HI:
+            self.sgprs[idx] = (current & 0x0000FFFF) | (u16 << 16)
+        else:
+            self.sgprs[idx] = (current & 0xFFFF0000) | u16
+
+    def get_sgpr_half_u16(self, idx: int, half: HalfSel) -> int:
+        dword = self.sgprs[idx]
+        return (dword >> 16) & MASK16 if half == HalfSel.HI else (dword & MASK16)
+
+    def set_sgpr_half_f16(self, idx: int, half: HalfSel, val: float) -> None:
+        self.set_sgpr_half_u16(idx, half, f16_to_u16(val))
+
+    def get_sgpr_half_f16(self, idx: int, half: HalfSel) -> float:
+        return u16_to_f16(self.get_sgpr_half_u16(idx, half))
+
+    def _resolve_operand_u16(self, src: ASTOperand, lane: int) -> int:
+        if src.kind == OperandKind.VGPR:
+            val_u16 = self.get_lane_vgpr_half_u16(lane, src.index, src.half)
+        elif src.kind == OperandKind.SGPR:
+            val_u16 = self.get_sgpr_half_u16(src.index, src.half)
+        elif src.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            val_u16 = f16_to_u16(float(src.value)) if src.value is not None else F16_POS_ZERO
+        else:
+            raise ValueError(f"Unsupported operand kind: {src.kind}")
+
+        return apply_src_mods_u16(val_u16, neg=src.neg, abs_=src.abs_)
+
+    def execute(self, inst: ASTInstruction) -> None:
+        inst.validate()
+        for lane in range(self.wave_size):
+            if (self._exec_mask >> lane) & 1:
+                u0 = self._resolve_operand_u16(inst.src0, lane)
+                u1 = self._resolve_operand_u16(inst.src1, lane)
+                u2 = self._resolve_operand_u16(inst.src2, lane)
+                res_u16 = ref_fma_f16_u16(u0, u1, u2, clamp=inst.clamp, omod=inst.omod.value)
+                self.set_lane_vgpr_half_u16(lane, inst.dst.index, inst.dst.half, res_u16)
+
+
+class TestFmaF16SIMDMultiLane(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    CANARY_OLD = 0xBEEF
+
+    def test_wave32_full_exec(self):
+        wave = SIMDWaveState(wave_size=32)
+        wave.exec_mask = 0xFFFFFFFF
+        for lane in range(32):
+            wave.set_lane_vgpr_half_f16(lane, 1, HalfSel.LO, float(lane))
+            wave.set_lane_vgpr_half_f16(lane, 2, HalfSel.LO, 2.0)
+            wave.set_lane_vgpr_half_f16(lane, 3, HalfSel.LO, 1.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.LO),
+            src2=ASTOperand.vgpr(3, HalfSel.LO),
+        )
+        wave.execute(inst)
+
+        for lane in range(32):
+            expected = float(lane * 2 + 1)
+            self.assertEqual(wave.get_lane_vgpr_half_f16(lane, 0, HalfSel.LO), expected)
+
+    def test_wave64_full_exec(self):
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_lo = 0xFFFFFFFF
+        wave.exec_hi = 0xFFFFFFFF
+        for lane in range(64):
+            wave.set_lane_vgpr_half_f16(lane, 1, HalfSel.LO, float(lane) * 0.5)
+            wave.set_lane_vgpr_half_f16(lane, 2, HalfSel.LO, 4.0)
+            wave.set_lane_vgpr_half_f16(lane, 3, HalfSel.LO, -10.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.LO),
+            src2=ASTOperand.vgpr(3, HalfSel.LO),
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            expected = float(lane * 0.5) * 4.0 - 10.0
+            self.assertEqual(wave.get_lane_vgpr_half_f16(lane, 0, HalfSel.LO), expected)
+
+    def test_wave64_divergence_exec_masking(self):
+        wave = SIMDWaveState(wave_size=64)
+        # Even lanes in low 32, odd lanes in high 32
+        wave.exec_lo = 0x55555555
+        wave.exec_hi = 0xAAAAAAAA
+
+        for lane in range(64):
+            wave.set_lane_vgpr_half_u16(lane, 0, HalfSel.LO, self.CANARY_OLD)
+            wave.set_lane_vgpr_half_f16(lane, 1, HalfSel.LO, 3.0)
+            wave.set_lane_vgpr_half_f16(lane, 2, HalfSel.LO, 5.0)
+            wave.set_lane_vgpr_half_f16(lane, 3, HalfSel.LO, 2.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.LO),
+            src2=ASTOperand.vgpr(3, HalfSel.LO),
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            is_active = bool((wave.exec_mask >> lane) & 1)
+            if is_active:
+                self.assertEqual(wave.get_lane_vgpr_half_f16(lane, 0, HalfSel.LO), 17.0)
+            else:
+                self.assertEqual(wave.get_lane_vgpr_half_u16(lane, 0, HalfSel.LO), self.CANARY_OLD)
+
+    def test_wave64_halves_masking(self):
+        wave = SIMDWaveState(wave_size=64)
+        # Only low 32 lanes active
+        wave.exec_lo = 0xFFFFFFFF
+        wave.exec_hi = 0x00000000
+
+        for lane in range(64):
+            wave.set_lane_vgpr_half_u16(lane, 0, HalfSel.LO, self.CANARY_OLD)
+            wave.set_lane_vgpr_half_f16(lane, 1, HalfSel.LO, 2.0)
+            wave.set_lane_vgpr_half_f16(lane, 2, HalfSel.LO, 2.0)
+            wave.set_lane_vgpr_half_f16(lane, 3, HalfSel.LO, 2.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.LO),
+            src2=ASTOperand.vgpr(3, HalfSel.LO),
+        )
+        wave.execute(inst)
+
+        for lane in range(32):
+            self.assertEqual(wave.get_lane_vgpr_half_f16(lane, 0, HalfSel.LO), 6.0)
+        for lane in range(32, 64):
+            self.assertEqual(wave.get_lane_vgpr_half_u16(lane, 0, HalfSel.LO), self.CANARY_OLD)
+
+    def test_single_active_lane(self):
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_mask = 1 << 17  # only lane 17
+
+        for lane in range(64):
+            wave.set_lane_vgpr_half_u16(lane, 0, HalfSel.LO, self.CANARY_OLD)
+            wave.set_lane_vgpr_half_f16(lane, 1, HalfSel.LO, 7.0)
+            wave.set_lane_vgpr_half_f16(lane, 2, HalfSel.LO, 3.0)
+            wave.set_lane_vgpr_half_f16(lane, 3, HalfSel.LO, 1.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.LO),
+            src2=ASTOperand.vgpr(3, HalfSel.LO),
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            if lane == 17:
+                self.assertEqual(wave.get_lane_vgpr_half_f16(lane, 0, HalfSel.LO), 22.0)
+            else:
+                self.assertEqual(wave.get_lane_vgpr_half_u16(lane, 0, HalfSel.LO), self.CANARY_OLD)
+
+    def test_zero_exec_preserves_all_lanes(self):
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_mask = 0
+
+        for lane in range(64):
+            wave.set_lane_vgpr_half_u16(lane, 0, HalfSel.LO, self.CANARY_OLD)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.inline_const(1.0),
+            src1=ASTOperand.inline_const(1.0),
+            src2=ASTOperand.inline_const(1.0),
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            self.assertEqual(wave.get_lane_vgpr_half_u16(lane, 0, HalfSel.LO), self.CANARY_OLD)
+
+
 if __name__ == "__main__":
     unittest.main()
