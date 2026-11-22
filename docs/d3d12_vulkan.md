@@ -1167,8 +1167,9 @@ and any validation error fails them.
   resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches
   to unsynchronised presents. The presenter's capture copies every presented image back, and the test checks
   that the whole image holds the clear colour at the swapchain's size (after the first 60 frames, after the
-  resize and at the end). Last, it reads the colour on screen with GDI when the window is in front and GDI can
-  read the screen. Under Wine's macOS driver it can't: `GetPixel` on the screen DC returns `CLR_INVALID` even
+  resize and at the end). Last, it reads the colour on screen with GDI when the window is in front, no other
+  window lies over its centre (an always-on-top one can, even over the foreground window) and GDI can read the
+  screen. Under Wine's macOS driver it can't: `GetPixel` on the screen DC returns `CLR_INVALID` even
   for a pixel GDI painted itself, and the window's own DC holds Wine's GDI surface (white), not the image
   presented through the Metal layer. There the capture checks are what confirms the colour.
   - The injected failures below make the runtime log `[rt] d3d12: present failed` three times (VkResult
