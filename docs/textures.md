@@ -879,6 +879,8 @@ via `bcpack.decode_with_info`).
 
 ## Reproduce
 
+The Python exporter also supports an explicitly selected local reconstruction profile for measured DDS comparisons. Build instructions, the JSON schema and the game-independent test are in the [calibrated export guide](../tools/bcpack_calibration/README.md).
+
 `tools/ttpf_mips.py` is the read-only measurement and decode tool (with `tools/bcpack.py`
 enabled in strict confirmed-history mode by default):
 

@@ -1533,6 +1533,7 @@ def main(argv=None):
     pe.add_argument("out")
     pe.add_argument("--mips", type=int)
     pe.add_argument("--force", action="store_true")
+    pe.add_argument("--calibration", metavar="PROFILE.json", help="export using an explicit locally fitted profile")
     pe.add_argument("--allow-provisional", action="store_true",
                     help="allow unconfirmed built-in BCPack history entries")
     pe.add_argument("--history",
@@ -1563,6 +1564,16 @@ def main(argv=None):
             return 0
         if a.cmd == "check":
             return check(pool, a.index, allow_provisional=a.allow_provisional, history=a.history)
+        if a.calibration:
+            if a.history:
+                print("ERROR: choose either --calibration or --history", file=sys.stderr)
+                return 2
+            try:
+                from calibrated_texture import export_file
+                return export_file(pool, a.index, a.out, a.mips, a.force, a.calibration)
+            except (OSError, ImportError, ValueError, TypeError, KeyError, IndexError) as exc:
+                print(f"calibrated export failed: {exc}", file=sys.stderr)
+                return 2
         return export(pool, a.index, a.out, a.mips, a.force,
                       allow_provisional=a.allow_provisional, history=a.history)
     finally:

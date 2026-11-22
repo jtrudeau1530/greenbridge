@@ -1,0 +1,27 @@
+# Calibrated TTPF export
+
+The Python exporter can replay a locally measured reconstruction profile for 2D BC1, BC3, BC4, BC5, BC6H and BC7 textures and 2D arrays. Select it explicitly with `--calibration PROFILE.json`. The profile is data. The compiled library is loaded from this crate's release build directory.
+
+From the repository root, build with Rust/Cargo and run in the Python environment where NumPy is installed:
+
+```text
+python -m pip install numpy
+cargo build --release --locked --manifest-path tools/bcpack_calibration/Cargo.toml
+python -IB tests/test_calibrated_texture.py -v
+python -I tools/ttpf_mips.py export path/to/pool.ttpf 0 output.dds --calibration path/to/profile.json
+```
+
+The synthetic test constructs its own BC1 pool and profile, runs the CLI and compares the full mip payload with known blocks. A real profile requires the caller's calibrated tables. The exporter does not derive the tables automatically. A matching file hash verifies reproduction of a previous fitted export. Original pixel fidelity needs independent reference pixels.
+
+## Version 1 profile
+
+The top-level JSON object contains `"version": 1` and the sections used by the requested texture:
+
+- `bc1.endpoints` holds 256 rows of six RGB565 components indexed by predictor age. Negative values mark unknown components. `bc1.selectors` contains four rows of 256 unsigned 32-bit masks in output bit order. The synthetic test generates both fields.
+- `bc3.endpoints` maps negative history offsets to eight RGB-alpha components in endpoint order. Offset -512 is the zero-distance predictor. `color` and `alpha` map quadrant and pair ranks to packed selector bits.
+- `bc4` maps profile names to dictionaries of history-slot numbers and two byte-valued endpoints. BC5 uses the decoder's built-in tables and the compatibility endpoint ordering.
+- `bc6h` uses the existing external BC6H history section.
+- `bc7.labels` has 1,024 rows of mode, partition, rotation and index selection indexed by the two signature symbols. `anchors` contains 128 unsigned 16-bit masks. Each entry of `seeds` is a 256 × 56 × 2 array indexed by age and field with left-aligned byte value and known-bit count. Tables are named `base`, `secondary`, `early` and `refined`. Optional fitted endpoint adjustments are keyed by SHA-256 of the contiguous lane-symbol matrix followed by little-endian signed 64-bit unresolved block indices. Each adjustment gives age, endpoint field and fitted byte value.
+- Optional `entries` maps pool basename and zero-based index to a profile name (default `base`). Optional `compatibility` maps a compressed BC1 stream's SHA-256 to a list of flattened symbol positions. Rotate the symbols at those positions left once to reproduce a known historical feeder ordering.
+
+The Rust entropy reader comes from the pinned `bcpack-rs` dependency. The Python reader handles streams for which that reader does not report full consumption. The fitted BC7 reconstruction tracks precision while decoding blocks in archive order. Visible blocks must resolve before the DDS is written.
