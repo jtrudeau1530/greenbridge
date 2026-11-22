@@ -118,6 +118,10 @@ count unchanged. Reading `samples` as a frame count produces a file that reports
 | `python -I tools/awc_opus.py <bank or dir> <out> [--jobs N]` | `<out>/<bank>/<stream id>.ogg`, or `.wav` for codec 0/2; `--jobs` processes that many banks at once |
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
+When exporting a directory, `awc_opus.py` keeps the path to each bank below the input root. For example,
+`a/music.awc` writes under `<out>/a/music/`. Passing that file on its own writes under `<out>/music/`.
+To regenerate a flat export from an earlier version, run `awc_opus.py` with the original bank directory and a fresh output directory.
+
 `audio_manifest.json` is the bank index: each bank's `Path`, `Offset`, `Size`, and its `Streams` with `Index`,
 `Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`. For streamed music,
 `Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
