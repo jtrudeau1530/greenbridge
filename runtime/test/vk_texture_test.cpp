@@ -21,6 +21,7 @@
 // capability on a device without shaderResourceMinLod prints "unsupported: ..." and exits 77.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,6 +58,7 @@ static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) 
 }
 
 #include "../src/descriptor_table.h"
+#include "../src/gfx10_descriptors.h"
 
 int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
@@ -132,12 +134,14 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
+    int best_rank = -1;
     for (uint32_t i = 0; i < n; ++i) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pds[i], &p);
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
             pd = pds[i];
             properties = p;
+            best_rank = rank;
         }
     }
     constexpr uint32_t push_words = 36;
@@ -145,7 +149,7 @@ int main(int argc, char** argv) {
     if (properties.limits.maxPushConstantsSize < push_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n",
                      push_bytes, properties.limits.maxPushConstantsSize);
-        return two_mip ? 77 : 1;
+        return 77;   // a device limit, not a wrong result: every texture test skips (128-byte devices, D3D-14)
     }
     uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn); vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf.data());
@@ -242,6 +246,8 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
     std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
+    if (two_mip)  // The gather test loads its S# from the four words just after the T#.
+        std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
     // Descriptor hash table: 16 slots.
@@ -321,6 +327,12 @@ int main(int argc, char** argv) {
     sci.maxLod = float(levels - 1);
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VkSamplerCreateInfo sci1 = sci;            // index 1: the S# the shader names
+    if (two_mip) {
+        const leonida::gfx10::SamplerWords words{ssharp[0], ssharp[1], ssharp[2], ssharp[3]};
+        const auto sampler = leonida::gfx10::decode(words);
+        sci1.minLod = sampler.min_lod;
+        sci1.maxLod = sampler.max_lod;
+    }
     if (dref) {
         sci1.compareEnable = VK_TRUE;
         sci1.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;

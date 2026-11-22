@@ -147,12 +147,19 @@ def scan_xml(data: bytes) -> dict:
         "content_values": set(),
     }
     depth = 0
+    ended = None
     try:
         parser = ET.iterparse(io.BytesIO(data), events=("start", "end", "comment"))
         for event, elem in parser:
             if event == "comment":
                 report["comments"] += 1
-            elif event == "start":
+                continue
+            # A closing tag can be read before its tail. The next start or end event finalizes it.
+            if ended is not None:
+                scan_refs(ended.tail, report)
+                ended.clear()
+                ended = None
+            if event == "start":
                 depth += 1
                 report["max_depth"] = max(report["max_depth"], depth)
                 if not report["root"]:
@@ -177,13 +184,14 @@ def scan_xml(data: bytes) -> dict:
                     report["xi_include"] += 1
             else:
                 scan_refs(elem.text, report)
-                scan_refs(elem.tail, report)
                 depth -= 1
-                elem.clear()
+                ended = elem
         report["well_formed"] = True
-    except ET.ParseError as exc:
-        # ET errors carry a line/column and a short reason, never the element content.
+    except (ET.ParseError, LookupError, ValueError) as exc:
+        # The parser also raises LookupError or ValueError for unsupported encoding declarations.
         report["error"] = str(exc)
+    if ended is not None:
+        scan_refs(ended.tail, report)
     report["attributes"] = sorted(report["attrs"])
     return report
 

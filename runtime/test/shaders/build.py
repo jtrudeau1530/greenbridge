@@ -16,6 +16,8 @@ are also what a shader reads through s_getpc_b64 (the code base) at that offset.
 The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
 their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
+With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
+each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 """
 import json
 import os
@@ -99,7 +101,7 @@ def translate_tests(work, names):
             cmd.append(f"-mattr={mattr}")
         cmd.append("-show-encoding")
         # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
-        r = subprocess.run(cmd, input=raw, capture_output=True, text=True)
+        r = mc_command.run(cmd, input=raw, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
@@ -117,6 +119,10 @@ def translate_tests(work, names):
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
+        cmd.append("--bary-fallback")
+    if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
+        cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode
 
 
@@ -165,6 +171,10 @@ def main():
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs
         spirv_stubs.generate_for_index(str(spirv), combined)
+        if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":
+            # The pass-through geometry shader each --bary-fallback PS is drawn with (<name>.bary_gs.spv).
+            import bary_fallback_gs
+            bary_fallback_gs.build_for_index(str(spirv))
     return 0
 
 

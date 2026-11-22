@@ -174,6 +174,16 @@ class DisasmInputTest(unittest.TestCase):
         self.assertIn("'clean': 2", p.stdout)
         self.assertIn("'scan failed': 1", p.stdout)
 
+    def test_directory_with_fssm_suffix_does_not_count_toward_limit(self):
+        os.mkdir(os.path.join(self.src, "a_cache.fssm"))
+        self.write("b_shader.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+
+        result = self.run_tool(self.src, "--out", out, "--limit", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(out), ["b_shader.s"])
+
     def test_jobs_and_limit_must_be_at_least_one(self):
         self.write("one.fssm", fssm())
         out = os.path.join(self.dir, "out")

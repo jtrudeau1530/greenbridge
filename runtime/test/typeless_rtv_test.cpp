@@ -107,6 +107,10 @@ int main() {
     auto conditional = vk;
     conditional.begin_conditional_rendering = +[](VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {};
     conditional.end_conditional_rendering = end;
+    conditional.prepare_predicate = [](VkBuffer source, VkDeviceSize offset, PredicateCapture& out) {
+        out = {source, offset, reinterpret_cast<VkBuffer>(std::uintptr_t{3}), 0, VK_NULL_HANDLE}; return true;
+    };
+    conditional.capture_predicate = [](VkCommandBuffer, const PredicateCapture&) {};
     ResourceBinding predicate{};
     predicate.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
     predicate.size = 8;
@@ -123,6 +127,50 @@ int main() {
         EXPECT(prepared.commands[1].rects[0].rect.extent.height == binding.height);
         EXPECT(requested_format == expected);
         ++checks;
+    }
+    // Eight bytes, not just the low word, must fit; missing/rejected preparation cannot emit any clears.
+    {
+        CommandList list;
+        EXPECT(list.set_predication({2, 0, d3d12_predication::equal_zero}));
+        EXPECT(list.clear_render_target({1, 0, 0, 1, ColorViewFormat::rgba8_uint}, color) && list.close());
+        auto short_buffer = predicate; short_buffer.size = 4;
+        PreparedList prepared;
+        auto resolve = [&](ResourceId id) { return id == 2 ? &short_buffer : &binding; };
+        EXPECT(prepare(list, resolve, conditional, prepared) == ReplayResult::invalid_predication);
+        short_buffer.size = 8;
+        EXPECT(prepare(list, resolve, conditional, prepared) == ReplayResult::success);
+        auto unavailable = conditional; unavailable.prepare_predicate = {};
+        EXPECT(prepare(list, resolve, unavailable, prepared) == ReplayResult::unsupported);
+        unavailable = conditional;
+        unavailable.prepare_predicate = [](VkBuffer, VkDeviceSize, PredicateCapture&) { return false; };
+        EXPECT(prepare(list, resolve, unavailable, prepared) == ReplayResult::unsupported);
+        checks += 4;
+    }
+    {
+        QueryPool statistics{};
+        statistics.pool = reinterpret_cast<VkQueryPool>(std::uintptr_t{4});
+        statistics.heap_type = d3d12_query_heap::pipeline_statistics; statistics.count = 1;
+        auto queries = conditional;
+        queries.reset_query_pool = +[](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {};
+        queries.begin_query = +[](VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {};
+        queries.end_query = +[](VkCommandBuffer, VkQueryPool, std::uint32_t) {};
+        queries.write_timestamp = +[](VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, std::uint32_t) {};
+        queries.copy_query_pool_results = +[](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t,
+                                              VkBuffer, VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {};
+        queries.fill_buffer = +[](VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, std::uint32_t) {};
+        queries.query_pool = [&](QueryHeapId) { return &statistics; };
+        for (bool inside : {false, true}) {
+            CommandList list;
+            if (!inside) EXPECT(list.set_predication({2, 0, d3d12_predication::equal_zero}));
+            EXPECT(list.begin_query({3, d3d12_query::pipeline_statistics, 0}));
+            if (inside) EXPECT(list.set_predication({2, 0, d3d12_predication::equal_zero}));
+            EXPECT(list.end_query({3, d3d12_query::pipeline_statistics, 0}) && list.close());
+            PreparedList prepared;
+            const auto resolve = [&](ResourceId id) { return id == 2 ? &predicate : &binding; };
+            EXPECT(prepare(list, resolve, queries, prepared) ==
+                   (inside ? ReplayResult::unsupported : ReplayResult::success));
+            ++checks;
+        }
     }
     auto layered = binding;
     layered.mip_levels = 3; layered.array_layers = 4;

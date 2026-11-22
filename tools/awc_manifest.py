@@ -29,6 +29,7 @@ import tempfile
 # -I keeps the script directory off sys.path, so add it explicitly before importing the parser.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 FIELDS = ("bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes")
@@ -171,6 +172,7 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
                 w.writerow(row)
         if tmp:
             f.close()
+            os.chmod(tmp, published_mode(out))   # mkstemp creates 0600
             os.replace(tmp, out)
             tmp = None
     finally:

@@ -238,6 +238,9 @@ def scan_dir(path, progress=None, output=None):
             continue
         if not stat.S_ISREG(info.st_mode) or (report is not None and os.path.samestat(info, report)):
             continue
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if name.lower().endswith((".json", ".csv")):
+            continue
         with open(full, "rb") as f:
             data = f.read()
         m = re.match(r"([0-9a-fA-F]{6,})", name)
@@ -322,25 +325,37 @@ def main():
     a = ap.parse_args()
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
-    if os.path.isdir(a.source):
-        rows, summary = scan_dir(a.source, output=a.out)
-    else:
-        def progress(n, pos, end):
-            if not a.quiet:
-                print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
-        try:
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .csv or .json file")
+    if os.path.splitext(a.out)[1].lower() not in (".json", ".csv"):
+        ap.error("output must end in .json or .csv")
+    folder = os.path.dirname(os.path.abspath(a.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
+    try:
+        if os.path.isdir(a.source):
+            rows, summary = scan_dir(a.source, output=a.out)
+        else:
+            def progress(n, pos, end):
+                if not a.quiet:
+                    print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
             rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
-        except (OSError, ValueError) as e:
-            print(f"{a.source}: {e}", file=sys.stderr)
-            return 2
-    write_output(a.out, rows, summary)
-    top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
-    print(json.dumps({k: summary[k] for k in
-                      ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",
-                       "span", "readable_fraction", "bink2_files", "elapsed_seconds")}, indent=1))
-    print(f"{len(summary['signatures'])} signature classes; top 15:")
-    for name, counts in top.items():
-        print(f"  {name:24} {counts['files']:6} files {counts['stored']:12} stored {counts['inflated']:12} inflated")
+    except (OSError, ValueError) as e:
+        print(f"{a.source}: {e}", file=sys.stderr)
+        return 2
+    try:
+        write_output(a.out, rows, summary)
+    except OSError as e:
+        print(f"{a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    if not a.quiet:
+        top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
+        print(json.dumps({k: summary[k] for k in
+                          ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",
+                           "span", "readable_fraction", "bink2_files", "elapsed_seconds")}, indent=1))
+        print(f"{len(summary['signatures'])} signature classes; top 15:")
+        for name, counts in top.items():
+            print(f"  {name:24} {counts['files']:6} files {counts['stored']:12} stored {counts['inflated']:12} inflated")
     return 0
 
 

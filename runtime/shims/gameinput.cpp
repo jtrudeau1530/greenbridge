@@ -5,12 +5,14 @@
 // vtables follow the public v0 API (gameinput_abi.h) and serves gamepads from SDL3:
 //
 //   - device enumeration, connect/disconnect and device callbacks (blocking and async enumeration)
-//   - GetCurrentReading / GetNextReading, GetGamepadState, GetUiNavigationState, controller axes and buttons
+//   - GetCurrentReading, and GetNextReading / GetPreviousReading over each pad's last half second of readings
+//   - GetGamepadState, GetUiNavigationState, controller axes and buttons
 //   - SetRumbleState: the two body motors through SDL_RumbleGamepad, the impulse-trigger motors through
 //     SDL_RumbleGamepadTriggers on pads that have them; on a DualSense the trigger signal becomes an adaptive-trigger
 //     effect (SDL_SendGamepadEffect), as set by LEONIDA_DS_TRIGGERS. That is an approximation of the Xbox impulse
 //     trigger signal, not the PS5 version's authored effects.
 //   - DualSense/DualShock 4 lightbar colour (LEONIDA_DS_LIGHTBAR) and the player LEDs by connection order
+//   - the keyboard pad (LEONIDA_KEYBOARD_PAD): one SDL virtual gamepad driven by the keyboard and mouse
 //
 // One thread owns SDL: the background poll thread by default, or the caller of rt::gameinput::poll() when
 // LEONIDA_GAMEINPUT_THREAD=0. Title calls never touch SDL: they read the latest snapshot and leave rumble requests
@@ -34,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -56,6 +59,8 @@ constexpr Uint32 kRumbleDurationMs = 0xFFFF;  // SDL's maximum; refreshed well b
 constexpr uint64_t kRumbleRefreshUs = 20'000'000;
 constexpr uint64_t kBatteryRefreshUs = 1'000'000;
 constexpr int kDsEffectSize = 47;  // the DualSense effects block SDL_SendGamepadEffect forwards (SDL's DS5EffectsState_t)
+constexpr uint64_t kHistoryUs = 500'000;  // a reading stays in the history until the one after it is this old
+constexpr size_t kHistoryCap = 512;       // readings per pad, whatever the poll rate
 
 uint64_t now_us() {
     static const LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
@@ -109,6 +114,12 @@ rt::gameinput::Config read_config() {
     }
     if (env("LEONIDA_RUMBLE") == "0") c.rumble = false;
     if (env("LEONIDA_GAMEINPUT_THREAD") == "0") c.background_thread = false;
+    const std::string k = env("LEONIDA_KEYBOARD_PAD");
+    if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
+    else if (k == "always") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
+    else if (!k.empty() && k != "0" && k != "off")
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
+                     k.c_str());
     return c;
 }
 
@@ -133,7 +144,7 @@ struct Snapshot {
 
 class Reading final : public IGameInputReading {
 public:
-    Reading(Device* device, const Snapshot& s, uint64_t seq, uint64_t ts);
+    Reading(Device* device, const Snapshot& s, uint64_t seq, uint64_t ts, uint64_t order);
     ~Reading();
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
@@ -196,13 +207,14 @@ public:
     }
 
     Device* device() const { return device_; }
-    uint64_t seq() const { return seq_; }
+    uint64_t order() const { return order_; }
 
 private:
     std::atomic<ULONG> refs_{1};
     Device* device_;
     Snapshot s_;
     uint64_t seq_, ts_;
+    uint64_t order_;  // place among every pad's readings, the order GetNextReading/GetPreviousReading follow
 };
 
 struct Rumble {
@@ -270,10 +282,13 @@ public:
     GameInputGamepadInfo gamepad_info{};
     GameInputUiNavigationInfo ui_info{};
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
-    Reading* latest = nullptr;  // one reference held
+    std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
+    uint64_t evicted_order = 0;    // order of the newest reading dropped from history
+    Reading* latest() const { return history.empty() ? nullptr : history.back(); }
     uint64_t seq = 0;
     Rumble wanted;
     GameInputBatteryState battery{0, 0, 0, 0, GameInputBatteryUnknown};
+    AppLocalDeviceId base_id{};  // id_bytes of the identity alone: twins share it, info.deviceId tells them apart
 
     // Poll-thread state.
     SDL_Gamepad* pad = nullptr;
@@ -289,7 +304,8 @@ private:
     std::atomic<ULONG> refs_{1};
 };
 
-Reading::Reading(Device* device, const Snapshot& s, uint64_t seq, uint64_t ts) : device_(device), s_(s), seq_(seq), ts_(ts) {
+Reading::Reading(Device* device, const Snapshot& s, uint64_t seq, uint64_t ts, uint64_t order)
+    : device_(device), s_(s), seq_(seq), ts_(ts), order_(order) {
     device_->AddRef();
 }
 Reading::~Reading() { device_->Release(); }
@@ -335,6 +351,7 @@ struct State {
     std::vector<Callback> callbacks;
     std::vector<Event> queue;
     GameInputCallbackToken next_token = 1;
+    uint64_t last_order = 0;  // Reading::order of the newest reading
     int dispatchers = 0;
     HANDLE wait_event = nullptr;  // auto-reset, signalled when a dispatcher has work
     rt::gameinput::Config config;
@@ -505,6 +522,12 @@ void id_bytes(const std::string& identity, const SDL_GUID& guid, AppLocalDeviceI
     }
 }
 
+// Twin n of an identity. Twin 0 is the plain id, so a pad without twins keeps the id it always had. Real identities
+// start with "s:", "p:" or are empty, never "t:", so a twin id cannot be another pad's own id.
+void id_bytes(const std::string& identity, const SDL_GUID& guid, uint32_t twin, AppLocalDeviceId* out) {
+    id_bytes(twin ? "t:" + std::to_string(twin) + ":" + identity : identity, guid, out);
+}
+
 void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
     GameInputDeviceInfo& i = d->info;
     i = {};
@@ -555,6 +578,20 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
     i.displayName = &d->display_name;
 }
 
+// Makes snap the device's current reading. A reading leaves the history once the one after it is more than kHistoryUs
+// old, so the last half second stays reachable however long the pad then idles; kHistoryCap bounds a flood. Readings
+// the title holds outlive their place here (~Reading only releases the device, which takes no lock). Under g().mu.
+Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
+    std::deque<Reading*>& h = d->history;
+    h.push_back(new Reading(d, snap, ++d->seq, ts, ++g().last_order));
+    while (h.size() > kHistoryCap || (h.size() > 1 && h[1]->GetTimestamp() + kHistoryUs < ts)) {
+        d->evicted_order = h.front()->order();
+        h.front()->Release();
+        h.pop_front();
+    }
+    return h.back();
+}
+
 void open_pad(SDL_JoystickID jid, uint64_t ts) {
     State& s = g();
     SDL_Gamepad* p = SDL_OpenGamepad(jid);
@@ -565,16 +602,34 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     const char* serial = SDL_GetGamepadSerial(p);
     const char* path = SDL_GetGamepadPath(p);
     const std::string identity = (serial && *serial) ? std::string("s:") + serial : (path && *path) ? std::string("p:") + path : "";
-    AppLocalDeviceId id{};
-    id_bytes(identity, SDL_GetGamepadGUIDForID(jid), &id);
+    const SDL_GUID guid = SDL_GetGamepadGUIDForID(jid);
+    AppLocalDeviceId base{};
+    id_bytes(identity, guid, &base);
 
     const SDL_PropertiesID props = SDL_GetGamepadProperties(p);
     std::lock_guard lock(s.mu);
+    // The same pad coming back gets its old object. Pads with the same GUID and serial or path (identical pads with
+    // neither, mostly) are twins sharing one base id, told apart by order alone: the lowest disconnected twin is
+    // reused, and a new one gets the next free twin id. Which physical pad was which cannot be recovered, so twins
+    // that return in a different order swap objects and ids (docs/gameinput.md).
     Device* d = nullptr;
-    for (Device* old : s.devices)  // the same pad coming back gets its old object
-        if (old->status == GameInputDeviceNoStatus && std::memcmp(&old->info.deviceId, &id, sizeof id) == 0) d = old;
+    uint32_t twins = 0;
+    for (Device* old : s.devices) {  // creation order, so twins in twin order
+        if (std::memcmp(&old->base_id, &base, sizeof base) != 0) continue;
+        ++twins;
+        if (!d && old->status == GameInputDeviceNoStatus) d = old;
+    }
+    AppLocalDeviceId id = d ? d->info.deviceId : base;  // a copy: fill_info clears info before it writes the id
     if (!d) {
+        const auto taken = [&s](const AppLocalDeviceId& v) {
+            for (Device* o : s.devices)
+                if (std::memcmp(&o->info.deviceId, &v, sizeof v) == 0) return true;
+            return false;
+        };
+        id_bytes(identity, guid, twins, &id);
+        for (uint32_t n = twins + 1; taken(id); ++n) id_bytes(identity, guid, n, &id);
         d = new Device;
+        d->base_id = base;
         s.devices.push_back(d);
     }
     d->pad = p;
@@ -609,8 +664,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
 
     const Snapshot snap = read_pad(p);
     d->last_snap = snap;
-    if (d->latest) d->latest->Release();
-    d->latest = new Reading(d, snap, ++d->seq, ts);
+    push_reading(d, snap, ts);
     queue_event({CbType::Device, d, nullptr, ts, status, GameInputDeviceNoStatus, false, 0});
     std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s)\n", d->name.c_str(), d->info.vendorId,
                  d->info.productId, player + 1, d->is_dualsense ? ", DualSense trigger effects" : "",
@@ -624,6 +678,9 @@ void close_pad(Device* d, uint64_t ts) {
     SDL_CloseGamepad(d->pad);
     d->pad = nullptr;
     d->player = -1;
+    if (!d->history.empty()) d->evicted_order = d->history.back()->order();  // the history ends with the session
+    for (Reading* r : d->history) r->Release();
+    d->history.clear();
     s.connected.erase(std::remove(s.connected.begin(), s.connected.end(), d), s.connected.end());
     queue_event({CbType::Device, d, nullptr, ts, GameInputDeviceNoStatus, old, false, 0});
     std::fprintf(stderr, "[rt] gameinput: disconnected %s\n", d->name.c_str());
@@ -716,6 +773,157 @@ void refresh_battery(Device* d, uint64_t now) {
     d->battery = b;
 }
 
+// ---- keyboard pad (poll thread only) ----------------------------------------------------------------------------
+//
+// The title reads gamepads, not the keyboard, so keys reach it as one more pad: an SDL virtual gamepad that this
+// code presses buttons on each poll. It then goes through open_pad and read_pad like any controller, so it gets a
+// device object, a player slot, readings, callbacks and UI navigation the same way. It has no motors, so rumble sent
+// to it is dropped. Keys are read with GetAsyncKeyState, which needs no window or message loop and works under Wine.
+// WASD is the left stick, the mouse the right stick, and the right/left mouse buttons the left/right triggers.
+
+constexpr rt::gameinput::KeyBinding kKeyBindings[] = {
+    {VK_UP, SDL_GAMEPAD_BUTTON_DPAD_UP, "Up"},
+    {VK_DOWN, SDL_GAMEPAD_BUTTON_DPAD_DOWN, "Down"},
+    {VK_LEFT, SDL_GAMEPAD_BUTTON_DPAD_LEFT, "Left"},
+    {VK_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "Right"},
+    {VK_RETURN, SDL_GAMEPAD_BUTTON_SOUTH, "Enter"},
+    {VK_BACK, SDL_GAMEPAD_BUTTON_EAST, "Backspace"},
+    {'X', SDL_GAMEPAD_BUTTON_WEST, "X"},
+    {'Y', SDL_GAMEPAD_BUTTON_NORTH, "Y"},
+    {'Q', SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "Q"},
+    {'E', SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "E"},
+    {VK_ESCAPE, SDL_GAMEPAD_BUTTON_START, "Esc"},
+    {VK_TAB, SDL_GAMEPAD_BUTTON_BACK, "Tab"},
+};
+
+// WASD on the left stick: a full press is the edge of the stick; a diagonal sits on the round gate, as a real stick
+// reports it, so each axis is 1/sqrt(2) of full.
+constexpr int kStickFull = 32767;
+constexpr int kStickDiagonal = 23170;  // 32767 / sqrt(2)
+
+// The mouse on the right stick, in SDL axis units per poll (2 ms with the background thread): each poll the stick
+// keeps kMouseDecayNum/kMouseDecayDen of its value and adds kMouseAxisPerPixel for every pixel the cursor moved, then
+// is clamped to full. Steady movement settles at 8 x 1024 units per pixel per poll, so 4 pixels per poll (2000
+// pixels a second) is full deflection; a stopped mouse falls back from full to exactly 0 in 67 polls (134 ms).
+// Integer math rounds toward zero, so the stick always reaches center.
+constexpr int kMouseAxisPerPixel = 1024;
+constexpr int kMouseDecayNum = 7, kMouseDecayDen = 8;
+
+bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+// shortcut: plain cursor deltas stop at the screen edge; capture or recenter the cursor if that matters in game.
+bool system_cursor_pos(int* x, int* y) {
+    POINT p;
+    if (!GetCursorPos(&p)) return false;
+    *x = p.x;
+    *y = p.y;
+    return true;
+}
+
+bool foreground_is_ours() {
+    const HWND w = GetForegroundWindow();
+    DWORD pid = 0;
+    return w && GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId();
+}
+
+std::atomic<rt::gameinput::KeyDownFn> g_key_down{async_key_down};
+std::atomic<rt::gameinput::HasFocusFn> g_has_focus{foreground_is_ours};
+std::atomic<rt::gameinput::CursorPosFn> g_cursor_pos{system_cursor_pos};
+
+struct KeyboardPad {
+    SDL_JoystickID id = 0;
+    SDL_Joystick* js = nullptr;
+    bool failed = false;  // attaching failed once; not retried every 2 ms
+    int right_x = 0, right_y = 0;    // the mouse's right stick, SDL axis units (+Y down)
+    int cursor_x = 0, cursor_y = 0;  // the cursor at the last poll
+    bool have_cursor = false;        // cursor_x/y are valid; false after focus loss, so the first poll moves nothing
+};
+KeyboardPad g_keyboard;
+
+void detach_keyboard_pad() {
+    if (g_keyboard.js) SDL_CloseJoystick(g_keyboard.js);
+    if (g_keyboard.id) SDL_DetachVirtualJoystick(g_keyboard.id);
+    if (g_keyboard.id) std::fprintf(stderr, "[rt] gameinput: keyboard pad removed\n");
+    g_keyboard = {};
+}
+
+bool attach_keyboard_pad() {
+    SDL_VirtualJoystickDesc d;
+    SDL_INIT_INTERFACE(&d);
+    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
+    d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+    d.name = "Keyboard pad (Leonida)";
+    g_keyboard.id = SDL_AttachVirtualJoystick(&d);
+    g_keyboard.js = g_keyboard.id ? SDL_OpenJoystick(g_keyboard.id) : nullptr;
+    if (!g_keyboard.js) {
+        std::fprintf(stderr, "[rt] gameinput: cannot attach the keyboard pad: %s\n", SDL_GetError());
+        detach_keyboard_pad();
+        g_keyboard.failed = true;
+        return false;
+    }
+    std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
+                         "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
+                         "button LT/RT)\n");
+    return true;
+}
+
+// Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
+void update_keyboard_pad() {
+    rt::gameinput::KeyboardPadMode mode;
+    {
+        std::lock_guard lock(g().mu);
+        mode = g().config.keyboard_pad;
+    }
+    if (mode == rt::gameinput::KeyboardPadMode::Off) {
+        if (g_keyboard.id) detach_keyboard_pad();
+        g_keyboard.failed = false;
+        return;
+    }
+    if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad())) return;
+
+    bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
+    int lx = 0, ly = 0;
+    bool aim = false, fire = false;
+    // Out of focus every button, stick and trigger is released, so a key held while switching windows does not stay
+    // pressed, and the cursor is read afresh on return, so moving it in another window does not swing the stick.
+    if (mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()()) {
+        const rt::gameinput::KeyDownFn key_down = g_key_down.load();
+        for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+        lx = key_down('D') - key_down('A');  // opposite keys cancel
+        ly = key_down('S') - key_down('W');  // SDL's +Y is down
+        aim = key_down(VK_RBUTTON);
+        fire = key_down(VK_LBUTTON);
+
+        int x = 0, y = 0;
+        const bool have = g_cursor_pos.load()(&x, &y);
+        const bool moved = have && g_keyboard.have_cursor;
+        auto step = [](int v, int pixels) {
+            const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
+                                static_cast<long long>(pixels) * kMouseAxisPerPixel;
+            return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
+        };
+        g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
+        g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
+        if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
+        g_keyboard.have_cursor = have;
+    } else {
+        g_keyboard.right_x = g_keyboard.right_y = 0;
+        g_keyboard.have_cursor = false;
+    }
+    for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
+    const int reach = lx && ly ? kStickDiagonal : kStickFull;
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTY, static_cast<Sint16>(ly * reach));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTX, static_cast<Sint16>(g_keyboard.right_x));
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHTY, static_cast<Sint16>(g_keyboard.right_y));
+    // SDL maps a full-range virtual axis to the trigger, so -32768 is released, 0 half pulled, 32767 full.
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, aim ? 32767 : -32768);
+    SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, fire ? 32767 : -32768);
+}
+
 bool init_sdl() {
     State& s = g();
     if (s.sdl_ready) return true;
@@ -745,6 +953,7 @@ void poll_once() {
     State& s = g();
     std::lock_guard pl(s.poll_mu);
     if (!init_sdl()) return;
+    update_keyboard_pad();
     SDL_UpdateGamepads();
     const uint64_t now = now_us();
 
@@ -781,9 +990,7 @@ void poll_once() {
         d->last_snap = snap;
         if (changed) {
             std::lock_guard lock(s.mu);
-            if (d->latest) d->latest->Release();
-            d->latest = new Reading(d, snap, ++d->seq, now);
-            queue_event({CbType::Reading, d, d->latest, now, 0, 0, false, 0});
+            queue_event({CbType::Reading, d, push_reading(d, snap, now), now, 0, 0, false, 0});
         }
         if (guide_changed) {
             std::lock_guard lock(s.mu);
@@ -896,6 +1103,42 @@ private:
 
 Device* as_device(IGameInputDevice* d) { return static_cast<Device*>(d); }
 
+// GetNextReading (forward) and GetPreviousReading: the reading right after or right before the reference in the order
+// readings were taken, from the filter device's history or, with no filter, every connected pad's. Readings compare by
+// Reading::order, not timestamp, since pads polled together share one. The horizon is the newest reading dropped from
+// the histories searched (with no filter the reference's pad counts too, even unplugged): a step that would cross it
+// is REFERENCE_READING_TOO_OLD rather than a silent skip.
+HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device, IGameInputReading** out,
+                     bool forward) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!ref) return E_INVALIDARG;
+    if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
+    const Reading* r = static_cast<Reading*>(ref);
+    State& s = g();
+    std::lock_guard lock(s.mu);
+    std::vector<Device*> scope = s.connected;
+    uint64_t horizon = 0;
+    if (device) {
+        if (as_device(device)->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+        scope = {as_device(device)};
+    } else {
+        horizon = r->device()->evicted_order;
+    }
+    for (Device* d : scope) horizon = std::max(horizon, d->evicted_order);
+    if (forward ? horizon > r->order() : horizon >= r->order()) return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
+    Reading* best = nullptr;
+    for (Device* d : scope)
+        for (Reading* c : d->history) {
+            const bool beyond = forward ? c->order() > r->order() : c->order() < r->order() && c->order() > horizon;
+            if (beyond && (!best || (c->order() < best->order()) == forward)) best = c;  // the nearest one
+        }
+    if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
+    best->AddRef();
+    *out = best;
+    return S_OK;
+}
+
 class GameInput final : public IGameInput {
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
@@ -922,10 +1165,10 @@ public:
         if (device) {
             Device* d = as_device(device);
             if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
-            best = d->latest;
+            best = d->latest();
         } else {
             for (Device* d : g().connected)  // the most recent reading from any gamepad
-                if (d->latest && (!best || d->latest->GetTimestamp() >= best->GetTimestamp())) best = d->latest;
+                if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();
@@ -933,27 +1176,13 @@ public:
         return S_OK;
     }
 
-    // No history is kept: the next reading is the current one when it is newer than the reference, and there is no
-    // previous one. A title that walks GetNextReading in a loop sees each poll's state once.
     HRESULT STDMETHODCALLTYPE GetNextReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                              IGameInputReading** out) override {
-        if (!out) return E_POINTER;
-        *out = nullptr;
-        if (!ref) return E_INVALIDARG;
-        Reading* r = static_cast<Reading*>(ref);
-        if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
-        Device* d = device ? as_device(device) : r->device();
-        std::lock_guard lock(g().mu);
-        if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
-        if (!d->latest || d->latest->seq() <= r->seq() || d->latest->device() != r->device()) return GAMEINPUT_E_READING_NOT_FOUND;
-        d->latest->AddRef();
-        *out = d->latest;
-        return S_OK;
+        return find_reading(ref, kind, device, out, true);
     }
-    HRESULT STDMETHODCALLTYPE GetPreviousReading(IGameInputReading*, uint32_t, IGameInputDevice*, IGameInputReading** out) override {
-        if (!out) return E_POINTER;
-        *out = nullptr;
-        return GAMEINPUT_E_READING_NOT_FOUND;
+    HRESULT STDMETHODCALLTYPE GetPreviousReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
+                                                 IGameInputReading** out) override {
+        return find_reading(ref, kind, device, out, false);
     }
     HRESULT STDMETHODCALLTYPE GetTemporalReading(uint64_t, IGameInputDevice*, IGameInputReading** out) override {
         if (!out) return E_POINTER;
@@ -1129,6 +1358,18 @@ bool output_state(int i, OutputState* out) {
     if (i < 0 || i >= static_cast<int>(g().connected.size()) || !out) return false;
     *out = g().connected[static_cast<size_t>(i)]->sent;
     return true;
+}
+
+void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus) {
+    g_key_down = key_down ? key_down : async_key_down;
+    g_has_focus = has_focus ? has_focus : foreground_is_ours;
+}
+
+void set_cursor_source(CursorPosFn cursor_pos) { g_cursor_pos = cursor_pos ? cursor_pos : system_cursor_pos; }
+
+const KeyBinding* keyboard_bindings(int* count) {
+    if (count) *count = static_cast<int>(std::size(kKeyBindings));
+    return kKeyBindings;
 }
 
 }  // namespace rt::gameinput

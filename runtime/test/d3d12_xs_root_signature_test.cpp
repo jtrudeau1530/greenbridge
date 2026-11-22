@@ -202,11 +202,16 @@ void test_version_1_1(SerializeFn serialize, DeserializeFn deserialize, ID3D12De
 }
 
 void test_version_1_2(SerializeFn serialize, DeserializeFn deserialize, ID3D12Device& device) {
-    // Older in-box D3D12 runtimes (e.g. Windows 11 23H2) refuse root signature
-    // 1.2 entirely, so the whole 1.2 path is skipped there.
+    // Older in-box D3D12 runtimes refuse root signature 1.2, so the whole 1.2 path is skipped there.
+    // Windows 11 23H2 answers with a lower HighestVersion; Windows 10 doesn't know 1.2 and fails the
+    // query with E_INVALIDARG instead.
     D3D12_FEATURE_DATA_ROOT_SIGNATURE feature{D3D_ROOT_SIGNATURE_VERSION_1_2};
-    require_success(device.CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &feature, sizeof(feature)),
-                    "query WARP root signature support");
+    const HRESULT query = device.CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &feature, sizeof(feature));
+    if (query == E_INVALIDARG) {
+        std::puts("SKIP root signature 1.2 (runtime does not know version 1.2)");
+        return;
+    }
+    require_success(query, "query WARP root signature support");
     if (feature.HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_2) {
         std::puts("SKIP root signature 1.2 (runtime HighestVersion < 1.2)");
         return;
@@ -277,7 +282,11 @@ int main() {
         ComPtr<IDXGIAdapter> adapter;
         ComPtr<ID3D12Device> device;
         require_success(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "create DXGI factory");
-        require_success(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "enumerate WARP adapter");
+        if (const HRESULT warp = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)); FAILED(warp)) {
+            // Windows always has WARP; Wine doesn't. CTest reads exit code 77 as a skip (SKIP_RETURN_CODE).
+            std::printf("SKIP no WARP adapter (0x%08lX)\n", static_cast<unsigned long>(warp));
+            return 77;
+        }
         require_success(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
                         "create WARP device");
         test_version_1_0(serialize, deserialize, *device.Get());

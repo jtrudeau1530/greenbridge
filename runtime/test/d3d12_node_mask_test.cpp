@@ -1,6 +1,7 @@
-// Compare what ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc report on the Vulkan-backed device
-// with Windows D3D12 (the default adapter and WARP). On a single adapter a node mask of 0 reads back as the one node
-// (1), and a committed resource reports the heap flags the runtime resolves: the caller's, plus the DENY bits of the
+// Compare what ID3D12Resource::GetHeapProperties, ID3D12DescriptorHeap::GetDesc and ID3D12CommandQueue::GetDesc
+// report on the Vulkan-backed device with Windows D3D12 (the default adapter and WARP). On a single adapter a node
+// mask of 0 reads back as the one node (1), and a committed resource reports the heap flags the runtime resolves:
+// the caller's, plus the DENY bits of the
 // resource classes it is not (a buffer 0xC0, a texture without render-target or depth use 0x44, the rest 0x84).
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
@@ -156,11 +157,42 @@ Totals compare_descriptor_heaps(ID3D12Device* ours, ID3D12Device* host, const ch
     }
     return totals;
 }
+
+// Command queues of each type with node mask 0 and 1; GetDesc should read back what the host reports.
+Totals compare_queues(ID3D12Device* ours, ID3D12Device* host, const char* host_name) {
+    Totals totals;
+    for (const auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY})
+        for (const UINT mask : {0u, 1u}) {
+            const D3D12_COMMAND_QUEUE_DESC desc{type, D3D12_COMMAND_QUEUE_PRIORITY_NORMAL,
+                                                D3D12_COMMAND_QUEUE_FLAG_NONE, mask};
+            Ref<ID3D12CommandQueue> expected, actual;
+            if (FAILED(host->CreateCommandQueue(&desc, IID_PPV_ARGS(&expected.p))) || !expected.p) {
+                ++totals.host_refused;
+                continue;
+            }
+            if (FAILED(ours->CreateCommandQueue(&desc, IID_PPV_ARGS(&actual.p))) || !actual.p) {
+                std::fprintf(stderr, "queue type %d, mask %u: not created by the layer\n", int(type), mask);
+                ++totals.ours_refused;
+                continue;
+            }
+            const D3D12_COMMAND_QUEUE_DESC a = actual->GetDesc(), e = expected->GetDesc();
+            if (a.Type == e.Type && a.Priority == e.Priority && a.Flags == e.Flags && a.NodeMask == e.NodeMask) {
+                ++totals.matched;
+                continue;
+            }
+            ++totals.mismatched;
+            std::fprintf(stderr, "queue type %d, mask %u: GetDesc differs from %s (ours node mask %u, host %u)\n",
+                         int(type), mask, host_name, a.NodeMask, e.NodeMask);
+        }
+    return totals;
+}
 }  // namespace
 
 int main() {
     vktest::Device vk;
-    if (!vk.create()) return 1;
+    const auto device_status = vk.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     unsigned matched = 0, mismatched = 0, references = 0;
     {
         Ref<ID3D12Device> ours;
@@ -224,6 +256,7 @@ int main() {
             const char* name = warp ? "WARP" : "the default adapter";
             const Totals heap_totals = compare_heaps(ours.p, host.p, name, heaps);
             const Totals desc_totals = compare_descriptor_heaps(ours.p, host.p, name, descriptors);
+            const Totals queue_totals = compare_queues(ours.p, host.p, name);
             std::printf("heap properties against %s: %u of %zu match, %u differ, %u refused by the host, %u not "
                         "created by the layer\n",
                         name, heap_totals.matched, heaps.size(), heap_totals.mismatched, heap_totals.host_refused,
@@ -232,8 +265,12 @@ int main() {
                         "%u not created by the layer\n",
                         name, desc_totals.matched, descriptors.size(), desc_totals.mismatched, desc_totals.host_refused,
                         desc_totals.ours_refused);
-            matched += heap_totals.matched + desc_totals.matched;
-            mismatched += heap_totals.mismatched + desc_totals.mismatched;
+            std::printf("command queue GetDesc against %s: %u of 6 match, %u differ, %u refused by the host, %u "
+                        "not created by the layer\n",
+                        name, queue_totals.matched, queue_totals.mismatched, queue_totals.host_refused,
+                        queue_totals.ours_refused);
+            matched += heap_totals.matched + desc_totals.matched + queue_totals.matched;
+            mismatched += heap_totals.mismatched + desc_totals.mismatched + queue_totals.mismatched;
             ++references;
         }
     }

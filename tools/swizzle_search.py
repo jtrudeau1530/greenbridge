@@ -98,8 +98,28 @@ def main():
     ap.add_argument("--tiles", type=int, default=48)
     ap.add_argument("--out")
     a = ap.parse_args()
-    data = open(a.blob, "rb").read()
-    res = search(data, a.bpe, a.tile, [int(w) for w in a.widths.split(",")], a.tiles)
+    if a.bpe < 1:
+        ap.error("--bpe must be at least 1")
+    if a.tile < a.bpe or a.tile % a.bpe:
+        ap.error("--tile must be a multiple of --bpe and at least --bpe")
+    blocks = a.tile // a.bpe
+    if blocks & (blocks - 1):
+        ap.error("--tile / --bpe must be a power of two")
+    try:
+        widths = [int(w) for w in a.widths.split(",")]
+    except ValueError:
+        ap.error("--widths must be a comma-separated list of integers")
+    if not widths or any(w < 4 or w % 4 for w in widths):
+        ap.error("--widths must be positive multiples of 4")
+    if a.tiles < 1:
+        ap.error("--tiles must be at least 1")
+    try:
+        with open(a.blob, "rb") as f:
+            data = f.read()
+    except OSError as e:  # a missing or unreadable input: one ERROR line, as the other tools do
+        print(f"ERROR: cannot read {a.blob}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    res = search(data, a.bpe, a.tile, widths, a.tiles)
     for s, w, seq in res[:8]:
         print(f"score {s:7.2f}  width {w:5}  bits(low->high) {seq}")
     if a.out:

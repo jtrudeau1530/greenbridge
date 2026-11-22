@@ -29,11 +29,12 @@ class DefaultStagesTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_main(self, os_name, *args):
+    def run_main(self, os_name, *args, lacking=("clang-cl",)):
         argv = ["make_game.py", "--game", self.game, "--out", os.path.join(self.tmp.name, "out"), *args]
         mocks = {n: mock.MagicMock() for n in STAGE_FUNCS}
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch.object(make_game.os, "name", os_name), \
+                mock.patch.object(make_game, "cross_build_missing", return_value=list(lacking)), \
                 mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch.object(make_game, "preflight") as preflight, \
@@ -42,10 +43,15 @@ class DefaultStagesTest(unittest.TestCase):
             self.assertEqual(make_game.main(), 0)
         return preflight.call_args.args[0], {n: m.called for n, m in mocks.items()}
 
-    def test_default_stages_leave_runtime_out_off_windows(self):
+    def test_default_stages_leave_runtime_out_off_windows_without_the_cross_build(self):
         stages, ran = self.run_main("posix")
         self.assertEqual(stages, ["check", "shaders", "assets", "pipelines"])
         self.assertEqual(ran, {"shaders": True, "assets": True, "runtime": False, "pipelines": True})
+
+    def test_default_stages_keep_runtime_off_windows_with_the_cross_build(self):
+        stages, ran = self.run_main("posix", lacking=())
+        self.assertEqual(stages, make_game.STAGES)
+        self.assertTrue(ran["runtime"])
 
     def test_default_stages_keep_runtime_on_windows(self):
         stages, ran = self.run_main("nt")
@@ -67,27 +73,87 @@ class DefaultStagesTest(unittest.TestCase):
 
 
 class PreflightTest(unittest.TestCase):
-    def test_runtime_asked_for_off_windows_fails_before_any_work(self):
+    def preflight(self, lacking, work):
+        with mock.patch.object(make_game.os, "name", "posix"), \
+                mock.patch.object(make_game.sys, "version_info", (3, 12, 0)), \
+                mock.patch.object(make_game, "cross_build_missing", return_value=lacking), \
+                mock.patch.object(make_game, "cross_configure") as configure, \
+                mock.patch.object(make_game, "visual_cpp_tools_ok") as vs:
+            make_game.preflight(["runtime"], work)
+        vs.assert_not_called()
+        return configure
+
+    def test_runtime_off_windows_without_the_cross_build_fails_before_any_work(self):
         err = io.StringIO()
         with tempfile.TemporaryDirectory() as work, \
-                mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch("sys.stderr", err), \
                 mock.patch.object(make_game.shutil, "disk_usage") as usage:
             with self.assertRaises(SystemExit) as ctx:
-                make_game.preflight(["shaders", "runtime"], os.path.join(work, "w"))
+                self.preflight(["clang-cl", "the xwin SDK"], os.path.join(work, "w"))
         self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("runtime stage builds on Windows only", err.getvalue())
+        self.assertIn("clang-cl (for the runtime stage, or pass --runtime-build)", err.getvalue())
+        self.assertIn("the xwin SDK (for the runtime stage", err.getvalue())
         usage.assert_not_called()
         self.assertFalse(os.path.exists(os.path.join(work, "w")))
 
+    def test_runtime_off_windows_configures_the_cross_build_before_any_work(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.preflight([], os.path.join(work, "w")).assert_called_once_with()
+
+
+class CrossBuildMissingTest(unittest.TestCase):
+    def setUp(self):
+        self.sdk = self.enterContext(tempfile.TemporaryDirectory())
+        os.makedirs(os.path.join(self.sdk, "VC", "Tools", "MSVC"))
+        os.makedirs(os.path.join(self.sdk, "Windows Kits", "10", "Lib", "10.0.26100", "um", "x64"))
+
+    def missing(self, have=("cmake", *make_game.CROSS_TOOLS), major=23, sdk=None):
+        with mock.patch.object(make_game.shutil, "which", side_effect=lambda t: f"/usr/bin/{t}" if t in have else None), \
+                mock.patch.object(make_game, "clang_cl_major", return_value=major), \
+                mock.patch.dict(os.environ, {"XWIN_DIR": sdk if sdk is not None else self.sdk}):
+            return make_game.cross_build_missing()
+
+    def test_everything_there(self):
+        self.assertEqual(self.missing(), [])
+
+    def test_missing_llvm_tools_are_named_together(self):
+        (item,) = self.missing(have=("cmake", "clang-cl", "llvm-lib", "llvm-rc", "llvm-mt"))
+        self.assertTrue(item.startswith("lld-link: LLVM 19 or newer"))
+        (item,) = self.missing(have=("cmake",))
+        self.assertTrue(item.startswith(", ".join(make_game.CROSS_TOOLS) + ":"))
+
+    def test_clang_older_than_19_is_refused(self):
+        (item,) = self.missing(major=18)
+        self.assertIn("this one is 18", item)
+        self.assertEqual(self.missing(major=None), [])
+
+    def test_cmake_and_the_sdk(self):
+        missing = self.missing(have=make_game.CROSS_TOOLS, sdk=os.path.join(self.sdk, "nothing"))
+        self.assertEqual(len(missing), 2)
+        self.assertEqual(missing[0], "CMake 3.24 or newer")
+        self.assertIn("xwin", missing[1])
+
+    def test_xwin_dir_defaults_to_the_documented_folder(self):
+        home = self.enterContext(tempfile.TemporaryDirectory())
+        env = {k: v for k, v in os.environ.items() if k != "XWIN_DIR"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(make_game.os.path, "expanduser", side_effect=lambda p: p.replace("~", home, 1)):
+            self.assertIsNone(make_game.xwin_dir())
+            sdk = os.path.join(home, ".local", "share", "xwin-sdk")
+            os.makedirs(os.path.join(sdk, "VC", "Tools", "MSVC"))
+            self.assertIsNone(make_game.xwin_dir())
+            os.makedirs(os.path.join(sdk, "Windows Kits", "10", "Lib", "10.0.26100", "um", "x64"))
+            self.assertEqual(make_game.xwin_dir(), sdk)
+
 
 class RuntimeBuildPreflightTest(unittest.TestCase):
-    def preflight(self, build, files):
+    def preflight(self, build, files, err=None):
         for name in files:
             open(os.path.join(build, name), "wb").close()
-        err = io.StringIO()
+        err = io.StringIO() if err is None else err
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch("sys.stderr", err), \
+                mock.patch.object(make_game.sys, "version_info", (3, 12, 0)), \
                 mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=False) as vs:
             make_game.preflight(["runtime"], os.path.join(build, "w"), runtime_build=build)
         vs.assert_not_called()
@@ -98,9 +164,12 @@ class RuntimeBuildPreflightTest(unittest.TestCase):
             self.preflight(build, make_game.RUNTIME_FILES)
 
     def test_runtime_build_without_the_tls_host_fails_before_any_work(self):
+        err = io.StringIO()
         with tempfile.TemporaryDirectory() as build:
-            with self.assertRaises(SystemExit):
-                self.preflight(build, ["gta6rt.exe"])
+            with self.assertRaises(SystemExit) as ctx:
+                self.preflight(build, ["gta6rt.exe"], err=err)
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("gta6rt_tls_host.dll", err.getvalue())
             self.assertFalse(os.path.exists(os.path.join(build, "w")))
 
 
@@ -144,6 +213,65 @@ class RuntimePackagingTest(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("gta6rt_tls_host.dll", err.getvalue())
+        self.assertFalse(os.path.exists(self.out))
+
+
+class CrossBuildTest(unittest.TestCase):
+    def setUp(self):
+        self.root = self.enterContext(tempfile.TemporaryDirectory())
+        self.build = os.path.join(self.root, "runtime", "build", "windows")
+        self.game = os.path.join(self.root, "game")
+        self.out = os.path.join(self.root, "out")
+        os.makedirs(self.game)
+
+    def runtime(self, xwin="/sdk", ninja=True):
+        def fake_run(args, hint="", **kw):
+            if args[1] == "--build":
+                os.makedirs(self.build, exist_ok=True)
+                for name in make_game.RUNTIME_FILES:
+                    with open(os.path.join(self.build, name), "wb") as f:
+                        f.write(name.encode())
+        with mock.patch.object(make_game.os, "name", "posix"), \
+                mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.object(make_game, "xwin_dir", return_value=xwin), \
+                mock.patch.object(make_game.shutil, "which", side_effect=lambda t: "/usr/bin/ninja" if ninja else None), \
+                mock.patch.object(make_game, "run", side_effect=fake_run) as self.run_mock, \
+                mock.patch.object(make_game, "log"):
+            make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, None, 4)
+        return [c.args[0] for c in self.run_mock.call_args_list]
+
+    def test_cross_builds_the_loader_and_packages_it_for_wine(self):
+        configure, build = self.runtime()
+        toolchain = os.path.join(self.root, "runtime", "cmake", "clang-cl-xwin.cmake")
+        self.assertEqual(configure, ["cmake", "-S", os.path.join(self.root, "runtime"), "-B", self.build,
+                                     "-G", "Ninja", "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                                     "--toolchain", toolchain, "-DXWIN_DIR=/sdk"])
+        self.assertEqual(build, ["cmake", "--build", self.build, "--parallel", "4",
+                                 "--target", "gta6rt", "gta6rt_tls_host"])
+        for name in make_game.RUNTIME_FILES:
+            with open(os.path.join(self.out, name), "rb") as f:
+                self.assertEqual(f.read(), name.encode())
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "gta6rt.sh")))
+
+    def test_without_ninja_cmake_picks_the_generator(self):
+        configure, _ = self.runtime(ninja=False)
+        self.assertNotIn("-G", configure)
+        self.assertIn("-DCMAKE_BUILD_TYPE=RelWithDebInfo", configure)
+
+    def test_an_existing_build_folder_keeps_its_generator_and_build_type(self):
+        os.makedirs(self.build)
+        open(os.path.join(self.build, "CMakeCache.txt"), "w").close()
+        configure, _ = self.runtime()
+        self.assertNotIn("-G", configure)
+        self.assertFalse(any(a.startswith("-DCMAKE_BUILD_TYPE") for a in configure))
+        self.assertIn("-DXWIN_DIR=/sdk", configure)
+
+    def test_without_an_sdk_nothing_runs(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err), self.assertRaises(SystemExit):
+            self.runtime(xwin=None)
+        self.run_mock.assert_not_called()
+        self.assertIn("xwin", err.getvalue())
         self.assertFalse(os.path.exists(self.out))
 
 

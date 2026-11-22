@@ -1,14 +1,19 @@
 """Resolve LLVM_MC to an argv list.
 
-LLVM_MC may be one executable (a path, spaces and all) or a whole command line. Windows needs the command-line
-form when llvm-mc runs inside WSL, because the official Windows LLVM build has no AMDGPU target:
+LLVM_MC may be one executable (a path, spaces and all, with or without its .exe) or a whole command line. Windows
+needs the command-line form when llvm-mc runs inside WSL, because the official Windows LLVM build has no AMDGPU
+target:
 
     set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
+
+run() starts such a command and turns a missing llvm-mc into one line instead of a FileNotFoundError traceback.
 """
 from __future__ import annotations
 
 import os
 import shlex
+import shutil
+import subprocess
 
 
 def split_command(raw: str) -> list:
@@ -18,9 +23,19 @@ def split_command(raw: str) -> list:
         return []
     if os.path.isfile(raw):
         return [raw]                    # a plain path, spaces and all
-    if os.name != "nt":
-        return shlex.split(raw)
-    parts = shlex.split(raw, posix=False)
+    if ("/" in raw or "\\" in raw) and shutil.which(raw):
+        # A path whose extension is left out (C:\Program Files\LLVM\bin\llvm-mc): Windows finds llvm-mc.exe
+        # for it, but it is no file under that exact name, so it used to be split at its spaces.
+        return [raw]
+    try:
+        if os.name != "nt":
+            parts = shlex.split(raw)
+        else:
+            parts = shlex.split(raw, posix=False)
+    except ValueError as e:
+        # shader_disasm.py calls mc_command() at import time: a bad LLVM_MC must give one clear line,
+        # not a ValueError traceback before any tool's own argument parsing runs.
+        raise SystemExit(f"LLVM_MC: invalid command line {raw!r}: {e}") from None
     return [p[1:-1] if len(p) > 1 and p[0] == p[-1] == '"' else p for p in parts]
 
 
@@ -29,3 +44,18 @@ def mc_command(raw: str | None = None) -> list:
     if raw is None:
         raw = os.environ.get("LLVM_MC", "llvm-mc")
     return split_command(raw) or ["llvm-mc"]
+
+
+def not_found(exe: str, error: OSError) -> str:
+    """The message for an llvm-mc that can't be started (shader_disasm.py's wording)."""
+    return (f"'{exe}' could not be started: {error}. Put llvm-mc on PATH or set LLVM_MC (or --llvm-mc) to it\n"
+            f"(on Windows, scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
+            f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+
+
+def run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
+    """subprocess.run for an llvm-mc command line; one that can't be started ends the tool with not_found()."""
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except OSError as e:
+        raise SystemExit(not_found(cmd[0], e)) from None

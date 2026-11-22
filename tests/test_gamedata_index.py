@@ -67,6 +67,20 @@ class GamedataIndexTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, target, *args], cwd=self.root,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
 
+    def test_rejects_a_shared_csv_and_json_destination(self):
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("existing report")
+        alias = os.path.join(self.root, ".", "index.json")
+
+        result = self.run_tool(self.carve, "--csv", out, "--json", alias)
+
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "existing report")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--csv and --json must use different paths", result.stderr)
+
     def test_bad_targets_are_one_line(self):
         empty = os.path.join(self.root, "empty.rpf")
         open(empty, "wb").close()

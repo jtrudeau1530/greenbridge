@@ -47,6 +47,11 @@ std::string read_string(const std::string& name, uint8_t* base, uint32_t image_s
     return {s, end};
 }
 
+// PE/COFF: NumberOfRvaAndSizes counts the data directories; entries past it are not directories, whatever they hold.
+IMAGE_DATA_DIRECTORY directory(const IMAGE_NT_HEADERS64* nt, unsigned index) {
+    return index < nt->OptionalHeader.NumberOfRvaAndSizes ? nt->OptionalHeader.DataDirectory[index] : IMAGE_DATA_DIRECTORY{};
+}
+
 // The TLS directory holds virtual addresses, which relocations have already moved to this mapping.
 uint64_t rva_in(const Module& m, uint64_t va, const char* what) {
     const uint64_t base = reinterpret_cast<uint64_t>(m.base);
@@ -77,9 +82,20 @@ struct TlsHostModule {
 
 TlsHostModule load_tls_host() {
     TlsHostModule host;
-    wchar_t exe[MAX_PATH] = {};
-    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return host;
-    const std::filesystem::path path = std::filesystem::path(exe).parent_path() / L"gta6rt_tls_host.dll";
+    // Dynamic buffer loop for paths that exceed MAX_PATH
+    std::wstring exe_path;
+    DWORD size = MAX_PATH;
+    while (true) {
+        exe_path.resize(size);
+        DWORD len = GetModuleFileNameW(nullptr, exe_path.data(), size);
+        if (len == 0) return host;
+        if (len < size - 1) {
+            exe_path.resize(len);
+            break;
+        }
+        size *= 2;
+    }
+    const std::filesystem::path path = std::filesystem::path(exe_path).parent_path() / L"gta6rt_tls_host.dll";
     // The helper is linked with the static CRT (/MT), so it needs only system DLLs. Restricting the dependency search
     // to System32 keeps a game-supplied vcruntime next to the executable from being picked up.
     host.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -150,6 +166,26 @@ Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) 
 }
 
 Loader::~Loader() {
+    // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
+    // block alive throughout the notifications: a detach handler can still call an imported function or free an
+    // FLS slot whose destructor lives in another mapped image.
+    for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
+        Module& m = **it;
+        if (!m.initialised) continue;  // a map-only load never opts in to running image code
+        m.initialised = false;
+        try {
+            run_tls_callbacks(m, DLL_PROCESS_DETACH);
+        } catch (const std::exception& e) {
+            // A module may have changed its callback table since attach. A destructor cannot propagate the validation
+            // error; report it and still let DllMain release resources before the image is freed.
+            std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
+        }
+        auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+        if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+            auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
+            entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
+        }
+    }
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
         // TLS state must go away before the image and its TLS block are unmapped.
@@ -190,8 +226,7 @@ Module& Loader::load(const std::filesystem::path& image) {
 // allowed. No entry in that set uses the indirect form (UnwindData bit 0).
 void Loader::register_unwind(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXCEPTION) return;
-    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     // Like the system loader, a trailing partial entry is ignored.
     const uint32_t count = dir.Size / sizeof(RUNTIME_FUNCTION);
     if (!count) return;
@@ -276,7 +311,7 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     m->base = static_cast<uint8_t*>(
         VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!m->base) {
-        auto& relocs = oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
         if (!relocs.Size)
             throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
         m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -297,7 +332,7 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
     if (delta) {
         m->relocated = true;
-        auto& dir = oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
         if (!dir.Size) throw std::runtime_error(m->name + ": the image has no relocations and isn't at its base");
         require_range(m->name, dir.VirtualAddress, dir.Size, m->size, "the relocation table");
         auto* block = at<IMAGE_BASE_RELOCATION>(m->base, dir.VirtualAddress);
@@ -455,7 +490,7 @@ void Loader::run_tls_callbacks(Module& m, uint32_t reason) {
 
 void Loader::parse_exports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
     if (!dir.Size) return;
     require_range(m.name, dir.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY), m.size, "the export directory");
     auto* ed = at<IMAGE_EXPORT_DIRECTORY>(m.base, dir.VirtualAddress);
@@ -509,8 +544,9 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     uint32_t ordinal = 0;
     if (by_ordinal) {
         for (size_t i = 1; i < symbol.size(); ++i) {
-            if (symbol[i] < '0' || symbol[i] > '9' || ordinal > 0xFFFF) return nullptr;
+            if (symbol[i] < '0' || symbol[i] > '9') return nullptr;
             ordinal = ordinal * 10 + static_cast<uint32_t>(symbol[i] - '0');
+            if (ordinal > 0xFFFF) return nullptr;  // checked after the digit, so "#65537" can't truncate to 1
         }
     }
 
@@ -595,7 +631,7 @@ void Loader::bind_imports(Module& m) {
         }
     };
 
-    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_IMPORT);
     if (dir.Size) {
         for (uint64_t i = 0;; ++i) {
             uint64_t rva = dir.VirtualAddress + i * sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -608,7 +644,7 @@ void Loader::bind_imports(Module& m) {
         }
     }
     // Delay imports are bound eagerly: simpler, and the full import surface shows up in --dry-run.
-    auto& ddir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    const auto ddir = directory(nt, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT);
     if (ddir.Size) {
         for (uint64_t i = 0;; ++i) {
             uint64_t rva = ddir.VirtualAddress + i * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);

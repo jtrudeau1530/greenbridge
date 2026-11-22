@@ -453,6 +453,15 @@ class TestCommandLineEndToEnd(unittest.TestCase):
             {"name": "vs_002", "stage": "vs", "instructions": 3, "vgpr_count": 4, "sgpr_count": 0},
         ])
 
+    def test_cli_ignores_directories_with_shader_suffix(self):
+        self.write("cs_main", "\ts_endpgm\n")
+        os.mkdir(os.path.join(self.disasm_dir, "cs_cache.s"))
+
+        _, data = self.run_profile(["--per-shader"])
+
+        self.assertEqual(data["shaders"], 1)
+        self.assertEqual([shader["name"] for shader in data["per_shader"]], ["cs_main"])
+
     def test_cli_warning_words_from_llvm_messages(self):
         a = echo("070080bf feffffff ffffffd7 050080bf feffffff 000081bf")
         b = echo("090080bf ffffffd7 000081bf")

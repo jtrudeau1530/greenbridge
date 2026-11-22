@@ -46,10 +46,10 @@ BASE_FIELDS = [
 PROBE_FIELDS = ["decodes", "codec", "probe_duration_s"]
 
 
-def _audio_layout(data, base, count):
+def _audio_layout(data, base, count, end):
     """Decode one candidate audio layout, or return None if it is not plausible."""
     need = base + 12 * count
-    if need > len(data):
+    if need > end:
         return None
     rates, flags = [], []
     for i in range(count):
@@ -93,7 +93,7 @@ def parse_header(data, offset):
         # layout first, then the other, and accept only plausible descriptors.
         bases = [offset + 0x30, offset + 0x2C] if revision in "ijkn" else [offset + 0x2C]
         for base in bases:
-            got = _audio_layout(data, base, audio)
+            got = _audio_layout(data, base, audio, offset + stored)
             if got:
                 rates, flags = got
                 break
@@ -135,7 +135,7 @@ def scan_file(path, source):
     """Index every Bink 2 stream in one file. Returns (rows, stats)."""
     rows = []
     size = os.path.getsize(path)
-    if size < HDR:
+    if size == 0:
         return rows, {"files_scanned": 1, "streams": 0, "bytes": 0, "zero_padding": 0,
                       "unread_bytes": 0, "span": 0}
     with open(path, "rb") as fh:
@@ -306,10 +306,14 @@ def main(argv=None):
 
     fmt = a.format or ("json" if a.out and a.out.lower().endswith(".json") else "csv")
     if a.out:
-        if fmt == "json":
-            write_json(a.out, a.target, rows, summary, probe)
-        else:
-            write_csv(a.out, rows, probe)
+        try:
+            if fmt == "json":
+                write_json(a.out, a.target, rows, summary, probe)
+            else:
+                write_csv(a.out, rows, probe)
+        except OSError as error:
+            print(f"bink_index: error: cannot write {a.out}: {error}", file=sys.stderr)
+            return 2
         print(f"{len(rows)} Bink 2 streams, {summary['bytes']} bytes, "
               f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding")
     else:

@@ -375,7 +375,7 @@ class TestMainBadSource(unittest.TestCase):
     def test_unlistable_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = io.StringIO()
-            with mock.patch.object(fssm_unpack.os, "listdir", side_effect=PermissionError(13, "Permission denied")), \
+            with mock.patch.object(fssm_unpack.os, "scandir", side_effect=PermissionError(13, "Permission denied")), \
                     mock.patch.object(sys, "stderr", out):
                 self.assertEqual(fssm_unpack.main([tmp]), 2)
             self.assertIn("cannot list", out.getvalue())
@@ -390,6 +390,33 @@ class TestMainDirectoryProcessing(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_main_rejects_invalid_fssm_magic(self):
+        bad_payload = b"JUNK\x01\x01" + bytes(58)
+        bad_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(bad_payload)}))])
+        bad_path = os.path.join(self.src, "bad.dxbc")
+        with open(bad_path, "wb") as f:
+            f.write(bad_dxbc)
+
+        cmd = [sys.executable, "-I", TOOL, self.src]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("'ValueError': 1", res.stdout)
+        self.assertIn("no shader in", res.stderr)
+        fssm_dir = os.path.join(self.src, "fssm")
+        self.assertEqual(os.listdir(fssm_dir) if os.path.isdir(fssm_dir) else [], [])
+        self.assertFalse(os.path.exists(os.path.join(self.src, "fssm_index.json")))
+
+        good_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        with open(os.path.join(self.src, "good.dxbc"), "wb") as f:
+            f.write(good_dxbc)
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("'ValueError': 1", res.stdout)
+        self.assertEqual(os.listdir(fssm_dir), ["good.fssm"])
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["good"])
 
     def test_main_cli_processing_and_index_generation(self):
         fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
@@ -416,6 +443,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write(dxbc_short_fssm)
         with open(os.path.join(self.src, "ignored.txt"), "w") as f:
             f.write("not a dxbc container")
+        os.mkdir(os.path.join(self.src, "cache.dxbc"))
 
         res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)

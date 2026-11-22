@@ -8,6 +8,10 @@ namespace rt::gameinput {
 // How the impulse-trigger motors (GameInputRumbleParams::leftTrigger/rightTrigger) reach a DualSense.
 enum class DsTriggerMode { Off, Rumble, Resistance };
 
+// The keyboard pad: one extra virtual gamepad driven by the keyboard. Focused reads keys only while a window of this
+// process is in the foreground; Always reads them whatever has focus (console tools such as gameinput_probe).
+enum class KeyboardPadMode { Off, Focused, Always };
+
 struct Config {
     DsTriggerMode ds_triggers = DsTriggerMode::Rumble;  // LEONIDA_DS_TRIGGERS=off|rumble|resistance
     float ds_trigger_gain = 1.0f;                       // LEONIDA_DS_TRIGGER_GAIN, 0..4, scales the effect strength
@@ -16,6 +20,7 @@ struct Config {
     uint8_t lightbar[3] = {0, 0, 0};                    //   player colour
     bool rumble = true;                                 // LEONIDA_RUMBLE=0 turns all rumble off
     bool background_thread = true;                      // LEONIDA_GAMEINPUT_THREAD=0: poll only from poll()
+    KeyboardPadMode keyboard_pad = KeyboardPadMode::Off;  // LEONIDA_KEYBOARD_PAD=1|focus|always|off
 };
 
 // The configuration in use. Read from the environment on the first GameInputCreate.
@@ -41,5 +46,25 @@ struct OutputState {
     bool trigger_rumble = false;          // the pad takes SDL_RumbleGamepadTriggers
 };
 bool output_state(int i, OutputState* out);
+
+// Where the keyboard pad reads keys from. Test seam: key_down(virtual_key) replaces GetAsyncKeyState, has_focus
+// replaces the foreground-window check of KeyboardPadMode::Focused. nullptr restores the default for either.
+using KeyDownFn = bool (*)(int virtual_key);
+using HasFocusFn = bool (*)();
+void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus);
+
+// Where the keyboard pad reads the mouse cursor from (screen pixels; false when it cannot be read). Test seam:
+// replaces GetCursorPos. nullptr restores the default.
+using CursorPosFn = bool (*)(int* x, int* y);
+void set_cursor_source(CursorPosFn cursor_pos);
+
+// One row of the keyboard pad's key map: a Windows virtual-key code and the SDL gamepad button it presses.
+struct KeyBinding {
+    int virtual_key;
+    int sdl_button;  // SDL_GamepadButton
+    const char* key_name;
+};
+// The fixed key map (docs/gameinput.md lists it). `count` receives the number of rows.
+const KeyBinding* keyboard_bindings(int* count);
 
 }  // namespace rt::gameinput

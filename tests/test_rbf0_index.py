@@ -224,6 +224,20 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(records[0]["chunks"], 1)
         self.assertEqual(summary["streams"], 2)
 
+    def test_directory_skips_the_carvers_index_and_reports(self):
+        """rpf9_carve.py writes index.json next to the streams; it and a report are not payloads."""
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        with open(os.path.join(self.root, "00000001.bin"), "wb") as f:
+            f.write(b"PSIN" + bytes(60))
+        with open(os.path.join(self.root, "index.json"), "w", encoding="utf-8") as f:
+            f.write('[{"off": 0, "stored": 16}]')
+        with open(os.path.join(self.root, "report.csv"), "w", encoding="utf-8") as f:
+            f.write("offset,size\n")
+        rows, records, summary = rbf0_index.scan_dir(self.root)
+        self.assertEqual(summary["streams"], 2)
+        self.assertEqual(sorted(r["offset"] for r in rows), [0, 1])
+
 
 class ArgumentTest(unittest.TestCase):
     """Out-of-range scan arguments are refused before anything is written."""
@@ -250,9 +264,37 @@ class ArgumentTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_directory_rejects_archive_ranges(self):
+        out = os.path.join(self.root, "index.json")
+        for flag in ("--start", "--limit"):
+            with self.subTest(flag=flag):
+                result = self.run_tool(self.root, out, flag, "1")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("apply to a single archive", result.stderr)
+                self.assertFalse(os.path.exists(out))
+
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args, "--quiet"],
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def test_negative_string_count_fails_before_an_index_is_written(self):
+        carve = os.path.join(self.root, "carve")
+        os.mkdir(carve)
+        blob = WIDE + _open(0, b"TestRoot")
+        blob += _value(1, 0x60, _name(b"a"), b"label")
+        blob += _value(1, 0x60, _name(b"b"))
+        blob += _value(1, 0x60, _name(b"c"))
+        blob += b"\xff\xff"
+        with open(os.path.join(carve, "00000000.bin"), "wb") as f:
+            f.write(blob)
+        out = os.path.join(self.root, "out.json")
+
+        p = self.run_tool(carve, out, "--strings", "-1")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("--strings", p.stderr)
+        self.assertIn("must be 0 or more", p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertFalse(os.path.exists(out))
 
     def test_missing_source_is_an_error_not_a_traceback(self):
         out = os.path.join(self.root, "missing.json")
