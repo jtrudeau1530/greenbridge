@@ -269,7 +269,8 @@ library on the 8 samples whose geometry is identified (0 differing bytes; 384 to
   min down and max up; a bound past the half range becomes `+-inf` (`0x7c00`/`0xfc00`), not `+-65504`.
 * *Leaf frame.* Leaf vertices are `(R * v - t) * s`, from `compressionParams`: bit 31 enables a per-axis scale
   `2^(e - 127)` with `e` the bytes 0, 1 and 2; bit 30 enables a translation per axis, the centre of `sceneBounds`
-  where the bounds do not straddle zero; bits 24-29 select an axis-aligned rotation (0 on every sample).
+  where the bounds do not straddle zero; bits 24-29 select one of 64 rotations, `Rz * Ry * Rx` in steps of pi/8
+  about each axis (index 0, the identity, on every sample).
 
 **The instance transform.** The 3x4 at descriptor `+0x50` is applied to the geometry, `x' = M * x`, before the BLAS
 is built. The samples carry the identity or an axis-aligned 90-degree rotation. Without it, most leaves of the
