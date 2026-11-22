@@ -51,6 +51,9 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
 2. **Import table.** Each DLL is marked `bundled` (in the game folder), `system` (present on this Windows), or
    `shim` (needs a reimplementation). The `shim` list is the real to-do list.
 3. **.pdata function count.** This gives function boundaries for patching and later analysis.
+4. **GDK runtime classes.** The exe imports no GDK function by name; `<exe>.gdk_calls.txt` lists the runtime classes
+   and vtable slots it calls through `xgameruntime.lib`'s thunks, and the classes `runtime/shims/xgameruntime.cpp`
+   doesn't serve yet ([runtime_imports.md](runtime_imports.md#measuring-which-runtime-classes-a-binary-calls)).
 
 Then `runtime\build\gta6rt.exe --dry-run <exe>` maps the image and binds every import to the shim table without
 running any game code. It reports what it couldn't bind.
