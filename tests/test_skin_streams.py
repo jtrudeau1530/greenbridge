@@ -313,6 +313,14 @@ class TestScanArchive(unittest.TestCase):
         stats = self.run_scan(system, gfx, extra=zlib.compress(system, 9))
         self.assertEqual(stats["resources"], 1)   # only the aligned copy counts
 
+    def test_empty_archive_is_zero_resources_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "empty.rpf")
+            open(path, "wb").close()
+            stats = ss.scan_archive(path, 64, lambda _text: None)
+            self.assertEqual((stats["resources"], stats["meshes"], stats["candidates"]), (0, 0, 0))
+            self.assertEqual(ss.main([path]), 0)
+
     def test_rigid_scan(self):
         system, gfx, _mesh = rigid_mesh(sixteen=True)
         stats = self.run_scan(system, gfx)

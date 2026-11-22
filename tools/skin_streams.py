@@ -372,6 +372,8 @@ def scan_archive(path, sample, log):
     stats = {"candidates": 0, "resources": 0, "skipped": 0, "meshes": 0, "vertices": 0,
              "unclassified": 0, "layouts": {}, "signatures": {}, "validated": {}}
     size = os.path.getsize(path)
+    if size == 0:
+        return stats    # mmap refuses an empty file; an empty archive has no resources to count
     t0 = time.time()
     with open(path, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
