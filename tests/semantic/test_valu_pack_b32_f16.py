@@ -375,6 +375,65 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class PackStatusFlags:
+    """Architectural condition codes and status flags for packed 16-bit float channels."""
+    ch0_zero: bool
+    ch1_zero: bool
+    both_zero: bool
+    ch0_negative: bool
+    ch1_negative: bool
+    ch0_nan: bool
+    ch1_nan: bool
+    ch0_infinite: bool
+    ch1_infinite: bool
+    ch0_subnormal: bool
+    ch1_subnormal: bool
+    ch0_snan: bool
+    ch1_snan: bool
+    ch0_qnan: bool
+    ch1_qnan: bool
+
+
+def evaluate_pack_flags(res32: int) -> PackStatusFlags:
+    """Evaluate packed floating-point status flags on 32-bit packed result."""
+    h0 = res32 & MASK16
+    h1 = (res32 >> 16) & MASK16
+
+    ch0_z = is_zero16(h0)
+    ch1_z = is_zero16(h1)
+
+    return PackStatusFlags(
+        ch0_zero=ch0_z,
+        ch1_zero=ch1_z,
+        both_zero=ch0_z and ch1_z,
+        ch0_negative=bool(h0 & SIGN16),
+        ch1_negative=bool(h1 & SIGN16),
+        ch0_nan=is_nan16(h0),
+        ch1_nan=is_nan16(h1),
+        ch0_infinite=is_inf16(h0),
+        ch1_infinite=is_inf16(h1),
+        ch0_subnormal=is_subnormal16(h0),
+        ch1_subnormal=is_subnormal16(h1),
+        ch0_snan=is_snan16(h0),
+        ch1_snan=is_snan16(h1),
+        ch0_qnan=is_qnan16(h0),
+        ch1_qnan=is_qnan16(h1),
+    )
+
+
+def compute_half_pack_carry(val0: int, val1: int) -> Tuple[int, int]:
+    """Compute 16-bit unsigned carry out from low half addition or packing."""
+    total = (val0 & MASK16) + (val1 & MASK16)
+    sum16 = total & MASK16
+    carry = (total >> 16) & 1
+    return sum16, carry
+
+
 class TestPackB32F16ModelAndOracle(unittest.TestCase):
     """Architectural model and mathematical reference oracle tests for v_pack_b32_f16."""
 
@@ -809,6 +868,78 @@ class TestRegisterAliasing(unittest.TestCase):
         for lane in range(32):
             expected = ((lane & 0xFFFF) << 16) | ((lane + 0x100) & 0xFFFF)
             self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_exact_zero_flags(self) -> None:
+        # Both zero (+0.0, +0.0)
+        res_both_pz = (POS_ZERO << 16) | POS_ZERO
+        flags_both = evaluate_pack_flags(res_both_pz)
+        self.assertTrue(flags_both.ch0_zero)
+        self.assertTrue(flags_both.ch1_zero)
+        self.assertTrue(flags_both.both_zero)
+        self.assertFalse(flags_both.ch0_negative)
+        self.assertFalse(flags_both.ch1_negative)
+
+        # ch0 non-zero, ch1 negative zero
+        res_mixed_z = (NEG_ZERO << 16) | ONE
+        flags_mixed = evaluate_pack_flags(res_mixed_z)
+        self.assertFalse(flags_mixed.ch0_zero)
+        self.assertTrue(flags_mixed.ch1_zero)
+        self.assertFalse(flags_mixed.both_zero)
+        self.assertFalse(flags_mixed.ch0_negative)
+        self.assertTrue(flags_mixed.ch1_negative)
+
+    def test_negative_sign_flags(self) -> None:
+        res = (NEG_TWO << 16) | NEG_ONE
+        flags = evaluate_pack_flags(res)
+        self.assertTrue(flags.ch0_negative)
+        self.assertTrue(flags.ch1_negative)
+        self.assertFalse(flags.ch0_zero)
+        self.assertFalse(flags.ch1_zero)
+
+    def test_nan_and_signaling_flags(self) -> None:
+        qnan = POS_QNAN
+        snan = POS_SNAN
+        res = (snan << 16) | qnan
+        flags = evaluate_pack_flags(res)
+        self.assertTrue(flags.ch0_nan)
+        self.assertTrue(flags.ch0_qnan)
+        self.assertFalse(flags.ch0_snan)
+
+        self.assertTrue(flags.ch1_nan)
+        self.assertFalse(flags.ch1_qnan)
+        self.assertTrue(flags.ch1_snan)
+
+    def test_infinity_flags(self) -> None:
+        res = (NEG_INF << 16) | POS_INF
+        flags = evaluate_pack_flags(res)
+        self.assertTrue(flags.ch0_infinite)
+        self.assertFalse(flags.ch0_negative)
+        self.assertTrue(flags.ch1_infinite)
+        self.assertTrue(flags.ch1_negative)
+
+    def test_subnormal_flags(self) -> None:
+        res = (MAX_SUBNORMAL << 16) | MIN_SUBNORMAL
+        flags = evaluate_pack_flags(res)
+        self.assertTrue(flags.ch0_subnormal)
+        self.assertTrue(flags.ch1_subnormal)
+        self.assertFalse(flags.ch0_zero)
+        self.assertFalse(flags.ch1_zero)
+
+    def test_half_pack_carry_generation(self) -> None:
+        # Summing two half-precision / 16-bit integer halves
+        # 0x8000 + 0x8000 = 0x10000 -> carry = 1, sum = 0
+        s16, c = compute_half_pack_carry(0x8000, 0x8000)
+        self.assertEqual(s16, 0x0000)
+        self.assertEqual(c, 1)
+
+        # 0x1234 + 0x2345 = 0x3579 -> carry = 0
+        s16_no_c, c0 = compute_half_pack_carry(0x1234, 0x2345)
+        self.assertEqual(s16_no_c, 0x3579)
+        self.assertEqual(c0, 0)
 
 
 if __name__ == "__main__":
