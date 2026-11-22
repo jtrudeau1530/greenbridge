@@ -1210,9 +1210,12 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     if (rt && !render_target_family(desc.Format)) return "render-target format";
     const UINT samples = desc.SampleDesc.Count;
     if (samples > 1 && !rt && !ds) return "multisampled texture that is not a render target or depth buffer";
-    // Every adapter measured reports one quality level; the two standard patterns are accepted too.
-    if (samples > 1 && desc.SampleDesc.Quality && desc.SampleDesc.Quality != D3D12_STANDARD_MULTISAMPLE_PATTERN &&
-        desc.SampleDesc.Quality != D3D12_CENTER_MULTISAMPLE_PATTERN)
+    // Every adapter measured reports one quality level; the two standard patterns are accepted too. They are spelled
+    // with the DXGI names: D3D12_STANDARD/CENTER_MULTISAMPLE_PATTERN, the same values, are only in d3d12.h from
+    // DirectX-Headers 1.613 on, and older Windows SDK 10.0.26100 headers lack them.
+    if (samples > 1 && desc.SampleDesc.Quality &&
+        desc.SampleDesc.Quality != DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN &&
+        desc.SampleDesc.Quality != DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN)
         return "sample quality";
     // A clear value is only for render targets and depth buffers, in the resource's format family.
     if (clear && (!(rt || ds) || clear->Format == DXGI_FORMAT_UNKNOWN ||
@@ -5827,8 +5830,8 @@ private:
         } else if (const UINT samples = desc->SampleDesc.Count;
                    !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
                    (samples > 1 && desc->SampleDesc.Quality &&
-                    desc->SampleDesc.Quality != D3D12_STANDARD_MULTISAMPLE_PATTERN &&
-                    desc->SampleDesc.Quality != D3D12_CENTER_MULTISAMPLE_PATTERN) ||
+                    desc->SampleDesc.Quality != DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN &&
+                    desc->SampleDesc.Quality != DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN) ||
                    (samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
                                     desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                                     !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |

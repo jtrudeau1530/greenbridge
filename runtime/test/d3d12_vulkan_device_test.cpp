@@ -3293,12 +3293,12 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: 4x MSAA quality standard pattern", [](ID3D12Device* d) {
              auto desc = texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-             desc.SampleDesc = {4, UINT(D3D12_STANDARD_MULTISAMPLE_PATTERN)};
+             desc.SampleDesc = {4, DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN};  // older SDKs lack the D3D12_ name
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
          }},
         {"committed: 4x MSAA quality center pattern", [](ID3D12Device* d) {
              auto desc = texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-             desc.SampleDesc = {4, UINT(D3D12_CENTER_MULTISAMPLE_PATTERN)};
+             desc.SampleDesc = {4, DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN};
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
          }},
         {"committed: resource flag RAYTRACING_ACCELERATION_STRUCTURE on a texture", [](ID3D12Device* d) {
