@@ -195,7 +195,7 @@ def main():
     import runner
     import tsharp
     try:
-        oracle = runner.Oracle()
+        oracle = runner.open_oracle()
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
