@@ -411,17 +411,42 @@ def test_typed_buffers_and_psv0():
     assert failures == 0, f"{failures} typed-buffer check(s) failed"
 
 
+def test_a_test_that_raises_fails_the_run_and_the_rest_still_run():
+    """The plain-script run used to hold every test in one try block that swallowed AssertionError: a failing bare
+    assert (test_duplicate_shader_names_keep_file_stages has one) skipped the tests after it and printed OK, exit 0."""
+    ran, reported = [], []
+
+    def raises():
+        ran.append("raises")
+        raise AssertionError("a bare assert failed")
+
+    def passes():
+        ran.append("passes")
+
+    raised = run_tests([raises, passes], report=reported.append)
+    check(raised == ["raises"], f"a test that raises is reported as failed ({raised})")
+    check(ran == ["raises", "passes"], f"the tests after it still run ({ran})")
+    check(reported == ["FAIL raises: a bare assert failed"], f"its message is printed ({reported})")
+    assert failures == 0, f"{failures} script-runner check(s) failed"
+
+
+def run_tests(tests, report=print):
+    """Run each test on its own, for the plain-script run (CI's standard-library job): one that raises
+    AssertionError is reported and the rest still run. Returns the names of the tests that raised."""
+    raised = []
+    for test in tests:
+        try:
+            test()
+        except AssertionError as error:
+            raised.append(test.__name__)
+            report(f"FAIL {test.__name__}: {error}")
+    return raised
+
+
 if __name__ == "__main__":
-    try:
-        test_feature_scan()
-        test_typed_buffers_and_psv0()
-        test_short_signature()
-        test_part_payload_outside_container_is_unreadable()
-        test_bad_shaders_folder_is_one_line()
-        test_v_perm_b32_selectors()
-        test_duplicate_shader_names_keep_file_stages()
-        test_out_inside_corpus_is_a_usage_error()
-    except AssertionError:
-        pass
-    print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")
-    sys.exit(1 if failures else 0)
+    # Every test_* function in the file, in file order, so a new test can't be left out of the script run.
+    raised = run_tests([fn for name, fn in list(globals().items()) if name.startswith("test_") and callable(fn)])
+    ok = not failures and not raised
+    print(f"test_feature_scan: {'OK' if ok else 'FAILED'} ({failures} failed check{'s' if failures != 1 else ''}, "
+          f"{len(raised)} failed test{'s' if len(raised) != 1 else ''})")
+    sys.exit(0 if ok else 1)
