@@ -323,8 +323,10 @@ Hash-only or opaque:
 `tools/world_index.py` scans an RPF9 archive or a directory of carved streams and writes JSON/CSV with
 `offset, size, signature, version, kind, structs, blocks, entities, extents, position bounds, LOD counts`,
 map name/parent hashes and the map root's 64-bit name key. It implements the header/schema validation above
-and the continuation join. It does not decrypt anything, does not extract models/textures, and keeps the
-output aggregate (one row per resource, no entity dump).
+and the continuation join. It does not decrypt anything and does not extract models/textures. Its JSON/CSV
+output is aggregate (one row per resource). `--entities-out` adds a local-only JSON-lines file with one row per
+complete entity (archetype hash and key, position, stored rotation, scales, LOD fields), the input of
+`world_build.py --placements` below.
 
 `tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
 `0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
@@ -346,6 +348,61 @@ python -I tests\test_world_names.py
 For a 76 GB archive always bound the run with `--start/--limit`; the tool records the window in its summary.
 A 0x7a resource split beyond the first continuation, or a map whose entity block lives in a graphics page, is
 reported with fewer entities or as `meta` rather than guessed.
+
+## Building a placed world
+
+`tools/world_build.py --placements` builds the viewer's chunks from map placements instead of each model's own
+coordinates. It covers points 3 and 4 of *What a runtime needs*; point 5 (HD/LOD switching) is not done.
+
+1. `world_index.py <levels.rpf> --entities-out <work>\world\entities.jsonl` writes one row per complete entity.
+2. rpf9dump exports the models (`models/manifest.json` + OBJ).
+3. `world_build.py <assets> --out <world> --placements <entities.jsonl>`. Each selected entity is matched to an
+   exported model by the lower-cased joaat of the manifest `Name` without its `.#dr`/`.#ft` suffix. When the
+   entity row carries the +0x20 key, the model's Murmur3-64 must equal it, as in `world_names.py`; a 32-bit-only
+   match is a `key_mismatch` and is not placed. The model is scaled by (`scaleXY`, `scaleXY`, `scaleZ`), rotated
+   by the **conjugate** of the stored quaternion, translated to `position`, and converted from RAGE Z-up to
+   glTF Y-up `(x, z, -y)`. Normals use the inverse-transpose; a negative scale product flips the winding.
+
+`--lod-levels` picks the `lodLevel` values to place (default `0,5`: HD and ORPHAN_HD) and `--region
+MINX,MINY,MAXX,MAXY` bounds the RAGE world X/Y. `world.json` then has `"layout": "placements"` and a
+`stats.placements` block: `rows`, `malformed`, `other_lod_level`, `outside_region`, `selected`, `placed`,
+`placed_unverified` (no key in the row), `key_mismatch`, `unresolved_archetype` (no exported model has that name),
+`model_not_loadable` and `distinct_models`.
+
+Measured on the 1.0.2.1 package:
+
+| Step | Result |
+|---|---|
+| `--entities-out` over the whole data area (24 parallel `--start/--limit` windows) | 1,670,435 rows, about 1 min |
+| `lodLevel` split | 0: 1,153,122 · 5: 396,871 · 1: 100,953 · 2: 16,828 · 3: 1,708 · 4: 601 · 6: 352 |
+| one 700 m × 700 m downtown box, HD + ORPHAN_HD | 29,258 entities, 3,995 distinct archetypes |
+| placed with models recovered by the pinned rpf9-explorer (917e9b9) | 10,729 (36.7%); 18,529 `unresolved_archetype`, 0 `key_mismatch` |
+| same box, models recovered with breadbbbb/rpf9-explorer#8 and #10 applied | 29,229 of 29,258 entities have a model (3,992 of 3,995 archetypes) |
+| build of the 10,729 placed instances (`--no-textures --jobs 8`, 256 m chunks) | 16 chunks, 29.3M triangles, 1.17 GB of GLB, median chunk 104 MB, max 164 MB; 5 min, 22 GB peak RSS |
+
+The unresolved share in that box is a model-recovery gap, not a naming gap. All 1,800 archetypes that #8/#10 add
+in that box are `.#ft` fragments (18,500 of the entities). The pinned `LooksLikeFragment` rejects their headers
+(breadbbbb/rpf9-explorer#8).
+
+Checks on the same box:
+- The conjugate of every stored rotation equals SixNG's independently derived world rotation:
+  |dot| ≥ 0.9999 on 29,124 of 29,125 entities matched by position and archetype, and the minimum is 0.99894.
+  Scales are equal on all 29,125.
+- Every placed instance's position lies inside its chunk's bounds (10,620 of 10,620 distinct
+  position/archetype pairs).
+
+**Not verified:** the result has not been looked at in a browser. Instances are baked into the chunk geometry,
+not shared, so a dense box makes 100 MB+ chunks; a smaller `--chunk-size` keeps them small. Building a whole
+city needs glTF instancing and LOD switching, which are next steps.
+
+```powershell
+python -I tools\world_index.py <levels.rpf> --out work\world\index.json --entities-out work\world\entities.jsonl
+python -I tools\world_build.py work\assets --out work\world\placed --no-textures `
+    --placements work\world\entities.jsonl --region=-900,500,-200,1200
+python -I tests\test_world_place.py
+```
+
+The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.
 
 ## Instanced props and grass
 
