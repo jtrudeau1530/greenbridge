@@ -384,7 +384,7 @@ class TranslatorValueSemantics(unittest.TestCase):
         memory = {0x0C: 0xEEEEEEEE}
         outputs = support.run_fragment(
             spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
-            push_constants=[0, 0, 16, 0] + [0] * 28, memory=memory)
+            push_constants=[0, 0, 16, 0x31016FAC] + [0] * 28, memory=memory)
         self.assertEqual(outputs, {})
         for address, want in EXPECTED_BOUNDS.items():
             with self.subTest(address=address):
@@ -398,7 +398,7 @@ class TranslatorValueSemantics(unittest.TestCase):
         memory = {}
         outputs = support.run_fragment(
             spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
-            push_constants=[0, 0, 0x100, 0] + [0] * 28, memory=memory)
+            push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
         self.assertEqual(outputs, {})
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
@@ -444,8 +444,7 @@ class RawBufferTailBounds(unittest.TestCase):
     4-byte aligned (undefined under the translator's Aligned 4), so a row that loads at an unaligned O sets
     base_low to make base + O aligned: the bound sees only O, so the measured O / NUM_RECORDS pairs are kept, but
     byte-exact data at an unaligned address is no longer checked here. The last tests pin paths the measurement did not cover and that keep their old check
-    of the first byte: structured buffers, idxen and stores (format loads share that check too; the
-    interpreter does not run their decode).
+    of the first byte: structured buffers and idxen (OOB_SELECT 1).
     """
 
     def run_program(self, load_lines, n, *, nr, base_low=0, word1=0, word3=0x31016FAC, offset=0, extra=()):
@@ -458,7 +457,7 @@ class RawBufferTailBounds(unittest.TestCase):
         spv = support.translate_lines("cs_vec_tail", lines, fssm=CS_BOUNDS_FSSM)
         memory = ReadLog({VEC_REGION + k: _pattern_word(k - base_low) for k in range(-4, 0x40)})
         support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
-                             push_constants=[0, 0, 0x100, 0] + [0] * 28, memory=memory)
+                             push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
         words = [dict.get(memory, 4 * i) for i in range(n)]
         return words, [a - VEC_REGION - base_low for a in memory.reads]
 
@@ -504,26 +503,29 @@ class RawBufferTailBounds(unittest.TestCase):
     def test_num_records_zero_reads_nothing(self):
         self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [None] * 4, nr=0, offset=0)
 
-    # Not measured; these keep the check of the first byte they had before.
+    # Modes 1 and 2 (OOB_SELECT) check the index or NUM_RECORDS once for the whole load; modes 0 and 3 are per dword
+    # (docs/buffer_bounds.md; tests/semantic/test_buffer_oob_select.py has the full table).
     def test_structured_buffer_keeps_its_first_byte_check(self):
-        # stride 4, NR 2 (8 bytes): x4 at offset 4 starts inside, so all four dwords are loaded
+        # OOB_SELECT 1, stride 4, NR 2 records (8 bytes): no idxen, so index 0 < 2 and every dword is loaded
         self.check("buffer_load_dwordx4 v[2:5], v1, s[4:7], 0 offen", 4, [4, 8, 0xC, 0x10],
-                   nr=2, offset=4, word1=4 << 16)
+                   nr=2, offset=4, word1=4 << 16, word3=0x11016FAC)
 
     def test_idxen_keeps_its_first_byte_check(self):
-        # stride 0, idxen with index 0 and offset:0xc, NR 0xe: offset 0xc < 0xe, so both dwords are loaded
-        self.check("buffer_load_dwordx2 v[2:3], v1, s[4:7], 0 idxen offset:12", 2, [0xC, 0x10], nr=0xE, offset=0)
+        # OOB_SELECT 1, idxen with index 0 and offset:0xc, NR 0xe: index 0 < 0xe, so both dwords are loaded
+        self.check("buffer_load_dwordx2 v[2:3], v1, s[4:7], 0 idxen offset:12", 2, [0xC, 0x10], nr=0xE, offset=0,
+                   word3=0x11016FAC)
 
-    def test_store_keeps_its_first_byte_check(self):
+    def test_store_is_per_dword(self):
+        # x2 at 0xc with NR 0x10: the first dword ends at 0x10 and lands, the second (ends at 0x14) is dropped
         lines = ["v_cmpx_eq_u32_e32 0, v0", f"s_mov_b32 s4, {VEC_REGION:#x}", "s_mov_b32 s5, 0",
-                 "s_mov_b32 s6, 0xe", "s_mov_b32 s7, 0x31016fac", "v_mov_b32 v1, 0xc",
+                 "s_mov_b32 s6, 0x10", "s_mov_b32 s7, 0x31016fac", "v_mov_b32 v1, 0xc",
                  "v_mov_b32 v2, 0x11111111", "v_mov_b32 v3, 0x22222222",
                  "buffer_store_dwordx2 v[2:3], v1, s[4:7], 0 offen", "s_endpgm"]
         spv = support.translate_lines("cs_vec_store", lines, fssm=CS_BOUNDS_FSSM)
         memory = {}
         support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
-                             push_constants=[0, 0, 0x100, 0] + [0] * 28, memory=memory)
-        self.assertEqual(memory, {VEC_REGION + 0xC: 0x11111111, VEC_REGION + 0x10: 0x22222222})
+                             push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(memory, {VEC_REGION + 0xC: 0x11111111})
 
 
 class MeasuredBoundsShaders(unittest.TestCase):
@@ -537,6 +539,8 @@ class MeasuredBoundsShaders(unittest.TestCase):
         "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
                               0xEEEEEEEE, 0xEEEEEEEE],
         "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
+        "cs_oob_select": [0x5EED000C, 0, 0x5EED0014, 0, 0x5EED0018, 0xEEEEEEEE, 0, 0],
+        "cs_oob_tail": [0, 0, 0x5EED0010, 0, 0xBEEF0000, 0xEEEEEEEE, 0, 0x5EED0010],
     }
 
     def test_words(self):
@@ -545,7 +549,7 @@ class MeasuredBoundsShaders(unittest.TestCase):
                 spv = support.translate_fixture(name, fssm=CS_BOUNDS_FSSM)
                 memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
                 support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
-                                     push_constants=[0, 0, 0xFFFFFFFF, 0] + [0] * 28, memory=memory)
+                                     push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
                 self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in want])
                 self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
 

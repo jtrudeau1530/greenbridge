@@ -215,7 +215,14 @@ def _exports(img: PeImage) -> list[str]:
         names.append(symbol if symbol is not None else "?")
         named.add(struct.unpack_from("<H", img.data, ord_at)[0])
     for i in range(min(functions, MAX_ENTRIES)):
-        if i not in named:
+        if i in named:
+            continue
+        # A zero RVA in AddressOfFunctions marks an unused ordinal slot, not an export. A forwarder (an RVA inside the
+        # export directory) is a real export. A slot the file does not hold is skipped like any other unreadable entry.
+        slot = img.offset(addr_functions + i * 4)
+        if slot is None or slot + 4 > len(img.data):
+            continue
+        if struct.unpack_from("<I", img.data, slot)[0]:
             names.append(f"#{base + i}")
     return names
 
@@ -378,7 +385,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
-    os.makedirs(a.out, exist_ok=True)
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        print(f"cannot create output directory {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 1
     rc = 0
     seen_paths: set[tuple[str, str]] = set()
     used_names: set[str] = set()

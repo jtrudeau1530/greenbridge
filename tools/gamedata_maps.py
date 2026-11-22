@@ -380,8 +380,12 @@ def main() -> int:
         out = {"payloads": [_public(p) for p in payloads]}
         if census:
             out["pamh_census"] = census
-        with open(a.json, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=1)
+        except OSError as e:
+            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 1
         print("wrote", a.json)
     return 0
 

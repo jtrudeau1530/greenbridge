@@ -293,6 +293,11 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertEqual(res.stdout.strip(), "OK")
 
+    def test_cli_direct_syntax_rejects_extra_path(self) -> None:
+        res = self.run_cli(self.game_dir, "extra", "--manifest", self.manifest_path)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("unrecognized arguments: extra", res.stderr)
+
     def test_cli_verbose_output(self) -> None:
         res = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--verbose")
         self.assertEqual(res.returncode, 0)

@@ -5,8 +5,8 @@
 // (Sony vendor/product id, so SDL treats it as one and the shim takes the trigger-effect path) and a plain pad
 // without trigger motors. The test covers enumeration and device callbacks, readings and their button/axis mapping,
 // UI navigation, the guide button, rumble and trigger rumble as SDL receives them, the DualSense effect bytes for
-// each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, unplugging and replugging, and the reading history behind
-// GetNextReading/GetPreviousReading. No game data.
+// each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, unplug/replug, reading history,
+// and identification of two or three otherwise indistinguishable pads. No game data.
 #include <windows.h>
 
 #include <SDL3/SDL.h>
@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "gameinput.h"
@@ -178,6 +179,12 @@ bool g_keys[256] = {};
 bool g_focus = false;
 bool fake_key_down(int vk) { return vk >= 0 && vk < 256 && g_keys[vk]; }
 bool fake_focus() { return g_focus; }
+int g_cursor_x = 0, g_cursor_y = 0;
+bool fake_cursor(int* x, int* y) {
+    *x = g_cursor_x;
+    *y = g_cursor_y;
+    return true;
+}
 
 GameInputGamepadState pad_state(IGameInput* input, IGameInputDevice* dev, uint32_t* ui = nullptr) {
     GameInputGamepadState st{};
@@ -194,9 +201,99 @@ GameInputGamepadState pad_state(IGameInput* input, IGameInputDevice* dev, uint32
     return st;
 }
 
+bool sticks_at_rest(const GameInputGamepadState& st) {
+    return st.leftThumbstickX == 0 && st.leftThumbstickY == 0 && st.rightThumbstickX == 0 &&
+           st.rightThumbstickY == 0 && st.leftTrigger == 0 && st.rightTrigger == 0;
+}
+
+// WASD, the mouse and its buttons. Runs in the focused mode with focus and nothing held.
+void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: sticks and triggers at rest");
+
+    struct Dir { std::vector<int> keys; float x, y; const char* what; };
+    const float d = 23170 / 32767.0f;
+    const Dir dirs[] = {
+        {{'W'}, 0, 1, "keyboard pad: W is left stick up"},
+        {{'S'}, 0, -1, "keyboard pad: S is left stick down"},
+        {{'A'}, -1, 0, "keyboard pad: A is left stick left"},
+        {{'D'}, 1, 0, "keyboard pad: D is left stick right"},
+        {{'W', 'S'}, 0, 0, "keyboard pad: W and S cancel"},
+        {{'A', 'D'}, 0, 0, "keyboard pad: A and D cancel"},
+        {{'W', 'S', 'D'}, 1, 0, "keyboard pad: W+S cancel, D still full right"},
+        {{'W', 'D'}, d, d, "keyboard pad: W+D is up-right on the round gate"},
+        {{'S', 'A'}, -d, -d, "keyboard pad: S+A is down-left on the round gate"},
+    };
+    for (const Dir& e : dirs) {
+        for (int k : e.keys) g_keys[k] = true;
+        rt::gameinput::poll();
+        const GameInputGamepadState st = pad_state(input, kb);
+        check(approx(st.leftThumbstickX, e.x) && approx(st.leftThumbstickY, e.y) && st.buttons == 0 &&
+                  st.rightThumbstickX == 0 && st.rightThumbstickY == 0,
+              e.what);
+        for (int k : e.keys) g_keys[k] = false;
+    }
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: left stick centers on release");
+
+    // 10 px right, 10 px down in one poll: 10 x 1024 axis units each, +Y down on screen is stick down.
+    g_cursor_x += 10;
+    g_cursor_y += 10;
+    rt::gameinput::poll();
+    GameInputGamepadState st = pad_state(input, kb);
+    check(approx(st.rightThumbstickX, 10240 / 32767.0f) && approx(st.rightThumbstickY, -10240 / 32767.0f) &&
+              st.leftThumbstickX == 0,
+          "keyboard pad: mouse delta moves the right stick");
+    g_cursor_x -= 500;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, -1), "keyboard pad: a large mouse delta clamps to full");
+    // The mouse stops: the stick falls back, never past center, to exactly 0.
+    int polls = 0;
+    float last = -1;
+    bool monotonic = true;
+    for (; polls < 200; ++polls) {
+        rt::gameinput::poll();
+        st = pad_state(input, kb);
+        monotonic &= st.rightThumbstickX >= last && st.rightThumbstickX <= 0;
+        last = st.rightThumbstickX;
+        if (st.rightThumbstickX == 0 && st.rightThumbstickY == 0) break;
+    }
+    check(monotonic && polls < 100 && sticks_at_rest(st), "keyboard pad: right stick decays to 0 when the mouse stops");
+
+    g_keys[VK_RBUTTON] = true;
+    rt::gameinput::poll();
+    st = pad_state(input, kb);
+    check(approx(st.leftTrigger, 1) && st.rightTrigger == 0 && st.buttons == 0,
+          "keyboard pad: right mouse button is the left trigger");
+    g_keys[VK_LBUTTON] = true;
+    rt::gameinput::poll();
+    st = pad_state(input, kb);
+    check(approx(st.leftTrigger, 1) && approx(st.rightTrigger, 1), "keyboard pad: left mouse button is the right trigger");
+    g_keys[VK_RBUTTON] = false;
+    rt::gameinput::poll();
+    st = pad_state(input, kb);
+    check(st.leftTrigger == 0 && approx(st.rightTrigger, 1), "keyboard pad: releasing a mouse button releases its trigger");
+
+    // Losing focus releases sticks and triggers; the cursor moved meanwhile does not swing the stick on return.
+    g_keys['W'] = g_keys['D'] = g_keys[VK_LBUTTON] = true;
+    g_cursor_x += 20;
+    rt::gameinput::poll();
+    check(!sticks_at_rest(pad_state(input, kb)), "keyboard pad: sticks and trigger held before focus loss");
+    g_focus = false;
+    g_cursor_x += 300;
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: losing focus releases sticks and triggers");
+    g_keys['W'] = g_keys['D'] = g_keys[VK_LBUTTON] = false;
+    g_cursor_x += 300;
+    g_focus = true;
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: no mouse jump when focus returns");
+}
+
 // Runs with no other pad connected and the device callback from main still registered.
 void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+    rt::gameinput::set_cursor_source(fake_cursor);
 
     set_env("LEONIDA_KEYBOARD_PAD", nullptr);
     rt::gameinput::reload_config();
@@ -284,6 +381,11 @@ void test_keyboard_pad(IGameInput* input) {
           "keyboard pad: LEONIDA_KEYBOARD_PAD=always reads keys without focus");
     g_keys[VK_DOWN] = g_keys[VK_RETURN] = false;
 
+    set_env("LEONIDA_KEYBOARD_PAD", "1");
+    rt::gameinput::reload_config();
+    g_focus = true;
+    test_keyboard_pad_sticks(input, kb);
+
     // Turning it off removes the pad; turning it on again brings back the same device object.
     set_env("LEONIDA_KEYBOARD_PAD", "off");
     rt::gameinput::reload_config();
@@ -302,6 +404,115 @@ void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
     rt::gameinput::set_keyboard_source(nullptr, nullptr);
+    rt::gameinput::set_cursor_source(nullptr);
+}
+
+bool same_id(const AppLocalDeviceId& a, const AppLocalDeviceId& b) { return std::memcmp(&a, &b, sizeof a) == 0; }
+
+// The id the shim derives from SDL: the GUID, then two FNV-1a hashes of "s:" serial, "p:" path or nothing, with
+// "t:<n>:" before it for twin n. Twin 0 is the id every pad had before twins were told apart.
+AppLocalDeviceId expected_id(const Pad& pad, int twin) {
+    const char* serial = SDL_GetJoystickSerial(pad.js);
+    const char* path = SDL_GetJoystickPath(pad.js);
+    std::string identity = (serial && *serial) ? std::string("s:") + serial : (path && *path) ? std::string("p:") + path : "";
+    if (twin) identity = "t:" + std::to_string(twin) + ":" + identity;
+    AppLocalDeviceId id{};
+    const SDL_GUID guid = SDL_GetJoystickGUIDForID(pad.id);
+    std::memcpy(id.value, guid.data, 16);
+    for (int half = 0; half < 2; ++half) {
+        uint64_t h = half ? 0x84222325cbf29ce4ull : 0xcbf29ce484222325ull;
+        for (unsigned char c : identity) h = (h ^ c) * 0x100000001b3ull;
+        std::memcpy(id.value + 16 + half * 8, &h, 8);
+    }
+    return id;
+}
+
+// Attaches one more identical twin and returns the device the shim reported for it.
+IGameInputDevice* plug(Pad& pad) {
+    const size_t before = g_device_events.size();
+    attach(pad, "Leonida virtual twin pad", 0x0F0D, 0x00C1, false);
+    rt::gameinput::poll();
+    return g_device_events.size() > before ? g_device_events.back().device : nullptr;
+}
+
+bool found_is(IGameInput* input, IGameInputDevice* dev) {
+    if (!dev) return false;
+    IGameInputDevice* found = nullptr;
+    const bool ok = input->FindDeviceFromId(&dev->GetDeviceInfo()->deviceId, &found) == S_OK && found == dev;
+    if (found) found->Release();
+    return ok;
+}
+
+// Pads SDL cannot tell apart: the same name, vendor and product, no serial, no path. Runs with no other pad connected.
+void test_twins(IGameInput* input) {
+    Pad pads[3];
+    IGameInputDevice* dev[3] = {};
+    AppLocalDeviceId id[3] = {};
+    for (int i = 0; i < 2; ++i) dev[i] = plug(pads[i]);
+    check(dev[0] && dev[1] && dev[0] != dev[1], "twins: two identical pads are two device objects");
+    if (!dev[0] || !dev[1]) {
+        for (Pad& p : pads) detach(p);
+        rt::gameinput::poll();
+        return;
+    }
+    const AppLocalDeviceId legacy = expected_id(pads[0], 0);
+    check(same_id(legacy, expected_id(pads[1], 0)), "twins: SDL gives them nothing to tell them apart");
+    for (int i = 0; i < 2; ++i) id[i] = dev[i]->GetDeviceInfo()->deviceId;
+    check(same_id(id[0], legacy), "twins: the first keeps the id a single pad has always had");
+    check(!same_id(id[0], id[1]) && same_id(id[1], expected_id(pads[1], 1)),
+          "twins: the second gets twin id 1, same GUID bytes, different from the first");
+    check(found_is(input, dev[0]) && found_is(input, dev[1]), "twins: FindDeviceFromId returns each twin for its own id");
+
+    SDL_SetJoystickVirtualButton(pads[0].js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    SDL_SetJoystickVirtualButton(pads[1].js, SDL_GAMEPAD_BUTTON_EAST, true);
+    rt::gameinput::poll();
+    check(pad_state(input, dev[0]).buttons == GameInputGamepadA && pad_state(input, dev[1]).buttons == GameInputGamepadB,
+          "twins: a reading filtered to each twin has only its own button");
+    IGameInputDevice* found = nullptr;
+    input->FindDeviceFromId(&id[1], &found);
+    check(found && pad_state(input, found).buttons == GameInputGamepadB,
+          "twins: the device found from the second id reads the second pad");
+    if (found) found->Release();
+
+    dev[2] = plug(pads[2]);
+    if (dev[2]) id[2] = dev[2]->GetDeviceInfo()->deviceId;
+    check(dev[2] && dev[2] != dev[0] && dev[2] != dev[1] && same_id(id[2], expected_id(pads[2], 2)) &&
+              !same_id(id[2], id[0]) && !same_id(id[2], id[1]) && found_is(input, dev[2]),
+          "twins: a third gets a third object and twin id 2");
+
+    // One twin unplugged: it gets its object and id back.
+    detach(pads[1]);
+    rt::gameinput::poll();
+    check(dev[1]->GetDeviceStatus() == GameInputDeviceNoStatus && found_is(input, dev[1]),
+          "twins: an unplugged twin is still found from its id");
+    check(plug(pads[1]) == dev[1] && same_id(dev[1]->GetDeviceInfo()->deviceId, id[1]),
+          "twins: the middle twin plugged back in gets its object and id back");
+    detach(pads[0]);
+    rt::gameinput::poll();
+    check(plug(pads[0]) == dev[0] && same_id(dev[0]->GetDeviceInfo()->deviceId, legacy),
+          "twins: so does the first, with the legacy id");
+
+    // Two unplugged: nothing tells them apart, so the first back takes the lower twin whichever pad it is.
+    detach(pads[1]);
+    detach(pads[2]);
+    rt::gameinput::poll();
+    IGameInputDevice* first_back = plug(pads[2]);
+    IGameInputDevice* second_back = plug(pads[1]);
+    check(first_back == dev[1] && second_back == dev[2], "twins: with two unplugged, objects follow arrival order");
+
+    // All unplugged and plugged in again: the same objects and ids in creation order, no new object.
+    for (Pad& p : pads) detach(p);
+    rt::gameinput::poll();
+    bool same = true;
+    for (int i = 0; i < 3; ++i) {
+        IGameInputDevice* d = plug(pads[i]);
+        same &= d && d == dev[i] && same_id(d->GetDeviceInfo()->deviceId, id[i]);
+    }
+    check(same && rt::gameinput::connected_count() == 3, "twins: all three replugged get the same objects and ids in order");
+
+    for (Pad& p : pads) detach(p);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "twins: removed at the end");
 }
 
 }  // namespace
@@ -752,6 +963,7 @@ int main() {
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "all pads closed after detaching");
 
+    test_twins(input);
     test_keyboard_pad(input);
     input->Release();
 

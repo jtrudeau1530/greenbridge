@@ -53,6 +53,11 @@ using KeyDownFn = bool (*)(int virtual_key);
 using HasFocusFn = bool (*)();
 void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus);
 
+// Where the keyboard pad reads the mouse cursor from (screen pixels; false when it cannot be read). Test seam:
+// replaces GetCursorPos. nullptr restores the default.
+using CursorPosFn = bool (*)(int* x, int* y);
+void set_cursor_source(CursorPosFn cursor_pos);
+
 // One row of the keyboard pad's key map: a Windows virtual-key code and the SDL gamepad button it presses.
 struct KeyBinding {
     int virtual_key;

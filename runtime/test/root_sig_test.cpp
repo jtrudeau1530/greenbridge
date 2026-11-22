@@ -379,8 +379,8 @@ void test_registered_shim(bool supports_1_2) {
 }
 
 void test_deserializer() {
-    // A blob whose RTS0 flags carry the Xbox high byte is rejected by the host
-    // deserializer; the shim clears the byte on a copy and succeeds.
+    // The host deserializer checks the container hash and hands an Xbox high byte back in the flags; the shim
+    // clears the byte on a copy, rehashes it and succeeds.
     D3D12_ROOT_SIGNATURE_DESC desc = make_legacy_desc(0);
     Blobs blobs;
     HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blobs.blob, &blobs.error);
@@ -407,6 +407,42 @@ void test_deserializer() {
     }
     check(found_rts0, "RTS0 chunk found in the serialized blob");
     if (!found_rts0) return;
+
+    // An Xbox-built blob was hashed with the high byte set: give the tampered copy a valid DXBC hash, as the
+    // console serializer would. Checked first against the hash the PC serializer wrote.
+    uint32_t hash[4];
+    rt::d3d12_xs::dxbc_checksum(bytes, size, hash);
+    check(std::memcmp(hash, bytes + 4, sizeof(hash)) == 0, "dxbc_checksum matches the PC serializer's hash");
+    {
+        // 0..7 root-constant parameters (24 bytes each) step the hashed length through all eight 8-byte slots
+        // of the last MD5 block, covering both sides of the 56-byte tail boundary.
+        D3D12_ROOT_PARAMETER params[7] = {};
+        for (UINT i = 0; i < 7; ++i) {
+            params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            params[i].Constants.ShaderRegister = i;
+            params[i].Constants.Num32BitValues = 1;
+        }
+        bool all_match = true;
+        for (UINT n = 0; n <= 7; ++n) {
+            D3D12_ROOT_SIGNATURE_DESC sized = make_legacy_desc(0);
+            sized.NumParameters = n;
+            sized.pParameters = n ? params : nullptr;
+            Blobs sb;
+            if (FAILED(D3D12SerializeRootSignature(&sized, D3D_ROOT_SIGNATURE_VERSION_1_0, &sb.blob, &sb.error)) ||
+                !sb.blob) {
+                all_match = false;
+                continue;
+            }
+            const uint8_t* sbytes = static_cast<const uint8_t*>(sb.blob->GetBufferPointer());
+            const SIZE_T ssize = sb.blob->GetBufferSize();
+            uint32_t shash[4];
+            rt::d3d12_xs::dxbc_checksum(sbytes, ssize, shash);
+            if (std::memcmp(shash, sbytes + 4, sizeof(shash)) != 0) all_match = false;
+        }
+        check(all_match, "dxbc_checksum matches the PC serializer's hash for every tail length");
+    }
+    rt::d3d12_xs::dxbc_checksum(tampered.data(), tampered.size(), hash);
+    std::memcpy(tampered.data() + 4, hash, sizeof(hash));
 
     std::vector<uint8_t> cleared;
     const bool rewritten = rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(tampered.data(), tampered.size(), cleared);

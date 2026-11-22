@@ -42,7 +42,7 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 FSSM = bytearray(0x148)
 struct.pack_into("<4I", FSSM, 0x138, 0x40088, 32, 1, 1)
 FSSM = bytes(FSSM)
-VSHARP = [0, 0, 0x1000, 0]
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
 
 
 def s32(x: int) -> int:

@@ -326,17 +326,17 @@ def main(argv=None):
         return 0 if self_test() else 1
     counts, first_failure = run_suite(a.programs, a.seed, a.max_ops, a.limit)
     total_skips = sum(counts["skip"].values())
-    print(f"{a.programs} programs (seed {a.seed}): "
+    total_run = counts["pass"] + counts["mismatch"] + total_skips + counts["harness-error"]
+    print(f"{total_run} programs (seed {a.seed}): "
           f"{counts['pass']} pass, {counts['mismatch']} mismatch, "
           f"{total_skips} skipped, {counts['harness-error']} harness errors")
     for reason, n in sorted(counts["skip"].items()):
         print(f"  skip x{n}: {reason}")
     if first_failure is not None:
-        print("FIRST MISMATCH:\n" + first_failure)
-        return 1
+        print("FIRST FAILURE:\n" + first_failure)
     if counts["harness-error"]:
         return 2
-    return 0
+    return 1 if counts["mismatch"] else 0
 
 
 if __name__ == "__main__":

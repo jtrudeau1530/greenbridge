@@ -188,7 +188,8 @@ class WorldIndexTest(unittest.TestCase):
             self.assertEqual(json.load(f)["summary"]["scan_end"], 0x41)
         os.remove(out)
         # --limit 0 used to read as "no limit" (the whole archive); negative values were used as given.
-        for args in (["--limit", "0"], ["--limit", "-16"], ["--start", "-1"]):
+        for args in (["--limit", "0"], ["--limit", "-16"], ["--start", "-1"],
+                     ["--max-inflate", "0"], ["--max-inflate", "-1"]):
             with self.subTest(args=args), self.assertRaises(SystemExit) as ctx, \
                     contextlib.redirect_stderr(io.StringIO()):
                 WI.main([path, "--out", out, *args])
@@ -200,6 +201,34 @@ class WorldIndexTest(unittest.TestCase):
                 with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(WI.main([path, "--out", out, "--start", start]), 2)
                 self.assertIn("outside the data area", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+    def test_scan_limit_excludes_crossing_stream_and_accepts_hex(self):
+        blob = make_resource()
+        stored = len(zlib.compress(blob))
+        path = os.path.join(self.dir, "sample.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf_streams([blob]))
+        out = os.path.join(self.dir, "out.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out, "--start", "0x40", "--limit", hex(stored)]), 0)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["resources"], 1)
+        self.assertEqual(doc["summary"]["scanned_bytes"], stored)
+
+        rows, stats = WI.scan_rpf(path, start=0x40, limit=stored - 1)
+        self.assertEqual(rows, [])
+        self.assertEqual(stats["streams"], 0)
+        self.assertEqual(stats["scanned_bytes"], 0)
+        self.assertEqual(stats["scan_end"], 0x40 + stored - 1)
+
+    def test_missing_path_is_an_error_not_a_traceback(self):
+        out = os.path.join(self.dir, "missing.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([os.path.join(self.dir, "nope.rpf"), "--out", out]), 2)
+        self.assertIn("ERROR:", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
     def test_rpf_scan_survives_a_damaged_candidate_continuation(self):
@@ -313,6 +342,13 @@ class WorldIndexTest(unittest.TestCase):
         WI.parse_resource(make_resource(), agg)
         stats = WN.resolve_archetypes(agg.to_json(), WN.NameDictionary())
         self.assertEqual((stats["entities"], stats["unique_hashes"], stats["unresolved_hashes"]), (1, 1, 1))
+
+
+def setUpModule():
+    # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
 if __name__ == "__main__":

@@ -26,11 +26,13 @@ def test_format_codes_match_the_translator_table():
         "R16G16B16A16_SFLOAT": "GFX10_FORMAT_16_16_16_16_FLOAT",
         "R32G32B32A32_SFLOAT": "GFX10_FORMAT_32_32_32_32_FLOAT",
         "R32_SFLOAT": "GFX10_FORMAT_32_FLOAT",
+        "R8G8B8A8_UINT": "GFX10_FORMAT_8_8_8_8_UINT",
+        "R8G8B8A8_SINT": "GFX10_FORMAT_8_8_8_8_SINT",
     }
     assert set(gfx10_names) == set(imf.FORMATS)
     for name, (_, code, bpp, model) in imf.FORMATS.items():
         assert by_name[gfx10_names[name]] == code, name
-        assert bpp in (4, 8, 16) and model in ("unorm8", "half4", "float4", "float1"), name
+        assert bpp in (4, 8, 16) and model in ("unorm8", "half4", "float4", "float1", "uint8", "sint8"), name
 
 
 def test_unorm_oracle_divides_by_255():
@@ -91,9 +93,27 @@ def test_pixel_shader_uses_the_requested_dmask(mask):
 
 def test_dmask_schedule_covers_each_format_and_keeps_full_mask_first():
     formats = tuple(imf.FORMATS)
-    pairs = {(formats[i % len(formats)], imf.DMASKS[i % len(imf.DMASKS)]) for i in range(60)}
+    pairs = {(formats[i % len(formats)], imf.DMASKS[(i // len(formats)) % len(imf.DMASKS)])
+             for i in range(len(formats) * len(imf.DMASKS))}
     assert imf.DMASKS[0] == 0xf
     assert pairs == {(fmt, mask) for fmt in formats for mask in range(1, 16)}
+
+
+@pytest.mark.parametrize("fmt,want,kind", [
+    ("R8G8B8A8_UINT", [0, 127, 128, 255], "u32"),
+    ("R8G8B8A8_SINT", [0, 127, -128, -1], "i32"),
+])
+def test_integer_oracle_and_conversion(fmt, want, kind):
+    texels = bytes([0, 127, 128, 255]) * 64
+    assert imf.oracle(fmt, texels, 8, 8)[0] == want
+    asm = imf.pixel_shader(8, 8, 0x5, imf.FORMATS[fmt][3])
+    assert f"v_cvt_f32_{kind}_e32 v4, v4" in asm
+    assert f"v_cvt_f32_{kind}_e32 v5, v5" in asm
+    assert f"v_cvt_f32_{kind}_e32 v6, v6" not in asm
+    got = [want[0], want[2], 3.0, 4.0] * (imf.DRAW * imf.DRAW)
+    assert not imf.compare(fmt, texels, 8, 8, got, 0x5)
+    got[1] = want[1]
+    assert imf.compare(fmt, texels, 8, 8, got, 0x5)
 
 
 def test_compare_detects_wrong_dmask_order_and_unwritten_register():
@@ -146,6 +166,37 @@ def test_compare_treats_any_nan_as_equal():
             value[0] = other_nan
             got.extend(value)
     assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got) == []
+
+
+def run_case_with_harness_result(monkeypatch, tmp_path, returncode, stdout):
+    """run_case with the translator stubbed out and vk_image_fuzz answering `returncode`/`stdout`."""
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
+    monkeypatch.setattr(imf, "assemble", lambda *_args: None)
+    monkeypatch.setattr(imf, "translate", lambda work: str(tmp_path / "spirv"))
+    monkeypatch.setattr(imf.subprocess, "run",
+                        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, returncode, stdout, ""))
+    return imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False)
+
+
+def test_unsupported_device_skips_with_the_harness_reason(monkeypatch, tmp_path, capsys):
+    # TEST-149: a 128-byte push constant device exits 77 with its own reason, which the skip line quotes.
+    result = run_case_with_harness_result(
+        monkeypatch, tmp_path, 77, "device: X\nunsupported: need 144 push constant bytes, device has 128\n")
+    assert result is None
+    assert "SKIP (unsupported: need 144 push constant bytes, device has 128)" in capsys.readouterr().out
+
+
+def test_unsupported_without_a_reason_line_still_skips(monkeypatch, tmp_path, capsys):
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 77, "device: X\n") is None
+    assert "SKIP (the device does not support the set)" in capsys.readouterr().out
+
+
+def test_a_harness_error_is_a_failure_not_a_skip(monkeypatch, tmp_path, capsys):
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 1, "device: X\nvkCreateDevice failed\n") is False
+    out = capsys.readouterr().out
+    assert "FAIL (vkCreateDevice failed)" in out and "SKIP" not in out
 
 
 def test_self_test_runs():

@@ -18,6 +18,7 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import zlib
 
 ENTRY = re.compile(rb"([\x21-\x7e]{3,200})\x00(.)(....)(....)\3(....)", re.DOTALL)
@@ -83,10 +84,11 @@ def main(argv=None) -> int:
         ap.error(f"{src} is not a file")
     if os.path.getsize(src) == 0:
         ap.error(f"{src} is empty")
+    if os.path.isfile(out):
+        ap.error(f"{out} is a file, not a folder")
     os.makedirs(out, exist_ok=True)
     index, seen, used, bad = [], {}, set(), 0
-    with open(src, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         for mt in ENTRY.finditer(m):
             name = mt.group(1).decode("latin-1")
             stored = struct.unpack("<I", mt.group(3))[0]
@@ -115,12 +117,13 @@ def main(argv=None) -> int:
             index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],
                           "stage": stage, "sm": sm, "size": size, "parts": {k: v[1] for k, v in p.items()}})
     # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
-    tmp = os.path.join(out, "index.json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=1)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, os.path.join(out, "index.json"))
+    with tempfile.TemporaryDirectory(dir=out, prefix=".shader-index-") as staging:
+        tmp = os.path.join(staging, "index.json")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(out, "index.json"))
     from collections import Counter
     print(f"{len(index)} shaders carved, {bad} candidates rejected")
     print("stages:", dict(Counter(e["stage"] for e in index)))

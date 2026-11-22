@@ -4,7 +4,9 @@
 
 Every byte here is built by the test. No game file or game asset name is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "story_index.py")
@@ -233,6 +236,15 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["signatures"]["psin"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["page-directory"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["rsc8"]["files"], 1)
+
+    def test_cli_reports_a_report_write_error(self):
+        out = os.path.join(self.root, "index.json")
+        err = io.StringIO()
+        with (mock.patch.object(sys, "argv", [TOOL, self.rpf, out, "--quiet"]),
+              mock.patch.object(story_index, "write_output", side_effect=OSError("disk full")),
+              contextlib.redirect_stderr(err)):
+            self.assertEqual(story_index.main(), 2)
+        self.assertIn(f"{out}: disk full", err.getvalue())
 
     def test_unwritable_or_bad_output_path_fails_before_the_scan(self):
         for out in (os.path.join(self.root, "no_such_folder", "x.json"),

@@ -8,12 +8,12 @@
 	s_mov_b32 s4, s0
 	s_mov_b32 s5, s1
 	s_mov_b32 s6, s2
-	s_mov_b32 s7, 0x32fac
+	s_mov_b32 s7, 0x31032fac
 	buffer_load_format_xyzw v[4:7], v3, s[4:7], 0 offen
 	s_waitcnt vmcnt(0)
 	v_mov_b32_e32 v8, 0
 	buffer_store_dwordx4 v[4:7], v8, s[0:3], 0 offen
-	s_mov_b32 s7, 0x2cfac
+	s_mov_b32 s7, 0x3102cfac
 	v_mov_b32_e32 v9, 52
 	buffer_load_format_xyzw v[4:7], v9, s[4:7], 0 offen
 	s_waitcnt vmcnt(0)
@@ -27,10 +27,10 @@
 	v_mov_b32_e32 v11, 0
 	v_mov_b32_e32 v12, 0.5
 	v_mov_b32_e32 v13, 1.0
-	s_mov_b32 s7, 0x32fac
+	s_mov_b32 s7, 0x31032fac
 	v_mov_b32_e32 v9, 56
 	buffer_store_format_xyzw v[10:13], v9, s[4:7], 0 offen
-	s_mov_b32 s7, 0x2cfac
+	s_mov_b32 s7, 0x3102cfac
 	v_mov_b32_e32 v9, 60
 	buffer_store_format_xyzw v[10:13], v9, s[4:7], 0 offen
 	s_endpgm

@@ -370,6 +370,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not game_dir:
             parser.error("target directory required when using 'verify'")
     else:
+        if args.target_dir is not None:
+            parser.error(f"unrecognized arguments: {args.target_dir}")
         game_dir = args.cmd_or_dir
 
     below_normal()

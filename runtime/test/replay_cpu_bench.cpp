@@ -2,13 +2,16 @@
 // (CommandList), check it (prepare) and write it (emit). Every Vulkan entry point is a no-op that only counts its
 // calls, and resources are fake bindings, so no GPU, driver or game files are involved and the numbers are the
 // layer's own cost. The real ExecuteCommandLists adds the driver's vkCmd* cost on top.
+// A binary occlusion resolve counts as one mock call at the emit boundary. The benchmark excludes recording
+// the Vulkan commands inside the queue's binary resolve helper.
 //
 // Two measurements:
 //   - per command type: a list of N commands of one kind (transitions come in pairs, queries as Begin+End),
 //     timed on its own, so one slow kind stands out;
 //   - a frame: L lists of P passes, each pass a mix of what a frame without draws records today (barriers,
 //     whole-view and rectangle clears, buffer and texture copies, a UAV clear, queries and predication).
-// prepare includes allocating the PreparedList and emit includes freeing it, as VulkanQueue::execute does.
+// prepare includes allocating the PreparedList and planning the query batch. emit includes committing query state
+// and freeing the preparation data, as VulkanQueue::execute does.
 // Each figure is the median over --reps runs after --warmup runs. Heap allocations (global operator new) and
 // Vulkan calls are counted per command; both are deterministic, unlike the times.
 //
@@ -30,7 +33,6 @@
 #include <functional>
 #include <iterator>
 #include <map>
-#include <memory>
 #include <new>
 #include <string>
 #include <tuple>
@@ -162,6 +164,8 @@ struct Scene {
         vk.end_query = nop<PFN_vkCmdEndQuery>();
         vk.write_timestamp = nop<PFN_vkCmdWriteTimestamp>();
         vk.copy_query_pool_results = nop<PFN_vkCmdCopyQueryPoolResults>();
+        vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
+                                          VkDeviceSize) { ++g_vk_calls; };
         vk.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer,
                                              range.layerCount, r.format);
@@ -325,17 +329,36 @@ Result run(Scene& scene, std::size_t lists, Build&& build, int reps, int warmup)
         }
         const auto t1 = clock::now();
         const std::size_t a1 = g_allocations;
-        // A new PreparedList per list and execution, as VulkanQueue::execute makes; freeing it counts in emit.
-        auto prepared = std::make_unique<std::vector<PreparedList>>(lists);
-        for (std::size_t i = 0; i < lists; ++i) {
-            const ReplayResult r = prepare(recorded[i], resolve, scene.vk, (*prepared)[i]);
-            if (r != ReplayResult::success) out.replay = r;
+        clock::time_point t2;
+        std::size_t a2, v2;
+        {
+            std::vector<PreparedList> prepared(lists);
+            QueryReplay queries;
+            for (std::size_t i = 0; i < lists; ++i) {
+                if (const auto r = prepare(recorded[i], resolve, scene.vk, prepared[i]); r != ReplayResult::success) {
+                    out.replay = r;
+                    break;
+                }
+            }
+            if (out.replay == ReplayResult::success) {
+                for (auto& list : prepared) {
+                    if (const auto r = queries.plan(list); r != ReplayResult::success) {
+                        out.replay = r;
+                        break;
+                    }
+                }
+            }
+            t2 = clock::now();
+            a2 = g_allocations;
+            v2 = g_vk_calls;
+            if (out.replay == ReplayResult::success) {
+                std::uint32_t open_labels = 0;
+                for (const auto& list : prepared)
+                    emit(list, command_buffer, scene.vk, &scene.tracker, &open_labels);
+                close_labels(command_buffer, scene.vk, open_labels);
+                queries.commit();  // every simulated submission completes immediately
+            }
         }
-        const auto t2 = clock::now();
-        const std::size_t a2 = g_allocations, v2 = g_vk_calls;
-        if (out.replay == ReplayResult::success)
-            for (const auto& list : *prepared) emit(list, command_buffer, scene.vk, &scene.tracker);
-        prepared.reset();
         const auto t3 = clock::now();
         const std::size_t a3 = g_allocations, v3 = g_vk_calls;
 

@@ -1,8 +1,8 @@
 # Buffer bounds: V# `OOB_SELECT`, measured on hardware
 
 Which buffer accesses the hardware treats as out of range, per the V# `OOB_SELECT` field (word 3 bits [29:28]),
-measured natively on AMD GPUs (SHADER-116). The translator does not read this field yet; SHADER-110 (@AlxcBTW)
-makes it pick the bounds check by mode, and the contract row is "Buffer bounds checking" in
+measured natively on AMD GPUs (SHADER-116). The translator reads this field and picks the bounds check by mode
+(SHADER-110); the contract row is "Buffer bounds checking" in
 [design.md](design.md). Out of range, a load returns 0 and a store or atomic does not touch memory.
 
 ## Measured rules

@@ -134,7 +134,7 @@ def measure(V, P, T):
     for bname, bsize, bptr in blocks:
         if bname not in (PROP_LIST, GRASS_LIST):
             continue
-        lsize = structs[bname][0]
+        lsize = structs.get(bname, (0,))[0]   # a block the schema has no struct for is unresolved
         buf, boff = resolve(V, P, bptr)
         if buf is None or lsize == 0 or bsize % lsize:
             add(T, "list_blocks_unresolved")

@@ -1,7 +1,7 @@
 ; Texture sampling test with d16: samples a 2D texture into packed f16 pairs (v4=r|g<<16, v5=b|a<<16),
 ; then unpacks the four f16 halves back to f32 and outputs to mrt0.
 ; Run: vk_texture_test vs_ids.spv ps_texture_sample_d16.spv out.raw 0 0 0 0 0
-;   -> verifies center pixel = (128/255, 128/255, 128/255, 1.0) -> exact f16 (0x3804 = 0.501953125, 0x3804, 0x3804, 0x3c00 = 1.0).
+;   -> 64x64 RGBA32F readback: each component is the nearest gradient texel's UNORM8 value rounded to f16, then widened.
 v_interp_p1_f32_e32 v2, v0, attr0.x
 v_interp_p2_f32_e32 v2, v1, attr0.x
 v_interp_p1_f32_e32 v3, v0, attr0.y

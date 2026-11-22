@@ -338,6 +338,15 @@ def write_csv(path: str, rows: list) -> None:
         w.writerows(rows)
 
 
+def same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carve directory or .rpf archive")
@@ -345,6 +354,8 @@ def main() -> int:
     ap.add_argument("--csv", help="write one row per payload to this CSV")
     ap.add_argument("--json", help="write the summary and rows to this JSON")
     a = ap.parse_args()
+    if a.csv and a.json and same_report_path(a.csv, a.json):
+        ap.error("--csv and --json must use different paths")
 
     if not os.path.exists(a.target):
         print(f"ERROR: {a.target} does not exist", file=sys.stderr)

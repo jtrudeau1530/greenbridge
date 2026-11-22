@@ -427,6 +427,58 @@ int compare_format_info(ID3D12Device* ours, const vktest::Device& vk) {
     return mismatches;
 }
 
+// D3D-122: descriptions GetCopyableFootprints must refuse (false) or answer (true), as the PC runtime does. All were
+// measured on WARP. Also on an NVIDIA GPU: texture Width/Height 0, Count 0, Count 4 without a render-target or depth
+// flag, Count 3; buffer Width 0, Height 2, Format, MipLevels 0, Layout, Count 0; and the buffer render-target, extra
+// mip, ROW_MAJOR and Quality 1 controls. compare_footprints checks them against the host, the main test on their own.
+std::vector<std::pair<D3D12_RESOURCE_DESC, bool>> footprint_validity_cases() {
+    const auto rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const auto rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    std::vector<std::pair<D3D12_RESOURCE_DESC, bool>> cases;
+    const auto add = [&](D3D12_RESOURCE_DESC d, bool valid, auto&& change) {
+        change(d);
+        cases.push_back({d, valid});
+    };
+    const auto buffer = buffer_desc(256);
+    add(buffer, false, [](auto& d) { d.Width = 0; });
+    add(buffer, false, [](auto& d) { d.Height = 2; });
+    add(buffer, false, [](auto& d) { d.DepthOrArraySize = 2; });
+    add(buffer, false, [](auto& d) { d.MipLevels = 0; });
+    add(buffer, false, [](auto& d) { d.MipLevels = 2; });
+    add(buffer, false, [&](auto& d) { d.Format = rgba; });
+    add(buffer, false, [](auto& d) { d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; });
+    add(buffer, false, [](auto& d) { d.SampleDesc.Count = 0; });
+    add(buffer, false, [](auto& d) { d.SampleDesc.Count = 2; });
+    add(buffer, false, [](auto& d) { d.SampleDesc.Quality = 1; });
+    add(buffer, false, [](auto& d) { d.Alignment = 4096; });
+    add(buffer, true, [&](auto& d) { d.Flags = rt; });
+    add(buffer, true, [](auto& d) { d.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; });
+
+    const auto texture = texture_desc(16, 16, rgba, D3D12_RESOURCE_FLAG_NONE);
+    add(texture, false, [](auto& d) { d.Width = 0; });
+    add(texture, false, [](auto& d) { d.Height = 0; });
+    add(texture, false, [](auto& d) { d.DepthOrArraySize = 0; });
+    add(texture, false, [](auto& d) { d.SampleDesc.Count = 0; });
+    add(texture, false, [](auto& d) { d.SampleDesc.Count = 4; });  // no render-target or depth flag
+    add(texture, false, [](auto& d) { d.SampleDesc.Count = 4, d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; });
+    add(texture, false, [&](auto& d) { d.SampleDesc.Count = 3, d.Flags = rt; });
+    add(texture, false, [&](auto& d) { d.SampleDesc.Count = 4, d.Flags = rt, d.MipLevels = 2; });
+    add(texture, false, [&](auto& d) { d.SampleDesc.Count = 4, d.Flags = rt, d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; });
+    add(texture, true, [&](auto& d) { d.SampleDesc.Count = 4, d.Flags = rt; });
+    add(texture, true, [](auto& d) { d.MipLevels = 9; });  // past the full chain
+    add(texture, true, [](auto& d) { d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; });
+    add(texture, true, [](auto& d) { d.SampleDesc.Quality = 1; });
+    add(texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), true,
+        [](auto& d) { d.SampleDesc.Count = 4; });
+
+    add(line_desc(16, 1, 1, rgba), false, [](auto& d) { d.Width = 0; });
+    add(line_desc(16, 1, 1, rgba), false, [&](auto& d) { d.SampleDesc.Count = 2, d.Flags = rt; });
+    add(volume_desc(1), false, [](auto& d) { d.DepthOrArraySize = 0; });
+    add(volume_desc(1), false, [](auto& d) { d.Height = 0; });
+    add(volume_desc(1), false, [&](auto& d) { d.SampleDesc.Count = 2, d.Flags = rt; });
+    return cases;
+}
+
 // GetCopyableFootprints must match the PC runtime's exactly, since applications size and fill upload buffers from
 // it. Unaligned block-compressed cases are skipped when the host runtime cannot answer them, so the rest still
 // run. Returns the number of mismatches, or -1 when the host has no D3D12 device to compare with.
@@ -439,7 +491,7 @@ int compare_footprints(ID3D12Device* ours) {
         D3D12_RESOURCE_DESC desc;
         UINT subresources;
     };
-    const Case cases[] = {
+    std::vector<Case> cases = {
         {volume_desc(5), 5},
         {line_desc(13, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM), 4},
         {line_desc(5, 3, 2, DXGI_FORMAT_R8G8B8A8_UNORM), 6},
@@ -472,6 +524,7 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
     };
+    for (const auto& c : footprint_validity_cases()) cases.push_back({c.first, 1});
     int mismatches = 0;
     for (const Case& c : cases) {
         if (!unaligned_blocks && uses_unaligned_blocks(c.desc)) {
@@ -547,6 +600,11 @@ int compare_allocation_info(ID3D12Device* ours) {
     bad_line.Height = 2;
     D3D12_RESOURCE_DESC line_rt = line_desc(8, 1, 1, rgba8);
     line_rt.Flags = rt;
+    const auto small_volume = [&](UINT width, UINT height, UINT16 depth, DXGI_FORMAT format) {
+        D3D12_RESOURCE_DESC desc = with(texture_desc(width, height, format, none, 1, depth), k4);
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        return desc;
+    };
     const Case cases[] = {
         {"buffer 300", buffer_desc(300), 0},
         {"buffer 64 KiB", buffer_desc(65536), 0},
@@ -560,6 +618,46 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"16x16 small render target", with(texture_desc(16, 16, rgba8, rt), k4), 16 * 16 * 4},
         {"1024x1024 small (too big)", with(texture_desc(1024, 1024, rgba8, none), k4), 1024 * 1024 * 4},
         {"64x64 BC1 small", with(texture_desc(64, 64, DXGI_FORMAT_BC1_UNORM, none, 3), k4), 16 * 16 * 8},
+        // 4 KiB alignment counts the 4 KiB tiles of one slice's top mip (at most 16), not the whole resource.
+        {"128x128 full chain small", with(texture_desc(128, 128, rgba8, none, 0), k4), 128 * 128 * 4},
+        {"64x64 array of 8 small", with(texture_desc(64, 64, rgba8, none, 1, 8), k4), 64 * 64 * 4 * 8},
+        {"16x16 array of 256 small", with(texture_desc(16, 16, rgba8, none, 1, 256), k4), 16 * 16 * 4 * 256},
+        {"256x64 full chain small", with(texture_desc(256, 64, rgba8, none, 0), k4), 256 * 64 * 4},
+        {"1D 16384 small", with(line_desc(16384, 1, 1, rgba8), k4), 16384 * 4},
+        {"R8 32x32x64 volume small", small_volume(32, 32, 64, DXGI_FORMAT_R8_UNORM), 32 * 32 * 64},
+        {"R16 16x16x128 volume small", small_volume(16, 16, 128, DXGI_FORMAT_R16_FLOAT), 16 * 16 * 128 * 2},
+        {"33x480 small (30 tiles)", with(texture_desc(33, 480, rgba8, none), k4), 33 * 480 * 4},
+        {"128x129 small (20 tiles)", with(texture_desc(128, 129, rgba8, none), k4), 128 * 129 * 4},
+        {"R8 65x1000 small (32 tiles)", with(texture_desc(65, 1000, DXGI_FORMAT_R8_UNORM, none), k4), 65 * 1000},
+        {"100x100 volume small (49 tiles)", small_volume(100, 100, 1, rgba8), 100 * 100 * 4},
+        {"R16 16x8x256 volume small (32 tiles)", small_volume(16, 8, 256, DXGI_FORMAT_R16_FLOAT), 16 * 8 * 256 * 2},
+        // One shape per element size, each exactly 16 tiles along one axis, then one texel more.
+        {"R8 16x256x16 volume small", small_volume(16, 256, 16, DXGI_FORMAT_R8_UNORM), 16 * 256 * 16},
+        {"R8 16x257x16 volume small (17 tiles)", small_volume(16, 257, 16, DXGI_FORMAT_R8_UNORM), 16 * 257 * 16},
+        {"R16 256x16x8 volume small", small_volume(256, 16, 8, DXGI_FORMAT_R16_FLOAT), 256 * 16 * 8 * 2},
+        {"R16 257x16x8 volume small (17 tiles)", small_volume(257, 16, 8, DXGI_FORMAT_R16_FLOAT), 257 * 16 * 8 * 2},
+        {"rgba8 256x8x8 volume small", small_volume(256, 8, 8, rgba8), 256 * 8 * 8 * 4},
+        {"rgba8 257x8x8 volume small (17 tiles)", small_volume(257, 8, 8, rgba8), 257 * 8 * 8 * 4},
+        {"rgba16 8x128x8 volume small", small_volume(8, 128, 8, DXGI_FORMAT_R16G16B16A16_FLOAT), 8 * 128 * 8 * 8},
+        {"rgba16 8x129x8 volume small (17 tiles)", small_volume(8, 129, 8, DXGI_FORMAT_R16G16B16A16_FLOAT),
+         8 * 129 * 8 * 8},
+        {"rgba32 128x8x4 volume small", small_volume(128, 8, 4, DXGI_FORMAT_R32G32B32A32_FLOAT), 128 * 8 * 4 * 16},
+        {"rgba32 129x8x4 volume small (17 tiles)", small_volume(129, 8, 4, DXGI_FORMAT_R32G32B32A32_FLOAT),
+         129 * 8 * 4 * 16},
+        {"BC1 32x512x8 volume small", small_volume(32, 512, 8, DXGI_FORMAT_BC1_UNORM), 8 * 128 * 8 * 8},
+        {"BC1 32x516x8 volume small (17 tiles)", small_volume(32, 516, 8, DXGI_FORMAT_BC1_UNORM), 8 * 129 * 8 * 8},
+        // Simultaneous access is for single-sampled color only; a volume cannot be a depth buffer.
+        {"depth with simultaneous access",
+         texture_desc(64, 64, DXGI_FORMAT_D32_FLOAT,
+                      D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS), 0},
+        {"4x MSAA with simultaneous access",
+         with(texture_desc(64, 64, rgba8, rt | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS), 0, 4), 0},
+        {"depth-stencil volume", [&] {
+             D3D12_RESOURCE_DESC desc = small_volume(8, 8, 4, DXGI_FORMAT_D32_FLOAT);
+             desc.Alignment = 0;
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+             return desc;
+         }(), 0},
         {"64x64 depth", texture_desc(64, 64, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
          64 * 64 * 4},
         {"8x8 array of 6", texture_desc(8, 8, rgba8, none, 4, 6), 8 * 8 * 4 * 6},
@@ -622,6 +720,25 @@ int compare_allocation_info(ID3D12Device* ours) {
     const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 3, buffers);
     const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 3, buffers);
     if (a.SizeInBytes != b.SizeInBytes || a.Alignment != b.Alignment) mismatch("three buffers", a, b);
+    // The total is rounded up to the largest alignment, saturates rather than wraps, and is aligned 1 when empty.
+    // The textures here are smaller than their alignment, so their sizes are fixed too.
+    const D3D12_RESOURCE_DESC to_total[][2] = {
+        {buffer_desc(300), with(texture_desc(16, 16, rgba8, none), k4)},
+        {with(texture_desc(64, 64, rgba8, rt), 0, 4), buffer_desc(300)},
+        {buffer_desc(1ull << 63), buffer_desc(1ull << 63)},
+        {buffer_desc(UINT64_MAX - k64), buffer_desc(1)},
+    };
+    const char* total_names[] = {"buffer + 4 KiB texture", "4x MSAA + buffer", "two 2^63 buffers",
+                                 "largest buffer + buffer"};
+    for (int i = 0; i < 4; ++i) {
+        const D3D12_RESOURCE_ALLOCATION_INFO x = ours->GetResourceAllocationInfo(0, 2, to_total[i]);
+        const D3D12_RESOURCE_ALLOCATION_INFO y = host->GetResourceAllocationInfo(0, 2, to_total[i]);
+        if (x.SizeInBytes != y.SizeInBytes || x.Alignment != y.Alignment) mismatch(total_names[i], x, y);
+    }
+    const D3D12_RESOURCE_ALLOCATION_INFO empty_a = ours->GetResourceAllocationInfo(0, 0, nullptr);
+    const D3D12_RESOURCE_ALLOCATION_INFO empty_b = host->GetResourceAllocationInfo(0, 0, nullptr);
+    if (empty_a.SizeInBytes != empty_b.SizeInBytes || empty_a.Alignment != empty_b.Alignment)
+        mismatch("no resources", empty_a, empty_b);
 
     Ref<ID3D12Device8> ours8;
     if (FAILED(ours->QueryInterface(IID_PPV_ARGS(&ours8.p)))) return mismatches + 1;
@@ -1732,6 +1849,18 @@ int main() {
         }
         EXPECT(device->GetNodeCount() == 1);
 
+        // _COM_Outptr_: a failed slot 14 leaves NULL in the caller's output, as the inner device does.
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC empty{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 0};
+            void* inner_out = reinterpret_cast<void*>(0x1111);
+            EXPECT(inner->CreateDescriptorHeap(&empty, __uuidof(ID3D12DescriptorHeap), &inner_out) == E_INVALIDARG &&
+                   inner_out == nullptr);
+            void* proxy_out = reinterpret_cast<void*>(0x1111);
+            EXPECT(device->CreateDescriptorHeap(&empty, __uuidof(ID3D12DescriptorHeap), &proxy_out) ==
+                   E_INVALIDARG);
+            EXPECT(proxy_out == nullptr);
+        }
+
         // BC1 can be sampled, but it cannot be an attachment or a storage image.
         if (d.bc) {
             const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -1956,6 +2085,18 @@ int main() {
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
         EXPECT(footprint_mismatches <= 0);
+        {
+            // D3D-122: the same refusals without a host device (CI's llvmpipe), so they can't regress unseen.
+            const auto cases = footprint_validity_cases();
+            for (size_t i = 0; i < cases.size(); ++i) {
+                UINT64 total = 0;
+                device->GetCopyableFootprints(&cases[i].first, 0, 1, 0, nullptr, nullptr, nullptr, &total);
+                if ((total != UINT64_MAX) != cases[i].second)
+                    std::fprintf(stderr, "footprint validity case %zu: total %llu, expected %s\n", i,
+                                 (unsigned long long)total, cases[i].second ? "a footprint" : "the failure answer");
+                EXPECT((total != UINT64_MAX) == cases[i].second);
+            }
+        }
 
         // Shader model and root signature (D3D-86): the answers are only useful if the game can rely on them, so
         // pin both the ceiling and the refusal cases rather than just comparing with the host.

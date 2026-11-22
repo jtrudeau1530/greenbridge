@@ -41,7 +41,10 @@ code from the mapped images runs. TLS reserves its module index through the runt
 
 `gta6rt --init <image>` runs the same mapping and then `Loader::initialise()`: each module's TLS
 callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
-run.
+run. When the loader is destroyed, initialised modules receive TLS callbacks and DLL entry-point calls with
+`DLL_PROCESS_DETACH`, in reverse initialisation order. All mapped images, unwind tables and static TLS stay
+available until these notifications finish, so DLLs can release resources such as FLS callbacks safely. The reserved
+argument is null (explicit unload). A map-only load receives no detach notifications.
 
 `--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
 print the usage and exit 2 before anything is mapped.
@@ -159,8 +162,9 @@ ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure
 ```
 
 On Windows the build configures the CPU tests that do not need a GPU or game files, including the
-root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools are built
-when the Vulkan SDK is found:
+root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools and
+D3D12-over-Vulkan COM targets are built when Vulkan headers are found (via `VULKAN_SDK`, an installed
+SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulkan-Headers release):
 
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
@@ -261,4 +265,17 @@ Vulkan GPU and runs explicitly.
 ```powershell
 $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
+```
+
+### Depth and stencil resolves
+
+`d3d12_depth_resolve_test` resolves one plane of a 4x D32 or D24S8 target into a 1x one with
+`ResolveSubresourceRegion` (MIN and MAX of depth or stencil, AVERAGE of depth by its own format; whole and by
+rectangle) on the Vulkan-backed device and on Windows D3D12 (the default adapter and WARP), and compares the
+destinations read back. Calls the layer refuses must fail `Close` and leave the destination as cleared. Clears give
+every sample of a pixel one value, so the modes over differing samples are not checked. It needs a Vulkan GPU.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_depth_resolve_test.exe
 ```

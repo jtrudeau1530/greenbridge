@@ -63,8 +63,9 @@ class JenkinsHashTest(unittest.TestCase):
             self.assertEqual(h & 0xFFFFFFFF, h)
 
     def test_latin1_encoding_and_replacement(self):
-        # Latin-1 character in range 0-255
-        self.assertEqual(hashdict.joaat("café"), hashdict.joaat("caf\xe9"))
+        # Latin-1 character in range 0-255: é hashes as the one byte 0xE9. "café" and "caf\xe9" are the same
+        # Python string, so the value is pinned (Latin-1 joaat, computed independently) instead of compared.
+        self.assertEqual(hashdict.joaat("caf\xe9"), 0xEEFBF723)
         # Character outside Latin-1 range is replaced with '?'
         self.assertEqual(hashdict.joaat("caf\u20ac"), hashdict.joaat("caf?"))
 
@@ -103,6 +104,43 @@ class StringHarvestTest(unittest.TestCase):
         hashdict.harvest(data, found4, minlen=4)
         self.assertNotIn("cde", found4)
         self.assertIn("ghij", found4)
+
+
+class LongRunHarvestTest(unittest.TestCase):
+    """A printable run longer than hashdict.MAX_NAME_LEN used to be cut at 201 characters, and the next match
+    started mid-run, so the component straddling the cut was lost and two fragments were added instead."""
+
+    def harvest(self, text):
+        found = set()
+        hashdict.harvest(b"\x00" + text.encode("ascii") + b"\x00", found, minlen=3)
+        return found
+
+    def test_long_path_keeps_the_component_that_straddles_the_old_cut(self):
+        dirs = [f"dir_{i:02d}_abc" for i in range(15)]
+        dirs[-1] += "x" * (181 - len("/".join(dirs)))
+        path = "platform:/levels/" + "/".join(dirs) + "/props_lev_des_building_name.ytd"
+        self.assertEqual(len(path), 230)
+        self.assertTrue(path[:201].endswith("/pr"))   # the old pattern cut inside "props_..."
+        found = self.harvest(path)
+        for part in ["platform", "levels", "props_lev_des_building_name", "ytd"] + dirs:
+            self.assertIn(part, found)
+        # no truncated prefix, no fragment of the straddling component, and the 230-character run is not a name
+        self.assertNotIn(path, found)
+        self.assertNotIn(path[:201], found)
+        self.assertNotIn("ops_lev_des_building_name", found)
+        self.assertNotIn("ops_lev_des_building_name.ytd", found)
+
+    def test_delimiter_free_token_over_the_cap_adds_nothing(self):
+        token = "a" * (hashdict.MAX_NAME_LEN + 1)
+        self.assertEqual(self.harvest(token), set())
+
+    def test_run_of_exactly_the_cap_is_added_whole(self):
+        token = "n" * hashdict.MAX_NAME_LEN
+        self.assertEqual(self.harvest(token), {token})
+        # with a delimiter: the whole run and its one piece of at least minlen ("d" is too short)
+        path = "d/" + "n" * (hashdict.MAX_NAME_LEN - 2)
+        self.assertEqual(len(path), hashdict.MAX_NAME_LEN)
+        self.assertEqual(self.harvest(path), {path, "n" * (hashdict.MAX_NAME_LEN - 2)})
 
 
 class LookupCLITest(unittest.TestCase):

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -206,12 +207,42 @@ class CliTest(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm"])
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json", "--limit", "0x1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm"])
         # A negative limit sliced from the end (paths[:-1] dropped b.fssm) instead of being refused.
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "-1"],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
         self.assertIn("must be 0 or more", p.stderr)
         self.assertEqual(p.stdout, "")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "nope"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("invalid int value: 'nope'", p.stderr)
+        self.assertNotIn("non_negative", p.stderr)
+
+    def test_ignores_fssm_subdirectories_and_reports_read_errors_cleanly(self):
+        os.makedirs(os.path.join(self.fssm_dir, "nested.fssm"))
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm", "b.fssm"])
+
+        err = PermissionError(13, "Permission denied", os.path.join(self.fssm_dir, "a.fssm"))
+        with mock.patch("fssm_header.summarize", side_effect=err):
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
+                orig_stderr = sys.stderr
+                try:
+                    sys.stderr = stderr_file
+                    rc = fssm_header.main([self.fssm_dir])
+                finally:
+                    sys.stderr = orig_stderr
+                stderr_file.seek(0)
+                err_out = stderr_file.read()
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot read", err_out)
 
     def test_text_tally(self):
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir], capture_output=True, text=True)

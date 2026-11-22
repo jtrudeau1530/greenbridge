@@ -214,6 +214,17 @@ class ScanTest(unittest.TestCase):
         self.assertIn("root_node_invalid", text.splitlines()[0])
         self.assertIn("bvh4:0x81020006", text)
 
+    def test_cli_rejects_colliding_output_paths(self):
+        out = os.path.join(self.dir, "index.json")
+        alias = os.path.join(self.dir, ".", "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", out, "--csv", alias])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--out and --csv must use different paths", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
     def test_directory_of_payloads(self):
         for name, payload in (("a.bin", bvh_payload(4)), ("b.bin", instance_payload()), ("c.bin", b"z" * 80)):
             with open(os.path.join(self.dir, name), "wb") as f:
@@ -284,6 +295,13 @@ class ScanTest(unittest.TestCase):
             self.assertIn("single archive", err.getvalue())
             self.assertEqual(so.getvalue(), "")
             self.assertFalse(os.path.exists(out))
+
+
+def setUpModule():
+    # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
 if __name__ == "__main__":

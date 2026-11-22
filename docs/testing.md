@@ -113,6 +113,14 @@ To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W
 `check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
 fails.
 
+## GPUs without mesh shaders (NVIDIA Pascal and older)
+
+Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
+runs them anyway, set `LEONIDA_MESH_COMPUTE=1` for `run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1` on a
+32-wide GPU (every mesh shader is wave64). The mesh shaders are then translated with `--mesh-compute`, dispatched as
+compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
+`bufferDeviceAddress` and `shaderInt64` instead.
+
 ## Without a GPU: Mesa llvmpipe
 
 Mesa's llvmpipe is a software Vulkan driver (`mesa-vulkan-drivers` on Debian and Ubuntu). CI runs the suite on it
@@ -135,6 +143,25 @@ the 32-lane tests `ps_bitmask_perm`, `cs_wqm_w32` and `cs_w32_lane_wrap` skip in
 instruction"), which is why the second run is limited to compute. llvmpipe is not a substitute for a result from a
 real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
 differences.
+
+## GPUs without fragment barycentrics (NVIDIA Volta, Pascal and older)
+
+`ps_bary`, `ps_uniform_branch` and `ps_scc_mask32` read raw barycentrics, which need
+`VK_KHR_fragment_shader_barycentric`; so do `ps_interp_f16_high` and `ms_f16_pack` (16-bit interpolants are
+`PerVertexKHR` inputs, and `--bary-fallback` cannot express them, so they skip under it). Where the device lacks it they're skipped; that's expected, not a failure. To
+`VK_KHR_fragment_shader_barycentric`. NVIDIA has it from Turing on; Volta (V100, Titan V) and older lack it, as do
+llvmpipe and some other drivers. Where the device lacks it they're skipped; that's expected, not a failure. To
+test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`** (or
+for `run_gpu_tests.py`). The shaders are then translated with `--bary-fallback` and drawn through a pass-through
+geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric fallback"), so the device needs
+geometry shaders instead.
+
+## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
+
+`ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;
+without it they're skipped, which is expected, not a failure. To test the fallback, set `LEONIDA_TEXOFF_FALLBACK=1`
+**for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
+(`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
 
 ## Choosing the GPU
 
