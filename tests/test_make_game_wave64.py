@@ -163,6 +163,46 @@ class DetectionGapsTest(unittest.TestCase):
         self.assertTrue(self.decide(real_format(("A", 32, ALL)), '{"native64": true}'))     # vulkaninfo wins: on
 
 
+class Rdna2AmdWindowsTest(unittest.TestCase):
+    """#857: AMD's Windows compiler for RDNA2 crashes on emulated LDS compute shaders. When the runtime's GPU is one
+    and runs wave64 natively, auto leaves emulation off even if another device (an Intel iGPU) is 32-wide."""
+
+    RX6700 = '{"device": "AMD Radeon RX 6700", "native64": true, "rdna2_amd_windows": true}'
+
+    def decide(self, vulkaninfo, tool, mode="auto"):
+        def fake_run(args, **kw):
+            if os.path.basename(str(args[-1])) == "vk_subgroup_info.py":
+                return subprocess.CompletedProcess(args, 0 if "native64" in tool else 1, stdout=tool, stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=vulkaninfo, stderr="")
+        logged = []
+        with mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(make_game, "log", logged.append):
+            return make_game.wave64_emulate(mode), logged
+
+    def test_intel_igpu_and_rdna2_card_leaves_it_off(self):
+        on, logged = self.decide(real_format(("Intel iGPU", 32, ALL), ("AMD Radeon RX 6700", 64, ALL)), self.RX6700)
+        self.assertFalse(on)
+        self.assertIn("#857", logged[-1])
+        self.assertIn("AMD Radeon RX 6700", logged[-1])
+
+    def test_other_runtime_gpus_keep_emulation_on(self):
+        two = real_format(("Intel iGPU", 32, ALL), ("Big GPU", 64, ALL))
+        for label, tool in (("rdna3", '{"native64": true, "rdna2_amd_windows": false}'),
+                            ("older_tool_without_the_key", '{"native64": true}'),
+                            ("rdna2_without_native64", '{"native64": false, "rdna2_amd_windows": true}'),
+                            ("unreadable", '{"error": "no Vulkan loader found"}'),
+                            ("not_json", "not json")):
+            with self.subTest(case=label):
+                self.assertTrue(self.decide(two, tool)[0])
+
+    def test_rdna2_only_pc_is_unchanged(self):
+        self.assertFalse(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700)[0])
+
+    def test_explicit_on_is_taken_as_given(self):
+        self.assertTrue(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700, mode="on")[0])
+
+
 class KeepEmulatedFlagTest(unittest.TestCase):
     """Only the default auto may keep emulated shaders; an explicit on or off is taken as given."""
 
