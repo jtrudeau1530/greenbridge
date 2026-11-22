@@ -213,6 +213,94 @@ class ScalarInterpreter:
         return result
 
 
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def get_vgpr(self, lane: int, index: int) -> int:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane {lane} out of range [0, {self.num_lanes - 1}]")
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        return self.vgprs[lane][index] & MASK32
+
+    def set_vgpr(self, lane: int, index: int, val: int) -> None:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane {lane} out of range [0, {self.num_lanes - 1}]")
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        self.vgprs[lane][index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        self.sgprs[index] = val & MASK32
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VLerpOperand, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, Reg32):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(lane, op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.value & MASK32
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VLerpU8Instruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+        # Atomic read phase across all lanes
+        s0_vals = [
+            self.resolve_lane_operand(instr.src0, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+        s1_vals = [
+            self.resolve_lane_operand(instr.src1, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+        s2_vals = [
+            self.resolve_lane_operand(instr.src2, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+
+        # Execution and selective write-back phase
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                res = oracle_v_lerp_u8(s0_vals[lane], s1_vals[lane], s2_vals[lane])
+                state.set_vgpr(lane, instr.dst.index, res)
+                results[lane] = res
+
+        return results
+
+
+
 
 
 # ==============================================================================
@@ -438,6 +526,138 @@ class TestScalarInterpreter(unittest.TestCase):
         # (0x18 + 0x30 + 1) >> 1 = (24 + 48 + 1) >> 1 = 73 >> 1 = 36 = 0x24
         self.assertEqual(res2, 0x24242424)
         self.assertEqual(self.state.get_vgpr(1), 0x24242424)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_lanes_active(self) -> None:
+        state = SIMDState(num_lanes=32)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            s0_val = pack_bytes_u32(lane * 2, lane * 3, lane * 4, lane * 5)
+            s1_val = pack_bytes_u32(10, 20, 30, 40)
+            s2_val = pack_bytes_u32(lane & 1, (lane >> 1) & 1, 0, 1)
+            state.set_vgpr(lane, 1, s0_val)
+            state.set_vgpr(lane, 2, s1_val)
+            state.set_vgpr(lane, 3, s2_val)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(2, RegType.VGPR)),
+            src2=VLerpOperand(Reg32(3, RegType.VGPR)),
+        )
+
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            expected = oracle_v_lerp_u8(
+                state.get_vgpr(lane, 1),
+                state.get_vgpr(lane, 2),
+                state.get_vgpr(lane, 3),
+            )
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+    def test_wave64_all_lanes_active(self) -> None:
+        state = SIMDState(num_lanes=64)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            state.set_vgpr(lane, 1, pack_bytes_u32(lane, lane ^ 0x55, 100, 200))
+            state.set_vgpr(lane, 2, pack_bytes_u32(50, 60, 70, 80))
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(2, RegType.VGPR)),
+            src2=VLerpOperand(Literal32(1)),
+        )
+
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 64)
+        for lane in range(64):
+            expected = oracle_v_lerp_u8(
+                state.get_vgpr(lane, 1),
+                state.get_vgpr(lane, 2),
+                1,
+            )
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+    def test_partial_exec_mask_even_lanes(self) -> None:
+        sentinel = 0xDEADBEEF
+        state = SIMDState(num_lanes=32, exec_mask=0x55555555)  # only even lanes active
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr(lane, 1, 0x10203040)
+            state.set_vgpr(lane, 2, 0x50607080)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(2, RegType.VGPR)),
+            src2=VLerpOperand(Literal32(0)),
+        )
+
+        results = interp.step(instr, state)
+        expected = oracle_v_lerp_u8(0x10203040, 0x50607080, 0)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], expected)
+                self.assertEqual(state.get_vgpr(lane, 0), expected)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+    def test_zero_exec_mask_no_modification(self) -> None:
+        sentinel = 0xCAFEBABE
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Literal32(0xFFFFFFFF)),
+            src1=VLerpOperand(Literal32(0xFFFFFFFF)),
+            src2=VLerpOperand(Literal32(1)),
+        )
+
+        results = interp.step(instr, state)
+        self.assertEqual(results, [None] * 32)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+    def test_sgpr_scalar_broadcast_across_divergent_lanes(self) -> None:
+        state = SIMDState(num_lanes=32)
+        interp = SIMDInterpreter()
+
+        state.set_sgpr(5, 0x20202020)  # broadcast to all lanes
+        for lane in range(32):
+            state.set_vgpr(lane, 1, pack_bytes_u32(lane, lane, lane, lane))
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(5, RegType.SGPR)),
+            src2=VLerpOperand(Literal32(1)),
+        )
+
+        results = interp.step(instr, state)
+        for lane in range(32):
+            expected = oracle_v_lerp_u8(
+                pack_bytes_u32(lane, lane, lane, lane),
+                0x20202020,
+                1,
+            )
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
 if __name__ == "__main__":
