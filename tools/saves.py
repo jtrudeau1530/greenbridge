@@ -100,7 +100,22 @@ def parse_jsav(d):
         body_off = d.index(b'{', table_end)
     except ValueError:
         raise ValueError('JSAV body marker not found after the entry table') from None
-    body_end = len(d.rstrip(b'\0'))
+    try:
+        body_text = d[body_off:].rstrip(b'\0').decode('utf-8')
+        _, json_end = json.JSONDecoder().raw_decode(body_text)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f'JSAV body is not valid UTF-8 JSON: {exc}') from None
+    # raw_decode returns a character offset, while the entry table uses byte offsets.
+    # The last nonzero byte is not the JSON boundary: corrupt data can follow the document's padding.
+    body_end = body_off + len(body_text[:json_end].encode('utf-8'))
+    for entry in entries:
+        start, end = entry['offset'], entry['offset'] + entry['size']
+        if start < body_off or end > body_end:
+            # Python slices silently truncate invalid ranges; never export or compare those as real blocks.
+            raise ValueError(f"JSAV entry {entry['index']} range {start:#x}..{end:#x} is outside "
+                             f"the JSON body {body_off:#x}..{body_end:#x}")
+    if body_text[json_end:].strip(' \t\r\n'):
+        raise ValueError('JSAV has non-padding data after the JSON body')
     return {'magic': 'JSAV', 'version': ver, 'code_blocks': n_code, 'script_blocks': n_script,
             'table_end': table_end, 'body_offset': body_off, 'body_end': body_end,
             'file_size': len(d)}, entries
