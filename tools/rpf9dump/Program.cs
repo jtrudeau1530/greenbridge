@@ -90,6 +90,9 @@ else if (mode == "xma")
             catch (Exception ex) { fail++; if (fail <= 5) Console.WriteLine($"  fail {e.Name}#{st.Index}: {ex.GetType().Name} {ex.Message}"); }
         }
     }
+    // make_game marks audio/xma done on exit 0, so a failed stream must fail the run to be retried.
+    Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
+    return fail != 0 ? 1 : 0;
 }
 else if (mode is "models" or "textures")
 {
