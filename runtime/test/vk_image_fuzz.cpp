@@ -204,12 +204,27 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
-    if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || !have.features.shaderInt64 ||
-        !have.features.shaderSampledImageArrayDynamicIndexing || !have.features.fragmentStoresAndAtomics ||
-        !have.features.shaderStorageImageReadWithoutFormat || !have.features.shaderStorageImageWriteWithoutFormat) {
-        std::printf("unsupported: the device lacks bufferDeviceAddress, runtimeDescriptorArray, shaderInt64, "
-                    "shaderSampledImageArrayDynamicIndexing, fragmentStoresAndAtomics or the without-format "
-                    "storage-image reads/writes\n");
+    // Name the missing feature(s): one message per run is not enough to tell which one stopped it.
+    std::string missing;
+    const auto need = [&missing](bool present, const char* name) {
+        if (present) return;
+        if (!missing.empty()) missing += ", ";
+        missing += name;
+    };
+    need(have12.bufferDeviceAddress, "bufferDeviceAddress");
+    need(have12.runtimeDescriptorArray, "runtimeDescriptorArray");
+    need(have.features.shaderInt64, "shaderInt64");
+    need(have.features.shaderSampledImageArrayDynamicIndexing, "shaderSampledImageArrayDynamicIndexing");
+    need(have.features.fragmentStoresAndAtomics, "fragmentStoresAndAtomics");
+    need(have.features.shaderStorageImageReadWithoutFormat, "shaderStorageImageReadWithoutFormat");
+    need(have.features.shaderStorageImageWriteWithoutFormat, "shaderStorageImageWriteWithoutFormat");
+    if (!missing.empty()) {
+        std::printf("unsupported: the device lacks %s\n", missing.c_str());
+        if (missing.find("shaderStorageImageReadWithoutFormat") != std::string::npos ||
+            missing.find("shaderStorageImageWriteWithoutFormat") != std::string::npos)
+            std::printf("  (the translated image_load declares the without-format storage-image capabilities: its "
+                        "uint/sint path is chosen from the T# FORMAT at run time, even when the case only reads a "
+                        "float format)\n");
         return unsupported;
     }
     BindlessFeatures device_flags{
