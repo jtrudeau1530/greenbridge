@@ -973,8 +973,84 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(s16(diff16_b), -5)
 
 
+
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    # IEEE 754 half-precision bit patterns
+    F16_POS_ZERO: int = 0x0000
+    F16_NEG_ZERO: int = 0x8000
+    F16_POS_INF: int = 0x7C00
+    F16_NEG_INF: int = 0xFC00
+    F16_QNAN: int = 0x7E00
+    F16_SNAN: int = 0x7C01
+    F16_MIN_SUBNORMAL: int = 0x0001
+    F16_MAX_SUBNORMAL: int = 0x03FF
+    F16_NEG_SUBNORMAL: int = 0x8001
+
+    def test_ieee754_special_float_bitpatterns_treated_as_raw_integers(self) -> None:
+        # v_pack_b32_i16 is an integer packing instruction. When shaders bit-cast
+        # floating point values (+0, -0, +/-inf, NaNs), hardware treats them strictly
+        # as raw bitfields without FPU traps, NaN canonicalization, or quietening.
+        specials = [
+            self.F16_POS_ZERO,
+            self.F16_NEG_ZERO,
+            self.F16_POS_INF,
+            self.F16_NEG_INF,
+            self.F16_QNAN,
+            self.F16_SNAN,
+        ]
+        for s0 in specials:
+            for s1 in specials:
+                res = oracle_v_pack_b32_i16(s0, s1)
+                self.assertEqual(extract_half(res, False), s0)
+                self.assertEqual(extract_half(res, True), s1)
+
+    def test_subnormal_half_float_bits_no_flush_to_zero(self) -> None:
+        # Ensure subnormal float patterns are preserved bit-for-bit without flush-to-zero (FTZ)
+        res = oracle_v_pack_b32_i16(self.F16_MIN_SUBNORMAL, self.F16_MAX_SUBNORMAL)
+        self.assertEqual(extract_half(res, False), self.F16_MIN_SUBNORMAL)
+        self.assertEqual(extract_half(res, True), self.F16_MAX_SUBNORMAL)
+
+        res_neg = oracle_v_pack_b32_i16(self.F16_NEG_SUBNORMAL, self.F16_POS_ZERO)
+        self.assertEqual(extract_half(res_neg, False), self.F16_NEG_SUBNORMAL)
+        self.assertEqual(extract_half(res_neg, True), self.F16_POS_ZERO)
+
+    def test_nan_payload_exact_preservation(self) -> None:
+        # Custom NaN payloads must not be quietened or truncated
+        custom_qnan = 0x7E55  # Quiet NaN with payload 0x55
+        custom_snan = 0x7C2A  # Signaling NaN with payload 0x2A
+        res = oracle_v_pack_b32_i16(custom_qnan, custom_snan)
+        self.assertEqual(extract_half(res, False), custom_qnan)
+        self.assertEqual(extract_half(res, True), custom_snan)
+
+    def test_signed_integer_boundary_extremes(self) -> None:
+        # Integer boundaries: -32768, 32767, -1, 0, 1, -2
+        boundaries = [0x8000, 0x7FFF, 0xFFFF, 0x0000, 0x0001, 0xFFFE]
+        for b0 in boundaries:
+            for b1 in boundaries:
+                res = oracle_v_pack_b32_i16(b0, b1)
+                self.assertEqual(extract_half(res, False), b0)
+                self.assertEqual(extract_half(res, True), b1)
+                self.assertEqual(res, ((b1 << 16) | b0) & MASK32)
+
+    def test_signed_twos_complement_wrap_and_saturation(self) -> None:
+        # -32768 (0x8000) negated in 16-bit two's complement without clamp wraps to -32768
+        neg_wrap = apply_i16_modifiers(0x8000, neg_mod=True, clamp=False)
+        self.assertEqual(neg_wrap, 0x8000)
+
+        # -32768 (0x8000) negated with clamp saturates to 32767 (0x7FFF)
+        neg_sat = apply_i16_modifiers(0x8000, neg_mod=True, clamp=True)
+        self.assertEqual(neg_sat, 0x7FFF)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
