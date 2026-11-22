@@ -4540,6 +4540,57 @@ class Gen:
                 self.dst(a[0], v)
             else:
                 self.write_lo16(a[0], lo)
+        elif op in ("v_min3_i16", "v_min3_u16", "v_max3_i16", "v_max3_u16", "v_med3_i16", "v_med3_u16"):
+            # Three-operand 16-bit integer min/max/median on the low halves (op_sel bits 0..2 pick the high half of
+            # S0..S2, bit 3 writes the high half of D); VOP3-only, so the other half of D is kept (RDNA2 ISA; Mesa
+            # ACO can_use_opsel). clamp is not modelled on integer min/max/med3.
+            if "clamp" in mods:
+                raise Unsupported(op + " clamp")
+            sb, dhi = self.opsel_bits(mods, 3)
+            if dhi and a[0]["k"] != "vgpr":
+                raise Unsupported("op_sel destination")
+            signed = op.endswith("_i16")
+            vals = []
+            for k, s_ in enumerate(a[1:4]):
+                u = self.src_u(s_)
+                if sb[k]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+                    u = t
+                h = self.tmp()
+                if signed:
+                    self.emit(f"{h} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
+                else:
+                    self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                vals.append(h)
+            x, y, z = vals
+            ty, pfx = ("%int", "S") if signed else ("%uint", "U")
+            if "med3" in op:
+                lo_, hi_, m = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{lo_} = OpExtInst {ty} %glsl {pfx}Min {x} {y}")
+                self.emit(f"{hi_} = OpExtInst {ty} %glsl {pfx}Max {x} {y}")
+                self.emit(f"{m} = OpExtInst {ty} %glsl {pfx}Clamp {z} {lo_} {hi_}")
+            else:
+                m0, m = self.tmp(), self.tmp()
+                fn = pfx + ("Min" if "min3" in op else "Max")
+                self.emit(f"{m0} = OpExtInst {ty} %glsl {fn} {x} {y}")
+                self.emit(f"{m} = OpExtInst {ty} %glsl {fn} {m0} {z}")
+            if signed:
+                r = self.tmp()
+                self.emit(f"{r} = OpBitcast %uint {m}")
+            else:
+                r = m
+            lo = self.tmp()
+            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            if dhi:
+                old, keep, sh16, v = (self.tmp() for _ in range(4))
+                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
+                self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                self.dst(a[0], v)
+            else:
+                self.write_lo16(a[0], lo)
         elif op == "v_bcnt_u32_b32":
             x, acc = self.src_u(a[1]), self.src_u(a[2])
             c, r = self.tmp(), self.tmp()
@@ -4662,10 +4713,16 @@ class Gen:
                 self.emit(f"OpStore {dp} {sel}")
             else:
                 self.dst(d, v)
-        elif op == "v_med3_f16":
+        elif op in ("v_med3_f16", "v_min3_f16", "v_max3_f16"):
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
             vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
-            r = self.med3_f(vals, a[1:4], sel)
+            if op == "v_med3_f16":
+                r = self.med3_f(vals, a[1:4], sel)
+            else:
+                f = "NMax" if "max" in op else "NMin"   # a NaN operand gives the other one (docs/design.md)
+                m, r = self.tmp(), self.tmp()
+                self.emit(f"{m} = OpExtInst %float %glsl {f} {vals[0]} {vals[1]}")
+                self.emit(f"{r} = OpExtInst %float %glsl {f} {m} {vals[2]}")
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
