@@ -1519,7 +1519,7 @@ Not implemented yet:
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins
-  conditional rendering on the predicate buffer, plain for `EQUAL_ZERO` (Vulkan discards when the word is 0) and
+  conditional rendering on the captured condition, plain for `EQUAL_ZERO` (Vulkan discards when the word is 0) and
   `VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT` for `NOT_EQUAL_ZERO`, ends it before a new predicate (it cannot
   nest) and at the end of the list (predication does not carry over to the next list). While a predicate is set,
   whole-view clears are replayed as one rectangle with `vkCmdClearAttachments`, because `vkCmdClearColorImage` and
@@ -1534,14 +1534,23 @@ Not implemented yet:
   Checked by part E of `vk_command_replay_test` on an NVIDIA GeForce RTX 3070, and end to end by
   `d3d12_vulkan_device_test` (an occlusion query resolved into a predicate, through legacy and enhanced barriers)
   on an NVIDIA GeForce RTX 5070.
+  The 64-bit value is captured on the GPU at each `SetPredication`: an internal eight-byte copy and a
+    one-invocation compute pass OR the two dwords into a private 32-bit condition. Later writes to the source do
+    not change that snapshot. A null buffer disables predication; rebinding ends the previous conditional scope
+    before the capture, so the internal dispatch is never predicated. Bounds checks require all eight bytes.
+    Capture arenas and descriptors remain alive until their command buffer's timeline ticket completes. No
+    CPU readback or per-predicate wait is used. This helper requires a compute-capable configured queue family;
+    unsupported queues fail preparation instead of falling back to the low word. The synthetic GLSL source and
+    embedded SPIR-V are shipped together; normal builds do not need a shader compiler.
+    Capturing a new predicate inside an active pipeline-statistics query is rejected as unsupported, because the
+    helper's compute invocation would otherwise pollute the application's result; capturing before the query is
+    allowed. Virtualising that query is not part of this change.
   Open:
   - Copies and resolves. D3D12 predicates `CopyBufferRegion`, `CopyTextureRegion`, `CopyResource` and
     `ResolveSubresource`; Vulkan's conditional rendering does not cover transfer commands, so they run
     unconditionally. `PreparedList::unpredicated_copies` counts them. A fix replays a predicated copy as a compute
     dispatch, which conditional rendering does cover.
-  - The 64-bit value. Vulkan reads one 32-bit word, so the low dword of D3D12's value is used: wrong only when the
-    low dword is 0 and the high one is not (an occlusion count that is a non-zero multiple of 2^32). A fix is a small
-    compute pass that ORs both dwords into a condition buffer.
+
   - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed
     (D3D-3, D3D-4, D3D-17); `ClearUnorderedAccessView*` and `ResolveSubresource` need the same check when added.
 

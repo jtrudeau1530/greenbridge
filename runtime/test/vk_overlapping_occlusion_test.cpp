@@ -169,6 +169,9 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     const auto get_memory = d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties");
     get_memory(d.physical, &memory);
     context.set_occlusion_resolve_memory(memory);
+    VkPhysicalDeviceProperties properties{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
+    context.configure_predication(get_device_proc, memory, properties.limits.maxStorageBufferRange, d.family);
     VulkanFence gate(context, 0);
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok() && gate.semaphore());
@@ -194,7 +197,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
         void* words = nullptr;
         ResourceBinding predicate{};
         predicate.size = 8;
-        predicate.buffer = d.buffer(8, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT, &words);
+        predicate.buffer = d.buffer(8, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &words);
         EXPECT(predicate.buffer && words);
         std::memset(words, 0, 8);
         context.add_resource(predicate_id, predicate);
