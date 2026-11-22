@@ -7,6 +7,7 @@ strings that occur in ordinary code.
 
 import json
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -144,6 +145,26 @@ class ContainerTests(unittest.TestCase):
     def test_safe_stem(self):
         self.assertEqual(psc.safe_stem("a b/c", 1), "a_b_c")
         self.assertEqual(psc.safe_stem(None, 7), "container_07")
+
+    def test_random_buffers_raise_only_container_error(self):
+        """The scan must never traceback on bytes that are not a container (dcastell1's review)."""
+        rng = random.Random(0xDBC)
+        for _ in range(2000):
+            size = rng.randrange(0, 400)
+            data = bytearray(rng.randbytes(size))
+            if size >= 4:
+                at = rng.randrange(0, size - 4)
+                data[at : at + 4] = b"DXBC"
+                try:
+                    psc.parse_container(bytes(data), at)
+                except psc.ContainerError:
+                    pass
+                except Exception as e:  # noqa: BLE001 - any other type is the failure being asserted
+                    self.fail(f"parse_container raised {type(e).__name__}: {e}")
+            try:
+                psc.inspect(bytes(data), "fuzz.dll")
+            except Exception as e:  # noqa: BLE001 - any exception is the failure being asserted
+                self.fail(f"inspect raised {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
