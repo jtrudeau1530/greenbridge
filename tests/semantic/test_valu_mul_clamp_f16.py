@@ -503,5 +503,79 @@ class TestSymbolicAST(unittest.TestCase):
             bad_clamp.validate()
 
 
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 v_mul_clamp_f16."""
+
+    def __init__(self, num_vgprs: int = 64, num_sgprs: int = 32):
+        self.reg_file = RegisterFile(num_vgprs=num_vgprs, num_sgprs=num_sgprs)
+
+    def resolve_operand(self, op: ASTOperand) -> int:
+        """Resolve an AST operand to its raw 16-bit binary representation."""
+        if op.kind == OperandKind.VGPR:
+            return self.reg_file.get_vgpr_half(op.reg_index, hi=op.hi)
+        elif op.kind == OperandKind.SGPR:
+            return self.reg_file.get_sgpr_half(op.reg_index, hi=op.hi)
+        elif op.kind in (OperandKind.LITERAL, OperandKind.INLINE_FLOAT):
+            return op.literal_val & MASK16
+        raise ValueError(f"Cannot resolve operand: {op}")
+
+    def execute_ast(self, inst: ASTInstruction) -> int:
+        """Execute a validated AST instruction and commit result to destination VGPR."""
+        inst.validate()
+        raw_s0 = self.resolve_operand(inst.src0)
+        raw_s1 = self.resolve_operand(inst.src1)
+
+        res = ref_mul_clamp_f16(
+            raw_s0,
+            raw_s1,
+            abs0=inst.src0.abs_mod,
+            neg0=inst.src0.neg_mod,
+            abs1=inst.src1.abs_mod,
+            neg1=inst.src1.neg_mod,
+            omod=inst.omod,
+        )
+
+        self.reg_file.set_vgpr_half(inst.dst.reg_index, hi=inst.dst.hi, val=res)
+        return res
+
+    def execute_asm(self, asm_line: str) -> int:
+        """Parse assembly string and execute on the scalar interpreter."""
+        inst = parse_v_mul_clamp_f16_asm(asm_line)
+        return self.execute_ast(inst)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def test_scalar_clamped_multiplication(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_vgpr_half(1, hi=False, val=f16_to_bits(0.5))
+        interp.reg_file.set_vgpr_half(2, hi=False, val=f16_to_bits(0.5))
+
+        res = interp.execute_asm("v_mul_f16 v0.l, v1.l, v2.l clamp")
+        self.assertEqual(bits_to_f16(res), 0.25)
+        self.assertEqual(interp.reg_file.get_vgpr_half(0, hi=False), f16_to_bits(0.25))
+
+    def test_scalar_clamp_saturation_upper(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_vgpr_half(1, hi=False, val=f16_to_bits(4.0))
+        interp.reg_file.set_vgpr_half(2, hi=False, val=f16_to_bits(2.0))
+
+        res = interp.execute_asm("v_mul_f16 v0.l, v1.l, v2.l clamp")
+        self.assertEqual(res, POS_ONE_F16)
+        self.assertEqual(interp.reg_file.get_vgpr_half(0, hi=False), POS_ONE_F16)
+
+    def test_scalar_destination_halfword_preservation(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_vgpr(5, 0xBEEF5555)
+        interp.reg_file.set_vgpr_half(1, hi=False, val=f16_to_bits(0.5))
+        interp.reg_file.set_vgpr_half(2, hi=False, val=f16_to_bits(0.5))
+
+        # Write to v5.l, v5.h must remain 0xBEEF
+        interp.execute_asm("v_mul_f16 v5.l, v1.l, v2.l clamp")
+        self.assertEqual(interp.reg_file.get_vgpr_half(5, hi=True), 0xBEEF)
+        self.assertEqual(interp.reg_file.get_vgpr_half(5, hi=False), f16_to_bits(0.25))
+
+
 if __name__ == "__main__":
     unittest.main()
