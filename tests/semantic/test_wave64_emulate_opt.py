@@ -204,7 +204,7 @@ def _check_spirv_structure(text):
         assert lbl in seen_labels, f"branch/merge references undefined label {lbl}"
 
 
-def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None, max_steps=2_000_000):
+def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None, max_steps=2_000_000, reverse_order=False):
     """Execute a --wave64-emulate compute shader across all `lx * ly * lz` invocations with real shared
     Workgroup memory and strict uniform OpControlBarrier checking. Returns `(memory, barrier_count)`."""
     _check_spirv_structure(spvasm)
@@ -505,10 +505,11 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
         return steps
 
     invs = [make_inv(i, c) for i, c in enumerate(coords)]
+    step_order = list(reversed(invs)) if reverse_order else invs
     total_steps = 0
     barriers = 0
     while True:
-        for inv in invs:
+        for inv in step_order:
             if not inv["done"]:
                 inv["barrier"] = None
                 total_steps += step_until_barrier(inv, max_steps - total_steps)
@@ -980,6 +981,90 @@ class LocalExecFoldTests(unittest.TestCase):
         spv2, _ = _translate_encoded("cs_neg_vcc_scc", insns_vcc_scc, (64, 1, 1), emulate=True)
         self.assertGreaterEqual(spv2.count("OpAtomicOr"), 2)  # branch vote + scc_from_mask vote
 
+    def test_s_cmovk_i32_keeps_scc_live_and_blocks_execz_fold(self):
+        # 1) s_cmovk_i32 implicitly reads SCC: s_and_saveexec_b64 must keep its cross-half SCC vote.
+        insns_vote = [
+            ("s_mov_b32 s14, 222", 4),
+            ("v_cmp_eq_u32_e64 s[10:11], 50, v0", 8),
+            ("s_and_saveexec_b64 s[12:13], s[10:11]", 4),
+            ("s_cmovk_i32 s14, 111", 4),
+            ("s_mov_b64 exec, -1", 4),
+            ("v_mov_b32_e32 v5, s14", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v5, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv1, _ = _translate_encoded("cs_cmovk_scc_live", insns_vote, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv1.count("OpAtomicOr"), 1)
+        mem1, _ = run_emulated_workgroup(spv1, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem1[lane * 4], 111, f"lane {lane}")
+
+        # 2) Region writing SCC when s_cmovk_i32 reads SCC after join MUST NOT fold (64 & 128 threads).
+        insns_fold = [
+            ("s_mov_b32 s14, 222", 4),
+            ("s_cmp_eq_u32 s14, 222", 4),
+            ("v_cmp_lt_u32_e64 s[6:7], 40, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 2", 4),
+            ("s_cmp_eq_u32 s14, 0", 4),
+            ("v_add_nc_u32_e32 v4, 1, v0", 4),
+            ("s_mov_b64 exec, -1", 4),
+            ("s_cmovk_i32 s14, 111", 4),
+            ("v_mov_b32_e32 v5, s14", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v5, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        for lx in (64, 128):
+            spv2, _ = _translate_encoded(f"cs_cmovk_no_fold_{lx}", insns_fold, (lx, 1, 1), emulate=True)
+            self.assertGreaterEqual(spv2.count("OpAtomicOr"), 1)
+            mem2, _ = run_emulated_workgroup(spv2, (lx, 1, 1), push_constants=VSHARP + [0] * 28)
+            for lane in range(lx):
+                self.assertEqual(mem2[lane * 4], 222, f"lx={lx} lane={lane}")
+
+        # 3) Every opcode in tools/rdna2spirv.py that emits `OpLoad %uint %scc` must satisfy reads_scc().
+        src_path = os.path.join(os.path.dirname(os.path.dirname(HERE)), "tools", "rdna2spirv.py")
+        with open(src_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        scc_ops = set()
+        for i, line in enumerate(lines):
+            if "OpLoad %uint %scc" not in line:
+                continue
+            for j in range(i, max(-1, i - 25), -1):
+                m_ops = re.findall(r'"(s_[a-z0-9_]+)"', lines[j])
+                if m_ops and ("elif op" in lines[j] or "if op" in lines[j]):
+                    scc_ops.update(m_ops)
+                    break
+        self.assertGreaterEqual(len(scc_ops), 8)
+        for op in sorted(scc_ops):
+            self.assertTrue(
+                wave64_emulate_opt.reads_scc({"op": op, "args": []}),
+                f"{op} loads %scc in rdna2spirv.py but reads_scc() returned False",
+            )
+
+    def test_m0_implicit_read_in_v_movrel_blocks_execz_fold(self):
+        # Region writes m0 and post-join v_movrels_b32 reads m0 implicitly -> MUST NOT fold.
+        insns = [
+            ("v_mov_b32_e32 v4, 10", 4),
+            ("v_mov_b32_e32 v5, 77", 4),
+            ("s_mov_b32 m0, 0", 4),
+            ("v_cmp_lt_u32_e64 s[6:7], 40, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 1", 4),
+            ("s_mov_b32 m0, 1", 4),
+            ("s_mov_b64 exec, -1", 4),
+            ("v_movrels_b32_e32 v6, v4", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v6, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, _ = _translate_encoded("cs_m0_vmovrel_no_fold", insns, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv.count("OpAtomicOr"), 1)
+        mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem[lane * 4], 77, f"lane {lane}: wave ran region so m0=1 -> v5=77 everywhere")
+
     def test_single_store_acyclic_fold_orders_war_and_raw(self):
         # Acyclic single-store s_cbranch_execz regions fold inline (0 OpAtomicOr), while uniform pre/post
         # memory ordering protects both WAR (load before folded store) and RAW (folded store before load).
@@ -1005,15 +1090,16 @@ class LocalExecFoldTests(unittest.TestCase):
             with self.subTest(size=size):
                 spv, _ = _translate_encoded("cs_single_store_fold", insns, size, emulate=True)
                 self.assertEqual(spv.count("OpAtomicOr"), 0)
-                mem, _ = run_emulated_workgroup(spv, size, push_constants=VSHARP + [0] * 28)
-                for tid in range(size[0]):
-                    partner = tid ^ 32
-                    # lanes < 32 kept 50 + tid; lanes >= 32 overwrote their slot with 500 + (50 + (tid ^ 32))
-                    if partner >= 32:
-                        want = 500 + 50 + (partner ^ 32)
-                    else:
-                        want = 50 + partner
-                    self.assertEqual(mem[512 + tid * 4], want, f"tid {tid}")
+                for rev in (False, True):
+                    mem, _ = run_emulated_workgroup(spv, size, push_constants=VSHARP + [0] * 28, reverse_order=rev)
+                    for tid in range(size[0]):
+                        partner = tid ^ 32
+                        # lanes < 32 kept 50 + tid; lanes >= 32 overwrote their slot with 500 + (50 + (tid ^ 32))
+                        if partner >= 32:
+                            want = 500 + 50 + (partner ^ 32)
+                        else:
+                            want = 50 + partner
+                        self.assertEqual(mem[512 + tid * 4], want, f"tid {tid} rev={rev}")
 
 
 class StructuredEmulationTests(unittest.TestCase):
@@ -1057,19 +1143,20 @@ class StructuredEmulationTests(unittest.TestCase):
                 self.assertNotIn("OpSwitch", spv)
                 self.assertEqual(len(gen.x_spills), 0)
                 self.assertNotIn("OpGroupNonUniform", spv)
-                mem, _ = run_emulated_workgroup(spv, (threads, 1, 1), push_constants=VSHARP + [0] * 28)
-                # Reference simulation
-                arr = [0] * 64
-                for l in range(threads):
-                    arr[l] = l
-                v4 = [l + (15 if l >= 20 else 0) + 15 for l in range(threads)]
-                for _ in range(3):
+                for rev in (False, True):
+                    mem, _ = run_emulated_workgroup(spv, (threads, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
+                    # Reference simulation
+                    arr = [0] * 64
                     for l in range(threads):
-                        arr[l] = v4[l]
-                    nxt = [v4[l] + arr[l ^ 32] for l in range(threads)]
-                    v4 = nxt
-                for l in range(threads):
-                    self.assertEqual(mem[512 + l * 4], v4[l] & 0xFFFFFFFF, f"lane {l}")
+                        arr[l] = l
+                    v4 = [l + (15 if l >= 20 else 0) + 15 for l in range(threads)]
+                    for _ in range(3):
+                        for l in range(threads):
+                            arr[l] = v4[l]
+                        nxt = [v4[l] + arr[l ^ 32] for l in range(threads)]
+                        v4 = nxt
+                    for l in range(threads):
+                        self.assertEqual(mem[512 + l * 4], v4[l] & 0xFFFFFFFF, f"lane {l} rev={rev}")
 
     def test_multiwave_structured_hybrid_zero_switch_and_local_mini_scheduler(self):
         # 128 threads (2 waves): top-level spine + sync-free guard (live-out scalar) + wave-divergent
@@ -1120,16 +1207,29 @@ class StructuredEmulationTests(unittest.TestCase):
         self.assertEqual(len(switches), 1)
         self.assertLessEqual(len(switches[0].split()) // 2, 3)
 
-        # Bit-exact verification against unoptimized baseline x_scheduler.
+        # Direct ISA-derived reference values for all 128 lanes:
+        # Wave 0 (0..63): skips guard 1 (s16=7, v4 = l + 7); enters guard 2 (s18 = 37 + 7 = 44,
+        #   v4 = l + 51, then adds partner (l^32) + 51 -> v4_w0(l) = l + (l^32) + 102).
+        # Wave 1 (64..127): enters guard 1 (s16=37; l in 64..95 -> l + 37; l in 96..127 -> l + 74); skips guard 2.
+        # After s_barrier: each lane adds v4 of (l ^ 64).
+        def isa_v4_before_sbar(l):
+            if l < 64:
+                return l + (l ^ 32) + 102
+            return l + (74 if l >= 96 else 37)
+
         orig_plan = wave64_emulate_opt.plan_structured_emulation
         wave64_emulate_opt.plan_structured_emulation = lambda *a, **kw: None
         try:
             spv_base, _ = _translate_encoded("cs_hybrid_128_base", insns, (128, 1, 1), emulate=True, rsrc2=0x20088)
         finally:
             wave64_emulate_opt.plan_structured_emulation = orig_plan
-        mem_new, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28)
         mem_base, _ = run_emulated_workgroup(spv_base, (128, 1, 1), push_constants=VSHARP + [0] * 28)
-        self.assertEqual(mem_new, mem_base)
+        for rev in (False, True):
+            mem_new, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
+            self.assertEqual(mem_new, mem_base)
+            for l in range(128):
+                want = isa_v4_before_sbar(l) + isa_v4_before_sbar(l ^ 64)
+                self.assertEqual(mem_new[1024 + l * 4], want, f"lane {l} rev={rev}")
 
     def test_multiwave_divergent_sbarrier_falls_back_to_rounds(self):
         # Wave 0 hits s_barrier in one arm while Wave 1 hits s_barrier in another -> MUST keep global rounds.
@@ -1198,10 +1298,11 @@ class StructuredEmulationTests(unittest.TestCase):
                             if "OpLoad %uint" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
             self.assertTrue(any("OpControlBarrier" in l for l in blk2_to_end[store_idx:load_idx]),
                             f"missing OpControlBarrier between blk2 buffer_store and blk3 buffer_load ({expected_mode})")
-            mem, _ = run_emulated_workgroup(spv, (lx, 1, 1), push_constants=VSHARP + [0] * 28)
-            for lane in range(lx):
-                partner = lane ^ 32
-                self.assertEqual(mem[512 + lane * 4], (partner + 7) + (lane + 7), f"lx={lx} lane={lane}")
+            for rev in (False, True):
+                mem, _ = run_emulated_workgroup(spv, (lx, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
+                for lane in range(lx):
+                    partner = lane ^ 32
+                    self.assertEqual(mem[512 + lane * 4], (partner + 7) + (lane + 7), f"lx={lx} lane={lane} rev={rev}")
 
 
 if __name__ == "__main__":

@@ -159,6 +159,13 @@ def test_random_graphs():
     _check_random_graphs()
 
 
+def test_depth():
+    assert S.depth([("block", 0)]) == 0
+    assert S.depth([("block", 0), ("loop", 1, [("block", 1), ("guard", 2, [("block", 2)])])]) == 2
+    assert S.depth([]) == 0
+    assert S.depth(S.structure([[1, 2], [3], [3], []])) == 1     # a diamond is one guard deep
+
+
 def test_shapes():
     assert S.structure([[]]) == [("block", 0)]
     assert S.structure([[1], [2], []]) == [("block", 0), ("block", 1), ("block", 2)]          # no tests needed

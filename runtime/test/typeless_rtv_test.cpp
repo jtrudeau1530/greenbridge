@@ -173,6 +173,8 @@ int main() {
             const auto resolve = [&](ResourceId id) { return id == 2 ? &predicate : &binding; };
             EXPECT(prepare(list, resolve, queries, prepared) ==
                    (inside ? ReplayResult::unsupported : ReplayResult::success));
+            EXPECT(prepare(list, resolve, queries, prepared, true) == ReplayResult::success);
+            EXPECT(prepared.statistics_segment_count == (inside ? 2u : 0u));
             ++checks;
         }
     }
