@@ -655,5 +655,188 @@ class TestSymbolicAST(unittest.TestCase):
             bad_mod.validate()
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter for v_trig_f64
+# ==============================================================================
+
+def parse_asm_operand(tok: str) -> ASTOperand:
+    tok = tok.strip()
+    neg = False
+    abs_val = False
+    if tok.startswith("-"):
+        neg = True
+        tok = tok[1:].strip()
+    if tok.startswith("|") and tok.endswith("|"):
+        abs_val = True
+        tok = tok[1:-1].strip()
+
+    if tok.startswith("v[") and tok.endswith("]"):
+        inner = tok[2:-1]
+        parts = inner.split(":")
+        reg_idx = int(parts[0])
+        return ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=reg_idx, neg=neg, abs_val=abs_val)
+    elif tok.startswith("s[") and tok.endswith("]"):
+        inner = tok[2:-1]
+        parts = inner.split(":")
+        reg_idx = int(parts[0])
+        return ASTOperand(kind=OperandKind.SGPR_PAIR, reg_idx=reg_idx, neg=neg, abs_val=abs_val)
+    elif tok.startswith("0x") or tok.startswith("0X"):
+        imm = int(tok, 16)
+        return ASTOperand(kind=OperandKind.LITERAL_64, imm_val=imm, neg=neg, abs_val=abs_val)
+    else:
+        try:
+            if "." in tok or "e" in tok.lower():
+                imm = f64_to_u64(float(tok))
+                return ASTOperand(kind=OperandKind.LITERAL_64, imm_val=imm, neg=neg, abs_val=abs_val)
+            imm = int(tok)
+            return ASTOperand(kind=OperandKind.INLINE_IMM, imm_val=imm, neg=neg, abs_val=abs_val)
+        except ValueError:
+            raise ValueError(f"Unrecognized assembly operand token: {tok}")
+
+
+def parse_asm_line(line: str) -> ASTInstruction:
+    clean = line.split(";")[0].split("//")[0].strip()
+    tokens = [t for t in clean.replace(",", " ").split() if t]
+    if not tokens:
+        raise ValueError("Empty assembly line")
+    opcode = tokens[0]
+    if opcode != "v_trig_f64":
+        raise ValueError(f"Expected opcode v_trig_f64, got {opcode}")
+
+    clamp = False
+    mode = TrigMode.SIN
+    raw_ops = []
+    for tok in tokens[1:]:
+        ltok = tok.lower()
+        if ltok == "clamp":
+            clamp = True
+        elif ltok == "cos":
+            mode = TrigMode.COS
+        elif ltok == "sin":
+            mode = TrigMode.SIN
+        else:
+            raw_ops.append(tok)
+
+    if len(raw_ops) != 2:
+        raise ValueError(f"v_trig_f64 requires 2 operands (dst, src0), got {len(raw_ops)}: {raw_ops}")
+
+    dst = parse_asm_operand(raw_ops[0])
+    src0 = parse_asm_operand(raw_ops[1])
+    inst = ASTInstruction(opcode=opcode, dst=dst, src0=src0, mode=mode, clamp=clamp)
+    inst.validate()
+    return inst
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU v_trig_f64."""
+
+    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
+        self.vgpr = VALURegisterFile(num_vgprs=num_vgprs)
+        self.num_sgprs = num_sgprs
+        self.sgprs = [0] * num_sgprs
+        self.vcc = 0
+        self.scc = 0
+
+    def get_sgpr(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def get_sgpr_pair(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs - 1):
+            raise IndexError(f"SGPR pair index out of range: s[{idx}:{idx+1}]")
+        lo = self.get_sgpr(idx)
+        hi = self.get_sgpr(idx + 1)
+        return join_dwords(lo, hi)
+
+    def set_sgpr_pair(self, idx: int, val64: int) -> None:
+        if not (0 <= idx < self.num_sgprs - 1):
+            raise IndexError(f"SGPR pair index out of range: s[{idx}:{idx+1}]")
+        lo, hi = split_dwords(val64)
+        self.set_sgpr(idx, lo)
+        self.set_sgpr(idx + 1, hi)
+
+    def resolve_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR_PAIR:
+            val = self.vgpr.get_vgpr_pair(op.reg_idx)
+        elif op.kind == OperandKind.SGPR_PAIR:
+            val = self.get_sgpr_pair(op.reg_idx)
+        elif op.kind == OperandKind.LITERAL_64:
+            val = op.imm_val
+        elif op.kind == OperandKind.INLINE_IMM:
+            val = op.imm_val
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+        return apply_input_modifiers_f64(val, neg=op.neg, abs_val=op.abs_val)
+
+    def execute_ast(self, inst: ASTInstruction) -> int:
+        inst.validate()
+        s0 = self.resolve_operand(inst.src0)
+        res = ref_trig_f64(s0, mode=inst.mode, clamp=inst.clamp)
+        self.vgpr.set_vgpr_pair(inst.dst.reg_idx, res)
+        return res
+
+    def execute_asm(self, line: str) -> int:
+        inst = parse_asm_line(line)
+        return self.execute_ast(inst)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar interpreter execution."""
+
+    def test_execute_vgpr_source(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, F64_QUARTER)
+        res = interp.execute_asm("v_trig_f64 v[0:1], v[2:3]")
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_ONE)
+
+    def test_execute_sgpr_source(self) -> None:
+        interp = ScalarInterpreter()
+        interp.set_sgpr_pair(4, F64_QUARTER)
+        res = interp.execute_asm("v_trig_f64 v[6:7], s[4:5]")
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(6), F64_ONE)
+
+    def test_execute_literal_source(self) -> None:
+        interp = ScalarInterpreter()
+        res = interp.execute_asm(f"v_trig_f64 v[0:1], 0x{F64_QUARTER:016x}")
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_ONE)
+
+    def test_execute_with_modifiers_and_clamp(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, F64_QUARTER)
+        # neg modifier makes turns -0.25 -> sin(-0.25) = -1.0; clamp makes it +0.0
+        res = interp.execute_asm("v_trig_f64 v[0:1], -v[2:3] clamp")
+        self.assertEqual(res, F64_POS_ZERO)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_POS_ZERO)
+
+    def test_execute_cos_mode(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, F64_POS_ZERO)
+        res = interp.execute_asm("v_trig_f64 v[0:1], v[2:3] cos")
+        self.assertEqual(res, F64_ONE)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_ONE)
+
+    def test_sequential_program_execution(self) -> None:
+        interp = ScalarInterpreter()
+        # Step 1: v[0:1] = sin(0.25 turns) = 1.0
+        interp.execute_asm(f"v_trig_f64 v[0:1], 0x{F64_QUARTER:016x}")
+        # Step 2: v[2:3] = cos(0.00 turns) = 1.0
+        interp.execute_asm("v_trig_f64 v[2:3], 0x0 cos")
+        # Step 3: v[4:5] = sin(v[0:1]) where v[0:1] is 1.0 -> sin(1.0 turn) = 0.0
+        interp.execute_asm("v_trig_f64 v[4:5], v[0:1]")
+
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_ONE)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(2), F64_ONE)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(4), F64_POS_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
