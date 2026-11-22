@@ -56,7 +56,7 @@ DMASKS = (0xf, *range(1, 0xf))
 def assemble(asm: str, name: str, work: str) -> None:
     """Assemble with llvm-mc like runtime/test/shaders/build.py, into work/disasm/<name>.s."""
     cmd = mc_command.mc_command() + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
-    r = subprocess.run(cmd, input=asm, capture_output=True, text=True)
+    r = mc_command.run(cmd, input=asm, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise SystemExit(f"llvm-mc rejected {name}:\n{r.stderr}")
     code = "".join(line for line in r.stdout.splitlines(keepends=True)
