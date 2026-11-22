@@ -14,7 +14,7 @@ Add-Type -Path "$CodeWalker\SharpDX.dll"; Add-Type -Path "$CodeWalker\SharpDX.Ma
 [void][Reflection.Assembly]::LoadFrom("$CodeWalker\CodeWalker.Core.dll")
 New-Item -ItemType Directory -Force $Out | Out-Null
 $fail = Join-Path $Out "failures.txt"
-"" | Set-Content -LiteralPath $fail
+"" | Set-Content -LiteralPath $fail -Encoding utf8
 $ok = @{ pso = 0; rbf = 0 }; $bad = @{ pso = 0; rbf = 0 }; $n = 0
 
 foreach ($dir in Get-ChildItem -LiteralPath $Carve -Directory) {
@@ -44,7 +44,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $Carve -Directory) {
         } catch {
             $bad[$kind]++
             $msg = $_.Exception.InnerException; if (-not $msg) { $msg = $_.Exception }
-            "$($dir.Name)\$name $kind : $($msg.Message)" | Add-Content -LiteralPath $fail
+            "$($dir.Name)\$name $kind : $($msg.Message)" | Add-Content -LiteralPath $fail -Encoding utf8
         }
     }
     if ($Limit -and $n -ge $Limit) { break }
