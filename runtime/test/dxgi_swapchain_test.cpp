@@ -263,6 +263,17 @@ int main() {
     if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&factory))) || !factory)
         return fail("create_dxgi_factory");
 
+    // Host-measured on Windows 11: MakeWindowAssociation takes DXGI_MWA_NO_WINDOW_CHANGES, DXGI_MWA_NO_ALT_ENTER
+    // and DXGI_MWA_NO_PRINT_SCREEN together or alone; any other bit is DXGI_ERROR_INVALID_CALL.
+    {
+        constexpr UINT known = DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_PRINT_SCREEN;
+        if (FAILED(factory->MakeWindowAssociation(hwnd, known))) return fail("MakeWindowAssociation(known flags)");
+        for (const UINT bad : {0x8u, 0x40u, known | 0x8u}) {
+            if (factory->MakeWindowAssociation(hwnd, bad) != DXGI_ERROR_INVALID_CALL)
+                return fail("MakeWindowAssociation accepted an unknown flag bit");
+        }
+    }
+
     D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
     ID3D12CommandQueue* queue = nullptr;
     ID3D12CommandAllocator* alloc = nullptr;
