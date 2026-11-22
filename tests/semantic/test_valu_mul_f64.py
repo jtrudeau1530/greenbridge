@@ -1334,5 +1334,160 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res, bits_base)
 
 
+# ==============================================================================
+# Mutants for Mutation Detection
+# ==============================================================================
+
+def mutant_mul_as_add(s0: int, s1: int, **kwargs) -> int:
+    """Mutant 1: Replaces multiplication with addition."""
+    v0 = u64_to_f64(s0)
+    v1 = u64_to_f64(s1)
+    return f64_to_u64(v0 + v1)
+
+
+def mutant_ignore_neg(s0: int, s1: int, *, src0_neg: bool = False, src1_neg: bool = False, **kwargs) -> int:
+    """Mutant 2: Ignores negative modifiers."""
+    return ref_mul_f64(s0, s1, src0_neg=False, src1_neg=False, **kwargs)
+
+
+def mutant_ignore_abs(s0: int, s1: int, *, src0_abs: bool = False, src1_abs: bool = False, **kwargs) -> int:
+    """Mutant 3: Ignores absolute value modifiers."""
+    return ref_mul_f64(s0, s1, src0_abs=False, src1_abs=False, **kwargs)
+
+
+def mutant_ignore_clamp(s0: int, s1: int, *, clamp: bool = False, **kwargs) -> int:
+    """Mutant 4: Ignores clamp."""
+    return ref_mul_f64(s0, s1, clamp=False, **kwargs)
+
+
+def mutant_clamp_nan_to_nan(s0: int, s1: int, *, clamp: bool = False, **kwargs) -> int:
+    """Mutant 5: Clamps numbers but fails to clamp NaN to +0.0."""
+    res = ref_mul_f64(s0, s1, clamp=False, **kwargs)
+    if clamp and not is_f64_nan(res):
+        val = u64_to_f64(res)
+        if val < 0.0:
+            return F64_POS_ZERO
+        elif val > 1.0:
+            return F64_ONE
+    return res
+
+
+def mutant_snan_not_quieted(s0: int, s1: int, **kwargs) -> int:
+    """Mutant 6: Returns SNaN without quieting."""
+    if is_f64_snan(s0):
+        return s0
+    if is_f64_snan(s1):
+        return s1
+    return ref_mul_f64(s0, s1, **kwargs)
+
+
+def mutant_zero_inf_returns_zero(s0: int, s1: int, **kwargs) -> int:
+    """Mutant 7: 0 * Inf returns 0 instead of canonical QNaN."""
+    if (is_f64_zero(s0) and is_f64_inf(s1)) or (is_f64_inf(s0) and is_f64_zero(s1)):
+        return F64_POS_ZERO
+    return ref_mul_f64(s0, s1, **kwargs)
+
+
+def mutant_f32_truncation(s0: int, s1: int, **kwargs) -> int:
+    """Mutant 8: Truncates operands to single-precision float."""
+    f0 = struct.unpack("<f", struct.pack("<f", u64_to_f64(s0)))[0]
+    f1 = struct.unpack("<f", struct.pack("<f", u64_to_f64(s1)))[0]
+    return f64_to_u64(float(f0 * f1))
+
+
+class TestNegativeControlsAndSyntaxRejection(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_bad_opcodes(self) -> None:
+        for bad_op in ("v_mul_f32", "v_add_f64", "s_mul_f64", "v_mul_i64", "foo"):
+            with self.assertRaises(ValueError):
+                parse_asm_line(f"{bad_op} v[0:1], v[2:3], v[4:5]")
+
+    def test_syntax_rejection_bad_operands(self) -> None:
+        # Malformed register syntax
+        for bad_line in (
+            "v_mul_f64 v0, v[2:3], v[4:5]",
+            "v_mul_f64 v[0:1], invalid_reg, v[4:5]",
+            "v_mul_f64 v[0:1], v[2:3], xyz",
+        ):
+            with self.assertRaises(ValueError):
+                parse_asm_line(bad_line)
+
+    def test_syntax_rejection_operand_count(self) -> None:
+        # Too few operands
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_f64 v[0:1], v[2:3]")
+        # Too many operands
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_f64 v[0:1], v[2:3], v[4:5], v[6:7]")
+
+    def test_syntax_rejection_destination_modifiers(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_f64 -v[0:1], v[2:3], v[4:5]")
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_f64 |v[0:1]|, v[2:3], v[4:5]")
+
+    def test_syntax_rejection_empty_lines(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("")
+        with self.assertRaises(ValueError):
+            parse_asm_line("   ; comment only")
+
+    def test_negative_control_add_instead_of_mul(self) -> None:
+        # Multiplying 3.0 * 4.0 should be 12.0, not 7.0
+        v0 = f64_to_u64(3.0)
+        v1 = f64_to_u64(4.0)
+        good = ref_mul_f64(v0, v1)
+        bad = mutant_mul_as_add(v0, v1)
+        self.assertNotEqual(good, bad)
+        self.assertEqual(u64_to_f64(good), 12.0)
+        self.assertEqual(u64_to_f64(bad), 7.0)
+
+    def test_negative_control_single_precision_loss(self) -> None:
+        # A precision pattern that fits binary64 but loses bits in binary32:
+        # 1.0000000000001 * 1.0000000000001
+        v = 1.0 + 1e-12
+        v_bits = f64_to_u64(v)
+        good = ref_mul_f64(v_bits, v_bits)
+        bad = mutant_f32_truncation(v_bits, v_bits)
+        self.assertNotEqual(good, bad)
+
+    def test_mutation_detection_all_mutants_caught(self) -> None:
+        # Verify that our test suite discriminator catches every mutant:
+        # Mutant 1: add instead of mul
+        self.assertNotEqual(ref_mul_f64(f64_to_u64(3.0), f64_to_u64(4.0)),
+                            mutant_mul_as_add(f64_to_u64(3.0), f64_to_u64(4.0)))
+
+        # Mutant 2: ignore neg
+        self.assertNotEqual(ref_mul_f64(f64_to_u64(3.0), f64_to_u64(4.0), src0_neg=True),
+                            mutant_ignore_neg(f64_to_u64(3.0), f64_to_u64(4.0), src0_neg=True))
+
+        # Mutant 3: ignore abs
+        self.assertNotEqual(ref_mul_f64(f64_to_u64(-3.0), f64_to_u64(4.0), src0_abs=True),
+                            mutant_ignore_abs(f64_to_u64(-3.0), f64_to_u64(4.0), src0_abs=True))
+
+        # Mutant 4: ignore clamp
+        self.assertNotEqual(ref_mul_f64(f64_to_u64(2.0), f64_to_u64(3.0), clamp=True),
+                            mutant_ignore_clamp(f64_to_u64(2.0), f64_to_u64(3.0), clamp=True))
+
+        # Mutant 5: clamp NaN to NaN instead of +0.0
+        self.assertNotEqual(ref_mul_f64(F64_POS_ZERO, F64_POS_INF, clamp=True),
+                            mutant_clamp_nan_to_nan(F64_POS_ZERO, F64_POS_INF, clamp=True))
+
+        # Mutant 6: SNaN not quieted
+        snan = 0x7FF0000000000001
+        self.assertNotEqual(ref_mul_f64(snan, F64_ONE),
+                            mutant_snan_not_quieted(snan, F64_ONE))
+
+        # Mutant 7: 0 * Inf returns 0 instead of QNaN
+        self.assertNotEqual(ref_mul_f64(F64_POS_ZERO, F64_POS_INF),
+                            mutant_zero_inf_returns_zero(F64_POS_ZERO, F64_POS_INF))
+
+        # Mutant 8: f32 truncation
+        v = f64_to_u64(1.0000000000001)
+        self.assertNotEqual(ref_mul_f64(v, v),
+                            mutant_f32_truncation(v, v))
+
+
 if __name__ == "__main__":
     unittest.main()
