@@ -334,6 +334,17 @@ class LinkingTest(unittest.TestCase):
         declarations = shader.reflect().outputs
         self.assertEqual([v.address.location for v in declarations[0].varyings], [5, 7])
 
+    def test_array_length_uses_literal_specialization_default(self) -> None:
+        producer = ModuleFixture("vs")
+        length = producer.allocate()
+        producer.emit(50, producer.uint, length, 2)  # OpSpecConstant with default length 2
+        producer.decorate(length, 1, 7)  # SpecId 7
+        shape = producer.emit_type(spv.OP_TYPE_ARRAY, producer.numeric(components=4), length)
+        producer.variable(spv.STORAGE_OUTPUT, shape, location=0)
+
+        self.assertEqual(kinds(producer, input(array_count=2)), [])
+        self.assertEqual(kinds(producer, input(array_count=3)), ["type-mismatch"])
+
     def test_matrix_and_array_of_columns_are_distinct_types(self):
         vertices = ModuleFixture("vs")
         column = vertices.numeric(32, 2)
