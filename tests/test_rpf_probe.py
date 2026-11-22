@@ -9,6 +9,8 @@ import io
 import json
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -148,6 +150,39 @@ class MainTests(unittest.TestCase):
         out = self.run_main()
         self.assertEqual(self.rows(), [])
         self.assertIn("0 archives", out)
+
+    @unittest.skipUnless(os.name == "posix", "requires a POSIX file size limit")
+    def test_failed_write_preserves_the_existing_report(self):
+        self.write("demo.rpf", b"9FPR" + struct.pack("<I", 16) + bytes(32))
+        previous = b'{"previous": true}'
+        out_dir = os.path.dirname(self.out)
+        os.makedirs(out_dir)
+        with open(self.out, "wb") as f:
+            f.write(previous)
+
+        limited_probe = """\
+import resource
+import runpy
+import signal
+import sys
+
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+resource.setrlimit(resource.RLIMIT_FSIZE, (32, 32))
+runpy.run_path(sys.argv.pop(1), run_name="__main__")
+"""
+        script = os.path.join(ROOT, "tools", "rpf_probe.py")
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", limited_probe, script, self.game, "--out", self.out],
+            capture_output=True, text=True,
+        )
+
+        with open(self.out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(os.listdir(out_dir), [os.path.basename(self.out)])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn(self.out, result.stderr)
 
     def test_failed_scan_preserves_the_existing_report(self):
         archive = self.write("a.rpf", archive_bytes())
