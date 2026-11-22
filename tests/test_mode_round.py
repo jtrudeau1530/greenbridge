@@ -172,10 +172,10 @@ def test_unmodelled_mode_writes_are_refused(asm, tmp_path):
 
 @pytest.mark.parametrize("x,y,z,want", [
     (0x99800000, 0x19800000, 0x3F800000, 0x3BFF),    # 1 - 2^-152: the product error underflows in f32
-    (0x9F000000, 0x1F000000, 0x3F800000, 0x3BFF),    # 1 - 2^-128: the product is an f32 subnormal (flushed on some drivers)
-    (0x1F000000, 0x1F000000, 0x3F800000, 0x3C00),    # 1 + 2^-128 toward zero is 1.0
+    (0x9F000000, 0x1F000000, 0x3F800000, 0x3BFF),    # 1 - 2^-130: the product is an f32 subnormal (flushed on some drivers)
+    (0x1F000000, 0x1F000000, 0x3F800000, 0x3C00),    # 1 + 2^-130 toward zero is 1.0
     (0x99800000, 0x19800000, 0xBF800000, 0xBC00),    # -1 - 2^-152 toward zero is -1.0
-    (0x19800000, 0x19800000, 0xBF800000, 0xBBFF),    # -1 + 2^-200 toward zero is -(1 - 2^-11)
+    (0x19800000, 0x19800000, 0xBF800000, 0xBBFF),    # -1 + 2^-152 toward zero is -(1 - 2^-11)
 ])
 def test_fma_mix_tiny_product(x, y, z, want, tmp_path):
     asm = (f"v_mov_b32 v1, {x:#x}\nv_mov_b32 v2, {y:#x}\nv_mov_b32 v4, {z:#x}\n"
