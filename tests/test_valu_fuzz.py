@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 from fractions import Fraction
+from itertools import permutations
 
 import pytest
 
@@ -70,6 +71,17 @@ def test_signed_zeros():
     assert vf.f16_op("add", 0x8000, 0x8000) == (0x8000, False)    # -0 + -0 = -0
     assert vf.f16_op("sub", 0x8000, 0x0000) == (0x8000, False)    # -0 - +0 = -0
     assert vf.f16_op("max", 0x0000, 0x8000)[1]                    # +0 vs -0: not promised, so uncertain
+
+
+@pytest.mark.parametrize("operands,expected", [
+    ((0x0000, 0x8000, 0x0000), 0x0000),  # +0, -0, +0
+    ((0x8000, 0x0000, 0x8000), 0x8000),  # -0, +0, -0
+    ((0xBC00, 0x0000, 0x8000), 0x8000),  # -1 < -0 < +0
+    ((0x3C00, 0x0000, 0x8000), 0x0000),  # -0 < +0 < +1
+])
+def test_f16_med3_orders_signed_zeros(operands, expected):
+    for args in dict.fromkeys(permutations(operands)):
+        assert vf.f16_op("med3", *args) == (expected, False), args
 
 
 @pytest.mark.parametrize("a,b,c,true,double", [

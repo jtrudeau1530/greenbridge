@@ -303,9 +303,8 @@ def f16_op(name, a, b, c=None):
         pick = (va >= vb) if name == "max" else (va <= vb)
         return (a if pick else b) & M16, False
     if name == "med3":
-        vals = sorted([(va, a), (vb, b), (vc, c)], key=lambda x: x[0])
-        if len({v for v, _ in vals}) < 3 and len({h & M16 for _, h in vals}) == 3:
-            return 0, True
+        # Half decoding loses the sign of zero. The documented med3 ordering puts -0 before +0.
+        vals = sorted(((va, a), (vb, b), (vc, c)), key=lambda item: (item[0], -f16_sign(item[1])))
         return vals[1][1] & M16, False
     raise ValueError(name)
 
