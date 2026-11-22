@@ -358,5 +358,167 @@ class TestSymbolicAST(unittest.TestCase):
             )
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 SALU instructions."""
+
+    def resolve_operand(self, op: SOP2Operand, state: ScalarModel) -> int:
+        if isinstance(op, SGPROperand):
+            return state.read_sgpr(op.index)
+        elif isinstance(op, LiteralU32):
+            return op.value & MASK_U32
+        elif isinstance(op, InlineConstant):
+            return op.value & MASK_U32
+        else:
+            raise TypeError(f"Unsupported operand type: {type(op).__name__}")
+
+    def step(self, instr: SAddSubCoU32Instruction, state: ScalarModel) -> Tuple[int, int]:
+        # Atomic read phase
+        s0_val = self.resolve_operand(instr.src0, state)
+        s1_val = self.resolve_operand(instr.src1, state)
+
+        # Computation phase
+        if instr.opcode in (SOPOpcode.S_ADD_CO_U32, SOPOpcode.S_ADD_U32):
+            res, cc = oracle_s_add_co_u32(s0_val, s1_val)
+        elif instr.opcode in (SOPOpcode.S_SUB_CO_U32, SOPOpcode.S_SUB_U32):
+            res, cc = oracle_s_sub_co_u32(s0_val, s1_val)
+        else:
+            raise ValueError(f"Unsupported opcode: {instr.opcode}")
+
+        # Update condition code and destination SGPR
+        state.set_scc(cc)
+        state.write_sgpr(instr.dst.index, res)
+        return res, cc
+
+    def run_program(
+        self, program: List[SAddSubCoU32Instruction], state: ScalarModel
+    ) -> List[Tuple[int, int]]:
+        results: List[Tuple[int, int]] = []
+        for instr in program:
+            results.append(self.step(instr, state))
+        return results
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Verification of deterministic scalar instruction interpretation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarModel()
+
+    def test_scalar_add_execution(self) -> None:
+        self.state.write_sgpr(1, 100)
+        self.state.write_sgpr(2, 250)
+        instr = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_CO_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, 350)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(0), 350)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_scalar_add_carry_generation(self) -> None:
+        self.state.write_sgpr(1, MAX_U32)
+        self.state.write_sgpr(2, 5)
+        instr = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, 4)
+        self.assertEqual(cc, 1)
+        self.assertEqual(self.state.read_sgpr(0), 4)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_scalar_sub_execution(self) -> None:
+        self.state.write_sgpr(1, 500)
+        self.state.write_sgpr(2, 200)
+        instr = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_SUB_CO_U32,
+            dst=SGPROperand(3),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, 300)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(3), 300)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_scalar_sub_borrow_generation(self) -> None:
+        self.state.write_sgpr(1, 10)
+        self.state.write_sgpr(2, 20)
+        instr = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_SUB_U32,
+            dst=SGPROperand(3),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        res, cc = self.interp.step(instr, self.state)
+        self.assertEqual(res, MAX_U32 - 9)
+        self.assertEqual(cc, 1)
+        self.assertEqual(self.state.read_sgpr(3), MAX_U32 - 9)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_scalar_with_literal_and_inline_constants(self) -> None:
+        self.state.write_sgpr(1, 0x1000)
+        # Add literal
+        instr_lit = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_CO_U32,
+            dst=SGPROperand(2),
+            src0=SGPROperand(1),
+            src1=LiteralU32(0x2000),
+        )
+        res_lit, cc_lit = self.interp.step(instr_lit, self.state)
+        self.assertEqual(res_lit, 0x3000)
+        self.assertEqual(cc_lit, 0)
+
+        # Sub inline constant
+        instr_inline = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_SUB_CO_U32,
+            dst=SGPROperand(3),
+            src0=SGPROperand(2),
+            src1=InlineConstant(1),
+        )
+        res_in, cc_in = self.interp.step(instr_inline, self.state)
+        self.assertEqual(res_in, 0x2FFF)
+        self.assertEqual(cc_in, 0)
+
+    def test_scalar_program_chain(self) -> None:
+        # Program: s0 = 0; s0 += 10; s0 += 20; s0 -= 5
+        program = [
+            SAddSubCoU32Instruction(
+                opcode=SOPOpcode.S_ADD_CO_U32,
+                dst=SGPROperand(0),
+                src0=SGPROperand(0),
+                src1=InlineConstant(10),
+            ),
+            SAddSubCoU32Instruction(
+                opcode=SOPOpcode.S_ADD_CO_U32,
+                dst=SGPROperand(0),
+                src0=SGPROperand(0),
+                src1=InlineConstant(20),
+            ),
+            SAddSubCoU32Instruction(
+                opcode=SOPOpcode.S_SUB_CO_U32,
+                dst=SGPROperand(0),
+                src0=SGPROperand(0),
+                src1=InlineConstant(5),
+            ),
+        ]
+        results = self.interp.run_program(program, self.state)
+        self.assertEqual(results, [(10, 0), (30, 0), (25, 0)])
+        self.assertEqual(self.state.read_sgpr(0), 25)
+
+
 if __name__ == "__main__":
     unittest.main()
