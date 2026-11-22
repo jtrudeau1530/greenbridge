@@ -1,4 +1,4 @@
-# Textures: the BCPack gap
+# Textures: TTPF pools and BCPack decoding
 
 Measured on 2026-11-21 from one retail Xbox Series install (1.0.2.1). The corpus is all 57
 RDS5 texture pools: 46 under `data/ttdb/**` and 11 under `pack/<name>/data/ttdb/**`, 57.94 GiB
@@ -7,13 +7,20 @@ field.
 
 ## Outcome
 
-| | Textures |
-|---|---:|
-| catalog entries | 357,115 |
-| exported with the complete source mip chain | 98,603 |
-| exported with fewer mips | 210,292 |
-| exported at least one mip | 308,895 |
-| skipped | 48,220 |
+| | Initial baseline | After layout/format fixes (zlib/raw) | Projected with BCPack (BC1–BC7)* |
+|---|---:|---:|---:|
+| catalog entries | 357,115 | 357,115 | 357,115 |
+| exported with the complete source mip chain | 98,603 | 305,959 | 357,115 |
+| exported with fewer mips | 210,292 | 16,423 | 0 |
+| exported at least one mip | 308,895 | 322,382 | 357,115 |
+| skipped | 48,220 | 34,733 | 0 |
+
+\* *Codec-availability projection from `tools/ttpf_mips.py scan` across all 57 pools, not a full
+DDS export run. In full-corpus chunk checks with locally calibrated history tables
+(`--allow-provisional --history <path>`), BC6H decodes 268 / 268 chunks (0 strict, 100%
+provisional) and BC7 decodes 5,150 / 5,167 chunks (583 strict, 99.67% provisional), while
+**17 / 5,167 BC7 chunks (0.33%)** still cleanly refuse in provisional mode when unknown built-in
+history references exceed the consistency budget (see §5 below).*
 
 A skipped row has `File: null` and a `Limitation`. Either the catalog marks the texture as
 unextractable, or its content does not decode (`NotSupportedException`, `InvalidDataException`).
@@ -45,9 +52,11 @@ format skips).
 
 Adding all six BCPack codecs (BC1, BC3, BC4, BC5, BC6H and BC7) in `tools/ttpf_mips.py`
 unlocks **51,156** more complete chains across the 57 pools (51,149 2D + 7 multi-slice 2D
-arrays), bringing the projected split to **357,115 complete** (100% of catalog entries),
-**0 partial** and **0 skipped** (**0** remaining BCPack skips, **0** layout/format skips and
-**0** skipped multi-slice descriptors).
+arrays), bringing the codec-availability projection to **357,115 complete** (100% of catalog
+entries), **0 partial** and **0 skipped** (**0** remaining BCPack codec skips, **0**
+layout/format skips and **0** skipped multi-slice descriptors). On actual chunk decode over all
+57 pools, BC6H requires `--allow-provisional --history <path>` (268 / 268 chunks) and
+**17 / 5,167 BC7 chunks (0.33%)** still cleanly refuse in provisional mode (see §5 below).
 
 This is the same 308,895 / 48,220 baseline already recorded in `docs/design.md`. The recount
 splits the 48,220 by cause: the old "(BCPack or unmapped)" label hides 14,713 skips whose
@@ -728,7 +737,8 @@ decodes at 36.6 dB median on held-out textures and says 621 of 3,276 pair textur
 known; the gap is the unpublished window and the unresolved codebook entries, not a
 byte-exact validation. The code is not adopted here.
 
-A decoder still needs:
+At the time of that initial probe (before the clean-room decoder below was implemented), a
+decoder still needed:
 
 1. the 256-slot pre-start predictor window (the largest blocker: 160/200 pair chunks);
 2. a stable 256-entry index codebook (two fits agree on 248/256; 8 rare mirror pairs are open);
@@ -736,6 +746,12 @@ A decoder still needs:
 4. record layouts and semantics for BC3, BC5, BC6H and BC7 (BC4 lane 1 is exact; the rest are
    not);
 5. a reference plaintext pair or a published bitstream specification for a byte-exact check.
+
+Items 1–4 are now resolved by the clean-room decoder documented in
+[Clean-room BCPack bitstream specification and decoder](#clean-room-bcpack-bitstream-specification-and-decoder)
+below (`tools/bcpack.py`, `tools/bcpack_tables.py`, `tools/bcpack_tables_bptc.py` and
+`tools/bcpack_history_calib.py`); item 5 remains external because no plaintext reference
+encoder ships with the package.
 
 ### The shipped binaries
 
