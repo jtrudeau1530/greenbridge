@@ -782,6 +782,30 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   972 of them `hyp_dpp`. As a control, `--permlane-fetch-inactive` there mismatches in 239 of 1,000 programs. A
   GFX10 assembler has no `global_store_b32`, so `asm.raw_kernel_text` puts the GFX10 name (`global_store_dword`)
   back for `gfx10xx`; nothing else the generator emits needed a change.
+  On a discrete RDNA2 card (RX 6700 XT, gfx1031, Windows, Adrenalin 26.8.1, through the HIP DLL of the driver;
+  BUILD-162): with `--dpp`, seeds 1 to 8, 1,000 programs each (500 per wave size), all 8,000 match, 984 of them
+  `hyp_dpp` and 1,964 `hyp_permlane`.
+- **DPP sweep (`--dpp-sweep`, BUILD-162).** The random `--dpp` programs run full waves, four ops and mostly
+  `row_mask`/`bank_mask` 0xF, so a rare control or mask pair can go untested for many seeds. `--dpp-sweep` replaces
+  the random programs with one short program per case: an EXEC write, then one DPP op. It covers every DPP16 control
+  (335: 256 `quad_perm`, `row_shl/shr/ror` 1 to 15, both mirrors, `row_share` and `row_xmask` 0 to 15) × `bound_ctrl`
+  × `fi` × three EXEC patterns (all lanes; every other lane, so each source is invalid in some lanes; and bank 0 off
+  in some rows, so whole 4-lane groups read inactive sources). It also covers all 256 `row_mask`/`bank_mask` pairs on
+  `row_shr:1`, `quad_perm:[1,0,3,2]` and `row_share:5`, × `bound_ctrl`, under two EXEC patterns. And it covers 19
+  DPP8 select sets (identity, reverse, swaps, the 8 broadcasts and the 7 rotations) × `fi` × the three EXEC patterns.
+  That makes 7,206 cases per wave size. The op rotates through `v_mov`/`v_not`/`v_add_nc_u32`/`v_xor`, and every
+  other group of four writes vD in place (`vD = src0`, as reductions do), so the model has to read every source
+  before it writes. Each case carries its family label, and failures print it. The run ends with a table of cases
+  and failures per family. The random draws of `--dpp` are unchanged: a test pins the program text of seed 77, and
+  800 programs from before and after the change are identical.
+  On the RX 6700 XT (gfx1031), `--dpp-sweep --oracle hw --wave both`: 14,412 cases, match 14,412, mismatch 0 in
+  every family, 40 of them `hyp_dpp` (DPP8 with an inactive source and fi = 0 reads 0). This is the first measured
+  check of every DPP16 control and mask pair on RDNA2 hardware, and it confirms the rules in the model's docstring
+  (and `docs/design.md`): `bound_ctrl` with an invalid source, `fi` on DPP16 and DPP8 inactive sources, an
+  unwritten lane keeping the old vD for non-mov ops, and `row_mask`/`bank_mask` in both wave sizes. In the same
+  run (`--oracle translator,hw`), the translator matches all of them as well: 7,206 wave32 native and 7,206 wave64
+  `--wave64-emulate`, with 0 rejected and 0 harness errors. One `vk_compute_test` runs per case, so the translator
+  side takes about 90 minutes there; the hardware side takes about one.
   First results (Radeon 880M, driver 26.11.2): 24,000 programs on the hardware, half wave32 and half native
   wave64, seeds 11 to 16 (4,000 programs each), with and without `--dpp`, 12 to 60 ops, with and without
   `--no-maskdata` and `--no-hw-guard`: match 24,000, mismatch 0, hyp_only 0, rejected 0. 7,652 of them contained
@@ -1120,6 +1144,48 @@ Using `fma_mix_odd` produces the exact hardware single-rounded words in both nea
 E `0x7bff`, F `0x3c01`, G `0x3c01`), which the translator produces across all 7 discriminating cases via
 `fma_mix_odd` in both nearest-even and toward-zero modes (SHADER-297). On Vulkan, using `fma_mix_odd` matches the
 exact single-rounded hardware words for all inputs.
+
+### `v_cvt_pknorm_*` NaN and rounding on RDNA2 (`tools/pknorm_probe.py`, SHADER-339)
+
+`docs/design.md` said `v_cvt_pknorm_i16_f32` / `v_cvt_pknorm_u16_f32` give 0 for a NaN, as `v_cvt_i32_f32` does,
+without a hardware measurement. The probe puts each NaN pattern in S0 and in S1 next to a finite value: quiet
+(`0x7fc00000`, `0xffc00000`), quiet with a payload (`0x7fc00001`, `0x7fffffff`, `0xffffffff`), signalling
+(`0x7f800001`, `0xff800001`, `0x7fa00000`). Finite values are the semantic test's (±0, ±1, ±0.5, ±2, ±inf,
+subnormals, steps of 1/32767 and 1/65535). It also has near-tie inputs: f32 values whose product with 32767 (or 65535)
+rounds to exactly k + 0.5 in f32, while the exact product is just below or just above it. There the translator's
+`OpFMul` then `RoundEven` and a single rounding of the exact product differ by one, in either direction.
+
+```
+python -I tools/pknorm_probe.py                 # the translator, on the CPU interpreter
+python -I tools/pknorm_probe.py --oracle hw     # also the native instruction on an AMD GPU (hardware oracle)
+```
+
+The `hw` side runs one lane per case in wave32 and wave64, under five MODEs:
+- the one inferred for the game (IEEE 0, DX10_CLAMP 1, f32 denormals flushed, f16/f64 kept, nearest);
+- the same with IEEE 1;
+- the same with DX10_CLAMP 0;
+- the same with both IEEE 1 and DX10_CLAMP 0;
+- the same with f32 denormals kept.
+
+It reports the NaN halves that give 0, the words equal to the translator's, and the near-tie words equal to a single
+rounding of the exact product. Exit 0 means every hardware word equals the translator's, 1 means one differs, 77
+means the oracle is unavailable. `tests/test_pknorm_probe.py` checks four near-tie words against a derivation written
+out by hand, and checks that the translator side rounds twice there and gives 0 for a NaN half.
+
+Results (134 cases per run):
+
+| GPU | Driver | NaN halves giving 0 | near ties: single / translator | other words equal |
+|---|---|---|---|---|
+| AMD Radeon iGPU (Ryzen 5 7600X, RDNA2, gfx1036), Windows 11, HIP backend, AMD clang (rocm-sdk-core 10.0.0) | 32.0.21045.29003 | 74 of 74 | 28 of 28 / 0 of 28 | 34 of 34 |
+
+The ten runs (two wave sizes, five MODEs) give the same words. A NaN gives 0 on RDNA2, as the translator assumes,
+whatever the IEEE, DX10_CLAMP and f32 denormal fields. The rounding does not match. The hardware rounds the exact
+product once, to nearest even. Examples:
+- `0x38400180` (exact 1.5 - 1.4e-9) gives 1, where the translator gives 2;
+- `0x3c004101` (exact 256.5 + 1.5e-5) gives 257, where the translator gives 256.
+
+The translator is not changed here. It needs the exact product: the product's rounding error is exact through `Fma`
+(`Fma(x, s, -p)`), and only its sign matters on a tie.
 
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
