@@ -449,7 +449,9 @@ descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
 the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
-of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
+of root signatures, which are not registered yet; the literal S#s of shaders (`literal_samplers` in the index),
+which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
+pipeline creation comes with the shader index, #291);
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
 feature, each logged and approximated; the storage arrays hold 255 images a dimension; nothing writes through a
 storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan

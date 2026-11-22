@@ -1579,6 +1579,7 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
@@ -3333,6 +3334,16 @@ VkDescriptorSet bindless_set(ID3D12Device* device) {
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->layout() : VK_NULL_HANDLE;
+}
+
+HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
+    if (!device) return E_INVALIDARG;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_INVALIDARG;
+    bool all = true;
+    for (const leonida::gfx10::SamplerWords& words : samplers) all = d->bind_sampler(words) && all;
+    return all ? S_OK : E_FAIL;
 }
 
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
