@@ -28,7 +28,8 @@ BINDLESS_H = os.path.join(ROOT, "runtime", "src", "vulkan_bindless.h")
 
 def capacities(path=BINDLESS_H):
     """Descriptor counts by binding number, from the `bindings` table of vulkan_bindless.h."""
-    src = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
     m = re.search(r"std::array<Binding,\s*(\d+)>\s*bindings\s*=\s*\{\{(.*?)\}\};", src, re.S)
     if not m:
         raise SystemExit(f"{path}: no `bindings` table")
@@ -45,6 +46,17 @@ def metal_ids(counts):
         ids.append(total)
         total += c
     return ids
+
+
+def _fresh_id(base, used):
+    """Return `base` if unused, otherwise `base_1`, `base_2`, ... and record it in `used`."""
+    cand = base
+    i = 1
+    while cand in used:
+        cand = f"{base}_{i}"
+        i += 1
+    used.add(cand)
+    return cand
 
 
 def rewrite(text, counts):
@@ -65,28 +77,52 @@ def rewrite(text, counts):
             raise SystemExit(f"{v}: binding {b} isn't in vulkan_bindless.h")
 
     defs = {}       # result id -> instruction text
-    for ln in lines:
+    ptr_pos = {}    # OpTypePointer result id -> line index, so shared capacities emit at the earliest pointer
+    for idx, ln in enumerate(lines):
         m = re.match(r"\s*(%\S+) = (.*)$", ln)
         if m:
             defs[m.group(1)] = m.group(2)
+            if re.match(r"OpTypePointer\b", m.group(2)):
+                ptr_pos[m.group(1)] = idx
     uint = next((r for r, d in defs.items() if d == "OpTypeInt 32 0"), None)
 
-    new_types = []      # inserted right after the variable's pointer type is declared
-    retype = {}         # variable -> new pointer type
-    for v, b in sorted(set0.items(), key=lambda kv: kv[1]):
+    candidates = []
+    for order, (v, b) in enumerate(set0.items()):
         var = re.match(r"OpVariable (%\S+) UniformConstant$", defs.get(v, ""))
         if not var:
             continue    # the hash table (a storage buffer) and other non-array resources keep their type
-        ptr = re.match(r"OpTypePointer UniformConstant (%\S+)$", defs[var.group(1)])
+        old_ptr = var.group(1)
+        ptr = re.match(r"OpTypePointer UniformConstant (%\S+)$", defs.get(old_ptr, ""))
         rt = re.match(r"OpTypeRuntimeArray (%\S+)$", defs.get(ptr.group(1), "")) if ptr else None
         if not rt:
             continue
         if uint is None:
             raise SystemExit("module has no 32-bit uint type for the array lengths")
-        cap, arr, nptr = f"%msl_cap_b{b}", f"%msl_arr_b{b}", f"%msl_ptr_b{b}"
-        new_types.append((var.group(1), [f"{cap} = OpConstant {uint} {counts[b]}",
-                                         f"{arr} = OpTypeArray {rt.group(1)} {cap}",
-                                         f"{nptr} = OpTypePointer UniformConstant {arr}"]))
+        candidates.append((b, ptr_pos.get(old_ptr, len(lines)), order, v, old_ptr, rt.group(1)))
+
+    used_ids = set(defs) | set(sets) | set(binds)
+    cap_by_bind = {}    # binding -> OpConstant id (emitted once per binding)
+    ptr_by_key = {}     # (binding, elem_type) -> new OpTypePointer id
+    new_types = []      # inserted right after the variable's pointer type is declared
+    retype = {}         # variable -> new pointer type
+    for b, _, _, v, old_ptr, elem in sorted(candidates):
+        if (b, elem) in ptr_by_key:
+            retype[v] = ptr_by_key[(b, elem)]
+            continue
+        decl = []
+        cap = cap_by_bind.get(b)
+        if cap is None:
+            cap = _fresh_id(f"%msl_cap_b{b}", used_ids)
+            cap_by_bind[b] = cap
+            decl.append(f"{cap} = OpConstant {uint} {counts[b]}")
+        arr = _fresh_id(f"%msl_arr_b{b}", used_ids)
+        nptr = _fresh_id(f"%msl_ptr_b{b}", used_ids)
+        decl.extend([
+            f"{arr} = OpTypeArray {elem} {cap}",
+            f"{nptr} = OpTypePointer UniformConstant {arr}",
+        ])
+        new_types.append((old_ptr, decl))
+        ptr_by_key[(b, elem)] = nptr
         retype[v] = nptr
 
     out = []
