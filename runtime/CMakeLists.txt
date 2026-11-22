@@ -94,6 +94,7 @@ if(WIN32)
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
+    shims/library_loader.cpp
     shims/process.cpp
   )
   add_dependencies(gta6rt gta6rt_tls_host)
@@ -200,6 +201,7 @@ if(WIN32)
   add_executable(xgameruntime_test
     test/xgameruntime_test.cpp
     shims/xgameruntime.cpp
+    shims/library_loader.cpp
     shims/registry.cpp
   )
   target_include_directories(xgameruntime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
