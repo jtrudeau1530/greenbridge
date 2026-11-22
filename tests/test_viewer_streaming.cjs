@@ -594,12 +594,38 @@ test('a valid LOD manifest is accepted', async () => {
     assert.equal(world.test, false);
 });
 
+test('orphan HD draws independently of the LOD chain in its cell', async () => {
+    const f = fixture(0);
+    f.context.world = {
+        test: false,
+        lod_bands: { hd: [0, 130], orphan_hd: [0, 100] },
+        chunks: [
+            { ...worldChunk, id: 'hd', url: 'hd.glb', lod: 'hd', cell: [0, 0, 256, 256] },
+            { ...worldChunk, id: 'orphan', url: 'orphan.glb', lod: 'orphan_hd', cell: [0, 0, 256, 256] },
+        ],
+    };
+    const hd = Object.assign(f.object(), { visible: true });
+    const orphan = Object.assign(f.object(), { visible: true });
+    f.frame();
+    await f.succeed(0, hd);
+    await f.succeed(1, orphan);
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(orphan.visible, true);
+
+    f.context.camera.position.x = 366; // 110 m from the cell, inside the orphan's unload slack.
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(orphan.visible, false);
+    assert.ok(f.state.live.has('orphan'));
+});
+
 test('LOD sets show one tier per cell by horizontal distance, with slack before unloading', async () => {
     const f = fixture(0);
     const cell = [0, 0, 256, 256];
     f.context.world = { test: false, lod_bands: { hd: [0, 130], lod: [130, 450], slod1: [450, 1000] }, chunks: [
         { id: 'hd', url: 'hd.glb', bounds: [0, 0, 0, 256, 50, 256], lod: 'hd', cell },
-        { id: 'lod', url: 'lod.glb', bounds: [0, 0, 0, 256, 80, 256], lod: 'lod', cell },
+        { id: 'lod', url: 'lod.glb', bounds: [0, 0, 0, 256, 80, 256], lod: 'lod', cell: [...cell] },
         { id: 'slod1', url: 'slod1.glb', bounds: [0, 0, 0, 256, 90, 256], lod: 'slod1', cell },
     ] };
     const pos = f.context.camera.position;
@@ -613,7 +639,11 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     f.frame();
     assert.deepEqual(f.requests.map(r => r.url), ['hd.glb', 'lod.glb']);
     assert.ok(f.state.live.has('hd'));
-    await f.succeed(1, lod);
+    assert.equal(hd.visible, true, 'HD fills the cell while LOD is fetching');
+    await f.receive(1);
+    f.frame();
+    assert.equal(hd.visible, true, 'HD fills the cell while LOD is parsing');
+    await f.finish(1, lod);
     f.frame();
     assert.equal(hd.visible, false);
     assert.equal(lod.visible, true);
