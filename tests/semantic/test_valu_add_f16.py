@@ -3,7 +3,9 @@ from __future__ import annotations
 import math
 import struct
 import unittest
-from typing import Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional, Tuple, Union
 
 # IEEE 754 binary16 (half precision) architectural constants
 SIGN_MASK: int = 0x8000
@@ -179,6 +181,108 @@ def oracle_v_add_f16(
     return raw_res
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+class SubWord(Enum):
+    LO = auto()
+    HI = auto()
+
+
+@dataclass(frozen=True)
+class Reg16:
+    """Represents an architectural 16-bit register operand (e.g. v0.l, v0.h, s2.l)."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+    sub_word: SubWord = SubWord.LO
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def is_hi(self) -> bool:
+        return self.sub_word == SubWord.HI
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        suffix = "h" if self.is_hi else "l"
+        return f"{prefix}{self.index}.{suffix}"
+
+
+@dataclass(frozen=True)
+class Literal16:
+    """Represents a 16-bit inline float constant or literal."""
+    bits: int
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal16:
+        return cls(f16_to_bits(val))
+
+    @property
+    def float_value(self) -> float:
+        return bits_to_f16(self.bits)
+
+    @property
+    def name(self) -> str:
+        if self.bits == POS_ZERO:
+            return "0.0"
+        if self.bits == NEG_ZERO:
+            return "-0.0"
+        f = self.float_value
+        if math.isnan(f):
+            return "nan"
+        if math.isinf(f):
+            return "inf" if f > 0 else "-inf"
+        return f"{f:g}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand16:
+    """Typed expression operand with optional input modifiers (abs, neg)."""
+    source: Union[Reg16, Literal16]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass(frozen=True)
+class VAddF16Instruction:
+    """Symbolic AST node representing a RDNA2 v_add_f16 instruction."""
+    dst: Reg16
+    src0: VOP3Operand16
+    src1: VOP3Operand16
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        s = f"v_add_f16 {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# ==============================================================================
+# Unit Tests
+# ==============================================================================
+
 class TestF16ModelAndOracle(unittest.TestCase):
     """Unit tests for binary16 bit model, predicates, and reference oracle."""
 
@@ -289,6 +393,71 @@ class TestF16ModelAndOracle(unittest.TestCase):
         res = oracle_v_add_f16(snan, f16_to_bits(1.0))
         self.assertTrue(is_qnan(res))
         self.assertEqual(res, snan | QNAN_BIT)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg16_validation_and_naming(self) -> None:
+        v0_l = Reg16(0, RegType.VGPR, SubWord.LO)
+        self.assertEqual(v0_l.name, "v0.l")
+        self.assertFalse(v0_l.is_hi)
+
+        v0_h = Reg16(0, RegType.VGPR, SubWord.HI)
+        self.assertEqual(v0_h.name, "v0.h")
+        self.assertTrue(v0_h.is_hi)
+
+        s8_l = Reg16(8, RegType.SGPR, SubWord.LO)
+        self.assertEqual(s8_l.name, "s8.l")
+        self.assertFalse(s8_l.is_hi)
+
+        with self.assertRaises(ValueError):
+            Reg16(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg16(-1, RegType.VGPR)
+
+    def test_operand_disassembly(self) -> None:
+        v = Reg16(2, RegType.VGPR, SubWord.LO)
+        op_plain = VOP3Operand16(v)
+        self.assertEqual(op_plain.disassemble(), "v2.l")
+
+        op_abs = VOP3Operand16(v, abs_mod=True)
+        self.assertEqual(op_abs.disassemble(), "|v2.l|")
+
+        op_neg = VOP3Operand16(v, neg_mod=True)
+        self.assertEqual(op_neg.disassemble(), "-v2.l")
+
+        op_neg_abs = VOP3Operand16(v, abs_mod=True, neg_mod=True)
+        self.assertEqual(op_neg_abs.disassemble(), "-|v2.l|")
+
+        lit = Literal16.from_float(1.5)
+        op_lit = VOP3Operand16(lit)
+        self.assertEqual(op_lit.disassemble(), "1.5")
+
+    def test_v_add_f16_ast_construction_and_validation(self) -> None:
+        dst = Reg16(0, RegType.VGPR, SubWord.LO)
+        src0 = VOP3Operand16(Reg16(2, RegType.VGPR, SubWord.HI), neg_mod=True, abs_mod=True)
+        src1 = VOP3Operand16(Reg16(4, RegType.SGPR, SubWord.LO))
+        instr = VAddF16Instruction(dst=dst, src0=src0, src1=src1, clamp=True)
+
+        self.assertEqual(instr.disassemble(), "v_add_f16 v0.l, -|v2.h|, s4.l clamp")
+
+        # Invalid destination type (SGPR)
+        with self.assertRaises(TypeError):
+            VAddF16Instruction(dst=Reg16(0, RegType.SGPR), src0=src0, src1=src1)
+
+    def test_structural_equality(self) -> None:
+        i1 = VAddF16Instruction(
+            Reg16(0, RegType.VGPR),
+            VOP3Operand16(Reg16(2, RegType.VGPR)),
+            VOP3Operand16(Literal16.from_float(0.0)),
+        )
+        i2 = VAddF16Instruction(
+            Reg16(0, RegType.VGPR),
+            VOP3Operand16(Reg16(2, RegType.VGPR)),
+            VOP3Operand16(Literal16.from_float(0.0)),
+        )
+        self.assertEqual(i1, i2)
 
 
 if __name__ == "__main__":
