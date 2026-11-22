@@ -248,6 +248,7 @@ def test_deep_sequential_chains_stay_flat_and_iterative():
 
 
 if __name__ == "__main__":
+    test_depth()
     test_shapes()
     test_deep_sequential_chains_stay_flat_and_iterative()
     structured, refused, loops, split_ok, split_cap = _check_random_graphs()
