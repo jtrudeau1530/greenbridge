@@ -412,13 +412,13 @@ void check_run_time_load() {
             {0x67ce4bfc, 0xb1d1, 0x4ac7, {0xbc, 0x3a, 0xcb, 0x92, 0x19, 0xa9, 0x7a, 0x85}},
             {0xdadc2895, 0x34b0, 0x4ef5, {0xa8, 0x3e, 0x45, 0x11, 0x4d, 0x62, 0x9b, 0x80}},
             system5};
-        bool all = true;
+        bool all_inherited = true;
         for (const GUID& iid : chain) {
             void* same = nullptr;
-            all = all && query(&system_cls, iid, &same) == S_OK && same == sy;
+            all_inherited = all_inherited && query(&system_cls, iid, &same) == S_OK && same == sy;
             if (same) release(same);
         }
-        check(all, "IXSystemImpl5 answers for every interface it inherits (IXSystemImpl .. IXSystemImpl4)");
+        check(all_inherited, "IXSystemImpl5 answers for every interface it inherits (IXSystemImpl .. IXSystemImpl4)");
         check(reinterpret_cast<IdQuery>(slot(sy, 5))(sy, sizeof(buf), buf, &used) == S_OK && used == 45 &&
                   reinterpret_cast<IdQuery>(slot(sy, 5))(sy, 44, buf, &used) ==
                       HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
