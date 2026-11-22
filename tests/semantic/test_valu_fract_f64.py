@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum, auto
 from fractions import Fraction
 import math
 import struct
+from typing import Union
 import unittest
 
 # IEEE 754 binary64 (double precision) architectural constants
@@ -205,6 +208,105 @@ def oracle_v_fract_f64(
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+class Opcode(Enum):
+    V_FRACT_F64 = auto()
+
+
+@dataclass(frozen=True)
+class RegPair:
+    """Represents an architectural 64-bit register pair (e.g., v[0:1] or s[4:5])."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 254):
+            raise ValueError(f"Register pair base index {self.index} out of range [0, 254]")
+
+    @property
+    def lo_reg(self) -> int:
+        return self.index
+
+    @property
+    def hi_reg(self) -> int:
+        return self.index + 1
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}[{self.index}:{self.index + 1}]"
+
+
+@dataclass(frozen=True)
+class Literal64:
+    """Represents a 64-bit literal or inline float constant."""
+    bits: int
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal64:
+        return cls(f64_to_bits(val))
+
+    @property
+    def float_value(self) -> float:
+        return bits_to_f64(self.bits)
+
+    @property
+    def name(self) -> str:
+        if self.bits == POS_ZERO_F64:
+            return "0.0"
+        if self.bits == NEG_ZERO_F64:
+            return "-0.0"
+        f = self.float_value
+        if math.isnan(f):
+            return "nan"
+        if math.isinf(f):
+            return "inf" if f > 0 else "-inf"
+        return f"{f:g}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand:
+    """Typed expression operand with optional input modifiers (abs, neg)."""
+    source: Union[RegPair, Literal64]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass(frozen=True)
+class VFractF64Instruction:
+    """Symbolic AST node representing a RDNA2 v_fract_f64 instruction."""
+    dst: RegPair
+    src0: VOP3Operand
+    clamp: bool = False
+    opcode: Opcode = Opcode.V_FRACT_F64
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        s = f"v_fract_f64 {self.dst.name}, {self.src0.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# ==============================================================================
 # Unit Tests: Reference Oracle and Architectural Model
 # ==============================================================================
 
@@ -352,6 +454,66 @@ class TestValuFractF64ModelAndOracle(unittest.TestCase):
         qnan = 0x7FF8_0000_ABCD_EF01
         res_qnan = oracle_v_fract_f64(qnan)
         self.assertEqual(res_qnan, qnan)
+
+
+class TestValuFractF64SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_regpair_validation_and_naming(self) -> None:
+        v0 = RegPair(0, RegType.VGPR)
+        self.assertEqual(v0.name, "v[0:1]")
+        self.assertEqual(v0.lo_reg, 0)
+        self.assertEqual(v0.hi_reg, 1)
+
+        s8 = RegPair(8, RegType.SGPR)
+        self.assertEqual(s8.name, "s[8:9]")
+        self.assertEqual(s8.lo_reg, 8)
+        self.assertEqual(s8.hi_reg, 9)
+
+        with self.assertRaises(ValueError):
+            RegPair(255, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegPair(-1, RegType.VGPR)
+
+    def test_operand_disassembly(self) -> None:
+        v = RegPair(2, RegType.VGPR)
+        op_plain = VOP3Operand(v)
+        self.assertEqual(op_plain.disassemble(), "v[2:3]")
+
+        op_abs = VOP3Operand(v, abs_mod=True)
+        self.assertEqual(op_abs.disassemble(), "|v[2:3]|")
+
+        op_neg = VOP3Operand(v, neg_mod=True)
+        self.assertEqual(op_neg.disassemble(), "-v[2:3]")
+
+        op_neg_abs = VOP3Operand(v, abs_mod=True, neg_mod=True)
+        self.assertEqual(op_neg_abs.disassemble(), "-|v[2:3]|")
+
+        lit = Literal64.from_float(1.5)
+        op_lit = VOP3Operand(lit)
+        self.assertEqual(op_lit.disassemble(), "1.5")
+
+    def test_v_fract_f64_ast_construction_and_validation(self) -> None:
+        dst = RegPair(0, RegType.VGPR)
+        src0 = VOP3Operand(RegPair(2, RegType.VGPR), neg_mod=True, abs_mod=True)
+        instr = VFractF64Instruction(dst=dst, src0=src0, clamp=True)
+
+        self.assertEqual(instr.disassemble(), "v_fract_f64 v[0:1], -|v[2:3]| clamp")
+
+        # Invalid destination type (SGPR)
+        with self.assertRaises(TypeError):
+            VFractF64Instruction(dst=RegPair(0, RegType.SGPR), src0=src0)
+
+    def test_structural_equality(self) -> None:
+        i1 = VFractF64Instruction(
+            RegPair(0, RegType.VGPR),
+            VOP3Operand(RegPair(2, RegType.VGPR)),
+        )
+        i2 = VFractF64Instruction(
+            RegPair(0, RegType.VGPR),
+            VOP3Operand(RegPair(2, RegType.VGPR)),
+        )
+        self.assertEqual(i1, i2)
 
 
 if __name__ == "__main__":
