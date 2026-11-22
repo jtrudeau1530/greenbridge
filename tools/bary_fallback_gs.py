@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 SUFFIX = ".bary_gs"   # <ps name>.bary_gs.spvasm / .spv next to the pixel shader
 
@@ -160,11 +161,14 @@ def build_for_index(spirv_dir, pair: tuple[str, str] | None = None):
     built = []
     for asm in write_for_index(spirv_dir, pair):
         spv = asm[: -len(".spvasm")] + ".spv"
-        for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
-                    ["spirv-val", "--target-env", "vulkan1.2", spv]):
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode:
-                raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
+        with tempfile.TemporaryDirectory(prefix=".bary-gs-", dir=os.path.dirname(spv)) as staging:
+            staged_spv = os.path.join(staging, os.path.basename(spv))
+            for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", staged_spv],
+                        ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode:
+                    raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
+            os.replace(staged_spv, spv)
         built.append(spv)
     return built
 
