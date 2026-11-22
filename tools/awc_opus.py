@@ -116,6 +116,10 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
     seq, granule, pending, size = 2, 0, [], 0
     target = pre_skip + length if length > 0 else None
     written = 0
+    if not packets:
+        out.append(ogg_page(serial, 2, pre_skip, [], 0x04))
+        write_file(path, b"".join(out))
+        return pre_skip
     for i, p in enumerate(packets):
         pending.append(p)
         granule += opus_samples(p)

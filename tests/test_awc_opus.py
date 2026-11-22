@@ -504,6 +504,16 @@ class ExportBankTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             awc.write_ogg_opus(path, packets, 1, 24, 4800, pre_skip=65536)
 
+    def test_empty_packet_list_writes_an_eos_page(self):
+        # No audio packets is still a valid empty stream: the EOS flag must be present.
+        path = os.path.join(self.tmp.name, "empty.ogg")
+        self.assertEqual(awc.write_ogg_opus(path, [], 1, 25, 0), 0)
+        with open(path, "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(len(pages), 3)
+        self.assertEqual(pages[-1]["flags"] & 0x04, 0x04)
+        self.assertEqual(pages[-1]["granule"], 0)
+
     def test_cli_pre_skip_override(self):
         bank, _, _ = self.make_bank()
         subprocess.run([sys.executable, "-I", awc.__file__, bank, self.out, "--jobs", "1", "--pre-skip", "0"],
