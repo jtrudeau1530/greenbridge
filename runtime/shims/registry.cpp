@@ -312,7 +312,7 @@ void remove_module_lookup(void* ctx) {
 }
 
 Table::Table(const Entry* entries, size_t count) {
-    for (size_t i = 0; i < count; ++i) table()[std::string(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
+    for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }
 
 void* find(const std::string& dll_lower, const std::string& name) {
@@ -322,6 +322,11 @@ void* find(const std::string& dll_lower, const std::string& name) {
 
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name) {
     std::lock_guard lock(g_pool_mutex);
+    static std::map<std::string, void*> s_thunks;
+    const std::string key = lower_ascii(dll) + "!" + name;
+    auto it = s_thunks.find(key);
+    if (it != s_thunks.end()) return it->second;
+
     if (!g_stub) g_stub = make_common_stub();
     if (!g_stub) return nullptr;
     if (!g_pool || g_pool_used + kThunkSize > g_pool_size) {
@@ -330,7 +335,7 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
         g_pool_used = 0;
         if (!g_pool) return nullptr;
     }
-    const char* what = _strdup((dll + "!" + name).c_str());  // lives for the process
+    const char* what = _strdup(key.c_str());  // lives for the process
     uint8_t* t = g_pool + g_pool_used;
     g_pool_used += kThunkSize;
     const uint64_t a = reinterpret_cast<uint64_t>(what), f = reinterpret_cast<uint64_t>(g_stub);
@@ -344,6 +349,7 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
     std::memset(code + 22, 0xCC, kThunkSize - 22);
     std::memcpy(t, code, kThunkSize);
     FlushInstructionCache(GetCurrentProcess(), t, kThunkSize);
+    s_thunks.emplace(key, t);
     return t;
 }
 
