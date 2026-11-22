@@ -1163,6 +1163,46 @@ clang), every result matched the rules in the tool's docstring:
 `tests/test_image_query_probe.py` checks the rules against the measured values, the descriptor bits and the
 kernels. A fake oracle plays the GPU to check the comparison and the exit codes; with a 2D depth of 1 it fails. On
 a GFX10 GPU the test runs the whole probe.
+### d16 image loads of 32-bit integer texels (`tools/image_d16_probe.py`, SHADER-387)
+
+`docs/design.md` ("Typed image loads") saturates a 32-bit UINT or SINT texel to the 16-bit range of its signedness
+when a d16 `image_load` packs it (Mesa sets `integer_dest_saturates` for AMD). Native gfx1036 had shown that on 2D
+images; the probe measures it on every dimension the translator handles, through the hardware oracle on a GFX10 GPU.
+
+```
+python -I tools/image_d16_probe.py --json d16_image.json   # 16 kernels, one lane per texel; exit 77 without the oracle
+python -I tools/image_d16_probe.py --self-test             # the rules, T# words and kernels, no GPU
+```
+
+- **Cases.** `SQ_RSRC_IMG_1D`, `2D`, `2D_ARRAY` (3 layers) and `3D` (depth 3), each with 32_UINT and 32_SINT
+  (`dmask:0x1`) and 32_32_UINT and 32_32_SINT (`dmask:0x3`, both results in one VGPR), read with `image_load` and
+  `image_load_mip` at mip 0. The texture sits in the kernel's code after `s_endpgm`, linear, with 256-byte rows (64
+  R32 or 32 R32G32 texels), so the layout does not depend on how the T# states the pitch. The staged words start with the values that separate the rules (0x7fff, 0x8000, 0xffff, 0x10000,
+  0x7fffffff, 0x80000000, -32769, -32768 and their neighbours), then a fixed mixing sequence.
+- **Rules compared:** `trunc` (the low 16 bits), `sat_u` (min(w, 0xffff)) and `sat_s` (w clamped to
+  [-32768, 32767]). Every pair differs on some staged value. A one-channel result also reports its high half, which
+  starts as 0x5a5a.
+- **Controls.** The same texel read without d16 must return the staged word, for x and, on two-channel formats, y:
+  a wrong extent, layer or slice offset fails it (exit 2). On gfx1036, a T# with one layer fewer than a 2D
+  array's three, a 3D depth of 1, or a 1D width of 32 failed 246 of 384, 246 of 384 and 31 of 64 controls.
+  `image_load` and `image_load_mip` must agree (exit 1).
+
+Measured on the integrated GPU of a Ryzen 7 7800X3D (gfx1036, AMD Windows driver 32.0.21045.29003, ROCm wheel
+clang), wave32, every control read back:
+
+| Dimension | Texels per format (one / two channels) | UINT | SINT | High half (one channel) |
+| --- | --- | --- | --- | --- |
+| 1D | 64 / 32 | `sat_u` on all | `sat_s` on all | kept |
+| 2D | 128 / 64 | `sat_u` on all | `sat_s` on all | kept |
+| 2D-array | 384 / 192 | `sat_u` on all | `sat_s` on all | kept |
+| 3D | 384 / 192 | `sat_u` on all | `sat_s` on all | kept |
+
+`image_load` and `image_load_mip` gave the same words on every texel. No result followed `trunc` where it differs
+from saturation. The translator's `saturate_int16` follows this on every dimension; the translated 1D, 2D-array and
+3D d16 loads have not been run on a GPU yet.
+
+`tests/test_image_d16_probe.py` checks the rules, the T# fields and the kernels without a GPU, assembles them for
+gfx1036 when AMD clang is there, and checks the exit codes with a fake oracle. On a GFX10 GPU it runs the probe.
 
 ### `v_fma_mix*` f16 rounding in nearest mode (`tools/fma_mix_probe.py`)
 
