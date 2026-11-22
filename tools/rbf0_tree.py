@@ -582,14 +582,16 @@ def write_xml(directory, docs):
             root.set("error", _xml_safe(doc["error"]))
         if doc["tree"] is not None:
             _xml_node(root, doc["tree"])
-        tree = ET.ElementTree(root)
-        ET.indent(tree, space=" ")
+        ET.indent(root, space=" ")
         name = f"{doc['offset']:08x}.xml"
         if name in used:
             name = f"{doc['offset']:08x}-{i:04d}.xml"
         used.add(name)
         path = os.path.join(directory, name)
-        tree.write(path, encoding="utf-8", xml_declaration=True)
+        # XML readers normalize literal carriage returns. Escape them after serializing ordinary XML text.
+        xml = ET.tostring(root, encoding="utf-8", xml_declaration=True).replace(b"\r", b"&#13;")
+        with open(path, "wb") as f:
+            f.write(xml)
         paths.append(path)
     return paths
 
