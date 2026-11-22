@@ -1030,7 +1030,10 @@ def test_irreducible_cfg_node_splitting(pattern, make_shader, monkeypatch):
 def test_deep_structured_nesting_uses_the_dispatch_loop(make_shader, monkeypatch):
     """SHADER-299: a tree nested deeper than MAX_STRUCTURED_DEPTH is emitted in the flat dispatch-loop form, which
     validates at the same depth in a fraction of the time; raising the bound brings the structured form back."""
-    n = rdna2spirv.MAX_STRUCTURED_DEPTH + 8
+    # cfg_structure hoists tails past 16 guards deep (#1904), so a chain never structures deeper than 16; the bound is
+    # set below that here so the chain still exceeds it.
+    monkeypatch.setattr(rdna2spirv, "MAX_STRUCTURED_DEPTH", 8)
+    n = 24
     body = "".join(f"s_cmp_eq_u32 s0, {i}\ns_cbranch_scc0 {3 + 2 * (n - i - 1)}\n" for i in range(n))
     shader = make_shader(body + "v_mov_b32 v8, s0\nexp mrt0 v8, v8, v8, v8 done vm\ns_endpgm\n",
                          name="ps_nesting_bound")

@@ -820,7 +820,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
         fail(f"shaders: FSPX programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
              "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
              "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
-    with open(settings_file, "w", encoding="utf-8") as f:
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
 
 

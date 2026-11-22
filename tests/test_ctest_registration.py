@@ -56,9 +56,10 @@ class CTestRegistrationTest(unittest.TestCase):
         skips = []
         for i, line in enumerate(lines):
             if 'std::printf("SKIP:' in line:
-                window = "\n".join(lines[i:i + 6])
-                codes = re.findall(r"return (\d+);", window)
-                skips.append(int(codes[0]) if codes else None)
+                # The path's own return, not a conditional one inside it (a LEONIDA_VK_DEVICE filter that matches
+                # nothing fails with `if (!filter.empty()) return 1;` just before the skip's `return 77;`).
+                codes = [int(m) for l in lines[i:i + 7] if "if (" not in l for m in re.findall(r"return (\d+);", l)]
+                skips.append(codes[0] if codes else None)
         # no loader, no ICD, no Vulkan 1.3 GPU -- all three are a ctest SKIP, not a failure.
         self.assertEqual(len(skips), 3, f"expected three whole-test SKIP paths, got {len(skips)}")
         self.assertEqual(skips, [77, 77, 77], "SKIP paths must return 77 for SKIP_RETURN_CODE 77")

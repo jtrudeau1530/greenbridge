@@ -418,7 +418,10 @@ class StubGenerationCliAndIoTests(unittest.TestCase):
         with open(d3d12_path, "w", encoding="utf-8") as f:
             f.write("// synthetic d3d12.h\n")
 
-        with mock.patch.dict(os.environ, {"INCLUDE": f"C:\\empty;{d3d12_dir}"}, clear=False):
+        # INCLUDE is os.pathsep-separated, as find_header reads it (";" on Windows, ":" elsewhere).
+        empty_dir = os.path.join(self.tmp_dir, "empty")
+        os.makedirs(empty_dir, exist_ok=True)
+        with mock.patch.dict(os.environ, {"INCLUDE": os.pathsep.join([empty_dir, d3d12_dir])}, clear=False):
             self.assertEqual(gen.find_header(), d3d12_path)
 
     def test_cli_output_generation_and_boilerplate(self):

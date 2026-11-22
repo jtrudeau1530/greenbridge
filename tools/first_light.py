@@ -95,7 +95,7 @@ def translate(work: str, picked: list[dict]) -> dict:
         index.append(
             {"name": entry["name"], "file": entry["file"], "stage": entry["stage"]}
         )
-    with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=0)
     run([os.path.join(TOOLS, "fssm_unpack.py"), dxbc])
     run(
@@ -373,7 +373,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         "ratio": result["ratio"],
         "ppm": ppm,
     }
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     return result
 
@@ -505,7 +505,7 @@ def main(argv=None) -> int:
         "clear": -1.0,
         "files": {"vs": "vs.spv", "ps": "ps.spv", "mesh": "mesh.bin"},
     }
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")
     if not (a.run or a.check):
@@ -520,4 +520,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())
