@@ -492,11 +492,11 @@ def main():
         if not os.path.isfile(a.src):
             print("ERROR: --dump takes one PSIN file", file=sys.stderr)
             return 2
-        with open(a.src, "rb") as f:
-            blob = f.read()
         try:
+            with open(a.src, "rb") as f:
+                blob = f.read()
             container = Container(blob)
-        except ValueError as e:
+        except (OSError, ValueError) as e:
             print(f"ERROR: {a.src}: {e}", file=sys.stderr)
             return 2
         stats = collections.Counter()

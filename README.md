@@ -95,6 +95,12 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
+**Low disk space:** the ~350 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
+needs about 30 GB; the `assets` stage (~300 GB) is only for the asset tools, and `--wav` adds several times the
+Ogg Opus size. `--work` and `--out` can sit on another drive; a read-only package drive needs `--overlay` on a
+writable one. Leave the `.s` files in `work/shaders/dxbc/disasm` in place: deleting them while keeping the folder
+makes the stage look finished with zero shaders, and a symlinked `disasm` is refused.
+
 **From a terminal**, with the same behaviour and more control:
 
 ```powershell
