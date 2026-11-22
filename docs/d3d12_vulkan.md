@@ -2443,9 +2443,9 @@ own names use the `XDXR` prefix for Xbox's raytracing path:
 
 **The builder's own shaders are console FSSM, not Xbox DXIL.** Each of the 52 containers carries an LLVM
 bitcode blob and an `XDAT`/`XBCH` record; the PC experiment below compiled the bitcode, but the console runtime
-executes the `XBCH` record. Measured from that record: 52/52 unpack to `FSSM`, 42 translate and all 42 pass
-`spirv-val` with the same translator the game's 26,503 shaders use; the 10 left need `global_atomic_fmax`/`fmin`,
-`buffer_load_ushort` and `tbuffer_load_format_x` with format 8 ([embedded_shaders.md](embedded_shaders.md)). The
+executes the `XBCH` record. Measured from that record: 52/52 unpack to `FSSM`, 51 translate and all 51 pass
+`spirv-val` with the same translator the game's 26,503 shaders use; the one left, `Box16Rehydration`, needs
+`buffer_store_short` ([embedded_shaders.md](embedded_shaders.md)). The
 raw 64-bit addresses are the corpus's existing raw-address path, not a separate lowering. Open: whether the game
 uses the builder at all (RT-5) and whether the translated programs match a reference on a GPU.
 
@@ -2716,6 +2716,8 @@ M0–M2 do not need the executable.
 | **M5** | Mesh shaders, `ExecuteIndirect`, bindless-table pressure, multi-threaded command lists, pipeline cache | World rendering | A stable open-world frame at any frame rate; then profile and optimise |
 | **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; the builder's 52 console `FSSM` programs (42 pass `spirv-val`, four rules left: [embedded_shaders.md](embedded_shaders.md)) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the `FSSM` translator or a substitute; no unknown XDXR call remains |
 | **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). **Plane compose** (section 4.5): 1-2 planes scaled from a source rectangle to a destination placement, point or bilinear, plane 1 alpha-blended (premultiplied or straight), SDR and HDR10 (PQ) planes converted to the swapchain, checked against a CPU model on two GPUs with 0 VUIDs (exact for point filtering, within 1-2 levels for bilinear, alpha and PQ conversions); the layouts, flag values and alpha convention are ours, the console's plane semantics are unmeasured, and the public HDR sample's second plane is the GameDVR copy, not an overlay. HDR10 swapchain (ST.2084 surface): verified on an RTX 5080 with an HDR10 display by @JavierBlanco23 in #2069, not on AMD (our test displays list no ST.2084 surface); HDR10 on an SDR swapchain is clipped, not tone mapped. `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; VRS, alt-tab, an AMD HDR10 display run are open |
+| **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; the builder's 52 console `FSSM` programs (51 pass `spirv-val`, one rule left: [embedded_shaders.md](embedded_shaders.md)) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the `FSSM` translator or a substitute; no unknown XDXR call remains |
+| **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; HDR, VRS, plane compose, alt-tab are open |
 
 **M3 occlusion portability (D3D-209).** Vulkan's [occlusion query specification](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#queries-occlusion)
 permits a count multiplied by the number of written color outputs, even with `VK_QUERY_CONTROL_PRECISE_BIT`.
@@ -2831,7 +2833,7 @@ folded into the table below with the measurement basis noted per row; nothing is
   Our earlier "forward the blob to the host" was too simple; the PC serializer rejects the Xbox bits.
 - **BVH builder.** Its console programs are `FSSM`; the bitcode in the same container is the representation the
   PC compiler consumed. "Run the builder's dispatches" therefore takes the same FSSM → SPIR-V path as the game,
-  with four rules still missing ([embedded_shaders.md](embedded_shaders.md)).
+  with one rule still missing ([embedded_shaders.md](embedded_shaders.md)).
 
 **Narrows.**
 
@@ -2851,11 +2853,10 @@ folded into the table below with the measurement basis noted per row; nothing is
 The builder's 52 compute shaders are a second *corpus*, not a second shader front end. Each container carries an
 LLVM bitcode blob and an `XDAT`/`XBCH` record; the bitcode is what the PC D3D12 compiler experiment consumed
 (44 of 53 rejected, 22 lowered), while the console runtime executes the `XBCH` record. That record decompresses
-to `FSSM`, the same container the game's own compute shaders use: 52/52 unpack, 42 translate and all 42 pass
-`spirv-val` with `tools/rdna2spirv.py`. The 10 left stop at `global_atomic_fmax`/`fmin` (6 programs),
-`buffer_load_ushort` (3) and `tbuffer_load_format_x` with format 8 (1); [embedded_shaders.md](embedded_shaders.md)
-lists them. The raw 64-bit addresses are the translator's existing raw-address path, so no address-to-resource
-table is needed on top. A port that runs `XboxBvhBuilder` therefore needs the FSSM translator plus four rules,
+to `FSSM`, the same container the game's own compute shaders use: 52/52 unpack, 51 translate and all 51 pass
+`spirv-val` with `tools/rdna2spirv.py`. The one left, `Box16Rehydration`, stops at `buffer_store_short`;
+[embedded_shaders.md](embedded_shaders.md) lists the rules that closed the other nine. The raw 64-bit addresses are the translator's existing raw-address path, so no address-to-resource
+table is needed on top. A port that runs `XboxBvhBuilder` therefore needs the FSSM translator plus one rule,
 not a DXIL front end (a substitute builder remains the alternative).
 Correctness is still unverified on a GPU and the call sites need the executable (RT-5).
 
@@ -2937,8 +2938,8 @@ nothing is copied from their trees.
 - **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain
   unknown. If the game assumes console tiling or compression metadata, the layer needs a detile/repack step.
 - **BVH builder shaders.** The container's DXIL bitcode is Xbox DXIL that PC drivers reject; its console `XBCH`
-  record is `FSSM`, and 41 of the 52 programs already pass `spirv-val` through the same translator as the game
-  ([embedded_shaders.md](embedded_shaders.md)). The 10 left need four small rules. Translation is not execution:
+  record is `FSSM`, and 51 of the 52 programs already pass `spirv-val` through the same translator as the game
+  ([embedded_shaders.md](embedded_shaders.md)). The one left needs `buffer_store_short`. Translation is not execution:
   there is no GPU reference for any of the 52 yet.
 - **Ray tracing.** The game's RT work includes 64 compute shaders that traverse AMD-format BVH nodes, and it ships
   a BVH builder; a standard D3D12 AS path may also exist. If it is used, the layer must build AMD-format nodes, not
@@ -3079,7 +3080,7 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     prints the reason with the adapter's PCI vendor id. WARP creates all 53 PSOs, and the constructor and destructor
     return.
   - **The runtime itself still shouldn't hand Xbox DXIL to a PC driver.** The same container carries the console
-    `XBCH` record, which decompresses to `FSSM`; 41 of the 52 programs translate and pass `spirv-val` today
+    `XBCH` record, which decompresses to `FSSM`; 51 of the 52 programs translate and pass `spirv-val` today
     ([embedded_shaders.md](embedded_shaders.md)). Translating that record is the path that avoids a DXIL lowering
     front end (section 7.2, M6); the bitcode is a second representation.
 
