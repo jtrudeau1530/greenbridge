@@ -1177,5 +1177,223 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_lane_reg64(lane, RegPair(4, RegKind.VGPR)), sentinel)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class PackedConditionCodes:
+    """Architectural comparison condition codes for packed binary32 min/max."""
+    equal_lo: bool
+    less_lo: bool
+    greater_lo: bool
+    unordered_lo: bool
+    equal_hi: bool
+    less_hi: bool
+    greater_hi: bool
+    unordered_hi: bool
+    zero_lo: bool
+    zero_hi: bool
+    negative_lo: bool
+    negative_hi: bool
+
+
+@dataclass(frozen=True)
+class PackedFPStatusFlags:
+    """IEEE 754 floating-point status flags for packed single-precision operations."""
+    invalid: bool
+    denormal: bool
+    inexact: bool = False
+    overflow: bool = False
+    underflow: bool = False
+
+
+def _eval_half_relation(a: int, b: int, res: int) -> Tuple[bool, bool, bool, bool, bool, bool]:
+    nan_a = is_nan32(a)
+    nan_b = is_nan32(b)
+    if nan_a or nan_b:
+        unordered = True
+        equal = False
+        less = False
+        greater = False
+    else:
+        unordered = False
+        fa = bits_to_f32(a)
+        fb = bits_to_f32(b)
+        a_is_neg_zero = (a == NEG_ZERO)
+        b_is_neg_zero = (b == NEG_ZERO)
+        a_is_pos_zero = (a == POS_ZERO)
+        b_is_pos_zero = (b == POS_ZERO)
+
+        if (a_is_neg_zero and b_is_pos_zero):
+            equal = False
+            less = True
+            greater = False
+        elif (a_is_pos_zero and b_is_neg_zero):
+            equal = False
+            less = False
+            greater = True
+        elif (a_is_neg_zero and b_is_neg_zero) or (a_is_pos_zero and b_is_pos_zero):
+            equal = True
+            less = False
+            greater = False
+        else:
+            equal = (fa == fb)
+            less = (fa < fb)
+            greater = (fa > fb)
+
+    zero = is_zero32(res)
+    neg = bool(res & SIGN_MASK32)
+    return equal, less, greater, unordered, zero, neg
+
+
+def evaluate_pk_condition_codes(
+    s0_u64: int,
+    s1_u64: int,
+    res_u64: int,
+    op_sel: Tuple[int, int, int, int] = (0, 0, 1, 1),
+) -> PackedConditionCodes:
+    s0_words = unpack_pk_f32(s0_u64)
+    s1_words = unpack_pk_f32(s1_u64)
+    res_words = unpack_pk_f32(res_u64)
+
+    eq_lo, lt_lo, gt_lo, un_lo, z_lo, neg_lo = _eval_half_relation(
+        s0_words[op_sel[0]], s1_words[op_sel[1]], res_words[0]
+    )
+    eq_hi, lt_hi, gt_hi, un_hi, z_hi, neg_hi = _eval_half_relation(
+        s0_words[op_sel[2]], s1_words[op_sel[3]], res_words[1]
+    )
+
+    return PackedConditionCodes(
+        equal_lo=eq_lo, less_lo=lt_lo, greater_lo=gt_lo, unordered_lo=un_lo,
+        equal_hi=eq_hi, less_hi=lt_hi, greater_hi=gt_hi, unordered_hi=un_hi,
+        zero_lo=z_lo, zero_hi=z_hi, negative_lo=neg_lo, negative_hi=neg_hi,
+    )
+
+
+def evaluate_pk_status_flags(
+    s0_u64: int,
+    s1_u64: int,
+    res_u64: int,
+    op_sel: Tuple[int, int, int, int] = (0, 0, 1, 1),
+) -> PackedFPStatusFlags:
+    s0_words = unpack_pk_f32(s0_u64)
+    s1_words = unpack_pk_f32(s1_u64)
+    res_words = unpack_pk_f32(res_u64)
+
+    in0_lo = s0_words[op_sel[0]]
+    in1_lo = s1_words[op_sel[1]]
+    in0_hi = s0_words[op_sel[2]]
+    in1_hi = s1_words[op_sel[3]]
+
+    invalid = (
+        is_snan32(in0_lo) or is_snan32(in1_lo) or
+        is_snan32(in0_hi) or is_snan32(in1_hi)
+    )
+
+    denormal = (
+        is_subnormal32(in0_lo) or is_subnormal32(in1_lo) or
+        is_subnormal32(in0_hi) or is_subnormal32(in1_hi) or
+        is_subnormal32(res_words[0]) or is_subnormal32(res_words[1])
+    )
+
+    return PackedFPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=False,
+        overflow=False,
+        underflow=False,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_ordering(self) -> None:
+        s0 = pack_pk_f32(POS_ONE, f32_to_bits(3.0))
+        s1 = pack_pk_f32(POS_TWO, POS_HALF)
+        res = oracle_pk_min_f32(s0, s1)
+
+        cc = evaluate_pk_condition_codes(s0, s1, res)
+        self.assertTrue(cc.less_lo)
+        self.assertFalse(cc.greater_lo)
+        self.assertFalse(cc.equal_lo)
+        self.assertFalse(cc.unordered_lo)
+
+        self.assertTrue(cc.greater_hi)
+        self.assertFalse(cc.less_hi)
+        self.assertFalse(cc.equal_hi)
+        self.assertFalse(cc.unordered_hi)
+
+    def test_condition_codes_unordered_nan(self) -> None:
+        s0 = pack_pk_f32(QNAN_CANONICAL, POS_TWO)
+        s1 = pack_pk_f32(POS_ONE, POS_TWO)
+        res = oracle_pk_min_f32(s0, s1)
+
+        cc = evaluate_pk_condition_codes(s0, s1, res)
+        self.assertTrue(cc.unordered_lo)
+        self.assertFalse(cc.less_lo)
+        self.assertFalse(cc.greater_lo)
+        self.assertFalse(cc.equal_lo)
+
+        self.assertTrue(cc.equal_hi)
+        self.assertFalse(cc.unordered_hi)
+
+    def test_condition_codes_signed_zeros(self) -> None:
+        s0 = pack_pk_f32(NEG_ZERO, POS_ZERO)
+        s1 = pack_pk_f32(POS_ZERO, NEG_ZERO)
+        res = oracle_pk_min_f32(s0, s1)
+
+        cc = evaluate_pk_condition_codes(s0, s1, res)
+        self.assertTrue(cc.less_lo)
+        self.assertTrue(cc.zero_lo)
+        self.assertTrue(cc.negative_lo)
+
+        self.assertTrue(cc.greater_hi)
+        self.assertTrue(cc.zero_hi)
+        self.assertTrue(cc.negative_hi)
+
+    def test_status_flags_snan_invalid(self) -> None:
+        s0 = pack_pk_f32(SNAN_DEFAULT, POS_ONE)
+        s1 = pack_pk_f32(POS_TWO, POS_TWO)
+        res = oracle_pk_min_f32(s0, s1)
+
+        flags = evaluate_pk_status_flags(s0, s1, res)
+        self.assertTrue(flags.invalid)
+        self.assertFalse(flags.denormal)
+
+    def test_status_flags_subnormal_denormal(self) -> None:
+        s0 = pack_pk_f32(POS_MIN_SUBNORM, POS_ONE)
+        s1 = pack_pk_f32(POS_ONE, POS_ONE)
+        res = oracle_pk_min_f32(s0, s1)
+
+        flags = evaluate_pk_status_flags(s0, s1, res)
+        self.assertFalse(flags.invalid)
+        self.assertTrue(flags.denormal)
+
+    def test_carry_borrow_isolation(self) -> None:
+        interp = ScalarInterpreter()
+        state = ScalarMachineState()
+        state.vcc = 0x12345678ABCD9876
+
+        state.set_reg64(RegPair(0, RegKind.VGPR), pack_pk_f32(POS_ONE, POS_TWO))
+        state.set_reg64(RegPair(2, RegKind.VGPR), pack_pk_f32(POS_TWO, POS_ONE))
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MIN_F32,
+            dst=RegPair(4, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+            src1=VOP3POperand(RegPair(2, RegKind.VGPR)),
+        )
+        interp.step(instr, state)
+        self.assertEqual(state.vcc, 0x12345678ABCD9876)
+
+        simd_interp = SIMDInterpreter()
+        simd_state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        simd_state.vcc = 0x9876543210FEDCBA
+        simd_interp.step(instr, simd_state)
+        self.assertEqual(simd_state.vcc, 0x9876543210FEDCBA)
+
+
 if __name__ == "__main__":
     unittest.main()
