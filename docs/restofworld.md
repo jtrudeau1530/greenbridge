@@ -490,7 +490,9 @@ bit 30 matches the side of `dP/dv` that `cross(normal, tangent)` points to:
 | core_restofworld (143 blocks) | 10-bit | 52,153 | 86.3% | 22.3% | 97.8% |
 | core_restofworld | 8-bit | 6,992 | 56.4% | 15.8% | 92.6% |
 
-Bit 30 set means `cross(normal, tangent)` runs along `+v`. The 8-bit form in core_restofworld fits least;
+Bit 30 set means `cross(normal, tangent)` runs along `+v`. The shaders turn a set bit 30 into the factor
+`-1.0` (`v_cndmask_b32 ..., 1.0, -1.0`), so their bitangent is that factor times their own cross product;
+which operand order they use was not traced here. The 8-bit form in core_restofworld fits least;
 this check does not say why.
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the

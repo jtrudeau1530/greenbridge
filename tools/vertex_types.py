@@ -215,7 +215,9 @@ def tangent_0x21(w):
     tangent = b1 * cos(angle) - b2 * sin(angle).
     Bit 31 clear: octahedral tangent, x = bits 16-22, y = bits 23-29, each unorm7 remapped by v / 63.5 - 1.
     Bit 30 is the bitangent sign: 1 when cross(normal, tangent) runs along +v of the texture coordinates
-    (docs/restofworld.md), returned as +1 or -1. Returns (None, sign) when a vector cannot be built."""
+    (docs/restofworld.md), returned as +1 or -1. The shaders themselves turn a set bit 30 into the factor -1.0
+    (`v_cndmask_b32 ..., 1.0, -1.0`); the sign here is the measured side, not that factor.
+    Returns (None, sign) when a vector cannot be built."""
     sign = 1 if (w >> 30) & 1 else -1
     if not w >> 31:
         return _oct(((w >> 16) & 127) / 63.5 - 1, ((w >> 23) & 127) / 63.5 - 1), sign
