@@ -305,6 +305,33 @@ class PeInspectTest(unittest.TestCase):
         self.assertIn("## Needs checking or a shim", md)
         self.assertIn("`XMemAlloc`", md)
 
+    def test_runtime_load_candidates(self):
+        """DLL names held as strings but not imported: what a run-time LoadLibrary* reaches
+        (docs/runtime_imports.md)."""
+        base = {d["name"] for d in self.report["runtime_load_candidates"]}
+        self.assertEqual(base, {"d3d12_xs.dll"}, "the 64-bit fixture names d3d12_xs.dll without importing it")
+        buf = bytearray(build_image())
+        place(buf, 0x1E00, "XGameRuntime.dll".encode("utf-16-le") + b"\0\0")
+        place(buf, 0x1E40, b"gameplatformservices.dll\0xmem.dll\0")
+        path = os.path.join(self.dir, "loads.dll")
+        with open(path, "wb") as f:
+            f.write(buf)
+        r = pe_inspect.inspect(path, self.dir)
+        found = {d["name"]: d for d in r["runtime_load_candidates"]}
+        self.assertEqual(set(found) - base, {"gameplatformservices.dll", "xgameruntime.dll"}, "xmem.dll is imported")
+        self.assertEqual(found["xgameruntime.dll"]["encoding"], "utf-16")
+        self.assertEqual(found["gameplatformservices.dll"]["encoding"], "ascii")
+        self.assertIn(found["xgameruntime.dll"]["where"], ("system", "shim"))
+        md = pe_inspect.to_markdown(r)
+        self.assertIn("## Run-time load candidates", md)
+        self.assertIn("| xgameruntime.dll | utf-16 |", md)
+
+    def test_dll_strings_encodings_own_name_and_near_misses(self):
+        data = (b"a.dll\0" + "b.dll".encode("utf-16-le") + b"\0\0" + "a.dll".encode("utf-16-le") +
+                b" self.DLL x.dllz .dll y.dll")
+        got = pe_inspect.dll_strings(data, {"y.dll"}, "Self.dll")
+        self.assertEqual(got, [{"name": "a.dll", "encoding": "both"}, {"name": "b.dll", "encoding": "utf-16"}])
+
     def test_non_pe_input_is_rejected(self):
         bad = os.path.join(self.dir, "not_pe.bin")
         with open(bad, "wb") as f:
