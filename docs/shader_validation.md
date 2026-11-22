@@ -443,6 +443,10 @@ that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, ea
 `s_waitcnt` and `s_barrier`, then stores all 16 result VGPRs of every thread and the whole LDS.
 `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP`.
 
+For the translator oracle, `lds_fuzz.py` and `valu_fuzz.py` create and retain a unique output folder per run. With
+`--work DIR`, that folder is a new child of `DIR` (the printed work directory), rather than `DIR` itself; files from
+older runs and other contents of `DIR` are left alone. Without `--work`, it is created in the system temporary folder.
+
 - **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`, `u8_d16[_hi]`, `i8_d16[_hi]`), the
   byte and short writes (also `d16_hi`), `read2`/`write2` with and without `st64`, the add, sub,
   min, max, and, or and xor atomics with and without return, `wrxchg`, `cmpst`, `ds_swizzle_b32`
