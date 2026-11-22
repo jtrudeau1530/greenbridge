@@ -167,6 +167,31 @@ class Refusals(unittest.TestCase):
         self.assertTrue(doc["tree"].get("attribute_order_violation"))
         self.assertEqual(self.reason(doc=doc), "order")
 
+    def test_more_attribute_records_than_the_count(self):
+        # An attribute appended by hand without raising attrs_declared would be written after the count's last
+        # attribute and decode as the element's first content value: a different tree, with status "ok".
+        doc = rbf0_tree.parse_resource(Stream().open("r", attrs=1).int("id", 1).close().bytes())
+        self.assertEqual(rbf0_encode.encode(doc), Stream().open("r", attrs=1).int("id", 1).close().bytes())
+        extra = dict(doc["tree"]["attributes"][0], value=2)
+        doc["tree"]["attributes"].append(extra)
+        self.assertEqual(self.reason(doc=doc), "value")
+        doc["tree"]["attrs_declared"] = 2                       # the count raised with it: encodes, and reads back
+        back = rbf0_tree.parse_resource(rbf0_encode.encode(doc))
+        self.assertEqual((back["status"], [a["value"] for a in back["tree"]["attributes"]]), ("ok", [1, 2]))
+        self.assertEqual(back["tree"]["content"], [])
+
+    def test_fewer_attribute_records_than_the_count(self):
+        # Short of its count with no value in the content: what the decoder gives for such a resource, and exact.
+        short = Stream().open("r", attrs=2).int("id", 1).close().bytes()
+        doc = rbf0_tree.parse_resource(short)
+        self.assertEqual((doc["status"], len(doc["tree"]["attributes"]), doc["tree"]["attrs_declared"]), ("ok", 1, 2))
+        self.assertEqual(rbf0_encode.encode(doc), short)
+        # A value moved by hand from the attributes into the content would decode as an attribute again.
+        doc = rbf0_tree.parse_resource(Stream().open("r", attrs=2).int("id", 1).int("n", 2).close().bytes())
+        tree = doc["tree"]
+        tree["content"].append(dict(tree["attributes"].pop(), kind="value"))
+        self.assertEqual(self.reason(doc=doc), "order")
+
     def test_descriptor_out_of_order(self):
         doc = rbf0_tree.parse_resource(every_record(True))
         doc["tree"]["attributes"][0]["descriptor"] = 40
@@ -232,10 +257,47 @@ class Cli(unittest.TestCase):
         self.put("00020000.bin", every_record(False))
         self.put("00030000.bin", Stream().open("r").float("f", math.nan).close().bytes())
         code, out = self.run_main("--check", self.carve)
-        self.assertEqual(code, 0, out)
+        self.assertEqual(code, 1, out)                                 # a refused resource is not a verified one
         self.assertIn("3 resource(s): 2 exact, 0 different, 1 refused", out)
         self.assertIn("refused (nan): 1", out)
         self.assertIn("narrow-32: 1 of 1 exact", out)
+
+    def test_check_exit_status_is_zero_only_when_every_resource_is_exact(self):
+        self.put("00001000.bin", every_record(True))
+        self.put("00002000.bin", every_record(False))
+        code, out = self.run_main("--check", self.carve)
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 resource(s): 2 exact, 0 different, 0 refused", out)
+        self.put("00003000.bin", Stream().open("r").float("f", math.nan).close().bytes())
+        code, out = self.run_main("--check", self.carve)
+        self.assertEqual(code, 1, out)
+        self.assertIn("3 resource(s): 2 exact, 0 different, 1 refused", out)
+        # Nothing but refusals: a round trip that verified no resource must not read as success.
+        only = os.path.join(self.carve, "00003000.bin")
+        code, out = self.run_main("--check", only)
+        self.assertEqual(code, 1, out)
+        self.assertIn("1 resource(s): 0 exact, 0 different, 1 refused", out)
+
+    def test_check_compares_the_joined_bytes_with_the_recorded_size(self):
+        blob = every_record(True)
+        doc = rbf0_tree.parse_resource(blob)
+        self.assertEqual(doc["size"], len(blob))
+        real = rbf0_encode.resources
+        self.addCleanup(setattr, rbf0_encode, "resources", real)
+        rbf0_encode.resources = lambda source, limit=None: iter([(doc, blob)])
+        self.assertEqual(rbf0_encode.check("unused")["exact"], 1)
+        rbf0_encode.resources = lambda source, limit=None: iter([({**doc, "size": len(blob) - 1}, blob)])
+        counts = rbf0_encode.check("unused")
+        self.assertEqual((counts["exact"], counts["different"]), (0, 1))
+
+    def test_two_carved_streams_of_one_name_are_refused(self):
+        blob = every_record(True)
+        row = {"offset": 0, "stored": len(blob), "size": len(blob), "head": blob[:8], "name": "same.bin"}
+        real = rbf0_tree._rows
+        self.addCleanup(setattr, rbf0_tree, "_rows", real)
+        rbf0_tree._rows = lambda source: ([dict(row), dict(row, offset=1)], lambda r: blob)
+        with self.assertRaises(rbf0_tree.SelectionError):
+            list(rbf0_encode.resources("unused"))
 
     def test_encode_report_to_new_directory(self):
         self.put("00000100.bin", every_record(True))
