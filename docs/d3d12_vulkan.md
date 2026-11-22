@@ -1080,6 +1080,14 @@ parameter order:
 Before the draw/dispatch, the layer copies the current root arguments into a 32-dword block in that order and
 uploads it as push constants. Missing parameters are zero.
 
+Measured on the corpus (`python -I tools/user_sgpr_census.py <spirv/index.json> --base ps=8 vs=8 gs=8 cs=4 ms=16`, all 26,503 shaders). These are physical user SGPRs; the tool cannot see logical root-parameter indices.
+- The lowest user SGPR read as a pointer is s8 in most PS (9,830 of 12,101) and VS (1,660 of 2,236), s4 in CS (2,364 of 2,689) and s16 in mesh shaders (7,977 of 9,282).
+- Pointers are 32-bit (`ptr32_lo`) in every PS/VS/CS/MS shader that reads one; only the 195 GS read a 64-bit pointer (`ptr64_lo` at s8).
+- Consecutive pointer SGPRs in one shader are most often adjacent (distance 1: 22,008 PS, 14,548 MS, 3,059 CS, 1,836 VS), and the SGPR after a 32-bit pointer is never read as a `ptr64_hi`.
+- Below those bases only `const32` reads appear, at odd SGPRs in PS/VS/CS (s1, s3, s5, s7), and s2 in GS: a reserved block whose meaning is not established here.
+
+Taken together this disagrees with the packing above (from s0, two dwords per table) and is consistent with a per-stage base (s8 VS/PS, s4 CS, s16 MS) and one dword per table pointer. It is a census of shader reads, not a confirmed mapping: it does not show which root parameter feeds which SGPR, and the GS behave differently. `--expect ps=8 vs=8 cs=4 ms=16` turns it into a check; `tests/test_user_sgpr_census.py` shows that the two packing models give different results.
+
 Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
 refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
 `__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
