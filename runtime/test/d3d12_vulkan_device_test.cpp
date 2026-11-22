@@ -1120,6 +1120,21 @@ int compare_feature_support(ID3D12Device* ours) {
                          what, request, static_cast<unsigned long>(got_hr), got,
                          static_cast<unsigned long>(want_hr), want);
     };
+    // A host runtime older than a request refuses it with E_INVALIDARG where a newer one clamps it: Windows 10's
+    // d3d12.dll answers shader models up to 6.6 and root signatures up to 1.1. Such a request can't be compared with
+    // the host, so the layer's answer is checked against its own clamp instead. The requests ascend, so `answered`
+    // is the highest one the host has accepted so far.
+    unsigned predated = 0;
+    const auto host_predates = [&](const char* what, UINT request, UINT answered, HRESULT host_hr, HRESULT got_hr,
+                                   UINT got, UINT clamp) {
+        if (host_hr != E_INVALIDARG || !answered || request <= answered) return false;
+        ++predated;
+        if ((got_hr != S_OK || got != clamp) && mismatches++ < 8)
+            std::fprintf(stderr, "%s request 0x%02x: ours hr=0x%08lX value 0x%02x; the host runtime predates it, "
+                                 "the layer's clamp is S_OK 0x%02x\n",
+                         what, request, static_cast<unsigned long>(got_hr), got, clamp);
+        return true;
+    };
 
     // 5.1 upwards: D3D12's own baseline, which every SDK names, then 6.0-6.9 by number (only 6.0 is guaranteed to be
     // named by every SDK that has the query at all). And only values the runtime defines go to the host: it crashed
@@ -1132,12 +1147,18 @@ int compare_feature_support(ID3D12Device* ours) {
         static_cast<D3D_SHADER_MODEL>(0x65), static_cast<D3D_SHADER_MODEL>(0x66),
         static_cast<D3D_SHADER_MODEL>(0x67), static_cast<D3D_SHADER_MODEL>(0x68),
         static_cast<D3D_SHADER_MODEL>(0x69)};
+    UINT host_model = 0;
     for (const D3D_SHADER_MODEL model : models) {
         D3D12_FEATURE_DATA_SHADER_MODEL ours_data{model}, host_data{model};
         const HRESULT ours_hr =
             ours->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &ours_data, sizeof(ours_data));
         const HRESULT host_hr =
             host->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &host_data, sizeof(host_data));
+        if (SUCCEEDED(host_hr)) host_model = static_cast<UINT>(model);
+        if (host_predates("shader model", static_cast<UINT>(model), host_model, host_hr, ours_hr,
+                          static_cast<UINT>(ours_data.HighestShaderModel),
+                          std::min<UINT>(static_cast<UINT>(model), static_cast<UINT>(D3D_SHADER_MODEL_6_0))))
+            continue;
         const UINT want = std::min<UINT>(static_cast<UINT>(host_data.HighestShaderModel),
                                          static_cast<UINT>(D3D_SHADER_MODEL_6_0));
         report("shader model", static_cast<UINT>(model), ours_hr,
@@ -1147,17 +1168,28 @@ int compare_feature_support(ID3D12Device* ours) {
     // 0x3 is 1.2 by number: SDKs without the 1.2 headers do not name it (runtime/CMakeLists.txt probes for that).
     const D3D_ROOT_SIGNATURE_VERSION versions[] = {D3D_ROOT_SIGNATURE_VERSION_1_0, D3D_ROOT_SIGNATURE_VERSION_1_1,
                                                    static_cast<D3D_ROOT_SIGNATURE_VERSION>(0x3)};
+    UINT host_version = 0;
     for (const D3D_ROOT_SIGNATURE_VERSION version : versions) {
         D3D12_FEATURE_DATA_ROOT_SIGNATURE ours_data{version}, host_data{version};
         const HRESULT ours_hr =
             ours->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &ours_data, sizeof(ours_data));
         const HRESULT host_hr =
             host->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &host_data, sizeof(host_data));
+        if (SUCCEEDED(host_hr)) host_version = static_cast<UINT>(version);
+        if (host_predates("root signature", static_cast<UINT>(version), host_version, host_hr, ours_hr,
+                          static_cast<UINT>(ours_data.HighestVersion),
+                          std::min<UINT>(static_cast<UINT>(version),
+                                         static_cast<UINT>(D3D_ROOT_SIGNATURE_VERSION_1_1))))
+            continue;
         const UINT want = std::min<UINT>(static_cast<UINT>(host_data.HighestVersion),
                                          static_cast<UINT>(D3D_ROOT_SIGNATURE_VERSION_1_1));
         report("root signature", static_cast<UINT>(version), ours_hr,
                static_cast<UINT>(ours_data.HighestVersion), host_hr, want);
     }
+
+    if (predated)
+        std::printf("CheckFeatureSupport: %u requests the host runtime predates (e.g. Windows 10) checked against the "
+                    "layer's clamp instead of the host\n", predated);
 
     // A wrong DataSize is refused by both, in both queries.
     {
