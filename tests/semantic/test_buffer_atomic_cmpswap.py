@@ -1241,5 +1241,230 @@ class TestBufferAtomicCmpswapAliasing(unittest.TestCase):
             self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), 1000 + lane)
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class AtomicCmpswapFlags:
+    """Architectural condition codes and status flags for buffer_atomic_cmpswap."""
+    success: bool
+    zero: bool
+    negative: bool
+    diff: int
+    borrow: bool
+    carry: bool
+    overflow: bool
+    unaligned_addr: bool
+    out_of_bounds: bool
+
+
+def evaluate_cmpswap_flags(
+    old_val: int,
+    cmp_val: int,
+    src_val: int,
+    eff_addr: int,
+    num_records: int,
+    swapped: bool,
+) -> AtomicCmpswapFlags:
+    """Evaluate condition codes, status flags, and arithmetic carry/borrow for cmpswap."""
+    u_old = old_val & MASK32
+    u_cmp = cmp_val & MASK32
+    u_src = src_val & MASK32
+
+    # Zero flag: returned old value is zero
+    zero = (u_old == 0)
+
+    # Negative flag: MSB of returned old value is set
+    negative = bool(u_old & SIGN_BIT32)
+
+    # Unsigned difference and borrow against comparison value
+    diff = (u_old - u_cmp) & MASK32
+    borrow = u_old < u_cmp
+
+    # Carry generation on new value write
+    carry = ((u_old + u_src) > MASK32) if swapped else False
+
+    # Signed comparison overflow for (old_val - cmp_val)
+    s_old = (u_old ^ SIGN_BIT32) - SIGN_BIT32
+    s_cmp = (u_cmp ^ SIGN_BIT32) - SIGN_BIT32
+    s_diff = s_old - s_cmp
+    overflow = s_diff < -0x80000000 or s_diff > 0x7FFFFFFF
+
+    # Unaligned address check (low 2 bits must be zero for 4-byte dword alignment)
+    unaligned = bool(eff_addr & 0x3)
+
+    # Bounds check against descriptor limit
+    oob = (eff_addr + 4) > num_records
+
+    return AtomicCmpswapFlags(
+        success=swapped,
+        zero=zero,
+        negative=negative,
+        diff=diff,
+        borrow=borrow,
+        carry=carry,
+        overflow=overflow,
+        unaligned_addr=unaligned,
+        out_of_bounds=oob,
+    )
+
+
+class TestBufferAtomicCmpswapFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_exact_match_flags(self) -> None:
+        flags = evaluate_cmpswap_flags(
+            old_val=0x1234,
+            cmp_val=0x1234,
+            src_val=0x5678,
+            eff_addr=0x100,
+            num_records=1024,
+            swapped=True,
+        )
+        self.assertTrue(flags.success)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertEqual(flags.diff, 0)
+        self.assertFalse(flags.borrow)
+        self.assertFalse(flags.carry)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.unaligned_addr)
+        self.assertFalse(flags.out_of_bounds)
+
+    def test_zero_flag_on_zero_return(self) -> None:
+        flags = evaluate_cmpswap_flags(
+            old_val=0,
+            cmp_val=0,
+            src_val=100,
+            eff_addr=0x200,
+            num_records=1024,
+            swapped=True,
+        )
+        self.assertTrue(flags.success)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertEqual(flags.diff, 0)
+        self.assertFalse(flags.borrow)
+
+    def test_negative_flag_when_msb_set(self) -> None:
+        flags = evaluate_cmpswap_flags(
+            old_val=0x80000001,
+            cmp_val=0x10,
+            src_val=0x20,
+            eff_addr=0x300,
+            num_records=1024,
+            swapped=False,
+        )
+        self.assertFalse(flags.success)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertFalse(flags.borrow)
+
+    def test_borrow_generation_when_old_below_cmp(self) -> None:
+        flags = evaluate_cmpswap_flags(
+            old_val=10,
+            cmp_val=25,
+            src_val=50,
+            eff_addr=0x400,
+            num_records=1024,
+            swapped=False,
+        )
+        self.assertFalse(flags.success)
+        self.assertTrue(flags.borrow)
+        self.assertEqual(flags.diff, (10 - 25) & MASK32)
+
+    def test_no_borrow_when_old_above_cmp(self) -> None:
+        flags = evaluate_cmpswap_flags(
+            old_val=50,
+            cmp_val=25,
+            src_val=100,
+            eff_addr=0x500,
+            num_records=1024,
+            swapped=False,
+        )
+        self.assertFalse(flags.success)
+        self.assertFalse(flags.borrow)
+        self.assertEqual(flags.diff, 25)
+
+    def test_signed_overflow_flag(self) -> None:
+        # s_old = 0x7FFFFFFF (max positive), s_cmp = -10 (negative)
+        # diff = 0x7FFFFFFF - (-10) overflows positive 32-bit signed range
+        flags = evaluate_cmpswap_flags(
+            old_val=0x7FFFFFFF,
+            cmp_val=s32(-10),
+            src_val=0,
+            eff_addr=0x100,
+            num_records=1024,
+            swapped=False,
+        )
+        self.assertFalse(flags.success)
+        self.assertTrue(flags.overflow)
+
+    def test_unaligned_address_detection(self) -> None:
+        flags_unaligned = evaluate_cmpswap_flags(
+            old_val=10,
+            cmp_val=10,
+            src_val=20,
+            eff_addr=0x102,  # Not 4-byte aligned
+            num_records=1024,
+            swapped=True,
+        )
+        self.assertTrue(flags_unaligned.unaligned_addr)
+
+        flags_aligned = evaluate_cmpswap_flags(
+            old_val=10,
+            cmp_val=10,
+            src_val=20,
+            eff_addr=0x104,
+            num_records=1024,
+            swapped=True,
+        )
+        self.assertFalse(flags_aligned.unaligned_addr)
+
+    def test_out_of_bounds_detection(self) -> None:
+        flags_oob = evaluate_cmpswap_flags(
+            old_val=0,
+            cmp_val=0,
+            src_val=0,
+            eff_addr=1024,  # eff_addr + 4 > 1024
+            num_records=1024,
+            swapped=False,
+        )
+        self.assertTrue(flags_oob.out_of_bounds)
+
+        flags_in_bounds = evaluate_cmpswap_flags(
+            old_val=0,
+            cmp_val=0,
+            src_val=0,
+            eff_addr=1020,  # 1020 + 4 == 1024 (in bounds)
+            num_records=1024,
+            swapped=True,
+        )
+        self.assertFalse(flags_in_bounds.out_of_bounds)
+
+    def test_carry_generation_on_write(self) -> None:
+        # Carry flag is set when old + src overflows 32 bits on successful swap
+        flags_carry = evaluate_cmpswap_flags(
+            old_val=0xFFFFFFFF,
+            cmp_val=0xFFFFFFFF,
+            src_val=1,
+            eff_addr=0x100,
+            num_records=1024,
+            swapped=True,
+        )
+        self.assertTrue(flags_carry.carry)
+
+        flags_no_carry = evaluate_cmpswap_flags(
+            old_val=10,
+            cmp_val=10,
+            src_val=20,
+            eff_addr=0x100,
+            num_records=1024,
+            swapped=True,
+        )
+        self.assertFalse(flags_no_carry.carry)
+
+
 if __name__ == "__main__":
     unittest.main()
