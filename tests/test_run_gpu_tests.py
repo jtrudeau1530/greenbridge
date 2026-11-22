@@ -101,5 +101,38 @@ class NotWholeWave(unittest.TestCase):
                 self.assertIs(judge(0, DEVICE_64 + "out[0..7] = 55 48 BAD 0 0 0 0 0\n", **kw)[0], False)
 
 
+
+class UniformBranchCheck(unittest.TestCase):
+    """check_uniform_branch (ps_uniform_branch, ps_scc_mask32) must reject a readback in which no bit=0 pixel got
+    s5 = 8: that is what a translator deciding the branch per lane draws (#477, measured on RTX 5080 and RX 9070 XT:
+    1856 (8,1) / 192 (8,0) / 2048 (7,0) with the vote, 1856 / 0 / 2240 without)."""
+
+    @staticmethod
+    def judge(rows):
+        import os
+        import struct
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".raw")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                for s5, bit, bary in rows:
+                    f.write(struct.pack("<2I2f", s5, bit, bary, 0.0))
+            return rgt.check_uniform_branch(path)
+        finally:
+            os.remove(path)
+
+    def test_wave_vote_passes(self):
+        ok, detail = self.judge([(8, 1, 0.5), (8, 0, 0.1), (7, 0, 0.1)])
+        self.assertTrue(ok, detail)
+
+    def test_per_lane_decision_fails(self):
+        ok, detail = self.judge([(8, 1, 0.5), (7, 0, 0.1), (7, 0, 0.1)])
+        self.assertFalse(ok)
+        self.assertIn("no bit=0 pixel got s5=8", detail)
+
+    def test_set_bit_without_8_fails(self):
+        self.assertFalse(self.judge([(7, 1, 0.5), (8, 0, 0.1), (7, 0, 0.1)])[0])
+
+
 if __name__ == "__main__":
     unittest.main()

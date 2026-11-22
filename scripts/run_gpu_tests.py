@@ -340,11 +340,16 @@ def check_wqm(raw_path: str) -> tuple[bool, str]:
 def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     px = read_raw_rgba32f(raw_path)
     u32 = read_raw_u32(raw_path)
+    """ps_uniform_branch / ps_scc_mask32: s5 = 8 wherever the lane's own bit is set; a lane with bit 0 gets 8 when
+    another lane of its wave has the bit (the wave-wide vote), else 7. All three kinds must occur, as in check.py:
+    without a (8, bit 0) pixel the vote is not shown, and a translator that decides per lane would pass."""
     bad = 0
     n8 = 0
     n7 = 0
+    n80 = 0
     first = ""
     for i, ((_, _, bary_i, _), (s5, bit, _, _)) in enumerate(zip(px, u32)):
+        n80 += s5 == 8 and bit == 0
         if bit == 1:
             if bary_i <= 0.27 or s5 != 8:
                 if not bad:
@@ -363,7 +368,12 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
             n8 += 1
         elif s5 == 7:
             n7 += 1
-    return (bad == 0 and n8 > 0 and n7 > 0), (first if bad else f"s5==8: {n8}, s5==7: {n7} (4096 px)")
+    if bad:
+        return False, first
+    detail = f"s5==8: {n8} ({n80} of them with bit 0), s5==7: {n7} ({len(u32)} px)"
+    if not n80:
+        return False, "no bit=0 pixel got s5=8: the branch was decided per lane, not by the wave; " + detail
+    return (n8 - n80 > 0 and n7 > 0), detail
 
 
 def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
