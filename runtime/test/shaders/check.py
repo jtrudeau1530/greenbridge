@@ -914,7 +914,7 @@ def sampler_mismatch(data, words, view):
     for i, got in enumerate(struct.iter_unpack("<4f", data)):
         y, x = divmod(i, SAMPLER_SIZE)
         want = sampler_texel(explicit, x, y) + sampler_texel(implicit, x, y)
-        if any(abs(g - w) > 1e-6 for g, w in zip(got, want)):
+        if any(not math.isclose(g, w, rel_tol=0, abs_tol=1e-6) for g, w in zip(got, want)):
             return f"({x},{y}): {tuple(round(g, 4) for g in got)} != {tuple(round(w, 4) for w in want)}"
     return ""
 

@@ -889,6 +889,16 @@ class SamplerMipChecks(unittest.TestCase):
             self.assertTrue(check.sampler_mismatch(bytes(bad), words, view).startswith("(63,63):"))
         self.assertIn("bytes", check.sampler_mismatch(good[:-16], words, view))
 
+    def test_nan_in_any_sampler_channel_fails(self) -> None:
+        words, view = check.ssharp_words(1), (0, 1)
+        good = self.image(0, 1)
+        self.assertEqual(check.sampler_mismatch(good, words, view), "")
+        for channel in range(4):
+            with self.subTest(channel=channel):
+                bad = bytearray(good)
+                struct.pack_into("<I", bad, len(good) - 16 + 4 * channel, 0x7FC00000)
+                self.assertTrue(check.sampler_mismatch(bytes(bad), words, view).startswith("(63,63):"))
+
     def test_a_wrong_level_or_swapped_uv_fails_where_predicted(self):
         words, view = check.ssharp_words(1), (0, 1)
         self.assertTrue(check.sampler_mismatch(self.image(1, 1), words, view).startswith("(0,0):"))
