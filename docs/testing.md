@@ -119,6 +119,7 @@ With more than one GPU, pick one through the Vulkan loader, for example
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
+| A GPU test that uses `image_load` (or lighting built from real shaders) returns zero for every texel except pixel (0,0); the image is black | Reported by @Silliana in #603 (not reproduced here): the shader bounds-checks `image_load` against the width and height stored in the T# it reads from the descriptor, so a hand-built descriptor with no real size makes every other coordinate look out of range | Put the real width and height of the image in the T# (see `docs/d3d12_vulkan.md` §5.3, *Descriptor T#/S# parsing*); don't leave them zero |
 
 ## Posting your result
 

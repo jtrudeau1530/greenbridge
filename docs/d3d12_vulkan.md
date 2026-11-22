@@ -936,6 +936,12 @@ The trace will enumerate them.
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
   raw DCC metadata.
+- **G-buffer render targets stay 8-bit UNORM.** Reported by @Silliana in #603 (not reproduced here): the material
+  shaders pack data into plain bytes (the normal is octahedral-packed across three bytes of one target, and ID
+  bytes sit in another) and the lighting shaders unpack them with a `* 255` and a truncate. If the layer or a test
+  gives those targets another format (say f16 for everything), a byte is lost in many pixels: the normals go wrong
+  and the specular sparkles. Create them with the format the game asks for (`R8G8B8A8_UNORM` and the like) and don't
+  substitute a wider or float format for them.
 
 ### 4.3 Barriers and layouts
 
