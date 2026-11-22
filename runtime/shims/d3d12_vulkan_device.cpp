@@ -14,6 +14,7 @@
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
+#include "../src/vulkan_device_filter.h"
 
 #include <algorithm>
 #include <atomic>
@@ -3099,7 +3100,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
-        if (props.apiVersion < VK_API_VERSION_1_3) continue;
+        if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
         VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
@@ -3126,8 +3127,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
     if (!info.physical)
-        return fail("no Vulkan 1.3 GPU with dynamicRendering, synchronization2, timelineSemaphore and "
-                    "separateDepthStencilLayouts");
+        return fail(leonida::vulkan_device_filter().empty()
+                        ? "no Vulkan 1.3 GPU with dynamicRendering, synchronization2, timelineSemaphore and "
+                          "separateDepthStencilLayouts"
+                        : "no GPU named by LEONIDA_VK_DEVICE has Vulkan 1.3 with dynamicRendering, synchronization2, "
+                          "timelineSemaphore and separateDepthStencilLayouts");
 
     // VK_EXT_conditional_rendering for SetPredication, when the GPU has it (optional: docs/d3d12_vulkan.md 4.7).
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
