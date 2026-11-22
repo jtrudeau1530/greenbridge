@@ -1104,6 +1104,8 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc) {
     // D3D12's comparison functions are 1 (NEVER) to 8 (ALWAYS); the S#'s are 0 to 7 in the same order.
     if (reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON && desc.ComparisonFunc >= D3D12_COMPARISON_FUNC_NEVER)
         out.compare = g::CompareFunction(desc.ComparisonFunc - D3D12_COMPARISON_FUNC_NEVER);
+    out.compare_never = reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON &&
+                        desc.ComparisonFunc == D3D12_COMPARISON_FUNC_NEVER;
     if (reduction == D3D12_FILTER_REDUCTION_TYPE_MINIMUM) out.filter_mode = g::FilterMode::minimum;
     if (reduction == D3D12_FILTER_REDUCTION_TYPE_MAXIMUM) out.filter_mode = g::FilterMode::maximum;
     out.min_lod = desc.MinLOD;
