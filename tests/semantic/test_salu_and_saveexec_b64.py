@@ -25,9 +25,275 @@ Python 3.9+ compatible (from __future__ import annotations).
 """
 from __future__ import annotations
 
+import enum
 import os
+import re
 import sys
 import unittest
+from dataclasses import dataclass, field
+from typing import Optional, Union
+
+MASK32: int = 0xFFFFFFFF
+MASK64: int = 0xFFFFFFFFFFFFFFFF
+SIGN_BIT64: int = 0x8000000000000000
+ALL_LANES_64: int = 0xFFFFFFFFFFFFFFFF
+NO_LANES_64: int = 0x0000000000000000
+EVEN_LANES_64: int = 0x5555555555555555
+ODD_LANES_64: int = 0xAAAAAAAAAAAAAAAA
+LOW32_LANES_64: int = 0x00000000FFFFFFFF
+HIGH32_LANES_64: int = 0xFFFFFFFF00000000
+
+
+class RegKind(enum.Enum):
+    """Register kinds in the RDNA2 architectural state."""
+    SGPR = "sgpr"
+    VGPR = "vgpr"
+    EXEC = "exec"
+    VCC = "vcc"
+    SCC = "scc"
+    M0 = "m0"
+    LITERAL = "literal"
+    INLINE_CONST = "inline_const"
+
+
+@dataclass(frozen=True)
+class Register:
+    """Symbolic register representation with architectural width and alignment validation."""
+    kind: RegKind
+    index: int = 0
+    size: int = 32  # 32 or 64 bits
+
+    def validate(self) -> None:
+        """Validate architectural constraints for registers."""
+        if self.kind == RegKind.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of architectural range [0..105]")
+            if self.size == 64 and (self.index % 2 != 0):
+                raise ValueError(f"64-bit SGPR must be even-aligned: s[{self.index}:{self.index + 1}]")
+            if self.size == 64 and (self.index > 104):
+                raise ValueError(f"64-bit SGPR pair s[{self.index}:{self.index + 1}] exceeds max SGPR 105")
+        elif self.kind == RegKind.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of architectural range [0..255]")
+            if self.size == 64 and (self.index > 254):
+                raise ValueError(f"64-bit VGPR pair v[{self.index}:{self.index + 1}] exceeds max VGPR 255")
+
+    def __str__(self) -> str:
+        if self.kind == RegKind.SGPR:
+            return f"s[{self.index}:{self.index + 1}]" if self.size == 64 else f"s{self.index}"
+        if self.kind == RegKind.VGPR:
+            return f"v[{self.index}:{self.index + 1}]" if self.size == 64 else f"v{self.index}"
+        if self.kind == RegKind.EXEC:
+            return "exec" if self.size == 64 else "exec_lo"
+        if self.kind == RegKind.VCC:
+            return "vcc" if self.size == 64 else "vcc_lo"
+        if self.kind == RegKind.SCC:
+            return "scc"
+        if self.kind == RegKind.M0:
+            return "m0"
+        return f"{self.kind.value}:{self.index}"
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Symbolic instruction operand representing either a register or immediate."""
+    reg: Optional[Register] = None
+    imm: Optional[int] = None
+    size: int = 32
+
+    @property
+    def is_reg(self) -> bool:
+        return self.reg is not None
+
+    @property
+    def is_imm(self) -> bool:
+        return self.imm is not None
+
+    def __str__(self) -> str:
+        if self.reg is not None:
+            return str(self.reg)
+        if self.imm is not None:
+            return f"{self.imm:#x}" if self.imm > 9 or self.imm < -9 else str(self.imm)
+        return "<invalid>"
+
+
+class Opcode(enum.Enum):
+    """Opcode enumeration covering SALU and branch instructions."""
+    S_AND_SAVEEXEC_B64 = "s_and_saveexec_b64"
+    S_OR_SAVEEXEC_B64 = "s_or_saveexec_b64"
+    S_ANDN2_SAVEEXEC_B64 = "s_andn2_saveexec_b64"
+    S_MOV_B64 = "s_mov_b64"
+    S_MOV_B32 = "s_mov_b32"
+    S_CBRANCH_EXECZ = "s_cbranch_execz"
+    S_CBRANCH_EXECNZ = "s_cbranch_execnz"
+    S_CBRANCH_SCC0 = "s_cbranch_scc0"
+    S_CBRANCH_SCC1 = "s_cbranch_scc1"
+    S_ENDPGM = "s_endpgm"
+
+
+@dataclass
+class Instruction:
+    """Symbolic typed instruction expression in the AST."""
+    opcode: Opcode
+    dst: Optional[Register] = None
+    src0: Optional[Operand] = None
+    src1: Optional[Operand] = None
+    label_target: Optional[str] = None
+    comment: str = ""
+
+    def validate(self) -> None:
+        """Validate instruction operand typing and sizing."""
+        if self.opcode == Opcode.S_AND_SAVEEXEC_B64:
+            if self.dst is None or self.src0 is None:
+                raise ValueError(f"{self.opcode.value} requires sdst and ssrc0 operands")
+            if self.dst.size != 64:
+                raise ValueError(f"{self.opcode.value} destination must be 64-bit")
+            if self.dst.kind not in (RegKind.SGPR, RegKind.EXEC, RegKind.VCC):
+                raise ValueError(f"{self.opcode.value} destination must be SGPR, EXEC, or VCC")
+            self.dst.validate()
+            if self.src0.is_reg:
+                assert self.src0.reg is not None
+                if self.src0.reg.size != 64:
+                    raise ValueError(f"{self.opcode.value} source register must be 64-bit")
+                self.src0.reg.validate()
+        elif self.opcode == Opcode.S_MOV_B64:
+            if self.dst is None or self.src0 is None:
+                raise ValueError(f"{self.opcode.value} requires dst and src0")
+            if self.dst.size != 64:
+                raise ValueError(f"{self.opcode.value} dst must be 64-bit")
+            self.dst.validate()
+
+    def emit_asm(self) -> str:
+        """Serialize AST instruction to standard assembly text."""
+        parts = [self.opcode.value]
+        operands = []
+        if self.dst is not None:
+            operands.append(str(self.dst))
+        if self.src0 is not None:
+            operands.append(str(self.src0))
+        if self.src1 is not None:
+            operands.append(str(self.src1))
+        if self.label_target is not None:
+            operands.append(self.label_target)
+        line = f"{self.opcode.value} {', '.join(operands)}" if operands else self.opcode.value
+        if self.comment:
+            line = f"{line:<40} ; {self.comment}"
+        return line
+
+
+@dataclass
+class Program:
+    """Symbolic program representation containing AST instructions and labels."""
+    instructions: list[Instruction] = field(default_factory=list)
+    labels: dict[str, int] = field(default_factory=dict)
+
+    def add_instruction(self, inst: Instruction) -> None:
+        inst.validate()
+        self.instructions.append(inst)
+
+    def add_label(self, name: str) -> None:
+        self.labels[name] = len(self.instructions)
+
+    def emit_asm(self) -> str:
+        lines = []
+        label_positions = {pos: name for name, pos in self.labels.items()}
+        for i, inst in enumerate(self.instructions):
+            if i in label_positions:
+                lines.append(f"{label_positions[i]}:")
+            lines.append(f"    {inst.emit_asm()}")
+        if len(self.instructions) in label_positions:
+            lines.append(f"{label_positions[len(self.instructions)]}:")
+        return "\n".join(lines)
+
+
+def parse_operand(text: str, default_size: int = 64) -> Operand:
+    """Parse string operand into typed Operand AST node."""
+    text = text.strip()
+    if text == "exec":
+        return Operand(reg=Register(RegKind.EXEC, 0, size=64), size=64)
+    if text == "exec_lo":
+        return Operand(reg=Register(RegKind.EXEC, 0, size=32), size=32)
+    if text == "vcc":
+        return Operand(reg=Register(RegKind.VCC, 0, size=64), size=64)
+    if text == "vcc_lo":
+        return Operand(reg=Register(RegKind.VCC, 0, size=32), size=32)
+    if text == "scc":
+        return Operand(reg=Register(RegKind.SCC, 0, size=32), size=32)
+    if text == "m0":
+        return Operand(reg=Register(RegKind.M0, 0, size=32), size=32)
+
+    # 64-bit pair s[x:y] or v[x:y]
+    m_pair = re.match(r"^([sv])\[(\d+):(\d+)\]$", text)
+    if m_pair:
+        prefix, start, end = m_pair.group(1), int(m_pair.group(2)), int(m_pair.group(3))
+        if end != start + 1:
+            raise ValueError(f"Non-contiguous or >2-register pair not supported: {text}")
+        kind = RegKind.SGPR if prefix == "s" else RegKind.VGPR
+        reg = Register(kind=kind, index=start, size=64)
+        reg.validate()
+        return Operand(reg=reg, size=64)
+
+    # Single register sX or vX
+    m_single = re.match(r"^([sv])(\d+)$", text)
+    if m_single:
+        prefix, idx = m_single.group(1), int(m_single.group(2))
+        kind = RegKind.SGPR if prefix == "s" else RegKind.VGPR
+        reg = Register(kind=kind, index=idx, size=default_size)
+        reg.validate()
+        return Operand(reg=reg, size=default_size)
+
+    # Immediate (decimal or hex)
+    try:
+        val = int(text, 0)
+        return Operand(imm=val, size=default_size)
+    except ValueError:
+        raise ValueError(f"Unrecognized operand format: {text}")
+
+
+def parse_instruction(line: str) -> Instruction:
+    """Parse a single assembly text line into an Instruction AST node."""
+    clean = line.split(";", 1)[0].strip()
+    if not clean:
+        raise ValueError("Empty instruction line")
+    parts = clean.split(None, 1)
+    op_str = parts[0].lower()
+    try:
+        opcode = Opcode(op_str)
+    except ValueError:
+        raise ValueError(f"Unknown opcode: {op_str}")
+
+    if opcode == Opcode.S_ENDPGM:
+        return Instruction(opcode=opcode)
+
+    args_str = parts[1] if len(parts) > 1 else ""
+    raw_args = [a.strip() for a in args_str.split(",") if a.strip()]
+
+    if opcode == Opcode.S_AND_SAVEEXEC_B64:
+        if len(raw_args) != 2:
+            raise ValueError(f"{opcode.value} expects exactly 2 operands, got {len(raw_args)}")
+        dst_op = parse_operand(raw_args[0], default_size=64)
+        if not dst_op.is_reg:
+            raise ValueError(f"{opcode.value} destination must be a register")
+        src0_op = parse_operand(raw_args[1], default_size=64)
+        inst = Instruction(opcode=opcode, dst=dst_op.reg, src0=src0_op)
+        inst.validate()
+        return inst
+
+    if opcode in (Opcode.S_CBRANCH_EXECZ, Opcode.S_CBRANCH_EXECNZ, Opcode.S_CBRANCH_SCC0, Opcode.S_CBRANCH_SCC1):
+        if len(raw_args) != 1:
+            raise ValueError(f"{opcode.value} expects a single label target")
+        return Instruction(opcode=opcode, label_target=raw_args[0])
+
+    if opcode == Opcode.S_MOV_B64:
+        if len(raw_args) != 2:
+            raise ValueError(f"{opcode.value} expects dst, src0")
+        dst_op = parse_operand(raw_args[0], default_size=64)
+        src0_op = parse_operand(raw_args[1], default_size=64)
+        inst = Instruction(opcode=opcode, dst=dst_op.reg, src0=src0_op)
+        inst.validate()
+        return inst
+
+    raise NotImplementedError(f"Parser not implemented for opcode {opcode.value}")
 
 MASK32: int = 0xFFFFFFFF
 MASK64: int = 0xFFFFFFFFFFFFFFFF
@@ -208,6 +474,98 @@ class TestSaluAndSaveexecB64Oracle(unittest.TestCase):
         _, res_ab, _ = ref_s_and_saveexec_b64(a, b)
         _, res_ba, _ = ref_s_and_saveexec_b64(b, a)
         self.assertEqual(res_ab, res_ba)
+
+
+class TestSaluAndSaveexecB64AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_register_creation_and_bounds(self) -> None:
+        """Verify register AST nodes and alignment rules."""
+        # Valid 64-bit aligned SGPR pair
+        reg = Register(RegKind.SGPR, 4, size=64)
+        reg.validate()
+        self.assertEqual(str(reg), "s[4:5]")
+
+        # Valid 64-bit special registers
+        exec_reg = Register(RegKind.EXEC, 0, size=64)
+        exec_reg.validate()
+        self.assertEqual(str(exec_reg), "exec")
+
+        vcc_reg = Register(RegKind.VCC, 0, size=64)
+        vcc_reg.validate()
+        self.assertEqual(str(vcc_reg), "vcc")
+
+        # Invalid unaligned 64-bit SGPR (odd index)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 5, size=64).validate()
+
+        # Out-of-bounds SGPR index (> 104 for 64-bit pair)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106, size=64).validate()
+
+    def test_ast_instruction_encoding(self) -> None:
+        """Verify Instruction AST construction and assembly emission."""
+        dst = Register(RegKind.SGPR, 4, size=64)
+        src0 = Operand(reg=Register(RegKind.VCC, 0, size=64), size=64)
+        inst = Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=dst, src0=src0, comment="save old exec")
+        inst.validate()
+        asm = inst.emit_asm()
+        self.assertTrue(asm.startswith("s_and_saveexec_b64 s[4:5], vcc"))
+        self.assertIn("; save old exec", asm)
+
+    def test_ast_program_assembly_emission(self) -> None:
+        """Verify Program container emission with labels and instructions."""
+        prog = Program()
+        prog.add_instruction(Instruction(Opcode.S_MOV_B64, dst=Register(RegKind.SGPR, 0, size=64),
+                                         src0=Operand(imm=0xFFFFFFFFFFFFFFFF, size=64)))
+        prog.add_instruction(Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=Register(RegKind.SGPR, 4, size=64),
+                                         src0=Operand(reg=Register(RegKind.SGPR, 0, size=64), size=64)))
+        prog.add_instruction(Instruction(Opcode.S_CBRANCH_EXECZ, label_target="skip_divergent"))
+        prog.add_label("skip_divergent")
+        prog.add_instruction(Instruction(Opcode.S_ENDPGM))
+
+        asm = prog.emit_asm()
+        self.assertIn("s_and_saveexec_b64 s[4:5], s[0:1]", asm)
+        self.assertIn("skip_divergent:", asm)
+        self.assertIn("s_cbranch_execz skip_divergent", asm)
+        self.assertIn("s_endpgm", asm)
+
+    def test_ast_operand_parsing(self) -> None:
+        """Verify parsing operands from assembly strings."""
+        op_sgpr = parse_operand("s[12:13]")
+        self.assertTrue(op_sgpr.is_reg)
+        assert op_sgpr.reg is not None
+        self.assertEqual(op_sgpr.reg.kind, RegKind.SGPR)
+        self.assertEqual(op_sgpr.reg.index, 12)
+        self.assertEqual(op_sgpr.size, 64)
+
+        op_exec = parse_operand("exec")
+        self.assertTrue(op_exec.is_reg)
+        assert op_exec.reg is not None
+        self.assertEqual(op_exec.reg.kind, RegKind.EXEC)
+
+        op_imm = parse_operand("0x5555555555555555")
+        self.assertTrue(op_imm.is_imm)
+        self.assertEqual(op_imm.imm, 0x5555555555555555)
+
+    def test_ast_instruction_line_parsing(self) -> None:
+        """Verify parsing instruction lines."""
+        inst = parse_instruction("s_and_saveexec_b64 s[8:9], exec ; save exec")
+        self.assertEqual(inst.opcode, Opcode.S_AND_SAVEEXEC_B64)
+        assert inst.dst is not None
+        self.assertEqual(inst.dst.kind, RegKind.SGPR)
+        self.assertEqual(inst.dst.index, 8)
+        assert inst.src0 is not None and inst.src0.reg is not None
+        self.assertEqual(inst.src0.reg.kind, RegKind.EXEC)
+
+    def test_ast_program_semantic_validation(self) -> None:
+        """Verify AST semantic validation flags illegal constructs."""
+        # Destination not 64-bit
+        bad_dst = Register(RegKind.SGPR, 4, size=32)
+        bad_src = Operand(reg=Register(RegKind.SGPR, 6, size=64))
+        inst = Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=bad_dst, src0=bad_src)
+        with self.assertRaises(ValueError):
+            inst.validate()
 
 
 if __name__ == "__main__":
