@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -405,6 +406,85 @@ class ScanTest(unittest.TestCase):
                 bvh_index.main([self.dir, "--out", outdir])
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("is a folder, not a report file", err.getvalue())
+
+
+class _Unprintable:
+    """A cell whose str() fails part-way through the CSV, standing in for a write that dies mid-report."""
+
+    def __str__(self):
+        raise OSError("simulated write failure")
+
+
+class PublishTest(unittest.TestCase):
+    """write_outputs stages each report next to its destination and swaps it in: a run that fails while writing
+    keeps the previous report instead of leaving it truncated (before: open(dest, "w") emptied it first)."""
+
+    OLD_JSON = '{"summary": {"previous": true}, "streams": []}'
+    OLD_CSV = "source,offset\nprevious.rpf,0\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.out = os.path.join(self.dir, "index.json")
+        self.csv = os.path.join(self.dir, "index.csv")
+        with open(self.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(self.OLD_JSON)
+        with open(self.csv, "w", encoding="utf-8", newline="") as f:
+            f.write(self.OLD_CSV)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, path):
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+
+    def assert_previous_reports_kept(self):
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual(self.read(self.csv), self.OLD_CSV)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    def test_json_serialization_failure_keeps_previous_reports(self):
+        rows = [{"source": "a.rpf", "offset": 0, "bad": object()}]
+        with self.assertRaises(TypeError):
+            bvh_index.write_outputs(rows, [{"streams": 1}], self.out, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_csv_write_failure_keeps_previous_csv(self):
+        rows = [{"source": _Unprintable(), "offset": 0}]
+        with self.assertRaises(OSError):
+            bvh_index.write_outputs(rows, [{"streams": 1}], None, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_interrupted_write_keeps_previous_report(self):
+        with mock.patch.object(bvh_index.json, "dump", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                bvh_index.write_outputs([], [{"streams": 0}], self.out, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_reports_replaced_with_published_mode(self):
+        rows = [{"source": "a.rpf", "offset": 16, "bounds_min": [1, 2, 3]}]
+        with mock.patch.object(bvh_index, "published_mode", wraps=bvh_index.published_mode) as published, \
+                mock.patch.object(bvh_index.os, "chmod", wraps=os.chmod) as chmod:
+            bvh_index.write_outputs(rows, [{"streams": 1}], self.out, self.csv)
+        self.assertEqual([c.args for c in published.call_args_list], [(self.out,), (self.csv,)])
+        self.assertEqual(len(chmod.call_args_list), 2)
+        for call, dest in zip(chmod.call_args_list, (self.out, self.csv)):
+            staged, mode = call.args
+            self.assertEqual(os.path.dirname(staged), self.dir)
+            self.assertTrue(os.path.basename(staged).startswith(".bvh_index-"))
+            self.assertTrue(staged.endswith(".tmp"))
+            self.assertEqual(mode, bvh_index.published_mode(dest))
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["streams"][0]["offset"], 16)
+        self.assertEqual(self.read(self.csv).splitlines()[1].split(",")[:2], ["a.rpf", "16"])
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
+    def test_replaced_report_keeps_its_permission_bits(self):
+        os.chmod(self.out, 0o640)
+        bvh_index.write_outputs([], [{"streams": 0}], self.out, None)
+        self.assertEqual(os.stat(self.out).st_mode & 0o777, 0o640)
 
 
 def setUpModule():

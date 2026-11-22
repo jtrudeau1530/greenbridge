@@ -30,8 +30,13 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
+from contextlib import suppress
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -202,17 +207,38 @@ def _make_parent(path):
         os.makedirs(parent, exist_ok=True)
 
 
+def _publish(dest, write, newline):
+    """Write a report next to `dest` and swap it in, so a run that fails or is interrupted while writing (a
+    serialization error, a full disk, Ctrl+C) leaves the previous report as it was instead of a truncated one.
+    The result keeps the previous report's permission bits, or gets the usual ones for a new file."""
+    _make_parent(dest)
+    directory = os.path.dirname(os.path.abspath(dest))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline=newline, dir=directory,
+                                         prefix=".navmesh_index-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            write(f)
+        os.chmod(temp, published_mode(dest))
+        os.replace(temp, dest)
+    except BaseException:
+        if temp is not None:
+            with suppress(OSError):
+                os.unlink(temp)
+        raise
+
+
 def write_outputs(rows, summary, out_path, csv_path):
-    _make_parent(out_path)
-    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "pages": rows}, f, indent=1)
+    _publish(out_path, lambda f: json.dump({"summary": summary, "pages": rows}, f, indent=1), "\n")
     written = []
     if csv_path:
-        _make_parent(csv_path)
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+
+        def write_csv(f):
             w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             w.writerows(rows)
+
+        _publish(csv_path, write_csv, "")
         written.append(csv_path)
     return written
 
