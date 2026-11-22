@@ -271,6 +271,17 @@ class TbufferDefaultFormat(unittest.TestCase):
                         self.assertEqual(got, want)
         self.assertEqual(load_format(FMT_UINT8X4, 0, 4, dst_sel=1 << 9), (0, 0, 0, 1))
 
+    def test_invalid_descriptor_suppresses_fixed_format_load(self):
+        # Same address, 256-byte bound and instruction format. Only the V# FORMAT changes.
+        cases = ((False, 4, (0x44, 0x33, 0x22, 0x11), (0, 0, 0, 0)),
+                 (True, 3, (0x00330044, 0xa9bc0022), (0, 0xa9bc0000)))
+        for d16, n, bound, unbound in cases:
+            for fmt, want in ((FMT_U32, bound), (0, unbound)):
+                with self.subTest(d16=d16, fmt=fmt):
+                    got = load_format(fmt, 0, n, memory={BASE: 0x11223344}, d16=d16,
+                                      op="tbuffer_load_format", mods=" format:[BUF_FMT_8_8_8_8_UINT]")
+                    self.assertEqual(got[:len(want)], want)
+
     def test_packed_default_8_unorm(self):
         # The first byte is 0xff: 1.0 in f16 is 0x3c00. Preserve the upper destination half.
         got = load_format(FMT_U32, 0, 1, memory=self.MEM, d16=True, op="tbuffer_load_format")

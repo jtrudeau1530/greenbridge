@@ -1476,6 +1476,12 @@ class Gen:
         vd = a[0]
         addr, d3, in_b = self.buffer_address(a, mods, elem="fmt", fixed_fmt=fixed_fmt)
         if fixed_fmt is not None:
+            # An INVALID V# format denotes an unbound resource, even for an explicit MTBUF format.
+            descriptor_format, bound, accessible = (self.tmp() for _ in range(3))
+            self.emit(f"{descriptor_format} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
+            self.emit(f"{bound} = OpINotEqual %bool {descriptor_format} {self.cu(0)}")
+            self.emit(f"{accessible} = OpLogicalAnd %bool {in_b} {bound}")
+            in_b = accessible
             fmt = self.cu(fixed_fmt)          # tbuffer: format from the instruction
         else:
             fmt = self.tmp()
