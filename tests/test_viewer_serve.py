@@ -399,6 +399,7 @@ class PortArgumentTest(unittest.TestCase):
                     server.shutdown()
                     server.server_close()
                     thread.join(10)
+                self.assertFalse(thread.is_alive(), "the server thread is still running after shutdown()")
 
     @unittest.skipIf(os.name == "nt", "sends SIGINT, which a Windows child started this way does not get")
     def test_ctrl_c_stops_the_viewer_without_a_traceback(self):
