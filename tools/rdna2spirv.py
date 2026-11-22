@@ -6150,7 +6150,7 @@ class Gen:
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
             self.emit(f"{smp} = OpLoad %smp {sp}")
-            if op not in ("image_gather4_lz", "image_gather4_lz_o"):
+            if op not in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o"):
                 self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
             f = [self.tof(c) for c in coords]
             goff = None
@@ -6180,6 +6180,7 @@ class Gen:
                 self.uses_query = True
                 ch = dmask.bit_length() - 1
                 lv, lvm, rl, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1 = (self.tmp() for _ in range(15))
+                # Size and level-count queries read view properties; only the texel fetches need a typed alias.
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
                 lod = self.clamp_gather_lod(f[2], a[3]["r"] + 1)
@@ -6217,14 +6218,26 @@ class Gen:
                 self.emit(f"{szy} = OpCompositeExtract %int {sz} 1")
                 ax = [self.gather_addr(c, szx, modes[0]) for c in (x0, x1)]
                 ay = [self.gather_addr(c, szy, modes[1]) for c in (y0, y1)]
-                comps = []
+                texels = []
                 for xx, yy in ((ax[0], ay[1]), (ax[1], ay[1]), (ax[1], ay[0]), (ax[0], ay[0])):
-                    cc, tx, comp = self.tmp(), self.tmp(), self.tmp()
+                    cc = self.tmp()
                     self.emit(f"{cc} = OpCompositeConstruct %v2int {xx} {yy}")
-                    self.emit(f"{tx} = OpImageFetch %v4float {img} {cc} Lod {mc}")
-                    self.emit(f"{comp} = OpCompositeExtract %float {tx} {ch}")
-                    comps.append(comp)
-                self.store_gather_taps(vdata["r"], comps, d16)
+                    texels.append(cc)
+
+                def gather_mip(image: str, cls: int, ty: str) -> str:
+                    scalar = ("%float", "%uint", "%int")[cls]
+                    taps = []
+                    for cc in texels:
+                        tx, comp = self.tmp(), self.tmp()
+                        self.emit(f"{tx} = OpImageFetch {ty} {image} {cc} Lod {mc}")
+                        self.emit(f"{comp} = OpCompositeExtract {scalar} {tx} {ch}")
+                        taps.append(comp)
+                    result = self.tmp()
+                    self.emit(f"{result} = OpCompositeConstruct {ty} {' '.join(taps)}")
+                    return result
+
+                self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
+                                      0xf, vdata, d16, gather_mip)
                 self.uses_fhalf = True
                 return
             if op == "image_gather4_lz":
