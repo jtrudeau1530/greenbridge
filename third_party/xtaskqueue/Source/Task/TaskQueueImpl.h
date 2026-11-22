@@ -16,6 +16,13 @@
 
 SYSTEM_HANDLE_DEFINE_HELPERS(XTaskQueueHandle, XSystemHandleType::TaskQueue);
 
+namespace TaskQueueInternal
+{
+    // Private capability identifier; keep the shared ApiId enum unchanged.
+    constexpr ApiId kPinnableContextApiId =
+        static_cast<ApiId>(0x50494E31);
+}
+
 namespace ApiRefs
 {
     void GlobalAddRef();
@@ -383,17 +390,20 @@ private:
 #endif
 };
 
+class TaskQueueImpl;
+
 class TaskQueuePortContextImpl : public ITaskQueuePortContext
 {
 public:
     
     TaskQueuePortContextImpl(
-        _In_ ITaskQueue* queue,
+        _In_ TaskQueueImpl* queue,
         _In_ XTaskQueuePort type,
         _In_ SubmitCallback* submitCallback);
 
     uint32_t __stdcall AddRef() override;
     uint32_t __stdcall Release() override;
+    bool TryPin() noexcept;
     HRESULT __stdcall QueryApi(_In_ ApiId id, _Out_ void** ptr) override;
 
     XTaskQueuePort __stdcall GetType() override;
@@ -418,7 +428,7 @@ public:
 
 private:
 
-    ITaskQueue* m_queue = nullptr;
+    TaskQueueImpl* m_queue = nullptr;
     XTaskQueuePort m_type = XTaskQueuePort::Work;
     SubmitCallback* m_submitCallback = nullptr;
     std::atomic<TaskQueuePortStatus> m_status = { TaskQueuePortStatus::Active };

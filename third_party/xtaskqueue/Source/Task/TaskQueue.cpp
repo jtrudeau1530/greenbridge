@@ -1993,7 +1993,7 @@ void TaskQueuePortImpl::ProcessWaitCallback(
 //
 
 TaskQueuePortContextImpl::TaskQueuePortContextImpl(
-    _In_ ITaskQueue* queue,
+    _In_ TaskQueueImpl* queue,
     _In_ XTaskQueuePort type,
     _In_ SubmitCallback* submitCallback) :
     m_queue(queue),
@@ -2002,6 +2002,10 @@ TaskQueuePortContextImpl::TaskQueuePortContextImpl(
 {
 }
     
+bool TaskQueuePortContextImpl::TryPin() noexcept
+{
+    return m_queue->TryAddRef();
+}
 uint32_t __stdcall TaskQueuePortContextImpl::AddRef()
 {
     return m_queue->AddRef();
@@ -2017,6 +2021,17 @@ HRESULT __stdcall TaskQueuePortContextImpl::QueryApi(_In_ ApiId id, _Out_ void**
     if (ptr == nullptr)
     {
         return E_POINTER;
+    }
+
+    *ptr = nullptr;
+
+    if (id == TaskQueueInternal::kPinnableContextApiId)
+    {
+        // This concrete implementation can safely identify itself.
+        // The caller owns one reference, just like other QueryApi results.
+        *ptr = static_cast<TaskQueuePortContextImpl*>(this);
+        AddRef();
+        return S_OK;
     }
 
     if (id == ApiId::Identity || id == ApiId::TaskQueuePortContext)

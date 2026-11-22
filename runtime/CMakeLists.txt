@@ -764,6 +764,32 @@ if(BUILD_TESTING)
     add_test(NAME api_global_refs COMMAND api_global_refs_test)
     set_tests_properties(api_global_refs PROPERTIES TIMEOUT 10)
   endif()
+  # Internal XTaskQueue context pinning and rundown regression tests.
+  if(WIN32 AND TARGET gta6rt_xtaskqueue)
+    foreach(_context_test context_pinning context_rundown)
+      add_executable(${_context_test}_test
+        test/${_context_test}_test.cpp
+      )
+      target_include_directories(${_context_test}_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/shims/xtaskqueue
+        ${XTASKQUEUE_DIR}/Source/Task
+        ${XTASKQUEUE_DIR}/Source/Common
+      )
+      target_compile_definitions(${_context_test}_test PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX
+      )
+      target_compile_options(${_context_test}_test PRIVATE
+        /W4 /permissive- /utf-8 /EHsc
+      )
+      target_link_libraries(${_context_test}_test PRIVATE
+        gta6rt_xtaskqueue
+      )
+      add_test(NAME ${_context_test}
+        COMMAND ${_context_test}_test
+      )
+      set_tests_properties(${_context_test} PROPERTIES TIMEOUT 15)
+    endforeach()
+  endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
   endif()
