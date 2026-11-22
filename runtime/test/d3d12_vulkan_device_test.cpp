@@ -790,6 +790,12 @@ int main() {
         EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
                                            sizeof(invalid_sample_count)) == E_INVALIDARG);
 
+        D3D12_RESOURCE_DESC unsupported_quality =
+            texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        unsupported_quality.SampleDesc.Count = 4;
+        unsupported_quality.SampleDesc.Quality = 1;
+        EXPECT(device->GetResourceAllocationInfo(0, 1, &unsupported_quality).SizeInBytes == UINT64_MAX);
+
         D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
         EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
 
@@ -949,6 +955,16 @@ int main() {
             return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
                                                    IID_PPV_ARGS(&out.p));
         };
+        Ref<ID3D12Resource> refused_buffer;
+        D3D12_RESOURCE_DESC invalid_buffer_samples = buffer_desc(256);
+        invalid_buffer_samples.SampleDesc.Count = 0;
+        EXPECT(create(default_heap, invalid_buffer_samples, D3D12_RESOURCE_STATE_COPY_DEST, refused_buffer) ==
+               E_INVALIDARG && !refused_buffer.p);
+        invalid_buffer_samples.SampleDesc.Count = 1;
+        invalid_buffer_samples.SampleDesc.Quality = 1;
+        EXPECT(create(default_heap, invalid_buffer_samples, D3D12_RESOURCE_STATE_COPY_DEST, refused_buffer) ==
+               E_INVALIDARG && !refused_buffer.p);
+
         Ref<ID3D12Resource> rt_resource, ds, untouched, upload, readback, volume;
         D3D12_RESOURCE_DESC xbox_rt =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
