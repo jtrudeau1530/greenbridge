@@ -209,6 +209,17 @@ That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable
 `Fma` into two roundings, which is why `khr` exists. Neither the AMD (26.11.2) nor the NVIDIA (617.42) driver we tried
 does, so `cs_fma_fused` passing with `glsl` is not evidence that every driver is safe.
 
+## Hardware oracle (optional, AMD)
+
+`valu_fuzz.py`, `lds_fuzz.py`, `f32_fuzz.py` and `image_fuzz.py` take `--oracle hw`: the same programs run as native
+compute kernels on an AMD GPU (`tools/hw_oracle/`; setup in [shader_validation.md](shader_validation.md), "Hardware
+oracle"). It needs AMD clang with the amdgcn target (`LEONIDA_AMD_CLANG`), the AMD driver's HIP runtime and a host C
+compiler on Windows, or the libdrm launcher on Linux. Without them a run prints `hardware oracle unavailable: ...` and
+exits 77, so CI skips it. `image_fuzz.py --oracle hw` loads a linear texture through a T# built for the GPU's family
+(GFX11 on gfx11xx, GFX10 on gfx103x; `tests/test_image_fuzz_hw.py` has the exact words) and compares every texel with
+its CPU model; add `--negative-control` to check that wrong models are caught. A gfx1150 (RDNA3.5) is not RDNA2: a
+match supports the model and does not prove RDNA2. Run these one at a time: a second job on the same GPU can hang it.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example

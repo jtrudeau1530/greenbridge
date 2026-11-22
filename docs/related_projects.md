@@ -84,6 +84,22 @@ and file list in its README) with the licence file. `runtime/shims/xgameruntime.
 `xgameruntime.dll` imports. The HTTP and WebSocket stack is not included. Unlike the projects above, this is code
 use under a compatible licence, so the MIT notice must stay with the files.
 
+## Mesa (AMD register database and format tables) and LLVM's AMDGPU backend
+
+<https://gitlab.freedesktop.org/mesa/mesa> (`src/amd/registers/*.json`, `src/amd/common/ac_descriptors.c`),
+<https://github.com/llvm/llvm-project> (`llvm/lib/Target/AMDGPU/SIDefines.h`)
+
+**Licence:** Mesa's AMD code is MIT, LLVM is Apache-2.0 with LLVM exceptions. Both are GPL-3.0-or-later compatible,
+but nothing is copied.
+
+**What we use:** field positions and enum values, written into this repository's own code. `tools/hw_oracle/tsharp.py`
+builds the T# for the hardware oracle of `tools/image_fuzz.py` from Mesa's SQ_IMG_RSRC_WORD1..4 bit ranges
+(`gfx10-rsrc.json`, `gfx11-rsrc.json`), the way `ac_build_gfx10_texture_descriptor` and `ac_set_mutable_tex_desc_fields`
+fill them (linear images carry their pitch in WORD4), and the GFX10 and GFX11 format numbers (Mesa's `GFX10_FORMAT`,
+and for GFX11 the order of LLVM's `UfmtGFX11::UnifiedFormat`). The GFX11 numbers were confirmed on a gfx1150 by the
+hardware oracle itself (a wrong FORMAT changes the fetched words); the GFX10 numbers and layout are Mesa's and not yet
+run on RDNA2 hardware.
+
 ## The line
 
 | Fine | Not fine |
