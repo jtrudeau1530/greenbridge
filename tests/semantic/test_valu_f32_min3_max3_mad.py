@@ -348,7 +348,7 @@ def run_three_input(op: str, a_bits: int, b_bits: int, c_bits: int, mods: str = 
     """Translate and run a single 3-operand instruction (`v_min3_f32`, `v_max3_f32`, `v_mad_f32`,
     `v_mad_legacy_f32`, or `v_fmac_f32` where `c_bits` initializes the `v0` accumulator)."""
     mod_s = f" {mods}" if mods else ""
-    if op.startswith("v_fmac_f32"):
+    if op.startswith(("v_fmac_f32", "v_mac_f32")):
         lines = [
             f"v_mov_b32 v1, {a_bits & MASK32:#x}",
             f"v_mov_b32 v2, {b_bits & MASK32:#x}",
@@ -574,7 +574,7 @@ class MadAndFmacF32Tests(unittest.TestCase):
             (0x3FC00001, 0x3FBFFFFF, 0xC0100000, POS_ZERO, 0xA8800000),         # (1.5+2^-23)*(1.5-2^-23) - 2.25 = -2^-46
             (0x71800000, 0x4D800000, 0xFF000000, POS_INF, 0x7F000000),          # 2^100*2^28 - 2^127: ovf vs finite
             (0xF1800000, 0x4D800000, 0x7F000000, NEG_INF, 0xFF000000),          # -2^100*2^28 + 2^127: -ovf vs finite
-            # Subnormal operands or products: see DenormalDivergenceTests (RDNA2 mad flushes them).
+            # Subnormal operands or products: see DenormalFlushTests (RDNA2 mad flushes them).
         ]
         for a, b, c, want_mad, want_fmac in cases:
             with self.subTest(a=hex(a), b=hex(b), c=hex(c)):
@@ -685,31 +685,91 @@ class MadAndFmacF32Tests(unittest.TestCase):
         self.assertNotIn("Fma", spv)
 
 
-class DenormalDivergenceTests(unittest.TestCase):
-    """v_mad_f32, v_mac_f32 and v_mad_legacy_f32 do not support f32 denormals on RDNA2: a subnormal operand or
-    result is flushed to zero, whatever the MODE register says. Source: LLVM AMDGPU SIISelLowering.cpp,
-    SITargetLowering::isFMADLegal (llvm-project 1922c0c9244e41ed056f71e897512c72e24c7022), which only forms these
-    instructions when f32 denormals are flushed. The translator emits OpFMul + OpFAdd and keeps Vulkan's default
-    denormal handling, so these results differ from the hardware (docs/design.md, "Known approximations").
+def flush_bits(b: int) -> int:
+    """RDNA2 flush of v_mad_f32, v_mac_f32 and v_mad_legacy_f32: a subnormal reads as signed zero."""
+    b &= MASK32
+    return b & 0x80000000 if (b & 0x7FFFFFFF) < 0x00800000 else b
 
-    Each case pins what the translator does today and records the RDNA2 result next to it. A translator change that
-    models the flush should swap the expectation to the RDNA2 column.
+
+def ref_mad_f32_ftz(xb: int, yb: int, zb: int) -> int:
+    """v_mad_f32 with the denormal flush: inputs, the rounded product and the sum flush."""
+    prod = flush_bits(_mul_bits_f32(flush_bits(xb), flush_bits(yb)))
+    return flush_bits(_add_bits_f32(prod, flush_bits(zb)))
+
+
+def ref_mad_legacy_f32_ftz(xb: int, yb: int, zb: int) -> int:
+    """v_mad_legacy_f32 with the denormal flush, then the legacy 0 * anything -> +0.0 rule."""
+    x, y = flush_bits(xb), flush_bits(yb)
+    prod = POS_ZERO if (x & 0x7FFFFFFF) == 0 or (y & 0x7FFFFFFF) == 0 else flush_bits(_mul_bits_f32(x, y))
+    return flush_bits(_add_bits_f32(prod, flush_bits(zb)))
+
+
+class DenormalFlushTests(unittest.TestCase):
+    """v_mad_f32, v_mac_f32 and v_mad_legacy_f32 have no f32 denormal support on RDNA2: a subnormal operand,
+    the rounded product or the result reads as signed zero, whatever the MODE register says (SHADER-118). Source:
+    LLVM AMDGPU SIISelLowering.cpp, SITargetLowering::isFMADLegal (llvm-project
+    1922c0c9244e41ed056f71e897512c72e24c7022), which only forms these instructions when f32 denormals are
+    flushed. The translator emulates that with Gen.flush_f32, so the RDNA2 column below is what it computes.
+    9,297 of the 26,503 shaders in shaders.rpf use at least one of the three (440,858 occurrences, 0.99% of the
+    corpus), counted with tools/shader_profile.py over the gfx1013 disassembly.
     """
 
     CASES = [
-        # (op, a, b, c, translator, rdna2)
-        ("v_mad_f32", 0x17800000, 0x1C800000, SUBNORM_MIN, SUBNORM_MIN, POS_ZERO),    # 2^-80*2^-70 + 2^-149
-        ("v_mad_legacy_f32", SUBNORM_MIN, POS_INF, NEG_ONE, POS_INF, NEG_ONE),       # 2^-149 -> 0, 0*inf -> +0
-        ("v_mad_legacy_f32", NEG_SUBNORM_MIN, POS_INF, ONE, NEG_INF, ONE),           # -2^-149 -> 0, 0*inf -> +0
+        # (op, a, b, c, mods, want)  -- c is the addend (v_mad*) or the accumulator (v_mac_f32)
+        ("v_mad_f32", 0x17800000, 0x1C800000, SUBNORM_MIN, "", POS_ZERO),    # 2^-80*2^-70 + 2^-149
+        ("v_mad_f32", 0x17800000, 0x21800000, 0x00000200, "", POS_ZERO),     # product 2^-140 (subnormal)
+        ("v_mad_f32", NEG_SUBNORM_MIN, ONE, NEG_SUBNORM_MIN, "", NEG_ZERO),  # flushed to -0, -0 + -0 = -0
+        ("v_mac_f32", SUBNORM_MIN, ONE, SUBNORM_MIN, "", POS_ZERO),          # 2^-149*1 + 2^-149
+        ("v_mac_f32", ONE, ONE, SUBNORM_MIN, "", ONE),                       # 1 + 2^-149 = 1
+        ("v_mad_legacy_f32", SUBNORM_MIN, POS_INF, NEG_ONE, "", NEG_ONE),    # 2^-149 -> +0, 0*inf -> +0
+        ("v_mad_legacy_f32", NEG_SUBNORM_MIN, POS_INF, ONE, "", ONE),        # -2^-149 -> -0, 0*inf -> +0
+        ("v_mad_f32", 0x00800000, ONE, POS_ZERO, "div:2", POS_ZERO),        # FLT_MIN/2 flushed after omod
     ]
 
-    def test_translator_keeps_denormals_where_rdna2_flushes(self):
-        refs = {"v_mad_f32": ref_mad_f32, "v_mad_legacy_f32": ref_mad_legacy_f32}
-        for op, a, b, c, translator, rdna2 in self.CASES:
-            with self.subTest(op=op, a=hex(a), b=hex(b), c=hex(c)):
-                self.assertEqual(refs[op](a, b, c), translator)
-                self.assertEqual(run_three_input(op, a, b, c), translator)
-                self.assertNotEqual(translator, rdna2)
+    def test_flush_matches_the_rdna2_column(self):
+        refs = {"v_mad_f32": ref_mad_f32_ftz, "v_mac_f32": ref_mad_f32_ftz,
+                "v_mad_legacy_f32": ref_mad_legacy_f32_ftz}
+        for op, a, b, c, mods, want in self.CASES:
+            with self.subTest(op=op, a=hex(a), b=hex(b), c=hex(c), mods=mods):
+                got = run_three_input(op, a, b, c, mods)
+                self.assertEqual(got, want)
+                if mods == "":
+                    self.assertEqual(refs[op](a, b, c), want)
+
+    def test_normal_values_nan_and_inf_pass_through(self):
+        for op in ("v_mad_f32", "v_mac_f32"):
+            with self.subTest(op=op):
+                self.assertEqual(run_three_input(op, TWO, THREE, FOUR), f32_to_bits(10.0))
+                self.assertTrue(is_nan_bits(run_three_input(op, QNAN, ONE, ONE)))
+                self.assertTrue(is_nan_bits(run_three_input(op, POS_INF, ONE, NEG_INF)))  # inf - inf
+                self.assertEqual(run_three_input(op, NEG_ZERO, TWO, NEG_ZERO), NEG_ZERO)
+        # The legacy 0 * anything -> +0 rule still runs on the flushed operands.
+        self.assertEqual(run_three_input("v_mad_legacy_f32", TWO, THREE, FOUR), f32_to_bits(10.0))
+        self.assertTrue(is_nan_bits(run_three_input("v_mad_legacy_f32", QNAN, ONE, ONE)))
+        self.assertTrue(is_nan_bits(run_three_input("v_mad_legacy_f32", POS_INF, ONE, NEG_INF)))
+        self.assertEqual(run_three_input("v_mad_legacy_f32", NEG_ZERO, TWO, NEG_ZERO), POS_ZERO)
+
+    def test_denormal_divergence_is_still_detectable(self):
+        # Sabotage: turn every flush select into a pass-through; the subnormal cases above now differ.
+        cases = [
+            ("v_mad_f32", 0x17800000, 0x1C800000, SUBNORM_MIN, POS_ZERO),
+            ("v_mac_f32", SUBNORM_MIN, ONE, SUBNORM_MIN, POS_ZERO),
+            ("v_mad_legacy_f32", SUBNORM_MIN, POS_INF, NEG_ONE, NEG_ONE),
+        ]
+        for op, a, b, c, want in cases:
+            with self.subTest(op=op):
+                if op == "v_mac_f32":
+                    lines = [f"v_mov_b32 v1, {a:#x}", f"v_mov_b32 v2, {b:#x}",
+                             f"v_mov_b32 v0, {c:#x}", f"{op} v0, v1, v2"]
+                else:
+                    lines = [f"v_mov_b32 v1, {a:#x}", f"v_mov_b32 v2, {b:#x}",
+                             f"v_mov_b32 v3, {c:#x}", f"{op} v0, v1, v2, v3"]
+                spv = translate_ps(lines)
+                self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], want)
+                unflushed, count = re.subn(r"(%\w+) = OpSelect %float (%\w+) (%\w+) (%\w+)",
+                                           r"\1 = OpCopyObject %float \4", spv)
+                self.assertGreaterEqual(count, 3)
+                self.assertNotEqual(si.run_fragment(unflushed)["%out_mrt0"][0], want)
 
 
 class MadLegacyF32Tests(unittest.TestCase):
@@ -733,7 +793,7 @@ class MadLegacyF32Tests(unittest.TestCase):
             (TWO, NEG_ZERO, NEG_ZERO, POS_ZERO),             # legacy 2*(-0.0) -> +0.0; +0.0 + (-0.0) = +0.0
             # Non-zero tiny values must NOT trigger zero-override.
             (FLT_MIN, POS_INF, ONE, POS_INF),
-            # Subnormal multipliers: see DenormalDivergenceTests (RDNA2 flushes them to 0 first).
+            # Subnormal multipliers: see DenormalFlushTests (RDNA2 flushes them to 0 first).
             # Unfused rounding matches v_mad_f32 when neither multiplier is 0.
             (0x3F800008, 0x3F7FFFF0, NEG_ONE, POS_ZERO),
             (0x71800000, 0x4D800000, 0xFF000000, POS_INF),
