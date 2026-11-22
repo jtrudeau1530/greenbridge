@@ -19,8 +19,8 @@ Design rules (see tests/semantic/README.md):
     keep the old behaviour.
 
 Values: uint/int are Python ints in [0, 2**32) or [0, 2**64) for 64-bit types (signedness is applied by the
-operation, as in SPIR-V); float is a Python float rounded to binary32; vectors are tuples; arrays are lists;
-bool is bool.
+operation, as in SPIR-V); float is a Python float rounded to binary32 (one made by OpBitcast also keeps its exact
+32-bit pattern, so a signalling NaN comes back out unchanged); vectors are tuples; arrays are lists; bool is bool.
 """
 import math
 import re
@@ -77,7 +77,25 @@ def f32(x):
         return float("inf") if x > 0 else float("-inf")
 
 
+class _F32(float):
+    """A binary32 value that came from a bit pattern (OpBitcast) and still carries that exact pattern.
+
+    struct's binary32 -> double conversion quiets a signalling NaN (it sets bit 22, issue #509), so the float
+    value alone cannot give the word back. OpBitcast, OpCopyObject, loads, stores, composites and outputs pass
+    the value on unchanged and keep `bits`; arithmetic on it returns a plain float, which drops them (SPIR-V
+    leaves the bits of a NaN result open)."""
+
+    __slots__ = ("bits",)
+
+    def __new__(cls, bits):
+        self = super().__new__(cls, struct.unpack("<f", struct.pack("<I", bits))[0])
+        self.bits = bits
+        return self
+
+
 def f32_bits(x):
+    if isinstance(x, _F32):
+        return x.bits
     try:
         return struct.unpack("<I", struct.pack("<f", x))[0]
     except OverflowError:
@@ -85,7 +103,7 @@ def f32_bits(x):
 
 
 def bits_f32(b):
-    return struct.unpack("<f", struct.pack("<I", b & MASK))[0]
+    return _F32(b & MASK)
 
 
 def half_to_float(h):

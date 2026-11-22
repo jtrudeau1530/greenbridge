@@ -424,6 +424,59 @@ class InterpreterTests(unittest.TestCase):
         with self.assertRaises(si.UnsupportedConstruct):
             si.run_fragment(text)
 
+    # Signalling-NaN words (exponent all ones, bit 22 clear, mantissa not zero), a quiet NaN and two ordinary
+    # values. Issue #509: going through a Python float set bit 22 of the first four.
+    SNAN_WORDS = (0xFFA3A095, 0x7F800001, 0x7FBFFFFF, 0xFF800001, 0x7FC00001, 0x3F800000, 0x80000000)
+
+    def test_bitcast_keeps_signalling_nan_bits(self):
+        # SPIR-V OpBitcast: the bit pattern is unchanged. The word goes uint -> float and on through
+        # OpCopyObject, a composite, OpSelect and a Function variable before it comes back as a uint and also
+        # leaves through a float Output; both must be the word that went in.
+        text = HEADER.replace('OpEntryPoint Fragment %main "main" %out',
+                              'OpEntryPoint Fragment %main "main" %out %outf').replace(
+            "%main = OpFunction",
+            "%_ptr_Output_float = OpTypePointer Output %float\n%outf = OpVariable %_ptr_Output_float Output\n"
+            "%_ptr_Function_float = OpTypePointer Function %float\n%main = OpFunction")
+        body = ("%fv = OpVariable %_ptr_Function_float Function\n"
+                "%p = OpAccessChain %_ptr_PC_uint %pc %c0\n"
+                "%w = OpLoad %uint %p\n"
+                "%x = OpBitcast %float %w\n"
+                "%y = OpCopyObject %float %x\n"
+                "%v = OpCompositeConstruct %v2float %f1 %y\n"
+                "%e = OpCompositeExtract %float %v 1\n"
+                "%s = OpSelect %float %t %e %f2\n"
+                "OpStore %fv %s\n"
+                "%l = OpLoad %float %fv\n"
+                "OpStore %outf %l\n"
+                "%res = OpBitcast %uint %l\n"
+                "OpStore %out %res\n")
+        for word in self.SNAN_WORDS:
+            with self.subTest(word=f"{word:#010x}"):
+                out = si.run_fragment(text + body + FOOTER, push_constants=[word])
+                self.assertEqual(out["%out"], (word,))
+                self.assertEqual(out["%outf"], (word,))
+
+    def test_bitcast_signalling_nan_is_still_a_nan(self):
+        # The value keeps its bits but is still a float NaN to the float operations (OpIsNan, OpFOrdEqual).
+        text = HEADER.replace("%main = OpFunction", "%cS = OpConstant %uint 4288913557\n%main = OpFunction")
+        for body, want in (("%x = OpBitcast %float %cS\n%n = OpIsNan %bool %x\n", 1),
+                           ("%x = OpBitcast %float %cS\n%n = OpFOrdEqual %bool %x %x\n", 0)):
+            with self.subTest(body=body.splitlines()[1]):
+                out = si.run_fragment(text + body + "%res = OpSelect %uint %n %c1 %c0\nOpStore %out %res\n"
+                                      + FOOTER)
+                self.assertEqual(out["%out"], (want,))
+
+    def test_float_arithmetic_on_signalling_nan_gives_a_nan(self):
+        # Arithmetic drops the kept pattern: SPIR-V does not fix the bits of a NaN result, so only "a NaN" is
+        # asserted (exponent all ones, mantissa not zero).
+        text = HEADER.replace("%main = OpFunction", "%cS = OpConstant %uint 4288913557\n%main = OpFunction")
+        for op in ("%y = OpFAdd %float %x %f1\n", "%y = OpFMul %float %x %f2\n", "%y = OpFNegate %float %x\n"):
+            with self.subTest(op=op.split()[2]):
+                word = si.run_fragment(text + "%x = OpBitcast %float %cS\n" + op +
+                                       "%res = OpBitcast %uint %y\nOpStore %out %res\n" + FOOTER)["%out"][0]
+                self.assertEqual(word & 0x7F800000, 0x7F800000)
+                self.assertNotEqual(word & 0x007FFFFF, 0)
+
     def test_push_constant_reads_zero(self):
         text = HEADER + "%p = OpAccessChain %_ptr_PC_uint %pc %c0\n%res = OpLoad %uint %p\nOpStore %out %res\n" + FOOTER
         self.assertEqual(si.run_fragment(text)["%out"][0], 0)
