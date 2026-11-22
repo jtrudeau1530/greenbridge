@@ -7,11 +7,13 @@ import io
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import fssm_header  # noqa: E402
 import wave64_graphics_scan as scan  # noqa: E402
 
 
@@ -82,6 +84,27 @@ class ScanTests(unittest.TestCase):
         b = report["per_stage"]["ps"]
         self.assertEqual((b["wave64"], b["with_selected_op"]), (1, 1))
         self.assertEqual(b["occurrences"], {"s_cbranch_execz": 1})  # s_mov_b64 exec is the classifier, not a hit
+
+    def test_fssm_header_distinguishes_identical_markerless_shaders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            disasm = root / "disasm"
+            fssm = root / "fssm"
+            disasm.mkdir()
+            fssm.mkdir()
+            for size, flags in ((32, fssm_header.FLAG_WAVE32), (64, 0)):
+                name = f"ps_header{size}"
+                _, listing = fixture(name + ".s", ["v_readfirstlane_b32 s4, v1", "s_endpgm"])
+                (disasm / (name + ".s")).write_text(listing, encoding="utf-8", newline="\n")
+                header = bytearray(fssm_header.WAVE_FLAGS_OFFSET + 4)
+                header[:4] = fssm_header.MAGIC
+                struct.pack_into("<I", header, fssm_header.WAVE_FLAGS_OFFSET, flags)
+                (fssm / (name + ".fssm")).write_bytes(header)
+
+            report = scan.scan_directory(disasm)
+            ps = report["per_stage"]["ps"]
+            self.assertEqual((ps["shaders"], ps["wave64"], ps["with_selected_op"]), (2, 1, 1))
+            self.assertEqual(ps["occurrences"], {"v_readfirstlane_b32": 1})
 
     def test_mask_word_source_split(self):
         report = self.scan(PS_W64_BCNT_SPLIT, GS_W64)
