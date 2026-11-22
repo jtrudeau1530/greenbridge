@@ -361,10 +361,14 @@ What is implemented (all of it testable without the game):
 
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
-- **`runtime/src/vulkan_bindless.h`**: set 0 itself, the twenty bindings the translator declares, with the array
-  sizes `vk_pipeline_check` uses, and `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind
-  binding 2. One set for the device. Details:
-  - An image has one index in its dimension (2D, 2D array, 3D, 1D), the same in every binding of that dimension.
+- **`runtime/src/vulkan_bindless.h`**: set 0 includes the twenty bindings the translator declares, with the
+  array sizes `vk_pipeline_check` uses, and `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1)
+  behind binding 2. One set for the device. Details:
+  - An image has one index in its dimension (2D, 2D array, 3D, 1D, 2DMS or 2DMS array), shared by the
+    bindings for that dimension. The runtime adds sampled-image bindings in pairs for 2DMS and 2DMS array:
+    20/21 for floating-point and normalized color, 22/23 for unsigned integers, and 24/25 for signed integers.
+    The runtime enables pairs that fit the device's descriptor limits and have a multisampled zero fallback
+    of the matching numeric class. A missed key reads zero at texel (0, 0), layer 0, sample 0.
   - The storage arrays are shorter (256), so an image with a storage view gets an index below 256 and a read-only
     one goes above where there is room.
   - Index 0 of every array is a fallback (a 1x1 image of zeros, a nearest clamping sampler), because a miss is
@@ -390,6 +394,10 @@ side inwards:
     depth comparison field. The layer marks the NEVER comparison in S# word 3, bit 12 (unused with
     DERIV_ADJUST_EN clear) to give it a separate lookup key and a comparison-enabled Vulkan sampler.
   - A view the layer cannot show (below) leaves a null descriptor, all zeros, which finds the fallback.
+  - A typed multisampled color texture has one mip. Its default SRV covers every layer. An explicit
+    `TEXTURE2DMS` view reads layer zero, while `TEXTURE2DMSARRAY` selects a range starting at
+    `FirstArraySlice` (`ArraySize = UINT_MAX` selects the remaining layers). The format-support query
+    advertises `MULTISAMPLE_LOAD` when the format can be sampled with MSAA and its binding pair is available.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
   - `VulkanDeviceInfo::bindless` says the Vulkan device has the features this needs: `runtimeDescriptorArray`,
@@ -414,13 +422,15 @@ volume. A nonzero `ResourceMinLODClamp` on a 3D view is logged and leaves a null
 
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
-views of 1D and multisampled textures, 3D storage views and typeless volume SRVs; depth-plane views (`R24_UNORM_X8_TYPELESS`,
+views of 1D textures, 3D storage views and typeless volume SRVs, multisampled depth/stencil and typeless color SRVs, and shader-translator lowering
+for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect (the texture's backing format, so X24_8_32_FLOAT for a D24 texture where the layer stores it as
 `D32_SFLOAT_S8_UINT`), each on its own family only (the other family's is a null
 descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
-aspect, in its float-typed sampled arrays like other UINT views; descriptors the game writes itself, which need
+aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
+the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
 of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan

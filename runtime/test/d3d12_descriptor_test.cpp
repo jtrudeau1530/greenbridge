@@ -13,9 +13,10 @@
 //     CreateSampler2 samplers that clamp to a UINT (0,0,0,0) and (1,1,1,1) border, and a float white border on
 //     the UNORM texture. Every texel is the border: 0, 1 and 255 in each channel. Both white borders are built in
 //     at the same S# type, so this also checks that they are two samplers, not one.
-// The device has no pipelines yet, so the test makes that one pipeline in Vulkan itself and binds the device's set
-// (rt::d3d12::bindless_set). The shader is test/glsl/cs_sample.comp; without glslangValidator at build time the
-// sampling is skipped. No game data.
+// Multisample SRVs: four masked triangles seed different values per sample and array layer. A compute shader reads
+// them back using the T#s for the 2D, full-array and sliced-array views. The test builds its pipelines in Vulkan
+// and binds the device's set (rt::d3d12::bindless_set). Without glslangValidator the GPU readbacks are skipped.
+// No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -86,36 +87,131 @@ struct SampleKeys {
     std::uint32_t tsharp[8];
     std::uint32_t ssharp[4];
     std::uint32_t first;
-    std::uint32_t integer;  // the image is an integer one: cs_sample.comp reads it as a utexture2D
+    std::uint32_t mode;  // 0: normalized, 1: uint, 2: multisampled, 3: multisampled array
+    std::uint32_t layer;
 };
+
+VkShaderModule load_shader(vktest::Device& d, const char* path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) return VK_NULL_HANDLE;
+    std::vector<std::uint32_t> code(std::size_t(file.tellg()) / 4);
+    file.seekg(0);
+    if (code.empty() || !file.read(reinterpret_cast<char*>(code.data()), std::streamsize(code.size() * 4)))
+        return VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = code.size() * 4;
+    info.pCode = code.data();
+    VkShaderModule module{};
+    return d.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(d.device, &info, nullptr, &module) == VK_SUCCESS
+        ? module : VK_NULL_HANDLE;
+}
+
+// Seed a 2D image and three layers of an array. Each triangle writes one sample through gl_SampleMask,
+// so a device without sample-rate shading can still exercise reads of four independently known values.
+bool seed_ms_images(vktest::Device& d, VkImage single, VkImage array) {
+    const VkShaderModule vs = load_shader(d, LEONIDA_TEST_MSAA_VERT_SPV);
+    const VkShaderModule fs = load_shader(d, LEONIDA_TEST_MSAA_FRAG_SPV);
+    VkPipelineLayout layout{};
+    VkPipeline pipeline{};
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    bool ok = vs && fs && d.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(
+                              d.device, &layout_info, nullptr, &layout) == VK_SUCCESS;
+    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &format;
+    VkPipelineShaderStageCreateInfo stages[] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main"}};
+    VkPipelineVertexInputStateCreateInfo vertices{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    const VkRect2D area{{0, 0}, {4, 4}};
+    const VkViewport viewport{0, 0, 4, 4, 0, 1};
+    VkPipelineViewportStateCreateInfo viewports{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewports.viewportCount = viewports.scissorCount = 1;
+    viewports.pViewports = &viewport;
+    viewports.pScissors = &area;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkPipelineColorBlendAttachmentState color{};
+    color.colorWriteMask = 0xf;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &color;
+    VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
+    pi.stageCount = 2;
+    pi.pStages = stages;
+    pi.pVertexInputState = &vertices;
+    pi.pInputAssemblyState = &assembly;
+    pi.pViewportState = &viewports;
+    pi.pRasterizationState = &raster;
+    pi.pMultisampleState = &ms;
+    pi.pColorBlendState = &blend;
+    pi.layout = layout;
+    ok = ok && d.fn<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(
+                   d.device, VK_NULL_HANDLE, 1, &pi, nullptr, &pipeline) == VK_SUCCESS;
+    VkImageView views[4]{};
+    for (UINT k = 0; ok && k < std::size(views); ++k) {
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = k == 0 ? single : array;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        info.format = format;
+        info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, k == 0 ? 0 : k - 1, 1};
+        ok = d.fn<PFN_vkCreateImageView>("vkCreateImageView")(d.device, &info, nullptr, &views[k]) == VK_SUCCESS;
+    }
+    ok = ok && d.run([&](VkCommandBuffer cb) {
+        d.fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        for (UINT k = 0; k < std::size(views); ++k) {
+            VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            attachment.imageView = views[k];
+            attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfo draw{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            draw.renderArea = area;
+            draw.layerCount = draw.colorAttachmentCount = 1;
+            draw.pColorAttachments = &attachment;
+            d.fn<PFN_vkCmdBeginRendering>("vkCmdBeginRendering")(cb, &draw);
+            d.fn<PFN_vkCmdDraw>("vkCmdDraw")(cb, 3, 4, 0, 4 * k);
+            d.fn<PFN_vkCmdEndRendering>("vkCmdEndRendering")(cb);
+        }
+        VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        ready.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(
+            cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &ready, 0, nullptr, 0, nullptr);
+        return true;
+    });
+    for (VkImageView view : views) d.fn<PFN_vkDestroyImageView>("vkDestroyImageView")(d.device, view, nullptr);
+    d.fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(d.device, pipeline, nullptr);
+    d.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(d.device, layout, nullptr);
+    d.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(d.device, fs, nullptr);
+    d.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(d.device, vs, nullptr);
+    return ok;
+}
 
 // Runs test/glsl/cs_sample.comp once for each of `keys` on `set0`, the device's bindless set, and copies the
 // texels they wrote to `results` (64 RGBA8 texels each). Set 1 is the test's output buffer.
 bool sample_through_set(vktest::Device& d, VkDescriptorSet set0, VkDescriptorSetLayout set0_layout,
-                        std::span<const SampleKeys> keys, std::uint8_t* results) {
+                        std::span<const SampleKeys> keys, void* results, const char* shader = LEONIDA_TEST_CS_SAMPLE_SPV) {
     const VkDevice dev = d.device;
-    std::ifstream file(LEONIDA_TEST_CS_SAMPLE_SPV, std::ios::binary | std::ios::ate);
-    if (!file) return false;
-    std::vector<std::uint32_t> code(std::size_t(file.tellg()) / 4);
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(code.data()), std::streamsize(code.size() * 4));
-    if (code.empty()) return false;
 
     constexpr VkDeviceSize texels = 64;
     void* mapped = nullptr;
     const VkBuffer output = d.buffer(keys.size() * texels * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mapped);
     if (!output) return false;
 
-    VkShaderModule module = VK_NULL_HANDLE;
+    const VkShaderModule module = load_shader(d, shader);
     VkDescriptorSetLayout set1_layout = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorSet set1 = VK_NULL_HANDLE;
 
-    VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    module_info.codeSize = code.size() * 4;
-    module_info.pCode = code.data();
     const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
                                                nullptr};
     VkDescriptorSetLayoutCreateInfo set1_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -126,8 +222,7 @@ bool sample_through_set(vktest::Device& d, VkDescriptorSet set0, VkDescriptorSet
     pool_info.maxSets = 1;
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
-    bool ok = d.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(dev, &module_info, nullptr, &module) == VK_SUCCESS &&
-              d.fn<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(dev, &set1_info, nullptr,
+    bool ok = module && d.fn<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(dev, &set1_info, nullptr,
                                                                                    &set1_layout) == VK_SUCCESS &&
               d.fn<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(dev, &pool_info, nullptr, &pool) == VK_SUCCESS;
     if (ok) {
@@ -412,7 +507,17 @@ int main() {
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         const UINT sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         Ref<ID3D12DescriptorHeap> view_heap, sampler_heap;
-        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16,
+        struct LodView { UINT first, count; float clamp; bool force_alpha_one = false; };
+        constexpr LodView lod_views[] = {
+            {0, 3, 0.25f}, {0, 3, 0.75f}, {1, 2, 1.75f}, {0, 2, 1.75f}, {1, 2, 0.75f}, {0, 2, 1.75f, true}
+        };
+        constexpr UINT first_lod_slot = 10;
+        // Keep the multisample views after all minimum-LOD views and the preceding volume views.
+        enum : UINT {
+            ms_slot = first_lod_slot + std::size(lod_views), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
+        };
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&view_heap.p))));
         heap_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -423,11 +528,6 @@ int main() {
         const auto view_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(view_cpu + i * step)}; };
         const auto view_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(view_cpu + i * step); };
 
-        struct LodView { UINT first, count; float clamp; bool force_alpha_one = false; };
-        constexpr LodView lod_views[] = {
-            {0, 3, 0.25f}, {0, 3, 0.75f}, {1, 2, 1.75f}, {0, 2, 1.75f}, {1, 2, 0.75f}, {0, 2, 1.75f, true}
-        };
-        constexpr UINT first_lod_slot = 10;
         for (UINT i = 0; i < std::size(lod_views); ++i) {
             const auto& v = lod_views[i];
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -471,6 +571,73 @@ int main() {
         const auto null_at = [&](UINT i) {
             return std::all_of(view_bytes(i), view_bytes(i) + step, [](std::uint8_t byte) { return byte == 0; });
         };
+        D3D12_RESOURCE_DESC ms_desc = texture_desc;
+        ms_desc.Width = ms_desc.Height = 4;
+        ms_desc.SampleDesc.Count = 4;
+        ms_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        Ref<ID3D12Resource> ms_texture, ms_array;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT float_support{ms_desc.Format};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &float_support, sizeof(float_support))));
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS ms_quality{ms_desc.Format, 4};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms_quality, sizeof(ms_quality))));
+        if ((float_support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD) && ms_quality.NumQualityLevels) {
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ms_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ms_texture.p))));
+            ms_desc.DepthOrArraySize = 3;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ms_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ms_array.p))));
+            device->CreateShaderResourceView(ms_texture.p, nullptr, view_slot(ms_slot));
+            device->CreateShaderResourceView(ms_array.p, nullptr, view_slot(ms_array_slot));
+            g::Image ms_image{};
+            EXPECT(image_at(ms_slot, ms_image) && ms_image.type == g::ImageType::image_2d_msaa &&
+                   ms_image.samples == 4 && ms_image.first_mip == 0 && ms_image.mip_count == 1 && ms_image.layer_count == 1);
+            EXPECT(image_at(ms_array_slot, ms_image) && ms_image.type == g::ImageType::image_2d_msaa_array &&
+                   ms_image.samples == 4 && ms_image.first_layer == 0 && ms_image.layer_count == 3);
+            D3D12_SHADER_RESOURCE_VIEW_DESC ms_view{};
+            ms_view.Format = ms_desc.Format;
+            ms_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            ms_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+            device->CreateShaderResourceView(ms_texture.p, &ms_view, view_slot(ms_slice_slot));
+            EXPECT(std::memcmp(view_bytes(ms_slot), view_bytes(ms_slice_slot), step) == 0);
+            // An explicit UNKNOWN format inherits the texture format. A 2DMS view of an array selects layer zero.
+            ms_view.Format = DXGI_FORMAT_UNKNOWN;
+            device->CreateShaderResourceView(ms_texture.p, &ms_view, view_slot(ms_slice_slot));
+            EXPECT(std::memcmp(view_bytes(ms_slot), view_bytes(ms_slice_slot), step) == 0);
+            device->CreateShaderResourceView(ms_array.p, &ms_view, view_slot(ms_first_layer_slot));
+            EXPECT(image_at(ms_first_layer_slot, ms_image) && ms_image.type == g::ImageType::image_2d_msaa &&
+                   ms_image.first_layer == 0 && ms_image.layer_count == 1);
+            device->CreateShaderResourceView(texture.p, &ms_view, view_slot(ms_slice_slot));
+            EXPECT(null_at(ms_slice_slot));  // an MS view of a single-sampled image
+            ms_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            ms_view.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(ms_texture.p, &ms_view, view_slot(ms_slice_slot));
+            EXPECT(null_at(ms_slice_slot));  // and the inverse
+            ms_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            ms_view.Texture2DMSArray.FirstArraySlice = 3;
+            ms_view.Texture2DMSArray.ArraySize = 1;
+            device->CreateShaderResourceView(ms_array.p, &ms_view, view_slot(ms_slice_slot));
+            EXPECT(null_at(ms_slice_slot));
+            ms_view.Texture2DMSArray.FirstArraySlice = 1;
+            for (UINT invalid_count : {0u, 3u, UINT_MAX - 1}) {
+                ms_view.Texture2DMSArray.ArraySize = invalid_count;
+                device->CreateShaderResourceView(ms_array.p, &ms_view, view_slot(ms_slice_slot));
+                EXPECT(null_at(ms_slice_slot));
+            }
+            ms_view.Texture2DMSArray.ArraySize = 2;
+            ms_view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(6, 1, 2, 3);
+            device->CreateShaderResourceView(ms_array.p, &ms_view, view_slot(ms_slice_slot));
+            EXPECT(null_at(ms_slice_slot));
+            ms_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            for (UINT remaining : {2u, UINT_MAX}) {
+                ms_view.Texture2DMSArray.ArraySize = remaining;
+                device->CreateShaderResourceView(ms_array.p, &ms_view, view_slot(ms_slice_slot));
+                EXPECT(image_at(ms_slice_slot, ms_image) && ms_image.type == g::ImageType::image_2d_msaa_array &&
+                       ms_image.samples == 4 && ms_image.first_layer == 1 && ms_image.layer_count == 2);
+            }
+        } else {
+            std::printf("MSAA SRVs: device does not advertise 4x RGBA8 multisample loads, skipped\n");
+        }
+
         g::Image image{};
         EXPECT(image_at(own, image));
         EXPECT(image.type == g::ImageType::image_2d && image.width == size && image.height == size);
@@ -898,6 +1065,66 @@ int main() {
             transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
         list->ResourceBarrier(UINT(std::size(sampled)), sampled);
+        if (ms_texture.p) {
+            const D3D12_RESOURCE_BARRIER ms_sampled[] = {
+                transition(ms_texture.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                transition(ms_array.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+            list->ResourceBarrier(UINT(std::size(ms_sampled)), ms_sampled);
+        }
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+        struct IntegerMS {
+            DXGI_FORMAT format;
+            VkFormat vk_format;
+            const char* shader;
+            std::uint32_t value;
+            UINT slots[2];
+            Ref<ID3D12Resource> textures[2];  // single layer and two-layer array
+            SampleKeys keys[4]{};             // two hits and a missed key in each dimension
+        };
+        IntegerMS integer_ms[] = {
+            {DXGI_FORMAT_R32_UINT, VK_FORMAT_R32_UINT, LEONIDA_TEST_MS_UINT_SPV, 0xf1234567u,
+             {ms_uint_slot, ms_uint_array_slot}},
+            {DXGI_FORMAT_R32_SINT, VK_FORMAT_R32_SINT, LEONIDA_TEST_MS_SINT_SPV, std::uint32_t(-1234567),
+             {ms_sint_slot, ms_sint_array_slot}}};
+        for (auto& test : integer_ms) {
+            VkImageFormatProperties props{};
+            const auto query = d.instance_fn<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
+            constexpr auto usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            if (query(d.physical, test.vk_format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &props) != VK_SUCCESS ||
+                !(props.sampleCounts & (VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT))) {
+                std::printf("MSAA SRV format %u: no 2x or 4x sampled render target, skipped\n", UINT(test.format));
+                continue;
+            }
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT integer_support{test.format};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &integer_support, sizeof(integer_support))));
+            if (!(integer_support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD)) {
+                std::printf("MSAA SRV format %u: device does not advertise multisample loads, skipped\n",
+                            UINT(test.format));
+                continue;
+            }
+            D3D12_RESOURCE_DESC desc = ms_desc;
+            desc.Format = test.format;
+            desc.SampleDesc.Count = (props.sampleCounts & VK_SAMPLE_COUNT_4_BIT) ? 4 : 2;
+            for (UINT shape = 0; shape < 2; ++shape) {
+                desc.DepthOrArraySize = UINT16(1 + shape);
+                auto& resource = test.textures[shape];
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource.p))));
+                const UINT at = test.slots[shape];
+                device->CreateShaderResourceView(resource.p, nullptr, view_slot(at));
+                EXPECT(!null_at(at));
+                std::memcpy(test.keys[shape].tsharp, view_bytes(at), sizeof(test.keys[shape].tsharp));
+                test.keys[shape].mode = test.keys[2 + shape].mode = 2 + shape;
+                test.keys[shape].first = texels * shape;
+                test.keys[2 + shape].first = texels * (2 + shape);
+                test.keys[shape].layer = shape;
+                const auto barrier = transition(resource.p, D3D12_RESOURCE_STATE_COMMON,
+                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &barrier);
+            }
+        }
+#endif
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -1016,9 +1243,72 @@ int main() {
             std::memcpy(border_keys[k].tsharp, view_bytes(border_views[k]), sizeof(border_keys[k].tsharp));
             std::memcpy(border_keys[k].ssharp, sampler_at(border_samplers[k]), sizeof(border_keys[k].ssharp));
             border_keys[k].first = k * texels;
-            border_keys[k].integer = border_views[k] == uint_slot;
+            border_keys[k].mode = border_views[k] == uint_slot;
         }
         EXPECT(sample_through_set(d, set0, set0_layout, border_keys, borders.data()));
+
+        if (ms_texture.p) {
+            EXPECT(seed_ms_images(d, rt::d3d12::vulkan_image(ms_texture.p), rt::d3d12::vulkan_image(ms_array.p)));
+            // The last key uses the non-array binding to read layer zero of the array.
+            const struct { UINT slot, mode, view_layer, seed_layer; } ms_reads[] = {
+                {ms_slot, 2, 0, 0}, {ms_array_slot, 3, 0, 1}, {ms_array_slot, 3, 1, 2}, {ms_array_slot, 3, 2, 3},
+                {ms_slice_slot, 3, 0, 2}, {ms_slice_slot, 3, 1, 3}, {ms_first_layer_slot, 2, 0, 1}};
+            SampleKeys ms_keys[std::size(ms_reads)]{};
+            for (UINT k = 0; k < std::size(ms_keys); ++k) {
+                const auto type = ms_reads[k].mode == 2 ? g::ImageType::image_2d_msaa
+                                                        : g::ImageType::image_2d_msaa_array;
+                EXPECT(image_at(ms_reads[k].slot, image) && image.type == type);
+                std::memcpy(ms_keys[k].tsharp, view_bytes(ms_reads[k].slot), sizeof(ms_keys[k].tsharp));
+                ms_keys[k].first = k * texels;
+                ms_keys[k].mode = ms_reads[k].mode;
+                ms_keys[k].layer = ms_reads[k].view_layer;
+            }
+            std::array<std::uint8_t, std::size(ms_keys) * bytes> ms_results{};
+            EXPECT(sample_through_set(d, set0, set0_layout, ms_keys, ms_results.data(), LEONIDA_TEST_MS_FLOAT_SPV));
+            for (UINT k = 0; k < std::size(ms_keys); ++k)
+                for (UINT i = 0; i < texels; ++i) {
+                    const std::uint8_t expected[] = {std::uint8_t(i / 4 % 4), std::uint8_t(i / 16),
+                                                     std::uint8_t(4 * ms_reads[k].seed_layer + i % 4 + 1), 255};
+                    const auto* got = ms_results.data() + 4 * (k * texels + i);
+                    if (std::memcmp(got, expected, 4) != 0) {
+                        std::fprintf(stderr, "MSAA view %u layer %u texel (%u,%u) sample %u: got %u,%u,%u,%u, "
+                                     "expected %u,%u,%u,%u\n", ms_reads[k].slot, ms_reads[k].view_layer, i / 4 % 4, i / 16, i % 4,
+                                     got[0], got[1], got[2], got[3], expected[0], expected[1], expected[2], expected[3]);
+                        return 1;
+                    }
+                }
+            std::printf("MSAA SRVs: %zu per-sample values matched through 2D, full-array and sliced-array views\n",
+                        std::size(ms_keys) * texels);
+        }
+
+        for (auto& test : integer_ms) {
+            if (!test.textures[0].p) continue;
+            EXPECT(d.run([&](VkCommandBuffer cb) {
+                for (UINT shape = 0; shape < 2; ++shape) {
+                    VkClearColorValue color{};
+                    color.uint32[0] = test.value + shape;
+                    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 + shape};
+                    d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(cb,
+                        rt::d3d12::vulkan_image(test.textures[shape].p), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &all);
+                }
+                VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ready, 0, nullptr, 0, nullptr);
+                return true;
+            }));
+            std::array<std::uint32_t, 4 * texels> values{};
+            for (UINT shape = 0; shape < 2; ++shape)
+                EXPECT(std::memcmp(test.keys[shape].tsharp, view_bytes(test.slots[shape]), sizeof(test.keys[shape].tsharp)) == 0);
+            EXPECT(sample_through_set(d, set0, set0_layout, test.keys, values.data(), test.shader));
+            for (UINT k = 0; k < 4; ++k) {
+                const auto expected = k < 2 ? test.value + k : 0u;
+                for (UINT i = 0; i < texels; ++i) EXPECT(values[k * texels + i] == expected);
+            }
+            for (auto& resource : test.textures) resource.reset();
+            std::printf("MSAA format %u: 2D and array integer reads and zero fallbacks matched\n", UINT(test.format));
+        }
 #endif
 
         // A destroyed texture takes its views out of the set: the next ExecuteCommandLists writes that, and nothing
@@ -1129,6 +1419,8 @@ int main() {
         uint_texture.reset();
         for (auto& resource : byte_textures) resource.reset();
         byte_heap.reset();
+        ms_texture.reset();
+        ms_array.reset();
         view_heap.reset();
         sampler_heap.reset();
         list.reset();

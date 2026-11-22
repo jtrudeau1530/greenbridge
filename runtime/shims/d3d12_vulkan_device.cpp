@@ -316,6 +316,19 @@ struct DeviceState {
         return subgroups;
     }
 
+    // Integer sampled images need not support multisampling. Pick a supported count for the
+    // zero image in the corresponding set-0 bindings; one means that class is unavailable.
+    VkSampleCountFlagBits ms_fallback_samples(VkFormat format) const {
+        VkImageFormatProperties props{};
+        constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (image_format_properties(info.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                    usage, 0, &props) == VK_SUCCESS) {
+            for (UINT count = D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT; count > 1; count >>= 1)
+                if (props.sampleCounts & count) return VkSampleCountFlagBits(count);
+        }
+        return VK_SAMPLE_COUNT_1_BIT;
+    }
+
     // The format a texture description is created with, D24S8's fallback included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
@@ -426,8 +439,10 @@ struct DeviceState {
         case g::ImageType::cube: dimension = leonida::ImageDimension::dim_2d_array; break;
         case g::ImageType::image_3d: dimension = leonida::ImageDimension::dim_3d; break;
         case g::ImageType::image_1d: dimension = leonida::ImageDimension::dim_1d; break;
+        case g::ImageType::image_2d_msaa: dimension = leonida::ImageDimension::dim_2d_ms; break;
+        case g::ImageType::image_2d_msaa_array: dimension = leonida::ImageDimension::dim_2d_ms_array; break;
         default:
-            log_once("set 0 has no array for this image type (1D array or multisampled):", int(image.type));
+            log_once("set 0 has no array for this image type:", int(image.type));
             return false;
         }
         // A T# of 8_UINT on a depth-stencil image is a view of its stencil plane (image_descriptor, D3D-75). Vulkan
@@ -437,6 +452,11 @@ struct DeviceState {
         const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(image_format, image.format);
         if (view_format == VK_FORMAT_UNDEFINED) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
+            return false;
+        }
+        const unsigned sampled_class = g::multisampled(image.type) ? numeric_class(view_format) : 0;
+        if (g::multisampled(image.type) && !bindless->supports_ms_class(sampled_class)) {
+            log_once("set 0 has no multisample binding for this numeric class:", int(sampled_class));
             return false;
         }
         auto& vk = context->vk;
@@ -482,7 +502,7 @@ struct DeviceState {
             if (view_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
         }
         // Every state a shader can read or write the texture in is GENERAL (ResourceBinding::sampled_in_general).
-        entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views);
+        entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
         if (!entry.index) {
             log_once("a bindless image array is full; dimension", int(dimension));
             vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
@@ -1090,14 +1110,29 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const bool msaa = g::multisampled(view.type);
     if ((volume != (view.type == g::ImageType::image_3d)) ||
-        (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) || desc.SampleDesc.Count > 1) {
+        (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) || msaa != (desc.SampleDesc.Count > 1)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
     if (volume && view.min_lod != 0) {
         log_once("volume SRV requires a zero ResourceMinLODClamp; format", int(desc.Format));
         return false;
+    }
+    if (msaa) {
+        // The MS bindings expose typed colour SRVs. An MS view has one mip and can name an array slice range.
+        const Format format = texture_storage_format(desc.Format, false);
+        if (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || format.typeless ||
+            (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format)) {
+            log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
+            return false;
+        }
+        // Four 3-bit selectors followed by D3D12's always-set bit.
+        if ((view.mapping >> 12) != 1) {
+            log_once("invalid multisample shader view component mapping:", int(view.mapping));
+            return false;
+        }
     }
     VkFormat named = resource.format();
     if (volume && (vulkan_format(desc.Format, false).typeless ||
@@ -1136,6 +1171,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("view starts past the texture's mips or layers; first mip", int(view.first_mip));
         return false;
     }
+    if (msaa && view.layer_count != UINT_MAX && view.layer_count > UINT(desc.DepthOrArraySize) - view.first_layer) {
+        log_once("multisample shader view ends past the texture array; layers", int(view.layer_count));
+        return false;
+    }
     out = {};
     out.address = resource.image_address();
     out.format = code;
@@ -1143,6 +1182,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     out.width = std::uint32_t(desc.Width);
     out.height = desc.Height;
     out.depth = volume ? desc.DepthOrArraySize : 1;
+    out.samples = desc.SampleDesc.Count;
     out.first_mip = view.first_mip;
     out.mip_count = std::min<UINT>(view.mip_count, desc.MipLevels - view.first_mip);
     out.first_layer = view.first_layer;
@@ -1162,6 +1202,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     else if (desc.Format == DXGI_FORMAT_A8_UNORM) channels = {g::select_zero, g::select_zero, g::select_zero, g::select_x};
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
+        if (msaa && from > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) {
+            log_once("invalid multisample shader view component selector:", from);
+            return false;
+        }
         out.swizzle[i] = from < 4 ? channels[from]
                                   : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0 ? g::select_zero : g::select_one;
     }
@@ -1418,6 +1462,16 @@ public:
         leonida::BindlessFeatures features{};
         features.update_after_bind = true;  // VulkanDeviceInfo::bindless promises it
         features.partially_bound = state_.info.bindless_partially_bound;
+        const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
+        if (get_properties) {
+            VkPhysicalDeviceVulkan12Properties indexed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &indexed};
+            get_properties(state_.info.physical, &properties);
+            features.ms_samples = {VK_SAMPLE_COUNT_4_BIT, state_.ms_fallback_samples(VK_FORMAT_R32_UINT),
+                                   state_.ms_fallback_samples(VK_FORMAT_R32_SINT)};
+            leonida::bindless::limit_ms_bindings(features, properties.properties.limits, indexed);
+        }
         state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
@@ -1793,6 +1847,7 @@ public:
                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateShaderResourceView");
+        using leonida::gfx10::ImageType;
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
@@ -1807,10 +1862,13 @@ public:
         }
         TextureView view{};
         if (!desc) {
+            const bool array = r->desc().DepthOrArraySize > 1;
             if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
-                view.type = leonida::gfx10::ImageType::image_3d;
-            else if (r->desc().DepthOrArraySize > 1)
-                view.type = leonida::gfx10::ImageType::image_2d_array;
+                view.type = ImageType::image_3d;
+            else if (r->desc().SampleDesc.Count > 1)
+                view.type = array ? ImageType::image_2d_msaa_array : ImageType::image_2d_msaa;
+            else if (array)
+                view.type = ImageType::image_2d_array;
         } else {
             view.format = desc->Format;
             view.mapping = desc->Shader4ComponentMapping;
@@ -1821,6 +1879,15 @@ public:
                 view.mip_count = desc->Texture3D.MipLevels;
                 view.min_lod = desc->Texture3D.ResourceMinLODClamp;
                 break;
+            case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+                view.type = ImageType::image_2d_msaa;
+                view.layer_count = 1;
+                break;
+            case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+                view.type = ImageType::image_2d_msaa_array;
+                view.first_layer = desc->Texture2DMSArray.FirstArraySlice;
+                view.layer_count = desc->Texture2DMSArray.ArraySize;
+                break;
             case D3D12_SRV_DIMENSION_TEXTURE2D:
                 view.first_mip = desc->Texture2D.MostDetailedMip;
                 view.mip_count = desc->Texture2D.MipLevels;
@@ -1829,7 +1896,7 @@ public:
                 view.min_lod = desc->Texture2D.ResourceMinLODClamp;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
-                view.type = leonida::gfx10::ImageType::image_2d_array;
+                view.type = ImageType::image_2d_array;
                 view.first_mip = desc->Texture2DArray.MostDetailedMip;
                 view.mip_count = desc->Texture2DArray.MipLevels;
                 view.first_layer = desc->Texture2DArray.FirstArraySlice;
@@ -1838,14 +1905,14 @@ public:
                 view.min_lod = desc->Texture2DArray.ResourceMinLODClamp;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURECUBE:
-                view.type = leonida::gfx10::ImageType::cube;
+                view.type = ImageType::cube;
                 view.first_mip = desc->TextureCube.MostDetailedMip;
                 view.mip_count = desc->TextureCube.MipLevels;
                 view.layer_count = 6;
                 view.min_lod = desc->TextureCube.ResourceMinLODClamp;
                 break;
             case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
-                view.type = leonida::gfx10::ImageType::cube;
+                view.type = ImageType::cube;
                 view.first_mip = desc->TextureCubeArray.MostDetailedMip;
                 view.mip_count = desc->TextureCubeArray.MipLevels;
                 view.first_layer = desc->TextureCubeArray.First2DArrayFace;
@@ -2006,6 +2073,7 @@ public:
         } else if (const UINT samples = desc->SampleDesc.Count;
                    !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || desc->SampleDesc.Quality != 0 ||
                    (samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
+                                    (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
                                     desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                                     !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                                                      D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))) {
@@ -2599,6 +2667,10 @@ public:
                     (image_properties.sampleCounts & d3d12_multisample_sample_counts)) {
                     s1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
                           D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+                    if ((optimal & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) && !fmt.typeless &&
+                        fmt.aspects == VK_IMAGE_ASPECT_COLOR_BIT && leonida::gfx10::format_from_vulkan(vk_fmt) &&
+                        state_.bindless && state_.bindless->supports_ms_class(DeviceState::numeric_class(vk_fmt)))
+                        s1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
                 }
             }
             if (optimal & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) {
@@ -2793,8 +2865,10 @@ private:
         leonida::gfx10::Image image{};
         if (!image_descriptor(resource, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
+        const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
+                                                  resource.aspects(), storage);
+        if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(), storage);
     }
 
     // GetAdapterLuid's answer, and how queues read the clocks: calibrated timestamps when the caller enabled the
