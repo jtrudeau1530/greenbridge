@@ -76,7 +76,8 @@ struct Totals {
     unsigned matched = 0, mismatched = 0, host_refused = 0, ours_refused = 0;
 };
 
-Totals compare_heaps(ID3D12Device* ours, ID3D12Device* host, const char* host_name, const std::vector<HeapCase>& cases) {
+Totals compare_heaps(ID3D12Device* ours, ID3D12Device* host, const char* host_name,
+                     const std::vector<HeapCase>& cases) {
     Totals totals;
     for (const HeapCase& c : cases) {
         D3D12_HEAP_PROPERTIES heap{};
@@ -87,12 +88,14 @@ Totals compare_heaps(ID3D12Device* ours, ID3D12Device* host, const char* host_na
                                             : c.type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
                                                                                  : D3D12_RESOURCE_STATE_GENERIC_READ;
         Ref<ID3D12Resource> expected, actual;
-        if (FAILED(host->CreateCommittedResource(&heap, c.flags, &c.desc, state, nullptr, IID_PPV_ARGS(&expected.p))) ||
+        if (FAILED(host->CreateCommittedResource(&heap, c.flags, &c.desc, state, nullptr,
+                                                 IID_PPV_ARGS(&expected.p))) ||
             !expected.p) {
             ++totals.host_refused;
             continue;
         }
-        const HRESULT hr = ours->CreateCommittedResource(&heap, c.flags, &c.desc, state, nullptr, IID_PPV_ARGS(&actual.p));
+        const HRESULT hr =
+            ours->CreateCommittedResource(&heap, c.flags, &c.desc, state, nullptr, IID_PPV_ARGS(&actual.p));
         if (FAILED(hr) || !actual.p) {
             std::fprintf(stderr, "%s: not created by the layer (0x%08lx), not compared with %s\n", c.name,
                          static_cast<unsigned long>(hr), host_name);
@@ -106,6 +109,7 @@ Totals compare_heaps(ID3D12Device* ours, ID3D12Device* host, const char* host_na
         }
         ++totals.mismatched;
         std::fprintf(stderr, "%s: GetHeapProperties differs from %s\n", c.name, host_name);
+        std::fprintf(stderr, "  asked  masks %u/%u flags 0x%x\n", c.creation_mask, c.visible_mask, unsigned(c.flags));
         print("ours", a);
         print("host", e);
     }
@@ -170,7 +174,11 @@ int main() {
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
 
         constexpr auto none = D3D12_RESOURCE_FLAG_NONE, target = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                       depth = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                       depth = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                       uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        constexpr auto default_heap = D3D12_HEAP_TYPE_DEFAULT;
+        constexpr auto no_flags = D3D12_HEAP_FLAG_NONE;
+        constexpr auto shader_visible = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         constexpr auto rgba8 = DXGI_FORMAT_R8G8B8A8_UNORM;
         const D3D12_RESOURCE_DESC buf = buffer(256), buf_uav = [&] {
             D3D12_RESOURCE_DESC d = buffer(256);
@@ -181,28 +189,24 @@ int main() {
         std::vector<HeapCase> heaps;
         const std::pair<UINT, UINT> masks[] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
         for (const auto& [creation, visible] : masks) {
-            heaps.push_back({"default buffer", buf, D3D12_HEAP_TYPE_DEFAULT, creation, visible, D3D12_HEAP_FLAG_NONE});
-            heaps.push_back({"upload buffer", buf, D3D12_HEAP_TYPE_UPLOAD, creation, visible, D3D12_HEAP_FLAG_NONE});
-            heaps.push_back(
-                {"readback buffer", buf, D3D12_HEAP_TYPE_READBACK, creation, visible, D3D12_HEAP_FLAG_NONE});
+            heaps.push_back({"default buffer", buf, default_heap, creation, visible, no_flags});
+            heaps.push_back({"upload buffer", buf, D3D12_HEAP_TYPE_UPLOAD, creation, visible, no_flags});
+            heaps.push_back({"readback buffer", buf, D3D12_HEAP_TYPE_READBACK, creation, visible, no_flags});
         }
-        // Resolved heap flags by resource class, and a caller's flag kept beside them.
-        heaps.push_back({"default buffer, UAV", buf_uav, D3D12_HEAP_TYPE_DEFAULT, 1, 1, D3D12_HEAP_FLAG_NONE});
-        heaps.push_back({"default buffer, not zeroed", buf, D3D12_HEAP_TYPE_DEFAULT, 1, 1,
-                         D3D12_HEAP_FLAG_CREATE_NOT_ZEROED});
-        heaps.push_back({"default 2D, sampled", texture(none, rgba8), D3D12_HEAP_TYPE_DEFAULT, 1, 1, D3D12_HEAP_FLAG_NONE});
-        heaps.push_back({"default 2D, UAV", texture(uav, rgba8), D3D12_HEAP_TYPE_DEFAULT, 1, 1, D3D12_HEAP_FLAG_NONE});
-        heaps.push_back({"default 2D, render target", texture(target, rgba8), D3D12_HEAP_TYPE_DEFAULT, 1, 1,
-                         D3D12_HEAP_FLAG_NONE});
-        heaps.push_back({"default 2D, depth", texture(depth, DXGI_FORMAT_D32_FLOAT), D3D12_HEAP_TYPE_DEFAULT, 1, 1,
-                         D3D12_HEAP_FLAG_NONE});
+        // Resolved heap flags by resource class; the creation-only CREATE_NOT_ZEROED is not reported back.
+        heaps.push_back({"default buffer, UAV", buf_uav, default_heap, 1, 1, no_flags});
+        heaps.push_back({"default buffer, not zeroed", buf, default_heap, 1, 1, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED});
+        heaps.push_back({"default 2D, sampled", texture(none, rgba8), default_heap, 1, 1, no_flags});
+        heaps.push_back({"default 2D, UAV", texture(uav, rgba8), default_heap, 1, 1, no_flags});
+        heaps.push_back({"default 2D, render target", texture(target, rgba8), default_heap, 1, 1, no_flags});
+        heaps.push_back({"default 2D, depth", texture(depth, DXGI_FORMAT_D32_FLOAT), default_heap, 1, 1, no_flags});
 
         std::vector<DescriptorCase> descriptors;
         for (const UINT mask : {0u, 1u}) {
-            descriptors.push_back({"CBV/SRV/UAV, shader visible",
-                                   {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, mask}});
-            descriptors.push_back({"sampler, shader visible",
-                                   {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, mask}});
+            descriptors.push_back(
+                {"CBV/SRV/UAV, shader visible", {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, shader_visible, mask}});
+            descriptors.push_back(
+                {"sampler, shader visible", {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 8, shader_visible, mask}});
             descriptors.push_back({"RTV", {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, mask}});
             descriptors.push_back({"DSV", {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, mask}});
         }
@@ -220,12 +224,12 @@ int main() {
             const char* name = warp ? "WARP" : "the default adapter";
             const Totals heap_totals = compare_heaps(ours.p, host.p, name, heaps);
             const Totals desc_totals = compare_descriptor_heaps(ours.p, host.p, name, descriptors);
-            std::printf("heap properties against %s: %u of %zu match, %u differ, %u refused by the host, %u not created "
-                        "by the layer\n",
+            std::printf("heap properties against %s: %u of %zu match, %u differ, %u refused by the host, %u not "
+                        "created by the layer\n",
                         name, heap_totals.matched, heaps.size(), heap_totals.mismatched, heap_totals.host_refused,
                         heap_totals.ours_refused);
-            std::printf("descriptor heap GetDesc against %s: %u of %zu match, %u differ, %u refused by the host, %u not "
-                        "created by the layer\n",
+            std::printf("descriptor heap GetDesc against %s: %u of %zu match, %u differ, %u refused by the host, "
+                        "%u not created by the layer\n",
                         name, desc_totals.matched, descriptors.size(), desc_totals.mismatched, desc_totals.host_refused,
                         desc_totals.ours_refused);
             matched += heap_totals.matched + desc_totals.matched;
