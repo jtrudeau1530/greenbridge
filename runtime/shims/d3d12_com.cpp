@@ -589,6 +589,11 @@ public:
         cmd.argument_offset = argument_buffer_offset;
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
+        if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
+            if (!compute_pipeline_ || !compute_.layout) return check(false);
+            cmd.pipeline = compute_pipeline_;
+            cmd.user_data = compute_.data;
+        }
         check(list_.execute_indirect(cmd));
     }
 
@@ -1249,7 +1254,8 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
     if (!command_allocator || command_allocator->type() != type) return E_INVALIDARG;
     // A list is created open, so the allocator must be free: E_INVALIDARG as on the PC runtime (D3D-51).
     if (command_allocator->recording()) return E_INVALIDARG;
-    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE)
+    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
+        type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY)
         stub("create_command_list(non-direct type)");
     auto* object = new GraphicsCommandList(type);  // created open, as D3D12 does
     object->record_into(command_allocator);

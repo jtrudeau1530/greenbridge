@@ -565,6 +565,11 @@ struct ExecuteIndirect {
     std::uint64_t argument_offset = 0;
     ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
     std::uint64_t count_offset = 0;
+    // kind == dispatch: the compute pipeline and root arguments in effect, as Dispatch records them, so the dispatches
+    // run that pipeline with those arguments whatever the command buffer had bound. A pipeline of 0 leaves the binding
+    // as it is.
+    std::uintptr_t pipeline = 0;
+    std::array<std::uint32_t, 32> user_data{};
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).

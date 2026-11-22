@@ -2228,6 +2228,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect))
                     return ReplayResult::unsupported;
             }
+            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
+                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
+                const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
+                if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+                p.pipeline = *pipeline;
+            }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             if (vk.xdxr_check) {
                 if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
@@ -2949,6 +2956,18 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 } else if (ind->kind == IndirectKind::draw_indexed) {
                     vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
                 } else if (ind->kind == IndirectKind::dispatch) {
+                    if (ind->pipeline) {
+                        ShaderUserData data{};
+                        std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                        data.heap_base = vk.heap_base;
+                        data.code_base = p.pipeline.code_base;
+                        vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+                        if (p.pipeline.bindless_set)
+                            vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
+                                                    1, &p.pipeline.bindless_set, 0, nullptr);
+                        vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
+                                          &data);
+                    }
                     for (std::uint32_t k = 0; k < ind->max_count; ++k) {
                         vk.dispatch_indirect(command_buffer, p.binding.buffer,
                                              arguments + VkDeviceSize(k) * ind->stride);

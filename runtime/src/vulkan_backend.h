@@ -814,6 +814,15 @@ public:
         }
     }
 
+    // An image that got a storage (unordered-access) view. A shader can write it before any command names it, so the
+    // layer would not know it was used and the first barrier or copy that does would zero-fill it (vulkan_replay.h,
+    // initialize). The next submission therefore moves each such image to GENERAL, the layout its descriptor names,
+    // zero-filled, ahead of its lists. An image already tracked beyond UNDEFINED is left as it is.
+    void note_storage_image(ResourceId id) {
+        std::lock_guard lock(storage_mutex_);
+        storage_pending_.push_back(id);
+    }
+
     void remove_resource(ResourceId id) {
         VkImage img = VK_NULL_HANDLE;
         {
@@ -1115,6 +1124,8 @@ private:
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
+    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ only
+    std::vector<ResourceId> storage_pending_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
@@ -1420,6 +1431,18 @@ public:
             return ReplayResult::unsupported;
         }
         auto next_tracker = context_.tracker_;
+        std::vector<ResourceId> storage_images;
+        {
+            std::lock_guard lock(context_.storage_mutex_);
+            storage_images.swap(context_.storage_pending_);
+        }
+        for (const ResourceId id : storage_images) {
+            const ResourceBinding* image = context_.resolve(id);
+            if (!image || !image->image) continue;
+            const VkImageSubresourceRange range{image->aspects, 0, image->mip_levels, 0, image->array_layers};
+            auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
+            detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
+        }
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
@@ -1462,6 +1485,11 @@ public:
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+        if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
+            std::lock_guard lock(context_.storage_mutex_);
+            context_.storage_pending_.insert(context_.storage_pending_.end(), storage_images.begin(),
+                                             storage_images.end());
+        }
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);

@@ -58,8 +58,8 @@ def asm_mattr(path):
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
-def asm_fssm(path):
-    """The synthetic FSSM program a vs_/ps_ shader's header asks for, or None."""
+def asm_fssm_fields(path):
+    """(offset, words) of the "fssm-at" and "fssm-data" header comments, (None, []) without them."""
     at, words = None, []
     for ln in Path(path).read_text(encoding="utf-8").splitlines():
         s = ln.strip()
@@ -71,9 +71,25 @@ def asm_fssm(path):
         m = re.match(r";\s*fssm-data:\s*(.*)", s)
         if m:
             words += [int(w, 0) for w in m.group(1).split()]
+    return at, words
+
+
+def asm_fssm(path):
+    """The synthetic FSSM program a vs_/ps_ shader's header asks for, or None."""
+    at, words = asm_fssm_fields(path)
     if at is None or not words or at < 4 or at % 4:
         return None
     return b"FSSM" + bytes(at - 4) + b"".join(struct.pack("<I", w) for w in words)
+
+
+def cs_fssm_extra(path):
+    """A compute shader's "fssm-at"/"fssm-data" words (at 0x148 or later, after compute_header's header), or None.
+    Two compute shaders with the same group size and RSRC2 would otherwise share one FSSM hash, which is what the
+    layer finds a PSO's shader by."""
+    at, words = asm_fssm_fields(path)
+    if at is None or not words or at < 0x148 or at % 4:
+        return None
+    return at, b"".join(struct.pack("<I", w) for w in words)
 
 
 def shader_source(name):
@@ -113,7 +129,11 @@ def translate_tests(work, names):
         if program:   # where the translator looks for a program to hash, as in the game's work folder
             (fssm / (n + ".fssm")).write_bytes(program)
         if n.startswith("cs_"):
-            (fssm / (n + ".fssm")).write_bytes(compute_header(asm_path))
+            program = bytes(compute_header(asm_path))
+            extra = cs_fssm_extra(asm_path)
+            if extra:
+                program += bytes(extra[0] - len(program)) + extra[1]
+            (fssm / (n + ".fssm")).write_bytes(program)
         elif n in CLIP_CASES and n != "vs_clip_undeclared":
             (work / (n + ".dxbc")).write_bytes(clip_container())
         else:
@@ -135,6 +155,10 @@ def translate_tests(work, names):
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
+    # The CMake test targets name the spirv-as/spirv-val folder here instead of passing a whole PATH, which the Visual
+    # Studio generator's command line can't carry intact (a PATH entry ending in a backslash escapes the next quote).
+    if os.environ.get("LEONIDA_SPIRV_TOOLS"):
+        os.environ["PATH"] = os.environ["LEONIDA_SPIRV_TOOLS"] + os.pathsep + os.environ.get("PATH", "")
     out = Path(sys.argv[1])
     available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available
@@ -170,7 +194,8 @@ def main():
                 artifact = built / (n + suffix)
                 artifact.replace(spirv / artifact.name)
             sidecar = work / "fssm" / (n + ".fssm")
-            if not n.startswith("cs_") and sidecar.is_file():
+            published = not n.startswith("cs_") or cs_fssm_extra(os.path.join(HERE, n + ".asm"))
+            if published and sidecar.is_file():
                 (out / "fssm").mkdir(exist_ok=True)
                 sidecar.replace(out / "fssm" / sidecar.name)
         index.replace(published_index)

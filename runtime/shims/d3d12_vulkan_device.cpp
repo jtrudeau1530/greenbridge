@@ -3802,6 +3802,49 @@ public:
         write_image_descriptor(*r, view, destination, false);
     }
 
+    // An unordered-access view of a buffer is a V# in the slot (docs section 3.4): the shader loads those four dwords
+    // through its descriptor table and reaches the bytes by the console VA in them. A structured view (format
+    // UNKNOWN and a stride) is `stride` and a record count, a raw one (R32_TYPELESS with the RAW flag) is a byte count;
+    // typed buffer views are not written. A slot left as zeros is a null descriptor.
+    void write_buffer_uav(ID3D12Resource* resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+                          D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        const D3D12_RESOURCE_DESC& rd = Resource::from<Resource>(resource)->desc();
+        if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            log_once("unordered-access view of a buffer created without ALLOW_UNORDERED_ACCESS; flags", int(rd.Flags));
+            return;
+        }
+        if (!desc || desc->ViewDimension != D3D12_UAV_DIMENSION_BUFFER) {
+            log_once("unordered-access view of a buffer needs a buffer view description; dimension",
+                     desc ? int(desc->ViewDimension) : -1);
+            return;
+        }
+        const D3D12_BUFFER_UAV& view = desc->Buffer;
+        const bool structured = desc->Format == DXGI_FORMAT_UNKNOWN;
+        const bool raw = desc->Format == DXGI_FORMAT_R32_TYPELESS && (view.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
+        if (!structured && !raw) {
+            log_once("typed buffer unordered-access views not supported; format", int(desc->Format));
+            return;
+        }
+        const UINT64 unit = structured ? view.StructureByteStride : 4;
+        if (!unit || unit > 0x3fff || view.CounterOffsetInBytes ||
+            (UINT64(view.FirstElement) + view.NumElements) * unit > rd.Width ||
+            UINT64(view.NumElements) * (structured ? 1 : 4) > ~0u) {
+            log_once("unordered-access view of a buffer outside the resource or with a bad stride; elements",
+                     int(view.NumElements));
+            return;
+        }
+        const UINT64 va = resource->GetGPUVirtualAddress();
+        if (!va) return;
+        leonida::gfx10::Buffer buffer{};
+        buffer.address = va + view.FirstElement * unit;
+        buffer.stride = structured ? std::uint32_t(unit) : 0;
+        buffer.num_records = std::uint32_t(structured ? view.NumElements : UINT64(view.NumElements) * 4);
+        buffer.oob_select = structured ? leonida::gfx10::OobSelect::structured_with_offset
+                                       : leonida::gfx10::OobSelect::raw;
+        const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+    }
+
     // An unordered-access view of a texture is a T# too, of one mip; set 0 also holds it as a storage image.
     void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter,
                                                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
@@ -3814,7 +3857,8 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image() || counter) return stub("ID3D12Device::CreateUnorderedAccessView(buffer)");
+        if (counter) return stub("ID3D12Device::CreateUnorderedAccessView(counter)");
+        if (!r->image()) return write_buffer_uav(resource, desc, destination);
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
@@ -3845,6 +3889,7 @@ public:
             }
         }
         write_image_descriptor(*r, view, destination, true);
+        state_.context->note_storage_image(r->id());
     }
 
     // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
