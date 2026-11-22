@@ -630,13 +630,21 @@ def main() -> int:
         clean = check_report(rows)
     print_summary(summary, agg)
     if args.csv:
-        write_csv(args.csv, rows)
+        try:
+            write_csv(args.csv, rows)
+        except OSError as exc:
+            print(f"ERROR: cannot write {args.csv}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
         print("wrote", args.csv)
     if args.json:
         public_rows = [{key: value for key, value in row.items() if key != "_scan"} for row in rows]
-        _make_parent(args.json)
-        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
+        try:
+            _make_parent(args.json)
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
+        except OSError as exc:
+            print(f"ERROR: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
         print("wrote", args.json)
     return 0 if clean else 1
 

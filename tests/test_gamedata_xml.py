@@ -244,6 +244,17 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertTrue(tail["truncated"])
         self.assertFalse(tail["malformed"])
 
+    def test_unwritable_csv_or_json_is_one_error_line(self):
+        doc = self.write("alpha.xml", ALPHA)
+        blocker = self.write("blocker", b"x")
+        for flag, name in (("--csv", "out.csv"), ("--json", "out.json")):
+            with self.subTest(flag=flag):
+                out = os.path.join(blocker, name)
+                p = self.run_tool(doc, flag, out)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("ERROR: cannot write", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
