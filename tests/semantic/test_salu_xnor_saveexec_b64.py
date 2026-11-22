@@ -32,6 +32,8 @@ Standard library only: Python 3.9+ compatible, zero game data, zero external dep
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import os
 import random
 import struct
@@ -90,6 +92,152 @@ def oracle_s_xnor_saveexec_b64(src0: int, exec_current: int) -> Tuple[int, int, 
     new_exec = ref_xnor64(src0, exec_current)
     scc = ref_scc(new_exec)
     return saved_exec, new_exec, scc
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    """Register file domain for RDNA2 ISA."""
+    SGPR = auto()
+    VGPR = auto()
+    SPECIAL = auto()
+
+
+class SpecialReg(Enum):
+    """Architectural special registers relevant to SALU execution."""
+    EXEC = auto()
+    VCC = auto()
+    SCC = auto()
+    NULL = auto()
+
+
+@dataclass(frozen=True)
+class RegPair:
+    """Represents a 64-bit aligned register pair, e.g. s[4:5] or v[0:1]."""
+    index: int
+    reg_type: RegType = RegType.SGPR
+
+    def __post_init__(self) -> None:
+        if self.reg_type not in (RegType.SGPR, RegType.VGPR):
+            raise ValueError(f"Invalid reg_type: {self.reg_type}")
+        if self.index < 0:
+            raise ValueError(f"Register index must be non-negative, got {self.index}")
+        if self.index % 2 != 0:
+            raise ValueError(f"64-bit register pair must be even-aligned, got {self.index}")
+
+    @property
+    def lo_reg(self) -> int:
+        return self.index
+
+    @property
+    def hi_reg(self) -> int:
+        return self.index + 1
+
+    @property
+    def name(self) -> str:
+        prefix = "s" if self.reg_type == RegType.SGPR else "v"
+        return f"{prefix}[{self.index}:{self.index + 1}]"
+
+
+@dataclass(frozen=True)
+class SpecialRegOperand:
+    """Represents an architectural special register operand like exec or vcc."""
+    reg: SpecialReg
+
+    @property
+    def name(self) -> str:
+        return self.reg.name.lower()
+
+
+@dataclass(frozen=True)
+class Literal64:
+    """Represents a 64-bit constant literal scalar operand."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= MASK64):
+            raise ValueError(f"Literal64 out of 64-bit unsigned bounds: {self.bits}")
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.bits:016x}"
+
+
+@dataclass(frozen=True)
+class SALUSourceOperand:
+    """Typed source operand for scalar arithmetic instructions."""
+    source: Union[RegPair, SpecialRegOperand, Literal64]
+
+    def disassemble(self) -> str:
+        return self.source.name
+
+
+@dataclass(frozen=True)
+class SXnorSaveexecB64Instruction:
+    """Symbolic AST node representing the s_xnor_saveexec_b64 instruction."""
+    dst: Union[RegPair, SpecialRegOperand]
+    src0: SALUSourceOperand
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dst, RegPair):
+            if self.dst.reg_type != RegType.SGPR:
+                raise TypeError(f"SALU destination must be SGPR pair, got {self.dst.reg_type}")
+        elif isinstance(self.dst, SpecialRegOperand):
+            if self.dst.reg not in (SpecialReg.EXEC, SpecialReg.VCC):
+                raise TypeError(f"Invalid special register destination: {self.dst.reg}")
+        else:
+            raise TypeError(f"Unsupported destination operand type: {type(self.dst)}")
+
+    def disassemble(self) -> str:
+        dst_str = self.dst.name if hasattr(self.dst, "name") else str(self.dst)
+        return f"s_xnor_saveexec_b64 {dst_str}, {self.src0.disassemble()}"
+
+
+def parse_salu_instruction(line: str) -> SXnorSaveexecB64Instruction:
+    """Parse a single assembly line into an SXnorSaveexecB64Instruction AST node."""
+    line = line.strip()
+    if not line.startswith("s_xnor_saveexec_b64"):
+        raise ValueError(f"Not an s_xnor_saveexec_b64 instruction: {line}")
+    payload = line[len("s_xnor_saveexec_b64"):].strip()
+    parts = [p.strip() for p in payload.split(",")]
+    if len(parts) != 2:
+        raise ValueError(f"Expected 2 operands (dst, src0), got: {line}")
+    dst_part, src0_part = parts
+
+    # Parse destination
+    if dst_part.lower() == "exec":
+        dst: Union[RegPair, SpecialRegOperand] = SpecialRegOperand(SpecialReg.EXEC)
+    elif dst_part.lower() == "vcc":
+        dst = SpecialRegOperand(SpecialReg.VCC)
+    elif dst_part.startswith("s[") and dst_part.endswith("]"):
+        idx_str = dst_part[2:-1]
+        lo, hi = map(int, idx_str.split(":"))
+        if hi != lo + 1:
+            raise ValueError(f"Invalid 64-bit pair range: {dst_part}")
+        dst = RegPair(index=lo, reg_type=RegType.SGPR)
+    else:
+        raise ValueError(f"Unrecognized destination operand: {dst_part}")
+
+    # Parse src0
+    if src0_part.lower() == "exec":
+        src_op = SALUSourceOperand(SpecialRegOperand(SpecialReg.EXEC))
+    elif src0_part.lower() == "vcc":
+        src_op = SALUSourceOperand(SpecialRegOperand(SpecialReg.VCC))
+    elif src0_part.startswith("s[") and src0_part.endswith("]"):
+        idx_str = src0_part[2:-1]
+        lo, hi = map(int, idx_str.split(":"))
+        if hi != lo + 1:
+            raise ValueError(f"Invalid 64-bit pair range: {src0_part}")
+        src_op = SALUSourceOperand(RegPair(index=lo, reg_type=RegType.SGPR))
+    elif src0_part.startswith("0x") or src0_part.isdigit() or (src0_part.startswith("-") and src0_part[1:].isdigit()):
+        val = int(src0_part, 0) & MASK64
+        src_op = SALUSourceOperand(Literal64(bits=val))
+    else:
+        raise ValueError(f"Unrecognized src0 operand: {src0_part}")
+
+    return SXnorSaveexecB64Instruction(dst=dst, src0=src_op)
 
 
 class TestSXnorSaveexecB64ModelAndOracle(unittest.TestCase):
@@ -201,6 +349,86 @@ class TestSXnorSaveexecB64ModelAndOracle(unittest.TestCase):
             expected_new = (~(src ^ curr)) & MASK64
             self.assertEqual(new_exec, expected_new)
             self.assertEqual(scc, 1 if expected_new != 0 else 0)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Symbolic AST opcode definitions, expression typing, and parser tests."""
+
+    def test_ast_construction_sgpr_operands(self) -> None:
+        """Construct AST node with SGPR pair operands."""
+        dst = RegPair(index=4, reg_type=RegType.SGPR)
+        src0 = SALUSourceOperand(RegPair(index=2, reg_type=RegType.SGPR))
+        instr = SXnorSaveexecB64Instruction(dst=dst, src0=src0)
+        self.assertEqual(instr.dst, dst)
+        self.assertEqual(instr.src0, src0)
+        self.assertEqual(instr.disassemble(), "s_xnor_saveexec_b64 s[4:5], s[2:3]")
+
+    def test_ast_construction_literal_operand(self) -> None:
+        """Construct AST node with a 64-bit literal constant."""
+        dst = RegPair(index=0, reg_type=RegType.SGPR)
+        lit = Literal64(bits=0x123456789ABCDEF0)
+        instr = SXnorSaveexecB64Instruction(dst=dst, src0=SALUSourceOperand(lit))
+        self.assertEqual(instr.disassemble(), "s_xnor_saveexec_b64 s[0:1], 0x123456789abcdef0")
+
+    def test_ast_construction_special_registers(self) -> None:
+        """Construct AST node using special registers exec and vcc."""
+        dst = SpecialRegOperand(SpecialReg.EXEC)
+        src = SALUSourceOperand(SpecialRegOperand(SpecialReg.EXEC))
+        instr = SXnorSaveexecB64Instruction(dst=dst, src0=src)
+        self.assertEqual(instr.disassemble(), "s_xnor_saveexec_b64 exec, exec")
+
+    def test_ast_immutability(self) -> None:
+        """Ensure AST nodes are immutable frozen dataclasses."""
+        dst = RegPair(index=8, reg_type=RegType.SGPR)
+        src = SALUSourceOperand(RegPair(index=6, reg_type=RegType.SGPR))
+        instr = SXnorSaveexecB64Instruction(dst=dst, src0=src)
+        with self.assertRaises(Exception):
+            instr.dst = RegPair(index=10, reg_type=RegType.SGPR)  # type: ignore
+
+    def test_regpair_alignment_enforcement(self) -> None:
+        """Verify that odd SGPR indices are rejected for 64-bit register pairs."""
+        with self.assertRaises(ValueError):
+            RegPair(index=1, reg_type=RegType.SGPR)
+        with self.assertRaises(ValueError):
+            RegPair(index=3, reg_type=RegType.SGPR)
+        p = RegPair(index=2, reg_type=RegType.SGPR)
+        self.assertEqual(p.lo_reg, 2)
+        self.assertEqual(p.hi_reg, 3)
+
+    def test_invalid_destination_rejection(self) -> None:
+        """Verify that non-SGPR destinations raise TypeError."""
+        vgpr_dst = RegPair(index=0, reg_type=RegType.VGPR)
+        src = SALUSourceOperand(RegPair(index=2, reg_type=RegType.SGPR))
+        with self.assertRaises(TypeError):
+            SXnorSaveexecB64Instruction(dst=vgpr_dst, src0=src)
+
+    def test_parser_roundtrip(self) -> None:
+        """Verify that assembly parser parses and disassembles correctly."""
+        lines = [
+            "s_xnor_saveexec_b64 s[4:5], s[2:3]",
+            "s_xnor_saveexec_b64 s[0:1], exec",
+            "s_xnor_saveexec_b64 exec, s[8:9]",
+            "s_xnor_saveexec_b64 s[10:11], 0x0000000000000000",
+            "s_xnor_saveexec_b64 s[12:13], 0xffffffffffffffff",
+        ]
+        for line in lines:
+            with self.subTest(line=line):
+                ast_node = parse_salu_instruction(line)
+                self.assertEqual(ast_node.disassemble(), line)
+
+    def test_parser_syntax_errors(self) -> None:
+        """Verify parser rejections on malformed instructions."""
+        bad_lines = [
+            "v_add_f64 s[4:5], s[2:3]",
+            "s_xnor_saveexec_b64 s[4:5]",
+            "s_xnor_saveexec_b64 s[1:2], s[2:3]",
+            "s_xnor_saveexec_b64 s[4:5], s[2:3], s[0:1]",
+            "s_xnor_saveexec_b64 s[4:6], s[2:3]",
+        ]
+        for bad in bad_lines:
+            with self.subTest(bad=bad):
+                with self.assertRaises((ValueError, TypeError)):
+                    parse_salu_instruction(bad)
 
 
 if __name__ == "__main__":
