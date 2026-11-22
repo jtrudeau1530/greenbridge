@@ -118,12 +118,7 @@ int main() {
     for (const auto& c : cases) {
         for (const VkFormat format : {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_SFLOAT}) {
             for (const bool rect : {false, true}) {
-                auto expected = c;
-                // D3D12 rounds a UNORM tie up (0.5 is code 128 of 255); NVIDIA rounds it down, so the layer clears with the code above.
-                if (format == VK_FORMAT_R8G8B8A8_UNORM)
-                    for (auto& v : expected)
-                        if (v == 0.5f) v = 128.0f / 255.0f;
-                if (!replay_color(format, c, rect) || std::memcmp(captured.float32, expected.data(), sizeof(captured)) != 0) {
+                if (!replay_color(format, c, rect) || std::memcmp(captured.float32, c.data(), sizeof(captured)) != 0) {
                     std::fprintf(stderr, "float clear: format %d rect %d changed the value\n", int(format), int(rect));
                     return 1;
                 }

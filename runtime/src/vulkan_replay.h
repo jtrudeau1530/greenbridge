@@ -38,7 +38,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -887,28 +886,8 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     default: is_integer = false; break;
     }
     if (format != VK_FORMAT_A2B10G10R10_UINT_PACK32) alpha_high = high;
-    // UNORM targets: D3D12 converts a float to the nearest code with a tie going up (0.5 * 255 = 127.5 is 0x80).
-    // Vulkan leaves the tie to the GPU and NVIDIA rounds it down (0x7f), and a float one ulp above is not enough.
-    // An exact tie becomes the code above it divided by the maximum; every other value goes through untouched.
-    double unorm_max = 0;
-    switch (format) {
-    case VK_FORMAT_R8_UNORM:
-    case VK_FORMAT_R8G8_UNORM:
-    case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_B8G8R8A8_UNORM: unorm_max = 255; break;
-    case VK_FORMAT_R16_UNORM:
-    case VK_FORMAT_R16G16_UNORM:
-    case VK_FORMAT_R16G16B16A16_UNORM: unorm_max = 65535; break;
-    default: break;
-    }
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
-        if (unorm_max != 0) {
-            const double scaled = double(input[i]) * unorm_max;  // exact: 24 + 16 bits fit a double
-            const bool tie = input[i] > 0.0f && input[i] < 1.0f && scaled - std::floor(scaled) == 0.5;
-            value.float32[i] = tie ? float(std::ceil(scaled) / unorm_max) : input[i];
-            continue;
-        }
         if (!is_integer) {
             value.float32[i] = input[i];
             continue;

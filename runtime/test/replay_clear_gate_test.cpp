@@ -110,19 +110,6 @@ int main() {
     expect(run(rect_color, not_zeroed, vk, &fresh) == ReplayResult::success && clears == 0,
            "not_zeroed image: no zero-clear needed");
 
-    // D3D12 rounds a UNORM clear's tie up (0.5 * 255 = 127.5 is 0x80); NVIDIA rounds it down. The layer hands
-    // Vulkan the code above an exact tie (code / max) and leaves every other value alone.
-    {
-        const float half = 0.5f;
-        const auto c = leonida::detail::render_target_clear_color(VK_FORMAT_R8G8B8A8_UNORM, {half, 0.25f, 2.5f, 1.0f});
-        expect(c.float32[0] == 128.0f / 255.0f && c.float32[1] == 0.25f && c.float32[2] == 2.5f && c.float32[3] == 1.0f,
-               "RGBA8_UNORM clear: 0.5 moves above the tie, the rest is untouched");
-        const auto w = leonida::detail::render_target_clear_color(VK_FORMAT_R16_UNORM, {half, 0, 0, 0});
-        expect(w.float32[0] == 32768.0f / 65535.0f, "R16_UNORM clear: 0.5 is a tie too (32767.5)");
-        const auto f = leonida::detail::render_target_clear_color(VK_FORMAT_R32_SFLOAT, {half, 0, 0, 0});
-        expect(f.float32[0] == half, "float formats keep 0.5");
-    }
-
     if (failures) return 1;
     std::printf("replay_clear_gate_test: whole-view and implicit zero-clears refused without their function\n");
     return 0;
