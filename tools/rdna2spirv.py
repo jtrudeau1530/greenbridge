@@ -9588,7 +9588,13 @@ def main():
         write_index(os.path.join(a.out, "index.json"), merged)
         print(f"merged {len(merged)} entries")
         return 0
-    files = [a.src] if a.src.endswith(".s") else sorted(os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".s"))
+    if os.path.isfile(a.src) and a.src.endswith(".s"):
+        files = [a.src]
+    elif os.path.isdir(a.src):
+        with os.scandir(a.src) as entries:
+            files = sorted(e.path for e in entries if e.name.endswith(".s") and e.is_file())
+    else:
+        ap.error(f"{a.src} is not a .s file or a folder of .s files")
     files = files[: a.limit] if a.limit is not None else files
     shard = None
     if a.shard:
