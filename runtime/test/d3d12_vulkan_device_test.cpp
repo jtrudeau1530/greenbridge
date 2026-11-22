@@ -1645,8 +1645,11 @@ bool software_vulkan_device(const vktest::Device& vk) {
 // or -1 when the host has no D3D12 device.
 int compare_options1(ID3D12Device* ours, const vktest::Device& vk) {
     if (software_vulkan_device(vk)) return -2;
+    // The host device must be the same GPU (matched by LUID, then PCI ids), not the default adapter: on a PC with
+    // an AMD iGPU and an NVIDIA card the default is the NVIDIA, whose 32..32 lanes don't match the AMD's 32..64.
     Ref<ID3D12Device> host;
-    if (!create_host_device(host)) return -1;
+    std::string adapter_name;
+    if (!create_host_device_for_physical(vk.instance, vk.physical, vk.instance_proc, host, adapter_name)) return -1;
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 theirs{};
     if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &theirs, sizeof(theirs)))) return -1;
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 mine{};
