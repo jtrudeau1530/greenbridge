@@ -761,5 +761,100 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(bits_to_f16(interp.reg_file.get_vgpr_half(0, hi=False)), 0.0625)
 
 
+@dataclass
+class StatusFlags:
+    """Architectural floating-point status flags and condition codes with clamp detection."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    clamped_low: bool = False
+    clamped_high: bool = False
+
+
+def compute_f16_mantissa_product_carry(s0_bits: int, s1_bits: int) -> Tuple[int, int]:
+    """Compute product of normalized significands and carry-out bit."""
+    _, exp0, mant0 = split_f16(s0_bits)
+    _, exp1, mant1 = split_f16(s1_bits)
+
+    sig0 = (1024 | mant0) if exp0 > 0 else mant0
+    sig1 = (1024 | mant1) if exp1 > 0 else mant1
+
+    raw_prod = sig0 * sig1
+    carry = 1 if raw_prod >= (1 << 21) else 0
+    return raw_prod, carry
+
+
+def evaluate_v_mul_clamp_f16_flags(s0_bits: int, s1_bits: int, res_bits: int) -> StatusFlags:
+    """Evaluate condition codes and status flags for v_mul_clamp_f16."""
+    flags = StatusFlags()
+    s0 = s0_bits & MASK16
+    s1 = s1_bits & MASK16
+    res = res_bits & MASK16
+
+    if is_snan_f16(s0) or is_snan_f16(s1):
+        flags.invalid = True
+    elif (is_zero_f16(s0) and is_inf_f16(s1)) or (is_inf_f16(s0) and is_zero_f16(s1)):
+        flags.invalid = True
+
+    if res == POS_ZERO_F16:
+        flags.zero = True
+        if not (is_zero_f16(s0) or is_zero_f16(s1)):
+            flags.clamped_low = True
+
+    if res == POS_ONE_F16:
+        flags.clamped_high = True
+
+    if (res >> 15) & 1:
+        flags.negative = True
+
+    if is_subnormal_f16(s0) or is_subnormal_f16(s1) or is_subnormal_f16(res):
+        flags.denormal = True
+
+    return flags
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and mantissa product carry."""
+
+    def test_exact_in_range_flags(self) -> None:
+        s0 = f16_to_bits(0.5)
+        s1 = f16_to_bits(0.5)
+        res = ref_mul_clamp_f16(s0, s1)
+        flags = evaluate_v_mul_clamp_f16_flags(s0, s1, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.clamped_low)
+        self.assertFalse(flags.clamped_high)
+
+    def test_clamp_low_flags(self) -> None:
+        s0 = f16_to_bits(-2.0)
+        s1 = f16_to_bits(3.0)
+        res = ref_mul_clamp_f16(s0, s1)
+        self.assertEqual(res, POS_ZERO_F16)
+        flags = evaluate_v_mul_clamp_f16_flags(s0, s1, res)
+        self.assertTrue(flags.zero)
+        self.assertTrue(flags.clamped_low)
+        self.assertFalse(flags.negative)
+
+    def test_clamp_high_flags(self) -> None:
+        s0 = f16_to_bits(2.0)
+        s1 = f16_to_bits(4.0)
+        res = ref_mul_clamp_f16(s0, s1)
+        self.assertEqual(res, POS_ONE_F16)
+        flags = evaluate_v_mul_clamp_f16_flags(s0, s1, res)
+        self.assertTrue(flags.clamped_high)
+        self.assertFalse(flags.zero)
+
+    def test_mantissa_product_carry(self) -> None:
+        f_1p5 = f16_to_bits(1.5)
+        _, carry1 = compute_f16_mantissa_product_carry(f_1p5, f_1p5)
+        self.assertEqual(carry1, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
