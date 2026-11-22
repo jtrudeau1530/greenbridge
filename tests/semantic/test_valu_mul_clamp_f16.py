@@ -856,5 +856,41 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(carry1, 1)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 edge cases, subnormals, signed zero, and NaN behavior under clamp."""
+
+    def test_subnormal_multiplication_gradual_underflow(self) -> None:
+        # Smallest subnormal in (0.0, 1.0] preserved
+        res = ref_mul_clamp_f16(MIN_SUBNORMAL_F16, POS_ONE_F16)
+        self.assertEqual(res, MIN_SUBNORMAL_F16)
+
+        # Negative subnormal clamps to +0.0
+        neg_sub = MIN_SUBNORMAL_F16 | SIGN_MASK_F16
+        res_neg = ref_mul_clamp_f16(neg_sub, POS_ONE_F16)
+        self.assertEqual(res_neg, POS_ZERO_F16)
+
+    def test_signed_zero_combinations(self) -> None:
+        # All zero products clamp to +0.0 (no negative zero allowed)
+        self.assertEqual(ref_mul_clamp_f16(POS_ZERO_F16, POS_ZERO_F16), POS_ZERO_F16)
+        self.assertEqual(ref_mul_clamp_f16(POS_ZERO_F16, NEG_ZERO_F16), POS_ZERO_F16)
+        self.assertEqual(ref_mul_clamp_f16(NEG_ZERO_F16, NEG_ZERO_F16), POS_ZERO_F16)
+        self.assertEqual(ref_mul_clamp_f16(NEG_ZERO_F16, f16_to_bits(5.0)), POS_ZERO_F16)
+
+    def test_infinity_arithmetic_clamped(self) -> None:
+        # Positive infinities clamp to 1.0
+        self.assertEqual(ref_mul_clamp_f16(POS_INF_F16, POS_INF_F16), POS_ONE_F16)
+        self.assertEqual(ref_mul_clamp_f16(POS_INF_F16, POS_TWO_F16), POS_ONE_F16)
+        # Negative infinities clamp to 0.0
+        self.assertEqual(ref_mul_clamp_f16(POS_INF_F16, NEG_INF_F16), POS_ZERO_F16)
+        self.assertEqual(ref_mul_clamp_f16(NEG_INF_F16, POS_TWO_F16), POS_ZERO_F16)
+
+    def test_nan_clamping_to_positive_zero(self) -> None:
+        # RDNA2 hardware rule: any NaN subjected to clamp saturation becomes +0.0
+        self.assertEqual(ref_mul_clamp_f16(CANONICAL_QNAN_F16, POS_ONE_F16), POS_ZERO_F16)
+        self.assertEqual(ref_mul_clamp_f16(SNAN_F16, POS_TWO_F16), POS_ZERO_F16)
+        self.assertEqual(ref_mul_clamp_f16(POS_ZERO_F16, POS_INF_F16), POS_ZERO_F16)
+        self.assertEqual(ref_mul_clamp_f16(CANONICAL_QNAN_F16, CANONICAL_QNAN_F16), POS_ZERO_F16)
+
+
 if __name__ == "__main__":
     unittest.main()
