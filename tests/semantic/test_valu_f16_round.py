@@ -18,6 +18,8 @@ tools/rdna2spirv.py lowers v_fract_f16 to GLSL.std.450 Fract, which tests/semant
 exactly. A Fract result that rounded up to 1.0 is mapped to 0x3bff (the largest f16 below 1.0); ref_fract_f16 below
 models that fix-up for the end-to-end cases.
 """
+from __future__ import annotations
+
 import itertools
 import math
 import os
@@ -144,6 +146,22 @@ def is_f16_nan(half: int) -> bool:
     return (half & 0x7FFF) > 0x7C00
 
 
+def is_f16_inf(half: int) -> bool:
+    return (half & 0x7FFF) == 0x7C00
+
+
+def is_f16_subnormal(half: int) -> bool:
+    return (half & 0x7C00) == 0 and (half & 0x03FF) != 0
+
+
+def is_f16_zero(half: int) -> bool:
+    return (half & 0x7FFF) == 0
+
+
+f16_to_float = h2f
+float_to_f16 = f2h
+
+
 OPS = {
     "v_floor_f16": ("Floor", ref_floor),
     "v_ceil_f16": ("Ceil", ref_ceil),
@@ -213,6 +231,107 @@ class ReferenceOracleTests(unittest.TestCase):
         self.assertTrue(is_f16_nan(ref_fract(H_POS_INF)))
         self.assertEqual(merge_half(OLD, H_1P0, 0), 0xBEEF3C00)
         self.assertEqual(merge_half(OLD, H_1P0, 1), 0x3C001234)
+
+    def test_exact_integers_identity(self):
+        """Exact integer representations in binary16 are unchanged by all 4 rounding modes."""
+        for i in range(-100, 101):
+            h = f2h(float(i))
+            self.assertEqual(ref_floor(h), h, f"floor({i}) failed")
+            self.assertEqual(ref_ceil(h), h, f"ceil({i}) failed")
+            self.assertEqual(ref_trunc(h), h, f"trunc({i}) failed")
+            self.assertEqual(ref_rndne(h), h, f"rndne({i}) failed")
+
+    def test_exponent_ge_10_no_fractional_bits(self):
+        """Values with magnitude >= 2^10 = 1024 have no fractional bits in binary16 mantissa.
+
+        In IEEE 754 binary16 (5 exponent bits, 10 mantissa bits), when unbiased exponent >= 10,
+        the unit in the last place (ulp) is >= 1.0. Therefore, all representable binary16 numbers
+        with |x| >= 1024 are already exact integers and rounding is guaranteed to be an identity.
+        """
+        large_magnitudes = [
+            1024.0, 1025.0, 1026.0, 1200.0, 1536.0, 2048.0, 4096.0,
+            8192.0, 16384.0, 32768.0, 65504.0,
+        ]
+        for val in large_magnitudes:
+            for sign in (1.0, -1.0):
+                x = sign * val
+                h = f2h(x)
+                self.assertEqual(ref_floor(h), h, f"floor({x}) failed")
+                self.assertEqual(ref_ceil(h), h, f"ceil({x}) failed")
+                self.assertEqual(ref_trunc(h), h, f"trunc({x}) failed")
+                self.assertEqual(ref_rndne(h), h, f"rndne({x}) failed")
+
+    def test_signed_zeros_round_to_integral_rules(self):
+        """IEEE 754-2008 / 2019 roundToIntegral rules for negative fractional numbers and signed zeros.
+
+        Strict rules:
+          - floor(-0.5) = -1.0, floor(-0.0) = -0.0, floor(+0.0) = +0.0
+          - ceil(-0.5)  = -0.0, ceil(-0.0)  = -0.0, ceil(+0.0)  = +0.0
+          - trunc(-0.5) = -0.0, trunc(-0.0) = -0.0, trunc(+0.0) = +0.0
+          - rndne(-0.4) = -0.0, rndne(-0.5) = -0.0
+        """
+        self.assertEqual(ref_floor(H_NEG_0P5), H_NEG_1P0)
+        self.assertEqual(ref_ceil(H_NEG_0P5), H_NEG_ZERO)
+        self.assertEqual(ref_trunc(H_NEG_0P5), H_NEG_ZERO)
+        self.assertEqual(ref_rndne(f2h(-0.4)), H_NEG_ZERO)
+        self.assertEqual(ref_rndne(H_NEG_0P5), H_NEG_ZERO)
+
+        # Signed zero inputs produce identical signed zero outputs
+        for h_zero in (H_POS_ZERO, H_NEG_ZERO):
+            self.assertEqual(ref_floor(h_zero), h_zero)
+            self.assertEqual(ref_ceil(h_zero), h_zero)
+            self.assertEqual(ref_trunc(h_zero), h_zero)
+            self.assertEqual(ref_rndne(h_zero), h_zero)
+
+    def test_tie_breaking_to_even_halfway(self):
+        """Halfway cases (n + 0.5) must tie-break to the nearest even integer."""
+        cases = [
+            (H_0P5, H_POS_ZERO),       # 0.5 -> 0.0 (0 is even)
+            (H_1P5, H_2P0),            # 1.5 -> 2.0 (2 is even)
+            (H_2P5, H_2P0),            # 2.5 -> 2.0 (2 is even)
+            (H_3P5, H_4P0),            # 3.5 -> 4.0 (4 is even)
+            (f2h(4.5), H_4P0),         # 4.5 -> 4.0
+            (f2h(5.5), f2h(6.0)),      # 5.5 -> 6.0
+            (H_NEG_0P5, H_NEG_ZERO),   # -0.5 -> -0.0 (-0 is even)
+            (H_NEG_1P5, H_NEG_2P0),    # -1.5 -> -2.0
+            (H_NEG_2P5, H_NEG_2P0),    # -2.5 -> -2.0
+            (H_NEG_3P5, H_NEG_4P0),    # -3.5 -> -4.0
+            (f2h(-4.5), H_NEG_4P0),    # -4.5 -> -4.0
+            (f2h(-5.5), f2h(-6.0)),    # -5.5 -> -6.0
+            (H_1022P5, f2h(1022.0)),   # 1022.5 -> 1022.0 (even)
+            (H_1023P5, H_1024),        # 1023.5 -> 1024.0 (odd -> even)
+            (H_NEG_1022P5, f2h(-1022.0)),
+            (H_NEG_1023P5, f2h(-1024.0)),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=hex(inp), expected=hex(expected)):
+                self.assertEqual(ref_rndne(inp), expected)
+
+    def test_subnormals_and_special_values(self):
+        """Subnormals (< 2^-14) and infinities/NaNs handling in reference oracle."""
+        for sub in (H_SUB_MIN, H_SUB_MAX):
+            self.assertEqual(ref_floor(sub), H_POS_ZERO)
+            self.assertEqual(ref_ceil(sub), H_1P0)
+            self.assertEqual(ref_trunc(sub), H_POS_ZERO)
+            self.assertEqual(ref_rndne(sub), H_POS_ZERO)
+
+        for neg_sub in (H_NEG_SUB_MIN, H_NEG_SUB_MAX):
+            self.assertEqual(ref_floor(neg_sub), H_NEG_1P0)
+            self.assertEqual(ref_ceil(neg_sub), H_NEG_ZERO)
+            self.assertEqual(ref_trunc(neg_sub), H_NEG_ZERO)
+            self.assertEqual(ref_rndne(neg_sub), H_NEG_ZERO)
+
+        for inf in (H_POS_INF, H_NEG_INF):
+            self.assertEqual(ref_floor(inf), inf)
+            self.assertEqual(ref_ceil(inf), inf)
+            self.assertEqual(ref_trunc(inf), inf)
+            self.assertEqual(ref_rndne(inf), inf)
+
+        for nan in (H_QNAN, H_NEG_QNAN, H_SNAN):
+            self.assertTrue(is_f16_nan(ref_floor(nan)))
+            self.assertTrue(is_f16_nan(ref_ceil(nan)))
+            self.assertTrue(is_f16_nan(ref_trunc(nan)))
+            self.assertTrue(is_f16_nan(ref_rndne(nan)))
 
 
 class F16RoundingExecutionTests(unittest.TestCase):
