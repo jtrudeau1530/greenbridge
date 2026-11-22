@@ -111,6 +111,13 @@ With more than one GPU, pick one through the Vulkan loader, for example
 `VK_LOADER_DRIVERS_SELECT=*amd*` or `VK_LOADER_DRIVERS_SELECT=nv-vk*` (or `VK_DRIVER_FILES=<path to the ICD json>`).
 `vulkaninfo --summary` shows which devices the loader then sees.
 
+Two GPUs of one vendor share one driver, so the loader cannot tell them apart (an RTX 5070 Ti next to an RTX 3060,
+say; without a choice the D3D12 tests take the last discrete GPU). `LEONIDA_VK_DEVICE` names the GPU by part of its
+name, without case: `LEONIDA_VK_DEVICE=5070` or `LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`)
+and the layer's standalone device read it, and a value that matches no device fails the run instead of testing
+another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
+The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) do not read it yet.
+
 ## Known problems
 
 | What you see | Cause | What to do |

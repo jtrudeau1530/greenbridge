@@ -1,0 +1,293 @@
+// D3D-30 on the Vulkan device, through the Xbox-ABI proxy: SetEventOnMultipleFenceCompletion (ALL and ANY, with an
+// event and blocking), queue GetClockCalibration on both paths (calibrated timestamps on the standalone device when
+// the GPU has them, the submitted timestamp query on a device without the extension), GetAdapterLuid (must name a
+// DXGI adapter) and GetCustomHeapProperties (compared with the host PC runtime's answer when the host adapter is
+// NUMA, as the layer reports itself). No shaders or game data. LEONIDA_VK_VALIDATION=1 runs the test-made device
+// under VK_LAYER_KHRONOS_validation; any validation error fails the test.
+#include "vk_test_device.h"
+#include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_device.h"
+
+#include <dxgi1_4.h>
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <thread>
+#include <vector>
+
+#define EXPECT(condition) do { \
+    if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
+} while (0)
+
+namespace {
+
+template<class T>
+struct Ref {
+    T* p = nullptr;
+    ~Ref() { reset(); }
+    void reset() {
+        if (p) p->Release();
+        p = nullptr;
+    }
+    T* operator->() const { return p; }
+};
+
+struct Event {
+    HANDLE h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    ~Event() { CloseHandle(h); }
+    bool set_within(DWORD ms) const { return WaitForSingleObject(h, ms) == WAIT_OBJECT_0; }
+};
+
+UINT64 qpc() {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return UINT64(now.QuadPart);
+}
+
+// GetClockCalibration twice, 50 ms apart: the CPU stamps bracket the call, and both clocks advance at the same rate.
+int check_calibration(ID3D12CommandQueue* queue, double gpu_frequency, const char* path) {
+    LARGE_INTEGER qpf{};
+    QueryPerformanceFrequency(&qpf);
+    UINT64 gpu0 = 0, cpu0 = 0, gpu1 = 0, cpu1 = 0;
+    const UINT64 before = qpc();
+    EXPECT(SUCCEEDED(queue->GetClockCalibration(&gpu0, &cpu0)));
+    const UINT64 after = qpc();
+    EXPECT(before <= cpu0 && cpu0 <= after);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT(SUCCEEDED(queue->GetClockCalibration(&gpu1, &cpu1)));
+    EXPECT(gpu1 > gpu0 && cpu1 > cpu0);
+    const double gpu_s = double(gpu1 - gpu0) / gpu_frequency, cpu_s = double(cpu1 - cpu0) / double(qpf.QuadPart);
+    std::printf("%s: GPU %.6f s, CPU %.6f s between two calibrations (%.1f us apart)\n", path, gpu_s, cpu_s,
+                std::fabs(gpu_s - cpu_s) * 1e6);
+    EXPECT(std::fabs(gpu_s - cpu_s) < 0.002);  // 2 ms: the fallback's error is half a submission round trip
+    EXPECT(queue->GetClockCalibration(nullptr, &cpu0) == E_INVALIDARG);
+    EXPECT(queue->GetClockCalibration(&gpu0, nullptr) == E_INVALIDARG);
+    return 0;
+}
+
+int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    Ref<ID3D12Device1> device1;
+    EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
+    Ref<ID3D12Fence> a, b;
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&a.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&b.p))));
+    ID3D12Fence* both[] = {a.p, b.p};
+    constexpr auto ALL = D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, ANY = D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
+
+    // ALL with an event: one fence is not enough.
+    {
+        const UINT64 values[] = {1, 1};
+        Event event;
+        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ALL, event.h)));
+        EXPECT(SUCCEEDED(a->Signal(1)));
+        EXPECT(!event.set_within(50));
+        EXPECT(SUCCEEDED(queue->Signal(b.p, 1)));  // from the GPU
+        EXPECT(event.set_within(5000));
+    }
+    // ANY with an event: the first fence sets it, and the other never reaching its value doesn't matter.
+    {
+        const UINT64 values[] = {2, 100};
+        Event event;
+        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ANY, event.h)));
+        EXPECT(!event.set_within(50));
+        EXPECT(SUCCEEDED(queue->Signal(a.p, 2)));
+        EXPECT(event.set_within(5000));
+        EXPECT(!event.set_within(50));  // set once
+    }
+    // Values already reached: set before the call returns.
+    {
+        const UINT64 values[] = {2, 1};
+        Event all, any;
+        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ALL, all.h)));
+        EXPECT(all.set_within(0));
+        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ANY, any.h)));
+        EXPECT(any.set_within(0));
+    }
+    // A null event blocks: ALL until both fences are signalled from another thread, ANY until one is.
+    {
+        const UINT64 values[] = {3, 3};
+        std::thread signaller([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            a->Signal(3);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            b->Signal(3);
+        });
+        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ALL, nullptr)));
+        const bool reached = a->GetCompletedValue() >= 3 && b->GetCompletedValue() >= 3;
+        signaller.join();
+        EXPECT(reached);
+    }
+    {
+        const UINT64 values[] = {4, 4};
+        std::thread signaller([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            b->Signal(4);
+        });
+        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ANY, nullptr)));
+        const bool reached = b->GetCompletedValue() >= 4;
+        signaller.join();
+        EXPECT(reached && a->GetCompletedValue() == 3);
+    }
+    // A fence released while an event waits on it: nothing fires and nothing crashes.
+    {
+        Ref<ID3D12Fence> c;
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.p))));
+        ID3D12Fence* one[] = {c.p};
+        const UINT64 values[] = {1};
+        Event event;
+        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(one, values, 1, ALL, event.h)));
+        c.reset();
+        EXPECT(!event.set_within(30));
+    }
+    // Bad arguments.
+    {
+        const UINT64 values[] = {1, 1};
+        ID3D12Fence* with_null[] = {a.p, nullptr};
+        EXPECT(device1->SetEventOnMultipleFenceCompletion(both, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAGS(2),
+                                                           nullptr) == E_INVALIDARG);
+        EXPECT(device1->SetEventOnMultipleFenceCompletion(with_null, values, 2, ALL, nullptr) == E_INVALIDARG);
+        EXPECT(device1->SetEventOnMultipleFenceCompletion(nullptr, values, 2, ALL, nullptr) == E_INVALIDARG);
+        Event event;
+        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(nullptr, nullptr, 0, ALL, event.h)));
+        EXPECT(event.set_within(0));
+    }
+    return 0;
+}
+
+int check_luid(ID3D12Device* device) {
+    const LUID luid = device->GetAdapterLuid();
+    EXPECT(luid.LowPart || luid.HighPart);
+    Ref<IDXGIFactory4> factory;
+    EXPECT(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))));
+    Ref<IDXGIAdapter1> adapter;
+    EXPECT(SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter.p))));
+    DXGI_ADAPTER_DESC1 desc{};
+    EXPECT(SUCCEEDED(adapter->GetDesc1(&desc)));
+    std::printf("GetAdapterLuid: %08lx:%08lx is the DXGI adapter \"%ls\"\n", luid.HighPart, luid.LowPart,
+                desc.Description);
+    return 0;
+}
+
+int check_custom_heap_properties(ID3D12Device* device) {
+    struct Want {
+        D3D12_HEAP_TYPE type;
+        D3D12_CPU_PAGE_PROPERTY page;
+        D3D12_MEMORY_POOL pool;
+    };
+    const Want table[] = {
+        {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE, D3D12_MEMORY_POOL_L1},
+        {D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0},
+        {D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0},
+    };
+    for (const Want& want : table) {
+        for (UINT node_mask : {0u, 1u}) {
+            const D3D12_HEAP_PROPERTIES got = device->GetCustomHeapProperties(node_mask, want.type);
+            EXPECT(got.Type == D3D12_HEAP_TYPE_CUSTOM && got.CPUPageProperty == want.page &&
+                   got.MemoryPoolPreference == want.pool && got.CreationNodeMask == 1 && got.VisibleNodeMask == 1);
+        }
+    }
+    const D3D12_HEAP_PROPERTIES custom = device->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_CUSTOM);
+    EXPECT(custom.Type == D3D12_HEAP_TYPE(0) && custom.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_UNKNOWN);
+
+    // The host runtime on a NUMA adapter (the answer the layer gives in D3D12_FEATURE_ARCHITECTURE) must agree.
+    Ref<ID3D12Device> host;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+        std::printf("GetCustomHeapProperties: no host D3D12 device to compare with\n");
+        return 0;
+    }
+    D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
+    EXPECT(SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))));
+    if (architecture.UMA) {
+        std::printf("GetCustomHeapProperties: the host adapter is UMA; not compared\n");
+        return 0;
+    }
+    for (const Want& want : table) {
+        const D3D12_HEAP_PROPERTIES ours = device->GetCustomHeapProperties(0, want.type);
+        const D3D12_HEAP_PROPERTIES theirs = host->GetCustomHeapProperties(0, want.type);
+        if (std::memcmp(&ours, &theirs, sizeof(ours)) != 0) {
+            std::fprintf(stderr, "heap type %d: ours %d/%d/%d, host %d/%d/%d\n", want.type, ours.Type,
+                         ours.CPUPageProperty, ours.MemoryPoolPreference, theirs.Type, theirs.CPUPageProperty,
+                         theirs.MemoryPoolPreference);
+            return 1;
+        }
+    }
+    std::printf("GetCustomHeapProperties: DEFAULT, UPLOAD and READBACK match the host runtime\n");
+    return 0;
+}
+
+// The proxy over a Vulkan device, the way the game sees it.
+HRESULT wrap(ID3D12Device* inner, Ref<ID3D12Device>& device) {
+    const HRESULT hr = rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
+                                                         reinterpret_cast<void**>(&device.p));
+    if (SUCCEEDED(hr)) rt::d3d12::set_device_outer(inner, device.p);
+    return hr;
+}
+
+}  // namespace
+
+int main() {
+    vktest::Device d;
+    EXPECT(d.create());
+    VkPhysicalDeviceProperties properties{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
+    const double gpu_frequency = 1e9 / double(properties.limits.timestampPeriod);  // GetTimestampFrequency's answer
+
+    // A device without calibrated timestamps (the test device enables no extensions): the submitted fallback.
+    {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = d.instance_proc;
+        info.instance = d.instance;
+        info.physical = d.physical;
+        info.device = d.device;
+        info.queue = d.queue;
+        info.queue_family = d.family;
+        ID3D12Device* inner = nullptr;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
+        Ref<ID3D12Device> device;
+        EXPECT(SUCCEEDED(wrap(inner, device)));
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        Ref<ID3D12CommandQueue> queue;
+        EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        EXPECT(!rt::d3d12::queue_uses_calibrated_timestamps(queue.p));
+        EXPECT(check_calibration(queue.p, gpu_frequency, "fallback (submitted timestamp query)") == 0);
+        EXPECT(check_multiple_fences(device.p, queue.p) == 0);
+        EXPECT(check_luid(device.p) == 0);
+        EXPECT(check_custom_heap_properties(device.p) == 0);
+    }
+
+    // The standalone device enables VK_KHR/EXT_calibrated_timestamps where the GPU has it.
+    {
+        Ref<ID3D12Device> standalone;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone.p))));
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        Ref<ID3D12CommandQueue> queue;
+        EXPECT(SUCCEEDED(standalone->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        const auto extensions_of = d.instance_fn<PFN_vkEnumerateDeviceExtensionProperties>(
+            "vkEnumerateDeviceExtensionProperties");
+        std::uint32_t count = 0;
+        extensions_of(d.physical, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> extensions(count);
+        extensions_of(d.physical, nullptr, &count, extensions.data());
+        bool available = false;
+        for (const auto& e : extensions)
+            available = available || !std::strcmp(e.extensionName, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ||
+                        !std::strcmp(e.extensionName, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        const bool calibrated = rt::d3d12::queue_uses_calibrated_timestamps(queue.p);
+        std::printf("calibrated timestamps: %s on the GPU, %s by the queue\n", available ? "available" : "missing",
+                    calibrated ? "used" : "not used");
+        EXPECT(calibrated == available);  // Windows drivers calibrate DEVICE against QueryPerformanceCounter
+        EXPECT(check_calibration(queue.p, gpu_frequency, calibrated ? "calibrated timestamps" : "fallback") == 0);
+        EXPECT(check_multiple_fences(standalone.p, queue.p) == 0);
+        EXPECT(check_luid(standalone.p) == 0);
+    }
+
+    if (d.validation_errors()) {
+        std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+        return 1;
+    }
+    std::printf("fences and timing: multiple-fence waits, clock calibration, adapter LUID and custom heap "
+                "properties all checked\n");
+    return 0;
+}

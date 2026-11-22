@@ -35,6 +35,7 @@ inline constexpr std::uint32_t non_pixel_shader_resource = 0x40;
 inline constexpr std::uint32_t pixel_shader_resource = 0x80;
 inline constexpr std::uint32_t stream_out = 0x100;
 inline constexpr std::uint32_t indirect_argument = 0x200;
+inline constexpr std::uint32_t predication = 0x200;  // D3D12_RESOURCE_STATE_PREDICATION, the same bit
 inline constexpr std::uint32_t copy_dest = 0x400;
 inline constexpr std::uint32_t copy_source = 0x800;
 inline constexpr std::uint32_t resolve_dest = 0x1000;

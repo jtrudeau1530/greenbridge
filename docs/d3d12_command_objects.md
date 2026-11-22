@@ -295,9 +295,75 @@ passes a builder-specific object that also implements the interface. The byte of
 the field meanings and the method at `+0x490` are **Open**.
 
 This is the most important compatibility finding on this page. A replacement command list that
-implements only the public GCL7/GCL8 vtable is safe for the game's own public calls, but it is
-**not** safe to hand to `XboxBvhBuilder`'s build path. The helper will touch fields the public
+implements only the public GCL7/GCL8 vtable is **not** safe to hand to `XboxBvhBuilder`'s build path. (Section 3.5a
+shows it is not safe for console-compiled callers' public calls either: the console list order differs from the PC
+order past slot 26.) The helper will touch fields the public
 object does not define and call `+0x490`, which a public-only vtable does not have.
+
+### 3.5a The FSR DLL as a second device client
+
+`amd_fidelityfx_upscaler_xbox.dll` is a second shipped module compiled against the console device, the second
+measured client of the console **command list** after the BVH builder (section 3.3), and the first one run. It is run
+by `fsr_dispatch_test` with its measured Xbox backend
+descriptor ([d3d12_vulkan.md Appendix A.3](d3d12_vulkan.md)), on a PC device behind the Xbox-ABI proxy, and its
+command recorder (RVA `0x59a0`) was read with Ghidra 12.2 through REA. RVAs are from image base `0x180000000`. The
+run's command-list calls are the same 13, in the same order, on an RTX 2000 Ada (driver 597.06) and on WARP.
+
+**Device.** At context creation it calls slots 14, 15, 18, 19, 27, 38 and 76 and heap slot 9, all with the shapes the
+PC order and the measured overrides predict; slot 76 takes the seven `CreateCommittedResource` arguments. During
+`ffxDispatch` it adds 16 `CreateRootSignature` and heap slot 10 (the recorder also has a path that calls 24
+`CopyDescriptorsSimple`, not taken in this run), plus its two compute-pipeline paths:
+
+- **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
+  with `IID_ID3D12PipelineState` and a console-only desc: the root signature at `+0x00`, two pointers into the DLL
+  with sizes (`0x1c` and `0x14` bytes here) at `+0x08`..`+0x20`, and a copy of a code blob at `+0x28` with its size
+  at `+0x30` (`0x1080` bytes here; most likely the shader's native code). The proxy used to forward it to the PC
+  method at the same index; it now refuses it (`E_NOTIMPL`). When it fails, the DLL takes slot 62.
+- **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
+  runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
+  `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
+  PC device stops.
+- The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
+  and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
+  inside `XBCH` ([design.md](design.md)). What `FSPX` holds, and whether the existing unpacker and translator can
+  take it, is open; running FSR needs that, not the executable.
+
+**Command list.** The console list is **not** the PC order past `ResourceBarrier`. Each row is backed by the
+argument shape at the call and, where marked "run", by the call seen in the run. Rows marked "inferred" fit the
+shape and the shift around them, but the shape alone does not single the method out:
+
+| Console slot (offset) | PC slot | Method | Evidence |
+|---|---|---|---|
+| 14 (`+0x70`) | 14 | `Dispatch` | the vtable path of the inline dispatch at `0x59a0`; the BVH builder's `Dispatch(1,1,1)` at `+0x70` |
+| 15 (`+0x78`) | 15 | `CopyBufferRegion` | run: `(resource, 0, resource, …)` |
+| 25 (`+0xc8`) | 25 | `SetPipelineState` | `(pipeline)` at `0x59a0` |
+| 26 (`+0xd0`) | 26 | `ResourceBarrier` | run: `(1, barriers)`; the BVH builder's `+0xd0` |
+| 32 (`+0x100`) | **28** | `SetDescriptorHeaps` | run: `(1, &heap)`, the heap a device-proxy descriptor heap |
+| 33 (`+0x108`) | **29** | `SetComputeRootSignature` (inferred) | one pointer argument, the first call at `0x59a0` (null in the run, where pipeline creation had failed) |
+| 35 (`+0x118`) | **31** | `SetComputeRootDescriptorTable` | `(index, heap GPU start + offset)` at `0x59a0` |
+| 41 (`+0x148`) | **37** | `SetComputeRootConstantBufferView` (inferred) | `(index, 64-bit GPU VA from the constant allocator)` at `0x6738`; the root SRV/UAV setters take the same shape |
+| 53 (`+0x1a8`) | **49** | `ClearUnorderedAccessViewUint` | run: `(GPU handle, CPU handle, resource, …)` |
+| 61 (`+0x1e8`) | **59** | `ExecuteIndirect` | `(signature, 1, argument buffer, offset, null, 0)` at `0x59a0` |
+| 85 (`+0x2a8`) | — | console only | run: `(stack pointer, 0, 0)`, twice per dispatch |
+| 141 (`+0x468`) | — | console only | `(2, GPU VA, size, n)` at `0x65f8`: binds a buffer the DLL names `FFX_XBox_ComputeScratch` |
+
+So the console list has four more methods than the PC list between `ResourceBarrier` (26) and `SetDescriptorHeaps`
+(console 32), and two fewer between `ClearUnorderedAccessViewUint` (console 53) and `ExecuteIndirect` (console 61).
+Mapping the console list as "PC plus a constant" is wrong. The BVH builder's `+0x490` (slot 146) is also past the
+end of the PC list, like 141.
+
+**The list object is wider than its vtable, and this is what that width is for.** Before a root-argument or dispatch
+call the DLL checks a write cursor at `+0x18` against a limit (`+0x30` for root arguments, `+0x28` for a dispatch). While there is room,
+it writes the command into that buffer itself instead of calling: a root argument is a header word from the
+per-root-parameter table at `+0x344` and then the value (32 bits for a descriptor table, 64 for the slot-41 GPU VA),
+a dispatch four words (`0x4002c400`, or `(flag | 0x1000ba00) << 2`, then x, y, z).
+It sets a flag byte at `+0x140`, stores a flag at `+0x141` from the
+pipeline, and copies 32 bytes of the pipeline object (from its `+0x10`) to `+0x544`. These are the fields
+section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x544`).
+**With the cursor at the limit, every command goes through the vtable**: that is how `fsr_dispatch_test` records
+them, and it is the simplest contract for a layer that does not want to decode these packets. Whether the game's
+executable makes the same check before writing is unknown until it is available; it is compiled against the same
+console headers.
 
 ### 3.5 What the package does not measure
 

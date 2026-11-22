@@ -132,6 +132,137 @@ void CALLBACK on_guide(GameInputCallbackToken, void*, IGameInputDevice*, uint64_
 
 void set_env(const char* name, const char* value) { SetEnvironmentVariableA(name, value); }
 
+// ---- keyboard pad: a fake key source instead of GetAsyncKeyState ----
+bool g_keys[256] = {};
+bool g_focus = false;
+bool fake_key_down(int vk) { return vk >= 0 && vk < 256 && g_keys[vk]; }
+bool fake_focus() { return g_focus; }
+
+GameInputGamepadState pad_state(IGameInput* input, IGameInputDevice* dev, uint32_t* ui = nullptr) {
+    GameInputGamepadState st{};
+    IGameInputReading* r = nullptr;
+    if (input->GetCurrentReading(GameInputKindGamepad, dev, &r) == S_OK && r) {
+        r->GetGamepadState(&st);
+        if (ui) {
+            GameInputUiNavigationState nav{};
+            r->GetUiNavigationState(&nav);
+            *ui = nav.buttons;
+        }
+        r->Release();
+    }
+    return st;
+}
+
+// Runs with no other pad connected and the device callback from main still registered.
+void test_keyboard_pad(IGameInput* input) {
+    rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+
+    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "keyboard pad: off by default");
+
+    set_env("LEONIDA_KEYBOARD_PAD", "1");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().keyboard_pad == rt::gameinput::KeyboardPadMode::Focused,
+          "keyboard pad: LEONIDA_KEYBOARD_PAD=1 is the focused mode");
+    const size_t events_before = g_device_events.size();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 1, "keyboard pad: attached as one gamepad");
+    // Main leaves three device callbacks registered (blocking, async and blocking enumeration), so one connect is
+    // reported to each of them: all with the same device.
+    IGameInputDevice* kb = g_device_events.size() > events_before ? g_device_events.back().device : nullptr;
+    bool connect_events = g_device_events.size() == events_before + 3;
+    for (size_t i = events_before; i < g_device_events.size(); ++i)
+        connect_events &= g_device_events[i].device == kb && (g_device_events[i].current & GameInputDeviceConnected) &&
+                          g_device_events[i].previous == GameInputDeviceNoStatus;
+    check(connect_events, "keyboard pad: device callbacks on connect");
+    if (!kb) return;
+    const GameInputDeviceInfo* info = kb->GetDeviceInfo();
+    check(info->displayName && std::strcmp(info->displayName->data, "Keyboard pad (Leonida)") == 0,
+          "keyboard pad: display name");
+    check((info->supportedInput & GameInputKindGamepad) && info->supportedRumbleMotors == 0,
+          "keyboard pad: a gamepad without motors");
+    check(pad_state(input, kb).buttons == 0, "keyboard pad: at rest");
+
+    // Out of focus, keys are ignored.
+    g_focus = false;
+    g_keys[VK_RETURN] = true;
+    rt::gameinput::poll();
+    check(pad_state(input, kb).buttons == 0, "keyboard pad: no buttons while another window has focus");
+
+    // In focus, every binding presses its button.
+    g_focus = true;
+    g_keys[VK_RETURN] = false;
+    struct Expect { int vk; uint32_t button; const char* what; };
+    const Expect expect[] = {
+        {VK_UP, GameInputGamepadDPadUp, "keyboard pad: Up is d-pad up"},
+        {VK_DOWN, GameInputGamepadDPadDown, "keyboard pad: Down is d-pad down"},
+        {VK_LEFT, GameInputGamepadDPadLeft, "keyboard pad: Left is d-pad left"},
+        {VK_RIGHT, GameInputGamepadDPadRight, "keyboard pad: Right is d-pad right"},
+        {VK_RETURN, GameInputGamepadA, "keyboard pad: Enter is A"},
+        {VK_BACK, GameInputGamepadB, "keyboard pad: Backspace is B"},
+        {'X', GameInputGamepadX, "keyboard pad: X is X"},
+        {'Y', GameInputGamepadY, "keyboard pad: Y is Y"},
+        {'Q', GameInputGamepadLeftShoulder, "keyboard pad: Q is the left shoulder"},
+        {'E', GameInputGamepadRightShoulder, "keyboard pad: E is the right shoulder"},
+        {VK_ESCAPE, GameInputGamepadMenu, "keyboard pad: Esc is Menu"},
+        {VK_TAB, GameInputGamepadView, "keyboard pad: Tab is View"},
+    };
+    for (const Expect& e : expect) {
+        g_keys[e.vk] = true;
+        rt::gameinput::poll();
+        check(pad_state(input, kb).buttons == e.button, e.what);
+        g_keys[e.vk] = false;
+    }
+    int bindings = 0;
+    rt::gameinput::keyboard_bindings(&bindings);
+    check(bindings == static_cast<int>(std::size(expect)), "keyboard pad: every binding is tested");
+
+    // Two keys at once, and UI navigation from the d-pad and A.
+    g_keys[VK_DOWN] = g_keys[VK_RETURN] = true;
+    rt::gameinput::poll();
+    uint32_t ui = 0;
+    const GameInputGamepadState both = pad_state(input, kb, &ui);
+    check(both.buttons == (GameInputGamepadDPadDown | GameInputGamepadA), "keyboard pad: Down and Enter together");
+    check((ui & GameInputUiNavigationDown) && (ui & GameInputUiNavigationAccept), "keyboard pad: UI navigation down and accept");
+    check(approx(both.leftTrigger, 0) && approx(both.rightTrigger, 0) && approx(both.leftThumbstickX, 0) &&
+              approx(both.rightThumbstickY, 0),
+          "keyboard pad: sticks and triggers stay at rest");
+
+    // Losing focus releases held keys.
+    g_focus = false;
+    rt::gameinput::poll();
+    check(pad_state(input, kb).buttons == 0, "keyboard pad: losing focus releases every button");
+
+    // The always mode ignores focus.
+    set_env("LEONIDA_KEYBOARD_PAD", "always");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(pad_state(input, kb).buttons == (GameInputGamepadDPadDown | GameInputGamepadA),
+          "keyboard pad: LEONIDA_KEYBOARD_PAD=always reads keys without focus");
+    g_keys[VK_DOWN] = g_keys[VK_RETURN] = false;
+
+    // Turning it off removes the pad; turning it on again brings back the same device object.
+    set_env("LEONIDA_KEYBOARD_PAD", "off");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0 && kb->GetDeviceStatus() == GameInputDeviceNoStatus,
+          "keyboard pad: off removes it");
+    set_env("LEONIDA_KEYBOARD_PAD", "1");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 1 && g_device_events.back().device == kb &&
+              (kb->GetDeviceStatus() & GameInputDeviceConnected),
+          "keyboard pad: on again is the same device object");
+
+    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
+    rt::gameinput::set_keyboard_source(nullptr, nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -451,6 +582,8 @@ int main() {
     detach(ds);
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "all pads closed after detaching");
+
+    test_keyboard_pad(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

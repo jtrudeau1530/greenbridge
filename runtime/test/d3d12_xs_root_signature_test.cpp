@@ -277,7 +277,11 @@ int main() {
         ComPtr<IDXGIAdapter> adapter;
         ComPtr<ID3D12Device> device;
         require_success(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "create DXGI factory");
-        require_success(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "enumerate WARP adapter");
+        if (const HRESULT warp = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)); FAILED(warp)) {
+            // Windows always has WARP; Wine doesn't. CTest reads exit code 77 as a skip (SKIP_RETURN_CODE).
+            std::printf("SKIP no WARP adapter (0x%08lX)\n", static_cast<unsigned long>(warp));
+            return 77;
+        }
         require_success(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
                         "create WARP device");
         test_version_1_0(serialize, deserialize, *device.Get());

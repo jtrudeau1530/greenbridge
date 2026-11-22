@@ -7,9 +7,18 @@ shader); <disasm dir> holds the original <name>.s listings the translator read. 
 the driver's instruction count with the original one (code growth) and its VGPRs with the highest VGPR the original
 code uses, and it flags scratch memory and spills: a register file that didn't fit in registers and went to memory,
 which is the expensive case (relative VGPR indexing, v_movrels/v_movreld, forces it). It prints a summary per stage and,
-with --details, one line per shader. Statistic names are RADV/ACO's; another driver may name them differently.
+with --details, one line per shader.
+
+Metrics are read only where the driver emits these exact RADV/ACO statistic names with a numeric value: Instructions,
+VGPRs, SGPRs, Scratch size, Spilled VGPRs, Spilled SGPRs, Subgroups per SIMD. No equivalence is claimed for other
+drivers' statistics, even similarly named ones. A metric that isn't reported is shown as - (n/a in the summary), never
+as 0; a summary clause over fewer shaders than the stage has says so with (n of N), and the original VGPRs it compares
+with are those of the same shaders. With only one of the two spill statistics reported, spills shows it when positive,
+with >= to mark a lower bound, and - when it is 0. When a driver omits a comparison metric, --details also lists any additional driver counters under that
+shader with their original names and values. A note lists those names in summary mode.
 """
 import csv
+import math
 import os
 import statistics
 import sys
@@ -17,6 +26,16 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import shader_ir  # noqa: E402
+
+# (row key, RADV/ACO statistic name) of the statistics read as numbers; spills combine SPILLS.
+METRICS = [("aco", "Instructions"), ("vgprs", "VGPRs"), ("sgprs", "SGPRs"), ("scratch", "Scratch size"),
+           ("waves", "Subgroups per SIMD")]
+SPILLS = ("Spilled VGPRs", "Spilled SGPRs")
+KNOWN = {stat for _, stat in METRICS} | set(SPILLS)
+# --details columns after shader and stage: (row key, header, width, format spec).
+COLUMNS = [("orig", "orig", 5, ""), ("aco", "aco", 5, ""), ("growth", "growth", 6, ".2f"), ("v_orig", "v_orig", 6, ""),
+           ("vgprs", "VGPRs", 5, ""), ("sgprs", "SGPRs", 5, ""), ("scratch", "scratch", 7, ""),
+           ("spill_detail", "spills", 6, ""), ("waves", "waves", 5, "")]
 
 
 def original(path):
@@ -27,17 +46,74 @@ def original(path):
 
 
 def load_stats(path):
-    """{name: {"stage": .., statistic: value}} from vk_pipeline_check --stats."""
+    """Counter names and raw values by (shader, stage), as written by vk_pipeline_check --stats."""
     out = defaultdict(dict)
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            entry = out[row["name"]]
-            entry["stage"] = row["stage"]
-            try:
-                entry[row["statistic"]] = float(row["value"])
-            except ValueError:
-                entry[row["statistic"]] = row["value"]
+            out[row["name"], row["stage"]][row["statistic"]] = row["value"]
     return out
+
+
+def number(raw):
+    """The exact int, or else the finite float, a raw value holds; None if it is missing or not such a number."""
+    if raw is None:
+        return None
+    for parse in (int, float):
+        try:
+            value = parse(raw)
+            if not math.isfinite(value):
+                return None
+            return int(value) if isinstance(value, float) and value.is_integer() else value
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return None
+
+
+def shader_row(name, stage, st, src):
+    n_orig, v_orig = original(src)
+    r = {"name": name, "stage": stage, "orig": n_orig, "v_orig": v_orig}
+    for key, stat in METRICS:
+        r[key] = number(st.get(stat))
+    r["growth"] = None if r["aco"] is None else r["aco"] / max(n_orig, 1)
+
+    spill_counts = [number(st.get(stat)) for stat in SPILLS]
+    known_spills = [v for v in spill_counts if v is not None]
+    complete_spills = len(known_spills) == len(SPILLS)
+    total = sum(known_spills)
+    r["spills"] = total if complete_spills or total > 0 else None
+    r["spill_detail"] = f">={total}" if total > 0 and not complete_spills else r["spills"]
+
+    complete = complete_spills and all(r[key] is not None for key, _ in METRICS)
+    r["raw"] = {} if complete else {stat: value for stat, value in st.items() if stat not in KNOWN}
+    return r
+
+
+def cell(value, spec=""):
+    """A details cell: the value, or - when it isn't reported."""
+    return "-" if value is None else format(value, spec)
+
+
+def reported(rs, key):
+    return [r for r in rs if r[key] is not None]
+
+
+def coverage(n, total):
+    return f" ({n} of {total})" if n < total else ""
+
+
+def count_clause(rs, key, label):
+    """How many of the shaders reporting key have it above 0."""
+    known = reported(rs, key)
+    if not known:
+        return f"{label} n/a"
+    return f"{label} in {sum(r[key] > 0 for r in known)}{coverage(len(known), len(rs))}"
+
+
+def median_clause(rs, key, label):
+    known = reported(rs, key)
+    if not known:
+        return f"{label} n/a"
+    return f"{label} median {statistics.median(r[key] for r in known):g}{coverage(len(known), len(rs))}"
 
 
 def main():
@@ -46,33 +122,39 @@ def main():
         sys.exit(__doc__)
     stats, disasm = load_stats(args[0]), args[1]
     rows = []
-    for name, st in sorted(stats.items()):
+    for (name, stage), st in sorted(stats.items()):
         src = os.path.join(disasm, name + ".s")
-        if not os.path.isfile(src) or "Instructions" not in st:
-            continue
-        n_orig, v_orig = original(src)
-        rows.append({"name": name, "stage": st["stage"], "orig": n_orig, "aco": int(st["Instructions"]),
-                     "growth": st["Instructions"] / max(n_orig, 1), "v_orig": v_orig, "vgprs": int(st.get("VGPRs", 0)),
-                     "sgprs": int(st.get("SGPRs", 0)), "scratch": int(st.get("Scratch size", 0)),
-                     "spills": int(st.get("Spilled VGPRs", 0) + st.get("Spilled SGPRs", 0)),
-                     "waves": int(st.get("Subgroups per SIMD", 0))})
+        if os.path.isfile(src):
+            rows.append(shader_row(name, stage, st, src))
     if not rows:
         sys.exit("no shader is in both the statistics and the disasm folder")
     if "--details" in sys.argv:
-        print(f"{'shader':26} {'stage':5} {'orig':>5} {'aco':>5} {'growth':>6} {'v_orig':>6} {'VGPRs':>5} "
-              f"{'SGPRs':>5} {'scratch':>7} {'spills':>6} {'waves':>5}")
+        print(f"{'shader':26} {'stage':5} " + " ".join(f"{head:>{width}}" for _, head, width, _ in COLUMNS))
         for r in rows:
-            print(f"{r['name']:26} {r['stage']:5} {r['orig']:5} {r['aco']:5} {r['growth']:6.2f} {r['v_orig']:6} "
-                  f"{r['vgprs']:5} {r['sgprs']:5} {r['scratch']:7} {r['spills']:6} {r['waves']:5}")
+            print(f"{r['name']:26} {r['stage']:5} "
+                  + " ".join(f"{cell(r[key], spec):>{width}}" for key, _, width, spec in COLUMNS))
+            for stat, raw in sorted(r["raw"].items()):
+                print(f"    {stat} = {raw}")
         print()
+    else:
+        unread = sorted({stat for r in rows for stat in r["raw"]})
+        if unread:
+            print("additional driver statistics (see --details): " + "; ".join(unread), file=sys.stderr)
     for stage in sorted({r["stage"] for r in rows}):
         rs = [r for r in rows if r["stage"] == stage]
-        g = sorted(r["growth"] for r in rs)
-        print(f"{stage}: {len(rs)} shaders, code growth median {statistics.median(g):.2f}x "
-              f"(p90 {g[int(0.9 * (len(g) - 1))]:.2f}x, max {g[-1]:.2f}x); "
-              f"VGPRs median {statistics.median(r['vgprs'] for r in rs):g} vs original {statistics.median(r['v_orig'] for r in rs):g}; "
-              f"scratch in {sum(r['scratch'] > 0 for r in rs)}, spills in {sum(r['spills'] > 0 for r in rs)}; "
-              f"waves/SIMD median {statistics.median(r['waves'] for r in rs):g}")
+        g = sorted(r["growth"] for r in reported(rs, "growth"))
+        growth = "code growth n/a"
+        if g:
+            growth = (f"code growth median {statistics.median(g):.2f}x "
+                      f"(p90 {g[int(0.9 * (len(g) - 1))]:.2f}x, max {g[-1]:.2f}x){coverage(len(g), len(rs))}")
+        v = reported(rs, "vgprs")
+        vgprs = "VGPRs n/a"
+        if v:
+            vgprs = (f"VGPRs median {statistics.median(r['vgprs'] for r in v):g} "
+                     f"vs original {statistics.median(r['v_orig'] for r in v):g}{coverage(len(v), len(rs))}")
+        print(f"{stage}: {len(rs)} shaders, {growth}; {vgprs}; "
+              f"{count_clause(rs, 'scratch', 'scratch')}, {count_clause(rs, 'spills', 'spills')}; "
+              f"{median_clause(rs, 'waves', 'waves/SIMD')}")
     return 0
 
 

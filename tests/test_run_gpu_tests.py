@@ -44,7 +44,7 @@ class PackedFormatFixture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
 
-            def translate(_cmd):
+            def translate(_cmd, env=None, gpu=True):
                 (Path(tmp) / "spirv" / f"{name}.spv").touch()
                 return 0, ""
 
@@ -59,6 +59,37 @@ class PackedFormatFixture(unittest.TestCase):
             check_fmt.assert_called_once()
             self.assertIn(problem, output.getvalue())
             self.assertIn("0/1 passed", output.getvalue())
+
+
+class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
+    """vk_texture_test exits 77 on a device with 128 push constant bytes: a SKIP, not a FAIL."""
+    UNSUPPORTED_MSG = "unsupported: need 144 push constant bytes, device has 128\n"
+
+    def run_one(self, name):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            texture = SimpleNamespace(returncode=77, stdout="", stderr=self.UNSUPPORTED_MSG)
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt.subprocess, "run", return_value=texture),
+                  contextlib.redirect_stdout(output)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, output.getvalue()
+
+    def test_bindless_texture_and_gather_tests_skip(self):
+        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap"):
+            with self.subTest(name=name):
+                rc, out = self.run_one(name)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("SKIP (unsupported: need 144 push constant bytes, device has 128)", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
 
 
 class WholeWaveDump(unittest.TestCase):
