@@ -345,6 +345,14 @@ public:
         return bindless::multisampled(dimension) ? 0 : features_.counts[bindless::storage_binding(dimension, 0)];
     }
     std::uint32_t sampler_capacity() const { return features_.counts[bindless::sampler_binding]; }
+    // How many more images of a dimension, or samplers, add_image and add_sampler can take before they return 0.
+    std::uint32_t free_images(ImageDimension dimension) const {
+        const auto& used = image_used_[std::uint32_t(dimension)];
+        return std::uint32_t(std::count(used.begin(), used.end(), std::uint8_t(0)));
+    }
+    std::uint32_t free_samplers() const {
+        return std::uint32_t(std::count(sampler_used_.begin(), sampler_used_.end(), std::uint8_t(0)));
+    }
     // Set 0 of every pipeline layout made for translated shaders.
     VkDescriptorSetLayout layout() const { return layout_; }
     // Bound at set 0. The same set for the life of this object: flush() updates it in place.

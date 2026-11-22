@@ -33,6 +33,10 @@ import re
 import struct
 import sys
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 DXBC = b"DXBC"
 XDAT = b"XDAT"
 XBCH = b"XBCH"
@@ -218,6 +222,17 @@ def main(argv=None) -> int:
     )
     a = ap.parse_args(argv)
 
+    if a.extract and os.path.exists(a.extract) and not os.path.isdir(a.extract):
+        ap.error(f"--extract {a.extract} is not a folder")
+    if a.json:
+        if os.path.isdir(a.json):
+            ap.error(f"--json {a.json} is a folder, not a file")
+        for image in a.images:
+            if same_report_path(a.json, image):
+                ap.error(f"--json {a.json} would overwrite the input image {image}")
+        if a.extract and same_report_path(a.json, os.path.join(a.extract, "index.json")):
+            ap.error(f"--json {a.json} would overwrite the extract index")
+
     all_records, status, index = [], 0, []
     for image in a.images:
         try:
@@ -249,17 +264,31 @@ def main(argv=None) -> int:
                     f"  {r['offset']:#x} {r['size']:>7} {flags:<3} {name:<28} {chunks}"
                 )
         if a.extract:
-            index.extend(extract(data, records, a.extract))
+            try:
+                index.extend(extract(data, records, a.extract))
+            except OSError as e:
+                print(f"ERROR: cannot write {a.extract}: {e}", file=sys.stderr)
+                return 2
 
     if a.extract:
-        with open(os.path.join(a.extract, "index.json"), "w", encoding="utf-8", newline="\n") as f:
-            json.dump(index, f, indent=0)
+        index_path = os.path.join(a.extract, "index.json")
+        try:
+            with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f, indent=0)
+        except OSError as e:
+            print(f"ERROR: cannot write {index_path}: {e}", file=sys.stderr)
+            return 2
         print(f"  extracted {len(index)} file(s) to {a.extract}")
         print("  these are game data: do not commit them", file=sys.stderr)
 
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(all_records, f, indent=1)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(all_records, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e}", file=sys.stderr)
+            return 2
         print(f"wrote {a.json}")
     return status
 
