@@ -95,6 +95,24 @@ def test_depth_compare_sample_result_width(make_shader, d16):
     assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
 
 
+
+@pytest.mark.parametrize("export,depth", [
+    ("exp mrtz v2, off, off, off vm", True),               # Z only (SPI_SHADER_32_R)
+    ("exp mrtz v2, v3, off, off vm", True),                # Z and stencil (32_GR)
+    ("exp mrtz off, v3, off, off vm", False),              # stencil only (32_GR)
+    ("exp mrtz off, off, v3, off vm", False),              # sample mask only, 32-bit
+    ("exp mrtz v2, v2, v3, v3 compr vm", False),           # stencil and sample mask, 16-bit (UINT16_ABGR)
+], ids=["z", "z-stencil", "stencil", "mask", "compr"])
+def test_mrtz_depth_only_from_an_enabled_x(make_shader, export, depth):
+    """exp mrtz carries Z in x only when x is on in an uncompressed export; the 16-bit form holds stencil and sample
+    mask, never Z (Mesa ac_nir_lower_ps_late.c emit_ps_mrtz_export). Without a depth the shader must not replace it."""
+    shader = make_shader("v_mov_b32 v2, 0.5\nv_mov_b32 v3, 1\n" + export + "\nexp mrt0 v2, v2, v2, v2 done vm\n"
+                         "s_endpgm\n", "ps_mrtz")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert ("BuiltIn FragDepth" in spvasm) == depth
+    assert ("DepthReplacing" in spvasm) == depth
+
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
     path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
     with open(path, encoding="utf-8") as fixture:
