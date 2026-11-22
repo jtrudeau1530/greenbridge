@@ -19,8 +19,8 @@ The measured tags are `LSCH`, `LENM`, `LSNS`, `LGID`, `LRSC` and `CHKS`. `LGID` 
 (8 bytes). `LRSC` starts with a `0DRP` page directory header. `CHKS` carries the file size and a
 checksum. `LSNS` is high-entropy and is not decoded by this tool.
 
-`LSCH` is a type schema and `LENM` its enum table (measured over every PSIN in the data and script archives of
-package 1.0.2.1; see docs/psin.md). Both store all headers first and then all elements, and neither stores the
+`LSCH` is a type schema and `LENM` its enum table (measured over all 18,640 PSIN streams in the archives of package
+1.0.2.1; see docs/psin.md). Both store all headers first and then all elements, and neither stores the
 header count: it is the one count k for which the headers' element counts fill the payload exactly.
 
     LSCH struct header, 32 bytes        LSCH member, 16 bytes        LENM enum header, 24 bytes
