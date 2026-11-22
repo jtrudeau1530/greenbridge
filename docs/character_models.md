@@ -99,6 +99,25 @@ it must not be painted with a normal or ORM map.
 The hands and feet keys (`0x4D89F2311DBBB7A8`, `0xA54D9F8B51CA6034`) did not resolve in the
 scanned TTPF pools. The head has no texture reference at all.
 
+## Materials
+
+A binding audit of 120 exported scenes (232 material rows) found 62 with a real `C8E8C282`
+albedo, 29 with a shared `peds_*` collage, 4 with a `C6F46E79` normal map as the base colour,
+and 137 with no texture. The 4 normal-map rows are the biker jacket and crop tee: those parts
+have **no albedo**, so a preview must render them as clay rather than invent a colour.
+
+- **The belt is not a separate part.** It is 172 connected components / 2,229 vertices inside the
+  jeans mesh, with no node, material or texture key; it cannot be separated without editing the
+  geometry.
+- **UVs above 1 are wraps, not atlas pages.** The blazer reaches U=2.0014 (1,628 vertices); after
+  subtracting 1, 90.9% of those vertices are within 1e-4 of a page-0 vertex. The jeans reach
+  U=-0.9936, a -1 mirror.
+- **The body atlas is a shared collage.** `996FDBA2DB30CC12` is 256x256 and contains several ped
+  variants (faces, a tropical shirt, blue jeans, dark cloth). Only 43.7% of the sheet is covered
+  by the body's islands, so bilinear sampling at an island edge can read a neighbouring variant.
+  The blue in an earlier preview came from the authored `baseColorFactor` `(0.200, 0.270, 0.400)`,
+  not from this atlas.
+
 ## What is not decoded
 
 - **Fragment children.** All 2,865 fragments export as the 25-vertex bounds cube described above.
@@ -106,6 +125,13 @@ scanned TTPF pools. The head has no texture reference at all.
 - **Fragment children.** All 2,865 fragments export as the flat 25-vertex / 32-triangle bounds
   grid described above. A shared body that is only a child drawable would be invisible to the
   current export.
+- **Fragment children (tested).** A SixNG fragment-child walk (2026-11-21 build) finds **no**
+  child drawables in any of the 2,865 character fragments; every one is the flat 25-vertex /
+  32-triangle grid. The path is alive on world fragments (`bus2_frag_hi`: 14 model structs, 11
+  children, a 650 KB `model_parts.glb`), so the negative is a property of the character files.
+  `ambient_femalebody` is a 596-bone skeleton plus the same 25-vertex grid; it has no skin mesh.
+  A body that exists only as a child drawable is therefore not present in `packs.rpf`'s character
+  fragments.
 - **A ped-variation table.** `common.rpf` contains `CPedVariationBodyTypeManager`
   (`0x226000`) and `CPedComponentSetManager` (`0x228000`), but neither maps a component variation
   index to a drawable plus texture. The first is height and body-shape presets
@@ -131,14 +157,16 @@ scanned TTPF pools. The head has no texture reference at all.
 
 ```powershell
 rpf9dump models <packs.rpf> <outdir>
-python - <<'PY'
+```
+
+```python
 import json
+
 items = json.load(open(r"<outdir>/packs/models/manifest.json", encoding="utf-8"))["Items"]
 names = sorted({i["Name"] for i in items})
 print(len(items), len(names))
-print(sum(n.lower().endswith(".#ft") for n in names), "fragments")
+print(sum(1 for i in items if i.get("IsFragment")), "fragments")
 print([n for n in names if "lucia" in n.lower()])
-PY
 ```
 
 ```python

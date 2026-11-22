@@ -8,6 +8,11 @@ drawables do not use this 597-name table.
 No game data is reproduced here. Offsets, counts, field layouts and a few short name/hash
 examples are enough to reproduce the measurements against a reader's own package.
 
+The fragment carries the skeleton and a **25-vertex / 32-triangle bounds grid**, not a skin mesh. A
+SixNG fragment-child walk finds no embedded drawables in any of the 2,865 `packs.rpf` character
+fragments, while world fragments do have them; see
+[character_models.md](character_models.md#what-is-not-decoded).
+
 ## The skeleton name table
 
 Source resource: `ambient_femalebody_upper_nohead.#ft` in `packs.rpf`, stream offset
