@@ -9,13 +9,27 @@ $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 # FullName paths. Deriving the prefix from Resolve-Path then cuts the wrong number of characters and
 # re-carves already-caved archives; use the canonical form for both sides of the Substring.
 $prefix = (Get-Item -LiteralPath $Game).FullName.TrimEnd('\') + '\'
-$rows = @()
-foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -Filter *.rpf | Sort-Object Length) {
+$destinations = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+# Validate every destination before accepting any cached index or starting a carve.
+$archives = foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -Filter *.rpf | Sort-Object Length) {
     $rel = $f.FullName.Substring($prefix.Length)
-    $dest = Join-Path $Out ([IO.Path]::GetFileNameWithoutExtension(($rel -replace "[\\/]", "_")))
+    $name = [IO.Path]::GetFileNameWithoutExtension(($rel -replace "[\\/]", "_"))
+    if ($destinations.ContainsKey($name)) {
+        throw ("Archives '{0}' and '{1}' both map to '{2}'." -f $destinations[$name], $rel, $name)
+    }
+    $destinations.Add($name, $rel)
+    [pscustomobject]@{ file = $f; relative = $rel; destination = Join-Path $Out $name }
+}
+
+$rows = @()
+foreach ($archive in $archives) {
+    $f = $archive.file
+    $rel = $archive.relative
+    $dest = $archive.destination
     if (-not (Test-Path -LiteralPath (Join-Path $dest "index.json"))) {
         Write-Host ("{0:HH:mm:ss} carving {1} ({2:N1} GiB)" -f (Get-Date), $rel, ($f.Length / 1GB))
         python -I $tool $f.FullName $dest | Select-Object -Last 1
+        if ($LASTEXITCODE -ne 0) { throw "Carving $rel failed (exit $LASTEXITCODE)" }
     }
     $s = (Get-Content -LiteralPath (Join-Path $dest "index.json") -Raw | ConvertFrom-Json).summary
     $rows += [pscustomobject]@{ archive = $rel; files = $s.files; bink2 = $s.bink2_files; span = $s.span

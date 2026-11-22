@@ -346,11 +346,43 @@ class CliTest(unittest.TestCase):
         self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps"})
 
     def test_parent_stage_index_is_used_when_local_index_is_empty_or_unrelated(self):
-        for data in ({"unrelated": []}, [], {}):
+        for data in (
+            {"unrelated": []},
+            [],
+            {},
+            [{"file": "a.bin"}],
+            [{"file": "a.dxbc", "stage": None}],
+            [{"file": "a.dxbc", "stage": ""}],
+        ):
             with self.subTest(data=data):
                 with open(os.path.join(self.fssm_dir, "index.json"), "w", encoding="utf-8") as f:
                     json.dump(data, f)
                 self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps", "b": "ps"})
+
+    def test_stage_index_skips_malformed_rows_and_normalizes_subpaths(self):
+        with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump([
+                {"missing_file": True, "stage": "ps"},
+                {"file": None, "stage": "ps"},
+                {"file": "a.dxbc", "stage": None},
+                {"file": "dxbc/a.dxbc", "stage": "ps"},
+            ], f)
+        self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps"})
+
+    def test_unindexed_blob_falls_back_to_table_only_tally(self):
+        unlisted = os.path.join(self.fssm_dir, "unlisted.fssm")
+        with open(unlisted, "wb") as f:
+            f.write(blob([record(1, 0xF, 0, 0, 0x12), record(2, 0x3, 1, 1, 0x01)]))
+        p = subprocess.run([sys.executable, "-I", TOOL, unlisted, "--json"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        tally = json.loads(p.stdout)["tally"]
+        self.assertEqual(tally["stage_source"], "table-only")
+        self.assertEqual(tally["ps_with_table"], 1)
+        self.assertEqual(tally["entries"], 2)
+        self.assertEqual(tally["entry_counts"], {"2": 1})
+        self.assertEqual(tally["read_methods"], {"interp": 1, "mov": 1})
+
 
 
 class BindingCliTest(unittest.TestCase):

@@ -38,23 +38,23 @@ All 16 DLLs in the package map at their preferred base `0x180000000` with no rel
 | Image | Size of image | Entry RVA | Shim | Host | Module | Unimplemented |
 |---|---:|---:|---:|---:|---:|---:|
 | `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 3 | 57 | 0 | 0 |
-| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 3 | 54 | 0 | 0 |
-| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 5 | 81 | 0 | 0 |
-| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 4 | 18 | 0 | 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 10 | 188 | 0 | 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 8 | 132 | 0 | 0 |
-| `concrt140.dll` | 303,104 | `0x29160` | 1 | 102 | 0 | 0 |
+| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 4 | 53 | 0 | 0 |
+| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 6 | 80 | 0 | 0 |
+| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 5 | 17 | 0 | 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 11 | 187 | 0 | 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 9 | 131 | 0 | 0 |
+| `concrt140.dll` | 303,104 | `0x29160` | 2 | 101 | 0 | 0 |
 | `msvcp140.dll` | 577,536 | `0x525a0` | 9 | 178 | 0 | 0 |
-| `msvcp140_1.dll` | 36,864 | `0x15c0` | 1 | 32 | 0 | 0 |
-| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 1 | 95 | 0 | 0 |
-| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 3 | 61 | 0 | 0 |
-| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 1 | 23 | 0 | 0 |
-| `vccorlib140.dll` | 344,064 | `0x27e50` | 6 | 108 | 0 | 0 |
+| `msvcp140_1.dll` | 36,864 | `0x15c0` | 2 | 31 | 0 | 0 |
+| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 2 | 94 | 0 | 0 |
+| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 4 | 60 | 0 | 0 |
+| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 2 | 22 | 0 | 0 |
+| `vccorlib140.dll` | 344,064 | `0x27e50` | 7 | 107 | 0 | 0 |
 | `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 |
 | `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 |
 | `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 |
 
-Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged.
+Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged. `DisableThreadLibraryCalls` is served the same way: a mapped module gets `TRUE` (the real function refuses a module the Windows loader did not map, which failed the `DllMain` of the four `msvcp140_*` satellite DLLs), and any other handle goes to the real function.
 
 The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
 
@@ -154,10 +154,18 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl` and `XNetworkingImpl` (below); for any
-other class it logs the class and interface id and returns `0x80070032`, the documented error for a class the runtime
-doesn't provide, so the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives
-this path through the api-set binding `XCurl.dll` uses, and calls the served classes slot by slot.
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
+the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
+the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
+the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
+
+`XCurl.dll` has a second way in. One of its functions reads `HKLM\Microsoft\GamingServices` value
+`ServiceRetryTimeout`, then `LoadLibraryExW(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` and
+`GetProcAddress`es `GetApiVersionImpl` and `QueryApiImpl`. It calls the first through the CFG dispatch with two
+pointers to 64-bit locals (the result is not read), compares the pair with the one it saw last and keeps it. On the
+host that load would find a PC's Gaming Services runtime, which bypasses the offline classes, or nothing, in which
+case XCurl returns `0x87E00196`. The shims own `gameplatformservices.dll` too: its `QueryApiImpl` is the offline
+one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time.
 
 ### Class layouts, measured
 
@@ -175,13 +183,18 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 |---|---|---|
 | `XThreadingImpl` (`IXThreadingImpl`, 28 methods, slots 3-30) | 3-7 and 9-30 (`libHttpClient.GDK.dll`), 3, 5, 12, 16-18, 22, 29 (`XCurl.dll`) | e.g. 7 `XAsyncBegin` (5 args), 9 `XAsyncSchedule` (pointer, 32-bit), 10 `XAsyncComplete` (pointer, HRESULT, size), 12 `XTaskQueueCreate` (two 32-bit modes, pointer), 16 `XTaskQueueDispatch` (returns a byte), 19 `XTaskQueueSubmitDelayedCallback` (5 args), 22 `XTaskQueueTerminate` (pointer, bool, two pointers), 27 `XThreadSetTimeSensitive` (bool), 30 `XThreadIsTimeSensitive` (returns a byte). Slot 8 (`XAsyncBeginAlloc`, private) is never called; slot 28 (`XTaskQueueIsEmpty`, private) takes no arguments |
 | `XErrorImpl` (`IXErrorImpl`, slots 3-5) | 3 (`XCurl.dll`) | slot 3, the docs' `_unknown_`, takes an HRESULT and a pointer: `XErrorReport(HRESULT, const char*)` |
-| `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool) |
+| `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`), 3-20 (`libHttpClient.GDK.dll`, each in its documented argument shape, e.g. 18-20 (enum, u64 pointer / u64 / pointer)) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Served offline, asked for with `IXNetworkingImpl2`'s id |
+| `XSystemImpl` (`IXSystemImpl5`, slots 3-8 known) | 3-8 (`libHttpClient.GDK.dll`) | 3-5 `XSystemGetConsoleId` / `GetXboxLiveSandboxId` / `GetAppSpecificDeviceId` (size, pointer, pointer each), 6 `XSystemHandleTrack` (two pointers, IXSystemImpl3), 7 `XSystemIsHandleValid` (pointer), 8 `XSystemAllowFullDownloadBandwidth` (bool, IXSystemImpl4); IXSystemImpl2 and 5 add no known method. Served offline |
+| `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Not served yet |
 
 `XThreadingImpl` forwards each slot to `third_party/xtaskqueue`, the same implementation the named exports use;
 `XThreadSetTimeSensitive`/`XThreadIsTimeSensitive` keep a per-thread flag and the two private slots log once and
-answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetCallback` set. `XNetworkingImpl`
-reports an initialized network with unrestricted internet access for connectivity hints offline, succeeds certificate
-verification, and tracks hint-change registration tokens.
+answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetCallback` set.
+`XNetworkingImpl` answers as a console without a network would: the connectivity hint is initialized with no
+connectivity (level None), the port and URL security-information queries fail with
+`HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
+certificate check fails the same way, change registrations return tokens that never fire, and the three
+`IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
@@ -189,7 +202,7 @@ xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; co
 | Module | Runtime classes referenced (highest interface id present) |
 |---|---|
 | `XCurl.dll` | `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` (`IXNetworkingImpl2`) |
-| `libHttpClient.GDK.dll` | 24 of the 24 documented classes, each GUID once, the pattern of a linked id table rather than of use. Highest interfaces: `IXSystemImpl5`, `IXUserImpl5` (not 6), `IXGameImpl3`, `IXStoreImpl6`, `IXPackageImpl3` (not 4), `IXGameUiImpl4`, `IXGameSaveImpl3`, `IXGameStreamingImpl3`, `IXPersistentLocalStorageImpl3`, `IXUserDeviceImpl2`, `IXNetworkingImpl2` |
+| `libHttpClient.GDK.dll` | 24 of the 24 documented classes, each GUID once. Five are called through thunks ("Class layouts, measured" below): `XThreadingImpl` (27 thunks), `XPackageImpl` (30), `XNetworkingImpl` (18), `XSystemImpl` (6), `XErrorImpl` (3); the others are referenced only by the id table. Highest interfaces: `IXSystemImpl5`, `IXUserImpl5` (not 6), `IXGameImpl3`, `IXStoreImpl6`, `IXPackageImpl3` (not 4), `IXGameUiImpl4`, `IXGameSaveImpl3`, `IXGameStreamingImpl3`, `IXPersistentLocalStorageImpl3`, `IXUserDeviceImpl2`, `IXNetworkingImpl2` |
 | every other `.dll` | none |
 
 So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
@@ -202,6 +215,30 @@ the host Windows loader (excluding data-file loads and host-preferred CRTs). The
 binds its console imports (`xmem.dll`, `d3d12_xs.dll`) through the shim registry, runs its `DllMain` and TLS callbacks,
 and resolves direct, ordinal and forwarded exports from the mapped image. `run_tiny_bundled_load` exercises this path
 end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMemFree`.
+
+## WinHTTP offline
+
+`XCurl.dll` and `libHttpClient.GDK.dll` do their HTTP through WinHTTP: between them they import 16 functions from
+`winhttp.dll` (`WinHttpOpen`, `Connect`, `OpenRequest`, `SendRequest`, `ReceiveResponse`, `QueryHeaders`,
+`QueryDataAvailable`, `ReadData`, `WriteData`, `AddRequestHeaders`, `SetOption`, `QueryOption`, `SetTimeouts`,
+`SetStatusCallback`, `CloseHandle`, `CrackUrl`) and nothing from Winsock. Nothing here goes online, so `gta6rt` owns
+`winhttp.dll` (`runtime/shims/winhttp_offline.cpp`) and answers all 16 in-process:
+
+- Sessions, connections and requests are local handles: no name is resolved and no socket is opened.
+- `WinHttpSendRequest` fails with `ERROR_WINHTTP_CANNOT_CONNECT`. On a `WINHTTP_FLAG_ASYNC` session it returns `TRUE`
+  and the failure arrives as WinHTTP delivers one: `WINHTTP_CALLBACK_STATUS_REQUEST_ERROR` with `{API_SEND_REQUEST,
+  ERROR_WINHTTP_CANNOT_CONNECT}`, on a thread-pool thread, with the request's context. A request closed first gets
+  no error callback.
+- Reading a response and `WinHttpWriteData` fail with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`. Options, timeouts and
+  headers are accepted; `WINHTTP_OPTION_CONTEXT_VALUE` and `WINHTTP_OPTION_HANDLE_TYPE` can be queried.
+- A status callback is inherited by child handles, which report `HANDLE_CREATED`; every handle reports
+  `HANDLE_CLOSING` once, last. `WinHttpCrackUrl` only parses, so it is the host's.
+- Because the shims own the module, a title's `LoadLibrary("winhttp.dll")` gets a pseudo-handle too, and a WinHTTP
+  function outside these 16 resolves to `NULL` (logged), never to the host.
+
+Each refused server is logged once (`[rt] winhttp: offline, refused <host>:<port>`), which records what a title
+tried to reach. `runtime/test/winhttp_offline_test.cpp` (ctest `winhttp_offline`) covers the synchronous and
+asynchronous paths with `.invalid` names; it opens no connection.
 
 ## What this proves and what it does not
 

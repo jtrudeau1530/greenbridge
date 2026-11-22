@@ -299,6 +299,12 @@ class MqsadU32Tests(unittest.TestCase):
             with self.subTest(x=hex(x), y=hex(y)):
                 self.assertEqual(run_op(x, y, accs), ref(x, y, accs))
 
+    def test_null_pixel_source(self) -> None:
+        y, accs = 0x04000201, [0, 10, 20, M32]
+        lines = [f"v_mov_b32 v1, {y:#x}"] + [f"v_mov_b32 v{4 + k}, {v:#x}" for k, v in enumerate(accs)]
+        got = run_lines(lines + ["v_mqsad_u32_u8 v[8:11], null, v1, v[4:7]"])
+        self.assertEqual(got, ref(0, y, accs))
+
     def test_sgpr_source_pair(self):
         got = run_lines(["s_mov_b32 s2, 0x04030201", "s_mov_b32 s3, 0x08070605", "v_mov_b32 v1, 0x04030201"]
                         + [f"v_mov_b32 v{4 + k}, 0" for k in range(4)]

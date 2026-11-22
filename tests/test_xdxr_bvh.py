@@ -208,6 +208,29 @@ class ClosestHit(unittest.TestCase):
         self.assertGreater(hits, 50)
         self.assertGreater(rec, 0)
 
+    def test_tlas_bounds_and_inverse_use_the_stored_transform(self) -> None:
+        triangles = [[(1, 0, 0), (2, 0, 0), (1, 1, 0)]]
+        blas, info = X.build_blas(triangles)
+        mem = X.Memory()
+        blas_va = mem.place(0x100000, blas)
+        # The x scale rounds down in float32. Its translation then places
+        # the triangle's left edge at x = 0 rather than x = 1.
+        matrix = [[16777217, 0, 0, -16777216], [0, 1, 0, 0], [0, 0, 1, 0]]
+        instance = X.Instance(matrix, blas_va, info["root"], info["bounds"])
+        tlas, metadata = X.build_tlas([instance])
+        root = X.ptr_offset(metadata["root"])
+        instance_offset = X.ptr_offset(struct.unpack_from("<I", tlas, root)[0])
+        stored_x = struct.unpack_from("<4f", tlas, instance_offset)
+        self.assertEqual(stored_x, (16777216.0, 0.0, 0.0, -16777216.0))
+        self.assertEqual(struct.unpack_from("<6f", tlas, root + 16),
+                         (0.0, 0.0, 0.0, 16777216.0, 1.0, 0.0))
+        self.assertEqual(struct.unpack_from("<4f", tlas, instance_offset + 64),
+                         (2.0 ** -24, 0.0, 0.0, 1.0))
+        tlas_va = mem.place(0x200000, tlas)
+        hit = X.trace(mem, tlas_va, (0.25, 0.25, -1.0), (0.0, 0.0, 1.0))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["primitive"], 0)
+
     def test_instance_record(self):
         data, info = X.build_blas([TRI])
         inst = X.Instance([[1, 0, 0, 5], [0, 1, 0, 0], [0, 0, 1, 0]], 0x12300, info["root"], info["bounds"],
@@ -261,6 +284,63 @@ class Validate(unittest.TestCase):
         self.assertEqual(X.validate(b"\0" * 10), ["buffer shorter than the 64-byte header"])
 
 
+
+def console_layout(data, k):
+    """The same structure with the parent table laid out as the console writes it: offsetToParents negative, the entries
+    of the first k units (the leaves) before the header and not stored, the rest stored from the header end on."""
+    flags, units, crc, n, *rest = struct.unpack_from("<4I6fIiIIiI", data, 0)
+    nodes, remap, root, elements, parents, cp = rest[6:]
+    out = bytearray(data)
+    slots = (elements - parents) // 4
+    entries = [struct.unpack_from("<I", data, parents + 4 * u)[0] for u in range(slots)]
+    kept = entries[k:] + [0] * k
+    for i, e in enumerate(kept):
+        struct.pack_into("<I", out, parents + 4 * i, e)
+    struct.pack_into("<4I6fIiIIiI", out, 0, flags, units, crc, n, *rest[0:6], nodes, remap, root, elements,
+                     parents - 4 * k, cp)
+    return bytes(out), parents - 4 * k
+
+
+class ConsoleParentTable(unittest.TestCase):
+    """RT-151 review: real console structures have offsetToParents negative and store only the entries from the header
+    end on (docs/bvh.md 3.1); validate() used to raise struct.error on them."""
+
+    def build(self):
+        tris = [((i * 0.1, 0, 0), (i * 0.1 + 1, 0, 0), (i * 0.1, 1, 0)) for i in range(20)]
+        data, info = X.build_blas(tris)
+        return data, info
+
+    def test_a_negative_offset_to_parents_validates(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64           # the leaf units
+        con, off = console_layout(data, k)
+        self.assertLess(off, 0)
+        self.assertEqual(X.validate(con), [])
+
+    def test_a_wrong_stored_entry_is_still_caught(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64
+        con, off = console_layout(data, k)
+        bad = bytearray(con)
+        for entry in range(64, info["elements"], 4):                # every stored entry
+            struct.pack_into("<I", bad, entry, struct.unpack_from("<I", bad, entry)[0] ^ 0x10)
+        self.assertTrue(any("parent table entry" in e for e in X.validate(bytes(bad))))
+
+    def test_unstored_entries_are_not_compared(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64
+        con, off = console_layout(data, k)
+        self.assertLess(off + 4 * (k - 1), 64)                      # the last leaf entry lies before the header end
+        self.assertEqual(X.validate(con), [])
+
+    def test_a_runtime_build_keeps_its_offset_and_is_still_checked(self):
+        data, info = self.build()
+        self.assertEqual(X.validate(data), [])
+        bad = bytearray(data)
+        for entry in range(64, info["elements"], 4):
+            struct.pack_into("<I", bad, entry, struct.unpack_from("<I", bad, entry)[0] ^ 0x10)
+        self.assertTrue(any("parent table entry" in e for e in X.validate(bytes(bad))))
+
 class CheckBuild(unittest.TestCase):
     """check-build on cases written the way vk_xdxr_build_test writes them, built here by the reference."""
 
@@ -298,6 +378,19 @@ class CheckBuild(unittest.TestCase):
 
     def test_corrupted_leaves_fail(self):
         self.assertTrue(self.run_check(True))
+
+    def test_literal_bracket_path_via_main(self):
+        # a directory with '[' and ']' in its name must not be treated as a glob: main must
+        # discover the cases and run validation rather than silently returning the 77 skip code.
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "cases[1]")
+            os.mkdir(d)
+            self.write_cases(d, corrupt=False)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = X.main(["check-build", d])
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertIn("all cases match", out.getvalue())
 
     def test_empty_directory(self):
         with tempfile.TemporaryDirectory() as d:

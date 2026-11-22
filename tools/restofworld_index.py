@@ -129,7 +129,7 @@ def _printable(data):
     if not data:
         return False
     sample = data[:512]
-    good = sum(1 for b in sample if 9 <= b < 127 or b in (10, 13))
+    good = sum(1 for b in sample if 32 <= b < 127 or b in (9, 10, 13))
     return len(sample) >= 64 and good / len(sample) > 0.9
 
 
@@ -476,6 +476,19 @@ def byte_count(text):
     return value
 
 
+def _samefile(source, out):
+    """True when `out` names the same existing file as `source`.
+
+    os.path.samefile needs both paths on disk, so a not-yet-written output is
+    reported as "no alias" instead of forcing a scan or a write first. Any other
+    comparison failure propagates for the caller to report.
+    """
+    try:
+        return os.path.samefile(source, out)
+    except FileNotFoundError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin/.bk2 files")
@@ -494,9 +507,15 @@ def main():
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
     try:
-        overwrites_source = os.path.samefile(args.source, args.out)
-    except FileNotFoundError:
-        overwrites_source = False
+        overwrites_source = _samefile(args.source, args.out)
+        if not overwrites_source and os.path.isdir(args.source) and os.path.isfile(args.out):
+            # Protect scanned payloads and their carve manifest, including hard-link aliases.
+            for name in sorted(os.listdir(args.source)):
+                if name == "index.json" or name.endswith(".bin") or name.endswith(".bk2"):
+                    full = os.path.join(args.source, name)
+                    if os.path.isfile(full) and _samefile(full, args.out):
+                        overwrites_source = True
+                        break
     except OSError as e:
         ap.error(f"cannot compare source and output paths: {e}")
     if overwrites_source:

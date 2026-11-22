@@ -380,7 +380,7 @@ class InterpP1lvF16HalvesFallbackTests(unittest.TestCase):
         self.assertEqual([w & 0xFFFF for w in words[:3]], [0x3C00, 0x3C00, 0x3800])
         self.assertEqual(words[3], f32_bits(3.5))
 
-    def test_p1lv_f16_halves_location_clash_rejected(self):
+    def test_p1lv_f16_halves_location_clash_packs_and_overflow_rejects(self):
         clash = [
             "v_mov_b32_e32 v10, 0",
             "v_interp_p1lv_f16 v2, v0, attr0.x, v10",
@@ -390,9 +390,24 @@ class InterpP1lvF16HalvesFallbackTests(unittest.TestCase):
             "exp mrt0 v2, v3, v3, v3 done vm",
             "s_endpgm",
         ]
+        spv, meta = translate_with_flags("ps_p1lv_fh_packed", clash, f16_halves=True)
+        self.assertEqual(meta["f16_halves"], {"0": [27, 28]})
+        self.assertIn("OpDecorate %in_f16h0_0 Location 27", spv)
+        self.assertIn("OpDecorate %in_attr29 Location 29", spv)
+
+        overflow = ["v_mov_b32_e32 v10, 0"]
+        for a in range(29):
+            overflow += [f"v_interp_p1_f32_e32 v{20 + a}, v0, attr{a}.x",
+                         f"v_interp_p2_f32_e32 v{20 + a}, v1, attr{a}.x"]
+        overflow += [
+            "v_interp_p1lv_f16 v2, v0, attr0.x, v10",
+            "v_interp_p2_f16 v2, v1, attr0.x, v2",
+            "exp mrt0 v2, v20, v20, v20 done vm",
+            "s_endpgm",
+        ]
         with self.assertRaises(rdna2spirv.Unsupported) as cm:
-            translate_with_flags("ps_p1lv_fh_clash", clash, f16_halves=True)
-        self.assertIn("decoded-half location", str(cm.exception))
+            translate_with_flags("ps_p1lv_fh_overflow", overflow, f16_halves=True)
+        self.assertIn("decoded-half locations", str(cm.exception))
 
 
 class InterpF16BaryFallbackTests(unittest.TestCase):
