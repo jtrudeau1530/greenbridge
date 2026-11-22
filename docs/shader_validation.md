@@ -246,8 +246,22 @@ dword aligned (sub-dword loads at their natural alignment), with no format in wo
 results, `OOB_SELECT`, swizzling and the `s_buffer_load` alignment truncation depend on descriptor
 fields the translator does not model yet, so they need a GPU-confirmed rule before they are fuzzed.
 `spirv_mini_interp` gained `OpSConvert` and the 32-bit atomics on PhysicalStorageBuffer memory for
-this. Not covered yet: `buffer_load_format_*`/`tbuffer_load_format_*` (about 137,000 instructions in
-the corpus) and images.
+this. Not covered yet: images.
+
+The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
+random DST_SEL of 0/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
+(`16_16_SNORM`, `8_8_8_8_UNORM`, `8_8_8_8_UINT`, `2_10_10_10_UNORM`, `16_16_16_16_UINT`, about 53,000
+instructions) with an identity swizzle. Its reference decodes each element from the GFX10 format *name*
+(`tools/gfx10_formats.json`; channel widths listed from the top bit), not from the translator's own
+table: UNORM/SNORM correctly rounded, missing channels 0, 0, 0, 1. Elements are naturally aligned. Left
+out: DST_SEL 1 on integer formats, and whether `tbuffer` applies the V#'s DST_SEL (neither is measured).
+
+Two results are counted apart, not as mismatches, until a gfx10 hardware measurement settles them
+(posted in #374): `norm-ulp1`, a UNORM/SNORM result 1 ULP from the correctly rounded value (the
+translator multiplies by a rounded reciprocal), and `missing-w32`, the missing W of a 32-bit format,
+where the translator returns 0 and every other format 1 / 1.0. Over 5,000 programs, everything else
+matches; breaking the `16_16_SNORM` kind, the `8_8_8_8_UINT` widths or the DST_SEL order in the
+translator makes 33, 37 and 191 of 300 programs fail.
 
 A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
 76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
