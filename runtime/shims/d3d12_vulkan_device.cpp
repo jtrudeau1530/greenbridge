@@ -1,8 +1,9 @@
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
-// committed buffers and textures (2D, multisampled 2D, 3D), allocation info, CPU texture copies (WriteToSubresource/
-// ReadFromSubresource), a few feature queries. Everything else is a generated stub that reports itself once. See
-// docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what is still open.
+// committed buffers and textures (2D, multisampled 2D, 3D) and their 1/2/3 variants, allocation info, CPU
+// texture copies (WriteToSubresource/ReadFromSubresource), a few feature queries. Everything else is a generated
+// stub that reports itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what
+// is still open.
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
@@ -57,9 +58,15 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R16G16B16A16_TYPELESS: return {VK_FORMAT_R16G16B16A16_SFLOAT, color, true};
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return {VK_FORMAT_R16G16B16A16_SFLOAT, color};
     case DXGI_FORMAT_R16G16B16A16_UNORM: return {VK_FORMAT_R16G16B16A16_UNORM, color};
+    case DXGI_FORMAT_R16G16B16A16_UINT: return {VK_FORMAT_R16G16B16A16_UINT, color};
+    case DXGI_FORMAT_R16G16B16A16_SINT: return {VK_FORMAT_R16G16B16A16_SINT, color};
+    case DXGI_FORMAT_R32G32_TYPELESS: return {VK_FORMAT_R32G32_SFLOAT, color, true};
     case DXGI_FORMAT_R32G32_FLOAT: return {VK_FORMAT_R32G32_SFLOAT, color};
+    case DXGI_FORMAT_R32G32_UINT: return {VK_FORMAT_R32G32_UINT, color};
+    case DXGI_FORMAT_R32G32_SINT: return {VK_FORMAT_R32G32_SINT, color};
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color, true};
     case DXGI_FORMAT_R10G10B10A2_UNORM: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color};
+    case DXGI_FORMAT_R10G10B10A2_UINT: return {VK_FORMAT_A2B10G10R10_UINT_PACK32, color};
     case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: return {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, color};
     case DXGI_FORMAT_R11G11B10_FLOAT: return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, color};
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: return {VK_FORMAT_R8G8B8A8_UNORM, color, true};
@@ -71,9 +78,15 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_B8G8R8A8_TYPELESS: return {VK_FORMAT_B8G8R8A8_UNORM, color, true};
     case DXGI_FORMAT_B8G8R8A8_UNORM: return {VK_FORMAT_B8G8R8A8_UNORM, color};
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return {VK_FORMAT_B8G8R8A8_SRGB, color};
+    case DXGI_FORMAT_R16G16_TYPELESS: return {VK_FORMAT_R16G16_SFLOAT, color, true};
     case DXGI_FORMAT_B5G5R5A1_UNORM: return {VK_FORMAT_A1R5G5B5_UNORM_PACK16, color};
     case DXGI_FORMAT_R16G16_FLOAT: return {VK_FORMAT_R16G16_SFLOAT, color};
+    case DXGI_FORMAT_R16G16_UINT: return {VK_FORMAT_R16G16_UINT, color};
+    case DXGI_FORMAT_R16G16_SINT: return {VK_FORMAT_R16G16_SINT, color};
+    case DXGI_FORMAT_R8G8_TYPELESS: return {VK_FORMAT_R8G8_UNORM, color, true};
     case DXGI_FORMAT_R8G8_UNORM: return {VK_FORMAT_R8G8_UNORM, color};
+    case DXGI_FORMAT_R8G8_UINT: return {VK_FORMAT_R8G8_UINT, color};
+    case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
     case DXGI_FORMAT_R16_FLOAT: return {VK_FORMAT_R16_SFLOAT, color};
     case DXGI_FORMAT_R8_UNORM: return {VK_FORMAT_R8_UNORM, color};
     case DXGI_FORMAT_R32_FLOAT: return {VK_FORMAT_R32_SFLOAT, color};
@@ -1378,6 +1391,63 @@ public:
         state_.bind_sampler(words);
     }
 
+    // CreateSampler with a UINT border colour and non-normalized coordinates (D3D-28). A description the PC runtime
+    // refuses leaves the slot as it was, as the runtime itself does (without the debug layer) on an RTX 4090 and
+    // on WARP: docs/d3d12_vulkan.md section 3.2.
+    void STDMETHODCALLTYPE CreateSampler2(const D3D12_SAMPLER_DESC2* desc,
+                                          D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!destination.ptr || !desc) return;
+        const char* refusal = sampler2_refusal(*desc);
+        if (refusal) {
+            log_once(refusal, desc->Flags);
+            return;
+        }
+        const bool uint_border = desc->Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+        D3D12_SAMPLER_DESC base{desc->Filter,   desc->AddressU,      desc->AddressV,       desc->AddressW,
+                                desc->MipLODBias, desc->MaxAnisotropy, desc->ComparisonFunc, {},
+                                desc->MinLOD,   desc->MaxLOD};
+        if (!uint_border) std::memcpy(base.BorderColor, desc->FloatBorderColor, sizeof(base.BorderColor));
+        leonida::gfx10::Sampler sampler = sampler_descriptor(base);
+        if (uint_border) {
+            // The S#'s border types are the float ones', plus the layer's integer mark (kIntegerBorderPtr), which
+            // gives the integer border its own key and VK_BORDER_COLOR_INT_* in Vulkan.
+            namespace g = leonida::gfx10;
+            const UINT* c = desc->UintBorderColor;
+            const bool black = c[0] == 0 && c[1] == 0 && c[2] == 0;
+            sampler.border_color = black && c[3] == 0                                 ? g::BorderColor::transparent_black
+                                   : black && c[3] == 1                               ? g::BorderColor::opaque_black
+                                   : c[0] == 1 && c[1] == 1 && c[2] == 1 && c[3] == 1 ? g::BorderColor::opaque_white
+                                                                                      : g::BorderColor::table;
+            sampler.integer_border = true;
+        }
+        sampler.unnormalized = desc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+        const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler);
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.bind_sampler(words);
+    }
+
+    // Why the PC runtime refuses a D3D12_SAMPLER_DESC2, or null. The non-normalized rules are its debug layer's
+    // messages, which match Vulkan's for unnormalizedCoordinates; AddressW is free in both.
+    static const char* sampler2_refusal(const D3D12_SAMPLER_DESC2& desc) {
+        if (desc.Flags & ~UINT(D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR | D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES))
+            return "CreateSampler2 refused: unknown sampler flags; flags";
+        if (!(desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)) return nullptr;
+        if (D3D12_DECODE_MIN_FILTER(desc.Filter) != D3D12_DECODE_MAG_FILTER(desc.Filter) ||
+            D3D12_DECODE_MIP_FILTER(desc.Filter) != D3D12_FILTER_TYPE_POINT ||
+            D3D12_DECODE_IS_ANISOTROPIC_FILTER(desc.Filter) ||
+            D3D12_DECODE_FILTER_REDUCTION(desc.Filter) == D3D12_FILTER_REDUCTION_TYPE_COMPARISON)
+            return "CreateSampler2 refused: non-normalized sampler filter; flags";
+        const auto clamps = [](D3D12_TEXTURE_ADDRESS_MODE m) {
+            return m == D3D12_TEXTURE_ADDRESS_MODE_CLAMP || m == D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        };
+        if (!clamps(desc.AddressU) || !clamps(desc.AddressV))
+            return "CreateSampler2 refused: non-normalized sampler address mode; flags";
+        if (desc.MinLOD != 0 || desc.MaxLOD != 0 || desc.MipLODBias != 0)
+            return "CreateSampler2 refused: non-normalized sampler LOD; flags";
+        return nullptr;
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                       const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
@@ -1387,7 +1457,7 @@ public:
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            hr = resource->create_buffer();
+            hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0 ? resource->create_buffer() : E_INVALIDARG;
         } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
             log_once("committed resource dimension not supported:", desc->Dimension);
@@ -1397,11 +1467,12 @@ public:
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
             hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
         } else if (const UINT samples = desc->SampleDesc.Count;
-                   samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
-                                   desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-                                   !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))) {
-            hr = E_INVALIDARG;  // D3D12: a multisampled texture is a single-mip 2D render target or depth-stencil
+                   !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || desc->SampleDesc.Quality != 0 ||
+                   (samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
+                                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                                    !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))) {
+            hr = E_INVALIDARG;  // D3D12: nonzero power-of-two sample count up to 32; MSAA needs a single-mip 2D attachment
         } else {
             const Format format = state_.texture_format(*desc);
             if (format.format == VK_FORMAT_UNDEFINED) {
@@ -1481,6 +1552,70 @@ public:
             tilings[i] = {s.width, UINT16(s.height), UINT16(s.depth), s.start};
         }
         *count = n;
+    }
+
+    // The 1/2/3 variants (D3D-28) are the same calls with newer arguments, answered as the PC runtime answers them
+    // (probed on an RTX 4090; docs/d3d12_vulkan.md section 3.2 has the table). The initial state or layout is not
+    // used: new textures are tracked as UNDEFINED and moved on first use, and buffers have no layout.
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                                       const D3D12_CLEAR_VALUE* clear,
+                                                       ID3D12ProtectedResourceSession* session, REFIID riid,
+                                                       void** out) override {
+        if (out) *out = nullptr;
+        if (session) return refuse_protected_session(1);
+        return CreateCommittedResource(heap, heap_flags, desc, state, clear, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource2(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+                                                       const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES state,
+                                                       const D3D12_CLEAR_VALUE* clear,
+                                                       ID3D12ProtectedResourceSession* session, REFIID riid,
+                                                       void** out) override {
+        if (out) *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        if (session) return refuse_protected_session(2);
+        if (texture_mip_region(*desc)) return E_INVALIDARG;
+        const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        return CreateCommittedResource(heap, heap_flags, &base, state, clear, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource3(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+                                                       const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
+                                                       const D3D12_CLEAR_VALUE* clear,
+                                                       ID3D12ProtectedResourceSession* session, UINT32 castable_count,
+                                                       const DXGI_FORMAT* castable, REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        if (session) return refuse_protected_session(3);
+        if (texture_mip_region(*desc)) return E_INVALIDARG;
+        // Enhanced barriers: a buffer has no layout, so its initial layout must be UNDEFINED.
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && layout != D3D12_BARRIER_LAYOUT_UNDEFINED)
+            return E_INVALIDARG;
+        // A count with a null array is no list (as on the PC runtime). A list needs RelaxedFormatCastingSupported,
+        // which the layer does not report (D3D12_OPTIONS12 is unanswered); a device without it refuses every list.
+        if (castable_count && castable) {
+            log_once("castable formats refused (no relaxed format casting); count", int(castable_count));
+            return E_INVALIDARG;
+        }
+        const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        return CreateCommittedResource(heap, heap_flags, &base, D3D12_RESOURCE_STATE_COMMON, clear, riid, out);
+    }
+
+    // Device9. The creator ID only groups queues for tools; one creator is as good as another here.
+    HRESULT STDMETHODCALLTYPE CreateCommandQueue1(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID, REFIID riid,
+                                                  void** out) override {
+        return CreateCommandQueue(desc, riid, out);
+    }
+
+    // Device8. A texture with a mip region gets the failure answer (every output all ones), as on the PC runtime;
+    // a buffer's mip region is ignored.
+    void STDMETHODCALLTYPE GetCopyableFootprints1(const D3D12_RESOURCE_DESC1* desc, UINT first, UINT count,
+                                                  UINT64 base, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows,
+                                                  UINT64* row_sizes, UINT64* total) override {
+        const D3D12_RESOURCE_DESC base_desc = desc ? resource_desc(*desc) : D3D12_RESOURCE_DESC{};
+        const bool usable = desc && !texture_mip_region(*desc);
+        GetCopyableFootprints(usable ? &base_desc : nullptr, first, count, base, layouts, rows, row_sizes, total);
     }
 
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
@@ -1582,6 +1717,9 @@ public:
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
         log_once("CheckFeatureSupport feature", feature);
         if (!data) return E_INVALIDARG;
+        constexpr VkSampleCountFlags d3d12_multisample_sample_counts =
+            VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT |
+            VK_SAMPLE_COUNT_16_BIT | VK_SAMPLE_COUNT_32_BIT;
         switch (feature) {
         case D3D12_FEATURE_FEATURE_LEVELS: {
             if (size != sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) return E_INVALIDARG;
@@ -1629,6 +1767,15 @@ public:
             opts->CrossAdapterRowMajorTextureSupported = FALSE;
             opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS17: {
+            // Non-normalized samplers are core Vulkan (unnormalizedCoordinates), with the restrictions
+            // CreateSampler2 checks. No manual write tracking, as the RTX 4090 answers too.
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS17)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS17*>(data);
+            *opts = {};
+            opts->NonNormalizedCoordinateSamplersSupported = TRUE;
             return S_OK;
         }
         case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
@@ -1685,7 +1832,7 @@ public:
                 if (state_.image_format_properties &&
                     state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
                                                    VK_IMAGE_TILING_OPTIMAL, usage, flags, &image_properties) == VK_SUCCESS &&
-                    (image_properties.sampleCounts & ~VK_SAMPLE_COUNT_1_BIT)) {
+                    (image_properties.sampleCounts & d3d12_multisample_sample_counts)) {
                     s1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
                           D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
                 }
@@ -1714,17 +1861,30 @@ public:
             auto* levels = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(data);
             levels->NumQualityLevels = 0;
             if (levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE ||
-                levels->SampleCount == 0 || levels->SampleCount > 64 ||
+                levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
                 (levels->SampleCount & (levels->SampleCount - 1)) != 0)
                 return E_INVALIDARG;
-            const Format format = vulkan_format(levels->Format, false);
+            Format format = vulkan_format(levels->Format, false);
+            if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                D3D12_RESOURCE_DESC depth_desc{};
+                depth_desc.Format = levels->Format;
+                depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                format = state_.texture_format(depth_desc);  // includes the D24-to-D32 fallback used by creation
+            }
             if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
                 return DXGI_ERROR_UNSUPPORTED;
 
             // Vulkan exposes one standard sample pattern per supported count, so each supported count maps to
-            // one D3D12 quality level (quality index 0). Query the exact usages used for a D3D12 RT texture.
-            const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            // one D3D12 quality level (quality index 0). Query the matching colour or depth/stencil attachment
+            // usage, plus the transfer and sampled usages used by the resource implementation.
+            VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_SAMPLED_BIT;
+            if (format.aspects & VK_IMAGE_ASPECT_COLOR_BIT)
+                usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            else if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+                usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            else
+                return DXGI_ERROR_UNSUPPORTED;
             const VkImageCreateFlags flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
             VkImageFormatProperties image_properties{};
             const VkResult result = state_.image_format_properties(state_.info.physical, format.format,
@@ -1796,8 +1956,9 @@ private:
         const UINT max_layers =
             volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
         if (!desc.Width || !desc.Height || !desc.DepthOrArraySize || desc.Width > max_extent ||
-            desc.Height > max_extent || desc.DepthOrArraySize > max_layers || !samples || samples > 16 ||
-            (samples & (samples - 1)) || desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+            desc.Height > max_extent || desc.DepthOrArraySize > max_layers || !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
+            (samples & (samples - 1)) || desc.SampleDesc.Quality != 0 ||
+            desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
             return kInvalidAllocation;
         const UINT16 full = full_mips(desc.Width, desc.Height, depth);
         D3D12_RESOURCE_DESC resolved = desc;
@@ -1944,6 +2105,26 @@ private:
         state_.transition_image_layout = transition;
     }
 
+    // The layer reports no protected-session support, so a session is refused, as D3D12 refuses one on a device
+    // without D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT. `variant` is the method's number.
+    static HRESULT refuse_protected_session(int variant) {
+        log_once("protected resource session refused (not supported) by CreateCommittedResource", variant);
+        return E_INVALIDARG;
+    }
+
+    // D3D12_RESOURCE_DESC1 is D3D12_RESOURCE_DESC plus SamplerFeedbackMipRegion.
+    static D3D12_RESOURCE_DESC resource_desc(const D3D12_RESOURCE_DESC1& desc) {
+        return {desc.Dimension, desc.Alignment, desc.Width,      desc.Height, desc.DepthOrArraySize,
+                desc.MipLevels, desc.Format,    desc.SampleDesc, desc.Layout, desc.Flags};
+    }
+
+    // A sampler-feedback mip region on a texture, which needs a DXGI_FORMAT_SAMPLER_FEEDBACK_* resource the layer
+    // does not have. The PC runtime ignores the region on a buffer.
+    static bool texture_mip_region(const D3D12_RESOURCE_DESC1& desc) {
+        const D3D12_MIP_REGION& region = desc.SamplerFeedbackMipRegion;
+        return desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (region.Width || region.Height || region.Depth);
+    }
+
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -1976,7 +2157,11 @@ bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D1
     const Format requested = vulkan_format(format, false);
     if (requested.typeless || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return false;
     if (format == DXGI_FORMAT_R32G32B32A32_UINT || format == DXGI_FORMAT_R8G8B8A8_UINT ||
-        format == DXGI_FORMAT_R32_UINT)
+        format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R16G16B16A16_UINT ||
+        format == DXGI_FORMAT_R16G16B16A16_SINT || format == DXGI_FORMAT_R32G32_UINT ||
+        format == DXGI_FORMAT_R32G32_SINT || format == DXGI_FORMAT_R10G10B10A2_UINT ||
+        format == DXGI_FORMAT_R16G16_UINT || format == DXGI_FORMAT_R16G16_SINT ||
+        format == DXGI_FORMAT_R8G8_UINT || format == DXGI_FORMAT_R8G8_SINT)
         return false;
     const auto matches = [&](ID3D12Resource* resource) {
         const D3D12_RESOURCE_DESC desc = resource->GetDesc();

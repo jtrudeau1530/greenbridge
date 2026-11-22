@@ -278,6 +278,25 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         with open(out_json, encoding="utf-8") as f:
             return res.stdout, json.load(f, parse_constant=self.fail)
 
+    def test_cli_bad_source_or_out_is_one_line(self):
+        tool = os.path.join(ROOT, "tools", "shader_profile.py")
+        a_file = os.path.join(self.disasm_dir, "ps_001.s")
+        with open(a_file, "w", encoding="utf-8") as f:
+            f.write("\tv_mov_b32 v0, 1.0\n")
+        missing = os.path.join(self.tmp.name, "missing")
+        out_in_missing = os.path.join(self.tmp.name, "no_dir", "profile.json")
+        out_is_dir = os.path.join(self.tmp.name, "out_dir")
+        os.mkdir(out_is_dir)
+        for args, message in (([missing], "does not exist"), ([a_file], "is not a folder"),
+                              ([self.disasm_dir, "--out", out_in_missing], "folder for"),
+                              ([self.disasm_dir, "--out", out_is_dir], "cannot write")):
+            with self.subTest(case=message):
+                res = subprocess.run([sys.executable, "-I", tool, *args], capture_output=True, text=True)
+                self.assertEqual(res.returncode, 2)
+                self.assertIn(message, res.stderr)
+                self.assertNotIn("Traceback", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "profile.json")))
+
     def test_cli_alu_without_memory_writes_null(self):
         with open(os.path.join(self.disasm_dir, "ps_001.s"), "w", encoding="utf-8") as f:
             f.write("\tv_mov_b32 v0, 1.0\n\ts_endpgm\n")

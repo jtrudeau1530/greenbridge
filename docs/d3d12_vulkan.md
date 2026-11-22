@@ -214,6 +214,54 @@ What is implemented (all of it testable without the game):
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
+  - the `1`/`2`/`3` variants as wrappers over the methods above (D3D-28): `CreateCommittedResource1/2/3`,
+    `CreateCommandQueue1` and `GetCopyableFootprints1`. `D3D12_RESOURCE_DESC1` drops to `D3D12_RESOURCE_DESC`,
+    and the initial state or `D3D12_BARRIER_LAYOUT` is not used, because new textures start `UNDEFINED` and move
+    on first use. The newer arguments are answered as the PC runtime answers them. `d3d12_method_variants_test`
+    compares each answer below with the host runtime live, measured on an RTX 4090 (driver 621.14):
+
+    | Argument | Answer |
+    |---|---|
+    | a protected resource session | `E_INVALIDARG`; the layer reports no `D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT` |
+    | `SamplerFeedbackMipRegion` on a texture | `E_INVALIDARG` from `CreateCommittedResource2/3`; `GetCopyableFootprints1` returns its failure answer (every output all ones) |
+    | `SamplerFeedbackMipRegion` on a buffer | ignored |
+    | a buffer's initial layout other than `UNDEFINED` | `E_INVALIDARG` |
+    | a castable-format count with a null list | no list (`S_OK`) |
+    | a castable-format list | `E_INVALIDARG`: a list needs `RelaxedFormatCastingSupported`, and the layer does not answer `D3D12_OPTIONS12`. A device without relaxed casting refuses every list (ezwinxdlmao's probe on a Radeon 680M, in #156). With it, the RTX 4090 accepts same-size casts and refuses other sizes and any list on a buffer |
+    | `CreateCommandQueue1`'s creator ID | ignored |
+
+    `CreatePlacedResource1/2` and `CreateHeap1` wait for #286's base methods.
+  - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
+    `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` reads the union as integers. `(0,0,0,0)`, `(0,0,0,1)` and `(1,1,1,1)`
+    take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types,
+    since the hardware reads them by the image's format. Vulkan does not: an integer image sampled with a
+    `VK_BORDER_COLOR_FLOAT_*` border reads 0. Vonsek found this on an RTX 5080 (#538), and `d3d12_descriptor_test`
+    reproduces it on an RTX 4090 when the layer uses the float enums. So the layer marks an integer border in the S#
+    with `BORDER_COLOR_PTR = 0x800` (`gfx10::kIntegerBorderPtr`). The hardware reads that pointer only for a table
+    colour, and Mesa writes it only for `SQ_TEX_BORDER_COLOR_REGISTER`. The mark gives the integer border its own
+    key in the descriptor hash table, so it does not share the float border's `VkSampler`, and `vulkan_sampler`
+    makes it `VK_BORDER_COLOR_INT_*`. Any other colour is a table colour, still transparent black like
+    `CreateSampler`'s custom colours, with no integer mark yet. That includes the bits of `1.0f`, which as integers
+    are not white.
+    `D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES` sets `FORCE_UNNORMALIZED` (word 0, bit 15) and changes nothing
+    else; `vulkan_sampler` makes it `unnormalizedCoordinates`. The layer answers `D3D12_OPTIONS17` with
+    `NonNormalizedCoordinateSamplersSupported` (core Vulkan, with the same restrictions) and no
+    `ManualWriteTrackingResourceSupported`. That is what the RTX 4090 and WARP report, so what the PC runtime does
+    when the feature is unreported was not measured here.
+
+    A description the PC runtime refuses leaves the slot as it was. The runtime itself does this, without the
+    debug layer, on the RTX 4090 (driver 621.14) and on WARP; the debug layer's message names the rule.
+    `d3d12_sampler2_test` compares each row with the host runtime live:
+
+    | `CreateSampler2` input | Answer |
+    |---|---|
+    | a null description | the slot is left as it was |
+    | a flag other than the two | the slot is left as it was |
+    | non-normalized, with MIN ≠ MAG, a linear MIP filter, anisotropy or comparison | the slot is left as it was; `MINIMUM`/`MAXIMUM` filters are accepted |
+    | non-normalized, with `AddressU` or `AddressV` not `CLAMP`/`BORDER` | the slot is left as it was; `AddressW` is free, as in Vulkan |
+    | non-normalized, with `MinLOD`, `MaxLOD` or `MipLODBias` not 0 | the slot is left as it was; `-0` is 0 |
+    | non-normalized, a point filter with `MaxAnisotropy` or `ComparisonFunc` set | written; both are ignored (the debug layer warns about `ComparisonFunc`) |
+    | both flags | written |
 
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
 
@@ -333,6 +381,22 @@ and any validation error fails them.
   run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
   round trip and a buffer region. `GetCopyableFootprints` is compared with the PC runtime's, and a short run
   repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
+- `d3d12_method_variants_test`: each variant against the method it wraps, on the device directly (the proxy's
+  slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 12 creation cases (buffers on the
+  three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every
+  `CreateCommittedResource` variant, which must give the same result, description, heap properties and `Map`
+  answer. It runs the edge cases in the table above and compares them with the host's PC runtime when there is
+  one; protected sessions and castable lists are checked on the layer alone. `GetCopyableFootprints1` must match
+  `GetCopyableFootprints` field by field, including the failure answer. A texture from `CreateCommittedResource3`
+  is uploaded, copied back and compared on a queue from `CreateCommandQueue1`.
+- `d3d12_sampler2_test`: `CreateSampler2` against `CreateSampler`, on the slots' bytes. It checks:
+  - 10 descriptions without flags, which must be byte for byte the same;
+  - 6 UINT and float-bit border colours against their float equivalents (the three built-in UINT colours with
+    the integer mark, which must decode to `VK_BORDER_COLOR_INT_*`);
+  - 3 non-normalized samplers, which must be `CreateSampler`'s S# with `FORCE_UNNORMALIZED` set;
+  - the `D3D12_OPTIONS17` answer;
+  - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when
+    there is one.
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
@@ -340,6 +404,10 @@ and any validation error fails them.
     BGRA cube with a component mapping, an unordered-access view (the same bytes as the shader-resource view of
     that mip), and the null descriptors of a missing resource, a texture without `ALLOW_UNORDERED_ACCESS`, a view
     past the mips and a volume.
+  - UINT border colours (Vonsek's case on #538): an `R8G8B8A8_UINT` texture sampled one tile to the right
+    through `CreateSampler2` samplers with a UINT `(0,0,0,0)` and `(1,1,1,1)` border reads 0 and 1 in every
+    channel. A float white border on the UNORM texture reads 255; its S# differs from the UINT white one only in
+    the integer mark.
   - That set 0 holds them: a compute shader (`test/glsl/cs_sample.comp`, GLSL, compiled with `glslangValidator`;
     skipped without it) is handed a slot's T# and the sampler's S#, looks them up in the hash table as a
     translated shader does, and samples. The sampler wraps in U and the shader samples one tile to the right,
@@ -529,6 +597,16 @@ private copy before calling the host serializer/deserializer; never modify the g
 bits is unknown. The v1.0 `D3D12SerializeRootSignature` path keeps flags at offset +32, and a descriptor with
 `0x3000001` also fails on the PC runtime.
 
+**Version 1.2 on older runtimes.** The in-box `d3d12.dll` of Windows 10 (measured on 22H2, 10.0.19045, without the
+Agility SDK) and of Windows 11 23H2 (#361) serializes root signatures only up to 1.1. On Windows 10 it rejects even an
+empty 1.2 description with `E_INVALIDARG`, and `D3D12_FEATURE_ROOT_SIGNATURE` reports `HighestVersion` 1.1 (#528).
+Version 1.2 differs from 1.1 only in
+`D3D12_STATIC_SAMPLER_DESC1::Flags`. So on such a host, the `d3d12_xs` serializer rewrites a 1.2 description whose
+static samplers all have `Flags == 0` as the same root signature in 1.1. It refuses one that uses sampler flags (a
+UINT border colour or non-normalized coordinates) with a log line, since 1.1 can't express them. The host is probed
+once with an empty 1.2 description. `root_sig_test` checks the rewrite field by field and through the host
+deserializer.
+
 Things that can invalidate this simple model, all **Open**:
 
 - **Shader visibility.** The layer starts with one global block in root-parameter order and treats visibility as
@@ -666,9 +744,10 @@ The trace will enumerate them.
   "supported" is worse than a false "unsupported" at boot.
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`; multisample render-target
   and resolve bits also require the format's image-usage/sample-count query to succeed.
-- `D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS`: query `vkGetPhysicalDeviceImageFormatProperties` for the same
-  colour-attachment, transfer and sampled usages used by render-target textures. Vulkan exposes one standard sample
-  pattern, so a supported sample count reports one quality level (quality index 0).
+- `D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS`: query `vkGetPhysicalDeviceImageFormatProperties` for the matching
+  colour or depth/stencil attachment usage, plus the transfer and sampled usages used by the resource implementation.
+  Vulkan exposes one standard sample pattern, so a supported sample count reports one quality level (quality index 0);
+  only D3D12's legal sample counts (powers of two up to 32) are exposed.
 - `D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT` (`D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT`): report the
   arena's limits, not the console's.
 - `GetResourceAllocationInfo` and `GetCopyableFootprints`: implement D3D12's rules locally; the game uses them to
@@ -738,6 +817,23 @@ The trace will enumerate them.
     further measured differences: on array slices after the first, the PC runtime
     writes a tile index into packed subresources instead of the documented `D3D12_PACKED_TILE` (ours follows the
     documentation), and a resource that is not reserved has no tiles (all outputs zero), as on the PC runtime.
+  - **Measured on AMD** (RX 9070 XT, RDNA4, driver 32.0.31041.1004, Windows 11, `main` `91b36cf`): the AMD PC
+    runtime splits standard and packed mips differently, so `d3d12_vulkan_device_test`'s tiling comparison fails
+    there. Tile shapes agree in all 17 texture layouts, and 11 of them match exactly; in the other 6, AMD keeps more
+    mips as standard tiles before the packed tail:
+
+    | Layout | Tile | Standard mips: ours | AMD |
+    |---|---|---|---|
+    | 1000x300 RGBA8 sRGB, 3 slices | 128x128 | 2 | 4 |
+    | 2048x1024 BC7, 2 slices | 256x256 | 3 | 4 |
+    | 1000x600 BC3 | 256x256 | 2 | 3 |
+    | 100x100 RGBA8 | 128x128 | 0 | 1 |
+    | 4096x64 BGRA8 | 128x128 | 0 | 6 |
+    | 256x256x64 RGBA8 volume | 32x32x16 | 3 | 4 |
+
+    All 17 AMD results fit "a mip is packed once every axis is at most half the tile's largest side"
+    (**Hypothesis**: one driver, one GPU). Which split the console's runtime uses, and so which one the layer should
+    follow, is **Open** ([#374](https://github.com/ItsNotRexed/Leonida/issues/374#issuecomment-7071680820)).
   - `UpdateTileMappings` / `CopyTileMappings` log once and do nothing. What that loses: two resources mapped to the
     same heap tiles do not alias, and a tile unmapped or remapped keeps its contents. If the trace shows the game
     relies on either, the next step is sparse binding (`sparseBinding`, `sparseResidencyImage2D`) with the heaps
@@ -748,7 +844,8 @@ The trace will enumerate them.
   the layer needs a detile step or a matching tiled image. **Open**; the ABI value is known, the data layout is not.
 - Formats: a `DXGI_FORMAT` → `VkFormat` table, including sRGB and typeless variants. Typeless resources get a
   concrete image format plus `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and a `VK_KHR_image_format_list` when views cast
-  within the family; unsupported casts are logged and fall back to the resource format. Depth/stencil, BCn and
+  within the family; unsupported casts are logged and fall back to the resource format. `CreateCommittedResource3`'s
+  castable-format lists are refused for now (section 3.2's device list). Depth/stencil, BCn and
   packed formats map directly; any format the device rejects is a hard error with the DXGI value.
 - `Map`/`Unmap`: upload/readback buffers map their host-visible memory; default-heap resources return
   `E_INVALIDARG` as D3D12 does. A texture in a CPU-visible custom heap maps only with a null pointer (its layout is

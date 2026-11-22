@@ -71,6 +71,30 @@ The six unique Xbox-specific imports (eight consumer/import pairs) are exactly t
 The video path (`Bink2Scarlett.dll`), the BVH builder and the FidelityFX upscaler therefore all go through the
 two shim DLLs that already exist. `libHttpClient.GDK.dll` and `XCurl.dll` import only desktop APIs.
 
+## When an unimplemented import is called
+
+The table above has no unimplemented imports, but the game executable will. A call to one used to return 0
+silently, which for an `HRESULT` function is `S_OK` with its out parameters never written; the caller then carries on
+with stale pointers and fails somewhere unrelated. `LEONIDA_UNIMPLEMENTED` chooses what the thunk does instead
+(details in `runtime/README.md`):
+
+- `log` (default): print the name once, return 0. Unchanged.
+- `fail`: return `E_NOTIMPL` for imports known to return `HRESULT`, 0 otherwise.
+- `stop`: print the import, the caller as `module+RVA` and rcx/rdx/r8/r9, then break (debugger) or exit with code 3.
+
+The `--dry-run` report ends with `unimplemented by return policy: hresult=N other=N`, so the first run against the
+executable shows how many of its missing imports `fail` would turn into errors.
+
+The `HRESULT` list is by DLL and name: `D3D12Create*` and `D3D12Serialize*` (`d3d12.dll`, `d3d12_xs.dll`),
+`D3D12GetDebugInterface`, `D3D12EnableExperimentalFeatures`, `CreateDXGIFactory*`, `DXGIGetDebugInterface1`,
+`DXGIDeclareAdapterRemovalSupport` (`dxgi.dll`), and in `xgameruntime.dll` `XGameRuntimeInitialize`, `XGameEventWrite`
+and the families `XAsync*`, `XTaskQueue*`, `XUser*`, `XStore*`, `XGameSave*`, `XPackage*`, `XGameUi*` except the 33
+functions their public reference pages show returning `void`, `bool` or `int` (for example `XTaskQueueDispatch`,
+`XUserCloseHandle`, `XStoreIsLicenseValid`). The mixed `XSystem*`, `XGameStreaming*`, `XThread*` and `XDisplay*`
+families are not listed. The sources are the Microsoft Learn pages for the D3D12/DXGI functions and the GDK reference
+(`gaming/gdk/docs/reference/system/<family>/functions/<name>`); `D3D12XboxCreateDevice` is matched by name from the
+measurement in `d3d12_vulkan.md`, because its page could not be found.
+
 ## What this proves and what it does not
 
 - It proves the loader parses real Xbox Series PE files, maps their sections, applies no unnecessary relocation,

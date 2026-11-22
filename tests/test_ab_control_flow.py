@@ -2,7 +2,10 @@
 
     python -I tests/test_ab_control_flow.py
 """
+import argparse
+import contextlib
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
@@ -88,6 +91,33 @@ class CandidateSelectionTest(unittest.TestCase):
         for name in index:
             self.add_shader(name, "\ts_cbranch_scc0 12\n\ts_branch 40\n")
         self.assertEqual(AB.select_candidates(index, self.disasm, self.spirv, count=2), ["a", "b"])
+
+
+    def test_count_below_one_is_refused(self):
+        index = {"a": self.shader()}
+        self.add_shader("a", "\ts_cbranch_scc0 12\n\ts_branch 40\n")
+        for count in (0, -3):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                AB.select_candidates(index, self.disasm, self.spirv, count=count)
+
+
+class CountArgumentTest(unittest.TestCase):
+    def test_positive_int(self):
+        self.assertEqual(AB.positive_int("150"), 150)
+        for text in ("0", "-1", "x"):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                AB.positive_int(text)
+
+    def test_cli_refuses_counts_below_one_before_making_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            for flag in ("--count", "--runs", "--timeout"):
+                with self.subTest(flag=flag), self.assertRaises(SystemExit) as ctx, \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    AB.main([tmp, tmp, out, flag, "0"])
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn(flag, err.getvalue())
+            self.assertFalse(os.path.exists(out))
 
 
 class ResultClassificationTest(unittest.TestCase):

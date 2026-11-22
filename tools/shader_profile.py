@@ -219,13 +219,27 @@ def main():
     ap.add_argument("--per-shader", action="store_true",
                     help="also list each shader's instruction count and VGPR/SGPR footprint")
     a = ap.parse_args()
+    if not os.path.isdir(a.src):
+        what = "is not a folder" if os.path.exists(a.src) else "does not exist"
+        print(f"ERROR: {a.src} {what}. Give the folder of .s files shader_disasm.py writes.", file=sys.stderr)
+        return 2
+    path = a.out or os.path.join(a.src, "..", "profile.json")
+    out_dir = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(out_dir):        # checked before the scan, which takes minutes on the whole corpus
+        print(f"ERROR: the folder for {path} does not exist", file=sys.stderr)
+        return 2
+    try:
+        names = os.listdir(a.src)
+    except OSError as e:
+        print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     occ, users = Counter(), Counter()
     invalid_users = Counter()
     per_stage = defaultdict(Counter)
     reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
     shaders = []
     n = 0
-    for name in os.listdir(a.src):
+    for name in names:
         if not name.endswith(".s"):
             continue
         n += 1
@@ -259,9 +273,12 @@ def main():
            "registers": register_summary(reg_stage)}
     if a.per_shader:
         out["per_shader"] = sorted(shaders, key=lambda e: e["name"])
-    path = a.out or os.path.join(a.src, "..", "profile.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=1, allow_nan=False)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=1, allow_nan=False)
+    except OSError as e:
+        print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print(f"{n} shaders, {len(occ)} distinct mnemonics -> {os.path.abspath(path)}")
     for k, v in sorted(fam.items(), key=lambda kv: -kv[1][1]):
         print(f"  {k:8} {v[0]:4} mnemonics {v[1]:>12,} uses")
