@@ -185,6 +185,53 @@ if(WIN32)
   target_link_options(xgameruntime_test PRIVATE /OPT:NOREF)
   target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue)
 
+  # GameInput shim on SDL3 (zlib licence): any controller SDL supports, DualSense trigger effects and lightbar. Uses an
+  # installed SDL3 when find_package finds one (SDL3_DIR / CMAKE_PREFIX_PATH), else downloads the pinned release
+  # below once at configure time and builds it static. For an offline build pass
+  # -DFETCHCONTENT_SOURCE_DIR_SDL3=<extracted SDL3-3.4.20>. -DLEONIDA_SDL3=OFF builds without the shim, and the
+  # loader then binds GameInputCreate to the host's GameInput.dll or the unimplemented thunk as before.
+  option(LEONIDA_SDL3 "Build the GameInput shim on SDL3" ON)
+  if(LEONIDA_SDL3)
+    find_package(SDL3 3.2 CONFIG QUIET COMPONENTS SDL3-static)
+    if(NOT TARGET SDL3::SDL3-static)
+      include(FetchContent)
+      FetchContent_Declare(SDL3
+        URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20.tar.gz
+        URL_HASH SHA256=f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+      # Only what gamepads need: the joystick, HIDAPI, haptic, sensor and power code, in a static library.
+      set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+      set(SDL_STATIC ON CACHE BOOL "" FORCE)
+      set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+      set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+      set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+      set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+      set(SDL_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
+      foreach(_sdl_off SDL_AUDIO SDL_VIDEO SDL_GPU SDL_RENDER SDL_CAMERA SDL_DIALOG SDL_TRAY)
+        set(${_sdl_off} OFF CACHE BOOL "" FORCE)
+      endforeach()
+      FetchContent_MakeAvailable(SDL3)
+    endif()
+  endif()
+  if(LEONIDA_SDL3 AND TARGET SDL3::SDL3-static)
+    target_sources(gta6rt PRIVATE shims/gameinput.cpp)
+    target_link_libraries(gta6rt PRIVATE SDL3::SDL3-static)
+
+    # GameInput through the shim registry on SDL virtual joysticks: no controller, no game data.
+    add_executable(gameinput_test test/gameinput_test.cpp shims/gameinput.cpp shims/registry.cpp)
+    # gameinput_probe: the same shim on a real controller, run by hand (not a CTest).
+    add_executable(gameinput_probe test/gameinput_probe.cpp shims/gameinput.cpp shims/registry.cpp)
+    foreach(_gi gameinput_test gameinput_probe)
+      target_include_directories(${_gi} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+      target_compile_definitions(${_gi} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(${_gi} PRIVATE /W4 /permissive- /utf-8)
+      target_link_options(${_gi} PRIVATE /OPT:NOREF)
+      target_link_libraries(${_gi} PRIVATE SDL3::SDL3-static)
+    endforeach()
+  else()
+    message(STATUS "SDL3 not used: the GameInput shim, gameinput_test and gameinput_probe are not built")
+  endif()
+
 else()
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
 endif()
@@ -412,6 +459,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
+  endif()
+  if(WIN32 AND TARGET gameinput_test)
+    add_test(NAME gameinput COMMAND gameinput_test)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
     # The stand-in game passes only with its own arguments; with others it exits 1, which --run passes through.
