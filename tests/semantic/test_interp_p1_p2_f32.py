@@ -772,5 +772,201 @@ class TestScalarInterpInterpreter(unittest.TestCase):
         self.assertEqual(result1, result2)
 
 
+@dataclass
+class SIMDState:
+    """Architectural state for SIMD multi-lane Wave32 / Wave64 wavefront."""
+    num_lanes: int = 32
+    exec_mask: int = 0xFFFF_FFFF
+    lanes_vgpr: List[VGPRFile] = field(default_factory=list)
+    sgpr: List[int] = field(default_factory=lambda: [0] * 106)
+    attributes: AttributeFile = field(default_factory=AttributeFile)
+
+    def __post_init__(self) -> None:
+        if not self.lanes_vgpr:
+            self.lanes_vgpr = [VGPRFile() for _ in range(self.num_lanes)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.num_lanes):
+            return False
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.lanes_vgpr[lane].get(reg_idx)
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.lanes_vgpr[lane].set(reg_idx, val)
+
+    def get_vgpr_f32(self, lane: int, reg_idx: int) -> float:
+        return self.lanes_vgpr[lane].get_f32(reg_idx)
+
+    def set_vgpr_f32(self, lane: int, reg_idx: int, val: float) -> None:
+        self.lanes_vgpr[lane].set_f32(reg_idx, val)
+
+
+class SIMDInterpInterpreter:
+    """SIMD wavefront instruction interpreter supporting multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_src(self, operand: Operand, lane: int, state: SIMDState) -> int:
+        if operand.reg_type == RegType.VGPR:
+            return state.get_vgpr(lane, int(operand.index_or_val))
+        elif operand.reg_type == RegType.SGPR:
+            return state.sgpr[int(operand.index_or_val) & 0x7F]
+        elif operand.reg_type == RegType.LITERAL:
+            if isinstance(operand.index_or_val, float):
+                return f32_to_bits(operand.index_or_val)
+            return int(operand.index_or_val) & MASK32
+        elif operand.reg_type == RegType.PARAM_SEL:
+            if isinstance(operand.index_or_val, ParamSel):
+                return operand.index_or_val.value
+            return int(operand.index_or_val)
+        raise ValueError(f"Unknown operand type: {operand.reg_type}")
+
+    def step(self, inst: InterpInstruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+        chan = state.attributes.get_channel(inst.attr.attr_index, inst.attr.channel.value)
+        p0_bits = f32_to_bits(chan.p0)
+        p10_bits = f32_to_bits(chan.p10)
+        p20_bits = f32_to_bits(chan.p20)
+
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                continue
+
+            if inst.opcode == InterpOpcode.V_INTERP_P1_F32:
+                s_bits = self.resolve_lane_src(inst.src, lane, state)
+                res = oracle_v_interp_p1_f32(
+                    s_bits=s_bits,
+                    p10_bits=p10_bits,
+                    p0_bits=p0_bits,
+                    abs_s=inst.src.abs_mod,
+                    neg_s=inst.src.neg_mod,
+                    clamp=inst.clamp,
+                    omod=inst.omod,
+                )
+                state.set_vgpr(lane, inst.dst, res)
+                results[lane] = res
+
+            elif inst.opcode == InterpOpcode.V_INTERP_P2_F32:
+                s_bits = self.resolve_lane_src(inst.src, lane, state)
+                accum_bits = state.get_vgpr(lane, inst.dst)
+                res = oracle_v_interp_p2_f32(
+                    s_bits=s_bits,
+                    p20_bits=p20_bits,
+                    p1_accum_bits=accum_bits,
+                    abs_s=inst.src.abs_mod,
+                    neg_s=inst.src.neg_mod,
+                    clamp=inst.clamp,
+                    omod=inst.omod,
+                )
+                state.set_vgpr(lane, inst.dst, res)
+                results[lane] = res
+
+            elif inst.opcode == InterpOpcode.V_INTERP_MOV_F32:
+                param_sel = self.resolve_lane_src(inst.src, lane, state)
+                res = oracle_v_interp_mov_f32(
+                    param_sel=param_sel,
+                    p0_bits=p0_bits,
+                    p10_bits=p10_bits,
+                    p20_bits=p20_bits,
+                    abs_val=inst.src.abs_mod,
+                    neg_val=inst.src.neg_mod,
+                    clamp=inst.clamp,
+                    omod=inst.omod,
+                )
+                state.set_vgpr(lane, inst.dst, res)
+                results[lane] = res
+
+        return results
+
+    def run_program(self, instructions: List[InterpInstruction], state: SIMDState) -> None:
+        for inst in instructions:
+            self.step(inst, state)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpInterpreter()
+
+    def test_wave32_divergent_coordinates(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        # Attribute: v0=0.0, v1=32.0, v2=64.0 -> p0=0.0, p10=32.0, p20=64.0
+        state.attributes.set_attribute(0, 0, 0.0, 32.0, 64.0)
+
+        # Each lane has divergent i coordinate = lane / 32.0, j coordinate = 0.0
+        for lane in range(32):
+            state.set_vgpr_f32(lane, 0, lane / 32.0)
+            state.set_vgpr_f32(lane, 1, 0.0)
+
+        program = [
+            InterpInstruction(InterpOpcode.V_INTERP_P1_F32, 2, Operand(RegType.VGPR, 0), AttributeRef(0, Channel.X)),
+            InterpInstruction(InterpOpcode.V_INTERP_P2_F32, 2, Operand(RegType.VGPR, 1), AttributeRef(0, Channel.X)),
+        ]
+        self.interp.run_program(program, state)
+
+        # Expected result in lane k: 32.0 * (k / 32.0) + 0.0 = float(k)
+        for lane in range(32):
+            self.assertAlmostEqual(state.get_vgpr_f32(lane, 2), float(lane), places=5)
+
+    def test_wave64_exec_masking(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFF_FFFF_FFFF_FFFF)
+        state.attributes.set_attribute(1, 0, 10.0, 20.0, 30.0)
+
+        for lane in range(64):
+            state.set_vgpr_f32(lane, 0, 0.5)
+            state.set_vgpr_f32(lane, 1, 0.25)
+            state.set_vgpr_f32(lane, 2, -999.0)  # Sentinel
+
+        # Only upper 32 lanes active
+        state.exec_mask = 0xFFFF_FFFF_0000_0000
+
+        program = [
+            InterpInstruction(InterpOpcode.V_INTERP_P1_F32, 2, Operand(RegType.VGPR, 0), AttributeRef(1, Channel.X)),
+            InterpInstruction(InterpOpcode.V_INTERP_P2_F32, 2, Operand(RegType.VGPR, 1), AttributeRef(1, Channel.X)),
+        ]
+        self.interp.run_program(program, state)
+
+        # Inactive lanes 0..31 must retain sentinel -999.0
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr_f32(lane, 2), -999.0)
+
+        # Active lanes 32..63: p0=10, p10=10, p20=20
+        # p1: 10 * 0.5 + 10 = 15.0
+        # p2: 20 * 0.25 + 15 = 20.0
+        for lane in range(32, 64):
+            self.assertAlmostEqual(state.get_vgpr_f32(lane, 2), 20.0, places=5)
+
+    def test_alternating_lanes_exec_mask(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x5555_5555)  # Even lanes active
+        state.attributes.set_attribute(0, 0, 1.0, 2.0, 3.0)
+
+        for lane in range(32):
+            state.set_vgpr_f32(lane, 0, 1.0)
+            state.set_vgpr_f32(lane, 5, 777.0)
+
+        inst = InterpInstruction(InterpOpcode.V_INTERP_P1_F32, 5, Operand(RegType.VGPR, 0), AttributeRef(0, Channel.X))
+        self.interp.step(inst, state)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(state.get_vgpr_f32(lane, 5), 2.0)
+            else:
+                self.assertEqual(state.get_vgpr_f32(lane, 5), 777.0)
+
+    def test_zero_exec_mask(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        state.attributes.set_attribute(0, 0, 1.0, 2.0, 3.0)
+        for lane in range(32):
+            state.set_vgpr_f32(lane, 3, 123.0)
+
+        inst = InterpInstruction(InterpOpcode.V_INTERP_P1_F32, 3, Operand(RegType.VGPR, 0), AttributeRef(0, Channel.X))
+        results = self.interp.step(inst, state)
+
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr_f32(lane, 3), 123.0)
+
+
 if __name__ == "__main__":
     unittest.main()
