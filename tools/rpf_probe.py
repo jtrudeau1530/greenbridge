@@ -5,6 +5,7 @@ Usage:
 
 Reads the first 64 KiB of each archive only. It doesn't decrypt or extract anything.
 A directory scan or archive read error stops the survey before it writes the report.
+The report destination must not name an input archive or an alias of one.
 """
 import argparse
 import json
@@ -41,6 +42,15 @@ def probe(path: str) -> dict:
     }
 
 
+def _same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("game_dir")
@@ -52,10 +62,17 @@ def main() -> int:
         raise error
 
     try:
+        archives = []
         for root, _, files in os.walk(a.game_dir, onerror=scan_failed):
             for name in files:
                 if name.lower().endswith(".rpf"):
-                    rows.append(probe(os.path.join(root, name)))
+                    archives.append(os.path.join(root, name))
+        for path in archives:
+            if _same_report_path(a.out, path):
+                print(f"ERROR: --out would overwrite an input archive: {path}", file=sys.stderr)
+                return 2
+        for path in archives:
+            rows.append(probe(path))
     except OSError as error:
         path = error.filename or a.game_dir
         reason = error.strerror or str(error)
