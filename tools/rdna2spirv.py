@@ -64,11 +64,14 @@ MESH_COMPUTE = False
 # `exp paramN` also exports the channel's two f16 halves decoded to f32, low halves at f16_half_location(N, 0) and high
 # halves at f16_half_location(N, 1), and a PS *_f16 read of attrN.c takes component c of that smooth input. The
 # interpolation is linear, so this is the same P0 + i(P1 - P0) + j(P2 - P0) of the decoded halves, rounded by the
-# device's interpolator instead of by explicit arithmetic. The halves sit below location F16_HALF_TOP (30: 31
-# locations is MoltenVK's limit, 124 components), counting down from param 0, so a producer with params 0..P-1 has
-# room for the halves of params 0..(29 - P) / 2; Gen.export skips the ones that would land on its own params.
+# device's interpolator instead of by explicit arithmetic. The halves count down from location F16_HALF_TOP (param 0's
+# high halves, its low halves one below), so a producer with params 0..P-1 has room for the halves of params
+# 0..(28 - P) / 2; Gen.export skips the ones that would land on its own params. The top is 29, not 30 (SHADER-291):
+# MoltenVK's maxVertexOutputComponents is 124 because Metal counts gl_Position in its 128 vertex-output scalars, and
+# the validation layer counts it too (VUID-RuntimeSpirv-Location-06272), so (29 + 1) * 4 + 4 = 124 is the most a VS
+# can use there.
 F16_HALVES = False
-F16_HALF_TOP = 30
+F16_HALF_TOP = 29
 
 
 def f16_half_location(n, half):
