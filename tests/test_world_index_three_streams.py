@@ -22,15 +22,35 @@ def stream_ends(parts, start=0x40):
     return out
 
 
+def padding(spans):
+    """Alignment bytes between the first two streams and between the second and third."""
+    return sum(spans[i + 1][0] - spans[i][1] for i in range(2))
+
+
+def padded_split(blob):
+    """Three parts whose two alignment gaps add up to 16 bytes or more, and their spans.
+
+    How much padding a split leaves depends on the compressor's output lengths: zlib-ng (Python 3.14 on
+    Windows) compresses these parts to other lengths than zlib, so the split points are searched for
+    instead of fixed. The search starts at 0x150/0x420, which give 2 + 15 bytes with zlib, and the second
+    point stays at or below 0x500 so the CMapData root (at 0x500) is in the third part.
+    """
+    for first in range(0x150, 0x200):
+        for second in range(0x420, 0x501):
+            parts = [blob[:first], blob[first:second], blob[second:]]
+            spans = stream_ends(parts)
+            if padding(spans) >= 16:
+                return parts, spans
+    return None, None
+
+
 class ThreeStreamJoinTest(unittest.TestCase):
     def test_third_stream_follows_the_second_streams_real_end(self):
         blob = make_resource()
-        # The split points put 2 + 15 bytes of alignment padding after the first two streams, so
-        # "first stream start + both streams' lengths", rounded up to 16, lands inside the second stream.
-        parts = [blob[:0x150], blob[0x150:0x420], blob[0x420:]]
-        spans = stream_ends(parts)
-        pads = [spans[i + 1][0] - spans[i][1] for i in range(2)]
-        self.assertGreaterEqual(sum(pads), 16)  # precondition for the case
+        # With 16 or more bytes of padding after the first two streams, "first stream start + both streams'
+        # lengths", rounded up to 16, lands inside the second stream instead of at the third.
+        parts, spans = padded_split(blob)
+        self.assertIsNotNone(parts, "no split with 16 bytes of padding under this zlib")
         archive = make_rpf_streams(parts)
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "three.rpf")
