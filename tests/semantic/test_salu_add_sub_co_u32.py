@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 
 # ==============================================================================
@@ -188,6 +189,173 @@ class TestArchitecturalModel(unittest.TestCase):
         self.assertEqual(model.scc, 0)
         model.set_scc(42)
         self.assertEqual(model.scc, 1)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class SOPOpcode(Enum):
+    """SOP2 scalar ALU opcodes."""
+    S_ADD_CO_U32 = "s_add_co_u32"
+    S_SUB_CO_U32 = "s_sub_co_u32"
+    S_ADD_U32 = "s_add_u32"
+    S_SUB_U32 = "s_sub_u32"
+
+
+@dataclass(frozen=True)
+class SGPROperand:
+    """Represents a 32-bit Scalar General-Purpose Register operand."""
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < NUM_SGPRS):
+            raise ValueError(f"SGPR index {self.index} out of range [0, {NUM_SGPRS - 1}]")
+
+    @property
+    def name(self) -> str:
+        return f"s{self.index}"
+
+
+@dataclass(frozen=True)
+class LiteralU32:
+    """Represents an arbitrary 32-bit literal constant in the instruction stream."""
+    value: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.value <= MAX_U32):
+            raise ValueError(f"Literal constant 0x{self.value:X} out of range [0, 0x{MAX_U32:X}]")
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.value:08X}"
+
+
+@dataclass(frozen=True)
+class InlineConstant:
+    """Represents an inline integer constant (-16..64) encoded directly in operand field."""
+    value: int
+
+    def __post_init__(self) -> None:
+        if not (-16 <= self.value <= 64):
+            raise ValueError(f"Inline integer constant {self.value} out of range [-16, 64]")
+
+    @property
+    def name(self) -> str:
+        return f"{self.value}"
+
+
+SOP2Operand = Union[SGPROperand, LiteralU32, InlineConstant]
+
+
+@dataclass(frozen=True)
+class SAddSubCoU32Instruction:
+    """Symbolic AST node representing a 32-bit SALU add/sub with carry instruction."""
+    opcode: SOPOpcode
+    dst: SGPROperand
+    src0: SOP2Operand
+    src1: SOP2Operand
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dst, SGPROperand):
+            raise TypeError(f"Destination operand must be SGPROperand, got {type(self.dst).__name__}")
+        if self.opcode not in (
+            SOPOpcode.S_ADD_CO_U32,
+            SOPOpcode.S_SUB_CO_U32,
+            SOPOpcode.S_ADD_U32,
+            SOPOpcode.S_SUB_U32,
+        ):
+            raise ValueError(f"Invalid opcode for SAddSubCoU32Instruction: {self.opcode}")
+
+        # Hardware constraint: at most one 32-bit literal constant allowed in SOP2 encoding
+        literal_count = sum(1 for src in (self.src0, self.src1) if isinstance(src, LiteralU32))
+        if literal_count > 1:
+            raise ValueError("SOP2 instructions cannot encode more than one 32-bit literal constant")
+
+    def disassemble(self) -> str:
+        return f"{self.opcode.value} {self.dst.name}, {self.src0.name}, {self.src1.name}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Verification of symbolic AST node typing, bounds, constraints, and disassembly."""
+
+    def test_sgpr_operand_valid(self) -> None:
+        op = SGPROperand(0)
+        self.assertEqual(op.name, "s0")
+        op_max = SGPROperand(NUM_SGPRS - 1)
+        self.assertEqual(op_max.name, f"s{NUM_SGPRS - 1}")
+
+    def test_sgpr_operand_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            SGPROperand(-1)
+        with self.assertRaises(ValueError):
+            SGPROperand(NUM_SGPRS)
+
+    def test_literal_u32_valid(self) -> None:
+        lit = LiteralU32(0x1234_5678)
+        self.assertEqual(lit.name, "0x12345678")
+        self.assertEqual(lit.value, 0x1234_5678)
+
+    def test_literal_u32_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            LiteralU32(-1)
+        with self.assertRaises(ValueError):
+            LiteralU32(0x1_0000_0000)
+
+    def test_inline_constant_valid(self) -> None:
+        for val in (-16, 0, 1, 64):
+            c = InlineConstant(val)
+            self.assertEqual(c.name, str(val))
+            self.assertEqual(c.value, val)
+
+    def test_inline_constant_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            InlineConstant(-17)
+        with self.assertRaises(ValueError):
+            InlineConstant(65)
+
+    def test_instruction_disassembly(self) -> None:
+        instr_add = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_CO_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(1),
+            src1=SGPROperand(2),
+        )
+        self.assertEqual(instr_add.disassemble(), "s_add_co_u32 s0, s1, s2")
+
+        instr_sub = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_SUB_CO_U32,
+            dst=SGPROperand(4),
+            src0=SGPROperand(5),
+            src1=LiteralU32(0xDEADBEEF),
+        )
+        self.assertEqual(instr_sub.disassemble(), "s_sub_co_u32 s4, s5, 0xDEADBEEF")
+
+        instr_inline = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_U32,
+            dst=SGPROperand(10),
+            src0=SGPROperand(11),
+            src1=InlineConstant(1),
+        )
+        self.assertEqual(instr_inline.disassemble(), "s_add_u32 s10, s11, 1")
+
+    def test_instruction_invalid_dst(self) -> None:
+        with self.assertRaises(TypeError):
+            SAddSubCoU32Instruction(  # type: ignore[arg-type]
+                opcode=SOPOpcode.S_ADD_CO_U32,
+                dst=LiteralU32(42),  # type: ignore[arg-type]
+                src0=SGPROperand(0),
+                src1=SGPROperand(1),
+            )
+
+    def test_instruction_multiple_literals_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            SAddSubCoU32Instruction(
+                opcode=SOPOpcode.S_ADD_CO_U32,
+                dst=SGPROperand(0),
+                src0=LiteralU32(0x100),
+                src1=LiteralU32(0x200),
+            )
 
 
 if __name__ == "__main__":
