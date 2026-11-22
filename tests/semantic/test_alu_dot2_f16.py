@@ -22,9 +22,28 @@ Standard library only: Python 3.9+ compatible, zero game data, zero proprietary 
 from __future__ import annotations
 
 import math
+import os
 import re
 import struct
+import sys
+import tempfile
 import unittest
+import warnings
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 # Bit masks
 MASK16 = 0xFFFF
@@ -828,6 +847,269 @@ class TestWavefrontSimdExecution(unittest.TestCase):
                 self.assertTrue(math.isnan(f16_bits_to_float(actual)))
             else:
                 self.assertEqual(actual, exp, f"Edge case mismatch at lane {lane}")
+
+
+def build_spirv_dot2(
+    s0: int,
+    s1: int,
+    s2_acc: int | None = None,
+    clamp: bool = False,
+    op_sel: tuple[int, int] = (0, 0),
+    op_sel_hi: tuple[int, int] = (1, 1),
+) -> str:
+    """Generate synthetic SPIR-V assembly lowering for a packed f16 dot product."""
+    lines = [
+        "OpCapability Shader",
+        '%glsl = OpExtInstImport "GLSL.std.450"',
+        "OpMemoryModel Logical GLSL450",
+        'OpEntryPoint Fragment %main "main" %out_mrt0',
+        "OpExecutionMode %main OriginUpperLeft",
+        "OpDecorate %out_mrt0 Location 0",
+        "%void = OpTypeVoid",
+        "%fn = OpTypeFunction %void",
+        "%uint = OpTypeInt 32 0",
+        "%float = OpTypeFloat 32",
+        "%v4float = OpTypeVector %float 4",
+        "%v2float = OpTypeVector %float 2",
+        "%_ptr_Output_v4 = OpTypePointer Output %v4float",
+        "%out_mrt0 = OpVariable %_ptr_Output_v4 Output",
+        f"%c_s0 = OpConstant %uint {s0 & MASK32}",
+        f"%c_s1 = OpConstant %uint {s1 & MASK32}",
+        "%f0 = OpConstant %float 0",
+        "%f1 = OpConstant %float 1",
+    ]
+    if s2_acc is not None:
+        lines.append(f"%c_s2 = OpConstant %uint {s2_acc & MASK32}")
+    lines.extend([
+        "%main = OpFunction %void None %fn",
+        "%entry = OpLabel",
+        "%u0 = OpExtInst %v2float %glsl UnpackHalf2x16 %c_s0",
+        "%u1 = OpExtInst %v2float %glsl UnpackHalf2x16 %c_s1",
+        f"%x0 = OpCompositeExtract %float %u0 {op_sel[0] & 1}",
+        f"%y0 = OpCompositeExtract %float %u0 {op_sel_hi[0] & 1}",
+        f"%x1 = OpCompositeExtract %float %u1 {op_sel[1] & 1}",
+        f"%y1 = OpCompositeExtract %float %u1 {op_sel_hi[1] & 1}",
+        "%p0 = OpFMul %float %x0 %x1",
+        "%p1 = OpFMul %float %y0 %y1",
+        "%dot = OpFAdd %float %p0 %p1",
+    ])
+    cur_val = "%dot"
+    if s2_acc is not None:
+        lines.extend([
+            "%u2 = OpExtInst %v2float %glsl UnpackHalf2x16 %c_s2",
+            "%acc = OpCompositeExtract %float %u2 0",
+            "%dot_acc = OpFAdd %float %dot %acc",
+        ])
+        cur_val = "%dot_acc"
+    if clamp:
+        lines.append(f"%clamped = OpExtInst %float %glsl FClamp {cur_val} %f0 %f1")
+        cur_val = "%clamped"
+    lines.extend([
+        f"%res_vec = OpCompositeConstruct %v2float {cur_val} %f0",
+        "%pack = OpExtInst %uint %glsl PackHalf2x16 %res_vec",
+        "%flt = OpBitcast %float %pack",
+        "%mrt = OpCompositeConstruct %v4float %flt %flt %flt %flt",
+        "OpStore %out_mrt0 %mrt",
+        "OpReturn",
+        "OpFunctionEnd",
+    ])
+    return "\n".join(lines)
+
+
+class TestDot2SpirvTranslationAndExecution(unittest.TestCase):
+    """SPIR-V translation and execution tests for v_dot2_f16_f16 and v_dot2acc_f16_f16."""
+
+    def test_translator_unsupported_rejection(self):
+        """Translating v_dot2 instructions via rdna2spirv raises Unsupported as documented in docs/fssm_crosscheck.md."""
+        lines = [
+            "v_mov_b32 v1, 0x3c003c00",
+            "v_mov_b32 v2, 0x40004000",
+            "v_dot2_f16_f16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_dot2_unsupported", lines)
+        self.assertIn("v_dot2_f16_f16", str(cm.exception))
+
+    def test_translator_accumulating_unsupported_rejection(self):
+        """Translating v_dot2acc instructions via rdna2spirv raises Unsupported."""
+        lines = [
+            "v_mov_b32 v1, 0x3c003c00",
+            "v_mov_b32 v2, 0x40004000",
+            "v_mov_b32 v3, 0",
+            "v_dot2acc_f16_f16 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_dot2acc_unsupported", lines)
+        self.assertIn("v_dot2acc_f16_f16", str(cm.exception))
+
+    def test_spirv_mini_interp_basic_dot2(self):
+        """Execute lowered SPIR-V in spirv_mini_interp and assert equivalence with reference oracle."""
+        s0 = pack_f16x2(H_ONE, H_TWO)
+        s1 = pack_f16x2(H_THREE, H_FOUR)
+        spv = build_spirv_dot2(s0, s1)
+        out = si.run_fragment(spv)["%out_mrt0"]
+        expected = ref_dot2_f16(s0, s1)
+        self.assertEqual(out[0] & MASK16, expected & MASK16)
+
+    def test_spirv_mini_interp_accumulating(self):
+        """Execute accumulating dot product lowered to SPIR-V in spirv_mini_interp."""
+        s0 = pack_f16x2(H_ONE, H_TWO)
+        s1 = pack_f16x2(H_THREE, H_FOUR)
+        s2 = float_to_f16_bits(5.0)
+        spv = build_spirv_dot2(s0, s1, s2_acc=s2)
+        out = si.run_fragment(spv)["%out_mrt0"]
+        expected = ref_dot2acc_f16(s0, s1, s2)
+        self.assertEqual(out[0] & MASK16, expected & MASK16)
+
+    def test_spirv_mini_interp_clamped(self):
+        """Execute clamped dot product lowered to SPIR-V in spirv_mini_interp."""
+        s0 = pack_f16x2(H_TWO, H_TWO)
+        s1 = pack_f16x2(H_TWO, H_TWO)
+        spv = build_spirv_dot2(s0, s1, clamp=True)
+        out = si.run_fragment(spv)["%out_mrt0"]
+        expected = ref_dot2_f16(s0, s1, clamp=True)
+        self.assertEqual(out[0] & MASK16, expected & MASK16)
+
+    def test_spirv_mini_interp_op_sel_halves(self):
+        """Execute op_sel swapped halves lowered to SPIR-V in spirv_mini_interp."""
+        s0 = pack_f16x2(H_ONE, H_TWO)
+        s1 = pack_f16x2(H_THREE, H_FOUR)
+        spv = build_spirv_dot2(s0, s1, op_sel=(1, 0), op_sel_hi=(0, 1))
+        out = si.run_fragment(spv)["%out_mrt0"]
+        expected = ref_dot2_f16(s0, s1, op_sel=(1, 0), op_sel_hi=(0, 1))
+        self.assertEqual(out[0] & MASK16, expected & MASK16)
+
+
+class TestClampAndOverflowEdgeCases(unittest.TestCase):
+    """Rigorous boundary and edge case coverage: subnormals, signed zeros, clamp, and +/- infinity."""
+
+    def test_large_normal_multiplication_overflow(self):
+        """Product of two large normals exceeding 65504 overflows to positive infinity."""
+        s0 = pack_f16x2(H_NORM_MAX, H_POS_ZERO)
+        s1 = pack_f16x2(H_TWO, H_POS_ZERO)
+        res = ref_dot2_f16(s0, s1)
+        self.assertEqual(res, H_POS_INF)
+
+    def test_negative_overflow_to_negative_infinity(self):
+        """Product of large positive and negative normal overflows to negative infinity."""
+        s0 = pack_f16x2(H_NEG_NORM_MAX, H_POS_ZERO)
+        s1 = pack_f16x2(H_TWO, H_POS_ZERO)
+        res = ref_dot2_f16(s0, s1)
+        self.assertEqual(res, H_NEG_INF)
+
+    def test_overflow_with_clamp_modifier(self):
+        """Overflowed positive value (+inf) clamps to 1.0; negative (-inf) clamps to 0.0."""
+        s0 = pack_f16x2(H_NORM_MAX, H_POS_ZERO)
+        s1 = pack_f16x2(H_TWO, H_POS_ZERO)
+        self.assertEqual(ref_dot2_f16(s0, s1, clamp=True), H_ONE)
+
+        s0_neg = pack_f16x2(H_NEG_NORM_MAX, H_POS_ZERO)
+        self.assertEqual(ref_dot2_f16(s0_neg, s1, clamp=True), H_POS_ZERO)
+
+    def test_subnormal_precision_and_gradual_underflow(self):
+        """Subnormal precision is preserved when multiplying subnormal with 1.0."""
+        s0 = pack_f16x2(H_SUB_MAX, H_POS_ZERO)
+        s1 = pack_f16x2(H_ONE, H_POS_ZERO)
+        self.assertEqual(ref_dot2_f16(s0, s1), H_SUB_MAX)
+
+        s0_min = pack_f16x2(H_NEG_SUB_MIN, H_POS_ZERO)
+        self.assertEqual(ref_dot2_f16(s0_min, s1), H_NEG_SUB_MIN)
+
+    def test_signed_zero_multiplication_and_addition(self):
+        """Signed zero preservation adhering to IEEE-754 binary16 arithmetic."""
+        # (-0.0) * (+1.0) + (-0.0) * (+1.0) = -0.0
+        s0 = pack_f16x2(H_NEG_ZERO, H_NEG_ZERO)
+        s1 = pack_f16x2(H_ONE, H_ONE)
+        self.assertEqual(ref_dot2_f16(s0, s1), H_NEG_ZERO)
+
+        # (+0.0) + (+0.0) = +0.0
+        s0_pos = pack_f16x2(H_POS_ZERO, H_POS_ZERO)
+        self.assertEqual(ref_dot2_f16(s0_pos, s1), H_POS_ZERO)
+
+    def test_infinity_subtraction_produces_nan(self):
+        """(+inf) + (-inf) indeterminate sum produces quiet NaN."""
+        s0 = pack_f16x2(H_POS_INF, H_NEG_INF)
+        s1 = pack_f16x2(H_ONE, H_ONE)
+        res = ref_dot2_f16(s0, s1)
+        self.assertTrue(math.isnan(f16_bits_to_float(res)))
+
+    def test_nan_payload_propagation_with_accumulator(self):
+        """Accumulator NaN forces final result to NaN regardless of dot terms."""
+        s0 = pack_f16x2(H_ONE, H_ONE)
+        s1 = pack_f16x2(H_ONE, H_ONE)
+        res = ref_dot2acc_f16(s0, s1, s2_acc=H_QNAN)
+        self.assertTrue(math.isnan(f16_bits_to_float(res)))
+
+
+class TestNegativeControls(unittest.TestCase):
+    """Textual sabotage controls proving test sensitivity to algorithmic and translation defects."""
+
+    def test_control_fmul_sabotaged_to_fadd(self):
+        """Sabotaging OpFMul to OpFAdd produces a divergence that the reference oracle detects."""
+        s0 = pack_f16x2(H_ONE, H_TWO)
+        s1 = pack_f16x2(H_THREE, H_FOUR)
+        # True: 1*3 + 2*4 = 11.0
+        # Sabotaged: (1+3) + (2+4) = 10.0
+        expected = ref_dot2_f16(s0, s1)
+        good_spv = build_spirv_dot2(s0, s1)
+        self.assertIn("OpFMul", good_spv)
+        bad_spv = good_spv.replace("OpFMul", "OpFAdd")
+        bad_out = si.run_fragment(bad_spv)["%out_mrt0"][0] & MASK16
+        self.assertNotEqual(bad_out, expected & MASK16)
+
+    def test_control_fadd_sabotaged_to_fsub(self):
+        """Sabotaging OpFAdd to OpFSub produces a difference detected by the oracle."""
+        s0 = pack_f16x2(H_THREE, H_TWO)
+        s1 = pack_f16x2(H_TWO, H_ONE)
+        # True: 3*2 + 2*1 = 8.0
+        # Sabotaged: 3*2 - 2*1 = 4.0
+        expected = ref_dot2_f16(s0, s1)
+        good_spv = build_spirv_dot2(s0, s1)
+        self.assertIn("OpFAdd", good_spv)
+        bad_spv = good_spv.replace("%dot = OpFAdd %float %p0 %p1", "%dot = OpFSub %float %p0 %p1")
+        bad_out = si.run_fragment(bad_spv)["%out_mrt0"][0] & MASK16
+        self.assertNotEqual(bad_out, expected & MASK16)
+
+    def test_control_clamp_removal_detected(self):
+        """Omitting FClamp on saturated inputs results in unmasked overflow detected by the oracle."""
+        s0 = pack_f16x2(H_TWO, H_TWO)
+        s1 = pack_f16x2(H_TWO, H_TWO)
+        # True clamped: 8.0 clamped -> 1.0
+        expected = ref_dot2_f16(s0, s1, clamp=True)
+        good_spv = build_spirv_dot2(s0, s1, clamp=True)
+        self.assertIn("FClamp", good_spv)
+        bad_spv = good_spv.replace("%clamped %f0", "%dot %f0")
+        bad_out = si.run_fragment(bad_spv)["%out_mrt0"][0] & MASK16
+        self.assertNotEqual(bad_out, expected & MASK16)
+
+    def test_control_accumulator_omission_detected(self):
+        """Dropping the accumulator addition in v_dot2acc_f16_f16 is caught by the test oracle."""
+        s0 = pack_f16x2(H_ONE, H_ONE)
+        s1 = pack_f16x2(H_ONE, H_ONE)
+        s2 = float_to_f16_bits(5.0)
+        # True: 1*1 + 1*1 + 5 = 7.0
+        expected = ref_dot2acc_f16(s0, s1, s2)
+        good_spv = build_spirv_dot2(s0, s1, s2_acc=s2)
+        self.assertIn("%dot_acc", good_spv)
+        bad_spv = good_spv.replace("%dot_acc %f0", "%dot %f0")
+        bad_out = si.run_fragment(bad_spv)["%out_mrt0"][0] & MASK16
+        self.assertNotEqual(bad_out, expected & MASK16)
+
+    def test_control_op_sel_extraction_sabotaged(self):
+        """Extracting the wrong half-word from unpacked vector is caught by the oracle."""
+        s0 = pack_f16x2(H_ONE, H_FOUR)
+        s1 = pack_f16x2(H_TWO, H_THREE)
+        # With default op_sel=(0, 0), op_sel_hi=(1, 1): 1*2 + 4*3 = 14.0
+        expected = ref_dot2_f16(s0, s1)
+        good_spv = build_spirv_dot2(s0, s1)
+        self.assertIn("%x0 = OpCompositeExtract %float %u0 0", good_spv)
+        bad_spv = good_spv.replace("%x0 = OpCompositeExtract %float %u0 0", "%x0 = OpCompositeExtract %float %u0 1")
+        bad_out = si.run_fragment(bad_spv)["%out_mrt0"][0] & MASK16
+        self.assertNotEqual(bad_out, expected & MASK16)
 
 
 if __name__ == "__main__":
