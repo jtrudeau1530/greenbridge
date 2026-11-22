@@ -4,6 +4,7 @@
 """
 import contextlib
 import csv
+import errno
 import importlib.util
 import io
 import json
@@ -12,6 +13,7 @@ import struct
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -401,6 +403,34 @@ class WorldIndexTest(unittest.TestCase):
                 self.assertEqual(os.listdir(outputs), ["entities.jsonl"])
                 with open(entities, "rb") as f:
                     self.assertEqual(f.read(), previous)
+
+    def test_failed_directory_walk_keeps_existing_reports(self):
+        carve = os.path.join(self.dir, "carve")
+        blocked = os.path.join(carve, "unreadable")
+        os.makedirs(blocked)
+        with open(os.path.join(carve, "resource.bin"), "wb") as f:
+            f.write(make_resource())
+        summary = os.path.join(self.dir, "summary.json")
+        entities = os.path.join(self.dir, "entities.jsonl")
+        previous = b'{"previous":true}\n'
+        for report in (summary, entities):
+            with open(report, "wb") as f:
+                f.write(previous)
+
+        scandir = os.scandir
+
+        def scan(path):
+            if path == blocked:
+                raise PermissionError(errno.EACCES, "permission denied", blocked)
+            return scandir(path)
+
+        err = io.StringIO()
+        with mock.patch.object(WI.os, "scandir", side_effect=scan), contextlib.redirect_stderr(err):
+            self.assertEqual(WI.main([carve, "--out", summary, "--entities-out", entities]), 2)
+        self.assertIn("unreadable", err.getvalue())
+        for report in (summary, entities):
+            with open(report, "rb") as f:
+                self.assertEqual(f.read(), previous)
 
     def test_summary_write_failure_keeps_existing_placement_report(self):
         source = os.path.join(self.dir, "resource.bin")

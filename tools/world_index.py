@@ -395,7 +395,11 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
 
 
 def _directory_files(path):
-    for root, _, files in os.walk(path):
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    # A partial walk must fail before the caller starts writing reports.
+    for root, _, files in os.walk(path, onerror=scan_failed):
         for name in sorted(files):
             yield os.path.join(root, name)
 
