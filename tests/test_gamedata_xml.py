@@ -203,6 +203,23 @@ class GamedataXmlTest(unittest.TestCase):
                 self.assertIn("malformed " + root + " @", p.stdout)
                 self.assertIn("0 truncated at the start", p.stdout)
 
+    def test_check_crossed_text_in_missing_comment_or_cdata_prefix(self):
+        for opener, suffix in ((b"<!-- ", b" -->"), (b"<![CDATA[", b"]]>")):
+            payload = b"<A><B></A></B>" + suffix + b"</R>"
+            with self.subTest(opener=opener):
+                # Establish that these are tails of a well-formed document.
+                import xml.etree.ElementTree as ET
+                ET.fromstring(b"<R>" + opener + payload)
+                doc = self.write("lexical_tail.xml", payload)
+                p = self.run_tool(doc, "--check")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("1 truncated at the start", p.stdout)
+                self.assertIn("truncated R @", p.stdout)
+                # A stray terminator must not hide malformed text after it.
+                broken = self.write("lexical_broken.xml", payload[:-4] + b"<C><D></C></D></R>")
+                p = self.run_tool(broken, "--check")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+
     def test_check_reports_unknown_encoding_as_malformed(self):
         unknown = self.write("unknown.xml", b'<?xml version="1.0" encoding="not-a-charset"?><root/>')
         valid = self.write("valid.xml", b"<root/>")

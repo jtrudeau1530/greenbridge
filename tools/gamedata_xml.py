@@ -234,10 +234,25 @@ def file_row(doc: dict, scan: dict) -> dict:
         tail_only = not header
         fragment = not root or not doc.get("complete", True)
     elif scan["mismatched_tag"]:
-        # Expat saw a close that contradicts an opening in the retained bytes.
-        # Prepending missing ancestors could never repair that nesting.
-        root = gi.xml_root(doc["data"]) or scan["root"]
-        tail_only = fragment = False
+        # A cut inside a comment or CDATA changes the lexical meaning of the
+        # retained tags. Accept that explanation only if restoring the opener
+        # produces a complete document; a terminator alone is not evidence.
+        repaired_root = ""
+        data = doc["data"]
+        closing_root = gi.tail_root(data)
+        if not header and closing_root:
+            body = data[3:] if data.startswith(BOM) else data
+            for opener, terminator in ((b"<!--", b"-->"), (b"<![CDATA[", b"]]>")):
+                if terminator not in body:
+                    continue
+                try:
+                    ET.fromstring(b"<" + closing_root.encode("ascii") + b">" + opener + body)
+                except (ET.ParseError, LookupError, ValueError):
+                    continue
+                repaired_root = closing_root
+                break
+        root = repaired_root or gi.xml_root(data) or scan["root"]
+        tail_only, fragment = bool(repaired_root), False
     else:
         tail_only = not scan["well_formed"] and looks_truncated(doc["data"], root)
         fragment = not root
