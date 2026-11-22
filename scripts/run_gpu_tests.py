@@ -668,7 +668,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env,
                                                     os.environ.get("LEONIDA_W64_EMULATE") == "1"))
-        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
 
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
@@ -686,6 +686,8 @@ def run_suite(a, work: str) -> int:
                 "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
                 # SHADER-90: ds_permute_b32 (cs_w32_permute.asm): scatter, unwritten lane = 0, EXEC gates the write
                 "cs_w32_permute": [218, 29, 8, 211, 0, 15, 99, 15],
+                # SHADER-85: ds_read_u8/i8_d16[_hi] (cs_w32_lds_u8_d16.asm header)
+                "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -716,7 +718,7 @@ def run_suite(a, work: str) -> int:
                 "cs_barrier_divergent": [127, 126, 125, 124, 123, 122, 121, 120],
             }
             want = cs_dump_wants[name]
-            # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute is a whole-wave (wave64) mask test:
+            # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute / cs_w32_lds_u8_d16 is a whole-wave (wave64) mask test:
             # ask for a 64-wide subgroup and skip, as check.py does, where the device has none (vk_compute_test
             # exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were translated with
             # --wave64-emulate and run on any subgroup size.
@@ -724,7 +726,7 @@ def run_suite(a, work: str) -> int:
             emulated = w64_emulated()
             partial = name == "cs_w64x_partial"
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
-                                  "cs_w32_permute", "cs_barrier_divergent") and not emulated and not partial
+                                  "cs_w32_permute", "cs_barrier_divergent", "cs_w32_lds_u8_d16") and not emulated and not partial
 
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
@@ -734,7 +736,7 @@ def run_suite(a, work: str) -> int:
                 ok, detail = None, str(skip)
             else:
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
-                                           hexwords=name in ("cs_store", "cs_smem_soffset_imm"))
+                                           hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16"))
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])

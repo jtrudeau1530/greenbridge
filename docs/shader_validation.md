@@ -199,7 +199,7 @@ that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, ea
 `s_waitcnt` and `s_barrier`, then stores all 16 result VGPRs of every thread and the whole LDS.
 `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP`.
 
-- **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`), the
+- **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`, `u8_d16[_hi]`, `i8_d16[_hi]`), the
   byte and short writes (also `d16_hi`), `read2`/`write2` with and without `st64`, the add, sub,
   min, max, and, or and xor atomics with and without return, `wrxchg`, `cmpst`, `ds_swizzle_b32`
   and `ds_bpermute_b32`.
@@ -224,9 +224,9 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
   under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
   native and emulated) match.
 - **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
-- **Not covered.** The translator rejects the 8-bit d16 reads (`ds_read_u8_d16[_hi]`,
-  `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out. It supports `ds_permute_b32` since SHADER-90,
-  but the fuzzer does not generate it yet (FUZZ-10).
+- **Not covered.** The fuzzer does not generate `ds_permute_b32` yet (FUZZ-10); the translator supports it since
+  SHADER-90. The 8-bit d16 reads (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`) are translated since SHADER-85
+  (`cs_w32_lds_u8_d16`) and the fuzzer generates them.
 ### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
 
 `cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`
