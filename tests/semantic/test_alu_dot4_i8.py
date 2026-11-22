@@ -18,6 +18,12 @@ product with the two 16-bit halves of the second source exchanged, as op_sel sel
 ops. `ref_op_sel` reproduces them; the translator refuses any op_sel on these two instructions until a listing can
 carry it.
 
+neg_lo and neg_hi. llvm-mc accepts them on v_dot4_i32_i8 for gfx1036 (not on v_dot4c_i32_i8), and the hardware does
+not ignore them: on the same GPU, 5 operand sets with 8 forms each gave the words of `ref_neg`, 9 of which are in
+MEASURED_NEG. For S0 and S1, neg_lo flips bit 15 and neg_hi flips bit 31 of the dword; for the addend, neg_hi clears
+bit 31 and neg_lo then flips it. That is what the fields do to float operands, applied to integer ones. The
+translator refuses a set bit and takes an all-zero field as the plain instruction.
+
     python -m unittest discover -s tests/semantic -p test_alu_dot4_i8.py
 """
 import os
@@ -57,11 +63,37 @@ MEASURED_OP_SEL = [
 ]
 
 
+# (neg_lo, neg_hi, S0, S1, addend, result measured on gfx1036), one operand set under every form that was run
+MEASURED_NEG = [
+    ((0, 0, 0), (0, 0, 0), 0x04030201, 0x08070605, 0x00000064, 0x000000AA),   # plain: 70 + 100
+    ((1, 0, 0), (0, 0, 0), 0x04030201, 0x08070605, 0x00000064, 0xFFFFFDAA),   # S0 byte 1 reads as 0x82
+    ((0, 0, 0), (1, 0, 0), 0x04030201, 0x08070605, 0x00000064, 0xFFFFFCAA),   # S0 byte 3 reads as 0x84
+    ((0, 1, 0), (0, 0, 0), 0x04030201, 0x08070605, 0x00000064, 0xFFFFFFAA),   # S1 byte 1 reads as 0x86
+    ((0, 0, 0), (0, 1, 0), 0x04030201, 0x08070605, 0x00000064, 0xFFFFFEAA),   # S1 byte 3 reads as 0x88
+    ((0, 0, 1), (0, 0, 0), 0x04030201, 0x08070605, 0x00000064, 0x800000AA),   # the addend's bit 31 flipped
+    ((0, 0, 0), (0, 0, 1), 0x04030201, 0x08070605, 0x00000064, 0x000000AA),   # abs of a positive addend
+    ((0, 0, 1), (0, 0, 1), 0x04030201, 0x08070605, 0x00000064, 0x800000AA),   # abs, then negated
+    ((1, 1, 1), (1, 1, 1), 0x04030201, 0x08070605, 0x00000064, 0x800076AA),
+]
+
+
 def ref(a, b, addend):
     def s8(x):
         return x - 256 if x & 0x80 else x
     total = sum(s8((a >> (8 * i)) & 0xFF) * s8((b >> (8 * i)) & 0xFF) for i in range(4))
     return (total + addend) & 0xFFFFFFFF
+
+
+def ref_neg(neg_lo, neg_hi, a, b, addend):
+    """neg_lo[k] flips bit 15 and neg_hi[k] bit 31 of source k; the addend loses bit 31 under neg_hi[2] and has it
+    flipped under neg_lo[2], in that order."""
+    a ^= (0x8000 if neg_lo[0] else 0) ^ (0x80000000 if neg_hi[0] else 0)
+    b ^= (0x8000 if neg_lo[1] else 0) ^ (0x80000000 if neg_hi[1] else 0)
+    if neg_hi[2]:
+        addend &= 0x7FFFFFFF
+    if neg_lo[2]:
+        addend ^= 0x80000000
+    return ref(a, b, addend)
 
 
 def ref_op_sel(a, b, addend):
@@ -125,6 +157,29 @@ class Dot4I8(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported) as refused:
             support.translate_lines("ps_dot4_op_sel", lines)
         self.assertEqual(str(refused.exception), "v_dot4_i32_i8 op_sel")
+
+    def test_the_neg_reference_reproduces_the_hardware_words(self):
+        for neg_lo, neg_hi, a, b, addend, measured in MEASURED_NEG:
+            self.assertEqual(ref_neg(neg_lo, neg_hi, a, b, addend), measured, f"neg_lo {neg_lo} neg_hi {neg_hi}")
+        # The fields are not ignored: seven of the eight forms give another word than the plain instruction (the
+        # eighth takes the absolute value of an addend that is positive already).
+        plain = MEASURED_NEG[0][5]
+        self.assertEqual(sum(m != plain for *_, m in MEASURED_NEG[1:]), 7)
+
+    def test_a_set_neg_bit_is_refused(self):
+        for field in ("neg_lo:[1,0,0]", "neg_hi:[0,1,0]", "neg_lo:[0,0,1] neg_hi:[0,0,1]"):
+            with self.subTest(field=field):
+                lines = ["v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 0",
+                         f"v_dot4_i32_i8 v8, v1, v2, v3 {field}", "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
+                with self.assertRaises(rdna2spirv.Unsupported) as refused:
+                    support.translate_lines("ps_dot4_neg", lines)
+                self.assertEqual(str(refused.exception), "v_dot4_i32_i8 neg")
+
+    def test_an_all_zero_neg_field_is_the_plain_instruction(self):
+        lines = ["v_mov_b32_e32 v1, 0x04030201", "v_mov_b32_e32 v2, 0x08070605", "v_mov_b32_e32 v3, 0x64",
+                 "v_dot4_i32_i8 v8, v1, v2, v3 neg_lo:[0,0,0] neg_hi:[0,0,0]",
+                 "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
+        self.assertEqual(support.mrt0_words(support.translate_lines("ps_dot4_neg_zero", lines)), [0xAA] * 4)
 
     def test_clamp_is_refused(self):
         lines = ["v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 0",
