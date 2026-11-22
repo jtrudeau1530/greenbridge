@@ -432,6 +432,108 @@ class ScalarInterpreter:
         return res
 
 
+
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def read_lane_reg(self, lane: int, kind: RegKind, index: int, count: int = 1) -> int:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane {lane} out of range [0, {self.num_lanes})")
+        if index < 0 or index + count > 256:
+            raise IndexError(f"Register index {index} + count {count} out of bounds")
+        if kind == RegKind.VGPR:
+            if count == 1:
+                return self.vgprs[lane][index] & MASK32
+            elif count == 2:
+                return words_to_f64_bits(self.vgprs[lane][index], self.vgprs[lane][index + 1])
+        else:
+            if count == 1:
+                return self.sgprs[index] & MASK32
+            elif count == 2:
+                return words_to_f64_bits(self.sgprs[index], self.sgprs[index + 1])
+        raise ValueError(f"Unsupported register count: {count}")
+
+    def write_lane_reg(self, lane: int, kind: RegKind, index: int, count: int, value: int) -> None:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane {lane} out of range [0, {self.num_lanes})")
+        if index < 0 or index + count > 256:
+            raise IndexError(f"Register index {index} + count {count} out of bounds")
+        if kind == RegKind.VGPR:
+            if count == 1:
+                self.vgprs[lane][index] = value & MASK32
+            elif count == 2:
+                lo, hi = f64_bits_to_words(value)
+                self.vgprs[lane][index] = lo
+                self.vgprs[lane][index + 1] = hi
+            else:
+                raise ValueError(f"Unsupported count: {count}")
+        else:
+            if count == 1:
+                self.sgprs[index] = value & MASK32
+            elif count == 2:
+                lo, hi = f64_bits_to_words(value)
+                self.sgprs[index] = lo
+                self.sgprs[index + 1] = hi
+            else:
+                raise ValueError(f"Unsupported count: {count}")
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VOP1Operand, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, Register):
+            return state.read_lane_reg(lane, op.source.kind, op.source.index, op.source.count)
+        elif isinstance(op.source, (Literal32, Literal64)):
+            return op.source.bits
+        raise TypeError(f"Unknown operand source type: {type(op.source)}")
+
+    def step(self, instr: VCvtInstruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+        # Atomic read phase across all active lanes
+        raw_inputs = [
+            self.resolve_lane_operand(instr.src0, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+
+        # Execution phase
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                raw_src = raw_inputs[lane]
+                if instr.opcode == Opcode.V_CVT_F64_I32:
+                    res = oracle_v_cvt_f64_i32(raw_src, clamp=instr.clamp)
+                elif instr.opcode == Opcode.V_CVT_F64_U32:
+                    res = oracle_v_cvt_f64_u32(raw_src, clamp=instr.clamp)
+                elif instr.opcode == Opcode.V_CVT_I32_F64:
+                    res = oracle_v_cvt_i32_f64(raw_src, abs_mod=instr.src0.abs_mod, neg_mod=instr.src0.neg_mod)
+                elif instr.opcode == Opcode.V_CVT_U32_F64:
+                    res = oracle_v_cvt_u32_f64(raw_src, abs_mod=instr.src0.abs_mod, neg_mod=instr.src0.neg_mod)
+                else:
+                    raise NotImplementedError(f"Unsupported opcode {instr.opcode}")
+
+                state.write_lane_reg(lane, instr.dst.kind, instr.dst.index, instr.dst.count, res)
+                results[lane] = res
+
+        return results
+
+
 # ==============================================================================
 # Unit Tests: Mathematical Model and Reference Oracles
 # ==============================================================================
@@ -814,6 +916,125 @@ class TestScalarInterpreter(unittest.TestCase):
             runs.append(self.interp.step(inst, st))
         self.assertTrue(all(r == runs[0] for r in runs))
         self.assertEqual(runs[0], 42)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD execution, lane divergence, and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_full_exec(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            # Write lane number as signed integer into v4
+            state.write_lane_reg(lane, RegKind.VGPR, 4, 1, i32_to_u32(lane - 16))
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_I32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Register(RegKind.VGPR, 4, count=1)),
+        )
+        results = self.interp.step(inst, state)
+        for lane in range(32):
+            self.assertIsNotNone(results[lane])
+            expected_f = float(lane - 16)
+            self.assertEqual(bits_to_f64(state.read_lane_reg(lane, RegKind.VGPR, 0, count=2)), expected_f)
+
+    def test_wave32_divergent_masking(self) -> None:
+        canary = 0xDEAD_BEEF
+        # Alternating mask: even lanes active (0x55555555)
+        state = SIMDState(num_lanes=32, exec_mask=0x5555_5555)
+        for lane in range(32):
+            state.write_lane_reg(lane, RegKind.VGPR, 2, 2, f64_to_bits(float(lane) * 2.5))
+            state.write_lane_reg(lane, RegKind.VGPR, 0, 1, canary)
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2)),
+        )
+        results = self.interp.step(inst, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertIsNotNone(results[lane])
+                expected_int = int(math.trunc(float(lane) * 2.5))
+                self.assertEqual(state.read_lane_reg(lane, RegKind.VGPR, 0, count=1), expected_int)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.read_lane_reg(lane, RegKind.VGPR, 0, count=1), canary)
+
+    def test_wave64_full_exec(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFF_FFFF_FFFF_FFFF)
+        for lane in range(64):
+            state.write_lane_reg(lane, RegKind.VGPR, 6, 1, lane * 100)
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_U32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Register(RegKind.VGPR, 6, count=1)),
+        )
+        self.interp.step(inst, state)
+        for lane in range(64):
+            self.assertEqual(
+                bits_to_f64(state.read_lane_reg(lane, RegKind.VGPR, 0, count=2)),
+                float(lane * 100),
+            )
+
+    def test_wave64_half_disabled(self) -> None:
+        canary = 0xCAFE_BABE
+        # Lower 32 lanes active, upper 32 inactive
+        state = SIMDState(num_lanes=64, exec_mask=0x0000_0000_FFFF_FFFF)
+        for lane in range(64):
+            state.write_lane_reg(lane, RegKind.VGPR, 2, 2, f64_to_bits(100.9))
+            state.write_lane_reg(lane, RegKind.VGPR, 0, 1, canary)
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_U32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2)),
+        )
+        results = self.interp.step(inst, state)
+        for lane in range(64):
+            if lane < 32:
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(state.read_lane_reg(lane, RegKind.VGPR, 0, count=1), 100)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.read_lane_reg(lane, RegKind.VGPR, 0, count=1), canary)
+
+    def test_wave_exec_all_zero(self) -> None:
+        canary_lo = 0x1111_2222
+        canary_hi = 0x3333_4444
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        for lane in range(32):
+            state.write_lane_reg(lane, RegKind.VGPR, 0, 2, words_to_f64_bits(canary_lo, canary_hi))
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_I32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Literal32(99)),
+        )
+        results = self.interp.step(inst, state)
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(32):
+            self.assertEqual(
+                state.read_lane_reg(lane, RegKind.VGPR, 0, count=2),
+                words_to_f64_bits(canary_lo, canary_hi),
+            )
+
+    def test_simd_sgpr_uniform_broadcast(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        state.write_lane_reg(0, RegKind.SGPR, 8, 2, f64_to_bits(777.9))
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=VOP1Operand(Register(RegKind.SGPR, 8, count=2)),
+        )
+        self.interp.step(inst, state)
+        for lane in range(32):
+            self.assertEqual(state.read_lane_reg(lane, RegKind.VGPR, 0, count=1), 777)
 
 
 if __name__ == "__main__":
