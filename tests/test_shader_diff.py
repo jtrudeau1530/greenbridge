@@ -29,9 +29,40 @@ def test_compare_pair_flags_known_bad():
 
 def test_compare_pair_both_nan_matches():
     qnan = 0x7FC00001
-    assert sd.compare_pair([qnan] * 4, [0x7FC00002] * 4) is None
-    bad = sd.compare_pair([qnan] * 4, [0x3F800000] * 4)
+    writers = {reg: ("v_add_f32", 1) for reg in sd.EXPORT_REGS}
+    assert sd.compare_pair([qnan] * 4, [0x7FC00002] * 4, writers=writers) is None
+    bad = sd.compare_pair([qnan] * 4, [0x3F800000] * 4, writers=writers)
     assert bad is not None and "NaN" in bad
+
+
+@pytest.mark.parametrize("changed_word, replacement, width, expected", [
+    (1, 0x7FC00000, 4, ("lane word 1", "0xffffffff", "0x7fc00000", "v_mov_b32 at body line 4")),
+    (2, 3, 4, ("lane word 2", "v_mov_b32 at body line 5")),
+    (None, None, 3, ("shape mismatch: cpu has 4 words, spv has 3",)),
+])
+def test_run_one_reports_the_first_actual_mismatch(monkeypatch, changed_word, replacement, width, expected):
+    lines = ["v_mov_b32 v8, 0x7f800000", "v_mov_b32 v12, 0xff800000",
+             "v_add_f32 v8, v8, v12", "v_mov_b32 v9, 0xffffffff",
+             "v_mov_b32 v10, 1", "v_mov_b32 v11, 2"]
+    writers = {8: ("v_add_f32", 3), 9: ("v_mov_b32", 4), 10: ("v_mov_b32", 5), 11: ("v_mov_b32", 6)}
+    assert sd.run_one("ps_mixed_outputs", lines, writers) == ("match", "")
+    run_fragment = sd.run_fragment
+
+    def mutate_export(spvasm):
+        outputs = run_fragment(spvasm)
+        words = list(outputs["%out_mrt0"])
+        words[0] = 0x7FC00001  # Different payload for a floating-point NaN is allowed.
+        if changed_word is not None:
+            words[changed_word] = replacement
+        outputs["%out_mrt0"] = words[:width]
+        return outputs
+
+    monkeypatch.setattr(sd, "run_fragment", mutate_export)
+    status, detail = sd.run_one("ps_mixed_outputs", lines, writers)
+    assert status == "mismatch"
+    for fragment in expected:
+        assert fragment in detail
+    assert "v_add_f32 at body line 3" not in detail
 
 
 def test_unsupported_op_is_a_counted_skip():
