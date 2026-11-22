@@ -193,10 +193,10 @@ key. Across the measured character materials, the texture content separates clea
 | Parameter | Common formats | Measured role |
 |---|---|---|
 | `0xC8E8C282` | BC1/BC3/BC7 sRGB, some BC1/BC7 UNORM | **sRGB albedo** when present |
-| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | tangent-space normal map |
-| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | normal/detail normal |
-| `0x739E3D0D` | BC7 UNORM, some BC1 | ORM/mask |
-| `0x8ADB8480` | BC4 UNORM | mask |
+| `0xC6F46E79` | BC7 UNORM, BC1 UNORM | `speculartex`: specular/gloss (packed), not a normal map |
+| `0x1E77BF4C` | BC5 UNORM, some BC1/BC7 | `bumptex`: tangent-space normal/detail normal |
+| `0x739E3D0D` | BC7 UNORM, some BC1 | `speculartex2`: ORM/mask (packed) |
+| `0x8ADB8480` | BC4 UNORM | `materialid`: ID/palette map |
 
 This is a measured corpus split, not a claim that the hashes are globally unique semantics.
 The practical rule for exporters: use `0xC8E8C282` as albedo, and **do not fall back to the
@@ -256,10 +256,21 @@ The model binding is also decoded. `PERSCHARS_INFO` (`data.rpf@0x1AA5F000`, reco
 (`packs.rpf@0x11D1FF000`, record 1219) maps that link to `cs_mandy` (`0xD7C0CDFF`). `cs_mandy`
 is a live model id — a `story000.rpf` cutscene actor/voice table uses it — but there is **no
 named `cs_mandy` drawable**. Its 64-bit `ModelName` is `0x009B33B7D7C0CDFF`, and its `FragName`
-`0xC9888B65009B33B7` is byte-identical to `cs_lucia` and `cs_monalisa`: the shared female
-cutscene-ped fragment set. The realistic full-body in that family is `cs_lucia_legacypedcs`
+`0xC9888B65009B33B7` is the shared female cutscene base, carried by **904** female rows:
+`player_story000_00` (Lucia's model id `0xE472B687`), `cs_monalisa` (`0x9CB9BCC6`) and
+`cs_mandy` (`0xD7C0CDFF`), plus 901 others. No ped-model row carries `joaat("cs_lucia")`
+(`0x95F1E309`); that is a name prefix, not a model id. A second base
+`0x0A704516C676E805` is shared by `cs_shanese` (`0x3570D92E`) and 11 unnamed female rows, and
+8 female models have wholly model-specific fragments. None resolves to a name, and neither
+table contains an adult-token, `mp_f_*`, `nude`, `topless`, `stripper`, `prostitute`, `dancer`,
+`escort`, `hooker`, `swim`, `lingerie` or `club` female model. The realistic full-body in the
+shared base is `cs_lucia_legacypedcs`
 (874 v), so Mandy uses the same body as Lucia. Her nine-entry variation table has 18 u32 hashes;
-16 are unique to her, but none resolves to a shipped drawable or texture name.
+16 are unique to her. A deeper search — 373,484 shipped names / 725,869 normalised variants plus
+about 25 million generated strings — gives **0/18** exact matches. The sibling nine-entry table
+resolves 9 of 18 values to `joaat("outfit_01")` … `joaat("outfit_10")` (frequency corroborates
+it), so the table stores build-time design labels, not shipped asset names; the 18 component
+values are not recoverable by name enumeration.
 
 The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
