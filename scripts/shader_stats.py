@@ -131,10 +131,23 @@ def median_clause(rs, key, label):
     return f"{label} median {statistics.median(r[key] for r in known):g}{coverage(len(known), len(rs))}"
 
 
+USAGE = "usage: shader_stats.py <stats.csv> <disasm dir> [--details]"
+
+
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+    # A misspelt option (--detail) used to be dropped, and the summary printed as if it had been asked for.
+    unknown = [a for a in argv if a.startswith("--") and a != "--details"]
+    if unknown:
+        print(f"unknown option {unknown[0]}\n{USAGE}", file=sys.stderr)
+        return 2
+    args = [a for a in argv if not a.startswith("--")]
     if len(args) != 2:
-        sys.exit(__doc__)
+        print(USAGE, file=sys.stderr)
+        return 2
     path = args[0]
     try:
         stats = load_stats(path)
