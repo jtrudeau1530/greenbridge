@@ -725,10 +725,11 @@ if(TARGET Vulkan::Headers)
     else()
       find_program(LEONIDA_LLVM_MC llvm-mc HINTS "C:/msys64/ucrt64/bin")
     endif()
-    if(LEONIDA_LLVM_MC)
+    if(LEONIDA_LLVM_MC AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       set(LEONIDA_SG_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/subgroup_shaders)
       set(LEONIDA_SG_INDEXES "")
-      foreach(case "w64_native;cs_w64x_readlane;0" "w64_emulated;cs_w64x_readlane;1" "w32_native;cs_wqm_w32;0")
+      foreach(case "w64_native;cs_w64x_readlane;0" "w64_emulated;cs_w64x_readlane;1" "w32_native;cs_wqm_w32;0"
+                       "ps_w64_native;ps_w64x_readlane;0")
         list(GET case 0 folder)
         list(GET case 1 shader)
         list(GET case 2 emulate)
@@ -745,13 +746,26 @@ if(TARGET Vulkan::Headers)
           VERBATIM)
         list(APPEND LEONIDA_SG_INDEXES ${index})
       endforeach()
+      # The probe shaders that store the subgroup size the driver ran them with, and a one-triangle vertex shader.
+      foreach(source cs_sg_probe.comp ps_sg_probe.frag vs_sg_fullscreen.vert)
+        set(output ${LEONIDA_SG_DIR}/glsl/${source}.spv)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${CMAKE_COMMAND} -E make_directory ${LEONIDA_SG_DIR}/glsl
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling ${source}"
+          VERBATIM)
+        list(APPEND LEONIDA_SG_INDEXES ${output})
+      endforeach()
       add_executable(d3d12_subgroup_test test/d3d12_subgroup_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_SG_INDEXES})
       target_link_libraries(d3d12_subgroup_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_subgroup_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_SUBGROUP_SHADERS="${LEONIDA_SG_DIR}")
       target_compile_options(d3d12_subgroup_test PRIVATE /W4 /permissive- /utf-8)
     else()
-      message(STATUS "llvm-mc not found (set LLVM_MC): d3d12_subgroup_test is not built")
+      message(STATUS "llvm-mc (set LLVM_MC) or glslangValidator not found: d3d12_subgroup_test is not built")
     endif()
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
