@@ -282,6 +282,14 @@ bool xr_bias_compatible(const D3D12_RESOURCE_DESC& desc) {
     return mips == 1;
 }
 
+// The Xbox tiled layout word (slot 76, docs/d3d12_vulkan.md section 4.2) is outside D3D12_TEXTURE_LAYOUT's
+// enumerators, so compare as an integer.
+constexpr UINT kXboxTiledLayout = 0x101;
+
+bool is_tiled_layout(D3D12_TEXTURE_LAYOUT layout) {
+    return layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE || static_cast<UINT>(layout) == kXboxTiledLayout;
+}
+
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
 leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC& resource,
                                const D3D12_RENDER_TARGET_VIEW_DESC* view) {
@@ -4117,14 +4125,15 @@ public:
         return CreateReservedResource1(desc, D3D12_RESOURCE_STATE_COMMON, nullptr, session, riid, out);
     }
 
-    // Tiling of a reserved resource (src/resource_tiling.h). Anything else, as on the PC runtime, has no tiles:
-    // every output is zero and no subresource tiling is written.
+    // Tiling of a reserved resource or a tiled (64KB_UNDEFINED_SWIZZLE) texture (src/resource_tiling.h). Anything
+    // else, as on the PC runtime, has no tiles: every output is zero and no subresource tiling is written.
     void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource* resource, UINT* total, D3D12_PACKED_MIP_INFO* packed,
                                              D3D12_TILE_SHAPE* shape, UINT* count, UINT first,
                                              D3D12_SUBRESOURCE_TILING* tilings) override {
         leonida::ResourceTiling tiling;
         Resource* r = Resource::from<Resource>(resource);
-        const bool ok = r && r->reserved() && resource_tiling(r->GetDesc(), tiling);
+        const bool ok = r && (r->reserved() || is_tiled_layout(r->GetDesc().Layout)) &&
+                        resource_tiling(r->GetDesc(), tiling);
         if (total) *total = ok ? tiling.total_tiles : 0;
         if (packed)
             *packed = ok ? D3D12_PACKED_MIP_INFO{UINT8(tiling.standard_mips), UINT8(tiling.packed_mips),
@@ -4281,14 +4290,28 @@ public:
             log_once("placed resource offset not 64 KiB aligned:", int(heap_offset));
             return E_INVALIDARG;
         }
+        const bool tiled = is_tiled_layout(desc->Layout);
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            if (heap_offset + desc->Width > heap->bytes()) return E_INVALIDARG;
+            if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+            if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width) return E_INVALIDARG;
         } else if (heap_offset >= heap->bytes()) {
             return E_INVALIDARG;
         }
-        if (desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
-            log_once("tiled placed resource not supported yet; dimension", int(desc->Dimension));
-            return E_NOTIMPL;
+        if (tiled) {
+            if (heap->properties().Type == D3D12_HEAP_TYPE_UPLOAD ||
+                heap->properties().Type == D3D12_HEAP_TYPE_READBACK)
+                return E_INVALIDARG;
+            if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                return E_INVALIDARG;
+            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
+            if (alloc.SizeInBytes == UINT64_MAX || alloc.SizeInBytes > heap->bytes() ||
+                heap_offset > heap->bytes() - alloc.SizeInBytes)
+                return E_INVALIDARG;
+            if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+                log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
+                         int(desc->Dimension));
+            }
         }
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
@@ -4297,7 +4320,7 @@ public:
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             hr = resource->create_placed_buffer();
-        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        } else if (!tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             log_once("placed resource dimension not supported:", int(desc->Dimension));
         } else if (desc->SampleDesc.Count > 1) {
             log_once("multisampled placed resource not supported; samples", int(desc->SampleDesc.Count));
@@ -5075,8 +5098,16 @@ private:
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
             (volume && depth_stencil))
             return kInvalidAllocation;
-        if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
+        const bool tiled = is_tiled_layout(desc.Layout);
+        if (tiled) {
+            if (one_d) return kInvalidAllocation;
+            if (desc.Alignment && desc.Alignment != align_64k) return kInvalidAllocation;
+            // Tiled MSAA is 4x single-mip 2D attachment only (measured on RTX 5070 Ti and WARP).
+            if (samples > 1 && (samples != 4 || !(desc.Flags & attachment) || (desc.Flags & attachment) == attachment))
+                return kInvalidAllocation;
+        } else if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
+        }
 
         const Format format = state_.texture_format(desc);
         if (!format.format) {
@@ -5086,6 +5117,11 @@ private:
         VkMemoryRequirements need{};
         const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
+        if (tiled) {
+            leonida::ResourceTiling tiling;
+            if (!resource_tiling(resolved, tiling)) return kInvalidAllocation;
+            return {UINT64(tiling.total_tiles) * leonida::tile_size_in_bytes, align_64k};
+        }
 
         // D3D12's alignment: 64 KiB, or 4 MiB with MSAA, unless the description asks for a small one (4 KiB, 64 KiB
         // with MSAA). 4 KiB needs the top mip of one array slice to fit in 16 tiles of 4 KiB and the resource not to
@@ -5265,14 +5301,11 @@ private:
     HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, REFIID riid, void** out) {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
-        // The Xbox tiled layout word. 0x101 is outside D3D12_TEXTURE_LAYOUT's enumerators, so it can't be a
-        // constexpr enum value (clang rejects the cast in a constant expression); compare it as an integer.
-        constexpr UINT xbox_tiled = 0x101;
         D3D12_RESOURCE_DESC backing = *desc;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
         } else {
-            if (static_cast<UINT>(desc->Layout) == xbox_tiled) {
+            if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
                 log_once("reserved resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          desc->Dimension);
             } else if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
@@ -5324,6 +5357,7 @@ private:
         const leonida::BlockFormat block = leonida::block_format(format.format, format.aspects);
         tiling.element_bytes = block.bytes;
         tiling.block = block.block;
+        tiling.samples = desc.SampleDesc.Count;
         return leonida::resource_tiling(tiling, out);
     }
 
