@@ -95,9 +95,22 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
   cannot reach outside the package and the overlay.
 
-`runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`. Not mapped
-yet: `CreateDirectory*`/`RemoveDirectory*`, `MoveFile*`, `CopyFile*` and `SetFileAttributes*`; a title that makes a
-folder through them gets the host's error for a name like `GAME:\...`.
+- `CreateDirectory*` makes the folder in the overlay. A name the title can already see, including a folder only the
+  package has, fails with `ERROR_ALREADY_EXISTS`; a missing parent with `ERROR_PATH_NOT_FOUND`.
+- `RemoveDirectory*` needs the folder empty in the title's view (`ERROR_DIR_NOT_EMPTY` otherwise). An overlay folder is
+  removed; a package folder is hidden by a `.gta6rt-dir` marker inside its marker folder, and stays on disk. A marker
+  folder on its own (left by a file deleted below it) does not hide anything.
+- `MoveFile*` writes the destination in the overlay. A package file is copied there and its old name deleted by a
+  marker; an overlay file or an overlay-only folder is renamed. An existing destination needs
+  `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Moving a package folder fails with
+  `ERROR_ACCESS_DENIED` (as deleting one does), a move between `GAME:` and a host path with `ERROR_NOT_SAME_DEVICE`, and
+  `MOVEFILE_DELAY_UNTIL_REBOOT` with `ERROR_INVALID_PARAMETER`.
+- `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
+  overlay; fail-if-exists counts a name only the package has. Either side can be a host path.
+- `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
+  folder) first, so the package keeps its own.
+
+`runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
 ## When an unimplemented import is called
 
