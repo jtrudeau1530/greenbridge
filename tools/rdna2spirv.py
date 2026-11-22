@@ -6185,6 +6185,13 @@ class Gen:
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
+        elif op in ("v_fmamk_f16", "v_fmaak_f16"):
+            # VOP2 with a literal K (RDNA2 ISA): fmamk D = S0 * K + S1, printed `vdst, src0, K, vsrc1`; fmaak
+            # D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`. In print order both are a[1] * a[2] + a[3], as for
+            # v_fmamk/fmaak_f32. K is the f16 in the literal's low 16 bits (src_h: a float literal is converted).
+            # One rounding to f16, as v_fmac_f16 (SHADER-55); GFX10 f16 VOP2 writes the low half and keeps the high.
+            vals = [self.f16_in(t) for t in a[1:4]]
+            self.f16_out(a[0], self.fma_f16_odd(*vals), 0)
         elif op in ("v_add_nc_u16", "v_sub_nc_u16", "v_add_nc_i16", "v_sub_nc_i16"):
             # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept. The
             # i16 forms differ only under clamp (signed saturation); v_add_i16 / v_sub_i16 are internal names.
