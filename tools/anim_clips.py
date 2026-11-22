@@ -507,6 +507,18 @@ def is_root(head):
             and struct.unpack_from("<Q", head, 8)[0] >> 28 == 5)
 
 
+def _named_dictionary_root(page):
+    """A root prefix corroborated by a page-local dictionary name and its stored hash."""
+    if len(page) < 0x6C or not is_root(page):
+        return False
+    s = System(page)
+    try:
+        name = s.string(0x38)
+    except DecodeError:
+        return False
+    return bool(name) and anim_index.joaat32(name) == s.u32(0x68)
+
+
 def _inflate(m, row):
     return zlib.decompressobj().decompress(m[row["offset"]:row["offset"] + row["stored"]])
 
@@ -611,9 +623,13 @@ def group(m, rows, *, first_row_only: bool = False, continuation_rows=None):
             unresolved["graphics pages"] += 1
             continue
         while len(parts) < pages and has_next(k) and _next_to(rows[k], rows[k + 1]):
+            following = rows[k + 1]
+            if following["signature"] == "zero-prefix" and _named_dictionary_root(_inflate(m, following)):
+                break
             k += 1
             parts.append(k)
-        if len(parts) == pages - 1:
+        # A listed adjacent root cannot also be an unlisted gap page.
+        if len(parts) == pages - 1 and (k + 1 == len(rows) or not _next_to(rows[k], rows[k + 1])):
             joined = b"".join(_inflate(m, rows[j]) for j in parts)
             gap = _gap_page(m, rows[k], joined)
             if gap is not None:
