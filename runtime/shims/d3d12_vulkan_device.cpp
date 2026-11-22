@@ -2236,12 +2236,15 @@ public:
         case D3D12_FEATURE_FEATURE_LEVELS: {
             if (size != sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* levels = static_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS*>(data);
+            // The host (hardware and WARP) refuses an empty or missing list before reading it.
+            if (!levels->NumFeatureLevels || !levels->pFeatureLevelsRequested)
+                return d3d12_trace::result(method, E_INVALIDARG);
             D3D_FEATURE_LEVEL best = D3D_FEATURE_LEVEL(0);
             for (UINT i = 0; i < levels->NumFeatureLevels; ++i)
                 if (levels->pFeatureLevelsRequested[i] <= D3D_FEATURE_LEVEL_12_1)
                     best = std::max(best, levels->pFeatureLevelsRequested[i]);
+            levels->MaxSupportedFeatureLevel = best;  // 0 with DXGI_ERROR_UNSUPPORTED, as the host writes it
             if (!best) return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
-            levels->MaxSupportedFeatureLevel = best;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_ARCHITECTURE:

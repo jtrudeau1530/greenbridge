@@ -1758,6 +1758,17 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &feature_levels,
                                                      sizeof(feature_levels))));
         EXPECT(feature_levels.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL_12_1);
+        // An empty or missing list is E_INVALIDARG on the host (NVIDIA and WARP), not DXGI_ERROR_UNSUPPORTED or a
+        // read through null; a list the device can't meet answers DXGI_ERROR_UNSUPPORTED and writes level 0.
+        D3D12_FEATURE_DATA_FEATURE_LEVELS no_levels{0, levels, D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &no_levels, sizeof(no_levels)) == E_INVALIDARG);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS null_levels{1, nullptr, D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &null_levels, sizeof(null_levels)) ==
+               E_INVALIDARG);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS too_high{1, &levels[2], D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &too_high, sizeof(too_high)) ==
+               DXGI_ERROR_UNSUPPORTED);
+        EXPECT(too_high.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL(0));
         D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))));
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
