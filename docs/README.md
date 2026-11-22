@@ -19,10 +19,11 @@ method, scope and caveats. No game data is included.
 |---|---|
 | [models.md](models.md) | 350,248 models at the `917e9b9` pin, including 159,483 drawable-dictionary children; the re-count table is in models.md. |
 | [character_models.md](character_models.md) | `packs.rpf` character parts at `e293917`: 26,585 rows / 11,335 unique names, 2,865 fragments (all a 25-vertex bounds cube), Lucia's 22 named records and the decoded 13-part export, the `player_story000_00` drawable set, slot-name token counts, texture coverage (184/215), and what is not decoded (fragment children, ped variation, hair, bind pose). |
+| [models.md](models.md) | 382,781 models (2.64 billion triangles, 0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children and 55,417 fragments; the re-count table is in models.md. |
 | [character_skeleton.md](character_skeleton.md) | Character `.#ft` fragments: the 597-name shared skeleton table (596 `joaat32` hashes), the 597-record instance tree with 580 measured parents, the model-side bone-hash mapping, and the measured vertex joint-index/skin-weight layouts (`tools/skin_streams.py`); the reference TRS is not the bind pose. |
 | [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
-| [textures.md](textures.md) | 308,895 TTPF textures exported; 48,220 skips, mostly BCPack. |
-| [textures_arrays.md](textures_arrays.md) | 678 TTPF array/volume descriptors: 90 tile-mode-9 cubes have a validated 6-slice allocation layout; 588 remain unresolved. |
+| [textures.md](textures.md) | 357,115 TTPF descriptors across 57 pools: `rpf9dump` (`e293917`) decodes 354,991 strict-clean (99.41%) directly including BCPack BC1/BC3/BC4/BC5; `tools/bcpack.py` decodes all six BCPack modes (BC1–BC7). |
+| [textures_arrays.md](textures_arrays.md) | All 697 multi-slice TTPF descriptors resolved (127 mip-major `SW_64KB_D` 2D arrays, 567 streaming slice-major `SW_4KB_S` cubemaps, 3 `SW_4KB_S` 3D volumes) plus 357,115/357,115 chunk-page metadata validation. |
 | [animation.md](animation.md) | 130,470 `anim.rpf` streams, 95.4% readable; 1,126 rig sets / 6,677 source-to-rig entries / 3,669 rigs. |
 | [navmesh.md](navmesh.md) | 90,295 `navmeshes.rpf` streams (0 unclassified): 9,603 `0DRP` cover-point `0x7a` pages, 27,644 `0x00010015` navmesh tiles (`136×180` grid), 27,482 Band-3 sparse grids, 22 `PSIN`. |
 | [bvh.md](bvh.md) | 565,596 `core_bvh4.rpf` streams; 271,627 BVH4 streams and 269,106 instances, prebuilt acceleration data. |
