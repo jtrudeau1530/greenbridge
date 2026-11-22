@@ -1611,19 +1611,36 @@ class Gen:
             for k in range(sizes[op.rsplit("_", 1)[1]]):
                 v = self.load_reg("vgpr", a[1]["r"] + k)
                 self.emit(f"OpStore {self.lds_ptr(addr, off + 4 * k)} {v}")
-        elif op in ("ds_read2_b32", "ds_read2st64_b32", "ds_write2_b32", "ds_write2st64_b32"):
-            unit = 4 * (64 if "st64" in op else 1)
+        elif op in ("ds_read2_b32", "ds_read2st64_b32", "ds_write2_b32", "ds_write2st64_b32",
+                    "ds_read2_b64", "ds_read2st64_b64", "ds_write2_b64", "ds_write2st64_b64"):
+            # Two elements at ADDR + offset0 * unit and ADDR + offset1 * unit; unit = element size (4 or 8 bytes),
+            # times 64 for st64. A b64 element is two consecutive dwords (low first): read2_b64 fills
+            # v[d:d+3], write2_b64 takes two VGPR pairs.
+            words = 2 if op.endswith("_b64") else 1
+            unit = 4 * words * (64 if "st64" in op else 1)
             offs = (self.mod_int(mods, "offset0", 0) * unit, self.mod_int(mods, "offset1", 0) * unit)
             if op.startswith("ds_read2"):
                 addr = self.src_u(a[1])
-                for k, o in enumerate(offs):
-                    v = self.tmp()
-                    self.emit(f"{v} = OpLoad %uint {self.lds_ptr(addr, o)}")
+                vals = []
+                for o in offs:
+                    for w in range(words):
+                        v = self.tmp()
+                        self.emit(f"{v} = OpLoad %uint {self.lds_ptr(addr, o + 4 * w)}")
+                        vals.append(v)
+                for k, v in enumerate(vals):         # every load before the first write (vdst may alias vaddr)
                     self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, v)
             else:
                 addr = self.src_u(a[0])
                 for k, o in enumerate(offs):
-                    self.emit(f"OpStore {self.lds_ptr(addr, o)} {self.src_u(a[1 + k])}")
+                    data = a[1 + k]
+                    for w in range(words):
+                        if words == 1:
+                            v = self.src_u(data)
+                        elif data["k"] == "vgpr" and data.get("n") == 2:
+                            v = self.load_reg("vgpr", data["r"] + w)
+                        else:
+                            raise Unsupported(op + " data")
+                        self.emit(f"OpStore {self.lds_ptr(addr, o + 4 * w)} {v}")
         elif op in ("ds_read_u16", "ds_read_i16", "ds_read_u8", "ds_read_i8", "ds_read_u16_d16_hi", "ds_read_u16_d16",
                     "ds_read_u8_d16", "ds_read_u8_d16_hi", "ds_read_i8_d16", "ds_read_i8_d16_hi"):
             bits = 16 if "16" in op.split("_")[2] else 8
