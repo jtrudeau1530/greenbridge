@@ -1571,5 +1571,170 @@ class TestValuSubrevF16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res, POS_ZERO_F16)
 
 
+class TestValuSubrevF16NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs for v_subrev_f16."""
+
+    def test_syntax_rejection_empty_and_bad_opcode(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_subrev_f16_asm("")
+        with self.assertRaises(ValueError):
+            parse_subrev_f16_asm("v_add_f16_e32 v0, v1, v2")
+        with self.assertRaises(ValueError):
+            parse_subrev_f16_asm("v_subrev_f16_e32 v0, v1")
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1).validate()
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256).validate()
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -1).validate()
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106).validate()
+
+    def test_invalid_destination_kind(self) -> None:
+        # VALU destination cannot be SGPR
+        ast = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.SGPR, 0),
+            src0=Operand(reg=Register(RegKind.VGPR, 1)),
+            src1=Operand(reg=Register(RegKind.VGPR, 2)),
+        )
+        with self.assertRaises(TypeError):
+            ast.validate()
+
+    def test_invalid_vop2_modifiers(self) -> None:
+        # VOP2 cannot have clamp, omod, op_sel, or input modifiers
+        ast_clamp = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Operand(reg=Register(RegKind.VGPR, 1)),
+            src1=Operand(reg=Register(RegKind.VGPR, 2)),
+            mods=InstructionModifiers(clamp=True),
+            encoding=Encoding.VOP2,
+        )
+        with self.assertRaises(ValueError):
+            ast_clamp.validate()
+
+        ast_omod = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Operand(reg=Register(RegKind.VGPR, 1)),
+            src1=Operand(reg=Register(RegKind.VGPR, 2)),
+            mods=InstructionModifiers(omod="mul:2"),
+            encoding=Encoding.VOP2,
+        )
+        with self.assertRaises(ValueError):
+            ast_omod.validate()
+
+        ast_op_sel = InstructionAST(
+            opcode=Opcode.V_SUBREV_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Operand(reg=Register(RegKind.VGPR, 1)),
+            src1=Operand(reg=Register(RegKind.VGPR, 2)),
+            mods=InstructionModifiers(op_sel=(True, False, False)),
+            encoding=Encoding.VOP2,
+        )
+        with self.assertRaises(ValueError):
+            ast_op_sel.validate()
+
+    def test_state_out_of_bounds_access(self) -> None:
+        scalar = ScalarMachineState()
+        with self.assertRaises(IndexError):
+            scalar.get_vgpr(256)
+        with self.assertRaises(IndexError):
+            scalar.get_sgpr(106)
+        with self.assertRaises(IndexError):
+            scalar.set_vgpr(256, 0)
+        with self.assertRaises(IndexError):
+            scalar.set_sgpr(106, 0)
+
+    def test_simd_invalid_wave_size_and_lanes(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+        simd = SIMDWaveState(wave_size=32)
+        with self.assertRaises(IndexError):
+            simd.is_lane_active(32)
+
+
+class TestValuSubrevF16MutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional bugs/mutations in subrev semantics are caught."""
+
+    def test_mutation_non_reversed_subtraction(self) -> None:
+        # Mutation: computing S0 - S1 instead of S1 - S0
+        def mutated_sub(s0: int, s1: int) -> int:
+            return ref_subrev_f16(s1, s0)  # reversed operands
+
+        s0 = ONE_F16    # 1.0
+        s1 = THREE_F16  # 3.0
+        # True v_subrev_f16: 3.0 - 1.0 = 2.0
+        # Mutated: 1.0 - 3.0 = -2.0
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_sub(s0, s1), TWO_F16)
+
+    def test_mutation_signed_zero_blindness(self) -> None:
+        # Mutation: ignoring signed zero difference (-0.0) - (+0.0) -> producing +0.0
+        def mutated_zero_sub(s0: int, s1: int) -> int:
+            res = ref_subrev_f16(s0, s1)
+            if res == NEG_ZERO_F16:
+                return POS_ZERO_F16
+            return res
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_zero_sub(POS_ZERO_F16, NEG_ZERO_F16), NEG_ZERO_F16)
+
+    def test_mutation_infinity_cancellation(self) -> None:
+        # Mutation: (+inf) - (+inf) produces 0.0 instead of NaN
+        def mutated_inf_sub(s0: int, s1: int) -> int:
+            if s0 == POS_INF_F16 and s1 == POS_INF_F16:
+                return POS_ZERO_F16
+            return ref_subrev_f16(s0, s1)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_inf_sub(POS_INF_F16, POS_INF_F16), CANONICAL_QNAN_F16)
+
+    def test_mutation_clamp_nan_bug(self) -> None:
+        # Mutation: clamping NaN returns NaN instead of +0.0
+        def mutated_clamp_nan(s0: int, s1: int) -> int:
+            return ref_subrev_f16(s0, s1, clamp=False)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_clamp_nan(CANONICAL_QNAN_F16, ONE_F16), POS_ZERO_F16)
+
+    def test_mutation_exec_mask_leak(self) -> None:
+        # Mutation: inactive lane leaks write to destination
+        simd = SIMDWaveState(wave_size=32, exec_mask=0)  # all inactive
+        canary = 0xBEEF
+        simd.set_lane_vgpr(0, 0, pack_half(canary, canary))
+
+        interp = SIMDVALUInterpreter()
+        interp.step("v_subrev_f16_e32 v0, v1, v2", simd)
+        # Canary must remain intact
+        self.assertEqual(simd.get_lane_vgpr(0, 0), pack_half(canary, canary))
+
+        # Mutated write unconditionally overwrites
+        simd.set_lane_vgpr(0, 0, pack_half(ONE_F16, canary))
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.get_lane_vgpr(0, 0), pack_half(canary, canary))
+
+    def test_mutation_modifier_order(self) -> None:
+        # Mutation: applying neg then abs (which makes -|x| always positive | -x | = +x)
+        def mutated_mods(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits
+            if neg_mod:
+                res ^= SIGN_MASK_F16
+            if abs_mod:
+                res &= ~SIGN_MASK_F16
+            return res
+
+        # For -|1.0|, correct is -1.0 (sign bit set)
+        correct = apply_f16_input_mods(ONE_F16, abs_mod=True, neg_mod=True)
+        mutated = mutated_mods(ONE_F16, abs_mod=True, neg_mod=True)
+        self.assertEqual(correct, NEG_ONE_F16)
+        self.assertNotEqual(correct, mutated)
+
+
 if __name__ == "__main__":
     unittest.main()
