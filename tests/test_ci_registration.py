@@ -31,6 +31,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(".github", "workflows", "ci.yml")
@@ -69,9 +70,12 @@ def ci_rules(root):
 
 
 def tracked_under_tests(root):
-    result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
-    if result.returncode == 0:
-        return [n for n in result.stdout.split("\0") if n]
+    try:
+        result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
+        if result.returncode == 0:
+            return [n for n in result.stdout.split("\0") if n]
+    except OSError:
+        pass
     names = []                                     # no git: walk, as tests/test_docs_links.py does
     for base, dirs, files in os.walk(os.path.join(root, "tests")):
         dirs[:] = [d for d in dirs if d not in (".git", "third_party", "__pycache__")]
@@ -229,6 +233,12 @@ class RepositoryRegistrationTest(unittest.TestCase):
         # A glob that stops matching, or a git call that fails, must not turn the checks below into no-ops.
         self.assertGreaterEqual(len(self.files), 300, f"only {len(self.files)} test files found: {self.files[:5]}")
         self.assertTrue(any(f.startswith("tests/semantic/") for f in self.files))
+
+    def test_the_scan_falls_back_when_git_is_missing(self):
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("git")):
+            files = tracked_under_tests(ROOT)
+            self.assertGreaterEqual(len(files), 300)
+            self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
 
     def test_every_test_file_is_selected_by_a_job(self):
         unselected = [f for f in self.files if job_of(ROOT, f, self.rules) is None]
