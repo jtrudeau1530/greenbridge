@@ -124,6 +124,27 @@ class TestChains(unittest.TestCase):
         self.assertEqual(sorted(lang for _s, _o, lang, _t in scan.tables), ["de", "en"])
         self.assertEqual(scan.tables[0][1], 0x1000)
 
+    def test_resource_across_a_128k_first_stream(self):
+        # A resource's first stream can be any whole number of 64 KiB blocks (docs/page_directory.md): 41 data.rpf
+        # resources start with a 128 or 192 KiB stream whose descriptors end in the next stream.
+        res = make_resource(EN, pad=2 * T.BLOCK)        # tables start past the first 128 KiB
+        streams = [res[:2 * T.BLOCK], res[2 * T.BLOCK:], make_resource(DE), CONV]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.carve(tmp, streams)
+            scan = T.Scan()
+            for label, off, data in T.blobs(tmp):
+                scan.add(label, off, data)
+        self.assertEqual(sorted(lang for _s, _o, lang, _t in scan.tables), ["de", "en"])
+
+    def test_whole_block_streams_continue_and_others_end_the_chain(self):
+        for first, joined in ((T.BLOCK, True), (2 * T.BLOCK, True), (3 * T.BLOCK, True),
+                              (T.BLOCK + 16, False), (T.BLOCK - 16, False)):
+            with self.subTest(first=first):
+                rows = [{"off": 0, "size": first}, {"off": 1, "size": 100}]
+                data = {0: bytes(first), 1: b"b" * 100}
+                offsets = [o for o, _d in T._chains(rows, lambda r: data[r["off"]])]
+                self.assertEqual(offsets, [0] if joined else [0, 1])
+
     def test_short_stream_ends_the_chain(self):
         rows = [{"off": 0, "size": 100}, {"off": 1, "size": 50}]
         data = {0: b"a" * 100, 1: b"b" * 50}
@@ -155,6 +176,20 @@ class TestDialogue(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_csv_exports_explicitly_empty_strings(self) -> None:
+        strings = {"ZZ_SYNTHETIC_BLANK": "", "ZZ_SYNTHETIC_LINE": "This is the text you know"}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = write(os.path.join(tmp, "strings.bin"), make_resource(strings))
+            tables_csv = os.path.join(tmp, "tables.csv")
+            strings_csv = os.path.join(tmp, "strings.csv")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(T.main([source, "--tables", tables_csv, "--strings", strings_csv]), 0)
+            with open(tables_csv, encoding="utf-8", newline="") as f:
+                self.assertEqual([row["strings"] for row in csv.DictReader(f)], ["2"])
+            with open(strings_csv, encoding="utf-8", newline="") as f:
+                self.assertEqual({row["hash"]: row["text"] for row in csv.DictReader(f)},
+                                 {f"{T.joaat(label):08x}": text for label, text in strings.items()})
+
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")
