@@ -514,8 +514,12 @@ def main() -> int:
     graph["summary"]["mode"] = gx.document_mode(args.targets)
     print_summary(graph)
     if args.json:
-        with open(args.json, "w", encoding="utf-8") as f:
-            json.dump(graph, f, indent=1)
+        try:
+            with open(args.json, "w", encoding="utf-8") as f:
+                json.dump(graph, f, indent=1)
+        except OSError as exc:
+            print(f"cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
         print("wrote", args.json)
     return 0
 
