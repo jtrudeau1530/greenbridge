@@ -30,6 +30,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PRO
                    TEXTURE_MIP_TEST, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
+from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import WAVE32_LANE_DUMPS, narrow_subgroup_skip   # wave32 lane-mask dumps skip below 32 lanes, as in check.py
 
 
@@ -224,9 +225,14 @@ def unsupported_skip(msg: str) -> str:
     return f"SKIP ({m.group(0) if m else 'unsupported device'})"
 
 
-def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
+def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True) -> tuple[int, str]:
+    # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
+    # gpu=False (the translator over the whole suite) runs without a limit.
+    limit = gpu_test_timeout() if gpu else None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
+    except subprocess.TimeoutExpired:
+        return 1, timed_out(cmd[0], limit)
     except OSError as e:   # e.g. Smart App Control blocked a fresh build: fail this test, keep running the others
         return 1, start_failure(cmd[0], e)
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
@@ -568,7 +574,7 @@ def run_suite(a, work: str) -> int:
         cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", spirv_dir]
         if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
             cmd.append("--wave64-emulate")
-        rc, out = run_cmd(cmd)
+        rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
     print(out)
     if rc != 0:

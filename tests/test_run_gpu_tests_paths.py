@@ -55,7 +55,7 @@ class FilterSelection(unittest.TestCase):
         def write_disassembly(_llvm, _asm, path, name):
             Path(path).write_text(name, encoding="utf-8")
 
-        def translate(cmd):
+        def translate(cmd, gpu=True):
             inputs = Path(cmd[3])
             files = sorted(inputs.glob("*.s"))
             passes.append([path.name for path in files])
