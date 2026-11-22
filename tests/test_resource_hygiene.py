@@ -30,7 +30,17 @@ def _bare_open_calls(path: pathlib.Path) -> list[tuple[int, str]]:
 
 class ResourceHygieneTest(unittest.TestCase):
     def test_no_unmanaged_open_calls(self):
-        for rel in ("tools/rdna2spirv.py", "tools/amd_swizzle.py", "tools/awc_opus.py"):
+        for rel in (
+            "tools/rdna2spirv.py",
+            "tools/amd_swizzle.py",
+            "tools/awc_opus.py",
+            "tools/wave64_graphics_scan.py",
+            "tools/tex_export.py",
+            "tools/tex_mode_probe.py",
+            "tools/shader_disasm.py",
+            "tools/hashdict.py",
+            "tools/d3d12_xs_surface.py",
+        ):
             with self.subTest(file=rel):
                 bare = _bare_open_calls(ROOT / rel)
                 self.assertEqual(bare, [], f"unmanaged open() calls in {rel}: {bare}")

@@ -67,6 +67,7 @@ public:
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
+    bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
@@ -279,6 +280,8 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
+        enable12.storageBuffer8BitAccess = storage_buffer_8bit;
         // What the bindless set 0 of the translated shaders needs, where the device has it: runtime arrays of
         // images indexed dynamically, updated while the set is bound; and, to leave slots empty, partially bound
         // bindings.

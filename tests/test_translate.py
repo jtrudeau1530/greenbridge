@@ -66,6 +66,53 @@ def test_supported_instruction(case, make_shader):
     shader.validate(shader.translate())
 
 
+# VOP1/VOP2 DPP source controls. The source lane is a shuffle followed by row/bank masking; a lane that the
+# instruction leaves unwritten keeps its old destination, including for non-mov ops.
+DPP_CASES = {
+    "quad_perm": "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "quad_perm_masked": "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0x1 bank_mask:0x3",
+    "row_shl": "v_mov_b32_dpp v1, v0 row_shl:1 row_mask:0xf bank_mask:0xf",
+    "row_shr_bound": "v_mov_b32_dpp v1, v0 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+    "row_ror": "v_mov_b32_dpp v1, v0 row_ror:4 row_mask:0xf bank_mask:0xf",
+    "row_share": "v_mov_b32_dpp v1, v0 row_share:2 row_mask:0xf bank_mask:0xf",
+    "row_xmask": "v_mov_b32_dpp v1, v0 row_xmask:4 row_mask:0xf bank_mask:0xf",
+    "row_mirror": "v_mov_b32_dpp v1, v0 row_mirror row_mask:0xf bank_mask:0xf",
+    "row_half_mirror": "v_mov_b32_dpp v1, v0 row_half_mirror row_mask:0xf bank_mask:0xf",
+    "dpp8": "v_mov_b32_dpp v1, v0 dpp8:[7,6,5,4,3,2,1,0] fi:1",
+    "vop1_not_bank": "v_not_b32_dpp v1, v0 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0x1",
+    "vop2_add_shr": "v_add_nc_u32_dpp v1, v0, v2 row_shr:1 row_mask:0xf bank_mask:0xf",
+}
+
+
+@pytest.mark.parametrize("case", sorted(DPP_CASES))
+def test_dpp_controls_translate_and_validate(case, make_shader):
+    shader = make_shader(program("v_mov_b32 v0, v0\n" + DPP_CASES[case]))
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpGroupNonUniformShuffle" in spvasm
+
+
+@pytest.mark.parametrize("mods", [[], ["row_share:20"], ["row_shl:0"], ["row_shl:1", "row_shr:2"]])
+def test_dpp_bad_control_is_rejected(mods):
+    """A missing, out-of-range or duplicate DPP control must fail instead of guessing."""
+    gen = rdna2spirv.Gen("ps")
+    ins = {"op": "v_mov_b32_dpp", "args": [{"k": "vgpr", "r": 1}, {"k": "vgpr", "r": 0}], "mods": mods}
+    with pytest.raises(rdna2spirv.Unsupported):
+        gen.insn(ins)
+
+
+def test_dpp_wave64_emulation_goes_through_workgroup_memory(make_shader, monkeypatch):
+    """--wave64-emulate must not leave a subgroup shuffle in a DPP shader."""
+    shader = make_shader("s_mov_b64 exec, -1\n"
+                         "v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                         "s_endpgm\n", name="cs_dpp_w64")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpGroupNonUniform" not in spvasm and "%sg_lane" not in spvasm
+    assert "%x_buf" in spvasm and "OpControlBarrier" in spvasm
+
+
 def test_translation_is_deterministic(make_shader):
     shader = make_shader(program(SUPPORTED["v_fma_f32"]))
     assert shader.translate() == shader.translate()
@@ -342,6 +389,7 @@ def test_vs_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     assert [int(x) for x in chains] == list(range(n_comp))
     assert _vgpr_to_index_map(spvasm, "%out_clip", "%_ptr_Output_float") == {i: 10 + i for i in range(n_comp)}
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert meta["clip_distance_count"] == n_comp
     assert "shaderClipDistance" in meta["features"]
     assert "shaderCullDistance" not in meta["features"]
     assert 1 not in meta.get("outputs", [])
@@ -392,6 +440,8 @@ def test_vs_clip_and_cull_distances_across_pos1_pos2(make_shader):
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
     assert "shaderClipDistance" in meta["features"]
     assert "shaderCullDistance" in meta["features"]
+    assert meta["clip_distance_count"] == 2
+    assert meta["cull_distance_count"] == 3
     assert not ({1, 2} & set(meta.get("outputs", [])))
     assert not ({1, 2} & set(meta.get("params", [])))
 
@@ -420,6 +470,7 @@ def test_pos1_without_osg1_is_ignored(make_shader):
     assert "OpCapability ClipDistance" not in vs_spv
     assert "BuiltIn ClipDistance" not in vs_spv
     vs_meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, vs_spv)
+    assert "clip_distance_count" not in vs_meta
     assert "shaderClipDistance" not in vs_meta["features"]
     assert 1 not in vs_meta.get("outputs", [])
 
@@ -1201,6 +1252,40 @@ def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, ma
     mem = {base: 0}
     si.run_fragment(spv, memory=mem)
     assert mem[base] == expected_word
+
+
+@pytest.mark.parametrize("fmt, expected", [(56, 0x80000000), (57, 0x40810000)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_normalized_buffer_store_nan(fmt, expected, packed, make_shader):
+    # RGBA = positive signaling NaN, negative quiet NaN, -infinity, +0.5.
+    # gfx1036 stored zero for both NaNs, clamped infinity and rounded 0.5 to even.
+    if packed:
+        inputs = "v_mov_b32 v4, 0xfe017c01\nv_mov_b32 v5, 0x3800fc00\n"
+        store = "buffer_store_format_d16_xyzw v[4:5]"
+    else:
+        inputs = ("v_mov_b32 v4, 0x7f800001\nv_mov_b32 v5, 0xffc01000\n"
+                  "v_mov_b32 v6, 0xff800000\nv_mov_b32 v7, 0.5\n")
+        store = "buffer_store_format_xyzw v[4:7]"
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n" + inputs +
+           f"{store}, off, s[0:3], 0\ns_waitcnt vmcnt(0)\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_nan")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000: 0xDEADBEEF}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    assert memory[0x1000] == expected
+
+
+@pytest.mark.parametrize("fmt", [22, 20])  # 32_FLOAT, 32_UINT
+def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n"
+           "v_mov_b32 v4, 0xffc01000\nbuffer_store_format_x v4, off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_raw_store_nan")
+    memory = {0x1000: 0}
+    _load_mini_interp().run_fragment(shader.translate(), memory=memory)
+    assert memory[0x1000] == 0xFFC01000
 
 
 def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):

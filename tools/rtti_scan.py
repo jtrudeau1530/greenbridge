@@ -176,7 +176,7 @@ def scan_pe64_rtti(data: bytes) -> dict:
             if q in col_vas:
                 vt = p + 8
                 n = 0
-                while vt + 8 * (n + 1) <= len(img):
+                while vt + 8 * (n + 1) <= hi:
                     f = struct.unpack_from("<Q", img, vt + 8 * n)[0] - base
                     if not (0 <= f < len(img) and is_exec(f)):
                         break

@@ -563,7 +563,8 @@ inline constexpr VkSamplerReductionMode vulkan_reduction_mode(FilterMode mode) {
 // MIP_FILTER_NONE samples the base level only, which Vulkan expresses as nearest mip filtering with the LOD held
 // in [0, 0.25] (the Vulkan specification's note on samplers without mipmapping). An unnormalised sampler gets
 // what Vulkan requires of one: no mips, no anisotropy, no comparison.
-inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
+// A decoded GFX10 bias has absolute value at most 32. When creating a device sampler, pass its smaller limit.
+inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_bias = 32.0f) {
     static_assert(int(CompareFunction::never) == int(VK_COMPARE_OP_NEVER) &&
                   int(CompareFunction::less) == int(VK_COMPARE_OP_LESS) &&
                   int(CompareFunction::equal) == int(VK_COMPARE_OP_EQUAL) &&
@@ -583,7 +584,7 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
     info.addressModeU = vulkan_address_mode(sampler.address_u);
     info.addressModeV = vulkan_address_mode(sampler.address_v);
     info.addressModeW = vulkan_address_mode(sampler.address_w);
-    info.mipLodBias = sampler.lod_bias;
+    info.mipLodBias = std::clamp(sampler.lod_bias, -max_lod_bias, max_lod_bias);
     info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
     info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;

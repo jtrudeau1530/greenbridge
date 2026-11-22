@@ -341,13 +341,19 @@ if(BUILD_TESTING)
 
     # `gta6rt --run` rehearsal: a stand-in game EXE (CRT startup, statics, heap, files, threads) that imports
     # xgameruntime.dll from a link-time stub; under --run the shim registry answers those imports instead.
-    add_library(xgameruntime_stub SHARED test/fixtures/xgameruntime_stub.cpp)
+    add_library(xgameruntime_stub SHARED test/fixtures/xgameruntime_stub.cpp test/fixtures/xgameruntime_stub.def)
+    target_include_directories(xgameruntime_stub PUBLIC ${XTASKQUEUE_DIR}/Include)
     target_compile_definitions(xgameruntime_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     set_target_properties(xgameruntime_stub PROPERTIES
       OUTPUT_NAME xgameruntime
       PREFIX ""
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
+    add_executable(tiny_async test/fixtures/tiny_async.cpp)
+    target_link_libraries(tiny_async PRIVATE xgameruntime_stub)
+    set_target_properties(tiny_async PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
     add_executable(tiny_game test/fixtures/tiny_game.cpp)
     target_link_libraries(tiny_game PRIVATE xgameruntime_stub)
@@ -530,6 +536,9 @@ if(BUILD_TESTING)
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    add_test(NAME run_tiny_async COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_async>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_async.cmake")
     # The stand-in game passes only with its own arguments; with others it exits 1, which --run passes through.
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
@@ -604,13 +613,17 @@ if(NOT TARGET Vulkan::Headers)
 endif()
 if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
-          vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test)
+          vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  if(BUILD_TESTING)
+    add_test(NAME depth24_convert COMMAND depth24_convert_test)
+    set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   endif()
@@ -754,6 +767,29 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_uav_clear COMMAND d3d12_uav_clear_test)
     set_tests_properties(d3d12_uav_clear PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Emulation of R9G9B9E5_SHAREDEXP UAV textures as mutable R32_UINT on GPUs without E5B9G9R9 storage:
+    # format support, 1D/2D/3D/reserved creation, SRV/UAV T#s, WARP differential UAV clears, cross-backing copies,
+    # and set-0 storage write -> E5B9G9R9 sampled HDR round-trip.
+    add_executable(d3d12_r9g9b9e5_uav_test test/d3d12_r9g9b9e5_uav_test.cpp)
+    target_link_libraries(d3d12_r9g9b9e5_uav_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_r9g9b9e5_uav_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_r9g9b9e5_uav COMMAND d3d12_r9g9b9e5_uav_test)
+    set_tests_properties(d3d12_r9g9b9e5_uav PROPERTIES SKIP_RETURN_CODE 77)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_CS_R9G9B9E5_UAV ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_r9g9b9e5_uav.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_R9G9B9E5_UAV}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_R9G9B9E5_UAV}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_r9g9b9e5_uav.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_r9g9b9e5_uav.comp
+        COMMENT "Compiling cs_r9g9b9e5_uav.comp"
+        VERBATIM)
+      target_sources(d3d12_r9g9b9e5_uav_test PRIVATE ${LEONIDA_TEST_CS_R9G9B9E5_UAV})
+      target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE
+        LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV="${LEONIDA_TEST_CS_R9G9B9E5_UAV}")
+    endif()
+
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
     target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)
@@ -825,6 +861,13 @@ if(TARGET Vulkan::Headers)
     else()
       message(STATUS "glslangValidator not found: d3d12_descriptor_test skips its shader")
     endif()
+
+    add_executable(d3d12_predicated_copy_test test/d3d12_predicated_copy_test.cpp)
+    target_link_libraries(d3d12_predicated_copy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_predicated_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_predicated_copy_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_predicated_copy COMMAND d3d12_predicated_copy_test)
+    set_tests_properties(d3d12_predicated_copy PROPERTIES SKIP_RETURN_CODE 77)
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
@@ -929,6 +972,8 @@ if(TARGET Vulkan::Headers)
         LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}"
         LEONIDA_TEST_CS_RAYQUERY_SPV="${LEONIDA_TEST_CS_RAYQUERY}")
     endif()
+    add_test(NAME d3d12_indirect_rt COMMAND d3d12_indirect_rt_test)
+    set_tests_properties(d3d12_indirect_rt PROPERTIES SKIP_RETURN_CODE 77)
 
     # Milestone M0: a window, 60 cleared frames presented through the proxy on Vulkan.
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
@@ -992,6 +1037,11 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(bvh_builder_test PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
+    # fsr_dispatch_test can put the package's FidelityFX DLL on this device too (LEONIDA_FSR_DEVICE=vulkan).
+    if(TARGET fsr_dispatch_test)
+      target_link_libraries(fsr_dispatch_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(fsr_dispatch_test PRIVATE LEONIDA_VULKAN_DEVICE)
+    endif()
   else()
     message(STATUS "Python 3, Windows or d3d12.h missing: the D3D12 COM objects and d3d12_com_test are not built")
   endif()
@@ -1007,6 +1057,12 @@ if(TARGET Vulkan::Headers)
     add_executable(pipeline_cache_snapshot_test test/pipeline_cache_snapshot_test.cpp)
     target_link_libraries(pipeline_cache_snapshot_test PRIVATE Vulkan::Headers)
     add_test(NAME pipeline_cache_snapshot COMMAND pipeline_cache_snapshot_test)
+    add_executable(predicated_copy_test test/predicated_copy_test.cpp)
+    target_link_libraries(predicated_copy_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(predicated_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME predicated_copy COMMAND predicated_copy_test)
     add_executable(clear_color_test test/clear_color_test.cpp)
     target_link_libraries(clear_color_test PRIVATE Vulkan::Headers)
     if(WIN32)

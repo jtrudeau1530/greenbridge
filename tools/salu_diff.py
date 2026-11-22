@@ -14,8 +14,18 @@ words are compared with the reference: that validates the reference itself, not 
 whatever the machine has (gfx11 on an RDNA3 laptop), so a difference is checked against the ISA text before it
 counts as a reference bug. Without the oracle tools the run exits 77.
 
+With --branches the programs also consume SCC in control flow: after an SCC-producing instruction comes either
+a chain of 1..3 SCC consumers (s_cselect_b32, s_addc_u32, s_subb_u32) or s_cbranch_scc0/scc1 forward over the
+next 1..3 scalar instructions (no loops, no nesting, one lane). In the program lines a branch is written
+`s_cbranch_scc0 +N` (skip the next N instructions); the listing handed to the translator carries the real offset
+in dwords and `; encoding:` placeholders of each instruction's size, which is what places the branch targets.
+Half of the instructions are then drawn from the SCC producers among the selected opcodes, so over a few thousand
+programs every producer is followed by every consumer and by both branch senses. The hardware oracle does not
+take branch programs (its kernels are straight-line).
+
 Usage:
     python -I tools/salu_diff.py [--programs N] [--seed S] [--max-ops N] [--ops s_min_i32,s_cselect_b32]
+    python -I tools/salu_diff.py --branches [--programs N] [--seed S]   # SCC consumers and forward branches
     python -I tools/salu_diff.py --oracle hw             # hardware vs reference only
     python -I tools/salu_diff.py --oracle translator,hw  # both
     python -I tools/salu_diff.py --list-ops
@@ -31,8 +41,7 @@ s_wqm_b32) as per-lane wave masks, so a 64-bit integer reference disagrees with 
 names them explicitly). s_bfe_* control words stay inside offset + width <= 32 unless --bfe-any: past
 that the field stops at bit 31 (width = min(width, 32 - offset), so s_bfe_i32 sign-extends from the top bit
 that exists). gfx1150 hardware and the translator both do that; the ISA pseudocode does not say so, and RDNA2
-itself is unmeasured (#156). Known divergence on main: s_ff0/ff1_i32_b32 with a constant source, until
-SHADER-46 (#349) lands.
+itself is unmeasured (#156). s_ff0/ff1_i32_b32 with a constant source diverged until SHADER-46 (#349).
 """
 import argparse
 import gc
@@ -112,7 +121,7 @@ def bfe(src, ctl, signed):
     off, width = ctl & 31, (ctl >> 16) & 0x7F
     # A field that runs past bit 31 stops there: s_bfe_i32 sign-extends from the top bit that exists (LLVM
     # constantFoldBFE does for v_bfe; 5-bit width there). The s_bfe rule itself rests on the gfx1150 measurement
-    # (4000 random control words, --oracle hw); RDNA2 is unmeasured.
+    # (4000 random control words, --oracle hw), and RDNA2 agrees: gfx1036, 20,000 programs with --bfe-any.
     width = min(width, 32 - off)
     if width == 0:
         return 0
@@ -221,6 +230,25 @@ def _sopc():
 
 OPS = {**_sop2(), **_sop2_64(), **_sop1(), **_sopc()}
 
+SCC_CONSUMERS = ("s_cselect_b32", "s_addc_u32", "s_subb_u32")
+SCC_BRANCHES = ("s_cbranch_scc0", "s_cbranch_scc1")
+
+
+def writes_scc(name):
+    """Whether the opcode writes SCC (each one always does or never does)."""
+    form, fn = OPS[name]
+    return (fn(1, 2, 0, 3) if form == "sop1_rmw" else fn(1, 2, 0))[1] is not None
+
+
+def branch_skip(line):
+    """For `s_cbranch_scc0/1 +N`: (mnemonic, N); None for any other line."""
+    op, _, rest = line.partition(" ")
+    if op not in SCC_BRANCHES:
+        return None
+    if not rest.startswith("+"):
+        raise RefError(f"branch {line!r}: expected +N (instructions skipped)")
+    return op, int(rest[1:])
+
 
 # ---- program generation ---------------------------------------------------------------------------
 
@@ -282,13 +310,36 @@ def emit(rng, name):
     return f"{name} s{d}, 0x{k:x}"   # movk, sopk
 
 
-def generate(rng, n_ops, ops):
+def generate(rng, n_ops, ops, branches=False):
     lines = [f"s_mov_b32 s{r}, 0x{_value(rng):x}" for r in REGS]
     lines.append(f"s_cmp_eq_u32 s{rng.choice(REGS)}, s{rng.choice(REGS)}")   # a known SCC to start with
-    for _ in range(n_ops):
-        lines.append(emit(rng, rng.choice(ops)))
+    if branches:
+        lines += _cf_body(rng, n_ops, ops)
+    else:
+        for _ in range(n_ops):
+            lines.append(emit(rng, rng.choice(ops)))
     lines += observe(rng.sample(REGS, 3))
     return lines
+
+
+def _cf_body(rng, n_ops, ops):
+    """n_ops instructions, half of them SCC producers. After a producer: sometimes a chain of SCC consumers,
+    sometimes s_cbranch_scc0/1 forward over the next 1..3 instructions (which never branch themselves)."""
+    producers = [o for o in ops if writes_scc(o)] or ops
+    body = []
+    for _ in range(n_ops):
+        op = rng.choice(producers if rng.random() < 0.5 else ops)
+        body.append(emit(rng, op))
+        if not writes_scc(op):
+            continue
+        r = rng.random()
+        if r < 0.35:
+            body += [emit(rng, rng.choice(SCC_CONSUMERS)) for _ in range(rng.randint(1, 3))]
+        elif r < 0.8:
+            k = rng.randint(1, 3)
+            body.append(f"{rng.choice(SCC_BRANCHES)} +{k}")
+            body += [emit(rng, rng.choice(ops + list(SCC_CONSUMERS))) for _ in range(k)]
+    return body
 
 
 def observe(regs):
@@ -333,7 +384,17 @@ def _write(sgpr, tok, value, width):
 def reference(lines):
     """Run the scalar program; returns the four exported words."""
     sgpr, scc, vgpr = {}, 0, {}
+    skip = 0
     for line in lines:
+        if skip:
+            skip -= 1
+            continue
+        br = branch_skip(line)
+        if br:
+            # SOPP: if SCC == 0 (scc0) / SCC == 1 (scc1) then PC = PC + SIMM16 * 4 + 4; SCC is not written.
+            if scc == (0 if br[0] == "s_cbranch_scc0" else 1):
+                skip = br[1]
+            continue
         op, _, rest = line.partition(" ")
         args = [a.strip() for a in rest.split(", ")] if rest else []
         if op == "v_mov_b32":
@@ -387,6 +448,43 @@ def reference(lines):
 
 # ---- the translator side -------------------------------------------------------------------------
 
+def _is_literal(tok):
+    """A 32-bit source that needs a literal dword: not a register or an integer inline constant (-16..64)."""
+    tok = tok.strip()
+    if tok[0] in "sv":
+        return False
+    return not -16 <= s32(int(tok, 0)) <= 64
+
+
+def insn_size(line):
+    """Encoded bytes of one generated line: 4, or 8 with a literal (a SOPK immediate sits in SIMM16)."""
+    op, _, rest = line.partition(" ")
+    if op == "exp":
+        return 8
+    if op in SCC_BRANCHES or op == "s_endpgm" or (op in OPS and OPS[op][0] in ("sopk", "movk", "cmpk")):
+        return 4
+    args = rest.split(", ") if rest else []
+    srcs = args if op in OPS and OPS[op][0] in ("sopc", "sopc_64") else args[1:]
+    return 8 if any(_is_literal(a) for a in srcs) else 4
+
+
+def listing(lines):
+    """(text, size) per line, with `s_cbranch_scc0/1 +N` turned into the dword offset over the next N lines."""
+    sizes = [insn_size(line) for line in lines]
+    out = []
+    for i, line in enumerate(lines):
+        br = branch_skip(line)
+        if br:
+            if i + 1 + br[1] > len(lines):
+                raise RefError(f"branch {line!r} past the end of the program")
+            line = f"{br[0]} {sum(sizes[i + 1:i + 1 + br[1]]) // 4}"
+        out.append((line, sizes[i]))
+    return out
+
+
+def has_branches(lines):
+    return any(branch_skip(line) for line in lines)
+
 def translated(lines, name="ps_salu"):
     """Translate and execute; returns the four exported words, or raises Skip."""
     import rdna2spirv
@@ -396,10 +494,17 @@ def translated(lines, name="ps_salu"):
         os.mkdir(dis)
         path = os.path.join(dis, name + ".s")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f"; {name}  salu_diff case\n")
-            for line in lines:
-                f.write("\t" + line + "\n")
-            f.write("\texp mrt0 v8, v9, v10, v11 done vm\n\ts_endpgm\n")
+            if has_branches(lines):
+                # The translator places branch targets from the encoding sizes; it does not read the bytes.
+                body = listing(lines + ["exp mrt0 v8, v9, v10, v11 done vm", "s_endpgm"])
+                f.write(f"; {name}  code 0x0..0x{sum(n for _, n in body):x}\n")
+                for text, n in body:
+                    f.write("\t" + text + " ; encoding: [" + ",".join(["0x00"] * n) + "]\n")
+            else:
+                f.write(f"; {name}  salu_diff case\n")
+                for line in lines:
+                    f.write("\t" + line + "\n")
+                f.write("\texp mrt0 v8, v9, v10, v11 done vm\n\ts_endpgm\n")
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)
         try:
@@ -451,6 +556,19 @@ def check(lines, backends=("translator",), hw=None):
     return "; ".join(p for p in problems if p) or None
 
 
+def drop(body, i):
+    """body without line i; a branch that skipped over that line now skips one line fewer."""
+    out = []
+    for j, line in enumerate(body):
+        if j == i:
+            continue
+        br = branch_skip(line)
+        if br and j < i <= j + br[1]:
+            line = f"{br[0]} +{br[1] - 1}"
+        out.append(line)
+    return out
+
+
 def shrink(lines, check_fn=check):
     """Drop instructions (not seeds or the observation) while the program still mismatches."""
     n_seed = len(REGS)
@@ -459,10 +577,10 @@ def shrink(lines, check_fn=check):
     while changed:
         changed = False
         for i in range(len(body)):
-            trial = lines[:n_seed] + body[:i] + body[i + 1:] + lines[-5:]
+            trial = lines[:n_seed] + drop(body, i) + lines[-5:]
             try:
                 if check_fn(trial):
-                    body = body[:i] + body[i + 1:]
+                    body = drop(body, i)
                     changed = True
                     break
             except (Skip, RefError):
@@ -486,11 +604,11 @@ def hw_prepare(oracle, programs):
     return out
 
 
-def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None):
+def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None, branches=False):
     counts = {"pass": 0, "mismatch": 0, "skip": {}}
     failures = []
     rng = random.Random(seed)
-    progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
+    progs = [generate(rng, rng.randrange(1, max_ops + 1), ops, branches) for _ in range(programs)]
     hw_words = hw_prepare(oracle, progs) if "hw" in backends else [None] * programs
     for i, lines in enumerate(progs):
         try:
@@ -529,19 +647,24 @@ def main(argv=None):
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--all-failures", action="store_true", help="print every failing program, not just the first")
     ap.add_argument("--bfe-any", action="store_true",
-                    help="also give s_bfe_* control words past offset + width = 32 (measured on gfx1150: the field stops at bit 31; RDNA2 unmeasured)")
+                    help="also give s_bfe_* control words past offset + width = 32 (measured on gfx1150 and gfx1036: the field stops at bit 31)")
     ap.add_argument("--inline64", action="store_true",
                     help="also use inline constants as 64-bit sources (the translator reads them as lane masks)")
     ap.add_argument("--oracle", default="translator",
                     help="comma-separated comparison targets: translator (default), hw (natively on the AMD GPU; see "
                          "tools/hw_oracle/). 'hw' alone compares the hardware with the reference only")
     ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
+    ap.add_argument("--branches", action="store_true",
+                    help="SCC in control flow: consumer chains and s_cbranch_scc0/1 forward over 1..3 instructions "
+                         "after SCC producers (translator oracle only)")
     a = ap.parse_args(argv)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
+    if a.branches and "hw" in backends:
+        ap.error("--branches runs against the translator only (the hardware kernels are straight-line)")
     global INLINE64, BFE_ANY
     INLINE64, BFE_ANY = a.inline64, a.bfe_any
     if a.list_ops:
@@ -570,9 +693,10 @@ def main(argv=None):
             return 77
         print(f"hardware oracle: {oracle.device}")
     try:
-        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle)
+        counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle, a.branches)
         skips = sum(counts["skip"].values())
-        print(f"{a.programs} programs (seed {a.seed}, {'+'.join(backends)}): {counts['pass']} pass, "
+        mode = "+".join(backends) + (", branches" if a.branches else "")
+        print(f"{a.programs} programs (seed {a.seed}, {mode}): {counts['pass']} pass, "
               f"{counts['mismatch']} mismatch, {skips} skipped")
         for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
             print(f"  skip x{n}: {reason}")
@@ -582,7 +706,8 @@ def main(argv=None):
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
-            print("\n".join("\t" + line for line in small))
+            shown = [text for text, _ in listing(small)] if has_branches(small) else small
+            print("\n".join("\t" + line for line in shown))
     finally:
         if oracle:
             oracle.close()

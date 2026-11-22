@@ -302,6 +302,9 @@ int main() {
     CHECK(info.borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE && info.anisotropyEnable == VK_FALSE);
     // MIP_FILTER_NONE: the base level only.
     CHECK(info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST && info.minLod == 0.0f && info.maxLod == 0.25f);
+    CHECK(vulkan_sampler({.lod_bias = -32.0f}, 15.0f).mipLodBias == -15.0f);
+    CHECK(vulkan_sampler({.lod_bias = 31.0f}, 15.0f).mipLodBias == 15.0f);
+    CHECK(vulkan_sampler({.lod_bias = 2.25f}, 15.0f).mipLodBias == 2.25f);
     info = vulkan_sampler(point);
     CHECK(info.magFilter == VK_FILTER_NEAREST && info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST);
     CHECK(info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.mipLodBias == -0.75f);

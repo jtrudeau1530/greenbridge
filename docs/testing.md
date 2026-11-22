@@ -55,6 +55,12 @@ cmake --build runtime/build/linux --parallel
 
 On macOS, add `-DVulkan_INCLUDE_DIR=/opt/homebrew/include` to the first command.
 
+The test programs and `scripts/run_gpu_tests.py` should come from the same commit. Some checks tolerate an older
+binary (`unpinned_subgroup_skip`), but mixing them can report false failures in the compute tests: 28 `cs_*`
+failures on both an RTX 5070 Ti Laptop and a Radeon 610M with the `426023a` script and `48ad23f` binaries, where
+either matching pair is clean. If you cannot build locally, the `runtime-windows` artifact of the Runtime workflow
+belongs to the commit that built it; check that commit out as well.
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
@@ -90,7 +96,8 @@ WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/wind
 ```
 
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
-`make_game.py --runtime-build runtime/build/windows` takes this folder like a Windows build. CMake packages are
+`make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
+runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are
 looked up only inside the SDK folder, so a Windows SDL3 for the GameInput shim is passed as `-DSDL3_DIR=<its
 cmake folder>` (`CMAKE_PREFIX_PATH` is not searched here).
 
@@ -148,8 +155,7 @@ differences.
 
 `ps_bary`, `ps_uniform_branch` and `ps_scc_mask32` read raw barycentrics, which need
 `VK_KHR_fragment_shader_barycentric`; so do `ps_interp_f16_high` and `ms_f16_pack` (16-bit interpolants are
-`PerVertexKHR` inputs, and `--bary-fallback` cannot express them, so they skip under it). Where the device lacks it they're skipped; that's expected, not a failure. To
-`VK_KHR_fragment_shader_barycentric`. NVIDIA has it from Turing on; Volta (V100, Titan V) and older lack it, as do
+`PerVertexKHR` inputs, and `--bary-fallback` cannot express them, so they skip under it). NVIDIA has it from Turing on; Volta (V100, Titan V) and older lack it, as do
 llvmpipe and some other drivers. Where the device lacks it they're skipped; that's expected, not a failure. To
 test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`** (or
 for `run_gpu_tests.py`). The shaders are then translated with `--bary-fallback` and drawn through a pass-through
