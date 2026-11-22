@@ -1,4 +1,4 @@
-"""Semantic interpreter tests for RDNA2 v_subrev_f16 and v_subrev_nc_u32.
+"""Semantic interpreter tests for RDNA2 v_subrev_f16, v_subrev_nc_u32, and packed half-precision reverse subtraction.
 
 v_subrev_f16: D.f16 = S1.f16 - S0.f16 (VOP2 0x34 on GFX10), the reversed form of v_sub_f16. Like the other f16
 VOP2/VOP3 ops it writes the low half of the destination and keeps the high half; in the VOP3 form op_sel bit 0 / 1
@@ -7,7 +7,8 @@ reads the high half of src0 / src1 and bit 2 writes the high half of the destina
 tests/semantic/spirv_mini_interp.py and compares the exported word with a plain-Python reference: the difference
 of the two f16 values computed in double precision and rounded once to f16 (round to nearest even).
 
-Also covers v_subrev_nc_u32: D.u32 = (S1.u32 - S0.u32) & 0xFFFFFFFF, the non-carry 32-bit reverse subtract.
+Also covers v_subrev_nc_u32: D.u32 = (S1.u32 - S0.u32) & 0xFFFFFFFF, the non-carry 32-bit reverse subtract,
+and packed 16-bit lane execution (modeling v_pk_subrev_f16 on lo and hi halves).
 
 Standard library only: zero game data, no GPU hardware required.
 """
@@ -149,6 +150,28 @@ def ref_sub_nc_u32(s0: int, s1: int) -> int:
     return ((s0 & MASK32) - (s1 & MASK32)) & MASK32
 
 
+def ref_pk_subrev_f16(s0: int, s1: int, clamp: bool = False) -> int:
+    """Reference implementation of packed 16-bit reverse subtraction (v_pk_subrev_f16):
+    D.lo = S1.lo - S0.lo
+    D.hi = S1.hi - S0.hi
+    """
+    s0_lo, s0_hi = s0 & 0xFFFF, (s0 >> 16) & 0xFFFF
+    s1_lo, s1_hi = s1 & 0xFFFF, (s1 >> 16) & 0xFFFF
+    d_lo = ref_subrev_f16(s0_lo, s1_lo)
+    d_hi = ref_subrev_f16(s0_hi, s1_hi)
+    if clamp:
+        if not is_nan_f16(d_lo):
+            d_lo = f2h(max(0.0, min(1.0, h2f(d_lo))))
+        if not is_nan_f16(d_hi):
+            d_hi = f2h(max(0.0, min(1.0, h2f(d_hi))))
+    return pack16(d_lo, d_hi)
+
+
+def ref_pk_sub_f16(s0: int, s1: int, clamp: bool = False) -> int:
+    """Reference implementation of packed 16-bit forward subtraction: D = S0 - S1 on both halves."""
+    return ref_pk_subrev_f16(s1, s0, clamp=clamp)
+
+
 def ref_subrev_f16_opsel(
     w0: int,
     w1: int,
@@ -173,6 +196,126 @@ def ref_subrev_f16_opsel(
         f_clamped = max(0.0, min(1.0, f))
         res = f2h(f_clamped)
     return merge_half(old, res, dst_hi)
+
+
+class HalfVectorALUInterpreter:
+    """Deterministic SIMD vector ALU interpreter for half-precision and 32-bit operations.
+
+    Models:
+      - 32-lane (Wave32) or 64-lane (Wave64) SIMD execution
+      - VGPR file: 32-bit registers containing packed binary16 halves or u32 integers
+      - SGPR file: 32-bit scalar registers with automatic broadcast to vector lanes
+      - EXEC mask: lane gating where inactive lanes preserve pre-existing register state
+      - Inline constant and register operand resolution
+    """
+
+    def __init__(self, num_vgprs: int = 64, num_sgprs: int = 106, wave_size: int = 64):
+        self.num_vgprs = num_vgprs
+        self.num_sgprs = num_sgprs
+        self.wave_size = wave_size
+        self.vgprs = [[0] * wave_size for _ in range(num_vgprs)]
+        self.sgprs = [0] * num_sgprs
+        self.exec_mask = (1 << wave_size) - 1
+
+    def reset(self) -> None:
+        self.vgprs = [[0] * self.wave_size for _ in range(self.num_vgprs)]
+        self.sgprs = [0] * self.num_sgprs
+        self.exec_mask = (1 << self.wave_size) - 1
+
+    def set_vgpr(self, reg_idx: int, lane: int, val: int) -> None:
+        self.vgprs[reg_idx][lane] = val & MASK32
+
+    def get_vgpr(self, reg_idx: int, lane: int) -> int:
+        return self.vgprs[reg_idx][lane] & MASK32
+
+    def set_sgpr(self, reg_idx: int, val: int) -> None:
+        self.sgprs[reg_idx] = val & MASK32
+
+    def get_sgpr(self, reg_idx: int) -> int:
+        return self.sgprs[reg_idx] & MASK32
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def resolve_src(self, op: str | int, lane: int) -> int:
+        if isinstance(op, int):
+            return op & MASK32
+        op_str = op.strip().lower()
+        if op_str.startswith("v"):
+            idx = int(op_str[1:])
+            return self.vgprs[idx][lane] & MASK32
+        if op_str.startswith("s"):
+            idx = int(op_str[1:])
+            return self.sgprs[idx] & MASK32
+        return int(op_str, 0) & MASK32
+
+    def execute_v_subrev_f16(
+        self,
+        dst_idx: int,
+        src0: str | int,
+        src1: str | int,
+        op_sel: tuple[int, int, int] = (0, 0, 0),
+        clamp: bool = False,
+    ) -> None:
+        sel0, sel1, dst_hi = op_sel
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                old = self.vgprs[dst_idx][lane]
+                self.vgprs[dst_idx][lane] = ref_subrev_f16_opsel(
+                    s0, s1, old, sel0, sel1, dst_hi, clamp=clamp
+                )
+
+    def execute_v_sub_f16(
+        self,
+        dst_idx: int,
+        src0: str | int,
+        src1: str | int,
+        op_sel: tuple[int, int, int] = (0, 0, 0),
+        clamp: bool = False,
+    ) -> None:
+        sel0, sel1, dst_hi = op_sel
+        self.execute_v_subrev_f16(
+            dst_idx, src1, src0, op_sel=(sel1, sel0, dst_hi), clamp=clamp
+        )
+
+    def execute_v_pk_subrev_f16(
+        self,
+        dst_idx: int,
+        src0: str | int,
+        src1: str | int,
+        clamp: bool = False,
+    ) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                self.vgprs[dst_idx][lane] = ref_pk_subrev_f16(s0, s1, clamp=clamp)
+
+    def execute_v_subrev_nc_u32(
+        self,
+        dst_idx: int,
+        src0: str | int,
+        src1: str | int,
+    ) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                self.vgprs[dst_idx][lane] = ref_subrev_nc_u32(s0, s1)
+
+    def execute_v_sub_nc_u32(
+        self,
+        dst_idx: int,
+        src0: str | int,
+        src1: str | int,
+    ) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                self.vgprs[dst_idx][lane] = ref_sub_nc_u32(s0, s1)
 
 
 _TMP_DIR: tempfile.TemporaryDirectory | None = None
@@ -227,14 +370,12 @@ class SubrevF16ReferenceOracleTests(unittest.TestCase):
     """Mathematical properties and correctness of the half-precision reverse subtraction oracle."""
 
     def test_formula_s1_minus_s0(self):
-        # D = S1 - S0 (reverse subtraction)
         self.assertEqual(ref_subrev_f16(H_ONE_P_FIVE, H_HALF), H_NEG_ONE)
         self.assertEqual(ref_subrev_f16(H_HALF, H_ONE_P_FIVE), H_ONE)
         self.assertEqual(ref_subrev_f16(H_ONE, H_THREE), H_TWO)
         self.assertEqual(ref_subrev_f16(H_TWO, H_ONE), H_NEG_ONE)
 
     def test_non_commutativity(self):
-        # Subtraction is non-commutative: (S1 - S0) != (S0 - S1) when S0 != S1.
         pairs = [
             (H_ONE_P_FIVE, H_HALF),
             (H_ONE, H_THREE),
@@ -248,7 +389,6 @@ class SubrevF16ReferenceOracleTests(unittest.TestCase):
                 self.assertNotEqual(d_rev, d_rev_swapped)
 
     def test_anti_symmetry(self):
-        # Subtraction is anti-symmetric: (S1 - S0) == -(S0 - S1) for finite non-zero values.
         pairs = [
             (H_ONE_P_FIVE, H_HALF),
             (H_ONE, H_THREE),
@@ -260,7 +400,6 @@ class SubrevF16ReferenceOracleTests(unittest.TestCase):
             with self.subTest(s0=hex(s0), s1=hex(s1)):
                 r1 = ref_subrev_f16(s0, s1)
                 r2 = ref_subrev_f16(s1, s0)
-                # Opposite signs: sign bit toggled, same magnitude
                 self.assertEqual(r1 ^ 0x8000, r2)
                 self.assertAlmostEqual(h2f(r1), -h2f(r2), places=3)
 
@@ -268,15 +407,11 @@ class SubrevF16ReferenceOracleTests(unittest.TestCase):
         values = [H_HALF, H_ONE, H_ONE_P_FIVE, H_TWO, H_THREE, H_FOUR, H_NEG_ONE, H_NEG_TWO]
         for v in values:
             with self.subTest(v=hex(v)):
-                # S1 - 0 == S1
                 self.assertEqual(ref_subrev_f16(H_POS_ZERO, v), v)
-                # S1 - S1 == 0
                 self.assertEqual(ref_subrev_f16(v, v), H_POS_ZERO)
-                # 0 - S0 == -S0
                 self.assertEqual(ref_subrev_f16(v, H_POS_ZERO), v ^ 0x8000)
 
     def test_reversal_duality_with_sub(self):
-        # v_subrev_f16(S0, S1) == v_sub_f16(S1, S0)
         rng = random.Random(0x3416)
         samples = [H_POS_ZERO, H_HALF, H_ONE, H_ONE_P_FIVE, H_TWO, H_THREE, H_FOUR, H_NEG_ONE, H_NEG_TWO]
         for _ in range(50):
@@ -285,7 +420,6 @@ class SubrevF16ReferenceOracleTests(unittest.TestCase):
             self.assertEqual(ref_subrev_f16(s0, s1), ref_sub_f16(s1, s0))
 
     def test_u32_reverse_subtraction(self):
-        # Reference tests for v_subrev_nc_u32: D = S1 - S0 (mod 2^32)
         self.assertEqual(ref_subrev_nc_u32(30, 100), 70)
         self.assertEqual(ref_subrev_nc_u32(100, 30), (30 - 100) & MASK32)
         self.assertEqual(ref_subrev_nc_u32(0, 42), 42)
@@ -293,7 +427,6 @@ class SubrevF16ReferenceOracleTests(unittest.TestCase):
         self.assertEqual(ref_subrev_nc_u32(0x80000000, 0x7FFFFFFF), 0xFFFFFFFF)
         self.assertEqual(ref_subrev_nc_u32(0x7FFFFFFF, 0x80000000), 1)
 
-        # Anti-symmetry for u32
         for a, b in [(10, 50), (100, 25), (0x12345678, 0x87654321)]:
             fwd = ref_sub_nc_u32(a, b)
             rev = ref_subrev_nc_u32(a, b)
@@ -317,7 +450,6 @@ class SubrevF16ShaderTranslationTests(unittest.TestCase):
                 self.assertEqual(run(line, A, B), want)
 
     def test_neg_on_src0_and_clamp(self):
-        # -(1.5) reversed: 0.5 - (-1.5) = 2.0; clamp then limits it to 1.0.
         self.assertEqual(run("v_subrev_f16_e64 v0, -v1, v2", A, B), merge_half(OLD, f2h(2.0), 0))
         self.assertEqual(run("v_subrev_f16_e64 v0, -v1, v2 clamp", A, B), merge_half(OLD, f2h(1.0), 0))
 
@@ -345,16 +477,255 @@ class SubrevF16ShaderTranslationTests(unittest.TestCase):
         self.assertEqual(run_shader(lines, v1=0x80000000, v2=0x7FFFFFFF), 0xFFFFFFFF)
 
     def test_inline_constants_and_sgpr_sources(self):
-        # Test v_subrev_f16 with inline f16 constants
-        lines = ["v_subrev_f16_e32 v0, 0x3800, v2"]  # S1 - 0.5 (where S1 is v2.lo = 2.0 -> 1.5)
+        lines = ["v_subrev_f16_e32 v0, 0x3800, v2"]
         self.assertEqual(run_shader(lines, v2=H_TWO), merge_half(OLD, H_ONE_P_FIVE, 0))
 
-        # Test v_subrev_nc_u32 with inline constant and SGPR
         lines_sgpr = [
             "s_mov_b32 s0, 50",
-            "v_subrev_nc_u32 v0, s0, v2",  # v2 - 50 = 120 - 50 = 70
+            "v_subrev_nc_u32 v0, s0, v2",
         ]
         self.assertEqual(run_shader(lines_sgpr, v2=120), 70)
+
+
+class PackedSubrevF16OracleTests(unittest.TestCase):
+    """Reference oracle tests for packed 16-bit lane execution modeling v_pk_subrev_f16."""
+
+    def test_packed_subrev_formula(self):
+        # S0 = (hi: 1.0, lo: 0.5), S1 = (hi: 3.0, lo: 2.0)
+        # Expected: lo = 2.0 - 0.5 = 1.5, hi = 3.0 - 1.0 = 2.0
+        s0 = pack16(H_HALF, H_ONE)
+        s1 = pack16(H_TWO, H_THREE)
+        res = ref_pk_subrev_f16(s0, s1)
+        self.assertEqual(res & 0xFFFF, H_ONE_P_FIVE)
+        self.assertEqual((res >> 16) & 0xFFFF, H_TWO)
+
+    def test_packed_non_commutativity(self):
+        s0 = pack16(H_HALF, H_ONE)
+        s1 = pack16(H_TWO, H_THREE)
+        res_fwd = ref_pk_subrev_f16(s0, s1)
+        res_swapped = ref_pk_subrev_f16(s1, s0)
+        self.assertNotEqual(res_fwd, res_swapped)
+        # Check both lanes swapped individually
+        self.assertNotEqual(res_fwd & 0xFFFF, res_swapped & 0xFFFF)
+        self.assertNotEqual((res_fwd >> 16) & 0xFFFF, (res_swapped >> 16) & 0xFFFF)
+
+    def test_packed_anti_symmetry(self):
+        s0 = pack16(H_HALF, H_ONE)
+        s1 = pack16(H_TWO, H_THREE)
+        r1 = ref_pk_subrev_f16(s0, s1)
+        r2 = ref_pk_subrev_f16(s1, s0)
+        # Toggled sign bits on both halves
+        self.assertEqual((r1 & 0xFFFF) ^ 0x8000, r2 & 0xFFFF)
+        self.assertEqual(((r1 >> 16) & 0xFFFF) ^ 0x8000, (r2 >> 16) & 0xFFFF)
+
+    def test_packed_lane_isolation(self):
+        # Ensure modifying lo does not affect hi, and modifying hi does not affect lo
+        base_s0 = pack16(H_ONE, H_ONE)
+        base_s1 = pack16(H_TWO, H_THREE)
+        res_base = ref_pk_subrev_f16(base_s0, base_s1)
+
+        # Vary only lo in s0
+        mod_s0 = pack16(H_HALF, H_ONE)
+        res_mod = ref_pk_subrev_f16(mod_s0, base_s1)
+        self.assertNotEqual(res_base & 0xFFFF, res_mod & 0xFFFF)
+        self.assertEqual((res_base >> 16) & 0xFFFF, (res_mod >> 16) & 0xFFFF)
+
+        # Vary only hi in s1
+        mod_s1 = pack16(H_TWO, H_FOUR)
+        res_mod2 = ref_pk_subrev_f16(base_s0, mod_s1)
+        self.assertEqual(res_base & 0xFFFF, res_mod2 & 0xFFFF)
+        self.assertNotEqual((res_base >> 16) & 0xFFFF, (res_mod2 >> 16) & 0xFFFF)
+
+    def test_packed_reversal_duality(self):
+        s0 = pack16(H_ONE, H_TWO)
+        s1 = pack16(H_THREE, H_FOUR)
+        self.assertEqual(ref_pk_subrev_f16(s0, s1), ref_pk_sub_f16(s1, s0))
+
+
+class HalfVectorALUInterpreterTests(unittest.TestCase):
+    """Multi-lane SIMD interpreter tests modeling packed subrev, EXEC divergence, and state preservation."""
+
+    def test_simd_wave64_packed_subrev(self):
+        interp = HalfVectorALUInterpreter(wave_size=64)
+        for lane in range(64):
+            # Each lane has distinct packed halves
+            s0 = pack16(f2h(1.0 + lane * 0.1), f2h(2.0 + lane * 0.2))
+            s1 = pack16(f2h(5.0 + lane * 0.5), f2h(10.0 + lane * 1.0))
+            interp.set_vgpr(1, lane, s0)
+            interp.set_vgpr(2, lane, s1)
+
+        interp.execute_v_pk_subrev_f16(0, "v1", "v2")
+
+        for lane in range(64):
+            expected = ref_pk_subrev_f16(interp.get_vgpr(1, lane), interp.get_vgpr(2, lane))
+            self.assertEqual(interp.get_vgpr(0, lane), expected, f"lane {lane}")
+
+    def test_simd_wave32_packed_subrev(self):
+        interp = HalfVectorALUInterpreter(wave_size=32)
+        for lane in range(32):
+            s0 = pack16(H_HALF, H_ONE)
+            s1 = pack16(H_TWO, H_THREE)
+            interp.set_vgpr(1, lane, s0)
+            interp.set_vgpr(2, lane, s1)
+
+        interp.execute_v_pk_subrev_f16(0, "v1", "v2")
+
+        expected = ref_pk_subrev_f16(pack16(H_HALF, H_ONE), pack16(H_TWO, H_THREE))
+        for lane in range(32):
+            self.assertEqual(interp.get_vgpr(0, lane), expected, f"lane {lane}")
+
+    def test_simd_exec_mask_partial_divergence(self):
+        interp = HalfVectorALUInterpreter(wave_size=64)
+        for lane in range(64):
+            interp.set_vgpr(0, lane, 0xDEADBEEF)
+            interp.set_vgpr(1, lane, pack16(H_HALF, H_ONE))
+            interp.set_vgpr(2, lane, pack16(H_TWO, H_FOUR))
+
+        # Only even lanes active
+        interp.set_exec(0x5555555555555555)
+        interp.execute_v_pk_subrev_f16(0, "v1", "v2")
+
+        expected = ref_pk_subrev_f16(pack16(H_HALF, H_ONE), pack16(H_TWO, H_FOUR))
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(interp.get_vgpr(0, lane), expected, f"active lane {lane}")
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), 0xDEADBEEF, f"inactive lane {lane}")
+
+    def test_simd_exec_mask_single_lane(self):
+        interp = HalfVectorALUInterpreter(wave_size=64)
+        for lane in range(64):
+            interp.set_vgpr(0, lane, 0xCAFEBABE)
+            interp.set_vgpr(1, lane, pack16(H_ONE, H_TWO))
+            interp.set_vgpr(2, lane, pack16(H_THREE, H_FOUR))
+
+        # Only lane 7 active
+        interp.set_exec(1 << 7)
+        interp.execute_v_pk_subrev_f16(0, "v1", "v2")
+
+        expected = ref_pk_subrev_f16(pack16(H_ONE, H_TWO), pack16(H_THREE, H_FOUR))
+        for lane in range(64):
+            if lane == 7:
+                self.assertEqual(interp.get_vgpr(0, lane), expected)
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), 0xCAFEBABE)
+
+    def test_simd_exec_mask_all_inactive(self):
+        interp = HalfVectorALUInterpreter(wave_size=64)
+        for lane in range(64):
+            interp.set_vgpr(0, lane, 0x12345678)
+            interp.set_vgpr(1, lane, pack16(H_HALF, H_HALF))
+            interp.set_vgpr(2, lane, pack16(H_TWO, H_TWO))
+
+        interp.set_exec(0)
+        interp.execute_v_pk_subrev_f16(0, "v1", "v2")
+
+        for lane in range(64):
+            self.assertEqual(interp.get_vgpr(0, lane), 0x12345678)
+
+    def test_simd_scalar_broadcast_and_inline_constants(self):
+        interp = HalfVectorALUInterpreter(wave_size=32)
+        interp.set_sgpr(0, pack16(H_ONE, H_TWO))
+        for lane in range(32):
+            interp.set_vgpr(1, lane, pack16(H_THREE, H_FOUR))
+
+        # v_pk_subrev_f16 v0, s0, v1 -> v1 - s0
+        interp.execute_v_pk_subrev_f16(0, "s0", "v1")
+        expected = ref_pk_subrev_f16(pack16(H_ONE, H_TWO), pack16(H_THREE, H_FOUR))
+        for lane in range(32):
+            self.assertEqual(interp.get_vgpr(0, lane), expected)
+
+    def test_simd_v_subrev_f16_half_preservation(self):
+        interp = HalfVectorALUInterpreter(wave_size=32)
+        for lane in range(32):
+            interp.set_vgpr(0, lane, OLD)
+            interp.set_vgpr(1, lane, pack16(H_HALF, H_TWO))
+            interp.set_vgpr(2, lane, pack16(H_ONE_P_FIVE, H_THREE))
+
+        # Active lanes: only even lanes
+        interp.set_exec(0x55555555)
+        # v_subrev_f16 low half: v2.lo - v1.lo = 1.5 - 0.5 = 1.0 (0x3C00)
+        interp.execute_v_subrev_f16(0, "v1", "v2", op_sel=(0, 0, 0))
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                # Low half updated to 1.0, high half preserved from OLD (0xAAAA)
+                self.assertEqual(interp.get_vgpr(0, lane), merge_half(OLD, H_ONE, 0))
+            else:
+                # Both halves preserved from OLD
+                self.assertEqual(interp.get_vgpr(0, lane), OLD)
+
+    def test_simd_v_subrev_nc_u32_exec_divergence(self):
+        interp = HalfVectorALUInterpreter(wave_size=64)
+        for lane in range(64):
+            interp.set_vgpr(0, lane, 0x11111111)
+            interp.set_vgpr(1, lane, 50)
+            interp.set_vgpr(2, lane, 200 + lane)
+
+        # Upper 32 lanes active
+        interp.set_exec(0xFFFFFFFF00000000)
+        interp.execute_v_subrev_nc_u32(0, "v1", "v2")
+
+        for lane in range(64):
+            if lane >= 32:
+                self.assertEqual(interp.get_vgpr(0, lane), (200 + lane) - 50)
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), 0x11111111)
+
+
+class ShaderPackedAndExecExecutionTests(unittest.TestCase):
+    """Shader execution tests for packed operations and EXEC mask gating."""
+
+    def test_packed_execution_via_dual_subrev_f16(self):
+        # Run low half and high half reverse subtract into v0
+        lines = [
+            "v_subrev_f16_e64 v0, v1, v2 op_sel:[0,0,0]",  # v0.lo = v2.lo - v1.lo
+            "v_subrev_f16_e64 v0, v1, v2 op_sel:[1,1,1]",  # v0.hi = v2.hi - v1.hi
+        ]
+        # v1: lo=0.5, hi=1.0; v2: lo=2.0, hi=3.0
+        v1 = pack16(H_HALF, H_ONE)
+        v2 = pack16(H_TWO, H_THREE)
+        got = run_shader(lines, v1=v1, v2=v2, old=OLD)
+        want = ref_pk_subrev_f16(v1, v2)
+        self.assertEqual(got, want)
+
+    def test_packed_execution_via_v_pk_add_f16_with_negated_src0(self):
+        # RDNA2 packed reverse subtract is expressed as v_pk_add_f16 with neg_lo/neg_hi on src0:
+        # D.lo = -S0.lo + S1.lo = S1.lo - S0.lo
+        # D.hi = -S0.hi + S1.hi = S1.hi - S0.hi
+        lines = [
+            "v_pk_add_f16 v0, v1, v2 neg_lo:[1,0] neg_hi:[1,0]",
+        ]
+        v1 = pack16(H_HALF, H_ONE)
+        v2 = pack16(H_TWO, H_THREE)
+        got = run_shader(lines, v1=v1, v2=v2, old=OLD)
+        want = ref_pk_subrev_f16(v1, v2)
+        self.assertEqual(got, want)
+
+    def test_exec_masking_preserves_destination(self):
+        # When exec_lo is 0 during v_subrev_f16, v0 is untouched; re-enabling EXEC runs export
+        lines = [
+            "s_mov_b32 exec_lo, 0",
+            "v_subrev_f16_e32 v0, v1, v2",
+            "s_mov_b32 exec_lo, 1",
+        ]
+        got = run_shader(lines, v1=H_HALF, v2=H_TWO, old=OLD)
+        self.assertEqual(got, OLD)
+
+    def test_exec_masking_toggled_execution(self):
+        # First op skipped under exec_lo=0, second op executed under exec_lo=1
+        lines = [
+            "s_mov_b32 exec_lo, 0",
+            "v_subrev_f16_e64 v0, v1, v2 op_sel:[0,0,0]",  # skipped
+            "s_mov_b32 exec_lo, 1",
+            "v_subrev_f16_e64 v0, v1, v2 op_sel:[1,1,1]",  # executed: writes hi half
+        ]
+        v1 = pack16(H_HALF, H_ONE)
+        v2 = pack16(H_TWO, H_THREE)
+        got = run_shader(lines, v1=v1, v2=v2, old=OLD)
+        # Low half should still be OLD (0x5555), high half should be 3.0 - 1.0 = 2.0 (0x4000)
+        expected = merge_half(OLD, H_TWO, 1)
+        self.assertEqual(got, expected)
 
 
 if __name__ == "__main__":
