@@ -7,6 +7,9 @@
 //   dispatch (submit to queue idle) as "bench ms: median=.. min=.. max=.. n=..". The buffer is not cleared in between.
 //   VKC_OUT_WORDS=N (env): make the output buffer at least N words (default groups * 64), so a single group can
 //   write more than one word per thread. VKC_DUMP=<file> (env): write the whole buffer to <file> after the dispatch.
+//   VKC_HEAP_INIT=<file> (env): copy the file's bytes to the start of the buffer (Xbox VA 0) after the default fill
+//   and before the dispatch, so a program can read prepared inputs (a root table, descriptors, data) from the heap.
+//   The file must fit in the buffer (raise VKC_OUT_WORDS); bytes past it keep the fill.
 //   --require-wave64: require full 64-wide subgroups (local size X must be a multiple of 64), or exit 77.
 //   VKC_SGPRS=w4,w5,... (env): set s4, s5, ... (decimal or 0x hex, up to s31), the user SGPRs after the output V#,
 //   so a test can take input words (cs_user_sgprs.asm). They are zero otherwise. Same syntax as vk_harness's VKH_SGPRS.
@@ -87,6 +90,16 @@ int main(int argc, char** argv) {
     const uint32_t origins = workgroup_yz ? groups * groups_y * groups_z : 0;
     const char* out_words_env = std::getenv("VKC_OUT_WORDS");
     const char* dump_path = std::getenv("VKC_DUMP");
+    const char* heap_init_path = std::getenv("VKC_HEAP_INIT");
+    std::vector<char> heap_init;
+    if (heap_init_path) {
+        std::ifstream f(heap_init_path, std::ios::binary);
+        if (!f) {
+            std::fprintf(stderr, "VKC_HEAP_INIT: could not read %s\n", heap_init_path);
+            return 2;
+        }
+        heap_init.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
     uint32_t out_words = 0;
     if (out_words_env) {
         char* end;
@@ -218,6 +231,14 @@ int main(int argc, char** argv) {
     CHECK(vkBindBufferMemory(dev, buf, mem, 0));
     void* map; CHECK(vkMapMemory(dev, mem, 0, bytes, 0, &map));
     std::memset(map, workgroup_yz || !std::strcmp(argv[3], "exec64") ? 0 : 0xEE, size_t(bytes));
+    if (heap_init_path) {
+        if (heap_init.size() > size_t(bytes)) {
+            std::fprintf(stderr, "VKC_HEAP_INIT: %s is %zu bytes, the buffer %llu (raise VKC_OUT_WORDS)\n",
+                         heap_init_path, heap_init.size(), static_cast<unsigned long long>(bytes));
+            return 2;
+        }
+        if (!heap_init.empty()) std::memcpy(map, heap_init.data(), heap_init.size());
+    }
     if (!std::strcmp(argv[3], "bvh")) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
         // triangle at z=10 (node 0x40, addr 0x200), a triangle at z=5 (node 0x48, addr 0x240), a box the ray

@@ -84,6 +84,13 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
                 Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ if name == "cs_fmt_xy_xyz" else GOOD_TBUFFER_STORE)
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
+            if name == "cs_heap_init":
+                # The seeded words come back only if check.py wrote the init file and sized the buffer for it.
+                path = (env or {}).get("VKC_HEAP_INIT")
+                seeded = bool(path) and Path(path).read_bytes() == check.HEAP_INIT_FILE and \
+                    env.get("VKC_OUT_WORDS") == "68"
+                words = check.HEAP_INIT_EXPECTED if seeded else [0xEEEEEEEE] * 8
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
