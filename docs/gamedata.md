@@ -247,10 +247,11 @@ Which corner `origin` names was tested against the 2,036,542 map placements of t
 the grid; as the minimum corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The centre
 reading also gives a minimum x of exactly -13,312, the `PAMH` heightmap's minimum x above.
 
-Tile names: none of the four `tileTextureNamePrefix` values occurs at the start of a name in the local
-texture catalog, no fallback texture name's joaat hash is a catalog id, and seven obvious `prefix + x + y + suffix` spellings hash
-to 0-2 catalog ids out of 2,112 per atlas, which is chance level. The tile textures are therefore either outside
-the scanned archives or named another way; this is unresolved.
+Tile names: none of the four `tileTextureNamePrefix` values starts an archive entry name or a texture-dictionary
+item name in the local catalog (118,925 named items, 119,090 item hashes). Neither the global nor the sector
+fallback names match an item name or its joaat hash, and ten `prefix + x + y + suffix` spellings over all
+2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
+outside the scanned archives or named another way; this is unresolved.
 
 Not measured here (hypothesis): what the four grids hold (their names suggest per-tile map data for separate
 client systems), and how `zInflation` widens a tile's streaming box vertically.
