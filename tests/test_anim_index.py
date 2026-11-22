@@ -322,6 +322,24 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["signature"] for r in rows], ["move", "page-directory", "name-table"])
         self.assertEqual(summary["mode"], "directory")
 
+    def test_directory_rejects_start_and_limit(self):
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        for offset in (0x100, 0x200):
+            with open(os.path.join(folder, f"{offset:012x}.bin"), "wb") as f:
+                f.write(b"A" * 64)
+        cases = [("--start", "0"), ("--limit", "1"), ("--limit", "1", "--start", "0x200")]
+        for i, flags in enumerate(cases):
+            with self.subTest(flags=flags):
+                out = os.path.join(self.root, f"bad{i}.json")
+                p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", *flags],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+                for flag in flags[::2]:
+                    self.assertIn(flag, p.stderr)
+                self.assertFalse(os.path.exists(out))
+
     def test_directory_skips_the_carvers_index_and_reports(self):
         """rpf9_carve.py writes index.json next to the streams; it and a report are not payloads."""
         folder = os.path.join(self.root, "carved")
