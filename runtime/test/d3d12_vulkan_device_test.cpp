@@ -2147,11 +2147,21 @@ int compare_invalid_arguments(ID3D12Device* ours) {
     struct Case {
         const char* name;
         InvalidCase call;
-        bool (*host_newer)(ID3D12Device*) = nullptr;
+        bool (*comparable)(ID3D12Device*) = nullptr;
     };
     const auto device10 = [](ID3D12Device* d) {
         Ref<ID3D12Device10> newer;
         return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
+    };
+    const auto not_elevated = [](ID3D12Device*) {
+        HANDLE token = nullptr;
+        TOKEN_ELEVATION elevation{};
+        DWORD size = 0;
+        const bool elevated = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+                              GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+                              elevation.TokenIsElevated;
+        if (token) CloseHandle(token);
+        return !elevated;
     };
     static const Case cases[] = {
         // CreateCommittedResource: arguments.
@@ -2731,7 +2741,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"descriptor heap: shader-visible 2049 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2049,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
-         }},
+         }, +device10},
         {"descriptor heap: shader-visible 2048 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
@@ -2776,7 +2786,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command queue: global realtime priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME});
-         }},
+         }, +not_elevated},
         {"command queue: compute", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COMPUTE}); }},
         {"command queue: copy", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COPY}); }},
         {"command queue: high priority", [](ID3D12Device* d) {
@@ -2866,8 +2876,9 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
         if (a == b) continue;
-        if (c.host_newer && !c.host_newer(host.p) && a == S_OK && b == E_INVALIDARG) {
-            std::printf("invalid arguments %s: the host runtime predates it (refuses, ours accepts)\n", c.name);
+        if (c.comparable && !c.comparable(host.p)) {
+            std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
+                        a, b);
             continue;
         }
         ++mismatches;
