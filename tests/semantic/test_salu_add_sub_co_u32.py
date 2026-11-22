@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import unittest
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -981,6 +982,120 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
                 expected_borrow = 1 if a < b else 0
                 self.assertEqual(res64, expected_diff)
                 self.assertEqual(borrow_out, expected_borrow)
+
+
+# ==============================================================================
+# IEEE 754 Binary32 Boundary Extremes and Subnormal Bitfield Manipulation
+# ==============================================================================
+
+F32_POS_ZERO: int = 0x0000_0000
+F32_NEG_ZERO: int = 0x8000_0000
+F32_POS_ONE: int = 0x3F80_0000
+F32_NEG_ONE: int = 0xBF80_0000
+F32_POS_INF: int = 0x7F80_0000
+F32_NEG_INF: int = 0xFF80_0000
+F32_CANONICAL_QNAN: int = 0x7FC0_0000
+F32_SNAN: int = 0x7F80_0001
+F32_MIN_SUBNORMAL: int = 0x0000_0001
+F32_MAX_SUBNORMAL: int = 0x007F_FFFF
+F32_MIN_NORMAL: int = 0x0080_0000
+F32_MAX_NORMAL: int = 0x7F7F_FFFF
+
+F32_EXP_MASK: int = 0x7F80_0000
+F32_FRAC_MASK: int = 0x007F_FFFF
+F32_QNAN_BIT: int = 0x0040_0000
+
+
+def u32_to_f32(bits: int) -> float:
+    """Reinterpret unsigned 32-bit integer as IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK_U32))[0]
+
+
+def f32_to_u32(val: float) -> int:
+    """Reinterpret IEEE 754 single-precision float as unsigned 32-bit integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Check if bit pattern corresponds to IEEE 754 single-precision NaN."""
+    return ((bits & F32_EXP_MASK) == F32_EXP_MASK) and ((bits & F32_FRAC_MASK) != 0)
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Check if bit pattern corresponds to IEEE 754 single-precision subnormal."""
+    return ((bits & F32_EXP_MASK) == 0) and ((bits & F32_FRAC_MASK) != 0)
+
+
+def is_f32_inf(bits: int) -> bool:
+    """Check if bit pattern corresponds to IEEE 754 single-precision infinity."""
+    return ((bits & F32_EXP_MASK) == F32_EXP_MASK) and ((bits & F32_FRAC_MASK) == 0)
+
+
+class TestIEEE754BitwiseBoundariesAndSubnormals(unittest.TestCase):
+    """Verification of SALU integer arithmetic on IEEE 754 bit representations."""
+
+    def test_subnormal_to_normal_boundary_transition(self) -> None:
+        # Incrementing largest subnormal gives smallest positive normal
+        res, carry = oracle_s_add_co_u32(F32_MAX_SUBNORMAL, 1)
+        self.assertEqual(res, F32_MIN_NORMAL)
+        self.assertEqual(carry, 0)
+        self.assertTrue(is_f32_subnormal(F32_MAX_SUBNORMAL))
+        self.assertFalse(is_f32_subnormal(res))
+        self.assertAlmostEqual(u32_to_f32(res), 1.1754943508222875e-38, places=44)
+
+        # Decrementing smallest normal gives largest subnormal
+        res_sub, borrow = oracle_s_sub_co_u32(F32_MIN_NORMAL, 1)
+        self.assertEqual(res_sub, F32_MAX_SUBNORMAL)
+        self.assertEqual(borrow, 0)
+        self.assertTrue(is_f32_subnormal(res_sub))
+
+    def test_subnormal_zero_boundary(self) -> None:
+        # Smallest subnormal - 1 gives +0.0
+        res, borrow = oracle_s_sub_co_u32(F32_MIN_SUBNORMAL, 1)
+        self.assertEqual(res, F32_POS_ZERO)
+        self.assertEqual(borrow, 0)
+
+        # +0.0 - Smallest subnormal gives underflow/borrow
+        res_under, borrow_under = oracle_s_sub_co_u32(F32_POS_ZERO, F32_MIN_SUBNORMAL)
+        self.assertEqual(res_under, MAX_U32)
+        self.assertEqual(borrow_under, 1)
+
+    def test_biased_exponent_scaling_arithmetic(self) -> None:
+        # 1.0f is 0x3F80_0000. Adding 1 to the exponent field (0x0080_0000) produces 2.0f (0x4000_0000)
+        exp_step = 0x0080_0000
+        res_double, carry = oracle_s_add_co_u32(F32_POS_ONE, exp_step)
+        self.assertEqual(res_double, 0x4000_0000)
+        self.assertEqual(carry, 0)
+        self.assertEqual(u32_to_f32(res_double), 2.0)
+
+        # Decrementing exponent field of 1.0f produces 0.5f (0x3F00_0000)
+        res_half, borrow = oracle_s_sub_co_u32(F32_POS_ONE, exp_step)
+        self.assertEqual(res_half, 0x3F00_0000)
+        self.assertEqual(borrow, 0)
+        self.assertEqual(u32_to_f32(res_half), 0.5)
+
+    def test_nan_payload_arithmetic(self) -> None:
+        # Modifying NaN payload via SALU addition
+        res, carry = oracle_s_add_co_u32(F32_CANONICAL_QNAN, 0x0000_0007)
+        self.assertEqual(res, 0x7FC0_0007)
+        self.assertEqual(carry, 0)
+        self.assertTrue(is_f32_nan(res))
+        # Ensure quiet bit is preserved
+        self.assertTrue(bool(res & F32_QNAN_BIT))
+
+    def test_infinity_boundary_transitions(self) -> None:
+        # Adding 1 to +infinity turns it into a signaling NaN pattern (0x7F800001)
+        res_snan, carry = oracle_s_add_co_u32(F32_POS_INF, 1)
+        self.assertEqual(res_snan, F32_SNAN)
+        self.assertEqual(carry, 0)
+        self.assertTrue(is_f32_nan(res_snan))
+
+        # Subtracting 1 from +infinity turns it into max normal float (0x7F7FFFFF)
+        res_max_norm, borrow = oracle_s_sub_co_u32(F32_POS_INF, 1)
+        self.assertEqual(res_max_norm, F32_MAX_NORMAL)
+        self.assertEqual(borrow, 0)
+        self.assertFalse(is_f32_nan(res_max_norm))
+        self.assertFalse(is_f32_inf(res_max_norm))
 
 
 if __name__ == "__main__":
