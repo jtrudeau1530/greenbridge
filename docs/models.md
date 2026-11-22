@@ -31,9 +31,11 @@ drawable/LOD variant. The two sets are different scopes, not contradictory.
 
 `packs.rpf`'s `.#dr` pages are drawable-dictionary roots, not drawables, so the old candidate
 scan never saw them. At the new pin the dictionary walk recovers **24,034 models** from that
-archive (23,720 dictionary children plus the 314 fragments), against 314 before. The 314
-`48557ea`/`c3708fb` entries in the table below are therefore the pre-pin control, not the
-current `packs.rpf` result. The other archive rows were not re-counted at `917e9b9`.
+archive (23,720 dictionary children plus the 314 fragments), against 314 before. A full
+`rpf9dump models` export of the archive reports **`ok=24,034 fail=0 skip=0` in 263 s** (0
+embedded textures); the OBJs and manifest are local. The 314 `48557ea`/`c3708fb` entries in the
+table below are therefore the pre-pin control, not the current `packs.rpf` result. The other
+archive rows were not re-counted at `917e9b9`.
 
 ## Independent validation
 

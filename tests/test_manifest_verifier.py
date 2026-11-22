@@ -331,6 +331,18 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertIn("NEW       new_file.dat", res_strict.stdout)
         self.assertIn("1 problem(s)", res_strict.stdout)
 
+    def test_cli_strict_ignores_only_selected_in_tree_manifest(self) -> None:
+        in_tree = self.write_manifest(os.path.join(self.game_dir, "nested", "manifest.json"), self.payloads)
+        args = (self.game_dir, "--manifest", in_tree, "--strict", "--json")
+        res = self.run_cli(*args)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(json.loads(res.stdout)["untracked"], [])
+
+        self.write_manifest(os.path.join(self.game_dir, "manifest.json"), self.payloads)
+        res = self.run_cli(*args)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertEqual(json.loads(res.stdout)["untracked"], ["manifest.json"])
+
     def test_cli_missing_manifest_returns_exit_code_2(self) -> None:
         res = self.run_cli(self.game_dir, "--manifest", os.path.join(self.root, "none.json"))
         self.assertEqual(res.returncode, 2)
