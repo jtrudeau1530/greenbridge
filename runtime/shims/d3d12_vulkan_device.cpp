@@ -1979,6 +1979,8 @@ public:
                         case DXGI_FORMAT_R8G8B8A8_UNORM: view.format = leonida::ColorViewFormat::rgba8_unorm; break;
                         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: view.format = leonida::ColorViewFormat::rgba8_srgb; break;
                         case DXGI_FORMAT_R8G8B8A8_UINT: view.format = leonida::ColorViewFormat::rgba8_uint; break;
+                        case DXGI_FORMAT_R8G8B8A8_SINT: view.format = leonida::ColorViewFormat::rgba8_sint; break;
+                        case DXGI_FORMAT_R8G8B8A8_SNORM: view.format = leonida::ColorViewFormat::rgba8_snorm; break;
                         default: view = {}; break;
                         }
                         if (view.resource) {

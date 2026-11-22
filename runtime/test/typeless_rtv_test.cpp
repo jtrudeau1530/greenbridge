@@ -74,7 +74,9 @@ int main() {
     const std::pair<ColorViewFormat, VkFormat> formats[] = {
         {ColorViewFormat::rgba8_unorm, VK_FORMAT_R8G8B8A8_UNORM},
         {ColorViewFormat::rgba8_srgb, VK_FORMAT_R8G8B8A8_SRGB},
-        {ColorViewFormat::rgba8_uint, VK_FORMAT_R8G8B8A8_UINT}
+        {ColorViewFormat::rgba8_uint, VK_FORMAT_R8G8B8A8_UINT},
+        {ColorViewFormat::rgba8_sint, VK_FORMAT_R8G8B8A8_SINT},
+        {ColorViewFormat::rgba8_snorm, VK_FORMAT_R8G8B8A8_SNORM},
     };
     unsigned checks = 0;
     for (const auto& [format, expected] : formats) {
@@ -97,6 +99,8 @@ int main() {
             }
             if (format == ColorViewFormat::rgba8_uint) {
                 EXPECT(captured.uint32[0] == 1 && captured.uint32[1] == 2 && captured.uint32[2] == 255 && captured.uint32[3] == 0);
+            } else if (format == ColorViewFormat::rgba8_sint) {
+                EXPECT(captured.int32[0] == 1 && captured.int32[1] == 2 && captured.int32[2] == 127 && captured.int32[3] == -1);
             } else {
                 EXPECT(std::memcmp(captured.float32, color.data(), sizeof(captured)) == 0);
             }

@@ -1237,7 +1237,7 @@ The trace will enumerate them.
   `d3d12_uint_clear_test` compares full and rectangular D3D12 readbacks with WARP over seven input sets on all
   three formats; `clear_color_test` checks both replay paths without a GPU, including unchanged float values.
   This does not add typed-view reinterpretation of typeless resources or new integer formats.
-- **RGBA8 typeless RTV clears:** explicit UNORM, SRGB and UINT RTVs on a
+- **RGBA8 typeless RTV clears:** explicit UNORM, SRGB, UINT, SINT and SNORM RTVs on a
   `R8G8B8A8_TYPELESS` 2D resource with sample count 1, selecting a mip and a contiguous array-layer range.
   `TargetView` captures its format by value; copies and layout tracking keep the resource's base format.
   Reinterpreted full clears use dynamic rendering because `vkCmdClearColorImage` cannot select a view format.
@@ -1247,9 +1247,14 @@ The trace will enumerate them.
   On an RX 5700 XT, 13 synthetic full/rectangle readbacks match Windows WARP (UINT exact, normalized
   channels within one byte), including descriptor rewrites, format switches and an SRGB RTV on a UAV resource.
   The same tests fail without this change and when the cache ignores format. CPU replay covers 31 scenarios;
-  17 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
+  17 unsupported/invalid frontend views fail `Close` without submission. Other typeless families,
   typed-resource casts, MSAA and 3D typeless RTVs remain unsupported.
   Phase 2 adds 54 mip/array and 12 non-array higher-mip readbacks against WARP, including untouched sentinels.
+  D3D-161 adds SINT and SNORM views when the Vulkan format supports color attachments. SINT uses the existing
+  integer clear conversion, and SNORM passes floating-point values to the attachment. Signed channels matched
+  WARP byte for byte in full and rectangular clears on an RX 9070 XT (driver 32.0.32029.2010) and the integrated
+  Radeon in a Ryzen 5 9600X (32.0.21045.29003), including mip and array selections. The SNORM vectors avoid
+  half-step rounding ties.
 - **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For every integer RTV format the device
   exposes (`R8G8`, `R8G8B8A8`, `R16G16`, `R16G16B16A16`, `R32`, `R32G32` and `R32G32B32A32` in `_UINT` and `_SINT`,
   plus `R10G10B10A2_UINT`; `R8`/`R16` `_UINT`/`_SINT` are handled in replay too) convert those values numerically
