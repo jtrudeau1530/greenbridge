@@ -102,8 +102,9 @@ def main():
         if res:
             lin_raw = np.frombuffer(G[t["data_off"]:t["data_off"] + wb * hb * bpe], np.uint8)
             lin = smoothness(block_average(lin_raw.reshape(-1, bpe), bpe).reshape(hb, wb, 3)) if len(lin_raw) == wb * hb * bpe else -1
+            second = f"{res[1][0]:.4f} {res[1][1]} [{res[1][2]}]" if len(res) > 1 else "n/a"
             print(f"{t['w']}x{t['h']} {t['fmt_name']} mips={mips} gpu={t['gpu_size']}  best {res[0][0]:.4f} {res[0][1]} [{res[0][2]}]"
-                  f"  2nd {res[1][0]:.4f} {res[1][1]} [{res[1][2]}]  linear {lin:.4f}")
+                  f"  2nd {second}  linear {lin:.4f}")
             wins[(res[0][1].split(' ')[0], res[0][2])] += 1
     print("winners:", wins.most_common())
 
