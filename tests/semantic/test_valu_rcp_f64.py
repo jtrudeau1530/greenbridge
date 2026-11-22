@@ -1060,6 +1060,157 @@ class TestIEEE754Boundaries(unittest.TestCase):
         self.assertEqual(ref_rcp_f64(SNAN_F64, clamp=True), F64_POS_ZERO)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection for v_rcp_f64
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_empty_and_whitespace(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("")
+        with self.assertRaises(ValueError):
+            parse_asm_line("   ; comment only")
+
+    def test_syntax_rejection_wrong_opcode(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_rcp_f32 v[0:1], v[2:3]")
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_mul_f64 v[0:1], v[2:3]")
+
+    def test_syntax_rejection_wrong_operand_count(self) -> None:
+        # Zero source operands
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_rcp_f64 v[0:1]")
+        # Two source operands (v_rcp_f64 takes only one source operand!)
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_rcp_f64 v[0:1], v[2:3], v[4:5]")
+
+    def test_syntax_rejection_invalid_operand_tokens(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_operand("invalid_token")
+        with self.assertRaises(ValueError):
+            parse_asm_operand("m[0:1]")
+
+    def test_syntax_rejection_out_of_bounds_registers(self) -> None:
+        # Destination VGPR > 254
+        inst_bad_dst = ASTInstruction(
+            opcode="v_rcp_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, reg_idx=256),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, reg_idx=0),
+        )
+        with self.assertRaises(ValueError):
+            inst_bad_dst.validate()
+
+        # Source SGPR > 104
+        inst_bad_src = ASTInstruction(
+            opcode="v_rcp_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, reg_idx=0),
+            src0=ASTOperand(OperandKind.SGPR_PAIR, reg_idx=106),
+        )
+        with self.assertRaises(ValueError):
+            inst_bad_src.validate()
+
+    def test_syntax_rejection_illegal_dst_modifier(self) -> None:
+        inst_neg_dst = ASTInstruction(
+            opcode="v_rcp_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, reg_idx=0, neg=True),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, reg_idx=2),
+        )
+        with self.assertRaises(ValueError):
+            inst_neg_dst.validate()
+
+        inst_abs_dst = ASTInstruction(
+            opcode="v_rcp_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, reg_idx=0, abs_val=True),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, reg_idx=2),
+        )
+        with self.assertRaises(ValueError):
+            inst_abs_dst.validate()
+
+    def test_negative_simd_wave_sizes_and_lengths(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=128)
+
+        # ref_simd_rcp_f64 with invalid wave size
+        with self.assertRaises(ValueError):
+            ref_simd_rcp_f64([0] * 16, wave_size=16)
+
+        # ref_simd_rcp_f64 with length mismatch
+        with self.assertRaises(ValueError):
+            ref_simd_rcp_f64([0] * 32, wave_size=64)
+
+    def test_negative_register_file_bounds(self) -> None:
+        rf = VALURegisterFile(num_vgprs=16)
+        with self.assertRaises(IndexError):
+            rf.get_vgpr(-1)
+        with self.assertRaises(IndexError):
+            rf.get_vgpr(16)
+        with self.assertRaises(IndexError):
+            rf.get_vgpr_pair(15)
+        with self.assertRaises(IndexError):
+            rf.set_vgpr_pair(15, 0)
+
+    def test_mutation_zero_reciprocal_sign_detection(self) -> None:
+        # A buggy oracle that fails to propagate sign on 1.0 / -0.0
+        def mutated_oracle(src: int) -> int:
+            if is_f64_zero(src):
+                return F64_POS_INF  # Bug: always positive infinity
+            return ref_rcp_f64(src)
+
+        correct = ref_rcp_f64(F64_NEG_ZERO)
+        buggy = mutated_oracle(F64_NEG_ZERO)
+        self.assertNotEqual(buggy, correct)
+        self.assertEqual(correct, F64_NEG_INF)
+
+    def test_mutation_clamp_nan_to_zero_detection(self) -> None:
+        # A buggy clamp that leaves NaN intact instead of clamping to +0.0
+        def mutated_clamp(src: int) -> int:
+            res = ref_rcp_f64(src)
+            return res  # Bug: misses clamp on NaN
+
+        correct = ref_rcp_f64(F64_CANONICAL_QNAN, clamp=True)
+        buggy = mutated_clamp(F64_CANONICAL_QNAN)
+        self.assertNotEqual(buggy, correct)
+        self.assertEqual(correct, F64_POS_ZERO)
+
+    def test_mutation_clamp_negative_to_zero_detection(self) -> None:
+        # A buggy clamp that does not clamp negative values to 0.0
+        def mutated_clamp(src: int) -> int:
+            res = ref_rcp_f64(src)
+            return res  # Bug: misses lower clamp bound 0.0
+
+        val = f64_to_u64(-2.0)
+        correct = ref_rcp_f64(val, clamp=True)
+        buggy = mutated_clamp(val)
+        self.assertNotEqual(buggy, correct)
+        self.assertEqual(correct, F64_POS_ZERO)
+
+    def test_mutation_inactive_lane_tampering_detection(self) -> None:
+        # Verify SIMD step strictly protects inactive lanes
+        sim = SIMDWavefront(wave_size=32)
+        sentinel = join_dwords(OLD_VGPR_SENTINEL, OLD_VGPR_SENTINEL)
+        sim.store_vgpr_pair_wave(0, [sentinel] * 32)
+        sim.store_vgpr_pair_wave(2, [f64_to_u64(2.0)] * 32)
+        sim.exec_mask = 0x00000001  # Only lane 0 active
+
+        res = sim.step_v_rcp_f64(0, 2)
+        self.assertEqual(u64_to_f64(res[0]), 0.5)
+        for lane in range(1, 32):
+            self.assertEqual(res[lane], sentinel)
+
+    def test_mutation_abs_neg_modifier_order(self) -> None:
+        # RDNA2 rule: neg(abs(x)) forces sign to 1.
+        # If an implementation mistakenly computed abs(neg(x)), sign would be 0 (+0.5).
+        # We verify that neg=True, abs_val=True forces negative result (-0.5).
+        res = ref_rcp_f64(f64_to_u64(-2.0), src0_neg=True, src0_abs=True)
+        self.assertEqual(u64_to_f64(res), -0.5)
+        self.assertEqual(f64_sign(res), 1)
+
+
 class TestScalarInterpreter(unittest.TestCase):
     """Test suite for deterministic scalar instruction interpreter."""
 
