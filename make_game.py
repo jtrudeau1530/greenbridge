@@ -47,6 +47,8 @@ VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
 WINDOWS_ONLY = ("runtime",)   # off Windows: the clang-cl + xwin cross-build, or --runtime-build
 CROSS_TOOLS = ("clang-cl", "lld-link", "llvm-lib", "llvm-rc", "llvm-mt")
+CROSS_VARS = {"C_COMPILER": "clang-cl", "CXX_COMPILER": "clang-cl", "LINKER": "lld-link", "AR": "llvm-lib",
+              "RC_COMPILER": "llvm-rc", "MT": "llvm-mt"}   # the toolchain's CMAKE_<var> defaults
 XWIN_DEFAULT = os.path.join("~", ".local", "share", "xwin-sdk")
 RUNTIME_FILES = ("gta6rt.exe", "gta6rt_tls_host.dll")
 # Archives scanned for models and texture dictionaries, small to large.
@@ -300,7 +302,8 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
-              emulate: bool = False, keep_emulated: bool = False, jobs: int = 1) -> None:
+              emulate: bool = False, keep_emulated: bool = False,
+              fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if "runtime" in stages and runtime_build:
         absent = [n for n in RUNTIME_FILES if not os.path.isfile(os.path.join(runtime_build, n))]
@@ -353,7 +356,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     os.makedirs(work, exist_ok=True)
     free_gb = shutil.disk_usage(work).free / 2**30
     need_gb = sum(need.values())
-    if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated):
+    if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
         need_gb -= need["shaders"]
     if free_gb < need_gb:
@@ -391,9 +394,42 @@ def xwin_dir() -> "str | None":
     return d if os.path.isdir(os.path.join(d, "VC", "Tools", "MSVC")) and sdk else None
 
 
-def clang_cl_major() -> "int | None":
+CROSS_SUFFIXES = ("", *(f"-{n}" for n in range(40, 18, -1)))
+
+
+def cross_tool_suffix() -> "str | None":
+    """"" for the plain LLVM tool names, "-N" for a set named like clang-cl-21: the first complete set whose
+    clang-cl is 19 or newer, plain names first. None if there is none."""
+    for suffix in CROSS_SUFFIXES:
+        if all(shutil.which(t + suffix) for t in CROSS_TOOLS):
+            major = clang_cl_major("clang-cl" + suffix)
+            if major is None or major >= 19:
+                return suffix
+    return None
+
+
+def cross_build_dir() -> str:
+    return os.path.join(ROOT, "runtime", "build", "windows")
+
+
+def configured_cross_tools() -> dict:
+    """The LLVM tools an existing runtime/build/windows was configured with, from CMake's compiler files."""
+    found = {}
+    pattern = os.path.join(glob.escape(cross_build_dir()), "CMakeFiles", "*", "CMake*Compiler.cmake")
+    for path in sorted(glob.glob(pattern), key=os.path.getmtime):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in re.finditer(r'^set\((CMAKE_(?:CXX_COMPILER|LINKER|AR|MT|RC_COMPILER)) "([^"]+)"\)', text, re.M):
+            found[m.group(1)] = m.group(2)
+    return found
+
+
+def clang_cl_major(exe: str = "clang-cl") -> "int | None":
     try:
-        r = subprocess.run(["clang-cl", "--version"], capture_output=True, text=True, errors="replace", timeout=60)
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.search(r"clang version (\d+)", r.stdout)
@@ -405,13 +441,21 @@ def cross_build_missing() -> list:
     missing = []
     if not shutil.which("cmake"):
         missing.append("CMake 3.24 or newer")
-    absent = [t for t in CROSS_TOOLS if not shutil.which(t)]
-    if absent:
-        missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm)")
-    else:
-        major = clang_cl_major()
-        if major is not None and major < 19:
+    configured = configured_cross_tools()
+    if configured:
+        gone = sorted({t for t in configured.values() if not shutil.which(t)})
+        if gone:
+            missing.append(f"{', '.join(gone)}, which runtime/build/windows was configured with: put it back on "
+                           "PATH, or delete runtime/build/windows to configure it with the tools on PATH now")
+    elif cross_tool_suffix() is None:
+        major = clang_cl_major() if all(shutil.which(t) for t in CROSS_TOOLS) else None
+        partial = next((s for s in CROSS_SUFFIXES[1:] if shutil.which("clang-cl" + s)), "")
+        absent = [t + partial for t in CROSS_TOOLS if not shutil.which(t + partial)]
+        if major is not None and not absent:
             missing.append(f"clang-cl 19 or newer (this one is {major}; the MSVC STL from xwin rejects older Clang)")
+        else:
+            missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm), all five by their plain "
+                           "names or with one version suffix such as clang-cl-21")
     if not xwin_dir():
         missing.append("an xwin splat made with `xwin splat --use-winsysroot-style --preserve-ms-arch-notation` "
                        "(VC/Tools/MSVC and Windows Kits/10/Lib/<version>/um/x64) in XWIN_DIR or "
@@ -482,6 +526,11 @@ def requested_shader_mode(had: str, emulate: bool, keep_emulated: bool) -> str:
     return "on" if emulate or (had == "on" and keep_emulated) else "off"
 
 
+def translator_flags_setting(fallbacks: tuple[str, ...]) -> str:
+    """The recorded form of the translator fallback flags in spirv/translator_flags.txt (empty means none)."""
+    return " ".join(fallbacks)
+
+
 def llvm_mc_signature() -> str:
     command = mc_command()
     command[0] = shutil.which(command[0]) or command[0]
@@ -502,7 +551,8 @@ def disassembly_matches(dxbc: str, signature: str) -> bool:
             and read_shader_setting(os.path.join(dxbc, "disasm.done")) == signature)
 
 
-def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool) -> bool:
+def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
+                            fallbacks: tuple[str, ...] = ()) -> bool:
     """Check whether the shader stage can resume without carving, unpacking or translating again."""
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -513,6 +563,7 @@ def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool) -> bo
         return False
     had = read_shader_setting(os.path.join(spirv, "wave64_emulate.txt"), default="off")
     return (had == requested_shader_mode(had, emulate, keep_emulated)
+            and read_shader_setting(os.path.join(spirv, "translator_flags.txt")) == translator_flags_setting(fallbacks)
             and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest()
             and os.path.isfile(os.path.join(dxbc, "disasm.done"))
             and disassembly_matches(dxbc, llvm_mc_signature()))
@@ -530,7 +581,8 @@ def clear_shader_disassembly(work: str, disasm: str) -> None:
                     os.unlink(entry.path)
 
 
-def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False) -> None:
+def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False,
+            fallbacks: tuple[str, ...] = ()) -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -587,6 +639,16 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
             "translating again")
         drop(translated)
+    # The translation also depends on the fallback flags (--no-float-controls, --bary-fallback,
+    # --texel-offset-fallback, --mesh-compute), so they are kept beside it like the wave64 mode. A folder from
+    # before the file existed was translated without them.
+    flags_file = os.path.join(spirv, "translator_flags.txt")
+    want_flags = translator_flags_setting(fallbacks)
+    had_flags = read_shader_setting(flags_file)
+    if had_flags != want_flags and os.path.isfile(translated):
+        log(f"shaders: the fallback flags are now {want_flags or 'none'} (the shaders were translated with "
+            f"{had_flags or 'none'}): translating again")
+        drop(translated)
     if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
@@ -597,13 +659,24 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         os.makedirs(spirv, exist_ok=True)
         with open(mode_file, "w", encoding="utf-8") as f:
             f.write(want + "\n")
+        with open(flags_file, "w", encoding="utf-8") as f:
+            f.write(want_flags + "\n")
         with open(sources_file, "w", encoding="utf-8") as f:
             f.write(sources + "\n")
-        translate(disasm, spirv, jobs, emulate=emulate)
+        translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
 WAVE64_MODES = ("auto", "on", "off")
+
+# The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
+FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
+                  ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"))
+
+
+def fallback_flags(a) -> tuple[str, ...]:
+    """The fallback flags the parsed arguments ask for, in a stable order (the order they are recorded in)."""
+    return tuple(flag for flag, attr in FALLBACK_FLAGS if getattr(a, attr, False))
 
 
 def smallest_max_subgroup(vulkaninfo_text: str):
@@ -707,23 +780,26 @@ def translator_digest() -> str:
     return h.hexdigest()
 
 
-def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False) -> None:
+def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
+              fallbacks: tuple[str, ...] = ()) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
 
     A shard renames its index.part<i>.json into place last, so a part on disk is a finished shard. A run stopped
-    part-way, or during the merge, keeps those parts when it resumes with the same --jobs, wave64 mode and translator
-    source, and starts only the shards that have none. shaders() drops the plan whenever an earlier step reruns."""
+    part-way, or during the merge, keeps those parts when it resumes with the same --jobs, wave64 mode, fallback
+    flags and translator source, and starts only the shards that have none. shaders() drops the plan whenever an
+    earlier step reruns."""
     os.makedirs(spirv, exist_ok=True)
     plan_path = os.path.join(spirv, SHARD_PLAN)
-    plan = {"jobs": jobs, "wave64_emulate": bool(emulate), "translator": translator_digest()}
+    plan = {"jobs": jobs, "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks),
+            "translator": translator_digest()}
     try:
         with open(plan_path, encoding="utf-8") as f:
             same = json.load(f) == plan
     except (OSError, ValueError):
         same = False
     if not same:
-        # Parts from another --jobs would be merged in too, and parts from another mode or translator are wrong.
-        # They go before the new plan is written: a stop in between must not leave old parts under a new plan.
+        # Parts from another --jobs would be merged in too, and parts from another mode, flags or translator are
+        # wrong. They go before the new plan is written: a stop in between must not leave old parts under a new plan.
         for f in os.listdir(spirv):
             if f.startswith("index.part") and f.endswith(".json"):
                 os.remove(os.path.join(spirv, f))
@@ -734,6 +810,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False) -> None
         log(f"  keeping {jobs - len(todo)} of {jobs} shards finished by the run before")
     tool = os.path.join(TOOLS, "rdna2spirv.py")
     extra = ["--wave64-emulate"] if emulate else []
+    extra.extend(fallbacks)
     if todo:
         which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
@@ -922,9 +999,12 @@ def cross_configure() -> str:
     if not xwin:
         fail("runtime: no xwin SDK in XWIN_DIR or ~/.local/share/xwin-sdk (docs/testing.md, "
              "\"The Windows runtime on Linux\"), and no --runtime-build.")
-    build = os.path.join(ROOT, "runtime", "build", "windows")
+    build = cross_build_dir()
+    suffix = "" if configured_cross_tools() else cross_tool_suffix() or ""
+    tools = [f"-DCMAKE_{var}={shutil.which(name + suffix) or name + suffix}" for var, name in CROSS_VARS.items()
+             ] if suffix else []
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
-                    f"-DXWIN_DIR={xwin}", hint="CMake's error above says what the cross-build lacks "
+                    f"-DXWIN_DIR={xwin}", *tools, hint="CMake's error above says what the cross-build lacks "
                     "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
                     "runtime from --stages (the default without it: check,shaders,assets,pipelines).")
     return build
@@ -1038,6 +1118,19 @@ def main() -> int:
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) turns it on unless vulkaninfo shows that "
                          "every GPU has 64-wide subgroups")
+    ap.add_argument("--no-float-controls", action="store_true",
+                    help="translate without SignedZeroInfNanPreserve (Depends on: #664), for devices whose "
+                         "vk_pipeline_check skips a shader without shaderSignedZeroInfNanPreserveFloat32")
+    ap.add_argument("--bary-fallback", action="store_true",
+                    help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
+                         "geometry shader the runtime draws), for devices without "
+                         "VK_KHR_fragment_shader_barycentric")
+    ap.add_argument("--texel-offset-fallback", action="store_true",
+                    help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
+                         "without VK_KHR_maintenance8")
+    ap.add_argument("--mesh-compute", action="store_true",
+                    help="translate mesh shaders to compute shaders writing an output buffer, for devices "
+                         "without VK_EXT_mesh_shader")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -1098,11 +1191,13 @@ def main() -> int:
                 "(or pass --runtime-build)")
     emulate = "shaders" in stages and wave64_emulate(a.wave64_emulate)
     keep_emulated = a.wave64_emulate == "auto"
-    preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated, jobs=a.jobs)
+    fallbacks = fallback_flags(a) if "shaders" in stages else ()
+    preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
+              fallbacks=fallbacks, jobs=a.jobs)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
-        shaders(game, work, a.jobs, emulate=emulate, keep_emulated=keep_emulated)
+        shaders(game, work, a.jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
     if "assets" in stages:
         assets(game, work, a.wav, a.jobs)
     if "runtime" in stages:

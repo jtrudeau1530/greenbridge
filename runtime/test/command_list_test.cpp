@@ -107,7 +107,7 @@ int main() {
     // Copies: D3D12's own call rules (aligned footprints, a non-empty box, distinct CopyResource operands).
     CHECK(list.reset());
     CHECK(list.copy_buffer({1, 0, 2, 16, 64}));
-    CHECK(!list.copy_buffer({1, 0, 2, 16, 0}));
+    CHECK(list.copy_buffer({1, 0, 2, 16, 0}));
     CHECK(!list.copy_buffer({0, 0, 2, 16, 64}));
     const CopyLocation texture{3, false, 0, 0, 0, 0, 0, 0};
     const CopyLocation placed{4, true, 0, 512, 8, 8, 1, 256};

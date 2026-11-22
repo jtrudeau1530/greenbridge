@@ -31,11 +31,11 @@ def pack_position(x, y, z):
     return (y & 0xFF) | (x << 8) | ((y >> 8) << 32) | (z << 48)
 
 
-def grid_triangles():
+def grid_triangles(grid=GRID):
     tris = []
-    for j in range(GRID - 1):
-        for i in range(GRID - 1):
-            a, b, c, d = j * GRID + i, j * GRID + i + 1, (j + 1) * GRID + i, (j + 1) * GRID + i + 1
+    for j in range(grid - 1):
+        for i in range(grid - 1):
+            a, b, c, d = j * grid + i, j * grid + i + 1, (j + 1) * grid + i, (j + 1) * grid + i + 1
             tris += [(a, b, c), (b, d, c)]
     return tris
 
@@ -56,14 +56,15 @@ def group_for(tris, n):
     return struct.pack("<3I", 0x80000000 | len(chunks), tbase, vbase) + bytes(recs + words + refs)
 
 
-def block(uv_offset=-5, colour=(10, 20, 30, 255)):
-    """A 42 40 00 00 block on a flat grid: slots 0 (0x42 position), 1 (0x26), 2 (0x21 = snorm8 +z), 3 (0x28)."""
-    n = GRID * GRID
+def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True):
+    """A 42 40 00 00 block on a flat grid: slots 0 (0x42 position), 1 (0x26), 2 (0x21 = snorm8 +z), 3 (0x28),
+    followed by its meshlet group unless with_group is false."""
+    n = grid * grid
     streams = [
-        (0, 0x42, b"".join(struct.pack("<Q", pack_position(100 * (v % GRID), 100 * (v // GRID), 0)) for v in range(n))),
+        (0, 0x42, b"".join(struct.pack("<Q", pack_position(100 * (v % grid), 100 * (v // grid), 0)) for v in range(n))),
         (1, 0x26, bytes(colour) * n),
         (2, 0x21, bytes((0, 0, 127, 0)) * n),
-        (3, 0x28, b"".join(struct.pack("<2h", 1000 * (v % GRID + uv_offset), 1000 * (v // GRID + uv_offset))
+        (3, 0x28, b"".join(struct.pack("<2h", 1000 * (v % grid + uv_offset), 1000 * (v // grid + uv_offset))
                            for v in range(n))),
     ]
     head = bytearray(vt.HEADER)
@@ -80,9 +81,20 @@ def block(uv_offset=-5, colour=(10, 20, 30, 255)):
     struct.pack_into("<f", head, 0x7C, 4.0)
     buf = bytearray(head + body)
     buf += b"\0" * (-len(buf) % 16)
-    buf += group_for(grid_triangles(), n)
-    buf += b"\0" * (-len(buf) % 16)
+    if with_group:
+        buf += padded_group(grid)
     return bytes(buf)
+
+
+def padded_group(grid=GRID):
+    g = group_for(grid_triangles(grid), grid * grid)
+    return g + b"\0" * (-len(g) % 16)
+
+
+def measure_stream(data):
+    T, errors = {}, {}
+    vt.measure_stream(data, T, random.Random(1), errors)
+    return T, errors
 
 
 def measure(data):
@@ -141,6 +153,31 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(out["pos_header_finite"], 1)
 
 
+class BlockRunTests(unittest.TestCase):
+    """Blocks stored back to back, with their groups after the whole run in the same order."""
+
+    def test_two_blocks_then_two_groups(self):
+        data = block(with_group=False) + block(grid=8, with_group=False) + padded_group() + padded_group(8)
+        T, errors = measure_stream(data)
+        self.assertEqual((T.get("blocks"), T["vertices"], T["run_blocks"], errors), (2, 100 + 64, 2, {}))
+
+    def test_groups_out_of_order_fail_the_density_check(self):
+        data = block(with_group=False) + block(grid=8, with_group=False) + padded_group(8) + padded_group()
+        T, errors = measure_stream(data)
+        self.assertEqual((T.get("blocks"), errors), (None, {"group does not cover the block densely": 2}))
+
+    def test_blocks_without_a_group_in_the_stream_are_counted(self):
+        data = block(with_group=False) + block(with_group=False) + block(with_group=False) + padded_group()
+        T, errors = measure_stream(data)
+        self.assertEqual((T.get("blocks"), errors), (1, {"no group in the stream for a later block of the run": 2}))
+
+    def test_single_block_unchanged(self):
+        T, errors = measure_stream(block())
+        self.assertEqual((T.get("blocks"), T["run_blocks"], errors), (1, 1, {}))
+        with self.assertRaises(vt.BlockError):
+            measure_stream(block(with_group=False))
+
+
 class ArchiveTests(unittest.TestCase):
     def test_end_to_end_on_a_fake_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,6 +192,19 @@ class ArchiveTests(unittest.TestCase):
                 out = json.load(fh)
             self.assertEqual((out["streams"], out["blocks"]), (1, 1))
             self.assertEqual(out["tags"]["slot3:28"]["edge_jumps_signed"], 0)
+
+    def test_block_run_on_a_fake_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fake.rpf")
+            run = block(with_group=False) + block(grid=8, with_group=False) + padded_group() + padded_group(8)
+            with open(path, "wb") as fh:
+                fh.write(b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(run))
+            out_json = os.path.join(tmp, "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out_json], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out_json, encoding="utf-8") as fh:
+                out = json.load(fh)
+            self.assertEqual((out["streams"], out.get("blocks"), out["skipped"]), (1, 2, {}))
 
     def test_directory_scan_uses_stable_archive_order(self):
         with tempfile.TemporaryDirectory() as root:

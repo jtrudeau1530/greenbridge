@@ -353,13 +353,30 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.limit is not None and a.limit < 0:
         ap.exit(2, f"{ap.prog}: error: --limit must be non-negative\n")
+    # A bad path is one ERROR line, not a traceback out of os.listdir: the audit of a whole corpus can
+    # run for minutes, and an explicit --fssm/--dxbc that does not exist would otherwise be counted as
+    # "(missing fssm)" and print a report that looks right.
+    for label, path in (("", a.disasm_dir), ("--fssm: ", a.fssm), ("--dxbc: ", a.dxbc)):
+        if path is None:
+            continue
+        if not os.path.exists(path):
+            print(f"ERROR: {label}{path}: no such folder", file=sys.stderr)
+            return 2
+        if not os.path.isdir(path):
+            print(f"ERROR: {label}{path}: not a folder", file=sys.stderr)
+            return 2
 
     rep = audit(a.disasm_dir, fssm_dir=a.fssm, dxbc_dir=a.dxbc, limit=a.limit)
     print_report(rep)
     if a.json_out:
-        with open(a.json_out, "w", encoding="utf-8") as f:
-            json.dump(rep, f, indent=2)
-            f.write("\n")
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.json_out)), exist_ok=True)
+            with open(a.json_out, "w", encoding="utf-8") as f:
+                json.dump(rep, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: {a.json_out}: cannot write: {e.strerror or e}", file=sys.stderr)
+            return 1
         print(f"wrote {a.json_out}")
     return 0
 

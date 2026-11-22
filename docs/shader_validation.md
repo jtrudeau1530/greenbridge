@@ -165,8 +165,10 @@ Setup on Windows, about 800 MB and no admin rights:
   `clang.exe` ends up in `.venv\Lib\site-packages\_rocm_sdk_core\lib\llvm\bin`. A `.venv` in the working
   directory or repository is found by itself; otherwise set `LEONIDA_AMD_CLANG` to that `clang.exe`.
 - **Linux/ROCm is not supported yet:** `hw_oracle.c` is Windows-only (it loads the driver's DLL).
-- **Host C compiler.** MinGW gcc (on PATH, or `LEONIDA_HOST_CC`) builds `tools/hw_oracle/hw_oracle.c` once into the
-  temp folder. By hand: `gcc -O1 tools/hw_oracle/hw_oracle.c -o hw_oracle.exe`.
+- **Host C compiler.** `tools/hw_oracle/hw_oracle.c` is built once into the temp folder by MinGW gcc (on PATH or in
+  `C:\msys64`), else by MSVC: a `cl` on PATH (a Developer shell), else the Visual Studio that `vswhere` finds, through
+  its `vcvars64.bat`. The Visual Studio the runtime needs is therefore enough. `LEONIDA_HOST_CC` overrides the choice
+  (gcc or `cl.exe`). By hand: `gcc -O1 tools/hw_oracle/hw_oracle.c -o hw_oracle.exe` or `cl /O1 tools\hw_oracle\hw_oracle.c`.
 - `LEONIDA_HW_ARCH` overrides the detected architecture (`amdgpu-arch`, else `gfx1150`). GFX10 spellings
   (`s_load_dwordx2`, `global_store_dwordx4`) are used for `gfx10xx`, so the same kernels assemble for an RDNA2 card
   (checked by assembling for gfx1030 with clang and gfx1013 with `llvm-mc`; not run on one). `gfx12xx` (RDNA4) uses
