@@ -135,6 +135,7 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R16G16B16A16_TYPELESS: return {VK_FORMAT_R16G16B16A16_SFLOAT, color, true};
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return {VK_FORMAT_R16G16B16A16_SFLOAT, color};
     case DXGI_FORMAT_R16G16B16A16_UNORM: return {VK_FORMAT_R16G16B16A16_UNORM, color};
+    case DXGI_FORMAT_R16G16B16A16_SNORM: return {VK_FORMAT_R16G16B16A16_SNORM, color};
     case DXGI_FORMAT_R16G16B16A16_UINT: return {VK_FORMAT_R16G16B16A16_UINT, color};
     case DXGI_FORMAT_R16G16B16A16_SINT: return {VK_FORMAT_R16G16B16A16_SINT, color};
     case DXGI_FORMAT_R32G32_TYPELESS: return {VK_FORMAT_R32G32_SFLOAT, color, true};
@@ -160,6 +161,8 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     // DXGI names channels from the low bits up, Vulkan from the high bits down: B in bits 0-3, A in 12-15 in both.
     // Vulkan 1.3 requires sampling it (formerly VK_EXT_4444_formats).
     case DXGI_FORMAT_B4G4R4A4_UNORM: return {VK_FORMAT_A4R4G4B4_UNORM_PACK16, color};
+    // A in bits 0-3 and R in 12-15 (cleared and read back on native D3D12, AMD and WARP): Vulkan's R4G4B4A4_PACK16.
+    case DXGI_FORMAT_A4B4G4R4_UNORM: return {VK_FORMAT_R4G4B4A4_UNORM_PACK16, color};
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return {VK_FORMAT_B8G8R8A8_SRGB, color};
     // The X byte has no channel of its own: the BGRA8 images hold it, and shader views read alpha as 1.
     case DXGI_FORMAT_B8G8R8X8_TYPELESS: return {VK_FORMAT_B8G8R8A8_UNORM, color, true};
@@ -167,12 +170,17 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return {VK_FORMAT_B8G8R8A8_SRGB, color};
     case DXGI_FORMAT_R16G16_TYPELESS: return {VK_FORMAT_R16G16_SFLOAT, color, true};
     case DXGI_FORMAT_R16G16_FLOAT: return {VK_FORMAT_R16G16_SFLOAT, color};
+    case DXGI_FORMAT_R16G16_UNORM: return {VK_FORMAT_R16G16_UNORM, color};
+    case DXGI_FORMAT_R16G16_SNORM: return {VK_FORMAT_R16G16_SNORM, color};
     case DXGI_FORMAT_R16G16_UINT: return {VK_FORMAT_R16G16_UINT, color};
     case DXGI_FORMAT_R16G16_SINT: return {VK_FORMAT_R16G16_SINT, color};
     case DXGI_FORMAT_R8G8_TYPELESS: return {VK_FORMAT_R8G8_UNORM, color, true};
     case DXGI_FORMAT_R8G8_UNORM: return {VK_FORMAT_R8G8_UNORM, color};
     case DXGI_FORMAT_R8G8_SNORM: return {VK_FORMAT_R8G8_SNORM, color};
     case DXGI_FORMAT_R16_UNORM: return {VK_FORMAT_R16_UNORM, color};
+    case DXGI_FORMAT_R16_SNORM: return {VK_FORMAT_R16_SNORM, color};
+    case DXGI_FORMAT_R16_UINT: return {VK_FORMAT_R16_UINT, color};
+    case DXGI_FORMAT_R16_SINT: return {VK_FORMAT_R16_SINT, color};
     // DXGI names packed channels from the high bits down, Vulkan's PACK formats the same way but spelled the other
     // way round: B5G6R5 (blue in bits 0-4) is R5G6B5_PACK16 and B5G5R5A1 (alpha in bit 15) is A1R5G5B5_PACK16.
     case DXGI_FORMAT_B5G6R5_UNORM: return {VK_FORMAT_R5G6B5_UNORM_PACK16, color};
@@ -181,6 +189,10 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
     case DXGI_FORMAT_R16_FLOAT: return {VK_FORMAT_R16_SFLOAT, color};
     case DXGI_FORMAT_R8_UNORM: return {VK_FORMAT_R8_UNORM, color};
+    case DXGI_FORMAT_R8_TYPELESS: return {VK_FORMAT_R8_UNORM, color, true};
+    case DXGI_FORMAT_R8_SNORM: return {VK_FORMAT_R8_SNORM, color};
+    case DXGI_FORMAT_R8_UINT: return {VK_FORMAT_R8_UINT, color};
+    case DXGI_FORMAT_R8_SINT: return {VK_FORMAT_R8_SINT, color};
     case DXGI_FORMAT_R32_FLOAT: return {VK_FORMAT_R32_SFLOAT, color};
     case DXGI_FORMAT_R32_UINT: return {VK_FORMAT_R32_UINT, color};
     case DXGI_FORMAT_R32_SINT: return {VK_FORMAT_R32_SINT, color};
@@ -5495,13 +5507,7 @@ bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D1
     if (!dst || !src) return false;
     const Format requested = vulkan_format(format, false);
     if (requested.typeless || requested.rgb96 || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return false;
-    if (format == DXGI_FORMAT_R32G32B32A32_UINT || format == DXGI_FORMAT_R8G8B8A8_UINT ||
-        format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R16G16B16A16_UINT ||
-        format == DXGI_FORMAT_R16G16B16A16_SINT || format == DXGI_FORMAT_R32G32_UINT ||
-        format == DXGI_FORMAT_R32G32_SINT || format == DXGI_FORMAT_R10G10B10A2_UINT ||
-        format == DXGI_FORMAT_R16G16_UINT || format == DXGI_FORMAT_R16G16_SINT ||
-        format == DXGI_FORMAT_R8G8_UINT || format == DXGI_FORMAT_R8G8_SINT)
-        return false;
+    if (DeviceState::numeric_class(requested.format) != 0) return false;  // D3D12 resolves no integer format
     const auto matches = [&](ID3D12Resource* resource) {
         const D3D12_RESOURCE_DESC desc = resource->GetDesc();
         return vulkan_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL).format ==

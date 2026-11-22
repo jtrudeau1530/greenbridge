@@ -1792,6 +1792,179 @@ int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo
     return mismatches;
 }
 
+// Item 1 of the FORMAT_SUPPORT finding in #1380: formats the host creates that vulkan_format() didn't map. Each one
+// is created as a texture (as on the host, when there is one), reported as a 2D texture, and a 4x4 upload copied in
+// and back out reads back bit for bit. A4B4G4R4_UNORM is also cleared as a render target where the layer reports
+// one: the host keeps red in bits 12-15 and alpha in bits 0-3 (measured on AMD and WARP), the reverse of B4G4R4A4.
+int new_format_round_trips(ID3D12Device* device) {
+    struct NewFormat {
+        DXGI_FORMAT format;
+        UINT bytes;
+    };
+    constexpr NewFormat formats[] = {
+        {DXGI_FORMAT_R16_UINT, 2},           {DXGI_FORMAT_R16_SINT, 2},       {DXGI_FORMAT_R16_SNORM, 2},
+        {DXGI_FORMAT_R8_UINT, 1},            {DXGI_FORMAT_R8_SINT, 1},        {DXGI_FORMAT_R8_SNORM, 1},
+        {DXGI_FORMAT_R8_TYPELESS, 1},        {DXGI_FORMAT_R16G16_UNORM, 4},   {DXGI_FORMAT_R16G16_SNORM, 4},
+        {DXGI_FORMAT_R16G16B16A16_SNORM, 8}, {DXGI_FORMAT_A4B4G4R4_UNORM, 2},
+    };
+    constexpr UINT size = 4, pitch = 256, slot = 1024;
+    int failures = 0;
+    const auto fail = [&](DXGI_FORMAT format, const char* what) {
+        if (failures++ < 16) std::fprintf(stderr, "new format %d: %s\n", int(format), what);
+    };
+    Ref<ID3D12Device> host;
+    create_host_device(host);
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD},
+        readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const UINT64 buffer_bytes = UINT64(slot) * std::size(formats);
+    const D3D12_RESOURCE_DESC buffer = buffer_desc(buffer_bytes);
+    Ref<ID3D12Resource> upload, readback;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&upload.p))));
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&readback.p))));
+    if (!upload.p || !readback.p) return 1;
+    std::uint8_t *up = nullptr, *down = nullptr;
+    EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&down))));
+    if (!up || !down) return 1;
+    std::memset(down, 0xcd, size_t(buffer_bytes));
+    for (UINT64 i = 0; i < buffer_bytes; ++i) up[i] = std::uint8_t(i * 37 + (i >> 8) * 11 + 5);
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    if (!queue.p || !list.p || !fence.p) return 1;
+    UINT64 fence_value = 0;
+    const auto submit = [&] {
+        const bool closed = list->Close() == S_OK;
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        const bool replayed = rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success;
+        ++fence_value;
+        const bool waited = SUCCEEDED(queue->Signal(fence.p, fence_value)) &&
+                            SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr));
+        if (!closed || !replayed || !waited) fail(DXGI_FORMAT_UNKNOWN, "a command list didn't close, replay or finish");
+    };
+
+    std::array<Ref<ID3D12Resource>, std::size(formats)> textures;
+    for (size_t i = 0; i < std::size(formats); ++i) {
+        const DXGI_FORMAT format = formats[i].format;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+            !(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D))
+            fail(format, "FORMAT_SUPPORT reports no 2D texture");
+        const D3D12_RESOURCE_DESC desc = texture_desc(size, size, format, D3D12_RESOURCE_FLAG_NONE);
+        if (FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                   IID_PPV_ARGS(&textures[i].p)))) {
+            fail(format, "CreateCommittedResource failed");
+            continue;
+        }
+        if (host.p) {
+            Ref<ID3D12Resource> native;
+            if (FAILED(host->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&native.p))))
+                fail(format, "the host refuses a texture the layer creates");
+        }
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
+        UINT rows = 0;
+        UINT64 row_bytes = 0;
+        device->GetCopyableFootprints(&desc, 0, 1, UINT64(slot) * i, &placed, &rows, &row_bytes, nullptr);
+        if (placed.Footprint.Format != format || placed.Footprint.RowPitch != pitch || rows != size ||
+            row_bytes != UINT64(size) * formats[i].bytes) {
+            fail(format, "unexpected copyable footprint");
+            textures[i].reset();
+            continue;
+        }
+        const auto dst = subresource(textures[i].p, 0);
+        const auto in = footprint(upload.p, placed);
+        list->CopyTextureRegion(&dst, 0, 0, 0, &in, nullptr);
+        const D3D12_RESOURCE_BARRIER readable =
+            transition(textures[i].p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &readable);
+        const auto out = footprint(readback.p, placed);
+        list->CopyTextureRegion(&out, 0, 0, 0, &dst, nullptr);
+    }
+    submit();
+    unsigned round_trips = 0;
+    for (size_t i = 0; i < std::size(formats); ++i) {
+        if (!textures[i].p) continue;
+        const size_t base = size_t(slot) * i;
+        bool same = true;
+        for (UINT y = 0; y < size && same; ++y)
+            same = std::memcmp(down + base + y * pitch, up + base + y * pitch, size_t(size) * formats[i].bytes) == 0;
+        if (same)
+            ++round_trips;
+        else
+            fail(formats[i].format, "a texel read back differs from the one uploaded");
+    }
+
+    // A4B4G4R4 cleared to pure red, green, blue and alpha in turn.
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT a4_support{DXGI_FORMAT_A4B4G4R4_UNORM};
+    const bool a4_target =
+        SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &a4_support, sizeof(a4_support))) &&
+        (a4_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
+    unsigned a4_cleared = 0;
+    if (a4_target) {
+        const D3D12_RESOURCE_DESC desc =
+            texture_desc(1, 1, DXGI_FORMAT_A4B4G4R4_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        Ref<ID3D12Resource> target;
+        Ref<ID3D12DescriptorHeap> heap;
+        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                         IID_PPV_ARGS(&target.p))));
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+        if (target.p && heap.p) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE rtv = heap->GetCPUDescriptorHandleForHeapStart();
+            device->CreateRenderTargetView(target.p, nullptr, rtv);
+            constexpr float colours[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+            constexpr std::uint16_t words[4] = {0xf000, 0x0f00, 0x00f0, 0x000f};
+            const D3D12_PLACED_SUBRESOURCE_FOOTPRINT texel{0, {DXGI_FORMAT_A4B4G4R4_UNORM, 1, 1, 1, pitch}};
+            for (int c = 0; c < 4; ++c) {
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                list->ClearRenderTargetView(rtv, colours[c], 0, nullptr);
+                const D3D12_RESOURCE_BARRIER to_copy =
+                    transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &to_copy);
+                const auto src = subresource(target.p, 0);
+                const auto out = footprint(readback.p, texel);
+                list->CopyTextureRegion(&out, 0, 0, 0, &src, nullptr);
+                const D3D12_RESOURCE_BARRIER back =
+                    transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                list->ResourceBarrier(1, &back);
+                submit();
+                std::uint16_t got = 0;
+                std::memcpy(&got, down, 2);
+                if (got == words[c]) {
+                    ++a4_cleared;
+                } else if (failures++ < 16) {
+                    std::fprintf(stderr, "A4B4G4R4 clear to channel %d: got %04x, want %04x\n", c, got, words[c]);
+                }
+            }
+        }
+    }
+    upload->Unmap(0, nullptr);
+    readback->Unmap(0, nullptr);
+    std::printf("new formats: %u of %zu created and copied both ways bit for bit%s, A4B4G4R4 render target %s, "
+                "%d failures\n",
+                round_trips, std::size(formats), host.p ? " (host compared)" : "",
+                a4_target ? (a4_cleared == 4 ? "cleared to R, G, B and A" : "cleared wrong") : "not reported, skipped",
+                failures);
+    return failures;
+}
+
 // D3D-86: validate CheckFeatureSupport(D3D12_OPTIONS2..21 except 6/8/10/12/17), check size/null refusals and local
 // invariants, and verify conservative compatibility against the host PC D3D12 runtime on the same adapter.
 int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo& info) {
@@ -3287,6 +3460,7 @@ int main() {
         EXPECT(options_mismatches == 0);
         const int format_support_mismatches = compare_format_support(device.p, info);
         EXPECT(format_support_mismatches == 0);
+        EXPECT(new_format_round_trips(inner) == 0);  // the PC-ABI layer device: the proxy returns heap starts by value
 
         // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
         EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);

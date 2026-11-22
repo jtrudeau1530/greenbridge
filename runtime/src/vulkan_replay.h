@@ -410,6 +410,7 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R32G32B32A32_SINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
     case VK_FORMAT_R16G16B16A16_UINT:
     case VK_FORMAT_R16G16B16A16_SINT:
     case VK_FORMAT_R32G32_SFLOAT:
@@ -427,6 +428,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_B8G8R8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_SNORM:
     case VK_FORMAT_R16G16_UINT:
     case VK_FORMAT_R16G16_SINT:
     case VK_FORMAT_R32_SFLOAT:
@@ -443,9 +446,16 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R8G8_SINT:
     case VK_FORMAT_R16_SFLOAT:
     case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16_SINT:
     case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
     case VK_FORMAT_D16_UNORM: return {2, 1};
-    case VK_FORMAT_R8_UNORM: return {1, 1};
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_SNORM:
+    case VK_FORMAT_R8_UINT:
+    case VK_FORMAT_R8_SINT: return {1, 1};
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
     case VK_FORMAT_BC4_UNORM_BLOCK:
@@ -477,8 +487,7 @@ inline bool two_planes(const ResourceBinding& resource) {
 }
 
 // D3D12 copies between a depth format and a colour format of the same typeless family, bit for bit: D32_FLOAT with
-// R32_FLOAT/UINT/SINT (R32_TYPELESS) and D16_UNORM with R16_FLOAT/UNORM (R16_TYPELESS; the other R16 formats have no
-// copy layout here yet). Single-sampled, single-plane depth only: D24 and D32 with stencil have two planes, and a D24
+// R32_FLOAT/UINT/SINT (R32_TYPELESS) and D16_UNORM with R16_FLOAT/UNORM/SNORM/UINT/SINT (R16_TYPELESS). Single-sampled, single-plane depth only: D24 and D32 with stencil have two planes, and a D24
 // stored as D32 would need the depth24 conversion. Vulkan's vkCmdCopyImage refuses mismatched aspects, so the replay
 // stages these through a buffer.
 inline bool depth_colour_pair(const ResourceBinding& a, const ResourceBinding& b) {
@@ -490,7 +499,10 @@ inline bool depth_colour_pair(const ResourceBinding& a, const ResourceBinding& b
         case VK_FORMAT_R32_SINT: return 32;
         case VK_FORMAT_D16_UNORM:
         case VK_FORMAT_R16_SFLOAT:
-        case VK_FORMAT_R16_UNORM: return 16;
+        case VK_FORMAT_R16_UNORM:
+        case VK_FORMAT_R16_SNORM:
+        case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16_SINT: return 16;
         default: return 0;
         }
     };
