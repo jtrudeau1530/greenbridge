@@ -3199,7 +3199,16 @@ public:
             const auto layout_support = reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(
                 get_device(state_.info.device, "vkGetDescriptorSetLayoutSupport"));
             std::function<bool(const leonida::BindlessFeatures&)> layout_supported;
-            if (layout_support)
+            // MoltenVK's vkGetDescriptorSetLayoutSupport compares every layout with maxPerSetDescriptors (1212, the
+            // limit without argument buffers) and rejects even 1212 itself, while it creates and samples a 65536-image,
+            // 4096-sampler update-after-bind set correctly (docs/d3d12_vulkan.md section 5). There size_bindings'
+            // per-type update-after-bind limits, which MoltenVK takes from Metal's argument-buffer limits, decide.
+            VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 driver_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+            get_properties(state_.info.physical, &driver_properties);
+            if (driver.driverID == VK_DRIVER_ID_MOLTENVK)
+                layout_supported = [](const leonida::BindlessFeatures&) { return true; };
+            else if (layout_support)
                 layout_supported = [&](const leonida::BindlessFeatures& candidate) {
                     const leonida::bindless::SetLayout layout(candidate);
                     VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};
@@ -3221,9 +3230,7 @@ public:
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_1d)],
                      features.counts[b::storage_binding(leonida::ImageDimension::dim_2d, 0)]);
         // D3D12 promises a shader holds a full shader-visible sampler heap. Past this many distinct S#s, CreateSampler
-        // logs that the array is full and a shader reads the fallback (clamping) sampler. On MoltenVK, whose
-        // vkGetDescriptorSetLayoutSupport rejects any layout of maxPerSetDescriptors (1212) or more, the set
-        // keeps the default 1024 (docs/d3d12_vulkan.md section 5).
+        // logs that the array is full and a shader reads the fallback (clamping) sampler.
         if (features.counts[b::sampler_binding] < D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE + 1)
             std::fprintf(stderr, "[rt] d3d12: the bindless set holds fewer samplers than a full shader-visible "
                                  "sampler heap (%u of %u besides the fallback): its limits or "
