@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -197,7 +198,9 @@ int check_custom_heap_properties(ID3D12Device* device) {
         }
     }
     const D3D12_HEAP_PROPERTIES custom = device->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_CUSTOM);
-    EXPECT(custom.Type == D3D12_HEAP_TYPE(0) && custom.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_UNKNOWN);
+    EXPECT(custom.Type == D3D12_HEAP_TYPE(0) && custom.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_UNKNOWN &&
+           custom.MemoryPoolPreference == D3D12_MEMORY_POOL_UNKNOWN && custom.CreationNodeMask == 1 &&
+           custom.VisibleNodeMask == 1);
 
     // The host runtime on a NUMA adapter (the answer the layer gives in D3D12_FEATURE_ARCHITECTURE) must agree.
     Ref<ID3D12Device> host;
@@ -221,7 +224,23 @@ int check_custom_heap_properties(ID3D12Device* device) {
             return 1;
         }
     }
-    std::printf("GetCustomHeapProperties: DEFAULT, UPLOAD and READBACK match the host runtime\n");
+    // What has no custom equivalent: an all-zero description with node 0 in both masks on the host runtime.
+    const std::pair<UINT, D3D12_HEAP_TYPE> invalid[] = {
+        {0, D3D12_HEAP_TYPE_CUSTOM}, {1, D3D12_HEAP_TYPE_CUSTOM}, {0, D3D12_HEAP_TYPE(99)},
+        {2, D3D12_HEAP_TYPE_UPLOAD}};
+    for (const auto& [node_mask, type] : invalid) {
+        const D3D12_HEAP_PROPERTIES ours = device->GetCustomHeapProperties(node_mask, type);
+        const D3D12_HEAP_PROPERTIES theirs = host->GetCustomHeapProperties(node_mask, type);
+        if (std::memcmp(&ours, &theirs, sizeof(ours)) != 0) {
+            std::fprintf(stderr, "node mask %u, heap type %d: ours %d/%d/%d/%u/%u, host %d/%d/%d/%u/%u\n", node_mask,
+                         type, ours.Type, ours.CPUPageProperty, ours.MemoryPoolPreference, ours.CreationNodeMask,
+                         ours.VisibleNodeMask, theirs.Type, theirs.CPUPageProperty, theirs.MemoryPoolPreference,
+                         theirs.CreationNodeMask, theirs.VisibleNodeMask);
+            return 1;
+        }
+    }
+    std::printf("GetCustomHeapProperties: DEFAULT, UPLOAD, READBACK, CUSTOM, an unknown type and node mask 2 match "
+                "the host runtime\n");
     return 0;
 }
 

@@ -87,6 +87,7 @@ jobs:
           cmake -S runtime -B runtime/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DLEONIDA_D3D12_SHIM_TESTS=ON
+          -DLEONIDA_REQUIRE_VULKAN=ON
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
@@ -229,11 +230,12 @@ jobs:
           cmake -S runtime -B runtime/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DLEONIDA_REQUIRE_VULKAN=ON
       - name: Build
         run: cmake --build runtime/build --parallel
       - name: Check GPU tools exist
         run: |
-          for tool in vk_harness vk_pipeline_check vk_command_replay_test vk_predicate_capture_test vk_predicated_copy_test vk_compute_test vk_texture_test vk_store_test vk_bindless_test depth24_convert_test clear_color_test predicated_copy_test d3d12_state_map_test command_list_test descriptor_table_test gfx10_descriptors_test; do
+          for tool in vk_harness vk_pipeline_check vk_command_replay_test vk_queue_test vk_predicate_capture_test vk_predicated_copy_test vk_compute_test vk_texture_test vk_store_test vk_bindless_test depth24_convert_test clear_color_test predicated_copy_test d3d12_state_map_test command_list_test descriptor_table_test gfx10_descriptors_test; do
             if [ ! -f "runtime/build/$tool" ] && [ ! -f "runtime/build/$tool.exe" ]; then
               echo "Missing: $tool"
               exit 1

@@ -77,6 +77,68 @@ class ReportPathTest(unittest.TestCase):
             self.assertIn("would overwrite the input", result.stderr)
             self.assertEqual(doc.read_bytes(), before)
 
+    def test_json_cannot_overwrite_a_nested_xml(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = pathlib.Path(td) / "tree"
+            folder.mkdir()
+            doc = folder / "nested.xml"
+            doc.write_bytes(XML)
+            before = doc.read_bytes()
+            result = self.run_tool(folder, "--json", doc)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("would overwrite the input", result.stderr)
+            self.assertEqual(doc.read_bytes(), before)
+
+    def test_csv_cannot_overwrite_a_nested_xml(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = pathlib.Path(td) / "tree"
+            folder.mkdir()
+            doc = folder / "nested.xml"
+            doc.write_bytes(XML)
+            before = doc.read_bytes()
+            result = self.run_tool(folder, "--csv", doc)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("would overwrite the input", result.stderr)
+            self.assertEqual(doc.read_bytes(), before)
+
+    def test_nested_xml_alias_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = pathlib.Path(td) / "tree"
+            folder.mkdir()
+            (folder / "sub").mkdir()
+            doc = folder / "nested.xml"
+            doc.write_bytes(XML)
+            before = doc.read_bytes()
+            result = self.run_tool(folder, "--json", folder / "sub" / ".." / "nested.xml")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("would overwrite the input", result.stderr)
+            self.assertEqual(doc.read_bytes(), before)
+
+    def test_json_cannot_overwrite_a_carve_stream(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve = pathlib.Path(td) / "x.rpf"
+            carve.mkdir()
+            stream = carve / "000000000010.bin"
+            stream.write_bytes(b"not really xml")
+            before = stream.read_bytes()
+            (carve / "index.json").write_text(json.dumps({"files": [
+                {"off": 0x10, "stored": 14, "size": 14, "type": "xml", "head": ""}
+            ]}), encoding="utf-8")
+            result = self.run_tool(carve, "--json", stream)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("would overwrite the input", result.stderr)
+            self.assertEqual(stream.read_bytes(), before)
+
+    def test_report_inside_the_scanned_folder_still_works(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = pathlib.Path(td) / "tree"
+            folder.mkdir()
+            (folder / "a.xml").write_bytes(XML)
+            out = folder / "report.json"
+            result = self.run_tool(folder, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(out.is_file(), result.stderr)
+
     def test_report_path_cannot_be_a_directory(self):
         with tempfile.TemporaryDirectory() as td:
             carve = self.make_carve(td)

@@ -197,11 +197,16 @@ def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
         stem = safe_stem(record["name"], k)
         file = f"{stem}.dxbc"
         target = os.path.join(directory, file)
-        if os.path.exists(target):
-            file = f"{stem}_{k:02d}.dxbc"
-            target = os.path.join(directory, file)
-        with open(target, "wb") as f:
-            f.write(data[record["offset"] : record["offset"] + record["size"]])
+        n = k
+        while True:
+            try:
+                with open(target, "xb") as f:
+                    f.write(data[record["offset"] : record["offset"] + record["size"]])
+                break
+            except FileExistsError:
+                file = f"{stem}_{n:02d}.dxbc"
+                target = os.path.join(directory, file)
+                n += 1
         index.append({"name": stem, "file": file, "stage": "cs"})
     return index
 

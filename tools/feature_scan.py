@@ -230,6 +230,10 @@ def _written_regs(tok: str) -> list:
     return []
 
 
+def _has_secondary_sgpr_destination(op: str) -> bool:
+    return op.startswith("v_") and ("_co_" in op or op.startswith("v_div_scale"))
+
+
 def _update_const_regs(const_reg: dict, op: str, operands: list) -> None:
     """Track single-register immediate loads and invalidate any destination register written."""
     if not operands:
@@ -241,8 +245,12 @@ def _update_const_regs(const_reg: dict, op: str, operands: list) -> None:
         if imm is not None:
             const_reg[dst] = imm
             return
-    for r in _written_regs(dst):
-        const_reg.pop(r, None)
+    destination_count = 2 if _has_secondary_sgpr_destination(op) else 1
+    for operand in operands[:destination_count]:
+        tokens = operand.split()
+        if tokens:
+            for register in _written_regs(tokens[0]):
+                const_reg.pop(register, None)
 
 
 def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
@@ -361,7 +369,7 @@ def sgpr_writes(ins: dict) -> range:
     elif op.startswith(("v_readlane", "v_readfirstlane")) or (op.startswith("v_cmp") and not op.startswith("v_cmpx")
                                                                and op.endswith("_e64")):
         dst = args[0] if args else None
-    elif op.startswith("v_") and len(args) > 1 and ("_co_" in op or op.startswith("v_div_scale")):
+    elif len(args) > 1 and _has_secondary_sgpr_destination(op):
         dst = args[1]
     if dst and dst.get("k") == "sgpr":
         return range(dst["r"], dst["r"] + dst.get("n", 1))

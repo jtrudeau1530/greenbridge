@@ -237,7 +237,7 @@ def rewrite(text):
             ops[1::2] = ["%gsc_body" if lbl == entry_label else lbl for lbl in ops[1::2]]
             s = f"{m.group(1)} {' '.join(ops)}"
             ln = s
-        m = re.match(r"(%\w+) = OpAccessChain (%\w+) (%\w+) (.*)$", s)
+        m = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
         if m and m.group(3) in in_slot:
             idx = m.group(4).split()
             vtx = idx[0]
