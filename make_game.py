@@ -45,6 +45,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
+from shader_stage_manifest import shader_stems  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -638,9 +639,28 @@ def llvm_mc_signature() -> str:
     return json.dumps([command, version])
 
 
+def unpacked_shader_stems(dxbc: str) -> set[str] | None:
+    """Return current unpacked names, allowing the unpacker to skip non-FSSM containers."""
+    try:
+        carved = shader_stems(os.path.join(dxbc, "index.json"), "file", ".dxbc")
+        unpacked = shader_stems(os.path.join(dxbc, "fssm_index.json"), "name")
+    except (OSError, ValueError):
+        return None
+    return unpacked if unpacked and unpacked <= carved else None
+
+
 def disassembly_matches(dxbc: str, signature: str) -> bool:
-    return (os.path.isdir(os.path.join(dxbc, "disasm"))
-            and read_shader_setting(os.path.join(dxbc, "disasm.done")) == signature)
+    if read_shader_setting(os.path.join(dxbc, "disasm.done")) != signature:
+        return False
+    names = unpacked_shader_stems(dxbc)
+    if names is None:
+        return False
+    try:
+        with os.scandir(os.path.join(dxbc, "disasm")) as entries:
+            return all(entry.name[:-2] in names for entry in entries
+                       if entry.name.endswith(".s") and entry.is_file())
+    except OSError:
+        return False
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
@@ -691,10 +711,10 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         log("shaders: carving shaders.rpf")
         drop(translated, shard_plan, disassembled, unpacked)
         py("shader_carve.py", src, dxbc)
-    if not os.path.isfile(unpacked):
+    if unpacked_shader_stems(dxbc) is None:
         log("shaders: unpacking native code")
         drop(translated, shard_plan, disassembled)
-        py("fssm_unpack.py", dxbc)
+        py("fssm_unpack.py", dxbc, "--carve-index", carved)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
@@ -704,7 +724,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         log("shaders: disassembling (gfx1013)")
         drop(translated, shard_plan, disassembled)
         clear_shader_disassembly(work, disasm)
-        py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
+        py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--unpack-index", unpacked,
+           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
         with open(disassembled, "w", encoding="utf-8", newline="\n") as f:
             f.write(signature + "\n")
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without

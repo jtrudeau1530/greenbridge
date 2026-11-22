@@ -386,9 +386,9 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
 
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('[{"file": "shader.dxbc"}]')
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('[{"name": "shader"}]')
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
             f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
@@ -425,10 +425,10 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             fake_py_calls.append(tool)
             if tool == "shader_carve.py":
                 with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    f.write('[{"file": "shader.dxbc"}]')
             elif tool == "fssm_unpack.py":
                 with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
-                    f.write("{}")
+                    f.write('[{"name": "shader"}]')
 
         with mock.patch("make_game.py", side_effect=fake_py), \
                 mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \
