@@ -1126,7 +1126,7 @@ The trace will enumerate them.
   - `UAV_TYPED_LOAD` with every typed UAV. Typed UAV reads use the sampled binding (`image_read_typed`), not a
     storage-image read.
   - The UAV atomic bits other than exchange for `R32_UINT`, the one format with the `r32ui` storage view. There
-    is no `image_atomic_swap`.
+    is no `image_atomic_swap`, and the translator's image atomics cover 2D and 3D textures only.
   - No integer resolve, no 1D block-compressed, no 3D or shader reads of depth formats.
   - TYPELESS formats report texture dimensions and `MIP` only.
 
