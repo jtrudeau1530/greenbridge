@@ -1141,6 +1141,25 @@ def fallback_flags(a) -> tuple[str, ...]:
     return tuple(flag for flag, attr in FALLBACK_FLAGS if getattr(a, attr, False))
 
 
+def recorded_fallback_flags(work: str) -> tuple[str, ...]:
+    """The fallback flags the translation in `work` was made with (spirv/translator_flags.txt), () when there is none."""
+    return tuple(read_shader_setting(os.path.join(work, "shaders", "spirv", "translator_flags.txt")).split())
+
+
+def keep_recorded_fallback(flag: str, work: str) -> bool:
+    """Whether an automatic fallback flag stays on when the GPU probe can't tell if the GPU needs it.
+
+    The probe answers differently from run to run (a GPU asleep or hidden, a missing Vulkan loader, its 60 s
+    timeout). Dropping the flag then would translate the whole corpus without it, and the next run that can ask
+    would translate it a third time. A flag the probe turned on was needed by the GPU it last reached, so a
+    translation made with it is kept, as wave64 emulation is; a probe that answers still decides."""
+    if flag not in recorded_fallback_flags(work):
+        return False
+    log(f"shaders: couldn't ask the GPU the runtime would use whether it needs {flag}; the shaders were translated "
+        "with it and it stays on instead of translating them all again (a run that can ask the GPU decides again)")
+    return True
+
+
 def smallest_max_subgroup(vulkaninfo_text: str):
     """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
@@ -2019,14 +2038,20 @@ def main() -> int:
                 "(or pass --runtime-build)")
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
-    if "shaders" in stages and not a.f16_interp_fallback and runtime_gpu_per_vertex() is False:
-        log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
-            "fragmentShaderBarycentric): translating with --f16-interp-fallback")
-        a.f16_interp_fallback = True
+    if "shaders" in stages and not a.f16_interp_fallback:
+        per_vertex = runtime_gpu_per_vertex()
+        if per_vertex is False:
+            log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
+                "fragmentShaderBarycentric): translating with --f16-interp-fallback")
+            a.f16_interp_fallback = True
+        elif per_vertex is None:
+            a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
         max_pc = runtime_gpu_max_push_constants()
-        if max_pc is not None and max_pc < need_pc:
+        if max_pc is None:
+            a.pc_tail_ubo = keep_recorded_fallback("--pc-tail-ubo", work)
+        elif max_pc < need_pc:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
