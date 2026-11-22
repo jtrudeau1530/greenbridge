@@ -835,7 +835,7 @@ def run_translator(progs, a, work, tally):
             continue
         # A wave32 program needs 32-lane subgroups. Where vk_compute_test couldn't pin them, its words come from
         # another wave size and are no evidence either way. --wave64-emulate output uses no subgroup operations.
-        lanes = unpinned_subgroup(msg) if p.wave == 32 else None
+        lanes = unpinned_subgroup(msg) if rc == 0 and p.wave == 32 else None
         if lanes:
             skipped += 1
             print(f"SKIP {p.name}: the device can't run it at {lanes} lanes "
