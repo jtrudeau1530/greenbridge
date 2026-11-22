@@ -338,6 +338,34 @@ Names are per model and a building holds glass, decal and opaque shaders alike, 
 in absolute terms; the enrichment against bucket 0 is the signal. For export: bucket 1 needs blending, 2 is
 a projected decal, 3 needs alpha testing, 6 is a water surface.
 
+## Vehicle distant-light recipes
+
+`common.rpf` has one `CVehicleDistantLightData` XML document (see [gamedata.md](gamedata.md)) that ties
+vehicle models to far-away light recipes. Counts only; no model names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `distantLights`, `presetLights` | 1 each | empty |
+| `recipeLights/Item` | 1,980 | `vehicleModelName`, `secondaryRecipes`, `lights` |
+| `recipeLights/Item/secondaryRecipes/Item` | 2,383 | one token each; 0 to 3 per recipe (0: 312, 1: 1,029, 2: 563, 3: 76) |
+| `recipeLights/Item/lights` | 1,980 | empty in all |
+
+- **Every `vehicleModelName` is a real fragment model.** The 1,980 recipes name 319 distinct models, and all
+  319 exist as `.yft` entries in the local archive catalog, each also with a `<name>_hi.yft` high-detail
+  variant. None is a `.ydr`. A loader can therefore key the recipes by the vehicle's `.yft` base name.
+- A model has 1 to 45 recipes (93 models have one); in 304 of the 319 models every recipe has a different set
+  of secondary tokens, so a recipe is selected by its secondaries, not by the model alone.
+- The 780 distinct secondary tokens are not catalog entries (2 coincide with an entry name) and not texture
+  dictionary items, and are never another recipe's model name. 1,242 of the 2,383 contain the recipe's own
+  model name.
+- **No light data is stored**: `lights` is empty in all 1,980 recipes and both top-level lists are empty. In
+  this build the document is an index from model and variant to recipe with the light positions absent,
+  so distant vehicle lights cannot be reconstructed from it.
+
+Not measured here (hypothesis): what the secondary tokens name (per-model parts or liveries would fit the
+model-name substrings), and where the light positions are generated at runtime (for example from the model's
+own light bones).
+
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
