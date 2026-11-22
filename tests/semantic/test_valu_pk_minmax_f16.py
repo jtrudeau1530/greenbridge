@@ -673,6 +673,7 @@ class ScalarMachineState:
     """Architectural register file for single-lane scalar interpretation."""
     vgprs: List[int] = field(default_factory=lambda: [0] * 256)
     sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    vcc: int = 0
 
     def get_reg(self, reg: Reg) -> int:
         if reg.kind == RegKind.VGPR:
@@ -842,6 +843,7 @@ class SIMDState:
     exec_mask: Optional[int] = None
     vgprs: List[List[int]] = field(default_factory=list)
     sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    vcc: int = 0
 
     def __post_init__(self) -> None:
         if self.num_lanes not in (32, 64):
@@ -1206,6 +1208,239 @@ class TestRegisterAliasing(unittest.TestCase):
             # Reg 1 and Reg 2 remain unchanged
             self.assertEqual(state.get_lane_reg(lane, Reg(1, RegKind.VGPR)), pack_pk_f16(POS_TWO, POS_TWO))
             self.assertEqual(state.get_lane_reg(lane, Reg(2, RegKind.VGPR)), sentinel)
+
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class PackedConditionCodes:
+    """Architectural comparison condition codes for packed binary16 min/max."""
+    equal_lo: bool
+    less_lo: bool
+    greater_lo: bool
+    unordered_lo: bool
+    equal_hi: bool
+    less_hi: bool
+    greater_hi: bool
+    unordered_hi: bool
+    zero_lo: bool
+    zero_hi: bool
+    negative_lo: bool
+    negative_hi: bool
+
+
+@dataclass(frozen=True)
+class PackedFPStatusFlags:
+    """IEEE 754 floating-point status flags for packed half-precision operations."""
+    invalid: bool       # e.g., sNaN operand
+    denormal: bool      # e.g., subnormal operand or result
+    inexact: bool = False
+    overflow: bool = False
+    underflow: bool = False
+
+
+def _eval_half_relation(a: int, b: int, res: int) -> Tuple[bool, bool, bool, bool, bool, bool]:
+    """Helper to evaluate relation for a single half (equal, less, greater, unordered, zero, neg)."""
+    nan_a = is_nan16(a)
+    nan_b = is_nan16(b)
+    if nan_a or nan_b:
+        unordered = True
+        equal = False
+        less = False
+        greater = False
+    else:
+        unordered = False
+        fa = bits_to_f16(a)
+        fb = bits_to_f16(b)
+        a_is_neg_zero = (a == NEG_ZERO)
+        b_is_neg_zero = (b == NEG_ZERO)
+        a_is_pos_zero = (a == POS_ZERO)
+        b_is_pos_zero = (b == POS_ZERO)
+
+        if (a_is_neg_zero and b_is_pos_zero):
+            equal = False
+            less = True
+            greater = False
+        elif (a_is_pos_zero and b_is_neg_zero):
+            equal = False
+            less = False
+            greater = True
+        elif (a_is_neg_zero and b_is_neg_zero) or (a_is_pos_zero and b_is_pos_zero):
+            equal = True
+            less = False
+            greater = False
+        else:
+            equal = (fa == fb)
+            less = (fa < fb)
+            greater = (fa > fb)
+
+    zero = is_zero16(res)
+    neg = bool(res & SIGN_MASK16)
+    return equal, less, greater, unordered, zero, neg
+
+
+def evaluate_pk_condition_codes(
+    s0_u32: int,
+    s1_u32: int,
+    res_u32: int,
+    op_sel: Tuple[int, int, int, int] = (0, 0, 1, 1),
+) -> PackedConditionCodes:
+    """Evaluate condition codes for packed operations across lo and hi halves."""
+    s0_halves = unpack_pk_f16(s0_u32)
+    s1_halves = unpack_pk_f16(s1_u32)
+    res_halves = unpack_pk_f16(res_u32)
+
+    eq_lo, lt_lo, gt_lo, un_lo, z_lo, neg_lo = _eval_half_relation(
+        s0_halves[op_sel[0]], s1_halves[op_sel[1]], res_halves[0]
+    )
+    eq_hi, lt_hi, gt_hi, un_hi, z_hi, neg_hi = _eval_half_relation(
+        s0_halves[op_sel[2]], s1_halves[op_sel[3]], res_halves[1]
+    )
+
+    return PackedConditionCodes(
+        equal_lo=eq_lo, less_lo=lt_lo, greater_lo=gt_lo, unordered_lo=un_lo,
+        equal_hi=eq_hi, less_hi=lt_hi, greater_hi=gt_hi, unordered_hi=un_hi,
+        zero_lo=z_lo, zero_hi=z_hi, negative_lo=neg_lo, negative_hi=neg_hi,
+    )
+
+
+def evaluate_pk_status_flags(
+    s0_u32: int,
+    s1_u32: int,
+    res_u32: int,
+    op_sel: Tuple[int, int, int, int] = (0, 0, 1, 1),
+) -> PackedFPStatusFlags:
+    """Evaluate IEEE 754 architectural flags for packed binary16 min/max."""
+    s0_halves = unpack_pk_f16(s0_u32)
+    s1_halves = unpack_pk_f16(s1_u32)
+    res_halves = unpack_pk_f16(res_u32)
+
+    in0_lo = s0_halves[op_sel[0]]
+    in1_lo = s1_halves[op_sel[1]]
+    in0_hi = s0_halves[op_sel[2]]
+    in1_hi = s1_halves[op_sel[3]]
+
+    # Invalid operation triggered by any signaling NaN input
+    invalid = (
+        is_snan16(in0_lo) or is_snan16(in1_lo) or
+        is_snan16(in0_hi) or is_snan16(in1_hi)
+    )
+
+    # Denormal flag triggered by any subnormal input or result
+    denormal = (
+        is_subnormal16(in0_lo) or is_subnormal16(in1_lo) or
+        is_subnormal16(in0_hi) or is_subnormal16(in1_hi) or
+        is_subnormal16(res_halves[0]) or is_subnormal16(res_halves[1])
+    )
+
+    return PackedFPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=False,
+        overflow=False,
+        underflow=False,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_ordering(self) -> None:
+        # lo: 1.0 < 2.0 (less_lo=True), hi: 3.0 > 0.5 (greater_hi=True)
+        s0 = pack_pk_f16(POS_ONE, f16_to_bits(3.0))
+        s1 = pack_pk_f16(POS_TWO, POS_HALF)
+        res = oracle_pk_min_f16(s0, s1)
+
+        cc = evaluate_pk_condition_codes(s0, s1, res)
+        self.assertTrue(cc.less_lo)
+        self.assertFalse(cc.greater_lo)
+        self.assertFalse(cc.equal_lo)
+        self.assertFalse(cc.unordered_lo)
+
+        self.assertTrue(cc.greater_hi)
+        self.assertFalse(cc.less_hi)
+        self.assertFalse(cc.equal_hi)
+        self.assertFalse(cc.unordered_hi)
+
+    def test_condition_codes_unordered_nan(self) -> None:
+        # lo: NaN vs 1.0 -> unordered_lo = True
+        # hi: 2.0 == 2.0 -> equal_hi = True
+        s0 = pack_pk_f16(QNAN_CANONICAL, POS_TWO)
+        s1 = pack_pk_f16(POS_ONE, POS_TWO)
+        res = oracle_pk_min_f16(s0, s1)
+
+        cc = evaluate_pk_condition_codes(s0, s1, res)
+        self.assertTrue(cc.unordered_lo)
+        self.assertFalse(cc.less_lo)
+        self.assertFalse(cc.greater_lo)
+        self.assertFalse(cc.equal_lo)
+
+        self.assertTrue(cc.equal_hi)
+        self.assertFalse(cc.unordered_hi)
+
+    def test_condition_codes_signed_zeros(self) -> None:
+        # lo: -0.0 vs +0.0 -> -0.0 < +0.0, so less_lo=True, zero_lo=True, negative_lo=True
+        # hi: +0.0 vs -0.0 -> +0.0 > -0.0, so greater_hi=True
+        s0 = pack_pk_f16(NEG_ZERO, POS_ZERO)
+        s1 = pack_pk_f16(POS_ZERO, NEG_ZERO)
+        res = oracle_pk_min_f16(s0, s1)
+
+        cc = evaluate_pk_condition_codes(s0, s1, res)
+        self.assertTrue(cc.less_lo)
+        self.assertTrue(cc.zero_lo)
+        self.assertTrue(cc.negative_lo)
+
+        self.assertTrue(cc.greater_hi)
+        self.assertTrue(cc.zero_hi)
+        self.assertTrue(cc.negative_hi)  # min(+0.0, -0.0) == -0.0
+
+    def test_status_flags_snan_invalid(self) -> None:
+        # Signaling NaN in lo triggers invalid flag
+        s0 = pack_pk_f16(SNAN_DEFAULT, POS_ONE)
+        s1 = pack_pk_f16(POS_TWO, POS_TWO)
+        res = oracle_pk_min_f16(s0, s1)
+
+        flags = evaluate_pk_status_flags(s0, s1, res)
+        self.assertTrue(flags.invalid)
+        self.assertFalse(flags.denormal)
+
+    def test_status_flags_subnormal_denormal(self) -> None:
+        # Subnormal input triggers denormal flag
+        s0 = pack_pk_f16(POS_MIN_SUBNORM, POS_ONE)
+        s1 = pack_pk_f16(POS_ONE, POS_ONE)
+        res = oracle_pk_min_f16(s0, s1)
+
+        flags = evaluate_pk_status_flags(s0, s1, res)
+        self.assertFalse(flags.invalid)
+        self.assertTrue(flags.denormal)
+
+    def test_carry_borrow_isolation(self) -> None:
+        # In RDNA2, packed VALU min/max instructions do not produce carry/borrow or alter VCC.
+        interp = ScalarInterpreter()
+        state = ScalarMachineState()
+        state.vcc = 0x12345678  # pre-existing VCC condition code
+
+        state.set_reg(Reg(0, RegKind.VGPR), pack_pk_f16(POS_ONE, POS_TWO))
+        state.set_reg(Reg(1, RegKind.VGPR), pack_pk_f16(POS_TWO, POS_ONE))
+
+        instr = VPkMinMaxF16Instruction(
+            opcode=Opcode.V_PK_MIN_F16,
+            dst=Reg(2, RegKind.VGPR),
+            src0=VOP3POperand(Reg(0, RegKind.VGPR)),
+            src1=VOP3POperand(Reg(1, RegKind.VGPR)),
+        )
+        interp.step(instr, state)
+        # VCC must remain strictly preserved
+        self.assertEqual(state.vcc, 0x12345678)
+
+        # Same for SIMD execution
+        simd_interp = SIMDInterpreter()
+        simd_state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        simd_state.vcc = 0x87654321
+        simd_interp.step(instr, simd_state)
+        self.assertEqual(simd_state.vcc, 0x87654321)
 
 
 if __name__ == "__main__":
