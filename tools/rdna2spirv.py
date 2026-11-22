@@ -1325,6 +1325,62 @@ class Gen:
         for i, v in enumerate(phis):
             self.dst({"k": "vgpr", "r": vd["r"] + i, "n": 1}, v)
 
+    BUFFER_SUB = {
+        "buffer_load_ubyte": (1, False), "buffer_load_sbyte": (1, True),
+        "buffer_load_ushort": (2, False), "buffer_load_sshort": (2, True),
+    }
+
+    def buffer_load_sub(self, op, a, mods):
+        """buffer_load_{u,s}byte / buffer_load_{u,s}short vD, vaddr, s[V#], soffset [offen|idxen] offset:N.
+        Loads 1 or 2 bytes from V#.base + offsets, zero- or sign-extended to 32 bits. Out-of-bounds lanes
+        (OOB_SELECT with element size 1 or 2) return 0 without reading memory; inactive lanes keep vD."""
+        if any(m in mods for m in ("lds", "tfe", "d16")):
+            raise Unsupported(op + " form")
+        nbytes, signed = self.BUFFER_SUB[op]
+        vd = a[0]
+        if vd["k"] != "vgpr" or vd.get("n", 1) != 1:
+            raise Unsupported(op + " destination")
+        addr, _, in_b, step = self.buffer_address(a, mods, elem=nbytes)
+        act = self.active_b()
+        cond = self.tmp()
+        self.emit(f"{cond} = OpLogicalAnd %bool {act} {in_b}")
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre_label = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        alo, b3, b64, aligned, sh = (self.tmp() for _ in range(5))
+        self.emit(f"{alo} = OpUConvert %uint {addr}")
+        self.emit(f"{b3} = OpBitwiseAnd %uint {alo} {self.cu(3)}")
+        self.emit(f"{b64} = OpUConvert %ulong {b3}")
+        self.emit(f"{aligned} = OpISub %ulong {addr} {b64}")
+        self.emit(f"{sh} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
+        ptr, host = self.tmp(), self.host_addr(aligned)
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+        p0, w0 = self.buf_dword_ptr(ptr, host, step, 0), self.tmp()
+        self.emit(f"{w0} = OpLoad %uint {p0} Aligned 4")
+        ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
+        val = self.tmp()
+        if nbytes == 1:
+            self.emit(f"{val} = {ext} %uint {w0} {sh} {self.cu(8)}")
+        else:
+            cross, idx1, w1, lo_part, hi_byte, hi_sh, crossed, raw = (self.tmp() for _ in range(8))
+            self.emit(f"{cross} = OpIEqual %bool {b3} {self.cu(3)}")
+            self.emit(f"{idx1} = OpSelect %uint {cross} {self.cu(1)} {self.cu(0)}")
+            p1 = self.buf_dword_ptr(ptr, host, step, idx1)
+            self.emit(f"{w1} = OpLoad %uint {p1} Aligned 4")
+            self.emit(f"{lo_part} = OpShiftRightLogical %uint {w0} {sh}")
+            self.emit(f"{hi_byte} = OpBitFieldUExtract %uint {w1} {self.cu(0)} {self.cu(8)}")
+            self.emit(f"{hi_sh} = OpShiftLeftLogical %uint {hi_byte} {self.cu(8)}")
+            self.emit(f"{crossed} = OpBitwiseOr %uint {lo_part} {hi_sh}")
+            self.emit(f"{raw} = OpSelect %uint {cross} {crossed} {lo_part}")
+            self.emit(f"{val} = {ext} %uint {raw} {self.cu(0)} {self.cu(16)}")
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        res = self.tmp()
+        self.emit(f"{res} = OpPhi %uint {val} {lbl_do} {self.cu(0)} {pre_label}")
+        self.dst(vd, res)
+
     # GFX10 buffer formats (from Mesa src/amd/registers/gfx10-rsrc.json, GFX10_FORMAT):
     #   code: (bytes, kind, component bit widths from bit 0)
     # The names list the widths from the top bit down, so 2_10_10_10 (50) is R10G10B10A2.
@@ -1334,7 +1390,7 @@ class Gen:
                72: (12, "u32", (32, 32, 32)), 75: (16, "u32", (32, 32, 32, 32)),
                21: (4, "i32", (32,)), 63: (8, "i32", (32, 32)), 73: (12, "i32", (32, 32, 32)),
                76: (16, "i32", (32, 32, 32, 32)), 13: (2, "f16", (16,)), 29: (4, "f16", (16, 16)),
-               71: (8, "f16", (16, 16, 16, 16)), 1: (1, "unorm", (8,)), 14: (2, "unorm", (8, 8)),
+               71: (8, "f16", (16, 16, 16, 16)), 1: (1, "unorm", (8,)), 5: (1, "uint", (8,)), 14: (2, "unorm", (8, 8)),
                56: (4, "unorm", (8, 8, 8, 8)), 57: (4, "snorm", (8, 8, 8, 8)), 60: (4, "uint", (8, 8, 8, 8)),
                7: (2, "unorm", (16,)), 23: (4, "unorm", (16, 16)), 24: (4, "snorm", (16, 16)),
                65: (8, "unorm", (16, 16, 16, 16)), 66: (8, "snorm", (16, 16, 16, 16)),
@@ -1525,6 +1581,8 @@ class Gen:
         kind = op[len("global_atomic_"):]
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.global_atomic_x2(op, kind[:-3], a, mods)
+        if kind in ("fmin", "fmax"):
+            return self.global_atomic_float(op, kind, a, mods)
         if kind not in self.BUF_ATOMICS or any(m in mods for m in ("slc", "dlc", "lds")):
             raise Unsupported(op if kind not in self.BUF_ATOMICS else op + " form")
         rtn = "glc" in mods
@@ -1554,6 +1612,55 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         self.emit(f"{old} = OpPhi %uint {res} {lbl_do} {old_d} {pre}")
+        if vdst is not None:
+            self.store_reg("vgpr", vdst["r"], old)
+
+    def global_atomic_float(self, op, kind, a, mods):
+        """global_atomic_{fmin,fmax} [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: 32-bit float min/max at the
+        global_* address via a CAS loop (OpAtomicCompareExchange + GLSL.std.450 NMin/NMax, so no shader float atomic
+        extension is needed). Inactive lanes don't touch memory and keep vdst."""
+        if any(m in mods for m in ("slc", "dlc", "lds")):
+            raise Unsupported(op + " form")
+        rtn = "glc" in mods
+        if len(a) != (4 if rtn else 3):
+            raise Unsupported(op + " operands")
+        vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != 1 or \
+                (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 1)):
+            raise Unsupported(op + " operands")
+        full = self.global_address(op, vaddr, saddr, mods)
+        val_f = self.tof(self.load_reg("vgpr", vdata["r"]))
+        old_d = self.load_reg("vgpr", vdst["r"]) if vdst is not None else self.cu(0)
+        lbl_do, lbl_hdr, lbl_cont, lbl_exit, lbl_end = (
+            self.tmp() + s for s in ("_do", "_hdr", "_cont", "_exit", "_end"))
+        pre = self.current_label_placeholder()
+        act = self.active_b()      # loaded before the merge: OpSelectionMerge must directly precede the branch
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        ptr, p, init = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+        self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
+        self.emit(f"{init} = OpLoad %uint {p} Aligned 4")
+        self.emit(f"OpBranch {lbl_hdr}")
+        self.emit(f"{lbl_hdr} = OpLabel")
+        cur, cur_f, new_f, new_u, got, done = (self.tmp() for _ in range(6))
+        self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
+        self.emit(f"{cur_f} = OpBitcast %float {cur}")
+        glsl_op = "NMin" if kind == "fmin" else "NMax"
+        self.emit(f"{new_f} = OpExtInst %float %glsl {glsl_op} {cur_f} {val_f}")
+        self.emit(f"{new_u} = OpBitcast %uint {new_f}")
+        self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {new_u} {cur}")
+        self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+        self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+        self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+        self.emit(f"{lbl_cont} = OpLabel")
+        self.emit(f"OpBranch {lbl_hdr}")
+        self.emit(f"{lbl_exit} = OpLabel")
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        old = self.tmp()
+        self.emit(f"{old} = OpPhi %uint {cur} {lbl_exit} {old_d} {pre}")
         if vdst is not None:
             self.store_reg("vgpr", vdst["r"], old)
 
@@ -2376,6 +2483,9 @@ class Gen:
             """in-range bool of dword k of the access (k = 0: the first dword)."""
             return check_end(4 * k + 4)
 
+        if isinstance(elem, int):
+            in_b = check_end(elem)
+            return addr, d3, in_b, step
         if elem == "fmt":
             # a typed element is all or nothing and ends at its size (measured, gfx1150: 32_32_32_32 at off 20 of 32
             # reads 0 entirely): the size of the V#'s (or the instruction's) format
@@ -5024,6 +5134,8 @@ class Gen:
             self.dst(a[0], r)
         elif op.startswith("buffer_load_dword"):
             self.buffer_load(op, a, mods)
+        elif op in self.BUFFER_SUB:
+            self.buffer_load_sub(op, a, mods)
         elif op in ("buffer_load_format_x", "buffer_load_format_xy", "buffer_load_format_xyz",
                     "buffer_load_format_xyzw", "buffer_load_format_d16_x", "buffer_load_format_d16_xy",
                     "buffer_load_format_d16_xyz", "buffer_load_format_d16_xyzw"):

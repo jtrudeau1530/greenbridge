@@ -78,7 +78,7 @@ def check_structure(body):
 _IGNORED = frozenset({
     "OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
     "OpDecorate", "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpSelectionMerge",
-    "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
+    "OpLoopMerge", "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
 })
 
 _ATOMICS = frozenset({
@@ -544,6 +544,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     pc = fn_start.get("%main", 0)
     killed = False
     cur_label = prev_label = None
+    back_edges = 0
     while pc < len(body):
         if step:
             yield _TICK
@@ -582,8 +583,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             killed = True
             break
         if op == "OpBranch":
-            if a[0] not in labels or labels[a[0]] < pc:
-                raise UnsupportedConstruct("non-forward branch")
+            if a[0] not in labels:
+                raise UnsupportedConstruct(f"unknown branch target {a[0]}")
+            if labels[a[0]] < pc:
+                back_edges += 1
+                if back_edges > 10000:
+                    raise UnsupportedConstruct("loop iteration limit exceeded")
             pc = labels[a[0]]
             continue
         if op == "OpBranchConditional":
@@ -591,8 +596,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if not isinstance(cond, bool):
                 raise UnsupportedConstruct("OpBranchConditional with a non-bool condition")
             target = a[1] if cond else a[2]
-            if target not in labels or labels[target] < pc:
-                raise UnsupportedConstruct("non-forward branch")
+            if target not in labels:
+                raise UnsupportedConstruct(f"unknown branch target {target}")
+            if labels[target] < pc:
+                back_edges += 1
+                if back_edges > 10000:
+                    raise UnsupportedConstruct("loop iteration limit exceeded")
             pc = labels[target]
             continue
         if op == "OpPhi":
