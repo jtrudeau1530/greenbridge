@@ -8943,19 +8943,71 @@ class Gen:
             # RDNA2 ISA SOP1: D = EXEC; EXEC = f(S0, EXEC); SCC = (EXEC != 0). One invocation holds its own lane's bit
             # (0 or ~0), so f is the bitwise op on that bit, NOT included: a lane EXEC had off becomes active when f
             # gives 1 for it (nand, nor, orn2, xnor ...), as on hardware. Definitions as tools/cf_ref.py _SAVEEXEC.
+            # In wave64, the _b32 form operates strictly on EXEC_LO (lanes 0..31): EXEC_HI (lanes 32..63) is unchanged
+            # and SCC reflects EXEC_LO != 0 only.
+            kind = op[2:].split("_saveexec")[0]
             saved = self.exec_value()
-            src = self.mask_src(a[1], wide=op.endswith("b64"))
-            r = self.exec_logic(op[2:].split("_saveexec")[0], src, saved)
-            self.mask_dst(a[0], saved)
-            self.set_exec(r)
-            self.scc_from_mask(r)
+            half32 = self.wave64 and op.endswith("_b32")
+            if half32 and self.holds_lane_mask(a[1]) and self.mask_half(a[1]) == "hi":
+                _, hi_w = self.wave_mask(a[1])
+                sh, shr, bit, src = (self.tmp() for _ in range(4))
+                self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+                self.emit(f"{shr} = OpShiftRightLogical %uint {hi_w} {sh}")
+                self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+                self.emit(f"{src} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            else:
+                src = self.mask_src(a[1], wide=op.endswith("b64"))
+            r = self.exec_logic(kind, src, saved)
+            if half32:
+                if a[0]["k"] == "special" and a[0].get("t") in ("exec_hi", "vcc_hi"):
+                    lo_w, _ = self.wave_mask({"k": "special", "t": "exec"})
+                    sh, shr, bit, mapped = (self.tmp() for _ in range(4))
+                    self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+                    self.emit(f"{shr} = OpShiftRightLogical %uint {lo_w} {sh}")
+                    self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+                    self.emit(f"{mapped} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                    self.put_mask(a[0], mapped, "hi")
+                else:
+                    self.put_mask(a[0], saved, "lo")
+                self.exec_half_write(0, r)
+                self.scc_any_half(r, "lo")
+            else:
+                self.mask_dst(a[0], saved)
+                self.set_exec(r)
+                self.scc_from_mask(r)
         elif op in ("s_andn2_wrexec_b64", "s_andn2_wrexec_b32", "s_andn1_wrexec_b64", "s_andn1_wrexec_b32"):
             # RDNA ISA: andn2: EXEC = S0 & ~EXEC; andn1: EXEC = ~S0 & EXEC; then D = EXEC; SCC = (EXEC != 0).
-            x, y = self.mask_src(a[1], wide=op.endswith("b64")), self.exec_value()
-            r = self.exec_logic(op[2:].split("_wrexec")[0], x, y)
-            self.set_exec(r)
-            self.mask_dst(a[0], r)
-            self.scc_from_mask(r)
+            # In wave64, the _b32 form operates strictly on EXEC_LO (lanes 0..31).
+            kind = op[2:].split("_wrexec")[0]
+            half32 = self.wave64 and op.endswith("_b32")
+            if half32 and self.holds_lane_mask(a[1]) and self.mask_half(a[1]) == "hi":
+                _, hi_w = self.wave_mask(a[1])
+                sh, shr, bit, x = (self.tmp() for _ in range(4))
+                self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+                self.emit(f"{shr} = OpShiftRightLogical %uint {hi_w} {sh}")
+                self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+                self.emit(f"{x} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            else:
+                x = self.mask_src(a[1], wide=op.endswith("b64"))
+            y = self.exec_value()
+            r = self.exec_logic(kind, x, y)
+            if half32:
+                self.exec_half_write(0, r)
+                if a[0]["k"] == "special" and a[0].get("t") in ("exec_hi", "vcc_hi"):
+                    lo_w, _ = self.wave_mask({"k": "special", "t": "exec"})
+                    sh, shr, bit, mapped = (self.tmp() for _ in range(4))
+                    self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+                    self.emit(f"{shr} = OpShiftRightLogical %uint {lo_w} {sh}")
+                    self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+                    self.emit(f"{mapped} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                    self.put_mask(a[0], mapped, "hi")
+                else:
+                    self.put_mask(a[0], r, "lo")
+                self.scc_any_half(r, "lo")
+            else:
+                self.set_exec(r)
+                self.mask_dst(a[0], r)
+                self.scc_from_mask(r)
         elif op in ("s_bfe_u64", "s_bfe_i64"):
             # 64-bit bitfield extract: offset = S1[5:0], width = S1[22:16] (0-127). A width of 0 gives 0; a field
             # running past bit 63 stops there (LLVM constantFoldBFE: Src0 >> Offset, arithmetic for i64), so the
