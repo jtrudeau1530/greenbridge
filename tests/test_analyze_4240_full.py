@@ -88,6 +88,18 @@ class Analyze4240Test(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         self.assertNotIn("Processing", p.stdout)
 
+    def test_a_folder_input_is_one_line_and_the_run_continues(self):
+        # Before: exists() let a folder through, open() raised PermissionError, and the archives after it were lost.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        good = self.truncated_archive()
+        p = self.run_tool(folder, good)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("is not a file", p.stderr)
+        self.assertIn("carve", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("Processing " + good, p.stdout, "the next archive is still read")
+
     def test_limit_below_one_is_refused(self):
         path = self.truncated_archive()
         for bad in ("0", "-1"):

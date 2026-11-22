@@ -37,22 +37,24 @@ All 16 DLLs in the package map at their preferred base `0x180000000` with no rel
 
 | Image | Size of image | Entry RVA | Shim | Host | Module | Unimplemented |
 |---|---:|---:|---:|---:|---:|---:|
-| `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 2 | 58 | 0 | 0 |
-| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 2 | 55 | 0 | 0 |
-| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 4 | 82 | 0 | 0 |
-| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 0 | 22 | 0 | 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 0 | 198 | 0 | 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 0 | 140 | 0 | 0 |
-| `concrt140.dll` | 303,104 | `0x29160` | 0 | 103 | 0 | 0 |
-| `msvcp140.dll` | 577,536 | `0x525a0` | 0 | 187 | 0 | 0 |
-| `msvcp140_1.dll` | 36,864 | `0x15c0` | 0 | 33 | 0 | 0 |
-| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 0 | 96 | 0 | 0 |
-| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 0 | 64 | 0 | 0 |
-| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 0 | 24 | 0 | 0 |
-| `vccorlib140.dll` | 344,064 | `0x27e50` | 0 | 114 | 0 | 0 |
-| `vcomp140.dll` | 86,016 | `0x6580` | 0 | 78 | 0 | 0 |
-| `vcruntime140.dll` | 110,592 | `0xf890` | 0 | 41 | 0 | 0 |
-| `vcruntime140_1.dll` | 49,152 | `0x3e90` | 0 | 34 | 0 | 0 |
+| `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 3 | 57 | 0 | 0 |
+| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 3 | 54 | 0 | 0 |
+| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 5 | 81 | 0 | 0 |
+| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 4 | 18 | 0 | 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 7 | 191 | 0 | 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 7 | 133 | 0 | 0 |
+| `concrt140.dll` | 303,104 | `0x29160` | 1 | 102 | 0 | 0 |
+| `msvcp140.dll` | 577,536 | `0x525a0` | 5 | 182 | 0 | 0 |
+| `msvcp140_1.dll` | 36,864 | `0x15c0` | 1 | 32 | 0 | 0 |
+| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 1 | 95 | 0 | 0 |
+| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 3 | 61 | 0 | 0 |
+| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 1 | 23 | 0 | 0 |
+| `vccorlib140.dll` | 344,064 | `0x27e50` | 6 | 108 | 0 | 0 |
+| `vcomp140.dll` | 86,016 | `0x6580` | 3 | 75 | 0 | 0 |
+| `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 |
+| `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 |
+
+Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged.
 
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
@@ -94,6 +96,46 @@ functions their public reference pages show returning `void`, `bool` or `int` (f
 families are not listed. The sources are the Microsoft Learn pages for the D3D12/DXGI functions and the GDK reference
 (`gaming/gdk/docs/reference/system/<family>/functions/<name>`); `D3D12XboxCreateDevice` is matched by name from the
 measurement in `d3d12_vulkan.md`, because its page could not be found.
+
+## Run-time loaded modules
+
+Not every console module is reached through an import table. `libHttpClient.GDK.dll` and `XCurl.dll` both use the
+GDK runtime, but `dumpbin /imports` shows **no import of `xgameruntime.dll`** in either. Both carry the wide string
+`xgameruntime.dll` and the ASCII names `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`,
+`QueryApiImpl` and `UninitializeApiImpl`, next to a statically linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s
+thunks `LoadLibraryW` the runtime and `GetProcAddress` those five names at run time. xodus-gaming/xgameruntime-docs
+(GPL-3.0) documents the same mechanism for PC GDK titles: `InitializeApiImplEx2` is what
+`XGameRuntimeInitialize[WithOptions]` calls, and `QueryApiImpl` hands out the runtime's COM classes, whose methods
+mostly correspond one to one to the `xgameruntime.lib` functions. The executable is very likely linked the same way.
+
+Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
+shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`) with a
+pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
+with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
+
+`runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
+version and mode once. `QueryApiImpl` logs each class and interface id it is asked for and returns `0x80070032`, the
+documented error for a class the runtime doesn't provide. The class method layouts are not known yet, so the first
+boot with the executable lists the interfaces to implement next. `xgameruntime_test` drives this path through the
+api-set binding `XCurl.dll` uses.
+
+Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
+xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
+
+| Module | Runtime classes referenced (highest interface id present) |
+|---|---|
+| `XCurl.dll` | `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` (`IXNetworkingImpl2`) |
+| `libHttpClient.GDK.dll` | 24 of the 24 documented classes, each GUID once, the pattern of a linked id table rather than of use. Highest interfaces: `IXSystemImpl5`, `IXUserImpl5` (not 6), `IXGameImpl3`, `IXStoreImpl6`, `IXPackageImpl3` (not 4), `IXGameUiImpl4`, `IXGameSaveImpl3`, `IXGameStreamingImpl3`, `IXPersistentLocalStorageImpl3`, `IXUserDeviceImpl2`, `IXNetworkingImpl2` |
+| every other `.dll` | none |
+
+So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
+`libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
+`IXUserImpl6`. The executable's own set is still unmeasured. `QueryApiImpl`'s log gives it on the first boot.
+
+What this does not cover: a title that `LoadLibrary`s one of the package's bundled DLLs (`Bink2Scarlett.dll`,
+`XboxBvhBuilder.dll`, the FidelityFX DLLs) still gets the host loader, which loads the Xbox build without the
+registry's bindings for its own console imports (`xmem.dll`, `d3d12_xs.dll`).
 
 ## What this proves and what it does not
 

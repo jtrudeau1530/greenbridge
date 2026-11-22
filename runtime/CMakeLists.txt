@@ -94,6 +94,7 @@ if(WIN32)
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
+    shims/library_loader.cpp
     shims/process.cpp
   )
   add_dependencies(gta6rt gta6rt_tls_host)
@@ -200,6 +201,7 @@ if(WIN32)
   add_executable(xgameruntime_test
     test/xgameruntime_test.cpp
     shims/xgameruntime.cpp
+    shims/library_loader.cpp
     shims/registry.cpp
   )
   target_include_directories(xgameruntime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -750,6 +752,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_multithread_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_multithread COMMAND d3d12_multithread_test)
     set_tests_properties(d3d12_multithread PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # A queued Wait must not block a Signal submitted by another D3D12 queue.
+    add_executable(d3d12_queue_wait_test test/d3d12_queue_wait_test.cpp)
+    target_link_libraries(d3d12_queue_wait_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_queue_wait_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_queue_wait_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_queue_wait COMMAND d3d12_queue_wait_test)
+    set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
 
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
     add_executable(d3d12_gcl8_test test/d3d12_gcl8_test.cpp)
@@ -897,6 +906,8 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_rgb9e5_rtv COMMAND d3d12_clear_test --rgb9e5)
+    set_tests_properties(d3d12_rgb9e5_rtv PROPERTIES SKIP_RETURN_CODE 77)
     # Not in ctest yet: on NVIDIA it fails on the 0.5 tie rounding #521 fixes; register it once that lands.
 
     # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
@@ -1111,6 +1122,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(predicated_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME predicated_copy COMMAND predicated_copy_test)
+    # CopyResource (buffer-to-buffer) and CopyTexture (including depth24_as_float) apply ResourceBinding::buffer_offset (no GPU).
+    add_executable(replay_copy_offset_test test/replay_copy_offset_test.cpp)
+    target_link_libraries(replay_copy_offset_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_copy_offset_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_copy_offset COMMAND replay_copy_offset_test)
     add_executable(clear_color_test test/clear_color_test.cpp)
     target_link_libraries(clear_color_test PRIVATE Vulkan::Headers)
     if(WIN32)

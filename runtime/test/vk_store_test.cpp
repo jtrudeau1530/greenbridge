@@ -1,6 +1,6 @@
 // Headless Vulkan test for translated typed image stores and loads (runtime/test/shaders/cs_imgstore.asm and
 // cs_imgload.asm).
-// Usage: vk_store_test cs.spv [load]
+// Usage: vk_store_test cs.spv [load|load-d16]
 // The shader builds three T#s (word1 FORMAT = 56 rgba8 unorm, 20 r32 uint, 21 r32 sint) and stores to three 8x8
 // images. The translator picks the float / uint / sint view (set 0, bindings 8 / 9 / 10 for 2D) from the FORMAT
 // field, and the bindless index from the descriptor hash table (binding 2). As in the runtime, each image has its
@@ -11,6 +11,7 @@
 // shaderStorageImageReadWithoutFormat, and a module that declares StorageImageReadWithoutFormat fails (SHADER-151).
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
+#include "vk_shader_fma.h"
 
 #include <cmath>
 #include <cstdio>
@@ -102,7 +103,8 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     // "load" mode (cs_imgload.asm): the sint image receives the sum of the two texels read back with image_load.
-    const bool load_mode = argc > 2 && !std::strcmp(argv[2], "load");
+    const bool packed_load = argc > 2 && !std::strcmp(argv[2], "load-d16");
+    const bool load_mode = packed_load || (argc > 2 && !std::strcmp(argv[2], "load"));
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (code.size() < 20 || code.size() % 4) { std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]); return 1; }
@@ -123,8 +125,14 @@ int main(int argc, char** argv) {
     }
     f2.features.shaderInt64 = VK_TRUE;
     f2.pNext = &f12;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr)
+    fma.query(gipa, inst, pd);
+    if (!fma.accepts(code.data(), code.size(), argv[1])) return 77;
+    fma.link_after(&f2);
+    const char* fma_extension = fma.extension();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.pNext = &f2;
+    if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
@@ -256,13 +264,21 @@ int main(int argc, char** argv) {
     VkBuffer rb[3]; void* rbp[3];
     for (int k = 0; k < 3; k++) CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb[k], &rbp[k]));
     // Load mode: what the uint and sint images hold before the dispatch, texel (x, y) at i = 8y + x.
+    // The last row of the D16 fixture exercises both sides of each 16-bit boundary.
+    struct PackedLoad { uint32_t u; int32_t s, sum; };
+    constexpr PackedLoad boundary[] = {
+        {65535, 0, 65535}, {65536, 0, 65535}, {65537, 0, 65535}, {0, 32767, 32767},
+        {0, 32768, 32767}, {0, -32768, -32768}, {0, -32769, -32768}, {65536, -32769, 32767},
+    };
+    static_assert(sizeof(boundary) / sizeof(boundary[0]) == W);
     VkBuffer fill[2]{}; void* fillp[2]{};
     if (load_mode) {
         for (int j = 0; j < 2; j++)
             CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &fill[j], &fillp[j]));
         for (uint32_t i = 0; i < W * W; i++) {
-            static_cast<uint32_t*>(fillp[0])[i] = 100 + i;
-            static_cast<int32_t*>(fillp[1])[i] = -2 * int32_t(i);
+            const bool edge = packed_load && i / W == W - 1;
+            static_cast<uint32_t*>(fillp[0])[i] = edge ? boundary[i % W].u : 100 + i;
+            static_cast<int32_t*>(fillp[1])[i] = edge ? boundary[i % W].s : -2 * int32_t(i);
         }
     }
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpci.queueFamilyIndex = qi;
@@ -325,9 +341,10 @@ int main(int argc, char** argv) {
             const uint8_t* c = static_cast<const uint8_t*>(rbp[0]) + 4 * i;
             int er = int(std::lround(x / 7.0 * 255)), eg = int(std::lround(y / 7.0 * 255));
             if (std::abs(c[0] - er) > 1 || std::abs(c[1] - eg) > 1 || std::abs(c[2] - 128) > 1 || c[3] != 255) bad[0]++;
-            if (static_cast<const uint32_t*>(rbp[1])[i] != 100 + 8 * y + x) bad[1]++;
+            const bool edge = packed_load && y == W - 1;
+            if (static_cast<const uint32_t*>(rbp[1])[i] != (edge ? boundary[x].u : 100 + i)) bad[1]++;
             // load: the uint texel (100 + 8y + x) plus the sint one (-2 (8y + x)), both read with image_load
-            const int32_t want_s = load_mode ? 100 - int32_t(8 * y + x) : -int32_t(8 * y + x);
+            const int32_t want_s = edge ? boundary[x].sum : load_mode ? 100 - int32_t(i) : -int32_t(i);
             if (static_cast<const int32_t*>(rbp[2])[i] != want_s) bad[2]++;
         }
     const uint8_t* c = static_cast<const uint8_t*>(rbp[0]) + 4 * (3 * W + 5);

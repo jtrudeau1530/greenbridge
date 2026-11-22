@@ -70,6 +70,7 @@ public:
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
@@ -346,6 +347,21 @@ public:
             enable13.pNext = &host_copy;
         }
 
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+        // VK_KHR_shader_fma where the device has it: translated shaders built with --fma khr use OpFmaKHR.
+        VkPhysicalDeviceShaderFmaFeaturesKHR fma_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+        if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_SHADER_FMA_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fma_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            shader_fma = fma_features.shaderFmaFloat32 == VK_TRUE;
+            if (shader_fma) {
+                fma_features.pNext = enable13.pNext;
+                enable13.pNext = &fma_features;
+            }
+        }
+#endif
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
@@ -361,6 +377,9 @@ public:
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+        if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+#endif
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

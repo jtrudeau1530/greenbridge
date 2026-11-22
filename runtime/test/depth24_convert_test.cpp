@@ -347,6 +347,115 @@ int main() {
             }
         }
         std::printf("depth24: concurrent VulkanQueue::execute (lazy depth24 lock + parallel non-d24 prepare) ok\n");
+
+        // Suballocated arena slices (nonzero ResourceBinding::buffer_offset) in a single shared VkBuffer:
+        // CopyResource, ordinary RGBA8 CopyTexture, and depth24_as_float CopyTexture (including a non-256-aligned
+        // buffer_offset) must read/write only their own slices and leave guard sentinels untouched.
+        {
+            constexpr std::uint32_t w = 64, h = 4;
+            constexpr std::uint32_t slice_words = w * h;
+            constexpr VkDeviceSize slice_bytes = VkDeviceSize(slice_words) * 4;  // 1024 bytes
+            constexpr VkDeviceSize src_off = 512;
+            constexpr VkDeviceSize copy_off = 2048;
+            constexpr VkDeviceSize rgba_rb_off = 4096;
+            constexpr VkDeviceSize d24_rb_off = 6148;  // 4-byte aligned, non-256-aligned (exercises app_base_words != 0)
+            constexpr VkDeviceSize arena_bytes = 8192;
+            constexpr std::uint32_t guard_word = 0xA5A5A5A5u;
+            constexpr std::uint32_t poison_word = 0xCDCDCDCDu;
+
+            std::uint32_t* arena_ptr = nullptr;
+            const VkBuffer arena = gpu.buffer(arena_bytes, usage, reinterpret_cast<void**>(&arena_ptr));
+            EXPECT(arena && arena_ptr);
+            for (std::size_t i = 0; i < arena_bytes / 4; ++i) arena_ptr[i] = guard_word;
+            for (std::uint32_t i = 0; i < slice_words; ++i) {
+                arena_ptr[src_off / 4 + i] = ((i * 65521u + 17u) & depth24_max) | ((0x40u + (i & 0x3fu)) << 24);
+                arena_ptr[copy_off / 4 + i] = poison_word;
+                arena_ptr[rgba_rb_off / 4 + i] = poison_word;
+                arena_ptr[d24_rb_off / 4 + i] = poison_word;
+            }
+
+            const VkImage rgba_img = gpu.image(VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            const VkImage d24_slice_img =
+                gpu.image(VK_FORMAT_D32_SFLOAT_S8_UINT, w, h, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+            EXPECT(rgba_img != VK_NULL_HANDLE && d24_slice_img != VK_NULL_HANDLE);
+
+            constexpr ResourceId id_src = 10, id_copy = 11, id_rgba_rb = 12, id_d24_rb = 13;
+            constexpr ResourceId id_rgba_img = 14, id_d24_img = 15;
+            const auto reg_slice = [&](ResourceId id, VkDeviceSize off, bool readback) {
+                ResourceBinding b{};
+                b.buffer = arena;
+                b.buffer_offset = off;
+                b.size = slice_bytes;
+                b.host_readable = readback;
+                context.add_resource(id, b);
+            };
+            reg_slice(id_src, src_off, false);
+            reg_slice(id_copy, copy_off, true);
+            reg_slice(id_rgba_rb, rgba_rb_off, true);
+            reg_slice(id_d24_rb, d24_rb_off, true);
+
+            ResourceBinding rgba_b{};
+            rgba_b.image = rgba_img;
+            rgba_b.format = VK_FORMAT_R8G8B8A8_UNORM;
+            rgba_b.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+            rgba_b.width = w;
+            rgba_b.height = h;
+            rgba_b.mip_levels = 1;
+            rgba_b.array_layers = 1;
+            rgba_b.depth = 1;
+            rgba_b.samples = 1;
+            context.add_resource(id_rgba_img, rgba_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+            ResourceBinding d24_b{};
+            d24_b.image = d24_slice_img;
+            d24_b.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+            d24_b.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            d24_b.width = w;
+            d24_b.height = h;
+            d24_b.mip_levels = 1;
+            d24_b.array_layers = 1;
+            d24_b.depth = 1;
+            d24_b.samples = 1;
+            d24_b.depth24 = true;
+            d24_b.depth24_as_float = true;
+            context.add_resource(id_d24_img, d24_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+            CommandList slice_list;
+            EXPECT(slice_list.copy_resource({id_copy, id_src}));
+            const CopyLocation fp_src{id_src, true, 0, 0, w, h, 1, w * 4};
+            const CopyLocation fp_rgba_rb{id_rgba_rb, true, 0, 0, w, h, 1, w * 4};
+            const CopyLocation fp_d24_rb{id_d24_rb, true, 0, 0, w, h, 1, w * 4};
+            const CopyLocation loc_rgba{id_rgba_img, false, 0, 0, 0, 0, 0, 0};
+            const CopyLocation loc_d24{id_d24_img, false, 0, 0, 0, 0, 0, 0};
+            EXPECT(slice_list.copy_texture({loc_rgba, 0, 0, 0, fp_src, false, {}}));
+            EXPECT(slice_list.copy_texture({fp_rgba_rb, 0, 0, 0, loc_rgba, false, {}}));
+            EXPECT(slice_list.copy_texture({loc_d24, 0, 0, 0, fp_src, false, {}}));
+            EXPECT(slice_list.copy_texture({fp_d24_rb, 0, 0, 0, loc_d24, false, {}}));
+            EXPECT(slice_list.close());
+
+            const CommandList* ptr = &slice_list;
+            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);
+            EXPECT(queue_a.idle());
+
+            for (std::uint32_t i = 0; i < slice_words; ++i) {
+                const std::uint32_t src_word = arena_ptr[src_off / 4 + i];
+                EXPECT(arena_ptr[copy_off / 4 + i] == src_word);
+                EXPECT(arena_ptr[rgba_rb_off / 4 + i] == src_word);
+                EXPECT(arena_ptr[d24_rb_off / 4 + i] == (src_word & depth24_max));
+            }
+            const auto in_slice = [&](std::size_t word_idx) {
+                const VkDeviceSize byte_off = VkDeviceSize(word_idx) * 4;
+                const auto within_slot = [&](VkDeviceSize start) {
+                    return byte_off >= start && byte_off < start + slice_bytes;
+                };
+                return within_slot(src_off) || within_slot(copy_off) || within_slot(rgba_rb_off) ||
+                       within_slot(d24_rb_off);
+            };
+            for (std::size_t i = 0; i < arena_bytes / 4; ++i)
+                if (!in_slice(i)) EXPECT(arena_ptr[i] == guard_word);
+
+            std::printf("depth24: shared-buffer offsets (CopyResource, RGBA8 and depth24 CopyTexture) ok\n");
+        }
     }
 
     // 6. 96-bit texels (Depth24Job::rgb96, D3D-62): three words a texel in the footprint, four in the scratch, the

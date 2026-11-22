@@ -128,7 +128,7 @@ def detile(data, eq, bpe, wb, hb):
 
 def main():
     sys.path.insert(0, os.path.dirname(__file__))
-    from tile_probe import score
+    from tile_probe import check_preview_path, score
     from swizzle_search import render  # noqa: F401
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
@@ -139,6 +139,8 @@ def main():
     ap.add_argument("--modes", default="_64K_")
     ap.add_argument("--out")
     a = ap.parse_args()
+    if a.out:
+        check_preview_path(a.out, a.blob)
     nibbles, tables = load()
     with open(a.blob, "rb") as f:
         data = f.read()[a.offset:]

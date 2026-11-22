@@ -19,6 +19,7 @@ VKC_DUMP, and every word every thread stores is compared. docs/shader_validation
 Exit code: 0 when every program that ran matches (or differs only in a program with a hypothesis op), 1 on a
 mismatch or an untranslated program, 2 when the only failures are harness errors: vk_compute_test timed out or
 gave no dump for a program. Such a program is listed with the others (and kept with --keep) and the run goes on.
+A missing vk_compute_test for the translator oracle is one line and exit 1, before any program is generated.
 
 Needs LLVM_MC (llvm-mc with AMDGPU, as for the shaders stage), the Vulkan SDK and a built vk_compute_test
 (cmake --build runtime/build --target vk_compute_test). No game files.
@@ -930,6 +931,9 @@ def main():
     backends = tuple(dict.fromkeys(t.strip() for t in args.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
+    if "translator" in backends and not os.path.isfile(args.exe):   # before any program is generated or run
+        sys.exit(f"vk_compute_test not found at {args.exe} or in its RelWithDebInfo/Release folder; build it first "
+                 "(cmake --build <build dir> --target vk_compute_test) or give its path with --exe")
     oracle = None
     if "hw" in backends:
         from hw_oracle import runner

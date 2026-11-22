@@ -320,6 +320,17 @@ void* find(const std::string& dll_lower, const std::string& name) {
     return it == table().end() ? nullptr : it->second;
 }
 
+bool owns_dll(const std::string& dll_lower) {
+    static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
+                                       "vulkan-1.dll", "ntdll.dll", "user32.dll"};
+    if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
+    for (const char* h : host)
+        if (dll_lower == h) return false;
+    const std::string prefix = dll_lower + "!";
+    auto it = table().lower_bound(prefix);
+    return it != table().end() && it->first.compare(0, prefix.size(), prefix) == 0;
+}
+
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name) {
     std::lock_guard lock(g_pool_mutex);
     static std::map<std::string, void*> s_thunks;

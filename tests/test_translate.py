@@ -770,6 +770,12 @@ def _count(text, op):
     return len(re.findall(rf"= {op} ", text))
 
 
+def _gather_address_bit_offsets(text: str) -> list[int]:
+    constants = {name: int(value) for name, value in re.findall(r"(%\w+) = OpConstant %uint (\d+)", text)}
+    fields = re.findall(r"OpBitFieldUExtract %uint %\w+ (%\w+) (%\w+)", text)
+    return [constants[offset] for offset, width in fields if constants[width] == 3]
+
+
 @pytest.mark.parametrize("mx", range(4))
 @pytest.mark.parametrize("my", range(4))
 def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
@@ -781,7 +787,7 @@ def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, ma
     assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
     assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
-    assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
+    assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
 
 
 def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
@@ -824,7 +830,7 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     shader = make_shader(_gather_l(0x12, dynamic=True))
     text = shader.translate()
     shader.validate(text)
-    assert _count(text, "OpBitFieldUExtract") == 2          # CLAMP_X and CLAMP_Y
+    assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
     assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
 
 
@@ -1138,7 +1144,8 @@ def test_gather_d16_avoids_packhalf2x16(make_shader, suffix, last_addr):
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
-    assert asm2.count("OpImageFetch ") == (0 if suffix == "lz" else 4)
+    for ty in ("%v4float", "%v4uint_st", "%v4int_st"):
+        assert asm2.count(f"OpImageFetch {ty} ") == (0 if suffix == "lz" else 4)
 
 
 def _load_mini_interp():
