@@ -61,7 +61,8 @@ class Wave64EmulateTest(unittest.TestCase):
                 mock.patch.object(make_game.subprocess, "run", side_effect=fake_run) as run, \
                 mock.patch.object(make_game, "log", lambda *a: None):
             result = make_game.wave64_emulate(mode)
-        return result, run.called
+        asked_vulkaninfo = any(call.args[0] == [which] for call in run.call_args_list)
+        return result, asked_vulkaninfo
 
     def test_on_and_off_never_ask_vulkaninfo(self):
         self.assertEqual(self.decide("on", stdout=vulkaninfo_text(64)), (True, False))
@@ -213,6 +214,16 @@ class Rdna2AmdWindowsTest(unittest.TestCase):
 
     def test_rdna2_only_pc_is_unchanged(self):
         self.assertFalse(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700)[0])
+
+    def test_rdna2_guard_when_vulkaninfo_is_missing_or_unreadable(self):
+        for exe in (None, "vulkaninfo"):
+            with self.subTest(vulkaninfo=exe), \
+                    mock.patch.object(make_game.shutil, "which", return_value=exe), \
+                    mock.patch.object(make_game, "runtime_gpu_info", return_value=json.loads(self.RX6700)), \
+                    mock.patch.object(make_game.subprocess, "run", side_effect=OSError("cannot start")), \
+                    mock.patch.object(make_game, "log") as log:
+                self.assertEqual(make_game.wave64_settings("auto"), (False, False))
+                self.assertIn("#857", log.call_args.args[0])
 
     def test_explicit_on_is_taken_as_given(self):
         self.assertTrue(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700, mode="on")[0])

@@ -786,12 +786,21 @@ def smallest_max_subgroup(vulkaninfo_text: str):
 def wave64_settings(mode: str) -> tuple[bool, bool]:
     """Return whether to translate with emulation and whether to reuse emulated shaders. A wave64 compute or mesh
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
-    size, at the cost of a workgroup barrier per segment. "auto" turns it on unless every Vulkan device reports
-    maxSubgroupSize >= 64, so a PC with both a 64-wide and a 32-wide GPU, or one vulkaninfo can't read, gets the
-    output that is exact on all of them."""
+    size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA2
+    under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
+    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
     if mode == "on":
         return True, False
     if mode == "off":
+        return False, False
+    gpu = runtime_gpu_info()
+    native64 = bool(gpu["native64"]) if "native64" in gpu else None
+    if gpu.get("rdna2_amd_windows") and native64:
+        # #857: AMD's Windows compiler for RDNA2 crashes on many emulated LDS compute pipelines.
+        # The runtime probe can identify that GPU even when vulkaninfo is unavailable.
+        log(f"shaders: the runtime's GPU ({gpu.get('device', '?')}) is RDNA2 on the AMD Windows driver "
+            "and runs wave64 natively. That driver can crash on emulated wave64 code (#857), so auto uses "
+            "native wave64 and does not reuse emulated outputs (--wave64-emulate on to force emulation)")
         return False, False
     exe = shutil.which("vulkaninfo")
     size = None
@@ -805,15 +814,6 @@ def wave64_settings(mode: str) -> tuple[bool, bool]:
         log("shaders: couldn't read the GPU's subgroup size from vulkaninfo: wave64 emulation on "
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
         return True, True
-    gpu = runtime_gpu_info()
-    native64 = bool(gpu["native64"]) if "native64" in gpu else None
-    if gpu.get("rdna2_amd_windows") and native64:
-        # #857: AMD's Windows compiler for RDNA2 crashes on many emulated LDS compute pipelines. An older work
-        # folder's emulated shaders are unsafe on the same driver, even when every enumerated GPU is 64-wide.
-        log(f"shaders: smallest maximum subgroup size is {size}, but the runtime's GPU ({gpu.get('device', '?')}) "
-            "is RDNA2 on the AMD Windows driver, whose shader compiler crashes on emulated wave64 code (#857), "
-            "and runs wave64 natively: wave64 emulation off (--wave64-emulate on to force it)")
-        return False, False
     on = size < 64
     if not on and native64 is False:
         log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for both "
