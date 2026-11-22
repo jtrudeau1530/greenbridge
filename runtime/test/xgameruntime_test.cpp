@@ -182,6 +182,89 @@ void check_run_time_load() {
     void* out = reinterpret_cast<void*>(1);
     check(query(&some_class, some_class, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr,
           "QueryApiImpl refuses a class it doesn't provide yet (HRESULT 0x80070032) and clears the out pointer");
+
+    // XThreadingImpl and XErrorImpl, driven the way xgameruntime.lib's thunks in the package's DLLs do: QueryApiImpl
+    // with the class id as both ids, one vtable slot with `this` first, then Release (slot 2).
+    const GUID threading = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
+    const GUID error_cls = {0x8ca467f7, 0x22e8, 0x4096, {0x84, 0x56, 0xbb, 0x8a, 0xa1, 0x3f, 0x79, 0xd8}};
+    using Fn = void*;
+    auto slot = [](void* obj, int index) { return (*static_cast<Fn* const*>(obj))[index]; };
+    auto release = [&](void* obj) { reinterpret_cast<ULONG(STDMETHODCALLTYPE*)(void*)>(slot(obj, 2))(obj); };
+    auto get = [&](const GUID& cls) {
+        void* p = nullptr;
+        return query(&cls, cls, &p) == S_OK ? p : nullptr;
+    };
+    void* t = get(threading);
+    check(t != nullptr, "QueryApiImpl hands out XThreadingImpl for its class id");
+    if (t) {
+        void* again = get(threading);
+        check(again == t, "XThreadingImpl is one process-wide object");
+        release(again);
+        XTaskQueueHandle queue = nullptr;
+        using Create = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueDispatchMode, XTaskQueueDispatchMode,
+                                                  XTaskQueueHandle*);
+        check(reinterpret_cast<Create>(slot(t, 12))(t, XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual,
+                                                    &queue) == S_OK && queue,
+              "slot 12 is XTaskQueueCreate");
+        static std::atomic<int> s_ran{0};
+        using Submit = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, void*,
+                                                  XTaskQueueCallback*);
+        XTaskQueueCallback* cb = [](void* ctx, bool canceled) {
+            if (!canceled) static_cast<std::atomic<int>*>(ctx)->fetch_add(1);
+        };
+        check(reinterpret_cast<Submit>(slot(t, 18))(t, queue, XTaskQueuePort::Work, &s_ran, cb) == S_OK,
+              "slot 18 is XTaskQueueSubmitCallback");
+        using Dispatch = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, uint32_t);
+        check(reinterpret_cast<Dispatch>(slot(t, 16))(t, queue, XTaskQueuePort::Work, 0) && s_ran.load() == 1,
+              "slot 16 is XTaskQueueDispatch: the callback ran on the work port");
+        XTaskQueueHandle dup = nullptr;
+        using Dup = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueueHandle*);
+        check(reinterpret_cast<Dup>(slot(t, 15))(t, queue, &dup) == S_OK && dup,
+              "slot 15 is XTaskQueueDuplicateHandle");
+        using Close = void(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle);
+        reinterpret_cast<Close>(slot(t, 17))(t, dup);
+        reinterpret_cast<Close>(slot(t, 17))(t, queue);
+        using SetSensitive = HRESULT(STDMETHODCALLTYPE*)(void*, bool);
+        using IsSensitive = bool(STDMETHODCALLTYPE*)(void*);
+        check(reinterpret_cast<SetSensitive>(slot(t, 27))(t, true) == S_OK &&
+                  reinterpret_cast<IsSensitive>(slot(t, 30))(t) &&
+                  reinterpret_cast<SetSensitive>(slot(t, 27))(t, false) == S_OK &&
+                  !reinterpret_cast<IsSensitive>(slot(t, 30))(t),
+              "slots 27 and 30 set and read this thread's time-sensitive flag");
+        void* unk = nullptr;
+        const GUID iunknown = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+        using QI = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
+        check(reinterpret_cast<QI>(slot(t, 0))(t, iunknown, &unk) == S_OK && unk == t &&
+                  reinterpret_cast<QI>(slot(t, 0))(t, error_cls, &unk) == E_NOINTERFACE && !unk,
+              "QueryInterface answers IUnknown and the class id, not another class");
+        release(t);
+        release(t);
+    }
+    void* e = get(error_cls);
+    check(e != nullptr, "QueryApiImpl hands out XErrorImpl for its class id");
+    if (e) {
+        struct Seen {
+            HRESULT hr;
+            char msg[32];
+        } seen{};
+        using Callback = bool(CALLBACK*)(HRESULT, const char*, void*);
+        Callback on_error = [](HRESULT hr, const char* msg, void* ctx) {
+            auto* s = static_cast<Seen*>(ctx);
+            s->hr = hr;
+            strncpy_s(s->msg, msg ? msg : "", _TRUNCATE);
+            return true;
+        };
+        using SetCallback = void(STDMETHODCALLTYPE*)(void*, Callback, void*);
+        using Report = void(STDMETHODCALLTYPE*)(void*, HRESULT, const char*);
+        reinterpret_cast<SetCallback>(slot(e, 4))(e, on_error, &seen);
+        reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
+        check(seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
+              "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
+        using SetOptions = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);
+        check(reinterpret_cast<SetOptions>(slot(e, 5))(e, 0, 0) == S_OK, "slot 5 is XErrorSetOptions");
+        release(e);
+    }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
     HMODULE k32 = load_w(L"kernel32.dll");
