@@ -556,6 +556,28 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         self.assertEqual(entry_b["endpgm"], [0x20, 0x60])
         self.assertEqual(entry_b["tags"], ["0xd"])
 
+    def test_index_publication_never_uses_fixed_tmp_sentinel(self):
+        """The old fixed fssm_index.json.tmp staging path could truncate an unrelated user file (or a
+        hardlink to one). Index publication must use private staging and leave any pre-existing
+        .tmp sentinel untouched."""
+        fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1)}))]))
+
+        sentinel = os.path.join(self.src, "fssm_index.json.tmp")
+        with open(sentinel, "w") as f:
+            f.write("keep-me")
+
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        with open(sentinel, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep-me")
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["shader_a"])
+        self.assertEqual(sorted(os.listdir(self.src)),
+                         ["fssm", "fssm_index.json", "fssm_index.json.tmp", "shader_a.dxbc"])
+
 
 if __name__ == "__main__":
     unittest.main()
