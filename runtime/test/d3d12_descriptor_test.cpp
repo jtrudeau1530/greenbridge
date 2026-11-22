@@ -683,17 +683,17 @@ int main() {
         };
         UINT64 packed_signal = 2;
         for (const auto& format : packed_formats) {
-            D3D12_RESOURCE_DESC packed_desc = texture_desc;
-            packed_desc.Format = format.dxgi;
-            Ref<ID3D12Resource> packed;
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &packed_desc,
+            D3D12_RESOURCE_DESC format_desc = texture_desc;
+            format_desc.Format = format.dxgi;
+            Ref<ID3D12Resource> format_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &format_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                             IID_PPV_ARGS(&packed.p))));
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT packed_placed{};
+                                                             IID_PPV_ARGS(&format_texture.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT format_footprint{};
             UINT64 row_size = 0;
-            device->GetCopyableFootprints(&packed_desc, 0, 1, 49152, &packed_placed, nullptr, &row_size, nullptr);
-            EXPECT(packed_placed.Footprint.Format == format.dxgi && row_size == size * 2 &&
-                   packed_placed.Footprint.RowPitch == 256);
+            device->GetCopyableFootprints(&format_desc, 0, 1, 49152, &format_footprint, nullptr, &row_size, nullptr);
+            EXPECT(format_footprint.Footprint.Format == format.dxgi && row_size == size * 2 &&
+                   format_footprint.Footprint.RowPitch == 256);
             constexpr std::uint16_t b5_words[] = {0xfc00, 0x7c00, 0x83e1, 0xc117};
             constexpr std::array<std::uint8_t, 4> b5_rgba[] = {
                 {255, 0, 0, 255}, {255, 0, 0, 0}, {0, 255, 8, 255}, {132, 66, 189, 255}
@@ -712,20 +712,20 @@ int main() {
                         word = std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
                         rgba = {std::uint8_t(r * 17), std::uint8_t(g * 17), std::uint8_t(b * 17), std::uint8_t(a * 17)};
                     }
-                    std::memcpy(static_cast<std::uint8_t*>(mapped) + packed_placed.Offset +
-                                    y * packed_placed.Footprint.RowPitch + x * 2,
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + format_footprint.Offset +
+                                    y * format_footprint.Footprint.RowPitch + x * 2,
                                 &word, 2);
                 }
             // Set 0 takes in a view at the next ExecuteCommandLists, so it is made before the upload runs.
-            device->CreateShaderResourceView(packed.p, nullptr, view_slot(null_slot));
+            device->CreateShaderResourceView(format_texture.p, nullptr, view_slot(null_slot));
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
-            D3D12_TEXTURE_COPY_LOCATION to_packed{packed.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION to_packed{format_texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
             to_packed.SubresourceIndex = 0;
             D3D12_TEXTURE_COPY_LOCATION from_packed{upload.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
-            from_packed.PlacedFootprint = packed_placed;
+            from_packed.PlacedFootprint = format_footprint;
             list->CopyTextureRegion(&to_packed, 0, 0, 0, &from_packed, nullptr);
             const D3D12_RESOURCE_BARRIER readable =
-                transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(format_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &readable);
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
