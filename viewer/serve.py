@@ -178,9 +178,11 @@ def main():
         # The usual cause is a viewer that is still running on the port; this ended in a traceback.
         ap.error(f"can't listen on port {a.port}: {e.strerror or e}. Is a viewer already running? "
                  "--port 0 asks the OS for a free port")
-    print(f"viewer: http://127.0.0.1:{srv.server_address[1]}/  world: {Handler.world or '(none: test terrain)'}",
-          flush=True)
     try:
+        # Inside the try: a Ctrl+C that arrives once this line is out (the test sends SIGINT as soon as it reads it)
+        # must stop the viewer too, not escape between the print and serve_forever() with a traceback.
+        print(f"viewer: http://127.0.0.1:{srv.server_address[1]}/  world: {Handler.world or '(none: test terrain)'}",
+              flush=True)
         srv.serve_forever()
     except KeyboardInterrupt:      # Ctrl+C is how the viewer is stopped
         print("viewer: stopped", flush=True)
