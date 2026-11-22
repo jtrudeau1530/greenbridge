@@ -339,7 +339,8 @@ def read_payloads(directory: str, rows: list[dict] | None = None) -> list[dict]:
         size = len(data)
         parts = [data]
         j = i
-        while size < target_size and rows[j].get("size") == 65536 and j + 1 < len(rows):
+        # The header's size bounds the join, so any whole number of 64 KiB blocks may continue (as in gamedata_index).
+        while size < target_size and rows[j].get("size", 0) and rows[j]["size"] % 65536 == 0 and j + 1 < len(rows):
             nxt = _read_row(directory, rows[j + 1])
             if nxt[:4] in MAGIC or nxt.startswith((b"<?xml", b"\xef\xbb\xbf<")):
                 break

@@ -240,7 +240,10 @@ def build_rows(rows: list, source) -> list:
             group = [i]
             detail = magic_name(data)
             j = i + 1
-            while j < n and rows[j - 1]["size"] == 65536:
+            # A resource's first stream may be any whole number of 64 KiB blocks (docs/page_directory.md: 128 and
+            # 192 KiB first streams continue in the next one). Only these headed kinds take that rule: a binary,
+            # text or XML run has no header proving a continuation, so it keeps the exact 64 KiB rule below.
+            while j < n and rows[j - 1]["size"] and rows[j - 1]["size"] % 65536 == 0:
                 nxt = source.read(rows[j])
                 nk = stream_kind(nxt, rows[j])
                 if nk in ("decl", "bink2", "rbf0", "psin", "other"):
