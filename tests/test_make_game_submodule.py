@@ -1,4 +1,6 @@
 """Exercise submodule initialization with local Git repositories and a synthetic file."""
+from __future__ import annotations
+
 from functools import partial
 import os
 from pathlib import Path
@@ -18,7 +20,9 @@ class EnsureSubmoduleTest(unittest.TestCase):
     submodule = Path("third_party", "rpf9-explorer")
 
     def setUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="leonida submodule ")))
+        td = tempfile.TemporaryDirectory(prefix="leonida submodule ")
+        self.addCleanup(td.cleanup)
+        self.root = Path(td.name)
         # Restoring a patched os.environ can drop inherited empty values on Windows.
         self.git_env = os.environ.copy()
         self.git_env.pop("GIT_CONFIG_COUNT", None)

@@ -11,6 +11,7 @@ Usage:
 
 Writes <out_dir>/<name>.dxbc and <out_dir>/index.json (name, offset, stage, shader model, parts).
 """
+import argparse
 import json
 import mmap
 import os
@@ -72,8 +73,16 @@ def file_name(name: str, seen: dict, used: set) -> str:
     return fname
 
 
-def main() -> int:
-    src, out = sys.argv[1], sys.argv[2]
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Carve DXBC shader containers out of an RPF9 archive.")
+    ap.add_argument("src", help="the shaders.rpf archive")
+    ap.add_argument("out", help="folder for the .dxbc files and index.json")
+    a = ap.parse_args(argv)
+    src, out = a.src, a.out
+    if not os.path.isfile(src):
+        ap.error(f"{src} is not a file")
+    if os.path.getsize(src) == 0:
+        ap.error(f"{src} is empty")
     os.makedirs(out, exist_ok=True)
     index, seen, used, bad = [], {}, set(), 0
     with open(src, "rb") as fh:

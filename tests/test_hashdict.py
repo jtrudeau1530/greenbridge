@@ -260,11 +260,12 @@ class CarveAndExtraCLITest(unittest.TestCase):
         with open(self.extra_file, "wb") as f:
             f.write(b"widget Widget str_85_83667 str_63346_847129")
 
+        flags = ["-P"] if sys.version_info >= (3, 11) else []
         results = []
         for seed in ("1", "2"):
             # Unlike -I, -P keeps PYTHONHASHSEED while leaving the script directory off sys.path.
             result = subprocess.run(
-                [sys.executable, "-P", TOOL, self.carve_dir, "--out", self.out_json, "--extra", self.extra_file],
+                [sys.executable, *flags, TOOL, self.carve_dir, "--out", self.out_json, "--extra", self.extra_file],
                 env=dict(os.environ, PYTHONHASHSEED=seed), capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)

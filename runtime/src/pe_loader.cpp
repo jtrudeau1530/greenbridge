@@ -592,9 +592,12 @@ void Loader::bind_imports(Module& m) {
             if (!d->ImportAddressTableRVA)
                 throw std::runtime_error(m.name + ": a delay-import descriptor has no address table");
             std::string dll = read_string(m.name, m.base, m.size, d->DllNameRVA, "a delay-imported DLL name");
-            // The name table is optional: without it, entries are read back through the address table itself.
-            bind_thunks(dll, d->ImportNameTableRVA ? d->ImportNameTableRVA : d->ImportAddressTableRVA,
-                        d->ImportAddressTableRVA);
+            // Without a name table the IAT still holds delay thunks, not import names, so there is no symbol to bind
+            // eagerly. Every MSVC delay descriptor and every System32 DLL has one; reject the form instead of reading
+            // thunk addresses as name RVAs.
+            if (!d->ImportNameTableRVA)
+                throw std::runtime_error(m.name + ": a delay-import descriptor has no name table");
+            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA);
         }
     }
 }

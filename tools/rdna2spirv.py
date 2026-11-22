@@ -969,9 +969,20 @@ class Gen:
                "global_load_ubyte": (8, False), "global_load_sbyte": (8, True)}.get(op)
         n = 1 if (op.endswith("dword") or sub) else int(op.rsplit("x", 1)[1])
         data, vaddr, saddr = (a[0], a[1], a[2]) if load else (a[1], a[0], a[2])
-        inst = next((int(m.split(":")[1], 0) for m in mods if m.startswith("offset:")), 0)
-        if inst & 0x800:
-            inst -= 0x1000            # 12-bit signed offset
+        # The instruction offset is a 12-bit signed byte offset, and llvm-mc prints it signed (offset:-4 for the
+        # field 0xffc; it rejects offset:0xffc and anything outside -2048..2047), which is the only spelling the
+        # disassembler and build.py deliver. RX 6800 (gfx1030): pointer 0x1000, offset:-4 reads byte 0xffc.
+        inst = [m.split(":", 1)[1] for m in mods if m.startswith("offset:")]
+        if len(inst) > 1:
+            raise Unsupported(f"{op} offset form")
+        try:
+            inst = int(inst[0], 0) if inst else 0
+        except ValueError:
+            raise Unsupported(f"{op} offset:{inst[0]}") from None
+        if 0x800 <= inst <= 0xFFF:
+            inst -= 0x1000            # the raw 12-bit field from a tool that prints it unsigned: same offset
+        if not -0x800 <= inst <= 0x7FF:
+            raise Unsupported(f"{op} offset:{inst}")     # not a 12-bit value: don't guess an address
         if saddr["k"] == "sgpr" and saddr.get("n") == 2:
             lo, hi = self.load_reg("sgpr", saddr["r"]), self.load_reg("sgpr", saddr["r"] + 1)
             voff = self.load_reg("vgpr", vaddr["r"])
@@ -1625,6 +1636,21 @@ class Gen:
         self.uses_vote = True
         self.emit(f"{z} = OpSelect %uint {any_} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpStore %scc {z}")
+
+    def scc_logic(self, a, r):
+        """SCC of a 32-bit bitwise SOP2 (s_and/or/xor/andn2/orn2/nand/nor/xnor_b32): D != 0. In a wave32 program
+        an operation on lane masks (a source holds one, or it writes EXEC) has the whole wave's mask as D, so SCC
+        is the vote of scc_from_mask, as for the _b64 forms. Until 2026-11-22 it was this lane's bit instead:
+        `s_and_b32 s0, vcc_lo, exec_lo; s_cbranch_scc0` skipped the block in the lanes whose own bit was 0
+        although the wave runs it, and a loop closed by `s_andn2_b32 exec_lo, ...; s_cbranch_scc1` let each lane
+        leave on its last iteration, before the wave did (tools/cf_diff.py, FUZZ-8). In a wave64 program the
+        same op works on one half of a mask (lanes 0-31 or 32-63), whose SCC would be a vote of that half only;
+        that case still takes the lane's bit and is not covered by the fuzzer yet."""
+        writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
+        if not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2])):
+            self.scc_from_mask(r)
+        else:
+            self.scc_nonzero(r)
 
     SGPRS = 128                     # size of the %sgpr array without the parking slots
 
@@ -2470,6 +2496,21 @@ class Gen:
             self.emit(f"{on} = OpLogicalAnd %bool {ge} {lt}")
             self.emit(f"{m} = OpSelect %uint {on} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             self.mask_dst(a[0], m)
+        elif op in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
+            # D = {S1 half, S0 half}: the low result half comes from S0, the high one from S1; the letters name the
+            # half taken from each (l = bits 15:0, h = bits 31:16), S0 first. SCC is not written.
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            lo, hi, r = self.tmp(), self.tmp(), self.tmp()
+            if op == "s_pack_hh_b32_b16":
+                self.emit(f"{lo} = OpShiftRightLogical %uint {x} {self.cu(16)}")
+            else:
+                self.emit(f"{lo} = OpBitwiseAnd %uint {x} {self.cu(0xFFFF)}")
+            if op == "s_pack_ll_b32_b16":
+                self.emit(f"{hi} = OpShiftLeftLogical %uint {y} {self.cu(16)}")
+            else:
+                self.emit(f"{hi} = OpBitwiseAnd %uint {y} {self.cu(0xFFFF0000)}")
+            self.emit(f"{r} = OpBitwiseOr %uint {lo} {hi}")
+            self.dst(a[0], r)
         elif op == "s_bfm_b32":
             # D = ((1 << (S0 & 31)) - 1) << (S1 & 31): an ordinary scalar value
             x, y = self.src_u(a[1]), self.src_u(a[2])
@@ -2542,7 +2583,9 @@ class Gen:
             self.uses_subgroup = True
             v, ln = self.src_u(a[1]), self.src_u(a[2])
             m, r = self.tmp(), self.tmp()
-            self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63)}")
+            # RDNA2: wave64 uses S1[5:0] (mod 64); wave32 uses S1[4:0] (mod 32). Masking wave32 with 63 left
+            # lane selects 32..63 pointing past a 32-wide subgroup (SHADER-52 / FUZZ-7).
+            self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
             self.g_shuffle(r, v, m)
             self.dst(a[0], r)
         elif op == "v_writelane_b32":
@@ -2558,7 +2601,7 @@ class Gen:
                 self.emit(f"{me} = OpCopyObject %uint {self.wave_lane()}")
             else:
                 self.emit(f"{me} = OpLoad %uint %sg_lane")
-            self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63)}")
+            self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
             self.emit(f"{eq} = OpIEqual %bool {me} {m}")
             p = self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a[0]['r'])}")
@@ -2620,6 +2663,25 @@ class Gen:
             self.emit(f"{sh} = OpShiftLeftLogical %uint {self.cu(1)} {m}")
             self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', a[0]['r'])}")
             self.emit(f"{r} = OpBitwiseOr %uint {old} {sh}")
+            self.dst(a[0], r)
+        elif op in ("v_mul_hi_u32_u24", "v_mul_hi_i32_i24"):
+            # High 32 bits of the 48-bit product of the low 24 bits of each source: zero-extended for u24,
+            # sign-extended from bit 23 for i24 (RDNA2 ISA). The low 32 bits are v_mul_u32_u24 / v_mul_i32_i24.
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            signed = op == "v_mul_hi_i32_i24"
+            xs, ys, s, r = (self.tmp() for _ in range(4))
+            ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
+            self.emit(f"{xs} = {ext} %uint {x} {self.cu(0)} {self.cu(24)}")
+            self.emit(f"{ys} = {ext} %uint {y} {self.cu(0)} {self.cu(24)}")
+            if signed:
+                xi, yi, hi = self.as_int(xs), self.as_int(ys), self.tmp()
+                self.emit(f"{s} = OpSMulExtended %smul {xi} {yi}")
+                self.emit(f"{hi} = OpCompositeExtract %int {s} 1")
+                self.emit(f"{r} = OpBitcast %uint {hi}")
+                self.uses_smul = True
+            else:
+                self.emit(f"{s} = OpUMulExtended %umul {xs} {ys}")
+                self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
             self.dst(a[0], r)
         elif op in ("v_mul_i32_i24", "v_mad_i32_i24"):
             # signed 24-bit operands (sign-extended from bit 23), low 32 bits of the product (+ src2 for mad)
@@ -2732,8 +2794,9 @@ class Gen:
             self.emit(f"{nz} = OpINotEqual %bool {m} {self.cu(0)}")
             self.emit(f"{r} = OpSelect %uint {nz} {r0} {lo_}")
             self.dst(a[0], r)
-        elif op == "v_lshlrev_b64":
-            # v[d:d+1] = v[s:s+1] << (src0 & 63)
+        elif op in ("v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64"):
+            # v[d:d+1] = v[s:s+1] << / >> (src0 & 63): logical left, logical right, or arithmetic right (the sign
+            # bit 63 is copied in).
             sh, src = a[1], a[2]
             if a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
@@ -2753,7 +2816,9 @@ class Gen:
             self.emit(f"{x} = OpBitwiseOr %ulong {t} {l64}")
             self.emit(f"{m} = OpBitwiseAnd %uint {s} {self.cu(63)}")
             self.emit(f"{sh64} = OpUConvert %ulong {m}")
-            self.emit(f"{res} = OpShiftLeftLogical %ulong {x} {sh64}")
+            shop = {"v_lshlrev_b64": "OpShiftLeftLogical", "v_lshrrev_b64": "OpShiftRightLogical",
+                    "v_ashrrev_i64": "OpShiftRightArithmetic"}[op]
+            self.emit(f"{res} = {shop} %ulong {x} {sh64}")
             self.emit(f"{rlo} = OpUConvert %uint {res}")
             hs = self.tmp()
             self.emit(f"{hs} = OpShiftRightLogical %ulong {res} %c64_32")
@@ -3223,6 +3288,20 @@ class Gen:
                 r, carry = r2, cc
             self.dst(a[0], r)
             self.emit(f"OpStore %scc {carry}")
+        elif op in ("s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32"):
+            # D = (S0 << N) + S1. SCC = unsigned overflow of the sum taken in 64 bits (RDNA ISA pseudocode:
+            # tmp = (64'U(S0) << N) + 64'U(S1); SCC = tmp >= 2^32), so bits shifted out of S0 count as a carry too.
+            n = int(op[6])
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            sh, out, s, r, c, ovf = (self.tmp() for _ in range(6))
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {x} {self.cu(n)}")
+            self.emit(f"{out} = OpShiftRightLogical %uint {x} {self.cu(32 - n)}")
+            self.emit(f"{s} = OpIAddCarry %umul {sh} {y}")
+            self.emit(f"{r} = OpCompositeExtract %uint {s} 0")
+            self.emit(f"{c} = OpCompositeExtract %uint {s} 1")
+            self.emit(f"{ovf} = OpBitwiseOr %uint {out} {c}")
+            self.dst(a[0], r)
+            self.scc_nonzero(ovf)
         elif op == "s_getpc_b64":
             # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
@@ -3272,7 +3351,7 @@ class Gen:
             # SCC (RDNA ISA): bitwise ops -> result != 0; s_add/sub_i32 -> signed overflow;
             # s_min_u32 -> S0 < S1, s_max_u32 -> S0 > S1; s_cselect leaves SCC.
             if op in ("s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
-                self.scc_nonzero(r)
+                self.scc_logic(a, r)
             elif op in ("s_add_i32", "s_sub_i32"):
                 self.scc_add_overflow(x, y, r, sub=op == "s_sub_i32")
             elif op in ("s_min_u32", "s_max_u32"):
@@ -3485,6 +3564,25 @@ class Gen:
             self.emit(f"{s} = OpUMulExtended %umul {x} {y}")
             self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
             self.dst(a[0], r)
+        elif op == "s_mul_hi_i32":
+            # High 32 bits of the signed 64-bit product; SCC is not written.
+            x, y = self.as_int(self.src_u(a[1])), self.as_int(self.src_u(a[2]))
+            s, hi, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{s} = OpSMulExtended %smul {x} {y}")
+            self.emit(f"{hi} = OpCompositeExtract %int {s} 1")
+            self.emit(f"{r} = OpBitcast %uint {hi}")
+            self.uses_smul = True
+            self.dst(a[0], r)
+        elif op == "s_absdiff_i32":
+            # RDNA2 ISA: D = S0 - S1 as a 32-bit signed value, negated if negative; SCC = (D != 0). The difference
+            # wraps before the absolute value (0x7FFFFFFF - 0x80000000 = -1 -> 1), and SAbs keeps 0x80000000 as is.
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            d, ab, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{d} = OpISub %uint {x} {y}")
+            self.emit(f"{ab} = OpExtInst %int %glsl SAbs {self.as_int(d)}")
+            self.emit(f"{r} = OpBitcast %uint {ab}")
+            self.dst(a[0], r)
+            self.scc_nonzero(r)
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
             sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
             selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
@@ -3654,7 +3752,9 @@ class Gen:
                     y = m
                 self.emit(f"{r} = {kind} %uint {x} {y}")
             self.dst(a[0], r)
-            if op in ("s_and_b32", "s_or_b32", "s_lshl_b32", "s_lshr_b32"):
+            if op in ("s_and_b32", "s_or_b32"):
+                self.scc_logic(a, r)
+            elif op in ("s_lshl_b32", "s_lshr_b32"):
                 self.scc_nonzero(r)
         elif op in SHIFT_REV:
             sh, x = self.src_u(a[1]), self.src_u(a[2])

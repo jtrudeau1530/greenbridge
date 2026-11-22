@@ -4,6 +4,7 @@ Usage:
     python -I rpf_probe.py <game_dir> [--out FILE]
 
 Reads the first 64 KiB of each archive only. It doesn't decrypt or extract anything.
+A directory scan or archive read error stops the survey before it writes the report.
 """
 import argparse
 import json
