@@ -261,7 +261,7 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
     vperm_sext_shaders = vperm_sext_insns = 0
     vperm_classes = {"0_7": 0, "8_11": 0, "12": 0, "13_plus": 0}
     files = 0
-    for fn in os.listdir(disasm_dir):
+    for fn in sorted(os.listdir(disasm_dir)):
         if not fn.endswith(".s"):
             continue
         files += 1
