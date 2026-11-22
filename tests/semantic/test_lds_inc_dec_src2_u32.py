@@ -32,6 +32,8 @@ Architecture & Specification:
   - Non-returning: Vector general-purpose registers (VGPRs) are not modified.
 """
 
+from dataclasses import dataclass
+from enum import Enum
 import sys
 import unittest
 
@@ -116,6 +118,77 @@ def calc_lds_src2_addresses(
     return byte_addr_a, byte_addr_b, dword_idx_a, dword_idx_b
 
 
+# ==============================================================================
+# Symbolic AST Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Supported DS src2 family opcodes."""
+    DS_INC_SRC2_U32 = "ds_inc_src2_u32"
+    DS_DEC_SRC2_U32 = "ds_dec_src2_u32"
+    DS_ADD_SRC2_U32 = "ds_add_src2_u32"
+    DS_SUB_SRC2_U32 = "ds_sub_src2_u32"
+
+
+class RegType(Enum):
+    """Register file class."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_VGPRS):
+            raise ValueError(
+                f"Register index out of bounds: {self.reg_type.value}{self.index} "
+                f"(expected 0 <= index < {DEFAULT_NUM_VGPRS})"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class LDSAddressExpression:
+    """Symbolic representation of LDS address with dual offset descriptors."""
+    base_reg: RegisterOperand
+    offset0: int = 0
+    offset1: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset0 <= 0xFF):
+            raise ValueError(f"offset0 out of 8-bit range: {self.offset0}")
+        if not (0 <= self.offset1 <= 0xFF):
+            raise ValueError(f"offset1 out of 8-bit range: {self.offset1}")
+        if self.base_reg.reg_type != RegType.VGPR:
+            raise TypeError("LDS base address register must be a VGPR")
+
+
+@dataclass(frozen=True)
+class DSSrc2Instruction:
+    """Symbolic AST node for DS src2 atomic instruction."""
+    opcode: DSOpcode
+    addr: LDSAddressExpression
+
+    def disasm(self) -> str:
+        """Format canonical assembly mnemonic and operand string."""
+        parts = [self.opcode.value, self.addr.base_reg.name]
+        if self.addr.offset0 != 0:
+            parts.append(f"offset0:{self.addr.offset0}")
+        if self.addr.offset1 != 0:
+            parts.append(f"offset1:{self.addr.offset1}")
+        if self.addr.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+
 class TestReferenceModelAndOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and architectural model."""
 
@@ -197,6 +270,69 @@ class TestReferenceModelAndOracle(unittest.TestCase):
         self.assertEqual(ref_ds_add_src2_u32(4, 4), 8)
         # sub: 4 - 4 = 0
         self.assertEqual(ref_ds_sub_src2_u32(4, 4), 0)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_enumeration(self) -> None:
+        self.assertEqual(DSOpcode.DS_INC_SRC2_U32.value, "ds_inc_src2_u32")
+        self.assertEqual(DSOpcode.DS_DEC_SRC2_U32.value, "ds_dec_src2_u32")
+        self.assertEqual(DSOpcode.DS_ADD_SRC2_U32.value, "ds_add_src2_u32")
+        self.assertEqual(DSOpcode.DS_SUB_SRC2_U32.value, "ds_sub_src2_u32")
+
+    def test_register_operand_validation_and_naming(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        self.assertEqual(v0.name, "v0")
+        v255 = RegisterOperand(255, RegType.VGPR)
+        self.assertEqual(v255.name, "v255")
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+    def test_address_expression_validation(self) -> None:
+        v5 = RegisterOperand(5, RegType.VGPR)
+        addr = LDSAddressExpression(base_reg=v5, offset0=10, offset1=20)
+        self.assertEqual(addr.base_reg.name, "v5")
+        self.assertEqual(addr.offset0, 10)
+        self.assertEqual(addr.offset1, 20)
+
+        # Invalid offsets
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v5, offset0=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v5, offset0=256)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v5, offset1=300)
+
+        # Base register must be VGPR
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(TypeError):
+            LDSAddressExpression(base_reg=s0)
+
+    def test_disasm_formatting(self) -> None:
+        v2 = RegisterOperand(2, RegType.VGPR)
+        addr = LDSAddressExpression(base_reg=v2, offset0=4, offset1=8)
+        instr_inc = DSSrc2Instruction(DSOpcode.DS_INC_SRC2_U32, addr)
+        self.assertEqual(instr_inc.disasm(), "ds_inc_src2_u32 v2 offset0:4 offset1:8")
+
+        addr_no_offset = LDSAddressExpression(base_reg=v2, offset0=0, offset1=0)
+        instr_dec = DSSrc2Instruction(DSOpcode.DS_DEC_SRC2_U32, addr_no_offset)
+        self.assertEqual(instr_dec.disasm(), "ds_dec_src2_u32 v2")
+
+        addr_gds = LDSAddressExpression(base_reg=v2, offset0=1, offset1=2, gds=True)
+        instr_add = DSSrc2Instruction(DSOpcode.DS_ADD_SRC2_U32, addr_gds)
+        self.assertEqual(instr_add.disasm(), "ds_add_src2_u32 v2 offset0:1 offset1:2 gds")
+
+    def test_ast_immutability_and_equality(self) -> None:
+        v1 = RegisterOperand(1, RegType.VGPR)
+        addr1 = LDSAddressExpression(base_reg=v1, offset0=2, offset1=3)
+        addr2 = LDSAddressExpression(base_reg=v1, offset0=2, offset1=3)
+        instr1 = DSSrc2Instruction(DSOpcode.DS_SUB_SRC2_U32, addr1)
+        instr2 = DSSrc2Instruction(DSOpcode.DS_SUB_SRC2_U32, addr2)
+        self.assertEqual(instr1, instr2)
 
 
 if __name__ == "__main__":
