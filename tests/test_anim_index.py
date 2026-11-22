@@ -397,6 +397,17 @@ class RigArchiveTest(unittest.TestCase):
         self.assertEqual(r["summary"]["rigsets"], 3)
         self.assertEqual(r["summary"]["entries"], 3)
 
+    def test_cli_rejects_a_shared_rig_destination(self):
+        out = os.path.join(self.root, "index.json")
+        alias = os.path.join(self.root, ".", "index.json")
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.rpf, out, "--rigs", alias, "--quiet"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("index and --rigs must use different paths", result.stderr)
+        self.assertFalse(os.path.exists(out))
+
     def test_cli_rigs(self):
         out = os.path.join(self.root, "index.json")
         rigs = os.path.join(self.root, "rigs.json")

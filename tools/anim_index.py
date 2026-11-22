@@ -476,6 +476,15 @@ def byte_count(text):
     return value
 
 
+def same_report_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
@@ -485,6 +494,8 @@ def main():
     ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if a.rigs and same_report_path(a.out, a.rigs):
+        ap.error("index and --rigs must use different paths")
     try:
         if os.path.isdir(a.source):
             if a.start is not None or a.limit is not None:
