@@ -155,7 +155,9 @@ def step(state, ins):
             # VGPR (SHADER-21 part 2). Only per-lane mask computations take the all-lanes store,
             # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
             return op != "v_mov_b32"
-    if "_saveexec_b" in op or "_wrexec_b" in op or op == "s_bfm_b64":
+    if "_saveexec_b" in op or "_wrexec_b" in op:
+        put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
+    elif op == "s_bfm_b64":
         put(state, a[0], MASK)
     elif op.startswith(COPIES) and len(a) > 1:
         k = kind(state, a[1])
