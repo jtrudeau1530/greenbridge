@@ -1073,5 +1073,129 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
                 self.assertEqual(state.get_vgpr(lane, 2), POS_ZERO)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_f16x2(ONE_F16, TWO_F16))
+        state.set_vgpr(1, pack_f16x2(THREE_F16, FOUR_F16))
+        instr = VDot2F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(res), 11.0)
+        self.assertEqual(state.get_vgpr(0), res)
+        # src1 must be preserved intact
+        self.assertEqual(state.get_vgpr(1), pack_f16x2(THREE_F16, FOUR_F16))
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_f16x2(ONE_F16, TWO_F16))
+        state.set_vgpr(1, pack_f16x2(THREE_F16, FOUR_F16))
+        instr = VDot2F16Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(res), 11.0)
+        self.assertEqual(state.get_vgpr(1), res)
+        # src0 must be preserved intact
+        self.assertEqual(state.get_vgpr(0), pack_f16x2(ONE_F16, TWO_F16))
+
+    def test_dst_alias_src2_accumulator(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_f16x2(ONE_F16, TWO_F16))
+        state.set_vgpr(1, pack_f16x2(TWO_F16, ONE_F16))
+        state.set_vgpr(2, FIVE_F16)
+        instr = VDot2AccF16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        # 1*2 + 2*1 + 5 = 9.0
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(res), 9.0)
+        self.assertEqual(state.get_vgpr(2), res)
+        self.assertEqual(state.get_vgpr(0), pack_f16x2(ONE_F16, TWO_F16))
+        self.assertEqual(state.get_vgpr(1), pack_f16x2(TWO_F16, ONE_F16))
+
+    def test_dst_alias_all_sources(self) -> None:
+        state = ScalarMachineState()
+        # [1.0, 1.0] -> 1*1 + 1*1 + 1 = 3.0 (with low 16 bits = 1.0 treated as acc)
+        state.set_vgpr(0, pack_f16x2(ONE_F16, ONE_F16))
+        instr = VDot2AccF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            src2=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(res), 3.0)
+        self.assertEqual(state.get_vgpr(0), res)
+
+    def test_inplace_iterative_dot2acc_accumulation(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_f16x2(HALF_F16, HALF_F16))
+        state.set_vgpr(1, pack_f16x2(ONE_F16, ONE_F16))
+        state.set_vgpr(2, POS_ZERO)
+        # each step adds 0.5*1.0 + 0.5*1.0 = 1.0 into v2
+        instr = VDot2AccF16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        for _ in range(50):
+            self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f16(state.get_vgpr(2)), 50.0)
+
+    def test_simd_multi_lane_register_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, pack_f16x2(ONE_F16, ONE_F16))
+            state.set_vgpr(lane, 1, pack_f16x2(TWO_F16, TWO_F16))
+            state.set_vgpr(lane, 2, f16_to_bits(float(lane)))
+
+        instr = VDot2AccF16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            # 1*2 + 1*2 + lane = 4.0 + lane
+            self.assertEqual(bits_to_f16(state.get_vgpr(lane, 2)), 4.0 + float(lane))
+
+    def test_independent_register_preservation(self) -> None:
+        state = ScalarMachineState()
+        for i in range(256):
+            state.set_vgpr(i, 0xA5A5_0000 | i)
+            state.set_sgpr(i, 0x5A5A_0000 | i)
+
+        state.set_vgpr(10, pack_f16x2(ONE_F16, TWO_F16))
+        state.set_vgpr(11, pack_f16x2(THREE_F16, FOUR_F16))
+        instr = VDot2F16Instruction(
+            dst=Reg(12, RegType.VGPR),
+            src0=VOP3Operand(Reg(10, RegType.VGPR)),
+            src1=VOP3Operand(Reg(11, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+
+        for i in range(256):
+            if i not in (10, 11, 12):
+                self.assertEqual(state.get_vgpr(i), 0xA5A5_0000 | i)
+            self.assertEqual(state.get_sgpr(i), 0x5A5A_0000 | i)
+
+
 if __name__ == "__main__":
     unittest.main()
