@@ -112,6 +112,33 @@ texture-creation method at 76 where the PC interface has `CreateStateObject`/som
 by that work.** They are the four calls a game must make before it can have a queue, allocator,
 list or fence, so they are the first thing a trace must confirm.
 
+**They cannot be measured from the package either (D3D-350).** The package ships no D3D12 runtime:
+the 16 DLLs in [`game/xbox-1.0.2.1.json`](../game/xbox-1.0.2.1.json) do not include
+`d3d12_xs.dll`, which is part of the console OS, and the device clients that are shipped never call
+these four slots. Measured on 1.0.2.1 (counts only):
+
+| Image | `ID3D12*` IIDs it contains | Imports from `d3d12_xs.dll` | Calls at `0x40`/`0x48`/`0x60`/`0x120` on the device |
+|---|---|---|---|
+| `XboxBvhBuilder.dll` | `PipelineState`, `RootSignature` | `D3D12SerializeVersionedRootSignature` | none: no indirect call at any of the four offsets |
+| `amd_fidelityfx_upscaler_xbox.dll` | `CommandSignature`, `DescriptorHeap`, `Device`, `Heap`, `PipelineState`, `Resource`, `RootSignature`, `RootSignatureDeserializer` | `D3D12CreateRootSignatureDeserializer` | none: the 3 calls at `0x40` are `ID3D12Resource::Map` on a resource it has just created, the 29 at `0x48` are `Close`/`Unmap`-shaped calls with no `(type, &IID, &out)` arguments, the 4 at `0x60` are a function-pointer field in a plain struct (no vtable load), and there are none at `0x120` |
+| `amd_fidelityfx_loader_xbox.dll`, `Bink2Scarlett.dll` | none | none | — |
+
+Neither image contains the IID of `ID3D12CommandQueue`, `ID3D12CommandAllocator`,
+`ID3D12CommandList`, `ID3D12GraphicsCommandList`, `ID3D12Fence` or `ID3D12Fence1`, and neither
+can take one from `d3d12_xs.dll`: each imports one function there and no GUID data (ordinals
+23–115). A creator called through `IID_PPV_ARGS` needs that IID, so these clients do not create
+queues, allocators, lists or fences; they record into lists the game gives them. The interfaces
+that *are* present are the positive control: they are what each client is known to create
+(compute PSOs through slot 62, root signatures, descriptor heaps, and resources through slots 27
+and 76). The IID column is reproduced by `python -I tools/d3d12_iid_scan.py <package>/*.dll`
+(`tests/test_d3d12_iid_scan.py`); the call-site column comes from `dumpbin /disasm` listings,
+following each `0x40`/`0x48`/`0x60`/`0x120` call back to its receiver.
+
+So the four slots' callers are in the game executable, which the package does not contain (the
+same blocker as RT-5). Confidence for slots 8, 9, 12 and 36 stays **Open**: the table in §2.1 is
+still the SDK baseline. Once the executable is available, `tools/d3d12_iid_scan.py` run on it
+shows whether it carries these IIDs, and its call sites through them give the slots.
+
 ### 2.2 Queue, allocator and fence
 
 `ID3D12CommandQueue` is declared at `d3d12.h:8701`. It has 19 slots (0–18); its own methods start
