@@ -212,6 +212,25 @@ class FmaMixF16Tests(unittest.TestCase):
         got = run("v_fma_mixhi_f16 v0, v0, v1, v2 op_sel:[0,0,0] op_sel_hi:[1,0,1]", f2u(2.0), pack_h(0.5, 9.0), 0, old=old)
         self.assertEqual(got, pack_h(1.5, 3.5))
 
+    def test_single_rounding_discriminating_cases(self):
+        # Discriminating test cases A through G from tools/fma_mix_probe.py where
+        # hardware single rounding gives 1 ulp difference from double rounding.
+        # Case A: 1 * 2^-40 + (1 + 2^-11) -> single: 0x3c01, double: 0x3c00
+        got_a = run("v_fma_mixlo_f16 v0, v1, v2, v3", 0x3F800000, 0x2B800000, 0x3F801000, old=OLD)
+        self.assertEqual(got_a, (OLD & 0xFFFF0000) | 0x3C01)
+
+        # Case B: 1 * -2^-40 + (1 + 3 * 2^-11) -> single: 0x3c01, double: 0x3c02
+        got_b = run("v_fma_mixhi_f16 v0, v1, v2, v3", 0x3F800000, 0xAB800000, 0x3F803000, old=OLD)
+        self.assertEqual(got_b, (0x3C01 << 16) | (OLD & 0xFFFF))
+
+        # Case C: -1 * 2^-40 - (1 + 2^-11) -> single: 0xbc01, double: 0xbc00
+        got_c = run("v_fma_mixlo_f16 v0, v1, v2, v3", 0xBF800000, 0x2B800000, 0xBF801000, old=OLD)
+        self.assertEqual(got_c, (OLD & 0xFFFF0000) | 0xBC01)
+
+        # Case G (f16 operands): (1 + 2^-7) * (2^-11 - 2^-18) + (1 + 2^-10) -> single: 0x3c01, double: 0x3c02
+        got_g = run("v_fma_mixlo_f16 v0, v1, v2, v3 op_sel_hi:[1,1,1]", 0x3C08, 0x0FF0, 0x3C01, old=OLD)
+        self.assertEqual(got_g, (OLD & 0xFFFF0000) | 0x3C01)
+
 
 class NegativeControls(unittest.TestCase):
     """Sabotaging the translated SPIR-V must change the observed output."""

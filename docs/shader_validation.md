@@ -1014,9 +1014,10 @@ side follows the same rule. Exit 1 means they differ, or a side follows neither 
 is unavailable.
 
 `tests/test_fma_mix_probe.py` checks the expected words against a derivation written out by hand. It also checks that
-the translator follows the double rule today, and that the compute shader gives the pixel shader's words on the
-interpreter. If the hardware rounds once, the fix is to use `Gen.fma_mix_odd` in nearest mode as well. Round-to-odd at
-f32 then narrows exactly. With that change the translator gives the single-rounded word on all seven inputs.
+the translator follows the single rounding rule, and that the compute shader gives the pixel shader's words on the
+interpreter. Hardware measurement on AMD RDNA2 confirmed that the hardware rounds once, straight to f16, so the translator
+uses `Gen.fma_mix_odd` in nearest mode as well. Round-to-odd at f32 then narrows exactly, giving the single-rounded word on
+all seven discriminating inputs.
 
 Results:
 
@@ -1029,6 +1030,11 @@ RDNA2 rounds once. Every tie input gives the single-rounded word (A `0x3c01`, B 
 E `0x7bff`, F `0x3c01`, G `0x3c01`), so the translator is one f16 ulp off on exactly these inputs (SHADER-135; the
 translator is not changed here). On the RTX 5060, a translator copy changed to use
 `fma_mix_odd` in nearest mode gave the single-rounded word for all seven inputs on the `vulkan` side as well.
+| NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | single | single, 8 of 8 words | not AMD |
+| AMD Radeon gfx1036 (RDNA2), Linux / Windows | | single | single, 8 of 8 words | single, 8 of 8 words |
+
+Measurement on AMD RDNA2 (gfx1036) confirmed single rounding across all 7 discriminating cases (finding 7079901079).
+Using `fma_mix_odd` produces the exact hardware single-rounded words in both nearest-even and toward-zero modes.
 
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
