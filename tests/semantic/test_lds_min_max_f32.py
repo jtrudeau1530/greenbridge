@@ -728,5 +728,197 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(0), f32_to_bits(7.0))
 
 
+class SIMDWaveState:
+    """Architectural wavefront execution state for 32 or 64 lanes."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: int = 0xFFFFFFFF, lds: Optional[LDSMemory] = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wavefront size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = exec_mask & ((1 << wave_size) - 1)
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def is_lane_active(self, lane: int) -> bool:
+        """Return True if the given lane is enabled in the current EXEC mask."""
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg: VGPR) -> int:
+        """Read 32-bit VGPR for a specific lane."""
+        return self.vgprs[lane][reg.index] & MASK32
+
+    def set_vgpr(self, lane: int, reg: VGPR, val: int) -> None:
+        """Write 32-bit VGPR for a specific lane."""
+        self.vgprs[lane][reg.index] = val & MASK32
+
+
+class SIMDDSInterpreter:
+    """Multi-lane SIMD instruction interpreter modeling RDNA2 lockstep execution and LDS atomics."""
+
+    def execute(self, state: SIMDWaveState, inst: DSMinMaxInstruction) -> Dict[int, int]:
+        """Execute DS min/max instruction across all active lanes of the wave.
+        
+        Returns a dict mapping {active_lane: return_val} for returning opcodes.
+        """
+        # Step 1: Latch inputs for all active lanes
+        active_lanes = [lane for lane in range(state.wave_size) if state.is_lane_active(lane)]
+        latched_inputs = [
+            (lane, state.get_vgpr(lane, inst.vaddr), state.get_vgpr(lane, inst.vdata))
+            for lane in active_lanes
+        ]
+
+        returns: Dict[int, int] = {}
+
+        # Step 2: Concurrently execute atomic operations across active lanes
+        for lane, addr, data in latched_inputs:
+            if inst.opcode.is_min:
+                old_val = state.lds.atomic_min_f32(addr, data, offset=inst.offset.value)
+            elif inst.opcode.is_max:
+                old_val = state.lds.atomic_max_f32(addr, data, offset=inst.offset.value)
+            else:
+                raise ValueError(f"Unsupported opcode: {inst.opcode}")
+
+            if inst.opcode.is_return:
+                assert inst.vdst is not None
+                state.set_vgpr(lane, inst.vdst, old_val)
+                returns[lane] = old_val
+
+        return returns
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD lockstep execution, 32/64-bit EXEC masking, and address convergence."""
+
+    def test_wave32_full_mask_divergent_addresses(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        # Initialize LDS dwords 0..31 with 100.0
+        for i in range(32):
+            lds.write_dword(i, f32_to_bits(100.0))
+
+        # Lane i targets dword i with float value (i * 2.0)
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), lane * 4)  # vaddr
+            wave.set_vgpr(lane, VGPR(2), f32_to_bits(float(lane * 2)))  # vdata
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_F32, vaddr=VGPR(1), vdata=VGPR(2))
+        interp.execute(wave, inst)
+
+        # Each dword i should have min(100.0, i * 2.0)
+        for i in range(32):
+            expected = f32_to_bits(float(i * 2))
+            self.assertEqual(lds.read_dword(i), expected)
+
+    def test_wave64_full_mask_divergent_addresses(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=64, exec_mask=0xFFFFFFFFFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        # Initialize LDS dwords 0..63 with -50.0
+        for i in range(64):
+            lds.write_dword(i, f32_to_bits(-50.0))
+
+        for lane in range(64):
+            wave.set_vgpr(lane, VGPR(1), lane * 4)
+            wave.set_vgpr(lane, VGPR(2), f32_to_bits(float(lane)))
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MAX_F32, vaddr=VGPR(1), vdata=VGPR(2))
+        interp.execute(wave, inst)
+
+        for i in range(64):
+            expected = f32_to_bits(float(i))
+            self.assertEqual(lds.read_dword(i), expected)
+
+    def test_wave32_partial_exec_masking(self) -> None:
+        lds = LDSMemory(65536)
+        # Even lanes only: 0x55555555
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x55555555, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        # Initialize LDS dwords 0..31 with 50.0
+        for i in range(32):
+            lds.write_dword(i, f32_to_bits(50.0))
+
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), lane * 4)
+            wave.set_vgpr(lane, VGPR(2), f32_to_bits(10.0))
+            wave.set_vgpr(lane, VGPR(0), 0xCAFEBABE)  # destination sentinel
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(0))
+        returns = interp.execute(wave, inst)
+
+        # Exactly 16 active lanes returned
+        self.assertEqual(len(returns), 16)
+        for lane in range(32):
+            if lane % 2 == 0:
+                # Active lane: LDS updated to 10.0, vdst received previous 50.0
+                self.assertEqual(lds.read_dword(lane), f32_to_bits(10.0))
+                self.assertEqual(wave.get_vgpr(lane, VGPR(0)), f32_to_bits(50.0))
+                self.assertIn(lane, returns)
+            else:
+                # Inactive lane: LDS untouched at 50.0, vdst untouched at sentinel
+                self.assertEqual(lds.read_dword(lane), f32_to_bits(50.0))
+                self.assertEqual(wave.get_vgpr(lane, VGPR(0)), 0xCAFEBABE)
+                self.assertNotIn(lane, returns)
+
+    def test_zero_exec_mask_no_mutation(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        lds.write_dword(0, f32_to_bits(42.0))
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), 0)
+            wave.set_vgpr(lane, VGPR(2), f32_to_bits(1.0))
+            wave.set_vgpr(lane, VGPR(3), 0x12345678)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(3))
+        returns = interp.execute(wave, inst)
+
+        self.assertEqual(len(returns), 0)
+        self.assertEqual(lds.read_dword(0), f32_to_bits(42.0))
+        for lane in range(32):
+            self.assertEqual(wave.get_vgpr(lane, VGPR(3)), 0x12345678)
+
+    def test_convergent_collision_all_lanes_single_dword(self) -> None:
+        # All 32 active lanes write to dword 4 with various float values
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        # Initial LDS value 100.0
+        lds.write_dword(4, f32_to_bits(100.0))
+
+        # Lane values: 32.0, 31.0, ..., 1.0 (Lane 31 writes 1.0)
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), 16)  # dword 4
+            wave.set_vgpr(lane, VGPR(2), f32_to_bits(float(32 - lane)))
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_F32, vaddr=VGPR(1), vdata=VGPR(2))
+        interp.execute(wave, inst)
+
+        # LDS at dword 4 must converge to global minimum: 1.0
+        self.assertEqual(lds.read_dword(4), f32_to_bits(1.0))
+
+    def test_convergent_collision_max_f32_all_lanes(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        # Initial LDS value -10.0
+        lds.write_dword(7, f32_to_bits(-10.0))
+
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), 28)  # dword 7
+            wave.set_vgpr(lane, VGPR(2), f32_to_bits(float(lane * 5)))  # max is lane 31 (155.0)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MAX_F32, vaddr=VGPR(1), vdata=VGPR(2))
+        interp.execute(wave, inst)
+
+        self.assertEqual(lds.read_dword(7), f32_to_bits(155.0))
+
+
 if __name__ == "__main__":
     unittest.main()
