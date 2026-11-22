@@ -431,6 +431,91 @@ class VDot2AccF16Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single execution thread."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_dot2_f16 family."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(
+        self,
+        instr: Union[VDot2F16Instruction, VDot2AccF16Instruction],
+        state: ScalarMachineState,
+    ) -> int:
+        # Atomic read phase
+        s0_raw = self.resolve_operand(instr.src0, state)
+        s1_raw = self.resolve_operand(instr.src1, state)
+
+        # Computation phase
+        if isinstance(instr, VDot2F16Instruction):
+            res_bits = oracle_v_dot2_f16(
+                src0_bits=s0_raw,
+                src1_bits=s1_raw,
+                abs0=(instr.src0.abs_lo, instr.src0.abs_hi),
+                neg0=(instr.src0.neg_lo, instr.src0.neg_hi),
+                abs1=(instr.src1.abs_lo, instr.src1.abs_hi),
+                neg1=(instr.src1.neg_lo, instr.src1.neg_hi),
+                op_sel=instr.op_sel,
+                op_sel_hi=instr.op_sel_hi,
+                clamp=instr.clamp,
+            )
+        elif isinstance(instr, VDot2AccF16Instruction):
+            s2_raw = self.resolve_operand(instr.src2, state)
+            res_bits = oracle_v_dot2acc_f16(
+                src0_bits=s0_raw,
+                src1_bits=s1_raw,
+                src2_acc_bits=s2_raw,
+                abs0=(instr.src0.abs_lo, instr.src0.abs_hi),
+                neg0=(instr.src0.neg_lo, instr.src0.neg_hi),
+                abs1=(instr.src1.abs_lo, instr.src1.abs_hi),
+                neg1=(instr.src1.neg_lo, instr.src1.neg_hi),
+                abs2=instr.src2.abs_lo,
+                neg2=instr.src2.neg_lo,
+                op_sel=instr.op_sel,
+                op_sel_hi=instr.op_sel_hi,
+                clamp=instr.clamp,
+            )
+        else:
+            raise TypeError(f"Unsupported instruction type: {type(instr)}")
+
+        # Write-back phase: write 16-bit scalar result into lower 16 bits of VGPR
+        state.set_vgpr(instr.dst.index, res_bits)
+        return res_bits
+
+
+# ==============================================================================
 # Unit Tests: Architectural Model and Reference Oracle
 # ==============================================================================
 
@@ -632,6 +717,107 @@ class TestASTOpcodeDefinitions(unittest.TestCase):
                 src1=VOP3Operand(Reg(2, RegType.VGPR)),
                 src2=VOP3Operand(Reg(3, RegType.VGPR)),
             )
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_vgpr_dot2(self) -> None:
+        self.state.set_vgpr(1, pack_f16x2(ONE_F16, TWO_F16))
+        self.state.set_vgpr(2, pack_f16x2(THREE_F16, FOUR_F16))
+        instr = VDot2F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f16(res), 11.0)
+        self.assertEqual(self.state.get_vgpr(0), res)
+
+    def test_scalar_vgpr_sgpr_dot2(self) -> None:
+        self.state.set_vgpr(4, pack_f16x2(TWO_F16, THREE_F16))
+        self.state.set_sgpr(8, pack_f16x2(TWO_F16, HALF_F16))
+        instr = VDot2F16Instruction(
+            dst=Reg(5, RegType.VGPR),
+            src0=VOP3Operand(Reg(4, RegType.VGPR)),
+            src1=VOP3Operand(Reg(8, RegType.SGPR)),
+        )
+        # 2*2 + 3*0.5 = 4 + 1.5 = 5.5
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f16(res), 5.5)
+        self.assertEqual(self.state.get_vgpr(5), res)
+
+    def test_scalar_vgpr_literal_dot2(self) -> None:
+        self.state.set_vgpr(10, pack_f16x2(ONE_F16, ONE_F16))
+        instr = VDot2F16Instruction(
+            dst=Reg(11, RegType.VGPR),
+            src0=VOP3Operand(Reg(10, RegType.VGPR)),
+            src1=VOP3Operand(Literal32.from_f16x2(4.0, 5.0)),
+        )
+        # 1*4 + 1*5 = 9.0
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f16(res), 9.0)
+        self.assertEqual(self.state.get_vgpr(11), res)
+
+    def test_scalar_dot2acc_with_accumulator(self) -> None:
+        self.state.set_vgpr(1, pack_f16x2(ONE_F16, TWO_F16))
+        self.state.set_vgpr(2, pack_f16x2(THREE_F16, FOUR_F16))
+        self.state.set_vgpr(3, FIVE_F16)
+        instr = VDot2AccF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+            src2=VOP3Operand(Reg(3, RegType.VGPR)),
+        )
+        # 1*3 + 2*4 + 5 = 16.0
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f16(res), 16.0)
+        self.assertEqual(self.state.get_vgpr(0), res)
+
+    def test_scalar_modifiers_and_clamp(self) -> None:
+        self.state.set_vgpr(0, pack_f16x2(NEG_ONE_F16, NEG_TWO_F16))
+        self.state.set_vgpr(1, pack_f16x2(THREE_F16, FOUR_F16))
+        instr = VDot2F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR), abs_lo=True, abs_hi=True),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            clamp=True,
+        )
+        # |-1|*3 + |-2|*4 = 11.0, clamped -> 1.0
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, ONE_F16)
+
+    def test_scalar_op_sel_permutation(self) -> None:
+        self.state.set_vgpr(0, pack_f16x2(ONE_F16, TWO_F16))
+        self.state.set_vgpr(1, pack_f16x2(THREE_F16, FOUR_F16))
+        instr = VDot2F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            op_sel=(1, 0),
+            op_sel_hi=(0, 1),
+        )
+        # s0[1]*s1[0] + s0[0]*s1[1] = 2*3 + 1*4 = 10.0
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f16(res), 10.0)
+
+    def test_scalar_execution_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_vgpr(0, pack_f16x2(f16_to_bits(1.234), f16_to_bits(5.678)))
+            st.set_vgpr(1, pack_f16x2(f16_to_bits(2.345), f16_to_bits(6.789)))
+            instr = VDot2F16Instruction(
+                dst=Reg(2, RegType.VGPR),
+                src0=VOP3Operand(Reg(0, RegType.VGPR)),
+                src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
 
 
 if __name__ == "__main__":
