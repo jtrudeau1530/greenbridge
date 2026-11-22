@@ -721,5 +721,224 @@ OpFunctionEnd
                 self.assertEqual(sum_val, expected_sum)
 
 
+class TestCarryPropagationLimits(unittest.TestCase):
+    """Verifies theoretical carry propagation limits and boundary conditions."""
+
+    def test_carry_bit_strictly_binary(self):
+        # Carry-out of (|s0 - s1| + s2) must always be in {0, 1}
+        rng = random.Random(0xC0FFEE)
+        for _ in range(500):
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            s2 = rng.getrandbits(32)
+            c = ref_sad_hi_u32(s0, s1, s2)
+            self.assertIn(c, (0, 1))
+
+    def test_zero_accumulator_never_carries(self):
+        # When s2 == 0: (|s0 - s1| + 0) <= 0xFFFFFFFF, carry is unconditionally 0
+        rng = random.Random(0x2E40)
+        for _ in range(200):
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            self.assertEqual(ref_sad_hi_u32(s0, s1, 0), 0)
+
+    def test_equal_operands_never_carry(self):
+        # When s0 == s1: |s0 - s1| = 0, sum = s2 <= 0xFFFFFFFF, carry is unconditionally 0
+        rng = random.Random(0x314159)
+        for _ in range(200):
+            val = rng.getrandbits(32)
+            s2 = rng.getrandbits(32)
+            self.assertEqual(ref_sad_hi_u32(val, val, s2), 0)
+
+    def test_minimal_s2_for_carry(self):
+        # s2 = 1 can produce a carry if and only if |s0 - s1| == 0xFFFFFFFF
+        self.assertEqual(ref_sad_hi_u32(0xFFFFFFFF, 0, 1), 1)
+        self.assertEqual(ref_sad_hi_u32(0, 0xFFFFFFFF, 1), 1)
+        # Any difference < 0xFFFFFFFF cannot carry with s2 = 1
+        self.assertEqual(ref_sad_hi_u32(0xFFFFFFFE, 0, 1), 0)
+        self.assertEqual(ref_sad_hi_u32(0x80000000, 0, 1), 0)
+
+    def test_carry_boundary_step_sweep(self):
+        # For various differences D > 0, test s2 at (2^32 - D - 1) vs (2^32 - D)
+        test_diffs = [1, 2, 0x10, 0x1000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF]
+        for d in test_diffs:
+            with self.subTest(diff=hex(d)):
+                s0 = d
+                s1 = 0
+                # s2 = 2^32 - d - 1 -> sum = 2^32 - 1 = 0xFFFFFFFF (no carry)
+                s2_no_carry = (1 << 32) - d - 1
+                lo_no, hi_no, full_no = ref_sad_full_64(s0, s1, s2_no_carry)
+                self.assertEqual(hi_no, 0)
+                self.assertEqual(lo_no, 0xFFFFFFFF)
+                self.assertEqual(full_no, 0xFFFFFFFF)
+
+                # s2 = 2^32 - d -> sum = 2^32 = 0x100000000 (carry out = 1, lo = 0)
+                s2_carry = (1 << 32) - d
+                lo_c, hi_c, full_c = ref_sad_full_64(s0, s1, s2_carry)
+                self.assertEqual(hi_c, 1)
+                self.assertEqual(lo_c, 0)
+                self.assertEqual(full_c, 0x100000000)
+
+                if d >= 2:
+                    # s2 = 2^32 - d + 1 -> sum = 2^32 + 1 (carry out = 1, lo = 1)
+                    s2_carry_plus1 = (1 << 32) - d + 1
+                    lo_cp, hi_cp, full_cp = ref_sad_full_64(s0, s1, s2_carry_plus1)
+                    self.assertEqual(hi_cp, 1)
+                    self.assertEqual(lo_cp, 1)
+                    self.assertEqual(full_cp, 0x100000001)
+
+
+class TestExtremeOperandSweeps(unittest.TestCase):
+    """Comprehensive test sweeps covering boundary values, walking bits, and patterns."""
+
+    CORNERS = [0, 1, 2, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFE, 0xFFFFFFFF]
+
+    def test_corner_value_cartesian_product(self):
+        for s0 in self.CORNERS:
+            for s1 in self.CORNERS:
+                for s2 in self.CORNERS:
+                    with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                        lo, hi, full = ref_sad_full_64(s0, s1, s2)
+                        self.assertEqual(hi, (full >> 32) & MASK32)
+                        self.assertEqual(lo, full & MASK32)
+                        self.assertEqual((hi << 32) | lo, full)
+
+    def test_walking_ones(self):
+        # Walk a single 1 bit through all 32 bit positions
+        for bit in range(32):
+            val = 1 << bit
+            with self.subTest(bit=bit):
+                # Diff against 0 with max accumulator -> always carries
+                lo, hi, full = ref_sad_full_64(val, 0, 0xFFFFFFFF)
+                self.assertEqual(hi, 1)
+                self.assertEqual(lo, val - 1)
+                self.assertEqual(full, 0x100000000 + val - 1)
+
+                # Diff against 0 with 0 accumulator -> never carries
+                lo0, hi0, full0 = ref_sad_full_64(val, 0, 0)
+                self.assertEqual(hi0, 0)
+                self.assertEqual(lo0, val)
+                self.assertEqual(full0, val)
+
+    def test_walking_zeros(self):
+        # Walk a single 0 bit through all 32 bit positions
+        for bit in range(32):
+            val = (~(1 << bit)) & MASK32
+            with self.subTest(bit=bit):
+                # Against 0xFFFFFFFF, difference is exactly 1 << bit
+                diff = ref_abs_diff_u32(val, 0xFFFFFFFF)
+                self.assertEqual(diff, 1 << bit)
+
+                # With accumulator 0
+                lo0, hi0, _ = ref_sad_full_64(val, 0xFFFFFFFF, 0)
+                self.assertEqual(hi0, 0)
+                self.assertEqual(lo0, 1 << bit)
+
+                # With accumulator 0xFFFFFFFF -> always carries
+                loc, hic, _ = ref_sad_full_64(val, 0xFFFFFFFF, 0xFFFFFFFF)
+                self.assertEqual(hic, 1)
+                self.assertEqual(loc, (1 << bit) - 1)
+
+    def test_alternating_bit_patterns(self):
+        patterns = [
+            0x55555555, 0xAAAAAAAA,
+            0x33333333, 0xCCCCCCCC,
+            0x0F0F0F0F, 0xF0F0F0F0,
+            0x00FF00FF, 0xFF00FF00,
+            0x0000FFFF, 0xFFFF0000,
+        ]
+        for p0, p1 in zip(patterns[:-1], patterns[1:]):
+            for acc in [0, 0x55555555, 0xAAAAAAAA, 0xFFFFFFFF]:
+                with self.subTest(p0=hex(p0), p1=hex(p1), acc=hex(acc)):
+                    lo, hi, full = ref_sad_full_64(p0, p1, acc)
+                    self.assertEqual((hi << 32) | lo, full)
+
+
+class TestNegativeControlsAndErrorHandling(unittest.TestCase):
+    """Verifies syntax rejection, clamp rejection, and error conditions."""
+
+    def setUp(self):
+        self.interp = SadHiValuInterpreter(num_lanes=1)
+
+    def test_clamp_modifier_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.interp.execute_line("v_sad_hi_u32 v0, v1, v2, v3 clamp")
+        self.assertIn("clamp is unsupported", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            self.interp.execute_line("v_sad_u32 v0, v1, v2, v3 clamp")
+        self.assertIn("clamp is unsupported", str(ctx.exception))
+
+    def test_invalid_operand_counts(self):
+        # 3 operands (missing s2)
+        with self.assertRaises(ValueError):
+            self.interp.execute_line("v_sad_hi_u32 v0, v1, v2")
+
+        # 5 operands (too many)
+        with self.assertRaises(ValueError):
+            self.interp.execute_line("v_sad_hi_u32 v0, v1, v2, v3, v4")
+
+    def test_out_of_bounds_registers(self):
+        with self.assertRaises(IndexError):
+            self.interp.execute_line("v_sad_hi_u32 v256, v0, v1, v2")
+
+        with self.assertRaises(IndexError):
+            self.interp.execute_line("v_sad_hi_u32 v0, s106, v1, v2")
+
+    def test_invalid_destination_register(self):
+        # Destination of VALU instruction must be VGPR
+        with self.assertRaises(ValueError):
+            self.interp.execute_line("v_sad_hi_u32 s0, v1, v2, v3")
+
+    def test_malformed_tokens(self):
+        with self.assertRaises(ValueError):
+            self.interp.execute_line("v_sad_hi_u32 v0, , v2, v3")
+
+        with self.assertRaises(ValueError):
+            self.interp.execute_line("v_sad_hi_u32 v0, invalid_token, v2, v3")
+
+    def test_unimplemented_opcode(self):
+        with self.assertRaises(NotImplementedError):
+            self.interp.execute_line("v_fake_op v0, v1")
+
+
+class TestDeterministicFuzzingAndDifferentialParity(unittest.TestCase):
+    """Deterministic fuzzing ensuring exact parity between oracle, interpreter, and invariants."""
+
+    def test_seeded_differential_fuzz(self):
+        rng = random.Random(0x5AD_41_032)
+        interp = SadHiValuInterpreter(num_lanes=1)
+
+        for i in range(500):
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            s2 = rng.getrandbits(32)
+
+            # Oracle computation
+            lo, hi, full = ref_sad_full_64(s0, s1, s2)
+
+            # Invariant 1: Carry in {0, 1}
+            self.assertIn(hi, (0, 1))
+
+            # Invariant 2: 64-bit reconstruction
+            self.assertEqual((hi << 32) | lo, full)
+
+            # Invariant 3: Symmetry of s0, s1
+            self.assertEqual(ref_sad_hi_u32(s1, s0, s2), hi)
+            self.assertEqual(ref_sad_u32(s1, s0, s2), lo)
+
+            # Invariant 4: Interpreter execution parity
+            interp.run_program([
+                f"v_mov_b32 v1, {hex(s0)}",
+                f"v_mov_b32 v2, {hex(s1)}",
+                f"v_mov_b32 v3, {hex(s2)}",
+                "v_sad_hi_u32 v0, v1, v2, v3",
+                "v_sad_u32 v4, v1, v2, v3",
+            ])
+            self.assertEqual(interp.get_vgpr(0, 0), hi)
+            self.assertEqual(interp.get_vgpr(0, 4), lo)
+
+
 if __name__ == "__main__":
     unittest.main()
+
