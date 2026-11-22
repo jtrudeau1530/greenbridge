@@ -382,6 +382,56 @@ void test_exports() {
     }
 }
 
+void test_empty_named_export() {
+    const char* what = "an empty named export stays unresolved without hiding valid exports";
+    auto img = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
+    ed->NumberOfFunctions = 3;
+    ed->NumberOfNames = 3;
+    nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = 0x1A0;
+    auto* funcs = reinterpret_cast<uint32_t*>(img.data() + 0x300);
+    funcs[1] = 0;
+    funcs[2] = 0x11C0;  // a code export outside the export directory
+    auto* names = reinterpret_cast<uint32_t*>(img.data() + 0x320);
+    names[0] = 0x1188;
+    names[1] = 0x1180;
+    names[2] = 0x1190;
+    auto* ords = reinterpret_cast<uint16_t*>(img.data() + 0x340);
+    ords[0] = 1;
+    ords[1] = 0;
+    ords[2] = 2;
+    std::memcpy(img.data() + 0x388, "empty\0", 6);
+    std::memcpy(img.data() + 0x390, "valid\0", 6);
+    auto provider = write_image_as(img, "empty_exports.dll");
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(provider);
+        for (const char* sym : {"empty", "#2"}) {
+            bool owns = false;
+            if (m.exports.count(sym) || m.forwarders.count(sym) ||
+                loader.resolve_module_export(m.base, sym, owns) || !owns)
+                return failed(what, std::string(sym) + " did not remain absent from the mapped module");
+        }
+        for (const char* sym : {"valid", "#3", "fwd", "#1"}) {
+            bool owns = false;
+            void* expected = (std::strcmp(sym, "valid") == 0 || std::strcmp(sym, "#3") == 0)
+                ? m.base + 0x11C0 : host_symbol("kernel32.dll", "GetCurrentProcessId");
+            if (!expected || loader.resolve_module_export(m.base, sym, owns) != expected || !owns)
+                return failed(what, std::string(sym) + " no longer resolves to its valid target");
+        }
+        auto importer = write_image_as(make_import_image("empty_exports.dll", "empty"), "empty_import.exe");
+        rt::Module& importing = loader.load(importer);
+        if (importing.imports.size() != 1 || importing.imports[0].binding != rt::Binding::Unimplemented)
+            return failed(what, "an import of the empty slot did not bind as unimplemented");
+        void* bound = *reinterpret_cast<void**>(importing.base + 0x1180);
+        if (!bound || bound == m.base)
+            return failed(what, "the empty import was not given a failure thunk");
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_imports() {
     {
         auto img = make_image();
@@ -1190,6 +1240,7 @@ int main() {
         test_truncation();
         test_relocations();
         test_exports();
+        test_empty_named_export();
         test_imports();
         test_import_name_rvas();
         test_delay_imports();

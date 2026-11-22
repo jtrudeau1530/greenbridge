@@ -1021,6 +1021,7 @@ void Loader::parse_exports(Module& m) {
     // into the string, so forwarders are kept apart and followed when an import asks for one.
     const uint64_t dir_begin = dir.VirtualAddress, dir_end = dir_begin + dir.Size;
     auto add_export = [&](const std::string& key, uint32_t rva) {
+        if (!rva) return;  // An unused address-table slot is absent even when a name refers to it.
         if (rva >= dir_begin && rva < dir_end)
             m.forwarders[key] = read_string(m.name, m.base, m.size, rva, "a forwarded export");
         else if (rva >= m.size)  // base + rva would point past the mapping, and a caller would jump there
