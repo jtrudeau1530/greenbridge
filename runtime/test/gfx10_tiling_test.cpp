@@ -50,6 +50,15 @@ int check_surface(TileMode mode, std::size_t bpe, std::size_t width, std::size_t
         for (std::size_t y = 0; y < height; ++y)
             std::copy_n(linear.begin() + y * pitch, row_bytes, expected.begin() + y * pitch);
         CHECK(decoded == expected);
+        std::vector<std::byte> reference(linear_size, std::byte{0xab});
+        for (std::size_t y = 0; y < height; ++y) {
+            for (std::size_t x = 0; x < width; ++x) {
+                std::size_t offset;
+                CHECK(surface.element_offset(x, y, offset));
+                std::copy_n(tiled.begin() + offset, bpe, reference.begin() + y * pitch + x * bpe);
+            }
+        }
+        CHECK(decoded == reference);
         std::vector<std::byte> encoded(tiled.size(), std::byte{0xcc});
         CHECK(surface.tile(decoded, encoded, pitch));
         CHECK(encoded == tiled);

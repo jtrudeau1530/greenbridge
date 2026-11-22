@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -122,10 +123,25 @@ private:
         if (source.size() < (to_tiled ? linear_size : size_) ||
             destination.size() < (to_tiled ? size_ : linear_size) ||
             tiling_detail::overlap(source, destination)) return false;
+        const auto tile_x_bits = std::countr_zero(tile_width_);
+        std::size_t x_offsets[256]{};
+        for (std::size_t x = 0; x < tile_width_; ++x) {
+            for (unsigned bit = 0; bit < bits_; ++bit) {
+                const int source_bit = pattern_[bit];
+                if (source_bit > 0) x_offsets[x] |= ((x >> (source_bit - 1)) & 1) << bit;
+            }
+        }
         for (std::size_t y = 0; y < height_; ++y) {
+            std::size_t y_offset = 0;
+            for (unsigned bit = 0; bit < bits_; ++bit) {
+                const int source_bit = pattern_[bit];
+                if (source_bit < 0) y_offset |= ((y >> (-source_bit - 1)) & 1) << bit;
+            }
+            const std::size_t tile_row = (y / tile_height_) * tiles_x_;
             for (std::size_t x = 0; x < width_; ++x) {
                 const std::size_t linear = y * pitch + x * element_bytes_;
-                const std::size_t tiled = address(x, y);
+                const std::size_t tiled = ((tile_row + (x >> tile_x_bits)) << bits_) +
+                                          y_offset + x_offsets[x & (tile_width_ - 1)];
                 std::memcpy(destination.data() + (to_tiled ? tiled : linear),
                             source.data() + (to_tiled ? linear : tiled), element_bytes_);
             }
