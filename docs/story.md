@@ -359,6 +359,29 @@ archive (`--normals`, counts only):
 - 69.4% of 699,618 shared edges have neighbouring faces within ~25°, and 0.37% are opposed;
 - 10,555 of 14,697 centre axes (71.8%) are in the same 1/16 m step, and 87.6% within one.
 
+**And in `story000.rpf`, the main story archive.** All 7,577 mesh streams parse with every check on (`--faces
+--centres --normals --cones`, counts only). Six of them are 256 KiB pages where texture-like data follows the mesh
+chunks on a 256-byte boundary behind zero padding; the walk stops there (`stopped_at_other_data`). They hold:
+
+| `42 40` blocks | Positions | Meshlets | Triangles |
+|---:|---:|---:|---:|
+| 173,877 | 29,602,924 | 405,418 | 38,626,760 |
+
+| Check | Count |
+|---|---:|
+| positions finite | all |
+| positions within 300 m | 29,572,450 (99.9%) |
+| shared edges with neighbouring faces within ~25° | 33,342,470 of 36,707,506 (90.8%); 1.4% opposed |
+| normals within 8° / 25° of their faces | 76.5% / 94.6% of 20,801,089; 2.1% opposed |
+| tangents perpendicular to the normal | 30,473,135 of 30,569,246 (99.7%) |
+| radius covers the farthest vertex from the stored centre | 257,091 of 275,832 meshlets (93.2%); 94.8% within rounding |
+| cones: axis within 25° / every face inside within 0.05 | 89.5% / 94.2% of 228,244 |
+
+The stored centres match the box centre less often here: 25.7% of axes in the same step, 41.5% within one,
+against 50.1% / 71.8% in the minigame archive. 625 meshlets use the 1/8 m step. Since the radius still covers the
+farthest vertex from the stored centre in 93.2%, the decoding holds; these assets seem to store a centre other
+than the box midpoint (a sphere centre would fit).
+
 Still open: the +0x5C word, the type-1 normal's
 bits 20-31, and what the `42 40` colour and UV slots hold beyond rpf9-explorer's reading.
 
