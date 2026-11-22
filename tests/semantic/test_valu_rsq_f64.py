@@ -1263,5 +1263,101 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(vcc_inf & vcc_nan, 0)
 
 
+# ============================================================================
+# Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_dbl_min_normal_boundary(self) -> None:
+        """rsq(2^-1022) = 2^511, exact power of 2 representation."""
+        res_bits = oracle_v_rsq_f64(DBL_MIN)
+        self.assertFalse(is_nan(res_bits))
+        self.assertFalse(is_inf(res_bits))
+        expected_val = 2.0 ** 511
+        self.assertAlmostEqual(bits_to_f64(res_bits), expected_val, delta=expected_val * 1e-15)
+
+    def test_dbl_max_normal_boundary(self) -> None:
+        """rsq(DBL_MAX) produces small finite positive normal float."""
+        res_bits = oracle_v_rsq_f64(DBL_MAX)
+        self.assertFalse(is_nan(res_bits))
+        self.assertFalse(is_inf(res_bits))
+        res_val = bits_to_f64(res_bits)
+        self.assertGreater(res_val, 0.0)
+        self.assertLess(res_val, 1e-150)
+
+    def test_subnorm_min_gradual_underflow(self) -> None:
+        """rsq(2^-1074) evaluates to 2^537 under IEEE-754 gradual underflow."""
+        res_bits = oracle_v_rsq_f64(SUBNORM_MIN, flush_subnormals=False)
+        self.assertFalse(is_nan(res_bits))
+        self.assertFalse(is_inf(res_bits))
+        expected_val = 2.0 ** 537
+        self.assertAlmostEqual(bits_to_f64(res_bits), expected_val, delta=expected_val * 1e-15)
+
+    def test_subnorm_max_gradual_underflow(self) -> None:
+        """Largest positive subnormal computes without NaN under IEEE mode."""
+        res_bits = oracle_v_rsq_f64(SUBNORM_MAX, flush_subnormals=False)
+        self.assertFalse(is_nan(res_bits))
+        self.assertFalse(is_inf(res_bits))
+        self.assertGreater(bits_to_f64(res_bits), 2.0 ** 511)
+
+    def test_subnormal_flush_to_zero_mode(self) -> None:
+        """Under FTZ mode, both smallest and largest subnormals flush to 0, producing +Inf."""
+        res_min_ftz = oracle_v_rsq_f64(SUBNORM_MIN, flush_subnormals=True)
+        self.assertEqual(res_min_ftz, POS_INF)
+
+        res_max_ftz = oracle_v_rsq_f64(SUBNORM_MAX, flush_subnormals=True)
+        self.assertEqual(res_max_ftz, POS_INF)
+
+    def test_qnan_payload_preservation(self) -> None:
+        """Quiet NaN payloads are preserved and have the quiet bit asserted."""
+        payload_a = 0x7FF8_0000_1234_5678
+        res_a = oracle_v_rsq_f64(payload_a)
+        self.assertEqual(res_a, payload_a)
+
+        payload_b = 0x7FF9_BEEF_CAFE_0001
+        res_b = oracle_v_rsq_f64(payload_b)
+        self.assertEqual(res_b, payload_b)
+
+    def test_snan_quieting(self) -> None:
+        """Signaling NaN is converted to a Quiet NaN with quiet bit set."""
+        snan = 0x7FF0_0000_0000_0001
+        res = oracle_v_rsq_f64(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertEqual(res, snan | QNAN_BIT)
+
+    def test_negative_subnormals_yield_qnan(self) -> None:
+        """Negative subnormals represent negative numbers and yield Canonical QNaN."""
+        neg_sub_min = SUBNORM_MIN | SIGN_MASK
+        neg_sub_max = SUBNORM_MAX | SIGN_MASK
+        self.assertEqual(oracle_v_rsq_f64(neg_sub_min), CANONICAL_QNAN)
+        self.assertEqual(oracle_v_rsq_f64(neg_sub_max), CANONICAL_QNAN)
+
+    def test_monotonic_decrease_across_normals(self) -> None:
+        """Reciprocal square root is strictly monotonically decreasing for positive inputs."""
+        inputs = [
+            0.0001, 0.01, 0.25, 0.5, 1.0, 2.0, 4.0, 16.0, 100.0, 10000.0, 1e8, 1e20,
+        ]
+        prev_res = math.inf
+        for inp in inputs:
+            curr_res = bits_to_f64(oracle_v_rsq_f64(f64_to_bits(inp)))
+            self.assertLess(curr_res, prev_res)
+            prev_res = curr_res
+
+    def test_clamp_saturation_at_boundaries(self) -> None:
+        """Clamp modifier saturates extreme values to [0.0, 1.0]."""
+        # SUBNORM_MIN produces 2^537 >> 1.0 -> clamped to 1.0
+        self.assertEqual(oracle_v_rsq_f64(SUBNORM_MIN, clamp=True), ONE_F64)
+        # DBL_MIN produces 2^511 >> 1.0 -> clamped to 1.0
+        self.assertEqual(oracle_v_rsq_f64(DBL_MIN, clamp=True), ONE_F64)
+        # DBL_MAX produces ~7.4e-155 -> within [0.0, 1.0] -> unchanged
+        self.assertEqual(oracle_v_rsq_f64(DBL_MAX, clamp=True), oracle_v_rsq_f64(DBL_MAX, clamp=False))
+        # +0.0 produces +inf -> clamped to 1.0
+        self.assertEqual(oracle_v_rsq_f64(POS_ZERO, clamp=True), ONE_F64)
+        # -0.0 produces +inf -> clamped to 1.0
+        self.assertEqual(oracle_v_rsq_f64(NEG_ZERO, clamp=True), ONE_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
