@@ -7,6 +7,7 @@ No game data: stage selection uses mocks, and the packaging and discovery tests 
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -216,6 +217,30 @@ class RuntimePackagingTest(unittest.TestCase):
     def write_artifact(self, name, contents):
         with open(os.path.join(self.build, name), "wb") as f:
             f.write(contents)
+
+    def test_first_load_hint(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        image = "Player's Test.exe"
+        out = os.path.join(self.root, "Port Files")
+        for platform in ("nt", "posix"):
+            with self.subTest(platform=platform), mock.patch.object(make_game.os, "name", platform), \
+                    mock.patch.object(make_game, "log") as log:
+                path = os.path.join(self.game, image)
+                with open(path, "wb"):
+                    pass
+                make_game.runtime(self.game, out, {"expected_exe": image}, self.build)
+                command = log.call_args.args[0].splitlines()[-1].strip()
+                if platform == "nt":
+                    self.assertIn("--dry-run", command)
+                    self.assertIn("gta6rt.exe'", command)
+                    self.assertIn("Player''s Test.exe'", command)
+                else:
+                    self.assertEqual(shlex.split(command.removeprefix("(").removesuffix(")")),
+                                     ["cd", self.game, "&&", os.path.join(out, "gta6rt.sh"), "--dry-run", "./" + image])
+                os.remove(path)
+                make_game.runtime(self.game, out, {"expected_exe": image}, self.build)
+                self.assertIn("is missing", log.call_args.args[0])
+                self.assertNotIn("--dry-run", log.call_args.args[0])
 
     def package(self):
         with mock.patch.object(make_game.os, "name", "nt"), \
