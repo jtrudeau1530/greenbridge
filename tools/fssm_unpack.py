@@ -125,7 +125,11 @@ def main(argv=None) -> int:
         print(f"ERROR: cannot list {src}: {e.strerror or e}", file=sys.stderr)
         return 2
     out = os.path.join(src, "fssm")
-    os.makedirs(out, exist_ok=True)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:
+        print(f"ERROR: cannot create output directory {out}: {e.strerror or e}", file=sys.stderr)
+        return 1
     rows, problems = [], Counter()
     for shader in shaders:
         with open(shader.path, "rb") as f:
