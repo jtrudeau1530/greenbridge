@@ -441,6 +441,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
             audio_dir = os.path.join(out, "audio")
             os.makedirs(audio_dir, exist_ok=True)
             with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
@@ -469,6 +471,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
 
             ogg_dir = os.path.join(out, "audio", "ogg")
             wav_dir = os.path.join(out, "audio", "wav")
@@ -502,6 +506,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
             audio = os.path.join(out, "audio")
             os.makedirs(os.path.join(audio, "xma"), exist_ok=True)
             os.makedirs(game, exist_ok=True)
@@ -526,6 +532,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
 
             manifest_dir = os.path.join(out, "audio")
             os.makedirs(manifest_dir, exist_ok=True)

@@ -139,6 +139,10 @@ folder that predates this record, reruns disassembly and translation while keepi
 The build records which translator sources produced the shaders. A change to those files reruns translation using the
 saved disassembly. Older work folders need one translation after upgrading to record this information.
 
+The build also records which decoder (the `third_party/rpf9-explorer` commit and the `tools/rpf9dump` sources) exported
+each archive's models and textures. When it changes, the assets stage removes that export and makes it again. Older
+work folders have no record, so their models and textures are exported once more after upgrading.
+
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
 on `--jobs` processes (half the CPU threads by default).

@@ -454,6 +454,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 os.makedirs(dest, exist_ok=True)
                 with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
                     f.write("{}")
+                with open(os.path.join(dest, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                    f.write(make_game.decoder_digest())
 
         with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
             f.write("{}")
