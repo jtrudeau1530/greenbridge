@@ -59,8 +59,9 @@ def tearDownModule():
 
 
 def load_format(fmt: int, offset: int, ncomp: int = 4, dst_sel: int = DST_SEL_XYZW,
-                memory: dict | None = None) -> tuple:
-    """buffer_load_format_<x..xyzw> of format `fmt` at byte `offset`; returns the four mrt0 words."""
+                memory: dict | None = None, op: str = "buffer_load_format", mods: str = "") -> tuple:
+    """<op>_<x..xyzw> with V# format `fmt` at byte `offset`; returns the four mrt0 words.
+    `mods` is emitted after soffset (e.g. " format:[BUF_FMT_8_UNORM]" for tbuffer_load_format)."""
     if _TMP_DIR is None:
         setUpModule()
     suffix = "xyzw"[:ncomp]
@@ -73,7 +74,7 @@ def load_format(fmt: int, offset: int, ncomp: int = 4, dst_sel: int = DST_SEL_XY
         "\ts_mov_b32 s2, 0x100\n"              # num_records (bytes)
         f"\ts_mov_b32 s3, {fmt << 12 | dst_sel:#x}\n"
         f"\tv_mov_b32 v1, {offset:#x}\n"
-        f"\tbuffer_load_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
+        f"\t{op}_{suffix} {vdata}, v1, s[0:3], 0{mods} offen\n"
         "\ts_waitcnt vmcnt(0)\n"
         f"\texp mrt0 {', '.join(regs)} done vm\n"
         "\ts_endpgm\n"
@@ -186,6 +187,37 @@ class DstSelOneByFormat(unittest.TestCase):
         self.assertEqual(unorm[2:], (0x3F800000, 0x3F800000))
         u8 = load_format(FMT_UINT8X4, 4, dst_sel=DST_SEL_X_0_1_1)
         self.assertEqual(u8[2:], (1, 1))
+
+
+class TbufferDefaultFormat(unittest.TestCase):
+    """GFX10 MTBUF: an omitted format: is BUF_FMT_8_UNORM (code 1), not the V# FORMAT. llvm-mc encodes
+    `format:[BUF_FMT_8_UNORM]` and no modifier identically and disassembles both without it.
+
+    The V# says FMT_U32, which would return the whole dword. The bytes are UNORM endpoints, 0xFF -> 1.0 and
+    0x00 -> 0.0, so the expected words are exact.
+    """
+
+    MEM = {BASE: 0x112200FF}
+    EXPLICIT = " format:[BUF_FMT_8_UNORM]"
+
+    def tload(self, offset, ncomp, mods=""):
+        return load_format(FMT_U32, offset, ncomp, memory=self.MEM, op="tbuffer_load_format", mods=mods)
+
+    def test_x_unorm_endpoints_ignore_descriptor_format(self):
+        for off, want in ((0, 0x3F800000), (1, 0)):
+            with self.subTest(off=off):
+                self.assertEqual(self.tload(off, 1)[0], want)
+
+    def test_every_suffix_matches_explicit_8_unorm(self):
+        for ncomp in (1, 2, 3, 4):
+            with self.subTest(suffix="xyzw"[:ncomp]):
+                got = self.tload(0, ncomp)[:ncomp]
+                self.assertEqual(got[0], 0x3F800000)
+                self.assertEqual(got, self.tload(0, ncomp, self.EXPLICIT)[:ncomp])
+
+    def test_explicit_invalid_still_rejected(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            self.tload(0, 1, " format:[BUF_FMT_INVALID]")
 
 
 class InterpreterConversions(unittest.TestCase):
