@@ -136,7 +136,9 @@ UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
 
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
-VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format) {
+// attachment_usable: the GPU can render to `format`. A UAV texture then also gets COLOR_ATTACHMENT usage, because
+// ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
+VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -149,7 +151,11 @@ VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const For
     info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+        info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
+            info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
     if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
     return info;
 }
@@ -178,6 +184,12 @@ struct DeviceState {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
         return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    }
+
+    bool color_attachment_usable(VkFormat format) const {
+        VkFormatProperties properties{};
+        format_properties(info.physical, format, &properties);
+        return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
     }
 
     // Whether the GPU has this format and usage in this sample count: not every format has every count.
@@ -524,7 +536,8 @@ public:
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
-        VkImageCreateInfo info = texture_create_info(desc_, format);
+        VkImageCreateInfo info =
+            texture_create_info(desc_, format, device_.color_attachment_usable(format.format));
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
         host_transfer_ = cpu_visible() && samples == 1 && device_.host_transfer_format(format.format);
@@ -552,6 +565,7 @@ public:
         binding.depth = depth;
         binding.volume = volume;
         binding.samples = samples;
+        binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
         // With the bindless set, a view's descriptor has one layout for as long as it lives (bind_image).
@@ -1974,7 +1988,8 @@ private:
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        if (!state_.memory_requirements(texture_create_info(resolved, format), need)) return kInvalidAllocation;
+        const VkImageCreateInfo image = texture_create_info(resolved, format, state_.color_attachment_usable(format.format));
+        if (!state_.memory_requirements(image, need)) return kInvalidAllocation;
 
         // D3D12's alignment: 64 KiB, or 4 MiB with MSAA, unless the description asks for a small one (4 KiB, 64 KiB
         // with MSAA). 4 KiB needs the resource to fit in 64 KiB and not be a render target or depth buffer; if it
