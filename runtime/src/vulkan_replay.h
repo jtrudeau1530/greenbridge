@@ -1369,8 +1369,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!image_range(p.binding, all_subresources, range)) return ReplayResult::invalid_subresource;
                 if (!discard->partial) p.discards.push_back(range);
             } else {
-                for (std::uint64_t i = discard->first_subresource; i < end; ++i) {
-                    const auto s = static_cast<std::uint32_t>(i);
+                for (std::uint64_t sub = discard->first_subresource; sub < end; ++sub) {
+                    const auto s = static_cast<std::uint32_t>(sub);
                     VkImageSubresourceRange range{};
                     if (!image_range(p.binding, s, range)) return ReplayResult::invalid_subresource;
                     if (!discard->partial) p.discards.push_back(range);
