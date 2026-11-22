@@ -308,7 +308,7 @@ class NamesTest(unittest.TestCase):
             def __init__(self, obj):
                 self._obj = obj
 
-            def decompress(self, data, max_length=-1):
+            def decompress(self, data, max_length=0):
                 seen.append(max_length)
                 return self._obj.decompress(data, max_length)
 
@@ -322,7 +322,7 @@ class NamesTest(unittest.TestCase):
             make_blob(arc, first, nxt)
             with mock.patch.object(rpf9_names.zlib, "decompressobj",
                                    lambda: Rec(real_decompressobj())):
-                with mock.patch.object(rpf9_names, "DECOMPRESS_MAX", 64):
+                with mock.patch.object(rpf9_names, "DECOMPRESS_MAX", 64, create=True):
                     rows, summary = rpf9_names.scan_archive(arc)
         self.assertTrue(seen, "decompress should have been called")
         self.assertTrue(all(m > 0 for m in seen), seen)

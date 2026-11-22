@@ -198,6 +198,7 @@ class RealIsaTests(unittest.TestCase):
         "v_mad_legacy_f32": "gfx1013 per llvm-mc, missing from the XML",
         "v_madak_f32": "gfx1013 per llvm-mc, missing from the XML",
         "v_madmk_f32": "gfx1013 per llvm-mc, missing from the XML",
+        "v_mac_legacy_f32": "gfx1013 per llvm-mc (VOP2 v_mac_legacy_f32_e32), missing from the XML",
         "v_add_u16": "internal: v_add_nc_u16 is re-dispatched under this GFX9 spelling",
         "v_sub_u16": "internal: v_sub_nc_u16 is re-dispatched under this GFX9 spelling",
         "v_subrev_u16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",

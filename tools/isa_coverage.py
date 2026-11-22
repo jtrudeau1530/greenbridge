@@ -177,11 +177,14 @@ def scan_translator(path):
     scope = {"_insn"}
     if "_insn" in methods:
         for c in ast.walk(methods["_insn"]):
-            if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and                     isinstance(c.func.value, ast.Name) and c.func.value.id == "self" and                     any(isinstance(x, ast.Name) and x.id == "op" for x in c.args[:1]):
+            if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                    and isinstance(c.func.value, ast.Name) and c.func.value.id == "self"
+                    and any(isinstance(x, ast.Name) and x.id == "op" for x in c.args[:1])):
                 scope.add(c.func.attr)
     for name in scope & set(methods):
         for node in ast.walk(methods[name]):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and                     node.func.attr == "startswith" and _is_op(node.func.value):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "startswith" and _is_op(node.func.value)):
                 for p in _strings(node):
                     if re.match(r"^[a-z0-9_]+$", p):
                         prefixes[p].add(node.lineno)
@@ -292,7 +295,8 @@ def markdown(rep, list_unknown=False):
         lines.append(f"| {c} | {t[c]} | {100 * t[c] / n:.1f}% |")
     lines += ["", "An instruction with several encodings is counted once in the table above and once per group "
               "below, so the group rows add up to more than the total.", "",
-              "| encoding | total | handled-exact | handled-family | refused | unknown |", "|---|---:|---:|---:|---:|---:|"]
+              "| encoding | total | handled-exact | handled-family | refused | unknown |",
+              "|---|---:|---:|---:|---:|---:|"]
     for g in sorted(rep["groups"], key=lambda g: GROUP_ORDER.index(g) if g in GROUP_ORDER else 99):
         r = rep["groups"][g]
         lines.append(f"| {g} | {r['total']} | {r['handled-exact']} | {r['handled-family']} | {r['refused']} | "

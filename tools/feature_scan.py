@@ -272,6 +272,25 @@ def scan_spirv(spirv_index: str) -> dict:
     return {"translated": dict(total), "uses_code_base": {k: v for k, v in code_base.items() if v}}
 
 
+def same_path(first: str, second: str) -> bool:
+    """True when two paths name the same file, including through a link or a case difference on Windows."""
+    a = os.path.normcase(os.path.abspath(first))
+    b = os.path.normcase(os.path.abspath(second))
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def inside_dir(path: str, folder: str) -> bool:
+    """True when path is folder itself or anything under it."""
+    root = os.path.normcase(os.path.abspath(folder))
+    target = os.path.normcase(os.path.abspath(path))
+    return target == root or target.startswith(root + os.sep)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("shaders", help="<work>/shaders from make_game.py")
@@ -284,6 +303,16 @@ def main() -> int:
         what = "is not a folder" if os.path.exists(a.shaders) else "does not exist"
         print(f"ERROR: {a.shaders} {what}. Give the <work>/shaders folder make_game.py writes.", file=sys.stderr)
         return 2
+    if a.out:  # a report is not an input: one written over the corpus index leaves the next run unable to scan
+        spirv_index = os.path.join(a.shaders, "spirv", "index.json")
+        if inside_dir(a.out, dxbc_dir):
+            print(f"ERROR: --out {a.out} is inside the scanned corpus {dxbc_dir}. Writing the report there would "
+                  "replace index.json or a .dxbc the scan reads. Give a report path outside it.", file=sys.stderr)
+            return 2
+        if same_path(a.out, spirv_index):
+            print(f"ERROR: --out {a.out} is {spirv_index}, which the scan reads. Give another report path.",
+                  file=sys.stderr)
+            return 2
     if not os.path.isfile(index_path):
         print(f"ERROR: {index_path} is missing. Run the shaders stage of make_game.py first.", file=sys.stderr)
         return 2

@@ -534,6 +534,44 @@ int main() {
         if (FAILED(sc->Present(0, 0))) return fail("Present (10-bit)");
     }
 
+    // IDXGISwapChain1::GetBackgroundColor and IDXGISwapChain2::GetMatrixTransform must return what their setters
+    // stored, with transparent black and the identity matrix as the defaults.
+    {
+        DXGI_RGBA background{};
+        if (FAILED(sc->GetBackgroundColor(&background)) || background.r != 0 || background.g != 0 ||
+            background.b != 0 || background.a != 0)
+            return fail("GetBackgroundColor default should be transparent black");
+        const DXGI_RGBA wanted{0.25f, 0.5f, 0.75f, 1.0f};
+        if (FAILED(sc->SetBackgroundColor(&wanted)) || FAILED(sc->GetBackgroundColor(&background)) ||
+            background.r != wanted.r || background.g != wanted.g || background.b != wanted.b ||
+            background.a != wanted.a)
+            return fail("SetBackgroundColor/GetBackgroundColor did not round-trip");
+        if (sc->SetBackgroundColor(nullptr) != E_INVALIDARG || sc->GetBackgroundColor(nullptr) != E_INVALIDARG)
+            return fail("Get/SetBackgroundColor(nullptr) should return E_INVALIDARG");
+
+        DXGI_MATRIX_3X2_F matrix{};
+        if (FAILED(sc->GetMatrixTransform(&matrix)) || matrix._11 != 1 || matrix._12 != 0 || matrix._21 != 0 ||
+            matrix._22 != 1 || matrix._31 != 0 || matrix._32 != 0)
+            return fail("GetMatrixTransform default should be the identity");
+        const DXGI_MATRIX_3X2_F wanted_matrix{2, 0, 0, 3, 4, 5};
+        if (FAILED(sc->SetMatrixTransform(&wanted_matrix)) || FAILED(sc->GetMatrixTransform(&matrix)) ||
+            matrix._11 != wanted_matrix._11 || matrix._12 != wanted_matrix._12 ||
+            matrix._21 != wanted_matrix._21 || matrix._22 != wanted_matrix._22 ||
+            matrix._31 != wanted_matrix._31 || matrix._32 != wanted_matrix._32)
+            return fail("SetMatrixTransform/GetMatrixTransform did not round-trip");
+        if (sc->SetMatrixTransform(nullptr) != E_INVALIDARG || sc->GetMatrixTransform(nullptr) != E_INVALIDARG)
+            return fail("Get/SetMatrixTransform(nullptr) should return E_INVALIDARG");
+
+        DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_ROTATE180;
+        if (FAILED(sc->GetRotation(&rotation)) || rotation != DXGI_MODE_ROTATION_IDENTITY)
+            return fail("GetRotation default should be identity");
+        if (FAILED(sc->SetRotation(DXGI_MODE_ROTATION_ROTATE90)) || FAILED(sc->GetRotation(&rotation)) ||
+            rotation != DXGI_MODE_ROTATION_ROTATE90)
+            return fail("SetRotation/GetRotation did not round-trip");
+        if (sc->GetRotation(nullptr) != E_INVALIDARG)
+            return fail("GetRotation(nullptr) should return E_INVALIDARG");
+    }
+
     // Unsupported swapchain format must fail explicitly instead of silently downgrading to BGRA8.
     if (sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_R32_UINT, 0) != DXGI_ERROR_UNSUPPORTED)
         return fail("ResizeBuffers should reject unsupported format DXGI_FORMAT_R32_UINT");

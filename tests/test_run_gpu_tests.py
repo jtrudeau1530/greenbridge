@@ -84,7 +84,7 @@ class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
             return rc, output.getvalue()
 
     def test_bindless_texture_and_gather_tests_skip(self):
-        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap"):
+        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap", "ps_array_resinfo"):
             with self.subTest(name=name):
                 rc, out = self.run_one(name)
                 self.assertEqual(rc, 0, out)

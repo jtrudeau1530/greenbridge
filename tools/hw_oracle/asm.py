@@ -63,11 +63,17 @@ def skip_reason(lines, arch):
     return None
 
 
+class ModeUnavailable(Exception):
+    """A requested float MODE field cannot be encoded on this architecture."""
+
+
 class Kernel:
     """One program to run. lines: the instructions. raw=False wraps them (output pointer load, v[8:11] store);
     raw=True means the lines already end with their own stores and s_endpgm and only get the output pointer in
     s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64. mode: the float MODE the kernel
     starts with (raw kernels only), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults.
+    On gfx1170+ the assembler rejects the ieee and dx10_clamp directives, so requesting those fields raises
+    ModeUnavailable while the denormal and rounding fields still work.
     lds: bytes of LDS the kernel allocates (.amdhsa_group_segment_fixed_size and the metadata's
     .group_segment_fixed_size; without it the hardware gives the group no LDS); vgprs, sgprs: registers the kernel uses
     (default 32 and 40)."""
@@ -98,6 +104,29 @@ MODE_FIELDS = {
     "round32": ".amdhsa_float_round_mode_32",
     "round16_64": ".amdhsa_float_round_mode_16_64",
 }
+# AMD clang (rocm-sdk-core 10.0.0) rejects these two directives on gfx1170 and later; the hardware keeps its
+# fixed IEEE/DX10_CLAMP behaviour there, so a run that asks for either field is a skip, not an assembler failure.
+_MODE_FIELDS_GONE_ON_GFX1170 = ("ieee", "dx10_clamp")
+
+
+# MODE fields a kernel descriptor can no longer set: GFX11.7 and GFX12 have fixed IEEE / DX10_CLAMP behaviour, and AMD
+# clang (rocm-sdk-core 10.0.0) rejects .amdhsa_ieee_mode and .amdhsa_dx10_clamp for gfx1201 with "directive
+# unsupported on gfx1170+" (FUZZ-43, found by @Dom-in in #1548). The four denormal and rounding fields still assemble.
+_MODE_FIXED = ("ieee", "dx10_clamp")
+
+
+def mode_skip_reason(mode, arch):
+    """Why a kernel's starting MODE cannot be set on this architecture, or None. A kernel that asks for one of
+    _MODE_FIXED on gfx1170+ (GFX11.7 and GFX12) is reported as not runnable there, rather than reaching the assembler,
+    which rejects the directive and, when every kernel of a chunk sets it, the whole chunk."""
+    fam = family(arch)
+    if not (fam == "gfx12" or (fam == "gfx11" and int(arch[5], 16) >= 7)):
+        return None
+    fixed = sorted(k for k in (mode or {}) if k in _MODE_FIXED)
+    if not fixed:
+        return None
+    return (f"MODE {', '.join(fixed)} cannot be set on {arch}: {', '.join(MODE_FIELDS[k] for k in fixed)} "
+            "is unsupported on gfx1170+ (the behaviour is fixed there)")
 
 
 # The global memory instructions GFX11 renamed, under their GFX10 names. A raw kernel body is written with the
@@ -115,6 +144,14 @@ def gfx10_spelling(line):
 def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
+    if int(arch[3:], 16) >= 0x1170:
+        unsupported = sorted(set(mode or {}) & set(_MODE_FIELDS_GONE_ON_GFX1170))
+        if unsupported:
+            fields = ", ".join(unsupported)
+            raise ModeUnavailable(
+                f"{fields} cannot be set on {arch}: AMD clang rejects .amdhsa_ieee_mode and .amdhsa_dx10_clamp "
+                "on gfx1170+, and the hardware keeps its fixed behaviour there; only denormal and rounding "
+                "mode fields are available")
     modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
     load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
     if fam == "gfx10":

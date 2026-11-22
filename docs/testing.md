@@ -114,6 +114,8 @@ python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
 ```
 
+For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed; their overlay layers ignore `VK_LOADER_LAYERS_DISABLE=~implicit~` and can inject unsupported swapchain flags.
+
 ## The Windows runtime on Linux, under Wine or Proton
 
 The Linux build above makes only the Vulkan programs. The loader (`gta6rt`), its shims and their tests are Windows
@@ -225,6 +227,17 @@ That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable
 `Fma` into two roundings, which is why `khr` exists. Neither the AMD (26.11.2) nor the NVIDIA (617.42) driver we tried
 does, so `cs_fma_fused` passing with `glsl` is not evidence that every driver is safe.
 
+## Hardware oracle (optional, AMD)
+
+`valu_fuzz.py`, `lds_fuzz.py`, `f32_fuzz.py` and `image_fuzz.py` take `--oracle hw`: the same programs run as native
+compute kernels on an AMD GPU (`tools/hw_oracle/`; setup in [shader_validation.md](shader_validation.md), "Hardware
+oracle"). It needs AMD clang with the amdgcn target (`LEONIDA_AMD_CLANG`), the AMD driver's HIP runtime and a host C
+compiler on Windows, or the libdrm launcher on Linux. Without them a run prints `hardware oracle unavailable: ...` and
+exits 77, so CI skips it. `image_fuzz.py --oracle hw` loads a linear texture through a T# built for the GPU's family
+(GFX11 on gfx11xx, GFX10 on gfx103x; `tests/test_image_fuzz_hw.py` has the exact words) and compares every texel with
+its CPU model; add `--negative-control` to check that wrong models are caught. A gfx1150 (RDNA3.5) is not RDNA2: a
+match supports the model and does not prove RDNA2. Run these one at a time: a second job on the same GPU can hang it.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example
@@ -245,6 +258,9 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 |---|---|---|
 | Windows refuses to start freshly built test programs ("An Application Control policy has blocked this file"), and the runner stops with a traceback | Smart App Control on Windows 11 | Turn Smart App Control off for the run |
 | Validation errors without a VUID, or messages from a layer you didn't ask for | An implicit Vulkan layer from other software (Rockstar Social Club, ReShade, MangoHud, an overlay) | Set `VK_LOADER_LAYERS_DISABLE=~implicit~` |
+| Validation errors that only your machine shows (e.g. `xbox_present`'s sRGB swapchain `STORAGE` message), with MSI Afterburner/RivaTuner or OBS installed | An overlay layer that hooks the swapchain: RivaTuner's `VK_LAYER_RTSS` adds `STORAGE` usage to it. On some setups it stays loaded even with `VK_LOADER_LAYERS_DISABLE=~implicit~` | Also set the layer's own switch: `DISABLE_RTSS_LAYER=1`, `DISABLE_VULKAN_OBS_CAPTURE=1` (OBS). Any other layer's switch is the `disable_environment` entry in its manifest (the JSON listed under `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers` or `HKCU\...`). `VK_LOADER_DEBUG=layer` prints the layers that were actually inserted |
+| Validation errors without a VUID, or messages from a layer you didn't ask for | An implicit Vulkan layer from other software (Rockstar Social Club, ReShade, MangoHud, an overlay) | Set `VK_LOADER_LAYERS_DISABLE=~implicit~`. Note that third-party overlays (RivaTuner `VK_LAYER_RTSS` from MSI Afterburner, OBS `VK_LAYER_OBS_HOOK`) stay loaded under `~implicit~` and can add `VK_IMAGE_USAGE_STORAGE_BIT` to swapchains; set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` to disable them |
+| False validation failures in `xbox_present` or present tests (e.g. sRGB swapchain `STORAGE` messages) with MSI Afterburner or OBS running | Overlay Vulkan layers (RivaTuner `VK_LAYER_RTSS`, OBS `VK_LAYER_OBS_HOOK`) remain active under `VK_LOADER_LAYERS_DISABLE=~implicit~` and inject `VK_IMAGE_USAGE_STORAGE_BIT` into swapchains | Set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` for validation runs |
 | Every test crashes inside `libnvidia-eglcore.so` | NVIDIA's 535 server driver (Ubuntu 24.04's default) | Use driver 615 or newer |
 | `build.py`: 0 translated, reason `.text` | An old `build.py` with LLVM 19 | Update to current `main` |
 | `vk_harness` doesn't compile: `VK_KHR_maintenance8` names unknown | Vulkan headers older than the SDK the code was written against | Update to current `main` (the code now builds without it), or use current Khronos Vulkan-Headers; conda-forge's package is too old |
