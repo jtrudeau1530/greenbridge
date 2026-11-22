@@ -5,7 +5,8 @@
 // (Sony vendor/product id, so SDL treats it as one and the shim takes the trigger-effect path) and a plain pad
 // without trigger motors. The test covers enumeration and device callbacks, readings and their button/axis mapping,
 // UI navigation, the guide button, rumble and trigger rumble as SDL receives them, the DualSense effect bytes for
-// each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, and unplugging and replugging. No game data.
+// each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, unplugging and replugging, and the reading history behind
+// GetNextReading/GetPreviousReading. No game data.
 #include <windows.h>
 
 #include <SDL3/SDL.h>
@@ -131,6 +132,177 @@ void CALLBACK on_guide(GameInputCallbackToken, void*, IGameInputDevice*, uint64_
 }
 
 void set_env(const char* name, const char* value) { SetEnvironmentVariableA(name, value); }
+
+uint32_t buttons_of(IGameInputReading* r) {
+    GameInputGamepadState s{};
+    return r && r->GetGamepadState(&s) ? s.buttons : ~0u;
+}
+
+IGameInputDevice* device_of(IGameInputReading* r) {  // devices live for the process: no reference is kept
+    IGameInputDevice* d = nullptr;
+    if (r) r->GetDevice(&d);
+    if (d) d->Release();
+    return d;
+}
+
+IGameInputReading* current(IGameInput* input, IGameInputDevice* device) {
+    IGameInputReading* r = nullptr;
+    input->GetCurrentReading(GameInputKindGamepad, device, &r);
+    return r;
+}
+
+// Steps GetNextReading (forward) or GetPreviousReading from ref until a step fails or limit readings are collected.
+// The readings are referenced; *last is the final result.
+std::vector<IGameInputReading*> walk(IGameInput* input, IGameInputReading* ref, IGameInputDevice* device, bool forward,
+                                     size_t limit, HRESULT* last = nullptr) {
+    std::vector<IGameInputReading*> out;
+    HRESULT hr = E_INVALIDARG;
+    for (IGameInputReading* at = ref; at && out.size() < limit; at = out.back()) {
+        IGameInputReading* r = nullptr;
+        hr = forward ? input->GetNextReading(at, GameInputKindGamepad, device, &r)
+                     : input->GetPreviousReading(at, GameInputKindGamepad, device, &r);
+        if (hr != S_OK) break;
+        out.push_back(r);
+    }
+    if (last) *last = hr;
+    return out;
+}
+
+void release_all(std::vector<IGameInputReading*>& v) {
+    for (IGameInputReading* r : v) r->Release();
+    v.clear();
+}
+
+// ---- keyboard pad: a fake key source instead of GetAsyncKeyState ----
+bool g_keys[256] = {};
+bool g_focus = false;
+bool fake_key_down(int vk) { return vk >= 0 && vk < 256 && g_keys[vk]; }
+bool fake_focus() { return g_focus; }
+
+GameInputGamepadState pad_state(IGameInput* input, IGameInputDevice* dev, uint32_t* ui = nullptr) {
+    GameInputGamepadState st{};
+    IGameInputReading* r = nullptr;
+    if (input->GetCurrentReading(GameInputKindGamepad, dev, &r) == S_OK && r) {
+        r->GetGamepadState(&st);
+        if (ui) {
+            GameInputUiNavigationState nav{};
+            r->GetUiNavigationState(&nav);
+            *ui = nav.buttons;
+        }
+        r->Release();
+    }
+    return st;
+}
+
+// Runs with no other pad connected and the device callback from main still registered.
+void test_keyboard_pad(IGameInput* input) {
+    rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+
+    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "keyboard pad: off by default");
+
+    set_env("LEONIDA_KEYBOARD_PAD", "1");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().keyboard_pad == rt::gameinput::KeyboardPadMode::Focused,
+          "keyboard pad: LEONIDA_KEYBOARD_PAD=1 is the focused mode");
+    const size_t events_before = g_device_events.size();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 1, "keyboard pad: attached as one gamepad");
+    // Main leaves three device callbacks registered (blocking, async and blocking enumeration), so one connect is
+    // reported to each of them: all with the same device.
+    IGameInputDevice* kb = g_device_events.size() > events_before ? g_device_events.back().device : nullptr;
+    bool connect_events = g_device_events.size() == events_before + 3;
+    for (size_t i = events_before; i < g_device_events.size(); ++i)
+        connect_events &= g_device_events[i].device == kb && (g_device_events[i].current & GameInputDeviceConnected) &&
+                          g_device_events[i].previous == GameInputDeviceNoStatus;
+    check(connect_events, "keyboard pad: device callbacks on connect");
+    if (!kb) return;
+    const GameInputDeviceInfo* info = kb->GetDeviceInfo();
+    check(info->displayName && std::strcmp(info->displayName->data, "Keyboard pad (Leonida)") == 0,
+          "keyboard pad: display name");
+    check((info->supportedInput & GameInputKindGamepad) && info->supportedRumbleMotors == 0,
+          "keyboard pad: a gamepad without motors");
+    check(pad_state(input, kb).buttons == 0, "keyboard pad: at rest");
+
+    // Out of focus, keys are ignored.
+    g_focus = false;
+    g_keys[VK_RETURN] = true;
+    rt::gameinput::poll();
+    check(pad_state(input, kb).buttons == 0, "keyboard pad: no buttons while another window has focus");
+
+    // In focus, every binding presses its button.
+    g_focus = true;
+    g_keys[VK_RETURN] = false;
+    struct Expect { int vk; uint32_t button; const char* what; };
+    const Expect expect[] = {
+        {VK_UP, GameInputGamepadDPadUp, "keyboard pad: Up is d-pad up"},
+        {VK_DOWN, GameInputGamepadDPadDown, "keyboard pad: Down is d-pad down"},
+        {VK_LEFT, GameInputGamepadDPadLeft, "keyboard pad: Left is d-pad left"},
+        {VK_RIGHT, GameInputGamepadDPadRight, "keyboard pad: Right is d-pad right"},
+        {VK_RETURN, GameInputGamepadA, "keyboard pad: Enter is A"},
+        {VK_BACK, GameInputGamepadB, "keyboard pad: Backspace is B"},
+        {'X', GameInputGamepadX, "keyboard pad: X is X"},
+        {'Y', GameInputGamepadY, "keyboard pad: Y is Y"},
+        {'Q', GameInputGamepadLeftShoulder, "keyboard pad: Q is the left shoulder"},
+        {'E', GameInputGamepadRightShoulder, "keyboard pad: E is the right shoulder"},
+        {VK_ESCAPE, GameInputGamepadMenu, "keyboard pad: Esc is Menu"},
+        {VK_TAB, GameInputGamepadView, "keyboard pad: Tab is View"},
+    };
+    for (const Expect& e : expect) {
+        g_keys[e.vk] = true;
+        rt::gameinput::poll();
+        check(pad_state(input, kb).buttons == e.button, e.what);
+        g_keys[e.vk] = false;
+    }
+    int bindings = 0;
+    rt::gameinput::keyboard_bindings(&bindings);
+    check(bindings == static_cast<int>(std::size(expect)), "keyboard pad: every binding is tested");
+
+    // Two keys at once, and UI navigation from the d-pad and A.
+    g_keys[VK_DOWN] = g_keys[VK_RETURN] = true;
+    rt::gameinput::poll();
+    uint32_t ui = 0;
+    const GameInputGamepadState both = pad_state(input, kb, &ui);
+    check(both.buttons == (GameInputGamepadDPadDown | GameInputGamepadA), "keyboard pad: Down and Enter together");
+    check((ui & GameInputUiNavigationDown) && (ui & GameInputUiNavigationAccept), "keyboard pad: UI navigation down and accept");
+    check(approx(both.leftTrigger, 0) && approx(both.rightTrigger, 0) && approx(both.leftThumbstickX, 0) &&
+              approx(both.rightThumbstickY, 0),
+          "keyboard pad: sticks and triggers stay at rest");
+
+    // Losing focus releases held keys.
+    g_focus = false;
+    rt::gameinput::poll();
+    check(pad_state(input, kb).buttons == 0, "keyboard pad: losing focus releases every button");
+
+    // The always mode ignores focus.
+    set_env("LEONIDA_KEYBOARD_PAD", "always");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(pad_state(input, kb).buttons == (GameInputGamepadDPadDown | GameInputGamepadA),
+          "keyboard pad: LEONIDA_KEYBOARD_PAD=always reads keys without focus");
+    g_keys[VK_DOWN] = g_keys[VK_RETURN] = false;
+
+    // Turning it off removes the pad; turning it on again brings back the same device object.
+    set_env("LEONIDA_KEYBOARD_PAD", "off");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0 && kb->GetDeviceStatus() == GameInputDeviceNoStatus,
+          "keyboard pad: off removes it");
+    set_env("LEONIDA_KEYBOARD_PAD", "1");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 1 && g_device_events.back().device == kb &&
+              (kb->GetDeviceStatus() & GameInputDeviceConnected),
+          "keyboard pad: on again is the same device object");
+
+    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
+    rt::gameinput::set_keyboard_source(nullptr, nullptr);
+}
 
 }  // namespace
 
@@ -445,12 +617,142 @@ int main() {
                                   nullptr, on_device, &blocking_token);
     check(g_device_events.size() == before.size() + 2, "blocking enumeration reports both pads before returning");
 
+    // ---- reading history: GetNextReading and GetPreviousReading ----
+    // A tap of A on the Xbox pad, pressed and released before the title reads again.
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_EAST, false);
+    rt::gameinput::poll();
+    IGameInputReading* idle = current(input, dev);
+    check(buttons_of(idle) == 0, "history: the reference reading is at rest");
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
+    rt::gameinput::poll();
+    HRESULT hr = S_OK;
+    std::vector<IGameInputReading*> seen = walk(input, idle, nullptr, true, 8, &hr);
+    check(seen.size() == 2 && buttons_of(seen[0]) == GameInputGamepadA && buttons_of(seen[1]) == 0 &&
+              hr == GAMEINPUT_E_READING_NOT_FOUND,
+          "history: GetNextReading gives a tap's press, its release, then READING_NOT_FOUND");
+    std::vector<IGameInputReading*> again = walk(input, seen.empty() ? nullptr : seen.back(), nullptr, false, 2);
+    check(again.size() == 2 && again[0] == seen[0] && again[1] == idle,
+          "history: GetPreviousReading walks back over the press to the reference");
+    release_all(again);
+    release_all(seen);
+    IGameInputReading* hit = nullptr;
+    check(input->GetNextReading(idle, GameInputKindGamepad | GameInputKindKeyboard, dev, &hit) == S_OK &&
+              buttons_of(hit) == GameInputGamepadA,
+          "history: a kind mask that includes the gamepad matches");
+    if (hit) hit->Release();
+    check(input->GetNextReading(idle, GameInputKindKeyboard, dev, &hit) == GAMEINPUT_E_READING_NOT_FOUND && !hit,
+          "history: keyboard alone finds no reading");
+    check(input->GetPreviousReading(idle, GameInputKindGamepad, dev, nullptr) == E_POINTER &&
+              input->GetPreviousReading(nullptr, GameInputKindGamepad, dev, &hit) == E_INVALIDARG && !hit,
+          "history: a null output is E_POINTER, a null reference E_INVALIDARG");
+
+    // Two pads in one stream, one poll each: A on the Xbox pad, B on the DualSense, Y on the Xbox pad.
+    IGameInputReading* start = current(input, dev);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_EAST, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_NORTH, true);
+    rt::gameinput::poll();
+    seen = walk(input, start, nullptr, true, 8, &hr);
+    const bool interleaved = seen.size() == 3 && device_of(seen[0]) == dev && device_of(seen[1]) == dsdev &&
+                             device_of(seen[2]) == dev && buttons_of(seen[1]) == GameInputGamepadB;
+    check(interleaved && hr == GAMEINPUT_E_READING_NOT_FOUND,
+          "history: with no device filter, both pads' readings come in the order they were taken");
+    if (interleaved) {
+        again = walk(input, seen[2], nullptr, false, 3);
+        check(again.size() == 3 && again[0] == seen[1] && again[1] == seen[0] && again[2] == start,
+              "history: GetPreviousReading gives the exact reverse");
+        release_all(again);
+        again = walk(input, start, dev, true, 8);
+        check(again.size() == 2 && again[0] == seen[0] && again[1] == seen[2], "history: a device filter skips the other pad");
+        release_all(again);
+        check(input->GetNextReading(seen[0], GameInputKindGamepad, dsdev, &hit) == S_OK && hit == seen[1],
+              "history: filtering on the other pad gives its next reading after the reference");
+        if (hit) hit->Release();
+        check(input->GetNextReading(seen[1], GameInputKindGamepad, dsdev, &hit) == GAMEINPUT_E_READING_NOT_FOUND && !hit,
+              "history: and never one of the reference's pad");
+    }
+    release_all(seen);
+    if (start) start->Release();
+
+    // Both pads change in one poll and their readings share a timestamp: each still comes once, in both directions.
+    IGameInputReading* pair_ref = current(input, dev);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_NORTH, false);
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_EAST, false);
+    rt::gameinput::poll();
+    seen = walk(input, pair_ref, nullptr, true, 8, &hr);
+    const bool paired = seen.size() == 2 && seen[0]->GetTimestamp() == seen[1]->GetTimestamp() &&
+                        device_of(seen[0]) != device_of(seen[1]);
+    check(paired && hr == GAMEINPUT_E_READING_NOT_FOUND, "history: two readings with one timestamp both come, once each");
+    if (paired) {
+        again = walk(input, seen[1], nullptr, false, 2);
+        check(again.size() == 2 && again[0] == seen[0] && again[1] == pair_ref, "history: and in reverse");
+        release_all(again);
+    }
+    release_all(seen);
+    if (pair_ref) pair_ref->Release();
+
+    // Ageing: a reading leaves the history once the reading after it is more than half a second old.
+    IGameInputReading* aged = current(input, dev);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
+    rt::gameinput::poll();
+    Sleep(600);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, false);
+    rt::gameinput::poll();
+    const uint32_t a_ls = GameInputGamepadA | GameInputGamepadLeftShoulder;
+    check(input->GetNextReading(aged, GameInputKindGamepad, dev, &hit) == S_OK && buttons_of(hit) == a_ls,
+          "history: a reference that has aged out still leads to its successor while that is kept");
+    if (hit) hit->Release();
+    check(input->GetPreviousReading(aged, GameInputKindGamepad, dev, &hit) == GAMEINPUT_E_REFERENCE_READING_TOO_OLD && !hit,
+          "history: GetPreviousReading on an aged-out reference is REFERENCE_READING_TOO_OLD");
+    Sleep(600);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
+    rt::gameinput::poll();
+    check(input->GetNextReading(aged, GameInputKindGamepad, dev, &hit) == GAMEINPUT_E_REFERENCE_READING_TOO_OLD && !hit &&
+              input->GetNextReading(aged, GameInputKindGamepad, nullptr, &hit) == GAMEINPUT_E_REFERENCE_READING_TOO_OLD && !hit,
+          "history: once a reading after the reference is dropped, GetNextReading is REFERENCE_READING_TOO_OLD");
+    check(buttons_of(aged) == GameInputGamepadA && device_of(aged) == dev,
+          "history: a reading the title holds stays readable after it leaves the history");
+    IGameInputReading* fresh = current(input, dev);
+    check(fresh && input->GetNextReading(fresh, GameInputKindGamepad, dev, &hit) == GAMEINPUT_E_READING_NOT_FOUND && !hit,
+          "history: after GetCurrentReading the title is caught up");
+
+    // Unplugging drops the pad's history; plugged back in, its last reading leads to the reconnect snapshot.
+    const uint64_t last_seq = fresh ? fresh->GetSequenceNumber(GameInputKindGamepad) : 0;
+    detach(xbox2);
+    rt::gameinput::poll();
+    check(input->GetNextReading(fresh, GameInputKindGamepad, dev, &hit) == GAMEINPUT_E_DEVICE_DISCONNECTED && !hit &&
+              input->GetPreviousReading(fresh, GameInputKindGamepad, dev, &hit) == GAMEINPUT_E_DEVICE_DISCONNECTED && !hit,
+          "history: filtering on an unplugged pad is DEVICE_DISCONNECTED");
+    check(input->GetNextReading(fresh, GameInputKindGamepad, nullptr, &hit) == GAMEINPUT_E_READING_NOT_FOUND && !hit,
+          "history: with no filter, nothing follows an unplugged pad's last reading");
+    check(buttons_of(fresh) == a_ls && device_of(fresh) == dev, "history: a held reading stays readable after unplugging");
+    attach(xbox2, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    rt::gameinput::poll();
+    IGameInputReading* reconnect = nullptr;
+    check(input->GetNextReading(fresh, GameInputKindGamepad, dev, &reconnect) == S_OK && device_of(reconnect) == dev &&
+              buttons_of(reconnect) == 0 && reconnect->GetSequenceNumber(GameInputKindGamepad) > last_seq,
+          "history: after replugging, the last reading before the unplug leads to the reconnect snapshot");
+    check(reconnect && input->GetPreviousReading(reconnect, GameInputKindGamepad, dev, &hit) == GAMEINPUT_E_READING_NOT_FOUND && !hit,
+          "history: nothing comes before the reconnect snapshot");
+    check(input->GetNextReading(aged, GameInputKindGamepad, dev, &hit) == GAMEINPUT_E_REFERENCE_READING_TOO_OLD && !hit,
+          "history: an older reading from before the unplug is REFERENCE_READING_TOO_OLD");
+    if (reconnect) reconnect->Release();
+    check(idle && aged && fresh && idle->Release() == 0 && aged->Release() == 0 && fresh->Release() == 0,
+          "history: dropped readings are freed once the title releases them");
+
     if (reading) reading->Release();
     dev->Release();
     detach(xbox2);
     detach(ds);
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "all pads closed after detaching");
+
+    test_keyboard_pad(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

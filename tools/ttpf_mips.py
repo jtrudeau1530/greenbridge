@@ -342,6 +342,8 @@ def block_means(pixels, blocks_w, blocks_h, pixels_w=None, pixels_h=None):
 
 
 def downsample2(blocks, blocks_w, blocks_h):
+    """2x2 mean over a block grid. This only predicts the child mip when the parent block grid
+    is exactly twice the child's; `check` uses `predict_child_means` instead."""
     ow, oh = max(1, blocks_w // 2), max(1, blocks_h // 2)
     out = []
     for y in range(oh):
@@ -360,10 +362,88 @@ def downsample2(blocks, blocks_w, blocks_h):
     return out
 
 
+class MipGeometryError(ValueError):
+    """Two adjacent mips do not form a 2x2 downsample, or a block list does not fit its mip."""
+
+
 def mean_abs_error(a, b):
+    if len(a) != len(b):
+        raise MipGeometryError(f"cannot compare {len(a)} predicted blocks with {len(b)} mip blocks")
     if not a:
         return None
     return sum(abs(x - y) for pa, pb in zip(a, b) for x, y in zip(pa, pb)) / (3 * len(a))
+
+
+def _visible_grid(mip):
+    """Return the (blocks_w, blocks_h) that hold visible texels, checking the block grid."""
+    pw, ph, bw, bh = mip["pixels_w"], mip["pixels_h"], mip["blocks_w"], mip["blocks_h"]
+    vw, vh = (pw + 3) // 4, (ph + 3) // 4
+    if pw < 1 or ph < 1 or bw < vw or bh < vh:
+        raise MipGeometryError(
+            f"mip {mip.get('index')} geometry: {bw}x{bh} blocks cannot hold {pw}x{ph} pixels")
+    return vw, vh
+
+
+def _visible_rows(layout, mip, data):
+    """Crop block-linear `data` from `detile` to the mip's visible blocks, tightly packed.
+
+    Storage grids can be wider or taller than the visible grid (17x13 BC1 stores its 8x6
+    child as 3x2 blocks); standard DDS readers expect only the visible rows. Aligned grids
+    are returned unchanged.
+    """
+    vw, vh = _visible_grid(mip)
+    bw, eb = mip["blocks_w"], layout["element_bytes"]
+    if (vw, vh) == (bw, mip["blocks_h"]):
+        return data
+    return b"".join(data[y * bw * eb:(y * bw + vw) * eb] for y in range(vh))
+
+
+def visible_block_means(means, mip):
+    """Select the `block_means` entries whose blocks hold visible texels, row-major."""
+    vw, vh = _visible_grid(mip)
+    bw = mip["blocks_w"]
+    if len(means) != bw * mip["blocks_h"]:
+        raise MipGeometryError(
+            f"mip {mip.get('index')} geometry: {len(means)} block means for "
+            f"{bw}x{mip['blocks_h']} blocks")
+    return [means[by * bw + bx] for by in range(vh) for bx in range(vw)]
+
+
+def predict_child_means(pixels, parent, child):
+    """Predict the visible block means of `child` as a 2x2 box downsample of `parent` pixels.
+
+    Child texel (x, y) is the mean of parent texels (2x + dx, 2y + dy), dx, dy in {0, 1},
+    clamped to the last visible parent row/column. Each child block averages only its
+    visible texels, so padding in either mip is never read. Returns one (r, g, b) per block
+    of the child's visible grid, ordered like `visible_block_means`.
+    """
+    pw, ph, cw, ch = parent["pixels_w"], parent["pixels_h"], child["pixels_w"], child["pixels_h"]
+    _visible_grid(parent)
+    vw, vh = _visible_grid(child)
+    if (cw, ch) != (max(1, pw // 2), max(1, ph // 2)):
+        raise MipGeometryError(
+            f"mip {child.get('index')} geometry: {cw}x{ch} is not the 2x2 downsample of {pw}x{ph}")
+    stride = parent["blocks_w"] * 4
+    if len(pixels) != stride * parent["blocks_h"] * 4:
+        raise MipGeometryError(
+            f"mip {parent.get('index')} geometry: {len(pixels)} pixels for "
+            f"{parent['blocks_w']}x{parent['blocks_h']} blocks")
+    out = []
+    for by in range(vh):
+        for bx in range(vw):
+            acc = [0.0, 0.0, 0.0]
+            n = 0
+            for y in range(by * 4, min(by * 4 + 4, ch)):
+                for x in range(bx * 4, min(bx * 4 + 4, cw)):
+                    for dy in range(2):
+                        row = min(ph - 1, 2 * y + dy) * stride
+                        for dx in range(2):
+                            q = pixels[row + min(pw - 1, 2 * x + dx)]
+                            for k in range(3):
+                                acc[k] += q[k]
+                            n += 1
+            out.append(tuple(a / n for a in acc))
+    return out
 
 
 # --- RDS5 / ETPF container ------------------------------------------------
@@ -1094,23 +1174,49 @@ def describe(pool, index):
     return out
 
 
-def _check_mip_chain_means(layout, fmt, slice_bytes_fn):
-    """Detile every mip of one 2D slice and return (means_per_mip, mip_errors)."""
-    means = []
-    for mip in layout["mips"]:
+def _check_mip_chain(layout, fmt, slice_bytes_fn):
+    """Detile every mip of one 2D slice and return (means_per_mip, mip_errors, predictions).
+
+    predictions[k] is the visible-block prediction for mip k from the decoded pixels of
+    mip k - 1 (None for mip 0 or an undecodable parent); mip_errors[k - 1] compares it with
+    mip k's visible blocks, so odd parent block counts and partial edge blocks are covered.
+    """
+    means, errs, preds = [], [], [None]
+    prev_px = None
+    for k, mip in enumerate(layout["mips"]):
         data = detile(layout, mip, slice_bytes_fn(mip))
         px = decode_pixels(fmt, data, mip["blocks_w"], mip["blocks_h"])
         means.append(None if px is None else block_means(
             px, mip["blocks_w"], mip["blocks_h"], mip["pixels_w"], mip["pixels_h"]))
-    errs = []
-    for k in range(1, len(layout["mips"])):
-        if means[k - 1] is None or means[k] is None:
-            errs.append(None)
-            continue
-        pm = layout["mips"][k - 1]
-        errs.append(round(mean_abs_error(downsample2(means[k - 1], pm["blocks_w"], pm["blocks_h"]),
-                                         means[k]), 2))
+        if k:
+            pred = None if prev_px is None else predict_child_means(prev_px, layout["mips"][k - 1], mip)
+            preds.append(pred)
+            errs.append(None if pred is None or px is None else round(
+                mean_abs_error(pred, visible_block_means(means[k], mip)), 2))
+        prev_px = px
+    return means, errs, preds
+
+
+def _check_mip_chain_means(layout, fmt, slice_bytes_fn):
+    """Detile every mip of one 2D slice and return (means_per_mip, mip_errors)."""
+    means, errs, _ = _check_mip_chain(layout, fmt, slice_bytes_fn)
     return means, errs
+
+
+def _tail_origin_control(layout, fmt, tiled, preds):
+    """Negative control: the first tail mip decoded at the tile origin instead of its in-tile
+    offset, against its prediction from the parent mip. None when it cannot be decoded."""
+    ft = layout["first_tail"]
+    if not preds or ft >= len(preds) or preds[ft] is None:
+        return None
+    tm = layout["mips"][ft]
+    bad = dict(tm, tile_x=0, tile_y=0)
+    data = detile(layout, bad, tiled[:layout["tile"]])
+    px = decode_pixels(fmt, data, tm["blocks_w"], tm["blocks_h"])
+    if px is None:
+        return None
+    means = block_means(px, tm["blocks_w"], tm["blocks_h"], tm["pixels_w"], tm["pixels_h"])
+    return round(mean_abs_error(preds[ft], visible_block_means(means, tm)), 2)
 
 
 def _read_range_or_block(pool, start, size, cache, bcpack_mode, index, shape=None,
@@ -1134,6 +1240,14 @@ def _read_range_or_block(pool, start, size, cache, bcpack_mode, index, shape=Non
 
 
 def check(pool, index, *, allow_provisional=False, history=None):
+    try:
+        return _check_texture(pool, index, allow_provisional=allow_provisional, history=history)
+    except MipGeometryError as exc:
+        print(json.dumps(dict(index=index, blocked=str(exc)), indent=1))
+        return 2
+
+
+def _check_texture(pool, index, *, allow_provisional=False, history=None):
     a = analyze(pool, index)
     if "layout" not in a or "available" not in a or a.get("blocked"):
         print(json.dumps(dict(index=index, blocked=a.get("blocked")), indent=1))
@@ -1226,10 +1340,10 @@ def check(pool, index, *, allow_provisional=False, history=None):
             return 2
         per_face_max = []
         all_errs = []
-        face0_means = None
+        face0_preds = None
         for face in range(6):
             fbase = face * layout["face_size"]
-            means, errs = _check_mip_chain_means(
+            means, errs, preds = _check_mip_chain(
                 layout, d["format"],
                 lambda m, b0=fbase: tiled[b0 + m["offset"]:b0 + m["offset"] + m["region"]])
             if all(m is None for m in means):
@@ -1238,20 +1352,12 @@ def check(pool, index, *, allow_provisional=False, history=None):
                     "(71/72/77/78/80/83)")), indent=1))
                 return 2
             if face == 0:
-                face0_means = means
+                face0_preds = preds
             per_face_max.append(max((e for e in errs if e is not None), default=None))
             all_errs.extend(errs)
         control = None
-        if 0 < layout["first_tail"] < d["mips"] and face0_means and face0_means[layout["first_tail"] - 1] is not None:
-            tm = layout["mips"][layout["first_tail"]]
-            bad = dict(tm, tile_x=0, tile_y=0)
-            data = detile(layout, bad, tiled[:layout["tile"]])
-            px = decode_pixels(d["format"], data, tm["blocks_w"], tm["blocks_h"])
-            if px is not None:
-                pm = layout["mips"][layout["first_tail"] - 1]
-                control = round(mean_abs_error(
-                    downsample2(face0_means[layout["first_tail"] - 1], pm["blocks_w"], pm["blocks_h"]),
-                    block_means(px, tm["blocks_w"], tm["blocks_h"], tm["pixels_w"], tm["pixels_h"])), 2)
+        if 0 < layout["first_tail"] < d["mips"]:
+            control = _tail_origin_control(layout, d["format"], tiled, face0_preds)
         result = dict(index=index, shape=shape, width=d["width"], height=d["height"],
                       depth=6, format=d["format"], mips=d["mips"], non_tail=d["non_tail"],
                       snapshots=layout["snapshots"], data_offset=layout["data_offset"],
@@ -1266,7 +1372,7 @@ def check(pool, index, *, allow_provisional=False, history=None):
                                  bcpack_history=history)
     if tiled is None:
         return 2
-    means, errs = _check_mip_chain_means(
+    means, errs, preds = _check_mip_chain(
         layout, d["format"],
         lambda m: tiled[m["offset"]:m["offset"] + m["region"]])
     if all(m is None for m in means):
@@ -1275,16 +1381,8 @@ def check(pool, index, *, allow_provisional=False, history=None):
             "(71/72/77/78/80/83)")), indent=1))
         return 2
     control = None
-    if 0 < layout["first_tail"] < d["mips"] and means[layout["first_tail"] - 1] is not None:
-        tm = layout["mips"][layout["first_tail"]]
-        bad = dict(tm, tile_x=0, tile_y=0)
-        data = detile(layout, bad, tiled[:layout["tile"]])
-        px = decode_pixels(d["format"], data, tm["blocks_w"], tm["blocks_h"])
-        if px is not None:
-            pm = layout["mips"][layout["first_tail"] - 1]
-            control = round(mean_abs_error(
-                downsample2(means[layout["first_tail"] - 1], pm["blocks_w"], pm["blocks_h"]),
-                block_means(px, tm["blocks_w"], tm["blocks_h"], tm["pixels_w"], tm["pixels_h"])), 2)
+    if 0 < layout["first_tail"] < d["mips"]:
+        control = _tail_origin_control(layout, d["format"], tiled, preds)
     result = dict(index=index, width=d["width"], height=d["height"], format=d["format"],
                   mips=d["mips"], non_tail=d["non_tail"], first_tail=layout["first_tail"],
                   tile=layout["tile"], chain_error=errs, max_error=max(
@@ -1361,7 +1459,7 @@ def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=F
                     tiled = pool.read_range(d["base"] + mip["offset"] + s * mip["slice_stride"],
                                             mip["region"], cache,
                                             bcpack_mode=bcpack_mode, bcpack_history=history)
-                    payload += detile(layout, mip, tiled)
+                    payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
         elif shape == "cubemap":
             face_base = d["base"] + layout["data_offset"]
             for face in range(6):
@@ -1369,12 +1467,12 @@ def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=F
                     tiled = pool.read_range(face_base + face * layout["face_size"] + mip["offset"],
                                             mip["region"], cache,
                                             bcpack_mode=bcpack_mode, bcpack_history=history)
-                    payload += detile(layout, mip, tiled)
+                    payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
         else:
             for mip in layout["mips"][:count]:
                 tiled = pool.read_range(d["base"] + mip["offset"], mip["region"], cache,
                                         bcpack_mode=bcpack_mode, bcpack_history=history)
-                payload += detile(layout, mip, tiled)
+                payload += _visible_rows(layout, mip, detile(layout, mip, tiled))
     except BcpackRequired as exc:
         print(f"texture {index}: {exc}", file=sys.stderr)
         return 2
@@ -1386,13 +1484,14 @@ def export(pool, index, out_path, mips=None, force=False, *, allow_provisional=F
         print(f"texture {index}: {exc}", file=sys.stderr)
         return 2
     if 148 + len(payload) > MAX_OUTPUT:
+        # MipGeometryError from _visible_rows is a ValueError and is reported above.
         print("DDS exceeds the 256 MiB output limit", file=sys.stderr)
         return 2
     if os.path.exists(out_path) and not force:
         print(f"{out_path} exists; pass --force to replace it", file=sys.stderr)
         return 2
-    top = layout["mips"][0]
-    linear = (top["blocks_w"] * top["blocks_h"] * layout["element_bytes"]
+    top_w, top_h = (_visible_grid(layout["mips"][0]) if d["format"] in BC_FORMATS else (0, 0))
+    linear = (top_w * top_h * layout["element_bytes"]
               if d["format"] in BC_FORMATS else d["width"] * layout["element_bytes"])
     blob = dds_bytes(
         d["width"], d["height"], d["format"], count, linear, bytes(payload),

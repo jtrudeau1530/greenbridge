@@ -198,7 +198,7 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | `scaleXY` | `9ca32637` | +0x54 | f32 | XY scale |
 | `scaleZ` | `10fb7c42` | +0x58 | f32 | Z scale |
 | `flags` | `67d26872` | +0x48 | u32 | entity flags |
-| entity id | `1b60404d` | +0x08 | u64 | per-entity id (unique; not a name key) |
+| entity id | `1b60404d` | +0x08 | u64 | per-entity id (not a name key; not unique, see world_names.md) |
 | archetype key | `c8a7b90a` | +0x20 | u64 | per-archetype key: MurmurHash3 x64 128 low 64 of the name |
 | `lodLevel` | `6c8f1715` | +0x7e | u8 | 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4 |
 | `parentIndex` | `d89231bd` | +0x5c | i16 | parent entity index (signed; -1 = none) |
@@ -225,7 +225,9 @@ table, not fixed offsets.
 assuming it. A local 79,738-name dictionary resolved 5,107/24,105 distinct archetype hashes (8,263/203,799
 entities) in two 1 GiB windows, every one confirmed by the 64-bit key, and rejected one 32-bit-only candidate.
 The same dictionary resolved 5/23,535 map names and 1/2,089 parent rows, all confirmed by the map key. This is a
-name-source lower bound, not a formula limit. See [world_names.md](world_names.md) and `tools/world_names.py`.
+name-source lower bound, not a formula limit: with the names `tools/rpf9_names.py` lists in `levels.rpf`, 99.85%
+of the 1,670,435 entities a whole-archive `world_index.py` run reads resolve, all verified by the 64-bit key. See [world_names.md](world_names.md) and
+`tools/world_names.py`.
 
 ### Measured placement summary
 
@@ -284,12 +286,11 @@ Hash-only or opaque:
 - map file `name`/`parent` (32-bit hashes; `parent` is non-zero in 2,089 of the 23,535 census maps). A local
   dictionary resolves 5 names and 1 parent; all five names are confirmed by the map root's 64-bit key. The
   remaining map-cell names are not in the local model/XML exports;
-- most `archetypeName` values. The repo's model export reports 350,248 models with names/bounds, but the local
-  dictionary used here contains 79,738 exact names. It resolves 5,107 of 24,105 distinct archetype hashes
-  (8,263 of 203,799 entities, 4.05%) in the two 1 GiB windows in [world_names.md](world_names.md); every match
-  is confirmed by the 64-bit key. The unresolved 95.95% are hash-only because their names are not in the local
-  exports, not because a different formula was observed. This is a lower bound, not a claim that the names do
-  not exist;
+- `archetypeName` values are 32-bit hashes, but nearly all of them resolve. With the `name.#dr`/`name.#ft` strings
+  that `tools/rpf9_names.py` lists in `levels.rpf` as the dictionary, 1,667,978 of 1,670,435 entities (99.85%,
+  227,422 of 228,681 distinct hashes) resolve, every one verified by the entity's 64-bit key; see
+  [world_names.md](world_names.md#whole-archive-coverage). The earlier figures (5,107 of 24,105 hashes, 8,263 of
+  203,799 entities = 4.05%, in two 1 GiB windows) used only names already exported locally;
 - texture keys do not appear in placement records. They are 64-bit asset keys in model materials, so a runtime
   resolves placement → archetype → model → material asset key;
 - the 0–2 GiB 7-struct family's field semantics and most of its payload;

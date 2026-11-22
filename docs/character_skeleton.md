@@ -148,6 +148,12 @@ The practical rule for exporters: use `0xC8E8C282` as albedo, and **do not fall 
 first texture** when it is absent. A normal map painted as a base colour is the usual symptom
 of that fallback.
 
+To apply this rule, pass `--base-color-param C8E8C282` to `tools/world_build.py` (or
+`base_color_param="C8E8C282"` to `build_world`): only references with that parameter hash are
+used as base colour, and materials without a resolvable match stay untextured clay. Without the
+option the exporter keeps its existing first-resolvable-reference behaviour, because these hash
+roles are measured only on the character corpus.
+
 ## Reproduction
 
 The measurement tools were local and are not part of this repository. A reader can reproduce

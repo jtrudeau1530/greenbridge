@@ -61,7 +61,7 @@ class PixelTestOnDeviceWithoutAFeature(unittest.TestCase):
     """run_gpu_tests.py's pixel branch with a fake vk_harness that exits 77 (no assembler or GPU needed)."""
 
     def test_the_skip_is_reported_once(self):
-        def fake_run_cmd(cmd, env=None):
+        def fake_run_cmd(cmd, env=None, gpu=True):
             if cmd[0] == sys.executable:                    # the translator: leave the .spv it would write
                 Path(cmd[cmd.index("--out") + 1], "ps_bary.spv").touch()
                 return 0, ""

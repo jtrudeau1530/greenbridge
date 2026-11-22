@@ -8,12 +8,14 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include "vulkan_depth24.h"
 #include "vulkan_replay.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -21,6 +23,18 @@
 #include <vector>
 
 namespace leonida {
+
+// VK_EXT_debug_utils labels: an instance extension, so a device has them only when its instance enabled it.
+struct DebugLabelFunctions {
+    PFN_vkCmdInsertDebugUtilsLabelEXT cmd_insert = nullptr;
+    PFN_vkCmdBeginDebugUtilsLabelEXT cmd_begin = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT cmd_end = nullptr;
+    PFN_vkQueueInsertDebugUtilsLabelEXT queue_insert = nullptr;
+    PFN_vkQueueBeginDebugUtilsLabelEXT queue_begin = nullptr;
+    PFN_vkQueueEndDebugUtilsLabelEXT queue_end = nullptr;
+
+    bool complete() const { return cmd_insert && cmd_begin && cmd_end && queue_insert && queue_begin && queue_end; }
+};
 
 struct VulkanDeviceFunctions {
 #define LEONIDA_VK_DEVICE_FUNCTIONS(X)                                                                         \
@@ -123,6 +137,17 @@ public:
     bool loaded() const { return loaded_; }
     VkDevice device() const { return device_; }
 
+    // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
+    // are ignored, so markers stay no-ops.
+    void enable_debug_labels(const DebugLabelFunctions& labels) {
+        if (!labels.complete()) return;
+        labels_ = labels;
+        replay_.insert_label = labels.cmd_insert;
+        replay_.begin_label = labels.cmd_begin;
+        replay_.end_label = labels.cmd_end;
+    }
+    bool debug_labels() const { return labels_.complete(); }
+
     // Registers a resource in its D3D12 initial state (a legacy state; images get the matching layout).
     // The image must already be in that layout, e.g. transitioned from UNDEFINED at creation.
     void add_resource(ResourceId id, const ResourceBinding& binding) {
@@ -173,6 +198,11 @@ public:
         return tracker_.layout(id, subresource);
     }
 
+    bool has_resource(ResourceId id) {
+        std::lock_guard lock(mutex_);
+        return resources_.find(id) != resources_.end();
+    }
+
     // `prepare` is called with the context locked, at the start of the command buffer of every
     // ExecuteCommandLists, before the lists are written: the device brings the bindless set 0 of the translated
     // shaders up to date there (vulkan_bindless.h) and records what the set needs first. When it fails, nothing
@@ -180,6 +210,22 @@ public:
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::lock_guard lock(mutex_);
         bindless_prepare_ = std::move(prepare);
+    }
+
+    // D24_UNORM_S8_UINT stored as D32: copies of its depth plane run a compute pass (vulkan_depth24.h). `allocate`
+    // gives the scratch buffers device-local memory. Without this such a copy is refused as unsupported.
+    void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate,
+                       std::uint64_t max_storage_range = 1u << 27) {
+        std::lock_guard lock(mutex_);
+        depth24_ = std::make_unique<Depth24Converter>(get, device_, std::move(allocate), max_storage_range);
+        if (!depth24_->loaded()) {
+            depth24_.reset();
+            return;
+        }
+        replay_.depth24_prepare = [this](Depth24Job& job, std::vector<Depth24Job>& parts) { return depth24_->prepare(job, parts); };
+        replay_.depth24_run = [this](VkCommandBuffer command_buffer, const Depth24Job& job) {
+            depth24_->run(command_buffer, job);
+        };
     }
 
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
@@ -231,10 +277,12 @@ private:
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
+    std::unique_ptr<Depth24Converter> depth24_;
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
     ReplayFunctions replay_;
+    DebugLabelFunctions labels_;
 };
 
 // A Vulkan timeline semaphore with D3D12 fence semantics for the host side.
@@ -306,7 +354,12 @@ public:
         auto& vk = context_.vk;
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
+            for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
             vk.vkQueueWaitIdle(queue_);
+        }
+        if (progress_) {
+            std::lock_guard lock(context_.mutex_);
+            if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -321,6 +374,7 @@ public:
     // the layout tracker as it was. Pending Wait()s are attached to this submission.
     ReplayResult execute(std::span<const CommandList* const> lists) {
         std::lock_guard lock(context_.mutex_);
+        if (context_.depth24_) context_.depth24_->collect();
         std::vector<PreparedList> prepared(lists.size());
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         for (std::size_t i = 0; i < lists.size(); ++i) {
@@ -339,7 +393,9 @@ public:
             if (context_.bindless_commit_) context_.bindless_commit_(submitted);
             return ReplayResult::unsupported;
         }
-        for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
+        std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
+        for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_, &open_labels);
+        close_labels(command_buffer, context_.replay_, open_labels);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.
         VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -349,6 +405,7 @@ public:
                                          0, 1, &host, 0, nullptr, 0, nullptr);
         context_.vk.vkEndCommandBuffer(command_buffer);
         const bool submitted = submit(command_buffer, VK_NULL_HANDLE, 0);
+        if (context_.depth24_) context_.depth24_->retire(progress_, submitted_);  // what this list's copies prepared
         if (context_.bindless_commit_) context_.bindless_commit_(submitted);
         return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
@@ -361,6 +418,26 @@ public:
     void wait(VkSemaphore fence, std::uint64_t value) {
         waits_.push_back(fence);
         wait_values_.push_back(value);
+    }
+
+    // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
+    // with no begin open on this queue is dropped, as Vulkan requires a matching begin. No-ops without the extension.
+    void marker(DebugMarker::Kind kind, const char* label) {
+        const DebugLabelFunctions& f = context_.labels_;
+        if (!f.complete()) return;
+        if (kind == DebugMarker::Kind::end && !open_labels_) return;
+        VkDebugUtilsLabelEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+        info.pLabelName = label ? label : "";
+        std::lock_guard lock(context_.submit_mutex());
+        if (kind == DebugMarker::Kind::set) {
+            f.queue_insert(queue_, &info);
+        } else if (kind == DebugMarker::Kind::begin) {
+            f.queue_begin(queue_, &info);
+            ++open_labels_;
+        } else {
+            f.queue_end(queue_);
+            --open_labels_;
+        }
     }
 
     bool idle() {
@@ -431,6 +508,7 @@ private:
     std::vector<std::pair<VkCommandBuffer, std::uint64_t>> buffers_;  // buffer, ticket that frees it
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
+    std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
 };
 

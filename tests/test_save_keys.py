@@ -3,6 +3,7 @@
 
     python -I tests/test_save_keys.py
 """
+import collections
 import contextlib
 import io
 import json
@@ -85,6 +86,18 @@ class Resolve(unittest.TestCase):
             saves.extract(self.jsav, out)
         self.assertEqual(set(sk.collect_keys([out])), set(sk.collect_keys([self.jsav])))
 
+    def test_directory_scan_reads_jsav_files(self):
+        # #844: a folder of .jsav saves counts the same as naming each file
+        with open(self.jsav, "rb") as f:
+            data = f.read()
+        folder = os.path.join(self.dir, "saves")
+        os.makedirs(folder)
+        for name in ("a.jsav", "b.ASAV", "c.bin", "d"):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+        one = sk.collect_keys([self.jsav])
+        self.assertEqual(sk.collect_keys([folder]), collections.Counter({k: 4 * n for k, n in one.items()}))
+
     def test_resolve_counts_per_family(self):
         res = os.path.join(self.dir, "res.json")
         text = run(["resolve", self.jsav, "--dict", self.dict, "--out", res])
@@ -164,6 +177,43 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertIn("JSAV header declares 4 entries", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("0 distinct keys", r.stdout)
+
+
+class DirectoryScanTest(unittest.TestCase):
+    """A directory of saves must include .jsav files, not just .bin/.json/extensionless names."""
+
+    def jsav(self, key):
+        data = bytearray(b"JSAV" + struct.pack("<III", 0, 1, 0))
+        data += struct.pack("<I", key) + bytes(16)
+        return bytes(data)
+
+    def test_jsav_files_in_a_directory_are_collected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a.jsav", "b.JSAV", "c.bin", "plain"):
+                with open(os.path.join(tmp, name), "wb") as f:
+                    f.write(self.jsav(0x12345678))
+            keys = sk.collect_keys([tmp])
+            self.assertEqual(keys[0x12345678], 4)
+
+    def test_warning_names_the_offending_file_in_a_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "broken.bin")
+            with open(path, "wb") as f:
+                f.write(b"JSAV" + struct.pack("<III", 0, 4, 0))  # claims 4 entries, has no table
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                keys = sk.collect_keys([tmp])
+            self.assertEqual(keys, {})
+            self.assertIn("broken.bin", err.getvalue())
+            self.assertIn("JSAV header declares 4 entries", err.getvalue())
+            self.assertEqual(err.getvalue().count("warning:"), 1)
+
+    def test_direct_jsav_file_still_matches_directory_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "save.jsav")
+            with open(path, "wb") as f:
+                f.write(self.jsav(0xABCDEF01))
+            self.assertEqual(sk.collect_keys([path]), sk.collect_keys([tmp]))
 
 
 if __name__ == "__main__":
