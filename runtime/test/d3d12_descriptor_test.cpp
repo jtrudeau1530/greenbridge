@@ -1981,6 +1981,17 @@ int main() {
             }
             std::array<std::uint8_t, 3 * bytes> mm_pixels{};
             EXPECT(sample_through_set(d, set0, set0_layout, mm_keys, mm_pixels.data()));
+            const auto get_fmt_props =
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+            VkFormatProperties rgba8_props{}, bc1_props{};
+            get_fmt_props(d.physical, VK_FORMAT_R8G8B8A8_UNORM, &rgba8_props);
+            get_fmt_props(d.physical, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &bc1_props);
+            const bool rgba8_minmax =
+                d.sampler_filter_minmax &&
+                (rgba8_props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
+            const bool bc1_minmax =
+                d.sampler_filter_minmax &&
+                (bc1_props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
             constexpr std::array<std::uint8_t, 4> want_min{16, 16, 16, 255};
             constexpr std::array<std::uint8_t, 4> want_max{240, 240, 240, 255};
             UINT min_matches = 0, max_matches = 0, blend_diff_min = 0, blend_diff_max = 0;
@@ -1988,7 +1999,7 @@ int main() {
                 const auto* got_min = &mm_pixels[0 * bytes + i * 4];
                 const auto* got_max = &mm_pixels[1 * bytes + i * 4];
                 const auto* got_blend = &mm_pixels[2 * bytes + i * 4];
-                if (d.sampler_filter_minmax) {
+                if (rgba8_minmax) {
                     min_matches += std::memcmp(got_min, want_min.data(), 4) == 0;
                     max_matches += std::memcmp(got_max, want_max.data(), 4) == 0;
                     blend_diff_min += std::memcmp(got_blend, want_min.data(), 4) != 0;
@@ -1998,10 +2009,12 @@ int main() {
                     max_matches += std::memcmp(got_max, got_blend, 4) == 0;
                 }
             }
-            std::printf("sampler reduction min/max: min %u/%u, max %u/%u (blend differed: %u/%u vs min, %u/%u vs max)\n",
-                        min_matches, texels, max_matches, texels, blend_diff_min, texels, blend_diff_max, texels);
+            std::printf("sampler reduction min/max (RGBA8=%s, BC1=%s): min %u/%u, max %u/%u (blend differed: %u/%u vs "
+                        "min, %u/%u vs max)\n",
+                        rgba8_minmax ? "yes" : "no", bc1_minmax ? "yes" : "no", min_matches, texels, max_matches,
+                        texels, blend_diff_min, texels, blend_diff_max, texels);
             EXPECT(min_matches == texels && max_matches == texels);
-            if (d.sampler_filter_minmax) EXPECT(blend_diff_min == texels && blend_diff_max == texels);
+            if (rgba8_minmax) EXPECT(blend_diff_min == texels && blend_diff_max == texels);
 #endif
         }
 
