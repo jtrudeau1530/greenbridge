@@ -450,11 +450,13 @@ this. Images have their own fuzzer (`tools/image_fuzz.py`, below).
 The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
 random DST_SEL of 0/1/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
 (`16_16_SNORM`, `8_8_8_8_UNORM`, `8_8_8_8_UINT`, `2_10_10_10_UNORM`, `16_16_16_16_UINT`, about 53,000
-instructions) with an identity swizzle. Its reference decodes each element from the GFX10 format *name*
-(`tools/gfx10_formats.json`; channel widths listed from the top bit), not from the translator's own
-table: UNORM/SNORM correctly rounded (`x/(2ⁿ−1)`), missing channels *c* mod *n*, DST_SEL 1 = integer 1
-for UINT/SINT and 1.0f otherwise (SHADER-86, RX 6700). Elements are naturally aligned. Left out: whether
-`tbuffer` applies the V#'s DST_SEL (unmeasured).
+instructions). Generated MTBUF cases use a bound 32_UINT V# and take their data format from the
+instruction. The reference decodes elements from the GFX10 format *name* in `tools/gfx10_formats.json`
+(channel widths listed from the top bit). UNORM/SNORM values use correctly rounded division.
+MUBUF repeats missing channels (*c* mod *n*) and DST_SEL 1 gives integer 1 for UINT/SINT and 1.0f
+otherwise (SHADER-86, RX 6700). MTBUF loads return instruction-format channels in order, zero-fill
+missing channels and return zero for an INVALID V# format (native gfx1036, wave32 and wave64).
+Elements are naturally aligned.
 
 Over 5,000 programs the reference and translator match bit for bit; breaking the `16_16_SNORM` kind, the
 `8_8_8_8_UINT` widths or the DST_SEL order in the translator makes 33, 37 and 191 of 300 programs fail.
