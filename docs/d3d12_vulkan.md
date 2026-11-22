@@ -2310,9 +2310,11 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   - **What sets the 49th apart: one error kind.** It is the only shader of the 53 that the validator reports for a
     resource in a function signature (a non-entry function that takes a resource). Its other counts are 265
     `extractvalue`, 6 Xbox externals and 514 `i64` mentions; the 36th shader has the same 265 and 468 and is created.
-  - **Workaround: the test switches to WARP on NVIDIA.** On an NVIDIA adapter (PCI vendor `0x10DE`), `bvh_builder_test`
-    now uses WARP unless `LEONIDA_BVH_HARDWARE=1`, and it prints the reason. WARP creates all 53 PSOs, and the
-    constructor and destructor return. It isn't known whether AMD hardware takes these shaders.
+  - **Workaround: the test uses WARP on every hardware vendor.** AMD doesn't take these shaders either: on an RX 7900
+    XTX (32.0.32029.2010) the constructor faults with `0xC0000005` right after the first slot 62 call (RT-89, #166).
+    So `bvh_builder_test` uses WARP whenever there is a hardware adapter, unless `LEONIDA_BVH_HARDWARE=1`, and it
+    prints the reason with the adapter's PCI vendor id. WARP creates all 53 PSOs, and the constructor and destructor
+    return.
   - **The runtime itself still shouldn't hand Xbox DXIL to a PC driver.** These shaders need lowering to PC DXIL or a
     translation of their own (section 7.2, M6) before they can run on hardware.
 
