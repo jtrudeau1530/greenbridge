@@ -36,6 +36,9 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+                                 IUnknown* device = nullptr);
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.
@@ -81,6 +84,15 @@ struct VulkanDeviceInfo {
     bool pipeline_statistics_query = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
+    // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
+    // do nothing.
+    bool debug_utils = false;
+    // Vulkan 1.2 bufferDeviceAddress is enabled: buffers carry VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT and
+    // ID3D12Resource::GetGPUVirtualAddress() returns the Vulkan buffer device address.
+    bool buffer_device_address = false;
+    // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
+    // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
+    bool ray_tracing = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -97,6 +109,12 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
+// The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
+VkBuffer vulkan_buffer(ID3D12Resource* resource);
+// True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
+bool device_supports_ray_tracing(ID3D12Device* device);
+// The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
+VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
@@ -123,6 +141,10 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // True when GetClockCalibration on `queue` reads calibrated timestamps, false when it submits a timestamp query
 // (or `queue` is not one of this module's queues). For tests.
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
+
+// Creates a Vulkan-backed IDXGIFactory4 bound to `device`'s VulkanContext, instance, physical device, and queue.
+// Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
+HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);

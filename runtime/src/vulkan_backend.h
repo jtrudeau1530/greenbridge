@@ -24,6 +24,18 @@
 
 namespace leonida {
 
+// VK_EXT_debug_utils labels: an instance extension, so a device has them only when its instance enabled it.
+struct DebugLabelFunctions {
+    PFN_vkCmdInsertDebugUtilsLabelEXT cmd_insert = nullptr;
+    PFN_vkCmdBeginDebugUtilsLabelEXT cmd_begin = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT cmd_end = nullptr;
+    PFN_vkQueueInsertDebugUtilsLabelEXT queue_insert = nullptr;
+    PFN_vkQueueBeginDebugUtilsLabelEXT queue_begin = nullptr;
+    PFN_vkQueueEndDebugUtilsLabelEXT queue_end = nullptr;
+
+    bool complete() const { return cmd_insert && cmd_begin && cmd_end && queue_insert && queue_begin && queue_end; }
+};
+
 struct VulkanDeviceFunctions {
 #define LEONIDA_VK_DEVICE_FUNCTIONS(X)                                                                         \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer)         \
@@ -35,10 +47,14 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)     \
-    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)            \
-    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) \
-    X(vkCmdCopyQueryPoolResults)
+    X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)        \
+    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)               \
+    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp)    \
+    X(vkCmdCopyQueryPoolResults) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDrawIndirectCount)    \
+    X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatchIndirect) X(vkGetBufferDeviceAddress)                      \
+    X(vkGetAccelerationStructureBuildSizesKHR) X(vkCreateAccelerationStructureKHR)                             \
+    X(vkDestroyAccelerationStructureKHR) X(vkGetAccelerationStructureDeviceAddressKHR)                         \
+    X(vkCmdBuildAccelerationStructuresKHR)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -67,9 +83,10 @@ struct VulkanDeviceFunctions {
 class VulkanContext {
 public:
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
+    // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
-                  bool conditional_rendering = false)
-        : device_(device), tracker_(separate_depth_stencil_layouts) {
+                  bool conditional_rendering = false, bool ray_tracing = false)
+        : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
         replay_.clear_color_image = vk.vkCmdClearColorImage;
@@ -96,6 +113,11 @@ public:
             }
             return false;
         };
+        replay_.draw_indirect = vk.vkCmdDrawIndirect;
+        replay_.draw_indexed_indirect = vk.vkCmdDrawIndexedIndirect;
+        replay_.draw_indirect_count = vk.vkCmdDrawIndirectCount;
+        replay_.draw_indexed_indirect_count = vk.vkCmdDrawIndexedIndirectCount;
+        replay_.dispatch_indirect = vk.vkCmdDispatchIndirect;
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
@@ -105,6 +127,13 @@ public:
         replay_.end_query = vk.vkCmdEndQuery;
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
+        if (ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR) {
+            replay_.build_acceleration_structures = vk.vkCmdBuildAccelerationStructuresKHR;
+            replay_.resolve_acceleration_structure = [this](std::uint64_t va) {
+                const auto it = acceleration_structures_.find(va);
+                return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
+            };
+        }
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
@@ -124,6 +153,17 @@ public:
 
     bool loaded() const { return loaded_; }
     VkDevice device() const { return device_; }
+
+    // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
+    // are ignored, so markers stay no-ops.
+    void enable_debug_labels(const DebugLabelFunctions& labels) {
+        if (!labels.complete()) return;
+        labels_ = labels;
+        replay_.insert_label = labels.cmd_insert;
+        replay_.begin_label = labels.cmd_begin;
+        replay_.end_label = labels.cmd_end;
+    }
+    bool debug_labels() const { return labels_.complete(); }
 
     // Registers a resource in its D3D12 initial state (a legacy state; images get the matching layout).
     // The image must already be in that layout, e.g. transitioned from UNDEFINED at creation.
@@ -173,6 +213,31 @@ public:
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(mutex_);
         return tracker_.layout(id, subresource);
+    }
+
+    bool has_resource(ResourceId id) {
+        std::lock_guard lock(mutex_);
+        return resources_.find(id) != resources_.end();
+    }
+
+    bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
+
+    void register_acceleration_structure(std::uint64_t va, VkAccelerationStructureKHR as) {
+        if (!va || !as) return;
+        std::lock_guard lock(mutex_);
+        acceleration_structures_[va] = as;
+    }
+
+    void unregister_acceleration_structure(std::uint64_t va) {
+        if (!va) return;
+        std::lock_guard lock(mutex_);
+        acceleration_structures_.erase(va);
+    }
+
+    VkAccelerationStructureKHR resolve_acceleration_structure(std::uint64_t va) {
+        std::lock_guard lock(mutex_);
+        const auto it = acceleration_structures_.find(va);
+        return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
     }
 
     // `prepare` is called with the context locked, at the start of the command buffer of every
@@ -243,9 +308,11 @@ private:
 
     VkDevice device_;
     bool loaded_ = false;
+    bool ray_tracing_ = false;
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
@@ -254,6 +321,7 @@ private:
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
     ReplayFunctions replay_;
+    DebugLabelFunctions labels_;
 };
 
 // A Vulkan timeline semaphore with D3D12 fence semantics for the host side.
@@ -325,6 +393,7 @@ public:
         auto& vk = context_.vk;
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
+            for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
             vk.vkQueueWaitIdle(queue_);
         }
         if (progress_) {
@@ -363,7 +432,9 @@ public:
             if (context_.bindless_commit_) context_.bindless_commit_(submitted);
             return ReplayResult::unsupported;
         }
-        for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
+        std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
+        for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_, &open_labels);
+        close_labels(command_buffer, context_.replay_, open_labels);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.
         VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -386,6 +457,26 @@ public:
     void wait(VkSemaphore fence, std::uint64_t value) {
         waits_.push_back(fence);
         wait_values_.push_back(value);
+    }
+
+    // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
+    // with no begin open on this queue is dropped, as Vulkan requires a matching begin. No-ops without the extension.
+    void marker(DebugMarker::Kind kind, const char* label) {
+        const DebugLabelFunctions& f = context_.labels_;
+        if (!f.complete()) return;
+        if (kind == DebugMarker::Kind::end && !open_labels_) return;
+        VkDebugUtilsLabelEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+        info.pLabelName = label ? label : "";
+        std::lock_guard lock(context_.submit_mutex());
+        if (kind == DebugMarker::Kind::set) {
+            f.queue_insert(queue_, &info);
+        } else if (kind == DebugMarker::Kind::begin) {
+            f.queue_begin(queue_, &info);
+            ++open_labels_;
+        } else {
+            f.queue_end(queue_);
+            --open_labels_;
+        }
     }
 
     bool idle() {
@@ -456,6 +547,7 @@ private:
     std::vector<std::pair<VkCommandBuffer, std::uint64_t>> buffers_;  // buffer, ticket that frees it
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
+    std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
 };
 

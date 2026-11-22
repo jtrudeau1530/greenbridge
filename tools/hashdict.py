@@ -64,6 +64,9 @@ def main():
             print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",
                   file=sys.stderr)
             return 2
+        if not isinstance(d, dict):
+            print(f"ERROR: the dictionary {a.lookup[0]} is not a JSON object of hash -> name", file=sys.stderr)
+            return 2
         for h, v in values:
             print(h, d.get(f"{v:08x}", "?"))
         return 0
@@ -80,8 +83,15 @@ def main():
         p = os.path.join(a.carve, arch, "index.json")
         if not os.path.isfile(p):
             continue
-        with open(p, encoding="utf-8") as f:
-            rows = json.load(f)["files"]
+        try:
+            with open(p, encoding="utf-8") as f:
+                rows = json.load(f)["files"]
+            if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                raise ValueError('"files" is not a list of entries')
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            reason = getattr(e, "strerror", None) or (f"no {e} key" if isinstance(e, KeyError) else e)
+            print(f"ERROR: cannot read {p}: {reason}", file=sys.stderr)
+            return 2
         for r in rows:
             if r.get("type") == "bink2":
                 continue
@@ -109,8 +119,14 @@ def main():
     d = {}
     for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(d, f)
+    # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError as e:
+        print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
+        return 2
     print(f"{len(strings)} strings -> {len(d)} hashes -> {a.out}")
     return 0
 

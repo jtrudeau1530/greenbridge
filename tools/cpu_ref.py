@@ -271,17 +271,6 @@ def check_supported(ins):
     return None
 
 
-def _inline_float_bits(value):
-    """Bits for an LLVM integer token used as a float source.
-
-    llvm-mc prints AMD inline constants 0..64 and -16..-1 as bare integers; those are floats in a
-    float-operand position. Other integers are 32-bit literals.
-    """
-    if 0 <= value <= 64 or -16 <= value <= -1:
-        return float_to_bits(float(value))
-    return value & MASK32
-
-
 # ---- machine ---------------------------------------------------------------------------------
 
 class Machine:
@@ -418,7 +407,7 @@ class Machine:
                                   "multi-dword SGPR source is not modelled")
             bits = self.sgpr.get(arg["r"], 0)
         elif kind == "imm":
-            bits = _inline_float_bits(arg["v"])
+            bits = arg["v"] & MASK32  # integer inline constants are bit patterns; float ones parse as "fimm"
         elif kind == "fimm":
             bits = float_to_bits(arg["v"])
         elif kind == "special":

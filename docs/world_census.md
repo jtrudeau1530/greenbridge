@@ -15,19 +15,20 @@ map resources and placement entities they contain.
 | Complete / validated map rows | **23,535 / 23,535** |
 | Exact entity counts | **1,670,442 / 1,670,442** |
 | Shards complete | **36 / 36** |
-| Zlib streams inflated | **1,122,614** |
-| Stored stream bytes | 75,165,813,806 |
-| Inflated bytes (all streams) | 175,587,890,693 |
-| Rejected zlib candidates | 906 |
-| Adopted continuation streams | 174 |
-| Metadata streams | 165,880 |
+| Zlib streams inflated | **1,117,857** |
+| Stored stream bytes | 74,877,281,159 |
+| Inflated bytes (all streams) | 174,941,755,029 |
+| Rejected zlib candidates | 840 |
+| Metadata streams | 164,914 |
 | Duplicate content groups | 0 |
 | Scan time | 290.8 s |
 
 A map row is a resource whose schema includes `CMapData`. `maps_exact` means every entity block
 counted against the declared `entity_size` and no entity block was left in a graphics page.
 `entities_exact` is the same check summed over all rows. Six entities of the 23,535 maps were split
-across a continuation; the joiner adopted 174 streams in total.
+across a continuation. The stream and byte totals don't depend on the shard size: each shard scans an
+8 MiB warm-up window before its start only to find a stream boundary, and the streams there are counted by
+the shard they belong to. The stored total therefore equals the accepted stream payload in Coverage below.
 
 ### Placement maps vs metadata
 
@@ -152,6 +153,7 @@ Each shard records a local archive fingerprint based on file size, timestamps, f
 and up to three 4 KiB samples. If filesystem identifiers are unavailable, the resolved path also
 contributes to the hash. Verifying every byte would require reading the whole archive. Copies or metadata changes can require a rescan. `--resume` rescans missing,
 older-format and mismatched shards. `--merge-only` reports their ranges as missing and exits 1.
+Use `--resume` to refresh format 4 shards in place, since their stream totals can include warm-up streams twice.
 
 ```powershell
 python -I tools\world_census.py <levels.rpf> --out work\world\census --shard-size 2147483648 --jobs 12

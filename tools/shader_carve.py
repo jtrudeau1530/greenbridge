@@ -94,12 +94,13 @@ def main(argv=None) -> int:
             if not (16 < stored < 64 << 20 and 32 < size < 256 << 20):
                 continue
             start = mt.end()
+            decompressor = zlib.decompressobj(-15)
             try:
-                data = zlib.decompressobj(-15).decompress(m[start:start + stored], size + 1)
+                data = decompressor.decompress(m[start:start + stored], size + 1)
             except zlib.error:
                 bad += 1
                 continue
-            if data[:4] != b"DXBC" or len(data) != size:
+            if not decompressor.eof or data[:4] != b"DXBC" or len(data) != size:
                 bad += 1
                 continue
             try:

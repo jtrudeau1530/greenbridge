@@ -3,13 +3,16 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication, discards, immediate buffer writes, atomic copies and queries. It has no Windows or Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies, queries and debug markers. It has no Windows or
+// Vulkan dependency.
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -474,10 +477,62 @@ struct ResolveQueries {
     std::uint64_t offset;
 };
 
+// SetMarker, BeginEvent and EndEvent, replayed as VK_EXT_debug_utils labels when the device has them (and skipped
+// when it does not). The label is UTF-8; an end has none.
+struct DebugMarker {
+    enum class Kind : std::uint8_t { set, begin, end };
+    Kind kind;
+    std::string label;
+};
+
+// ExecuteIndirect argument kind (from ID3D12CommandSignature).
+enum class IndirectKind : std::uint8_t {
+    draw = 0,
+    draw_indexed = 1,
+    dispatch = 2,
+};
+
+struct ExecuteIndirect {
+    IndirectKind kind = IndirectKind::draw;
+    std::uint32_t stride = 0;
+    std::uint32_t max_count = 0;
+    ResourceId argument_buffer = 0;
+    std::uint64_t argument_offset = 0;
+    ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
+    std::uint64_t count_offset = 0;
+};
+
+// Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
+struct RtTriangleGeometry {
+    std::uint64_t vertex_va = 0;
+    std::uint32_t vertex_count = 0;
+    std::uint32_t vertex_stride = 0;
+    std::uint32_t vertex_format = 0;  // VkFormat (e.g. VK_FORMAT_R32G32B32_SFLOAT)
+    std::uint64_t index_va = 0;
+    std::uint32_t index_count = 0;
+    std::uint32_t index_type = 0;     // 0=NONE, 1=UINT16, 2=UINT32
+    std::uint64_t transform_va = 0;
+    bool opaque = true;
+};
+
+// BLAS or TLAS build command (VK_KHR_acceleration_structure).
+struct BuildAccelerationStructure {
+    bool is_tlas = false;
+    bool update = false;
+    std::uint32_t build_flags = 0;
+    std::uint64_t dst_va = 0;
+    std::uint64_t src_va = 0;
+    std::uint64_t scratch_va = 0;
+    std::uint64_t instances_va = 0;
+    std::uint32_t instance_count = 0;
+    std::vector<RtTriangleGeometry> triangles;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries>;
+                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             ExecuteIndirect, BuildAccelerationStructure>;
 
 class CommandList {
 public:
@@ -655,6 +710,22 @@ public:
     // A query begun and not ended. Such a list still closes (D3D12's Close reports the error), but is not replayed.
     bool queries_open() const { return !active_.empty(); }
 
+    // Debug markers. D3D12 does not ask a list to balance its events (one list may end what another began), so
+    // they are recorded as given; the replay balances them per submission (vulkan_replay.h, emit).
+    bool marker(DebugMarker::Kind kind, std::string label = {}) {
+        if (kind == DebugMarker::Kind::end) label.clear();
+        return append(DebugMarker{kind, std::move(label)});
+    }
+
+    bool execute_indirect(const ExecuteIndirect& indirect) {
+        if (!indirect.argument_buffer || !indirect.stride || !indirect.max_count) return false;
+        return append(indirect);
+    }
+
+    bool build_acceleration_structure(BuildAccelerationStructure build) {
+        if (!build.dst_va || !build.scratch_va) return false;
+        return append(std::move(build));
+    }
     bool close() {
         if (closed_) return false;
         closed_ = true;

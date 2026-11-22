@@ -16,7 +16,7 @@ import os
 
 # Standard D3D11 / Khronos BPTC 2-subset (64 x 16 pixels, 1 bit/pixel) and
 # 3-subset (64 x 16 pixels, 2 bits/pixel) partition masks.
-_BC7_PART2_PACKED = (
+BC7_PART2_PACKED = (
     0xcccc, 0x8888, 0xeeee, 0xecc8, 0xc880, 0xfeec, 0xfec8, 0xec80,
     0xc800, 0xffec, 0xfe80, 0xe800, 0xffe8, 0xff00, 0xfff0, 0xf000,
     0xf710, 0x008e, 0x7100, 0x08ce, 0x008c, 0x7310, 0x3100, 0x8cce,
@@ -27,7 +27,7 @@ _BC7_PART2_PACKED = (
     0x9336, 0x9cc6, 0x817e, 0xe718, 0xccf0, 0x0fcc, 0x7744, 0xee22,
 )
 
-_BC7_PART3_PACKED = (
+BC7_PART3_PACKED = (
     0xaa685050, 0x6a5a5040, 0x5a5a4200, 0x5450a0a8, 0xa5a50000, 0xa0a05050,
     0x5555a0a0, 0x5a5a5050, 0xaa550000, 0xaa555500, 0xaaaa5500, 0x90909090,
     0x94949494, 0xa4a4a4a4, 0xa9a59450, 0x2a0a4250, 0xa5945040, 0x0a425054,
@@ -114,10 +114,10 @@ def _bc7_static():
     global _BC7_STATIC_CACHE
     if _BC7_STATIC_CACHE is None:
         part2 = tuple(
-            tuple((mask >> p) & 1 for p in range(16)) for mask in _BC7_PART2_PACKED
+            tuple((mask >> p) & 1 for p in range(16)) for mask in BC7_PART2_PACKED
         )
         part3 = tuple(
-            tuple((mask >> (2 * p)) & 3 for p in range(16)) for mask in _BC7_PART3_PACKED
+            tuple((mask >> (2 * p)) & 3 for p in range(16)) for mask in BC7_PART3_PACKED
         )
         cells = sorted(
             ((a, b) for a in range(32) for b in range(16)),

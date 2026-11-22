@@ -633,6 +633,19 @@ struct ReplayFunctions {
     PFN_vkCmdEndQuery end_query = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
+    // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
+    PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
+    PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT end_label = nullptr;
+    // ExecuteIndirect (Vulkan 1.0/1.2 core).
+    PFN_vkCmdDrawIndirect draw_indirect = nullptr;
+    PFN_vkCmdDrawIndexedIndirect draw_indexed_indirect = nullptr;
+    PFN_vkCmdDrawIndirectCount draw_indirect_count = nullptr;
+    PFN_vkCmdDrawIndexedIndirectCount draw_indexed_indirect_count = nullptr;
+    PFN_vkCmdDispatchIndirect dispatch_indirect = nullptr;
+    // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
+    PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
+    std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
@@ -681,6 +694,8 @@ struct Prepared {
     VkClearColorValue clear_color{};                 // ... the value that writes it into the image
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
     QueryPool* queries = nullptr;  // query commands: the heap
+    VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
+    VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
@@ -889,6 +904,7 @@ inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, 
     const auto add = [&](std::uint64_t offset, std::uint64_t bytes) {
         if (!bytes) return ReplayResult::success;
         if (offset % std::min(e, 4u)) return ReplayResult::invalid_clear;
+        offset += p.binding.buffer_offset;  // the view is relative to the resource, which starts at buffer_offset
         if (e <= 4) {
             const std::uint64_t a0 = (offset + 3) / 4 * 4, a1 = (offset + bytes) / 4 * 4;
             if ((a0 != offset || a1 != offset + bytes) && a1 < a0 + 4) return ReplayResult::unsupported;
@@ -1224,6 +1240,54 @@ public:
     std::size_t unpredicated_copies = 0;
 };
 
+// detail::initialize zero-clears an image piece the tracker holds in UNDEFINED (D3D12 committed resources start
+// zeroed) the first time a command touches it, with vkCmdClearColorImage or vkCmdClearDepthStencilImage. True when
+// a command of the list would need one of those and it is unset; replay() then refuses the list as unsupported, as
+// prepare() does for every other optional function, rather than emit calling a null pointer.
+inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFunctions& vk,
+                                   const LayoutTracker& tracker) {
+    if (vk.clear_color_image && vk.clear_depth_stencil_image) return false;
+    std::vector<LayoutPiece> pieces;
+    const auto missing = [&](ResourceId id, const ResourceBinding& resource, const VkImageSubresourceRange& range) {
+        if (!id || !resource.image || resource.not_zeroed ||
+            block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1)   // only moved, never cleared
+            return false;
+        pieces.clear();
+        if (!tracker.pieces(id, range, pieces)) return false;
+        for (const auto& piece : pieces)
+            if (piece.layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                ((piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) ? !vk.clear_color_image
+                                                                      : !vk.clear_depth_stencil_image))
+                return true;
+        return false;
+    };
+    const auto commands = prepared.list->commands();
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+        const auto& command = commands[i];
+        const auto& p = prepared.commands[i];
+        if (p.skip) continue;
+        if (const auto [dst, src] = copy_ids(command); dst || src) {
+            if (missing(dst, p.binding, p.range) || missing(src, p.source, p.source_range)) return true;
+            continue;
+        }
+        const ResourceId id = std::visit(
+            [](const auto& c) -> ResourceId {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, ClearRenderTarget> || std::is_same_v<T, ClearDepthStencil>)
+                    return c.target.resource;
+                else if constexpr (std::is_same_v<T, ClearUnorderedAccess>)
+                    return c.view.resource;
+                else if constexpr (requires { c.resource; })
+                    return c.resource;
+                else
+                    return 0;
+            },
+            command);
+        if (missing(id, p.binding, p.range)) return true;
+    }
+    return false;
+}
+
 // Resolves and checks every command. Nothing is written to a command buffer.
 // Resolve maps a ResourceId to a const ResourceBinding* (nullptr: unknown).
 template<typename Resolve>
@@ -1318,6 +1382,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                             VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
             } else if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
                        r != ReplayResult::success) return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
@@ -1331,6 +1396,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
                 return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
             if (!bind(view.resource)) return ReplayResult::unresolved_resource;
@@ -1358,6 +1424,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const auto rects = attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
             if (const auto r = rect_view(rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
                 return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
@@ -1479,14 +1546,50 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                     p.binding.size))
                     return ReplayResult::invalid_query;
             }
+        } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
+            if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
+            if (ind->count_buffer) {
+                const ResourceBinding* cnt = resolve(ind->count_buffer);
+                if (!cnt || !cnt->buffer) return ReplayResult::unresolved_resource;
+                p.source = *cnt;
+                if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
+                    (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count) ||
+                    ind->kind == IndirectKind::dispatch)
+                    return ReplayResult::unsupported;
+            } else {
+                if ((ind->kind == IndirectKind::draw && !vk.draw_indirect) ||
+                    (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect) ||
+                    (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect))
+                    return ReplayResult::unsupported;
+            }
+        } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
+            if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
+                return ReplayResult::unsupported;
+            p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
+            if (!p.accel_dst) return ReplayResult::unresolved_resource;
+            if (build->update && build->src_va) {
+                p.accel_src = vk.resolve_acceleration_structure(build->src_va);
+                if (!p.accel_src) return ReplayResult::unresolved_resource;
+            }
         }
     }
     return ReplayResult::success;
 }
 
+// Ends the debug labels a submission left open, so every command buffer is balanced as Vulkan requires.
+inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& vk, std::uint32_t& open_labels) {
+    for (; open_labels && vk.end_label; --open_labels) vk.end_label(command_buffer);
+    open_labels = 0;
+}
+
 // Writes a prepared list. With a tracker, barriers start from the tracked layouts and update them.
+// `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
+// is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
+// (close_labels). Without it, the list's own events are balanced at its end.
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
-                 LayoutTracker* tracker = nullptr) {
+                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
+    std::uint32_t own_labels = 0;
+    std::uint32_t& labels = open_labels ? *open_labels : own_labels;
     const auto commands = prepared.list->commands();
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
@@ -1551,7 +1654,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (tracker) tracker->set(id, range, new_layout);
         } else if (std::holds_alternative<UavBarrier>(command)) {
             const VulkanAccess uav = vulkan_access(d3d12_state::unordered_access, false);
-            detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, uav.stages, uav.access, uav.stages);
+            VkAccessFlags src_access = VK_ACCESS_SHADER_WRITE_BIT;
+            VkAccessFlags dst_access = uav.access;
+            VkPipelineStageFlags stages = uav.stages;
+            if (vk.build_acceleration_structures) {
+                src_access |= VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+                dst_access |= VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                              VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+                stages |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+            }
+            detail::memory_barrier(vk, command_buffer, src_access, stages, dst_access, stages);
         } else if (std::holds_alternative<AliasingBarrier>(command)) {
             detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
@@ -1807,6 +1919,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
+        } else if (const auto* marker = std::get_if<DebugMarker>(&command)) {
+            if (!vk.insert_label || !vk.begin_label || !vk.end_label) continue;
+            VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+            label.pLabelName = marker->label.c_str();
+            if (marker->kind == DebugMarker::Kind::set) {
+                vk.insert_label(command_buffer, &label);
+            } else if (marker->kind == DebugMarker::Kind::begin) {
+                vk.begin_label(command_buffer, &label);
+                ++labels;
+            } else if (labels) {
+                vk.end_label(command_buffer);
+                --labels;
+            }
         } else if (std::holds_alternative<DiscardResource>(command)) {
             // oldLayout = UNDEFINED tells the driver the contents may go; the image stays in the layout the tracker
             // has for it, so later commands see no change. Without a tracker the layout is unknown, and a part
@@ -1881,10 +2006,83 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk.fill_buffer(command_buffer, p.binding.buffer, offset, VkDeviceSize(run) * size, 0);
                 index += run;
             }
+        } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
+            if (ind->count_buffer) {
+                if (ind->kind == IndirectKind::draw) {
+                    vk.draw_indirect_count(command_buffer, p.binding.buffer, ind->argument_offset, p.source.buffer,
+                                           ind->count_offset, ind->max_count, ind->stride);
+                } else if (ind->kind == IndirectKind::draw_indexed) {
+                    vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, ind->argument_offset,
+                                                   p.source.buffer, ind->count_offset, ind->max_count, ind->stride);
+                }
+            } else {
+                if (ind->kind == IndirectKind::draw) {
+                    vk.draw_indirect(command_buffer, p.binding.buffer, ind->argument_offset, ind->max_count,
+                                     ind->stride);
+                } else if (ind->kind == IndirectKind::draw_indexed) {
+                    vk.draw_indexed_indirect(command_buffer, p.binding.buffer, ind->argument_offset, ind->max_count,
+                                             ind->stride);
+                } else if (ind->kind == IndirectKind::dispatch) {
+                    for (std::uint32_t k = 0; k < ind->max_count; ++k) {
+                        vk.dispatch_indirect(command_buffer, p.binding.buffer,
+                                             ind->argument_offset + std::uint64_t(k) * ind->stride);
+                    }
+                }
+            }
+        } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
+            std::vector<VkAccelerationStructureGeometryKHR> geoms;
+            std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
+            if (build->is_tlas) {
+                VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+                g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+                g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+                g.geometry.instances.arrayOfPointers = VK_FALSE;
+                g.geometry.instances.data.deviceAddress = build->instances_va;
+                geoms.push_back(g);
+                ranges.push_back({build->instance_count, 0, 0, 0});
+            } else {
+                geoms.reserve(build->triangles.size());
+                ranges.reserve(build->triangles.size());
+                for (const auto& t : build->triangles) {
+                    VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+                    g.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+                    g.flags = t.opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0u;
+                    auto& tr = g.geometry.triangles;
+                    tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+                    tr.vertexFormat = static_cast<VkFormat>(t.vertex_format);
+                    tr.vertexData.deviceAddress = t.vertex_va;
+                    tr.vertexStride = t.vertex_stride;
+                    tr.maxVertex = t.vertex_count ? (t.vertex_count - 1u) : 0u;
+                    tr.indexType = (t.index_type == 1)
+                                       ? VK_INDEX_TYPE_UINT16
+                                       : ((t.index_type == 2) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_NONE_KHR);
+                    tr.indexData.deviceAddress = t.index_va;
+                    tr.transformData.deviceAddress = t.transform_va;
+                    geoms.push_back(g);
+                    const std::uint32_t prim_count =
+                        (t.index_type != 0 && t.index_count >= 3) ? (t.index_count / 3u) : (t.vertex_count / 3u);
+                    ranges.push_back({prim_count, 0, 0, 0});
+                }
+            }
+            VkAccelerationStructureBuildGeometryInfoKHR info{
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+            info.type = build->is_tlas ? VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
+                                       : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            info.flags = build->build_flags;
+            info.mode = build->update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR
+                                      : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+            info.srcAccelerationStructure = build->update ? p.accel_src : VK_NULL_HANDLE;
+            info.dstAccelerationStructure = p.accel_dst;
+            info.geometryCount = static_cast<std::uint32_t>(geoms.size());
+            info.pGeometries = geoms.data();
+            info.scratchData.deviceAddress = build->scratch_va;
+            const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = ranges.data();
+            vk.build_acceleration_structures(command_buffer, 1, &info, &range_ptr);
         }
     }
     // Predication does not carry over to the next command list.
     if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
+    if (!open_labels) close_labels(command_buffer, vk, own_labels);
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.
@@ -1895,6 +2093,7 @@ ReplayResult replay(const CommandList& list, VkCommandBuffer command_buffer, Res
         return ReplayResult::unsupported;
     PreparedList prepared;
     if (const auto result = prepare(list, resolve, vk, prepared); result != ReplayResult::success) return result;
+    if (tracker && zero_clear_unavailable(prepared, vk, *tracker)) return ReplayResult::unsupported;
     emit(prepared, command_buffer, vk, tracker);
     return ReplayResult::success;
 }

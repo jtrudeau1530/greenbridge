@@ -15,6 +15,8 @@
 
 #include <dxgi1_4.h>
 
+#include <dxgi1_4.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -1643,8 +1645,11 @@ bool software_vulkan_device(const vktest::Device& vk) {
 // or -1 when the host has no D3D12 device.
 int compare_options1(ID3D12Device* ours, const vktest::Device& vk) {
     if (software_vulkan_device(vk)) return -2;
+    // The host device must be the same GPU (matched by LUID, then PCI ids), not the default adapter: on a PC with
+    // an AMD iGPU and an NVIDIA card the default is the NVIDIA, whose 32..32 lanes don't match the AMD's 32..64.
     Ref<ID3D12Device> host;
-    if (!create_host_device(host)) return -1;
+    std::string adapter_name;
+    if (!create_host_device_for_physical(vk.instance, vk.physical, vk.instance_proc, host, adapter_name)) return -1;
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 theirs{};
     if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &theirs, sizeof(theirs)))) return -1;
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 mine{};
@@ -1758,6 +1763,17 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &feature_levels,
                                                      sizeof(feature_levels))));
         EXPECT(feature_levels.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL_12_1);
+        // An empty or missing list is E_INVALIDARG on the host (NVIDIA and WARP), not DXGI_ERROR_UNSUPPORTED or a
+        // read through null; a list the device can't meet answers DXGI_ERROR_UNSUPPORTED and writes level 0.
+        D3D12_FEATURE_DATA_FEATURE_LEVELS no_levels{0, levels, D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &no_levels, sizeof(no_levels)) == E_INVALIDARG);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS null_levels{1, nullptr, D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &null_levels, sizeof(null_levels)) ==
+               E_INVALIDARG);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS too_high{1, &levels[2], D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &too_high, sizeof(too_high)) ==
+               DXGI_ERROR_UNSUPPORTED);
+        EXPECT(too_high.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL(0));
         D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))));
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
@@ -3086,8 +3102,8 @@ int main() {
         } else {
             Ref<ID3D12QueryHeap> occlusion;
             Ref<ID3D12Resource> predicate, target;
-            const D3D12_QUERY_HEAP_DESC heap_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
-            EXPECT(SUCCEEDED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&occlusion.p))));
+            const D3D12_QUERY_HEAP_DESC query_heap_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_heap_desc, IID_PPV_ARGS(&occlusion.p))));
             EXPECT(SUCCEEDED(create(default_heap, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST, predicate)));
             EXPECT(SUCCEEDED(create(default_heap,
                                     texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM,

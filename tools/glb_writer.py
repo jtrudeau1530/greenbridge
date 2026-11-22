@@ -17,13 +17,14 @@ import itertools
 import json
 import math
 import os
-import stat
 import struct
 import sys
 import tempfile
-import threading
 import time
 from collections.abc import Iterable
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -864,22 +865,6 @@ def _replace(source: str, destination: str) -> None:
     os.replace(source, destination)
 
 
-# os.umask can only be read by setting it, and the umask is process-wide: two writers reading it at once could
-# leave it at 0 for the whole process. One lock makes the set-and-restore atomic for every writer in this module.
-_UMASK_LOCK = threading.Lock()
-
-
-def _output_mode(path: str) -> int:
-    """Permission bits for a published GLB: those of the file it replaces, or 0666 minus the umask."""
-    try:
-        return stat.S_IMODE(os.stat(path).st_mode)
-    except FileNotFoundError:
-        with _UMASK_LOCK:
-            mask = os.umask(0)
-            os.umask(mask)
-        return 0o666 & ~mask
-
-
 def write_glb(
     path: str,
     primitives: list[dict],
@@ -905,7 +890,7 @@ def write_glb(
             tmp_path = f.name
             f.write(glb_bytes)
         # NamedTemporaryFile creates 0600; give the GLB the mode of the file it replaces, or a new file's.
-        os.chmod(tmp_path, _output_mode(out_path))
+        os.chmod(tmp_path, published_mode(out_path))
         # Close before replacement: Windows cannot rename an open staging file.
         _replace(tmp_path, out_path)
     except BaseException:
@@ -982,10 +967,14 @@ def read_glb_summary(data: bytes) -> dict:
     buffers = gltf.get("buffers")
     if isinstance(buffers, list) and buffers:
         buf0 = buffers[0]
-        if isinstance(buf0, dict) and "uri" not in buf0:
-            declared = buf0.get("byteLength", 0)
-            if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0 or declared > bin_bytes:
+        if isinstance(buf0, dict):
+            embedded = "uri" not in buf0
+            declared = buf0.get("byteLength", 0 if embedded else None)
+            invalid_length = isinstance(declared, bool) or not isinstance(declared, int) or declared < 0
+            if embedded and (invalid_length or declared > bin_bytes):
                 raise GlbError(f"buffers[0].byteLength ({declared}) exceeds BIN chunk ({bin_bytes})")
+            if invalid_length:
+                raise GlbError("invalid buffers[0].byteLength")
             buf0_limit = declared
 
     buffer_views = gltf.get("bufferViews")

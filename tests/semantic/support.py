@@ -31,10 +31,20 @@ def translate_fixture(name, dxbc=STUB_DXBC, fssm=None):
     src = os.path.join(FIXTURE_DIR, name + ".s")
     if not os.path.isfile(src):
         raise AssertionError(f"missing fixture {src}")        # a missing fixture is a failure, never a skip
+    with open(src, "rb") as f:
+        return translate_listing(name, f.read(), dxbc, fssm)
+
+
+def translate_lines(name, lines, dxbc=STUB_DXBC, fssm=None):
+    """Like translate_fixture for a hand-written program given as instruction lines (no fixture file)."""
+    text = f"; {name}  hand-written test program\n" + "".join("\t" + ln.strip() + "\n" for ln in lines)
+    return translate_listing(name, text.encode("utf-8"), dxbc, fssm)
+
+
+def translate_listing(name, data, dxbc=STUB_DXBC, fssm=None):
+    """SPIR-V assembly text for a listing in the translator's input format (bytes of a .s file)."""
     with tempfile.TemporaryDirectory() as tmp:
         os.mkdir(os.path.join(tmp, "disasm"))
-        with open(src, "rb") as f:
-            data = f.read()
         with open(os.path.join(tmp, "disasm", name + ".s"), "wb") as f:
             f.write(data)
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:

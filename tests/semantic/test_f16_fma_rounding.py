@@ -185,6 +185,34 @@ class F16FmaRoundingTests(unittest.TestCase):
         triples += [(0x0001, 0x3C00, 0x8000), (0x3C00, 0x3C00, 0xBC00), (0x7BFF, 0x4000, 0x0000), (0x0400, 0x0400, 0x0001)]
         self.check_ops(triples, "v_fma_f16")
 
+    def test_fmac_output_modifiers(self):
+        # LLVM gfx10_asm_vop2.s encodes clamp, mul:2, mul:4 and div:2 on v_fmac_f16_e64.
+        # High half (0xAAAA) of destination VGPR must remain untouched.
+        got = run([
+            "v_mov_b32 v0, 0xaaaa3c00",           # acc = 1.0h, hi = 0xAAAA
+            "v_fmac_f16_e64 v0, 1.0, 1.0 clamp",  # 1*1 + 1 = 2.0 -> clamp -> 1.0 (0x3c00)
+            "v_mov_b32 v1, 0xaaaa3800",           # acc = 0.5h
+            "v_fmac_f16_e64 v1, 0.5, 0.5 mul:2",  # (0.25 + 0.5) * 2 = 1.5 (0x3e00)
+            "v_mov_b32 v2, 0xaaaa3400",           # acc = 0.25h
+            "v_fmac_f16_e64 v2, 0.5, 0.5 mul:4",  # (0.25 + 0.25) * 4 = 2.0 (0x4000)
+            "v_mov_b32 v3, 0xaaaa4000",           # acc = 2.0h
+            "v_fmac_f16_e64 v3, 1.0, 2.0 div:2",  # (2 + 2) / 2 = 2.0 (0x4000)
+        ])
+        self.assertEqual(got, [0xAAAA3C00, 0xAAAA3E00, 0xAAAA4000, 0xAAAA4000])
+
+        # omod applies before clamp, and negative values clamp to 0.0.
+        got2 = run([
+            "v_mov_b32 v0, 0xaaaa3400",                  # acc = 0.25h
+            "v_fmac_f16_e64 v0, 0.5, 0.5 mul:2 clamp",   # (0.25 + 0.25) * 2 = 1.0 (0x3c00)
+            "v_mov_b32 v1, 0xaaaabc00",                  # acc = -1.0h
+            "v_fmac_f16_e64 v1, 0.5, 0.5 clamp",         # (0.25 - 1.0) = -0.75 -> clamp -> 0.0 (0x0000)
+            "v_mov_b32 v2, 0xaaaa3400",                  # acc = 0.25h
+            "v_fmac_f16_e64 v2, 0.5, 0.5 mul:4 clamp",   # (0.25 + 0.25) * 4 = 2.0 -> clamp -> 1.0 (0x3c00)
+            "v_mov_b32 v3, 0xaaaa3800",                  # acc = 0.5h
+            "v_fmac_f16_e64 v3, 1.0, 0.5 div:2 clamp",   # (0.5 + 0.5) / 2 = 0.5 (0x3800)
+        ])
+        self.assertEqual(got2, [0xAAAA3C00, 0xAAAA0000, 0xAAAA3C00, 0xAAAA3800])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,22 +25,47 @@ def operand(tok):
     t = tok.strip()
     neg = t.startswith("-")
     core = t[1:] if neg else t
-    absm = core.startswith("|") and core.endswith("|")
+    absm = len(core) > 2 and core.startswith("|") and core.endswith("|")
     if absm:
         core = core[1:-1]
     m = re.fullmatch(r"neg\((.+)\)", core)
-    if m:  # VOP3 negation of an inline constant, printed as neg(0) / neg(1.0)
+    if m:  # VOP3 FP negation: neg(0), neg(1.0), neg(0x3f800000), neg(|1.0|), neg(v1)
         inner = operand(m.group(1))
-        if inner.get("k") == "imm":
-            return {"k": "fimm", "v": -float(inner["v"]), "abs": False} if inner["v"] == 0 else {"k": "imm", "v": -inner["v"]}
-        if inner.get("k") == "fimm":
-            return {**inner, "v": -inner["v"]}
-        inner["neg"] = not inner.get("neg", False)
+        if absm:
+            # Outer |...| absorbs the inner neg; outer '-' (if any) negates the result.
+            inner["abs"] = True
+            if neg:
+                inner["neg"] = True
+            elif inner.get("k") in ("imm", "fimm"):
+                inner.pop("neg", None)
+            else:
+                inner["neg"] = False
+        elif not neg:
+            # Keep neg as a VOP3 sign-bit modifier on constants instead of integer negation:
+            # in LLVM AMDGPU, neg(1) flips bit 31 (0x80000001) while -1 is 0xffffffff.
+            new_neg = not inner.get("neg", False)
+            if not new_neg and inner.get("k") in ("imm", "fimm"):
+                inner.pop("neg", None)
+            else:
+                inner["neg"] = new_neg
+        return inner
+    m = re.fullmatch(r"abs\((.+)\)", core)
+    if m:  # VOP3 FP absolute value: abs(v0), abs(0xbf800000), neg(abs(1.0))
+        inner = operand(m.group(1))
+        inner["abs"] = True
+        if neg:
+            inner["neg"] = True
+        elif inner.get("k") in ("imm", "fimm"):
+            inner.pop("neg", None)
+        else:
+            inner["neg"] = False
         return inner
     m = re.fullmatch(r"sext\((.+)\)", core)
     if m:  # SDWA integer sign-extension of the selected source bits
         inner = operand(m.group(1))
         inner["sext"] = True
+        if absm:
+            inner["abs"] = True
         inner["neg"] = inner.get("neg", False) or neg
         return inner
     m = re.fullmatch(r"([sv])(\d+)", core)
@@ -69,10 +94,24 @@ def operand(tok):
     if re.fullmatch(r"-?(0x[0-9a-fA-F]+|\d+)", core):
         # int(core, 0) rejects the leading-zero decimals this regex accepts ('010', '08', '0001'),
         # which aborts a whole parse_file() run on one disassembly line.
-        v = int(core, 16) if core.lower().startswith("0x") else int(core, 10)
+        neg_core = core.startswith("-")
+        digits = core[1:] if neg_core else core
+        v = int(digits, 16) if digits.lower().startswith("0x") else int(digits, 10)
+        if neg_core:
+            v = -v
+        if absm:
+            out = {"k": "imm", "v": v, "abs": True}
+            if neg:
+                out["neg"] = True
+            return out
         return {"k": "imm", "v": -v if neg else v}
     if re.fullmatch(r"-?\d+\.\d+(e[+-]?\d+)?", core):
-        return {"k": "fimm", "v": float(core) * (-1 if neg else 1), "abs": absm}
+        if absm:
+            out = {"k": "fimm", "v": float(core), "abs": True}
+            if neg:
+                out["neg"] = True
+            return out
+        return {"k": "fimm", "v": float(core) * (-1 if neg else 1), "abs": False}
     if core.startswith("hwreg(") or core.startswith("sendmsg(") or core.startswith("vmcnt(") or \
             core.startswith("expcnt(") or core.startswith("lgkmcnt(") or core.startswith("vscnt(") or \
             core.startswith("depctr") or core.startswith("instid") or core.startswith("quad_perm") or \
@@ -118,7 +157,9 @@ def parse_line(line):
     code = code.strip()
     if not code:
         return None
-    op, _, rest = code.partition(" ")
+    fields = code.split(maxsplit=1)
+    op = fields[0]
+    rest = fields[1] if len(fields) > 1 else ""
     # sendmsg(MSG_GS, GS_OP_NOP) contains a comma: keep it as one operand.
     rest = SENDMSG.sub(lambda m: m.group(0).replace(", ", "|").replace(",", "|"), rest)
     mods = MODWORDS.findall(rest)
