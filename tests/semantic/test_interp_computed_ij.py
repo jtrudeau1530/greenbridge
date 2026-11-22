@@ -199,6 +199,28 @@ class ComputedIJ(unittest.TestCase):
         self.assertIn("%bc1 = OpCompositeExtract %float %bc 1", spv_save)
         self.assertIn("%bc2 = OpCompositeExtract %float %bc 2", spv_save)
 
+    def test_conditional_overwrite_then_copied_coords_preserves_hardware_barycentrics(self):
+        """After a conditional overwrite of v0, copying v0/v1 into temporaries for v_interp must still see hardware I/J."""
+        asm = [
+            "s_cmp_eq_u32 s0, 1    ; encoding: [0,0,0,0]",
+            "s_cbranch_scc0 1    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v0, 0    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v5, v0    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v6, v1    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v2, v5, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v2, v6, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v3, v5, attr0.y    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v3, v6, attr0.y    ; encoding: [0,0,0,0]",
+            "exp mrt0 v2, v3, v2, v3 done vm    ; encoding: [0,0,0,0,0,0,0,0]",
+            "s_endpgm    ; encoding: [0,0,0,0]",
+        ]
+        spv = support.translate_lines("ps_ij_cond_copy", asm)
+        inputs = support.varyings(spv, {0: ATTR0}, BARY)
+        w_untaken = support.mrt0_words(spv, inputs=inputs, push_constants=[0] * 36)
+        w_taken = support.mrt0_words(spv, inputs=inputs, push_constants=[1] + [0] * 35)
+        self.assertEqual(floats(w_untaken[:2]), (2 * I, 2 * J))
+        self.assertEqual(floats(w_taken[:2]), (0.0, 2 * J))
+
 
 class ComputedIJRefusals(unittest.TestCase):
     def refuse(self, asm, message):

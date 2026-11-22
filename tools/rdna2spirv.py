@@ -11474,9 +11474,8 @@ def translate(path):
                        for i in insns]
             ij_reads = read_before_write_vgprs(with_ij)
             conditional = branchy or any(writes_exec(i) for i in insns)
-            ij_used = {r for i in insns if "ij" in i for r in i["ij"][2:]} if conditional else set()
             for r, comp in ((0, "bary_i"), (1, "bary_j")):
-                if (r in ij_reads or r in ij_used) and r not in g.frag_inputs:
+                if (r in ij_reads or conditional) and r not in g.frag_inputs:
                     g.frag_inputs[r] = comp
                     g.cu(r)
     if any(base_op(i["op"]) in BRANCHES and not i.get("enc") for i in insns):
