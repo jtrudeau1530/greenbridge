@@ -863,7 +863,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_imgload", "cs_imgload_d16"):
+        elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in MIP_TEST_PASSES:
