@@ -197,6 +197,7 @@ class Gen:
         self.uses_lds = False
         self.lds_dwords = 16384        # CS: set from RSRC2 LDS_SIZE (power of two, covers every offset used)
         self.lds_need = 0              # CS: dwords the program needs (LDS_SIZE, largest constant offset)
+        self.lds_declared = 0          # CS: dwords RSRC2 LDS_SIZE allocates (the hardware allocation, unclipped)
         self.cs = None             # CS: user SGPR count, enabled workgroup ids, thread-id VGPR count, group size
         self.ms = None             # MS: {"maxv", "maxp", "threads"} from PSV0
         self.ms_params = set()     # MS: param export indices used
@@ -9407,9 +9408,13 @@ def assemble(gen):
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
             gvars += ["%lds = OpVariable %_ptr_WG_lds Workgroup"]
-        wg = (4 * gen.lds_dwords if gen.uses_lds else 0) + gen.x_buf_bytes()
-        if wg > MAX_SHARED_BYTES:       # SHADER-309: what fit_shared_memory could not shrink
-            raise Unsupported(f"CS workgroup memory {wg} B (LDS {4 * gen.lds_dwords if gen.uses_lds else 0} B + "
+        # SHADER-309: what fit_shared_memory could not shrink. The LDS counts at its RSRC2 allocation when that is
+        # larger than the array (clipped to 16384 dwords): a declared allocation over the cap is refused, not cut.
+        # A constant ds offset past 64 KiB is not counted: on hardware it is out of range (reads 0, writes dropped).
+        lds_b = 4 * max(gen.lds_dwords, gen.lds_declared) if gen.uses_lds else 0
+        wg = lds_b + gen.x_buf_bytes()
+        if wg > MAX_SHARED_BYTES:
+            raise Unsupported(f"CS workgroup memory {wg} B (LDS {lds_b} B + "
                               f"{'wave64 exchange' if gen.emulate else 'barrier rounds'} {gen.x_buf_bytes()} B) "
                               f"over maxComputeSharedMemorySize {MAX_SHARED_BYTES} B")
     if gen.frag_inputs or bary:
@@ -10581,6 +10586,7 @@ def translate(path):
             n *= 2
         g.lds_dwords = min(n, 16384)
         g.lds_need = need
+        g.lds_declared = ((rsrc2 >> 15) & 0x1FF) * 128
         g.cu(g.lds_dwords)
         g.cu(g.lds_dwords - 1)
         for i in range(user, user + 3):

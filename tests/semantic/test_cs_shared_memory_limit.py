@@ -134,6 +134,28 @@ class SharedMemoryLimitTests(unittest.TestCase):
                     rdna2spirv.WAVE64_EMULATE = prev
                 self.assertEqual(meta["lds_bytes"], sum(workgroup_bytes(spv).values()))
 
+    def test_native_allocation_over_64k_is_refused(self):
+        # RSRC2 LDS_SIZE counts 512-byte units, so the smallest allocation above 64 KiB is 129 units = 66,048 B.
+        # The array is clipped to 16,384 dwords; the allocation still counts, so the shader is refused, not cut.
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            translate(129, emulate=False)
+        self.assertIn("LDS 66048 B", str(cm.exception))
+
+    def test_native_constant_offset_just_past_64k_keeps_the_clipped_array(self):
+        # A b32 access at offset 65,524 is in range (bytes 65,524..65,527), but the translator's +4-dword slack for
+        # the widest access makes its computed need 16,385 dwords = 65,540 B. Constant offsets don't count against
+        # the cap (one really past 64 KiB is out of range on hardware: reads 0, writes dropped), so this translates
+        # with the 64 KiB array, as before SHADER-309.
+        prog = [ln.replace("ds_write_b32 v1, v0", "ds_write_b32 v1, v0 offset:65524") for ln in PROGRAM]
+        prev = rdna2spirv.WAVE64_EMULATE
+        rdna2spirv.WAVE64_EMULATE = False
+        try:
+            spv = support.translate_lines("cs_shared_limit", prog, fssm=fssm(1))
+        finally:
+            rdna2spirv.WAVE64_EMULATE = prev
+        self.assertEqual(rdna2spirv.translate.last_gen.lds_need, 16385)
+        self.assertEqual(workgroup_bytes(spv), {"%lds": 65536})
+
     def test_native_wave64_full_64k_lds_still_translates(self):
         # without the flag there is no %x_buf: a 64 KiB LDS is exactly the limit
         wg = workgroup_bytes(translate(128, emulate=False))
