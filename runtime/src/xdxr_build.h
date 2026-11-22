@@ -40,7 +40,10 @@ struct XdxrLayout {
     std::uint32_t nodes_off = 0;
     std::uint32_t size = 0;            // result data size in bytes, a multiple of 64
     std::uint32_t parent_entries = 0;  // one per 64-byte unit from elements_off on
-    std::uint32_t sort_size = 1;       // elements rounded up to a power of two
+    std::uint32_t sort_size = 0;       // keys the radix sort orders: one per element
+    static constexpr std::uint32_t radix_tile = 2048;  // xdxr_build.comp RADIX_TILE
+    static constexpr std::uint32_t radix_bins = 16;
+    static constexpr std::uint32_t radix_passes = 8;
     std::uint64_t scratch = 0;         // scratch bytes
 
     // False when the count would overflow the 32-bit offsets of the format.
@@ -68,11 +71,13 @@ struct XdxrLayout {
         nodes_off = std::uint32_t(n_off);
         size = std::uint32_t(end);
         parent_entries = std::uint32_t(body_units);
-        while (sort_size < count) sort_size <<= 1;
-        scratch = 64 + 8ull * sort_size + 24ull * (std::uint64_t(count) + nodes);
+        sort_size = count;
+        // centroid bounds, keys and element indices twice, digit counts per tile, a box per element and per node
+        scratch = 64 + 16ull * sort_size + 4ull * radix_bins * tiles() + 24ull * (std::uint64_t(count) + nodes);
         return true;
     }
     std::uint32_t root() const { return nodes - 1; }
+    std::uint32_t tiles() const { return (sort_size + radix_tile - 1) / radix_tile; }
 };
 
 // One geometry of a bottom-level build, as D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC gives it.
@@ -151,8 +156,8 @@ public:
 
 private:
     enum : std::uint32_t {
-        mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_sort = 4, mode_level = 5,
-        mode_header = 6
+        mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_level = 5, mode_header = 6,
+        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
@@ -191,14 +196,18 @@ private:
         m.mode = mode_morton;
         m.count = l.sort_size;
         dispatch(cb, m, m.count);
-        for (std::uint32_t k = 2; k <= l.sort_size; k <<= 1) {
-            for (std::uint32_t j = k >> 1; j > 0; j >>= 1) {
+        // stable LSD radix sort, 4 bits a pass; an even pass count leaves the result where the keys started
+        static_assert(XdxrLayout::radix_passes % 2 == 0, "the sorted keys must end in the first buffer");
+        if (l.sort_size > 1) {
+            for (std::uint32_t pass = 0; pass < XdxrLayout::radix_passes; ++pass) {
                 Push s = p;
-                s.mode = mode_sort;
-                s.count = l.sort_size;
-                s.first = j;
-                s.arg0 = k;
-                dispatch(cb, s, s.count);
+                s.first = pass;
+                s.mode = mode_radix_count;
+                dispatch(cb, s, 64 * l.tiles());       // one workgroup of 64 per tile
+                s.mode = mode_radix_scan;
+                dispatch(cb, s, 64);                   // one workgroup
+                s.mode = mode_radix_scatter;
+                dispatch(cb, s, 64 * l.tiles());
             }
         }
         for (std::size_t level = 0; level < l.level_counts.size(); ++level) {

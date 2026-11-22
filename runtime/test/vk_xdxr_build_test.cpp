@@ -6,7 +6,7 @@
 //
 // Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
-// triangles; and a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
+// triangles; 5000 triangles (three radix-sort tiles); and a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory) and writes nothing.
@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
@@ -117,7 +118,7 @@ struct Built {
 };
 
 int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir, const std::string& name,
-               const std::vector<Geometry>& geometries, Built& built) {
+               const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0) {
     std::vector<Buffer> keep;
     std::vector<XdxrTriangles> descs;
     std::uint32_t total = 0;
@@ -172,6 +173,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
     const auto* bytes = static_cast<const char*>(dst.map) + (base - dst.address);
     EXPECT(write_file(dir + "/" + name + ".bin", bytes, layout.size));
     const std::string json = "{\"kind\": \"blas\", \"address\": " + std::to_string(base) +
+                             (rays ? ", \"rays\": " + std::to_string(rays) : std::string()) +
                              ", \"triangles\": " + tris_json(built.tris) + "}\n";
     EXPECT(write_file(dir + "/" + name + ".json", json.data(), json.size()));
     std::printf("%s: %u triangles, %u bytes, %u nodes\n", name.c_str(), total, layout.size, layout.nodes);
@@ -186,6 +188,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string dir = argv[1];
+    // A failed run must not leave the previous run's cases for the checker to pass.
+    if (argc == 2) {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            const auto ext = entry.path().extension();
+            if (ext == ".bin" || ext == ".json") std::filesystem::remove(entry.path(), ec);
+        }
+    }
     vktest::Device gpu;
     gpu.request_buffer_device_address = true;
     const auto status = gpu.initialize();
@@ -277,6 +287,9 @@ int main(int argc, char** argv) {
     b.vertex_data[3 * 3 * 7] = std::nanf("");                    // triangle 7 of geometry 1: inactive
     if (build_blas(gpu, builder, dir, "blas_two_geometries", {a, b}, multi)) return 1;
     if (build_blas(gpu, builder, dir, "blas_empty", {}, empty)) return 1;
+    // three radix-sort tiles of 2048, the last one partial (fewer rays: the reference's brute force is slow)
+    Built tiles;
+    if (build_blas(gpu, builder, dir, "blas_three_sort_tiles", {soup(5000)}, tiles, 200)) return 1;
 
     // TLAS: instances over blas_random and blas_grid_u16_stride16. An instance names its BLAS by a 40-bit address
     // (256-byte units in 32 bits), as on the console; device addresses can be wider (llvmpipe's are host pointers).

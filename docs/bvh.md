@@ -339,7 +339,8 @@ the destination buffer:
 
 1. one thread per triangle (TRI0 leaves, remap `0x09`) or per instance (128-byte records, the world-to-object
    inverse, the BLAS root and identity-rotation flag);
-2. a 30-bit Morton key of each box centre, then a bitonic sort;
+2. a 30-bit Morton key of each box centre, then a stable radix sort: 8 passes of 4-bit digits, 24 dispatches
+   whatever the count, with no padding to a power of two;
 3. BOX32 nodes, built level by level from four consecutive sorted children, with the parent table and each
    instance's `ParentNode`;
 4. the header.

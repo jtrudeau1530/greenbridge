@@ -670,8 +670,8 @@ def validate(data, expect_bottom=None):
         if off + size > len(data) or off < HEADER_SIZE:
             errs.append(f"node {p:#x} outside the buffer")
             continue
-        if p in seen and kind > TRI3:
-            errs.append(f"node {p:#x} reached twice")
+        if p in seen:
+            errs.append(f"{'leaf' if kind <= TRI3 or kind == INSTANCE else 'node'} {p:#x} reached twice")
             continue
         seen.add(p)
         if parent is not None and kind > TRI3 and parents_off:
@@ -760,7 +760,8 @@ def check_build(directory, rays=300, seed=1):
                 tris = [t[:3] for t in blas[inst["blas"]]["triangles"]] if inst["blas"] >= 0 else []
                 scene.append((rows, inst["mask"], tris))
         bad = hits = 0
-        for _ in range(rays):
+        case_rays = min(rays, desc.get("rays", rays))      # a large case may ask for fewer (brute force is slow)
+        for _ in range(case_rays):
             o = [rng.uniform(-12, 12) for _ in range(3)]
             target = [rng.uniform(-6, 6) for _ in range(3)]
             d = [target[c] - o[c] for c in range(3)]
@@ -780,9 +781,9 @@ def check_build(directory, rays=300, seed=1):
                 same = (got["instance"], got["primitive"]) == (want["instance"], want["primitive"])
                 same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
             bad += not same
-        print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{rays} rays differ ({hits} hits)")
+        print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{case_rays} rays differ ({hits} hits)")
         if bad:
-            problems.append(f"{n}: {bad} of {rays} rays differ from brute force")
+            problems.append(f"{n}: {bad} of {case_rays} rays differ from brute force")
         if desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:
             problems.append(f"{n}: no ray hit anything; the check proves nothing")
     return problems
