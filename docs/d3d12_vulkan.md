@@ -2085,8 +2085,9 @@ Vulkan AS would be invisible to them. Two paths:
    it. Produce the AMD node layout in the arena, with the same geometry/instance rules the translator assumes,
    and make `GetRaytracingAccelerationStructurePrebuildInfo` return sizes for that layout.
    The layout is the XDXR BVH4 runtime form ([bvh.md](bvh.md) §3.1). `tools/xdxr_bvh.py` encodes it on the
-   CPU, with a reference traversal and a validator ([bvh.md](bvh.md) §7a). It is the reference the layer's compute
-   builder is checked against.
+   CPU, with a reference traversal and a validator ([bvh.md](bvh.md) §7a). `runtime/src/xdxr_build.h` builds it on
+   the GPU and is checked against that reference. It is not yet wired to `BuildRaytracingAccelerationStructure`, which
+   today builds a `VkAccelerationStructureKHR` (#743) that the game's shaders can't read.
 
 **Open:** which path the game uses. Resolve by logging the first call to the standard AS methods and by tracing the
 builder's command-list usage. If XDXR batched/streaming builds are used, their structs and compression formats need

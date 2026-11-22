@@ -569,16 +569,17 @@ def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst):
                 leaf = bvh_va + ptr_offset(p)
                 gif, base, prim2 = mem.u32(leaf + 48, 3)
                 prim = prim2 if ptr_type(p) == TRI1 else base
-                hit = {"t": t, "instance": inst, "geometry": gif >> 8, "primitive": prim,
+                hit = {"t": t, "instance": inst, "geometry": gif >> 8, "primitive": prim, "leaf": p,
                        "bary": (i_num / t_den, j_num / t_den), "front": t_den > 0}
         else:
             stack.extend(reversed([k for k in r if k != INVALID]))
     return hit
 
 
-def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF):
+def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
     """Closest hit of a ray in a TLAS or BLAS at ``bvh_va``: a dict with t, instance (None for a BLAS), geometry,
-    primitive, bary and front, or None."""
+    primitive, bary and front, or None. ``bias`` is added to the BLAS addresses instance records hold (application
+    address to the address in ``mem``)."""
     flags = mem.u32(bvh_va)[0]
     if flags & FLAG_BOTTOM_LEVEL:
         return _trace_blas(mem, bvh_va, org, d, tmax, None, None)
@@ -592,12 +593,12 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF):
         if ptr_type(p) == INSTANCE:
             rec = bvh_va + ptr_offset(p)
             id_mask, _, internal, blas = mem.u32(rec + 48, 4)
-            if not (id_mask >> 24) & mask:
+            if not (id_mask >> 24) & mask or blas == 0:         # masked out, or an instance with no BLAS
                 continue
             w2o = mem.f32(rec + 64, 12)
             m = [list(w2o[0:4]), list(w2o[4:8]), list(w2o[8:12])]
             lo, ld = _transform_point(m, org), _transform_dir(m, d)
-            blas_va = blas << 8
+            blas_va = (blas << 8) + bias
             root = internal & ~INST_FLAGS_MASK
             if root != mem.u32(blas_va + 48)[0]:
                 raise ValueError(f"instance root {root:#x} is not the BLAS header's root")
@@ -669,8 +670,8 @@ def validate(data, expect_bottom=None):
         if off + size > len(data) or off < HEADER_SIZE:
             errs.append(f"node {p:#x} outside the buffer")
             continue
-        if p in seen and kind > TRI3:
-            errs.append(f"node {p:#x} reached twice")
+        if p in seen:
+            errs.append(f"{'leaf' if kind <= TRI3 or kind == INSTANCE else 'node'} {p:#x} reached twice")
             continue
         seen.add(p)
         if parent is not None and kind > TRI3 and parents_off:
@@ -685,14 +686,17 @@ def validate(data, expect_bottom=None):
             if kind >= TRI2:
                 errs.append(f"node {p:#x}: TRI2/TRI3 overlap the leaf metadata and are not emitted")
             pts = [struct.unpack_from("<3f", data, off + 12 * s) for s in TRI_VERTS[kind]]
-            if box and not all(box[0][c] <= q[c] <= box[1][c] for q in pts for c in range(3)):
+            inactive = any(math.isnan(c) for q in pts for c in q)      # D3D12: never hit; its box is empty
+            if box and not inactive and not all(box[0][c] <= q[c] <= box[1][c] for q in pts for c in range(3)):
                 errs.append(f"triangle {p:#x} is not inside its parent's box")
             seen_leaves += 1
         elif kind == INSTANCE:
             if bottom:
                 errs.append(f"instance node {p:#x} in a bottom-level BVH")
-            if struct.unpack_from("<I", data, off + 60)[0] == 0:
-                errs.append(f"instance {p:#x} has no BLAS address")
+            # D3D12 allows an instance with no BLAS (it is inactive); it must not be reachable through a real box
+            if struct.unpack_from("<I", data, off + 60)[0] == 0 and box and \
+                    all(box[0][c] <= box[1][c] for c in range(3)):
+                errs.append(f"instance {p:#x} has no BLAS address but a non-empty box")
             seen_leaves += 1
         elif kind in (BOX16, BOX32):
             kids = struct.unpack_from("<4I", data, off)
@@ -712,6 +716,77 @@ def validate(data, expect_bottom=None):
     if seen_leaves != n_el:
         errs.append(f"numElements {n_el} but {seen_leaves} leaves are reachable")
     return errs
+
+
+# ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
+def _load_case(directory, name):
+    import json
+    with open(f"{directory}/{name}.json", encoding="utf-8") as fh:
+        desc = json.load(fh)
+    with open(f"{directory}/{name}.bin", "rb") as fh:
+        data = fh.read()
+    fix = lambda x: math.nan if x == "nan" else x                                   # noqa: E731
+    if desc["kind"] == "blas":
+        desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
+    return desc, data
+
+
+def check_build(directory, rays=300, seed=1):
+    """Validate every <case>.bin of a GPU build and trace rays against brute force. Returns a list of problems."""
+    import glob
+    import os
+    names = sorted(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(f"{directory}/*.json"))
+    if not names:
+        return [f"no cases in {directory}"]
+    problems = []
+    cases = {n: _load_case(directory, n) for n in names}
+    mem = Memory()
+    for n, (desc, data) in cases.items():
+        mem.place(desc["address"], data)
+    rng = random.Random(seed)
+    for n, (desc, data) in cases.items():
+        errs = validate(data, expect_bottom=desc["kind"] == "blas")
+        problems += [f"{n}: {e}" for e in errs]
+        if desc["kind"] == "blas":
+            tris = desc["triangles"]
+            scene = [(None, 0xFF, [t[:3] for t in tris])]
+            ids = [(t[3], t[4]) for t in tris]
+        else:
+            blas = [cases[b][0] for b in desc["blas"]]
+            scene, ids = [], None
+            for inst in desc["instances"]:
+                m = inst["transform"]
+                rows = [m[0:4], m[4:8], m[8:12]]
+                tris = [t[:3] for t in blas[inst["blas"]]["triangles"]] if inst["blas"] >= 0 else []
+                scene.append((rows, inst["mask"], tris))
+        bad = hits = 0
+        case_rays = min(rays, desc.get("rays", rays))      # a large case may ask for fewer (brute force is slow)
+        for _ in range(case_rays):
+            o = [rng.uniform(-12, 12) for _ in range(3)]
+            target = [rng.uniform(-6, 6) for _ in range(3)]
+            d = [target[c] - o[c] for c in range(3)]
+            got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0))
+            want = brute_force(scene, o, d)
+            hits += got is not None
+            if (got is None) != (want is None):
+                bad += 1
+                continue
+            if got is None:
+                continue
+            if ids is not None:
+                same = (got["geometry"], got["primitive"]) == ids[want["primitive"]]
+                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-6, abs_tol=1e-9)
+            else:
+                # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
+                same = (got["instance"], got["primitive"]) == (want["instance"], want["primitive"])
+                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
+            bad += not same
+        print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{case_rays} rays differ ({hits} hits)")
+        if bad:
+            problems.append(f"{n}: {bad} of {case_rays} rays differ from brute force")
+        if desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:
+            problems.append(f"{n}: no ray hit anything; the check proves nothing")
+    return problems
 
 
 # ---- self test and CLI ----
@@ -774,7 +849,18 @@ def main(argv=None):
     s.add_argument("--rays", type=int, default=400)
     v = sub.add_parser("validate", help="structural check of one runtime BVH buffer dumped to a file")
     v.add_argument("file")
+    c = sub.add_parser("check-build", help="check the cases vk_xdxr_build_test wrote to a directory")
+    c.add_argument("dir")
+    c.add_argument("--rays", type=int, default=300)
     a = ap.parse_args(argv)
+    if a.cmd == "check-build":
+        if a.rays < 1:
+            ap.error("--rays must be at least 1")
+        problems = check_build(a.dir, a.rays)
+        for e in problems:
+            print(e)
+        print("all cases match" if not problems else f"{len(problems)} problems")
+        return 1 if problems else 0
     if a.cmd == "selftest":
         if a.rays < 1:
             ap.error("--rays must be at least 1")
