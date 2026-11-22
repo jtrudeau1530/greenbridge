@@ -263,12 +263,13 @@ def gpu_test_timeout():
     text = (os.environ.get("LEONIDA_GPU_TEST_TIMEOUT") or "").strip()
     if not text:
         return DEFAULT_GPU_TEST_TIMEOUT
+    error = f"LEONIDA_GPU_TEST_TIMEOUT must be a finite number of seconds (0 = no limit), not {text!r}"
     try:
         limit = float(text)
     except ValueError:
-        sys.exit(f"LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not {text!r}")
-    if math.isnan(limit):
-        sys.exit("LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not nan")
+        sys.exit(error)
+    if not math.isfinite(limit):
+        sys.exit(error)
     return None if limit <= 0 else limit
 
 
