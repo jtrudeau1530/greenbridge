@@ -2671,6 +2671,19 @@ class Gen:
             if d is not None:
                 for w in range(2):
                     self.dst({"k": "vgpr", "r": d["r"] + w, "n": 1}, olds[w])
+        elif op in ("ds_mskor_b32", "ds_mskor_rtn_b32"):
+            # tmp = M[A]; M[A] = (tmp & ~DATA) | DATA2; the _rtn_ form returns tmp (RDNA2 ISA, DS). As two atomics:
+            # AND with ~DATA (its result is tmp, exactly), then OR with DATA2. The memory ends as the single op
+            # leaves it unless another lane's op on the same dword lands between the two; the returned value is exact.
+            d, ad, msk, dat = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
+            p = self.lds_ptr(self.src_u(ad), off)
+            inv, old, _or = self.tmp(), self.tmp(), self.tmp()
+            m_val, d_val = self.src_u(msk), self.src_u(dat)
+            self.emit(f"{inv} = OpNot %uint {m_val}")
+            self.emit(f"{old} = OpAtomicAnd %uint {p} {sc} {sem} {inv}")
+            self.emit(f"{_or} = OpAtomicOr %uint {p} {sc} {sem} {d_val}")
+            if d is not None:
+                self.dst(d, old)
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
             # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
