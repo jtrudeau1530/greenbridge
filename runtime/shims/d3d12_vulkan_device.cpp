@@ -7351,6 +7351,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
 #endif
+    VkPhysicalDeviceShaderClockFeaturesKHR shader_clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &shader_clock};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.shader_subgroup_clock = shader_clock.shaderSubgroupClock == VK_TRUE;
+        info.shader_device_clock = shader_clock.shaderDeviceClock == VK_TRUE;
+        if (info.shader_subgroup_clock || info.shader_device_clock) {
+            shader_clock.pNext = *v13.next();
+            *v13.next() = &shader_clock;
+        }
+    }
     // What graphics PSOs may ask for: different blend state per render target, wireframe, a depth-bias clamp and
     // SRC1 blend factors. Enabled where the GPU has them; a PSO that needs a missing one is refused.
     enable.independentBlend = chosen_features.independentBlend;
@@ -7454,6 +7465,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+    if (info.shader_subgroup_clock || info.shader_device_clock)
+        device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);

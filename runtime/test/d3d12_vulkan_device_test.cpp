@@ -5714,7 +5714,14 @@ int main() {
                 ext_query.pNext = &m8;
             }
 #endif
+            VkPhysicalDeviceShaderClockFeaturesKHR clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+            if (has(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+                clock.pNext = ext_query.pNext;
+                ext_query.pNext = &clock;
+            }
             if (features2) features2(made->physical, &ext_query);
+            EXPECT(made->shader_subgroup_clock == (clock.shaderSubgroupClock == VK_TRUE));
+            EXPECT(made->shader_device_clock == (clock.shaderDeviceClock == VK_TRUE));
             EXPECT(made->fragment_shader_barycentric == (bary.fragmentShaderBarycentric == VK_TRUE));
             EXPECT(made->fragment_shader_interlock == (lock.fragmentShaderPixelInterlock == VK_TRUE));
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME

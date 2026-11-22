@@ -764,7 +764,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Scan selected shaders to request only the optional extensions they actually use.
-    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false;
+    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false, want_clock = false;
     for (auto& [_, meta] : work) {
         if (meta->stage == "ms") want_mesh = true;
         if (meta->needs_maintenance8) want_m8 = true;
@@ -773,6 +773,7 @@ int main(int argc, char** argv) {
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
             else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
+            else if (feat == "shaderSubgroupClock" || feat == "shaderDeviceClock") want_clock = true;
         }
     }
 
@@ -854,6 +855,8 @@ int main(int argc, char** argv) {
     const bool ext_fma = false;
     (void)want_fma;
 #endif
+    VkPhysicalDeviceShaderClockFeaturesKHR clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+    const bool ext_clock = link(&clock, reinterpret_cast<VkBaseOutStructure*>(&clock), VK_KHR_SHADER_CLOCK_EXTENSION_NAME, want_clock);
     const bool ext_exe = link(&exe, reinterpret_cast<VkBaseOutStructure*>(&exe),
                               VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, !stats_path.empty());
     if (!stats_path.empty() && !ext_exe) {
@@ -948,6 +951,8 @@ int main(int argc, char** argv) {
                 return "no VK_KHR_shader_fma (shaderFmaFloat32)";
 #endif
             }
+            if (feat == "shaderSubgroupClock" && !(ext_clock && clock.shaderSubgroupClock)) return "no shaderSubgroupClock";
+            if (feat == "shaderDeviceClock" && !(ext_clock && clock.shaderDeviceClock)) return "no shaderDeviceClock";
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";
