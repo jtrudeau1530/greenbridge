@@ -5514,7 +5514,8 @@ class Gen:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
             if dim in self.STORE_DIMS:
-                self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, img_idx, dmask, vdata, d16)
+                self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, img_idx,
+                                      dmask, vdata, self.cu(0), d16)
                 return
             res = self.tmp()
             self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
@@ -5796,7 +5797,7 @@ class Gen:
             flags.append(nz)
         return flags
 
-    def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, d16=False):
+    def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, lod, d16=False):
         """image_load with the image's numeric type decided at run time (T# FORMAT). Every format is fetched
         (OpImageFetch) from the sampled array of the image's dimension, where the runtime binds the T#'s view in the
         T#'s own format: UINT/SINT formats through a uint/sint alias of that array (same set and binding, an
@@ -5806,7 +5807,7 @@ class Gen:
         and read-only integer textures, which have no storage view, are read too. A lookup miss (index 0) takes the
         float path: index 0 holds the RGBA8_UNORM fallback, which an integer alias must not read; it gives zeros.
         Results are the raw bits of the dmask components; with d16, two per VGPR (see write).
-        t1 is the T#'s second dword (FORMAT), idx the bindless index image_load already looked up."""
+        t1 is the T#'s second dword (FORMAT), idx the bindless index, lod the fetch level (zero for image_load)."""
         di = self.STORE_DIMS[dim][0]
         self.uses_int_fetch.add(di)
         is_u, is_s = self.fmt_int_flags(t1)
@@ -5846,7 +5847,7 @@ class Gen:
             ip, im, r, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_itx{cls}_{di} %itx{cls}_{di} {idx}")
             self.emit(f"{im} = OpLoad %itximg{cls}_{di} {ip}")
-            self.emit(f"{r} = OpImageFetch {ty} {im} {iv} Lod {self.cu(0)}")
+            self.emit(f"{r} = OpImageFetch {ty} {im} {iv} Lod {lod}")
             self.emit(f"{b} = OpBitcast %v4uint_st {r}")
             write(b)
 
@@ -5863,7 +5864,7 @@ class Gen:
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
         res, b = self.tmp(), self.tmp()
-        self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
+        self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {lod}")
         self.emit(f"{b} = OpBitcast %v4uint_st {res}")
         write(b, f16=True)
         self.emit(f"OpBranch {L['e3']}")
@@ -6085,20 +6086,13 @@ class Gen:
                     self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, u)
                     out += 1
             return
-        # image_load_mip: x, y, mip
+        # image_load_mip: x, y, mip, with the same typed SRV as image_load.
         if len(addr) < 3:
             raise Unsupported("image_load_mip coords")
         xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
-        iv, res = self.tmp(), self.tmp()
+        iv = self.tmp()
         self.emit(f"{iv} = OpCompositeConstruct %v2int {xs[0]} {xs[1]}")
-        self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {xs[2]}")
-        out = 0
-        for c in range(4):
-            if dmask >> c & 1:
-                comp = self.tmp()
-                self.emit(f"{comp} = OpCompositeExtract %float {res} {c}")
-                self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
-                out += 1
+        self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, idx, dmask, vdata, xs[2])
 
     def attribute(self, n, comp, flat=False, half=None):
         """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n).
