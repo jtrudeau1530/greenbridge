@@ -2649,6 +2649,14 @@ class Gen:
                 (t == "vcc_hi" and self.wave64 and "vcc" in self.cur_masks)
         return a["k"] == "sgpr" and all(a["r"] + i in self.cur_masks for i in range(a.get("n", 1)))
 
+    def any_mask_word(self, a):
+        """Whether any dword of an SGPR pair is a lane mask (EITHER constants are data here).
+
+        holds_lane_mask() needs every dword, but a pair with one mask word and one
+        zero/-1 word is a zero-extended mask: selecting it as data would read this lane's bit.
+        """
+        return a["k"] == "sgpr" and any(a["r"] + i in self.cur_masks for i in range(a.get("n", 1)))
+
     def wave_mask(self, a):
         """The whole wave's lane mask in operand `a` as real bits: (lanes 0-31, lanes 32-63). A register holds
         only this lane's bit (all ones or zero), so each lane puts its bit at its own position and the subgroup
@@ -5234,10 +5242,12 @@ class Gen:
             # S_CMOV_B64 : SOP1_64 under Uses = [SCC]). Plain 64-bit data only: a lane-mask pair holds one
             # lane's bit here, so selecting it as data would silently read a bool instead of the wave's mask
             # (issue #210). Those operands keep failing loudly.
-            if self.is_mask_op(a[1]):
-                raise Unsupported("s_cmov_b64 source")
-            if a[0]["k"] != "sgpr" or a[0].get("n") != 2 or self.holds_lane_mask(a[0]):
+            if self.is_mask_op(a[1]) or self.any_mask_word(a[1]):
+                raise Unsupported("s_cmov_b64 lane-mask source")
+            if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
                 raise Unsupported("s_cmov_b64 destination")
+            if self.holds_lane_mask(a[0]) or self.any_mask_word(a[0]):
+                raise Unsupported("s_cmov_b64 lane-mask destination")
             (xlo, xhi) = self.src64_data(a[1], op)
             # Read both old dwords before any store, so D overlapping S0 stays exact.
             oldlo, oldhi = self.load_reg("sgpr", a[0]["r"]), self.load_reg("sgpr", a[0]["r"] + 1)

@@ -188,36 +188,47 @@ class DataPairTests(unittest.TestCase):
 
 
 class RejectionTests(unittest.TestCase):
-    def test_lane_mask_source_rejected_with_message(self):
-        cases = [
-            ["v_cmp_ne_u32_e64 s[20:21], 0, v0",
-             "s_mov_b64 s[22:23], s[20:21]"],
-            ["s_mov_b64 s[22:23], exec"],
-        ]
-        for prologue in cases:
-            for src in ("s[22:23]", "exec"):
-                with self.subTest(src=src):
-                    lines = prologue + [scc_line(1), f"s_cmov_b64 s[2:3], {src}",
-                                        "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]
-                    with self.assertRaisesRegex(rdna2spirv.Unsupported,
-                                                re.escape("s_cmov_b64 source")):
-                        translate_ps(lines)
+    MASK_SOURCE = "s_cmov_b64 lane-mask source"
+    MASK_DEST = "s_cmov_b64 lane-mask destination"
+    DEST = "s_cmov_b64 destination"
 
-    def test_mask_and_invalid_destinations_rejected_with_message(self):
+    def test_lane_mask_source_rejected_with_message(self):
+        cmp = "v_cmp_ne_u32_e64 s[20:21], 0, v0"
         cases = [
-            ["v_cmp_ne_u32_e64 s[20:21], 0, v0",
-             "s_cmov_b64 s[20:21], s[4:5]"],       # a lane-mask SGPR pair
-            ["s_cmov_b64 exec, s[4:5]"],
-            ["s_cmov_b64 vcc, s[4:5]"],
-            ["s_cmov_b64 m0, s[4:5]"],
-            ["s_cmov_b64 s[4:5], s[4:5]", "s_cmov_b64 s4, s[4:5]"],
-            ["s_cmov_b64 null, s[4:5]"],
+            ([cmp, "s_mov_b64 s[22:23], s[20:21]"], "s[22:23]"),
+            (["s_mov_b64 s[22:23], exec"], "s[22:23]"),
+            ([], "exec"),
+            # A zero-extended 32-bit mask: one dword is a mask, the other is
+            # an EITHER constant. holds_lane_mask() alone misses this pair.
+            ([cmp, "s_mov_b32 s2, s20", "s_mov_b32 s3, 0"], "s[2:3]"),
+            ([cmp, "s_mov_b32 s2, 0", "s_mov_b32 s3, s20"], "s[2:3]"),
+        ]
+        for prologue, src in cases:
+            with self.subTest(src=src, prologue=prologue[-1] if prologue else "none"):
+                lines = prologue + [scc_line(1), f"s_cmov_b64 s[2:3], {src}",
+                                    "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, re.escape(self.MASK_SOURCE)):
+                    translate_ps(lines)
+
+    def test_mask_destination_rejected_with_message(self):
+        cmp = "v_cmp_ne_u32_e64 s[20:21], 0, v0"
+        cases = [
+            [cmp, "s_cmov_b64 s[20:21], s[4:5]"],
+            [cmp, "s_mov_b32 s2, s20", "s_mov_b32 s3, 0", "s_cmov_b64 s[2:3], s[4:5]"],
         ]
         for lines in cases:
             with self.subTest(lines=lines[-1]):
                 full = lines + ["exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]
-                with self.assertRaisesRegex(rdna2spirv.Unsupported,
-                                            re.escape("s_cmov_b64 destination")):
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, re.escape(self.MASK_DEST)):
+                    translate_ps(full)
+
+    def test_invalid_destinations_rejected_with_message(self):
+        for line in ("s_cmov_b64 exec, s[4:5]", "s_cmov_b64 vcc, s[4:5]",
+                     "s_cmov_b64 m0, s[4:5]", "s_cmov_b64 s4, s[4:5]",
+                     "s_cmov_b64 null, s[4:5]"):
+            with self.subTest(line=line):
+                full = [line, "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, re.escape(self.DEST)):
                     translate_ps(full)
 
 
