@@ -487,8 +487,8 @@ file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy,
 | Effects with `RaytracingResolve` CS programs | 341 (1,004 programs; 3 each for 324) |
 | Materials whose hash is the joaat of a carved effect name | 3,211 (96%), 8 of the 18 hashes |
 
-So a material leads to its effect and that effect's ray-tracing resolve programs. It does **not** lead to the
-draw (VS/PS/MS) programs from the package alone:
+So a material leads to its effect and that effect's ray-tracing resolve programs. The draw (VS/PS/MS) programs
+are not reachable through the carved programs' names, order or suffixes:
 
 - None of the 23,619 graphics programs (VS/PS/MS) carries an effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
 - `shaders.rpf` stores programs grouped by kind, not by effect (the 1,004 `RaytracingResolve` programs sit next
@@ -497,8 +497,34 @@ draw (VS/PS/MS) programs from the package alone:
   1,775) but is not the joaat of the program name, and only 1 of the 896 suffixes on the effect-named CS programs
   appears on any graphics program.
 
-The effect → technique → VS/PS table is therefore not in the carved programs' names, order or suffixes; it is
-presumably in the executable (RT-5). Until then, a real model is drawn with a chosen pair ([first_light.md](first_light.md)).
+They are reachable through the **effect records** in `shaders.rpf` (found by @jeremygold02, #2519). All fields
+are little-endian:
+
+1. **The effect record.** It starts with a one-byte name length and the name, including its terminator, then a
+   u32. Six stage lists follow, each a u32 count and that many u32 ordinals into a stage's programs.
+2. **The technique table.** A u32 count, then one 4-byte entry per technique: the low 15 bits of its first u16 are
+   the name's offset in the string block, and byte 3 is the pass count. A u32 pass total follows, then 24-byte pass
+   records.
+3. **The pass records.** The first six bytes of each pass select an entry of each stage list: 0 is unused,
+   otherwise `stage_list[selector - 1]`.
+
+Checked on three records of a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256 `0bc16345…`):
+
+| Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass mesh / pixel ordinal |
+|---|---|---:|---:|---|
+| windshield wiper mask | 1, 1, 0, 0, 0, 0 | 1 | 1 | 11017 / 10943 |
+| stock rim | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9143 / 8925 |
+| stock tire | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9089 / 8835 |
+
+Two things are still open:
+
+- **Finding effect records in general.** The three were found by their offsets; there is no general locator for
+  all effects yet.
+- **Which technique and pass the game draws with.** That is a run-time choice; it is presumably made in the
+  executable (RT-5).
+
+Until both are settled, a real model is drawn with a chosen pair ([first_light.md](first_light.md)). The effect
+records already give that choice a pair that can be checked independently.
 
 ## Vehicle distant-light recipes
 
