@@ -17,15 +17,31 @@
 
 namespace rt::d3d12 {
 
+// How a queue answers GetClockCalibration. With `calibrated` (vkGetCalibratedTimestampsKHR or its EXT alias, on a
+// device whose time domains include DEVICE and QUERY_PERFORMANCE_COUNTER) both clocks are read in one call. Without
+// it, the queue writes a timestamp query and reads QueryPerformanceCounter around it; that needs `get_device_proc`
+// and a queue family with timestamp_valid_bits > 0. With neither, GetClockCalibration fails.
+struct QueueClock {
+    PFN_vkGetCalibratedTimestampsKHR calibrated = nullptr;
+    PFN_vkGetDeviceProcAddr get_device_proc = nullptr;
+    std::uint32_t timestamp_valid_bits = 0;
+};
+
 // `device` (optional) is what the object's GetDevice returns; the object holds a reference to it.
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
-                             IUnknown* device = nullptr);
+                             IUnknown* device = nullptr, const QueueClock& clock = {});
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
+
+// ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
+// (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.
+HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, ID3D12Fence* const* fences,
+                                               const UINT64* values, UINT count,
+                                               D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event);
 
 // The Vulkan objects a D3D12 device runs on. Vulkan 1.3 with dynamicRendering, synchronization2, timelineSemaphore
 // and (when separate_depth_stencil_layouts is set) separateDepthStencilLayouts enabled.
@@ -48,6 +64,8 @@ struct VulkanDeviceInfo {
     // samplerAnisotropy and samplerMirrorClampToEdge enabled; without them such samplers are approximated.
     bool sampler_anisotropy = false;
     bool sampler_mirror_clamp_to_edge = false;
+    // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
+    bool calibrated_timestamps = false;
     // VK_EXT_conditional_rendering (with its conditionalRendering feature) is enabled: SetPredication works, and
     // buffers are created with VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT. Without it a predicated list is
     // rejected at ExecuteCommandLists.
@@ -102,6 +120,9 @@ bool device_upload_in_vram(ID3D12Device* device);
 // brought up to date at every ExecuteCommandLists.
 VkDescriptorSet bindless_set(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
+// True when GetClockCalibration on `queue` reads calibrated timestamps, false when it submits a timestamp query
+// (or `queue` is not one of this module's queues). For tests.
+bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
