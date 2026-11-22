@@ -216,6 +216,57 @@ or patch content not covered by the public references; sub-30 s stings were not 
 fingerprinted. No game audio is stored in the repository; the searches ran on a local copy and
 `radio-dump-v3` was not modified.
 
+## Stream names
+
+The stream table stores only `joaat(lowercase name) & 0x1FFFFFFF`, so the exporters name files by id.
+`tools/awc_names.py` recovers names by hashing dictionary words against those ids. With about 1.8 million distinct
+ids in a 2^29 space, roughly 0.3% of arbitrary words collide by chance, so a hit is accepted only under one of two
+rules:
+
+| Rule | Accepted when |
+|---|---|
+| `dialogue` | the word is shaped like a dialogue wave, `<root>au_<4 letters>_<NN>`, and is in the dictionary exactly |
+| `family` | one base (a name without its trailing `_<number>`) hits ids in the same bank with several numbered suffixes (`''`, `_00`-`_40`, `_1`-`_9`): at least 3 members, or 2 with adjacent numbers. Every token of the base occurs in at least 5 dictionary words, and at least one member is itself a dictionary word |
+
+Each run repeats the attack with `zq` prepended to every word. Those names can't be right, so what the control
+accepts estimates the false names. Per source, the dialogue rule is kept only when its control is under 2% of its
+real count, and the family rule takes the smallest family size whose control is under 2%.
+
+The dictionary comes from two kinds of input:
+
+- `--words`: plain word lists, or a `hashdict.py` JSON (its values).
+- `--conversations`: conversation data, which pairs a dialogue key with its line labels as
+  `<ROOT>AU_<XXXX>\0<LABEL>\0`. A key with N distinct labels yields the waves `<key>_01` .. `<key>_<N>`. Wave `_01`
+  speaks the first label, `_02` the second, and so on. In 1.0.2.1 the pairs are in 594 carved `story000.rpf`
+  streams, 4 `shared_minigame000.rpf` streams and 2 `data.rpf` streams, and they give 136,788 wave names.
+
+Measured on the 1.0.2.1 package (2026-11-22). The dictionary is about 2.9 million harvested identifiers plus the
+conversation waves:
+
+| Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
+|---|---:|---:|---:|---:|---:|---:|
+| `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
+| `story000.rpf` | 63,861 | 234,458 | 172,781 | 119,492 | 53,289 | 62 |
+| `shared_minigame000.rpf` | 638 | 4,334 | 1,957 | 1,957 | 0 | 3 |
+
+`story000.rpf` is 73.7% named: dialogue is named almost entirely, because conversation data lists every key.
+`audio.rpf` is 5.7% named. Its sound effects, ambience and music have no list, so only numbered families are
+found. Adding 1,319 more dialogue words that exist only as harvested strings (not in any conversation pair) brings
+`story000.rpf` to 173,800. When two accepted families claim the same id in one bank (3 rows), the first family in
+sorted base order keeps it.
+
+The output names game files: keep it local, and do not commit it or attach it to an issue.
+
+```sh
+python -I tools/hashdict.py <carve dir> --out <temp>/hashes.json
+python -I tools/awc_names.py <work>/assets/audio/awc --words <temp>/hashes.json \
+    --conversations <carve dir>/story000 --out <temp>/awc_names.csv
+```
+
+Each positional source is reported and thresholded on its own. A source is a directory of `.awc` banks, a single
+bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
+took about 3 minutes on one core.
+
 ## Never commit or share extracted audio
 
 Extracted banks, Ogg Opus, WAV, XMA2 and the manifest are game data. Keep them in the work folder, never in the
