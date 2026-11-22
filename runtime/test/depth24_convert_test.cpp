@@ -114,6 +114,21 @@ int main() {
     EXPECT(wrong == 0);
     std::printf("depth24: all %u words survive float and back\n", words);
 
+    // All payloads and both signs with an all-ones exponent. Only positive infinity saturates.
+    for (std::uint32_t i = 0; i < words; ++i)
+        scratch_words[i] = 0x7f800000u | ((i & 0x800000u) << 8) | (i & 0x7fffffu);
+    std::memset(app_words, 0xcd, std::size_t(words) * 4);
+    EXPECT(convert(false, 4096, 4096, 1, 4096, words, 0));
+    wrong = 0;
+    for (std::uint32_t i = 0; i < words; ++i) {
+        const std::uint32_t want = i == 0 ? 0xffffffu : 0u;
+        if (app_words[i] != want && wrong++ < 8)
+            std::fprintf(stderr, "special: f=%08x got %u want %u\n", scratch_words[i], app_words[i], want);
+    }
+    if (wrong) std::fprintf(stderr, "special: %llu mismatches\n", static_cast<unsigned long long>(wrong));
+    EXPECT(wrong == 0);
+    std::printf("depth24: both infinities and all NaN payloads quantise correctly\n");
+
     // 3. float patterns to words, against the reference.
     {
         std::uint32_t x = 7;
