@@ -80,7 +80,7 @@ int main() {
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
     if (!gipa) {
         std::printf("SKIP: vulkan-1.dll not available\n");
-        return 0;
+        return 77;  // ctest skips, as in the other GPU tests
     }
     const auto create_inst = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
     const auto enum_layers =
@@ -133,7 +133,13 @@ int main() {
     }
 
     VkInstance instance = VK_NULL_HANDLE;
-    if (create_inst(&ici, nullptr, &instance) != VK_SUCCESS) return fail("vkCreateInstance");
+    const VkResult inst_result = create_inst(&ici, nullptr, &instance);
+    if (inst_result == VK_ERROR_INCOMPATIBLE_DRIVER) {
+        // The loader is present but there is no ICD (CI runners, headless machines): ctest skips.
+        std::printf("SKIP: no Vulkan driver (vkCreateInstance returned VK_ERROR_INCOMPATIBLE_DRIVER)\n");
+        return 77;
+    }
+    if (inst_result != VK_SUCCESS) return fail("vkCreateInstance");
     const auto destroy_inst = reinterpret_cast<PFN_vkDestroyInstance>(gipa(instance, "vkDestroyInstance"));
     const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(instance, "vkGetDeviceProcAddr"));
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
@@ -195,7 +201,7 @@ int main() {
         std::printf("SKIP: no Vulkan 1.3 GPU found\n");
         if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
         destroy_inst(instance, nullptr);
-        return 0;
+        return 77;  // ctest skips, as in the other GPU tests
     }
 
     bool rt_supported = false;

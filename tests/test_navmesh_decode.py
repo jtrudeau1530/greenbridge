@@ -617,6 +617,23 @@ class NavmeshDecodeTest(unittest.TestCase):
             self.assertIn("--out and --csv must use different paths", result.stderr)
             self.assertFalse(os.path.exists(output))
 
+    def test_cli_creates_missing_output_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_0drp())
+            out_json = os.path.join(tmp, "reports", "deep", "nav.json")
+            out_csv = os.path.join(tmp, "tables", "nav.csv")
+            result = subprocess.run(
+                [sys.executable, "-I", TOOL, archive, "--out", out_json, "--csv", out_csv, "--quiet"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            with open(out_json, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["resources"]["0drp"]["resources"], 1)
+            with open(out_csv, newline="", encoding="utf-8") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 1)
+
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty.rpf")

@@ -1,3 +1,4 @@
+#include "predicated_copy_controls.h"
 // Record synthetic draws between the physical query boundaries emitted by the Leonida replay queue.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -173,6 +174,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
     context.configure_predication(get_device_proc, memory, properties.limits.maxStorageBufferRange, d.family);
     VulkanFence gate(context, 0);
+    PredicatedCopyControl copy_control;
+    EXPECT(copy_control.create(d, context, properties.limits));
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok() && gate.semaphore());
     struct OpenGate { VulkanFence& fence; ~OpenGate() { fence.signal(1); } } open_gate{gate};
@@ -231,6 +234,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     EXPECT(later.resolve_queries({a, binary, 3, 1, dst_id, 64}));
     EXPECT(later.resolve_queries({a, occ, 0, 1, dst_id, 72}));
     EXPECT(later.resolve_queries({a, binary, 3, 1, dst_id, 80}));
+    EXPECT(copy_control.record(later));
     EXPECT(later.close());
     const CommandList* second[] = {&later};
     EXPECT(queue.execute(second) == ReplayResult::success);
@@ -304,6 +308,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     std::printf("crossing 80/20; nested 84/16; %u segments summed; alternating binary results 1/1; "
                 "offsets and gated overwrites exact\n",
                 2 * bursts + 1);
+    EXPECT(copy_control.check());
     return 0;
 }
 
