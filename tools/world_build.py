@@ -64,6 +64,12 @@ def _load_json_dict(path: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _list_field(record: dict, key: str) -> list:
+    """Read an optional JSON array, treating other types as absent."""
+    value = record.get(key)
+    return value if isinstance(value, list) else []
+
+
 def _is_model_manifest(path: str) -> bool:
     data = _load_json_dict(path)
     if data is None:
@@ -217,7 +223,7 @@ def resolve_model_textures(
     emb_by_key: dict[str, str] = {}
     emb_by_hash: dict[str, str] = {}
 
-    for emb in item.get("Embedded") or []:
+    for emb in _list_field(item, "Embedded"):
         if not isinstance(emb, dict):
             continue
         raw_idx = emb.get("Index")
@@ -242,7 +248,7 @@ def resolve_model_textures(
             if _is_nonzero_key(norm_hash):
                 emb_by_hash.setdefault(norm_hash, dds_path)
 
-    materials = item.get("Materials") or []
+    materials = _list_field(item, "Materials")
     if materials:
         for mat in materials:
             if not isinstance(mat, dict):
@@ -258,7 +264,7 @@ def resolve_model_textures(
                 continue
 
             chosen: str | None = None
-            for ref in mat.get("Textures") or []:
+            for ref in _list_field(mat, "Textures"):
                 if not isinstance(ref, dict):
                     continue
                 # 1. Embedded by TextureIndex
@@ -560,7 +566,7 @@ def build_world(
             continue
 
         tex_map = resolve_model_textures(models_dir, item, ttpf_index) if textures else {}
-        mesh_shaders = item.get("MeshShaders") or []
+        mesh_shaders = _list_field(item, "MeshShaders")
         mat_to_dds: dict[str, str] = {}
 
         for p in prims:

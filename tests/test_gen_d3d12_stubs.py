@@ -113,6 +113,14 @@ class ParseInterfacesTests(unittest.TestCase):
         names = [item[2] for item in IFACES["IBase"][1] if item[0] == "m"]
         self.assertIn("AfterComment", names)
 
+    def test_cpp_line_comments_do_not_change_the_method_list(self):
+        header = GOOD_HEADER.replace(
+            "    virtual void STDMETHODCALLTYPE DoThing(UINT a, UINT b) = 0;",
+            "    // virtual void STDMETHODCALLTYPE Omitted() = 0; };\n"
+            "    virtual void STDMETHODCALLTYPE DoThing(UINT a, // parameter note\n"
+            "        UINT b) = 0; // trailing comment")
+        self.assertEqual(gen.parse_interfaces(header), IFACES)
+
     def test_preprocessor_lines_pass_through(self):
         items = gen.parse_interfaces(GUARDED_HEADER)["IGuarded"][1]
         self.assertEqual(items[0], ("#", "#if 0"))

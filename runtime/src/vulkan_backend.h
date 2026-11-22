@@ -33,12 +33,14 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCreateSampler) X(vkDestroySampler)
+    X(vkCmdResolveImage) X(vkCreateSampler) X(vkDestroySampler)                                                \
+    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
 
-    // The Vulkan 1.3 entry points may be null on older devices; everything else is required.
+    // The Vulkan 1.3 entry points may be null on older devices, and the extension ones (conditional rendering)
+    // when the extension is not enabled; everything else is required.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
@@ -58,7 +60,9 @@ struct VulkanDeviceFunctions {
 // Per device: what the queues share. Resources are registered by their stable ID (the COM resource pointer).
 class VulkanContext {
 public:
-    VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts)
+    // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
+    VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
+                  bool conditional_rendering = false)
         : device_(device), tracker_(separate_depth_stencil_layouts) {
         loaded_ = vk.load(get, device);
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
@@ -73,6 +77,10 @@ public:
         replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
         replay_.copy_image = vk.vkCmdCopyImage;
         replay_.resolve_image = vk.vkCmdResolveImage;
+        if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
+            replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
+            replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
+        }
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };

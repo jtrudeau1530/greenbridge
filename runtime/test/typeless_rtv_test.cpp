@@ -96,6 +96,27 @@ int main() {
             ++checks;
         }
     }
+    // Whole-view clears must keep main's predication attachment path, including same-format UNORM.
+    auto conditional = vk;
+    conditional.begin_conditional_rendering = +[](VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {};
+    conditional.end_conditional_rendering = end;
+    ResourceBinding predicate{};
+    predicate.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
+    predicate.size = 8;
+    for (const auto& [format, expected] : formats) {
+        CommandList predicated;
+        EXPECT(predicated.set_predication({2, 0, d3d12_predication::equal_zero}));
+        EXPECT(predicated.clear_render_target({1, 0, 0, 1, format}, color) && predicated.close());
+        PreparedList prepared;
+        reset_counters();
+        const auto resolve = [&](ResourceId id) { return id == 2 ? &predicate : &binding; };
+        EXPECT(prepare(predicated, resolve, conditional, prepared) == ReplayResult::success);
+        EXPECT(prepared.commands[1].rects.size() == 1);
+        EXPECT(prepared.commands[1].rects[0].rect.extent.width == binding.width);
+        EXPECT(prepared.commands[1].rects[0].rect.extent.height == binding.height);
+        EXPECT(requested_format == expected);
+        ++checks;
+    }
     const auto rejects = [&](ResourceBinding r, TargetView view) {
         CommandList list;
         if (!list.clear_render_target(view, color) || !list.close()) return false;

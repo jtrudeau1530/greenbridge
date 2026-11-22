@@ -52,7 +52,7 @@ work on booting can start as soon as one is available to a developer.
 | Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
 | Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
 | PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Untested against the real executable |
-| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, views and committed resources; barriers, clears, uploads and copies (BC included) run on Vulkan, checked on one GPU. No shader views, pipelines, draws or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
+| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, views, committed and reserved resources; barriers, clears, uploads and copies (BC included) run on Vulkan, checked on one GPU. No shader views, pipelines, draws or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
 | Booting, story mode, anything playable | ❌ No |
 
 ## How to build
@@ -80,7 +80,7 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 
 - **Your own copy** of the Xbox Series package, version 1.0.2.1.
 - **Windows 10/11 x64**, with about **350 GB** free for work files. They can go on another drive with `--work`.
-- [Python 3.11+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
+- [Python 3.12+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official

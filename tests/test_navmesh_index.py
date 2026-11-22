@@ -129,5 +129,17 @@ class NavmeshIndexTest(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
 
+class MissingInputTest(unittest.TestCase):
+    def test_missing_input_is_a_message_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "n.json")
+            p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "missing.rpf"), "--out", out],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertIn("missing.rpf", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()

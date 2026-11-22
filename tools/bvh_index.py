@@ -60,8 +60,9 @@ def below_normal():
 def decode_node_pointer(value):
     """Decode the low three type bits and the high 29-bit 64-byte node index."""
     typ = value & 7
+    invalid = value == INVALID_NODE
     return {"ptr": value, "index": value >> 3, "type": typ,
-            "name": NODE_TYPE_NAMES.get(typ, "invalid"), "invalid": value == INVALID_NODE}
+            "name": "invalid" if invalid else NODE_TYPE_NAMES[typ], "invalid": invalid}
 
 
 def parse_header(head):
@@ -95,6 +96,7 @@ def parse_header(head):
         "root_node_index": root_ptr["index"],
         "root_node_type": root_ptr["type"],
         "root_node_type_name": root_ptr["name"],
+        "root_node_invalid": root_ptr["invalid"],
         "offset_to_elements": struct.unpack_from("<I", head, 0x134)[0],
         "offset_to_parents": struct.unpack_from("<I", head, 0x138)[0],
         "compression_params": struct.unpack_from("<I", head, 0x13C)[0],
@@ -157,6 +159,7 @@ def classify(head, size, tail=None):
                           root_node_index=hdr["root_node_index"],
                           root_node_type=hdr["root_node_type"],
                           root_node_type_name=hdr["root_node_type_name"],
+                          root_node_invalid=hdr["root_node_invalid"],
                           offset_to_elements=hdr["offset_to_elements"],
                           offset_to_parents=hdr["offset_to_parents"],
                           compression_params=hdr["compression_params"],
@@ -337,7 +340,8 @@ def write_outputs(rows, summaries, out, csv_path):
         cols = ["source", "offset", "stored", "size", "kind", "signature", "version", "node_count",
                 "node_bytes", "declared_bytes", "tail_offset", "flags", "crc32", "num_elements",
                 "offset_to_nodes", "offset_to_prim_remap", "root_node_ptr", "root_node_index",
-                "root_node_type", "root_node_type_name", "offset_to_elements", "offset_to_parents",
+                "root_node_type", "root_node_type_name", "root_node_invalid", "offset_to_elements",
+                "offset_to_parents",
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:

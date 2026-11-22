@@ -75,6 +75,23 @@ class CarveEdgeTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["files"], 0)
         self.assertEqual(doc["summary"]["span"], 0)
 
+    def test_header_data_offset_past_eof_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            out = os.path.join(tmp, "out")
+            data = bytearray(0x40)
+            data[0:4] = b"RPF9"
+            struct.pack_into("<I", data, 4, 0x1000)   # data offset past the end of the file
+            with open(arc, "wb") as f:
+                f.write(data)
+            p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only"],
+                               capture_output=True, text=True)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("header data offset 4096", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+            self.assertFalse(os.path.exists(out))
+
     def test_bad_range_arguments_fail_before_the_out_dir_is_created(self):
         with tempfile.TemporaryDirectory() as tmp:
             arc = os.path.join(tmp, "x.rpf")

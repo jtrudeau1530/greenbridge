@@ -176,6 +176,51 @@ class InterpreterTests(unittest.TestCase):
                  "OpStore %out %res\n" + FOOTER)
         self.assertEqual(si.run_fragment(text, memory={4100: 0x12345678})["%out"][0], 0x12345678)
 
+    def test_sconvert_sign_extends_and_truncates(self):
+        """OpSConvert: sign-extend from the operand's width, wrap to the result's (the global_* offset path)."""
+        text = HEADER.replace("OpCapability Shader", "OpCapability Shader\nOpCapability Int64")
+        text = text.replace("%main = OpFunction", "%long = OpTypeInt 64 1\n%ulong = OpTypeInt 64 0\n"
+                            "%int = OpTypeInt 32 1\n%neg = OpConstant %int -16\n%main = OpFunction")
+        text += ("%w = OpSConvert %long %neg\n"           # -16 as 64 bits
+                 "%u = OpBitcast %ulong %w\n"
+                 "%hi64 = OpShiftRightLogical %ulong %u %c64_32\n"
+                 "%hi = OpUConvert %uint %hi64\n"
+                 "%back = OpSConvert %int %w\n"           # and back to 32 bits
+                 "%lo = OpBitcast %uint %back\n"
+                 "%res = OpBitwiseXor %uint %hi %lo\n"    # 0xFFFFFFFF ^ 0xFFFFFFF0
+                 "OpStore %out %res\n" + FOOTER)
+        text = text.replace("%main = OpFunction", "%c64_32 = OpConstant %ulong 32\n%main = OpFunction")
+        self.assertEqual(si.run_fragment(text)["%out"][0], 0x0000000F)
+
+    def test_physical_storage_buffer_atomics(self):
+        """Atomics on PhysicalStorageBuffer memory return the original value and write the combined one."""
+        text = HEADER.replace("OpMemoryModel Logical GLSL450",
+                              'OpCapability PhysicalStorageBufferAddresses\n'
+                              'OpExtension "SPV_KHR_physical_storage_buffer"\n'
+                              "OpMemoryModel PhysicalStorageBuffer64 GLSL450")
+        decls = ("%ulong = OpTypeInt 64 0\n"
+                 "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint\n"
+                 "%addr = OpConstant %ulong 4096\n%cm1 = OpConstant %uint 4294967295\n%c5 = OpConstant %uint 5\n")
+        text = text.replace("%main = OpFunction", decls + "%main = OpFunction")
+        cases = [  # (instruction, memory before, expected memory after, expected result)
+            ("OpAtomicIAdd %uint %p %c1 %c0 %cm1", 7, 6, 7),
+            ("OpAtomicISub %uint %p %c1 %c0 %c2", 1, 0xFFFFFFFF, 1),
+            ("OpAtomicSMin %uint %p %c1 %c0 %cm1", 3, 0xFFFFFFFF, 3),
+            ("OpAtomicUMin %uint %p %c1 %c0 %cm1", 3, 3, 3),
+            ("OpAtomicSMax %uint %p %c1 %c0 %c2", 0x80000000, 2, 0x80000000),
+            ("OpAtomicXor %uint %p %c1 %c0 %c5", 6, 3, 6),
+            ("OpAtomicExchange %uint %p %c1 %c0 %c5", 9, 5, 9),
+            ("OpAtomicCompareExchange %uint %p %c1 %c0 %c0 %c5 %c2", 2, 5, 2),   # equal: swapped
+            ("OpAtomicCompareExchange %uint %p %c1 %c0 %c0 %c5 %c2", 3, 3, 3),   # not equal: kept
+        ]
+        for ins, before, after, result in cases:
+            with self.subTest(ins=ins, before=before):
+                body = (text + "%p = OpConvertUToPtr %_ptr_PSB_uint %addr\n"
+                        f"%res = {ins}\nOpStore %out %res\n" + FOOTER)
+                memory = {4096: before}
+                self.assertEqual(si.run_fragment(body, memory=memory)["%out"][0], result)
+                self.assertEqual(memory[4096], after)
+
     def test_inputs_and_push_constants_can_be_seeded(self):
         text = HEADER.replace('OpEntryPoint Fragment %main "main" %out',
                               'OpEntryPoint Fragment %main "main" %out %in')
