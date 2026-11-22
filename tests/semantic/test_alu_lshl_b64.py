@@ -2,6 +2,7 @@
 
 1. Reference Oracle: Plain-Python RDNA2 ISA reference for v_lshlrev_b64 (D = S1 << (S0 & 63)).
 2. SIMD Multi-Lane: Tests across multiple VGPR register pairs and values.
+3. Zero-fill extremes, shift count modulo 64, and negative controls.
 """
 import os
 import random
@@ -91,10 +92,9 @@ class ALUIVectorLshlB64Tests(unittest.TestCase):
         self.assertEqual(run_op(1, 0x0000000100000001), 0x0000000200000002)
 
     def test_simd_multilane_pairs(self):
-        # Test using different register pair allocations (e.g., v[4:5], v[6:7])
         pairs = [
-            (4, 2, 3), # v[2:3] source, v[4:5] dest
-            (6, 8, 9), # v[8:9] source, v[6:7] dest
+            (4, 2, 3),
+            (6, 8, 9),
         ]
         for dst_reg, src_lo, src_hi in pairs:
             n = 5
@@ -104,11 +104,29 @@ class ALUIVectorLshlB64Tests(unittest.TestCase):
                 f"v_mov_b32 v{src_lo}, {x & 0xFFFFFFFF:#x}",
                 f"v_mov_b32 v{src_hi}, {x >> 32:#x}",
                 f"v_lshlrev_b64 v[{dst_reg}:{dst_reg+1}], v10, v[{src_lo}:{src_hi}]",
-                # Copy result to v[0:1] for EXPORT_HALVES
                 f"v_mov_b32 v0, v{dst_reg}",
                 f"v_mov_b32 v1, v{dst_reg+1}"
             ]
             self.assertEqual(run_lines(lines), ref_lshlrev_b64(n, x))
+
+    def test_extremes_and_modulo(self):
+        shifts = [0, 1, 31, 32, 33, 63, 64, 65, 127, 128, 0xFFFFFFFF]
+        values = [0, 1, M64, 1 << 63, 0x0123456789ABCDEF]
+        for n in shifts:
+            for x in values:
+                with self.subTest(n=n, x=hex(x)):
+                    self.assertEqual(run_op(n, x), ref_lshlrev_b64(n, x))
+
+    def test_negative_controls(self):
+        # Negative control: verify that incorrect shift or wrong mask fails
+        n = 4
+        x = 0x0000000100000001
+        correct = ref_lshlrev_b64(n, x)
+        actual = run_op(n, x)
+        self.assertEqual(actual, correct)
+        # Explicitly ensure it does NOT equal an unshifted or wrongly shifted value
+        self.assertNotEqual(actual, x)
+        self.assertNotEqual(actual, ref_lshlrev_b64(n + 1, x))
 
 if __name__ == "__main__":
     unittest.main()
