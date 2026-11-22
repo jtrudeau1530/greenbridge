@@ -698,6 +698,42 @@ int main() {
         const auto null_at = [&](UINT i) {
             return std::all_of(view_bytes(i), view_bytes(i) + step, [](std::uint8_t byte) { return byte == 0; });
         };
+        // An explicit D3D12_SRV_DIMENSION_TEXTURE1D view on a 1D texture array selects layer zero (like TEXTURE2D
+        // and TEXTURE2DMS on 2D arrays), while a default (nullptr) SRV on a 1D array remains a null descriptor.
+        {
+            auto line_array_desc = line_desc;
+            line_array_desc.DepthOrArraySize = 3;
+            Ref<ID3D12Resource> line_array;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &line_array_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&line_array.p))));
+            D3D12_DESCRIPTOR_HEAP_DESC la_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                    D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> la_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&la_heap_desc, IID_PPV_ARGS(&la_heap.p))));
+            const std::uint64_t la_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(la_heap.p, 9))(la_heap.p);
+            const D3D12_CPU_DESCRIPTOR_HANDLE la_default{SIZE_T(la_cpu)}, la_slice0{SIZE_T(la_cpu + step)};
+            std::memset(reinterpret_cast<void*>(la_default.ptr), 0x77, step);
+            device->CreateShaderResourceView(line_array.p, nullptr, la_default);
+            EXPECT(std::all_of(reinterpret_cast<const std::uint8_t*>(la_default.ptr),
+                               reinterpret_cast<const std::uint8_t*>(la_default.ptr) + step,
+                               [](std::uint8_t byte) { return byte == 0; }));
+            D3D12_SHADER_RESOURCE_VIEW_DESC la_view{};
+            la_view.Format = DXGI_FORMAT_UNKNOWN;
+            la_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            la_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            la_view.Texture1D = {1, 1, 0};
+            device->CreateShaderResourceView(line_array.p, &la_view, la_slice0);
+            g::ImageWords la_words{};
+            std::memcpy(la_words.data(), reinterpret_cast<const void*>(la_slice0.ptr), sizeof(la_words));
+            g::Image la_image{};
+            EXPECT(g::is_image(la_words) && g::decode(la_words, la_image) &&
+                   la_image.type == g::ImageType::image_1d && la_image.first_mip == 1 && la_image.mip_count == 1 &&
+                   la_image.first_layer == 0 && la_image.layer_count == 1);
+            std::uint32_t la_key[8]{};
+            std::memcpy(la_key, la_words.data(), sizeof(la_key));
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, la_key) != 0);
+        }
         D3D12_RESOURCE_DESC ms_desc = texture_desc;
         ms_desc.Width = ms_desc.Height = 4;
         ms_desc.SampleDesc.Count = 4;
@@ -2164,6 +2200,47 @@ int main() {
             EXPECT(min_matches == texels && max_matches == texels);
             if (rgba8_minmax) EXPECT(blend_diff_min == texels && blend_diff_max == texels);
 #endif
+        }
+
+        // Cross-family castable SRV: write_image_descriptor must pass resource.has_view_format_list() into a single
+        // bind_image call so a listed R8G8B8A8_UINT -> R32_UINT view registers cleanly without a spurious first-pass
+        // failure (and without double-binding every view).
+        if (d.bindless) {
+            Ref<ID3D12Device10> inner10;
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&inner10.p))));
+            D3D12_RESOURCE_DESC1 cast_desc{};
+            cast_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            cast_desc.Width = 4;
+            cast_desc.Height = 4;
+            cast_desc.DepthOrArraySize = 1;
+            cast_desc.MipLevels = 1;
+            cast_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+            cast_desc.SampleDesc = {1, 0};
+            cast_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            const DXGI_FORMAT cast_formats[] = {DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R32_UINT};
+            Ref<ID3D12Resource> cast_tex;
+            EXPECT(SUCCEEDED(inner10->CreateCommittedResource3(
+                &default_heap, D3D12_HEAP_FLAG_NONE, &cast_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr,
+                2, cast_formats, IID_PPV_ARGS(&cast_tex.p))));
+            const D3D12_DESCRIPTOR_HEAP_DESC cast_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> cast_heap;
+            EXPECT(SUCCEEDED(inner10->CreateDescriptorHeap(&cast_hd, IID_PPV_ARGS(&cast_heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE cast_slot = cast_heap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_SHADER_RESOURCE_VIEW_DESC cast_srv{};
+            cast_srv.Format = DXGI_FORMAT_R32_UINT;
+            cast_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            cast_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            cast_srv.Texture2D.MipLevels = 1;
+            inner10->CreateShaderResourceView(cast_tex.p, &cast_srv, cast_slot);
+            g::ImageWords cast_words{};
+            std::memcpy(cast_words.data(), reinterpret_cast<const void*>(cast_slot.ptr), sizeof(cast_words));
+            g::Image decoded{};
+            EXPECT(g::decode(cast_words, decoded) && decoded.type == g::ImageType::image_2d);
+            EXPECT(decoded.format == g::format_from_vulkan(VK_FORMAT_R32_UINT));
+            std::uint32_t cast_key[8]{};
+            std::memcpy(cast_key, cast_words.data(), sizeof(cast_key));
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, cast_key) != 0);
         }
 
         upload.reset();

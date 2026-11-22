@@ -85,6 +85,24 @@ class Generator(unittest.TestCase):
             else:
                 self.assertEqual(x, y)
 
+    def test_permute_is_generated_and_no_exec_clears_only_permute(self):
+        self.assertIn("permute", f.EXEC_KINDS)
+        found = 0
+        for idx in range(40):
+            a = f.Program(1, idx, 64, permute=True)
+            b = f.Program(1, idx, 64, no_exec=("permute",), permute=True)
+            self.assertEqual(len(a.ops), len(b.ops))
+            for x, y in zip(a.ops, b.ops):
+                if x["kind"] == "permute":
+                    if x["exec"] is not None:
+                        found += 1
+                    self.assertIsNone(y["exec"])
+                    self.assertEqual({k: v for k, v in x.items() if k not in ("exec", "hyp")},
+                                     {k: v for k, v in y.items() if k not in ("exec", "hyp")})
+                else:
+                    self.assertEqual(x, y)
+        self.assertGreater(found, 0, "expected at least one permute op with non-None exec mask")
+
 
 class Model(unittest.TestCase):
     def test_initial_lds_pattern(self):
@@ -103,6 +121,48 @@ class Model(unittest.TestCase):
         keep = f.Program(1, 0, 32)
         keep.ops = []
         self.assertEqual(regs[9][21], keep.model()[0][9][21])  # lane 9 is off itself: keeps its value
+
+    def test_permute_collision_highest_active_wins_and_unaddressed_is_zero(self):
+        # All active lanes scatter to lane 5 in their own 32-lane half (mul=0, add=5, offset=0).
+        # EXEC: low half has lanes 0..7 active (highest active = 7); high half has lanes 32, 35, 40 active (highest = 40).
+        mask = 0xFF | (1 << 32) | (1 << 35) | (1 << 40)
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "permute", "mul": 0, "add": 5, "offset": 0, "src": 20, "dst": 21, "exec": mask}]
+        base = f.Program(1, 0, 64)
+        base.ops = []
+        init_regs, _ = base.model()
+        regs, _ = p.model()
+
+        # Low half: lane 5 is active and receives highest active source (lane 7).
+        self.assertEqual(regs[5][21], init_regs[7][20])
+        # Low half: active lanes != 5 receive nobody -> 0.
+        for t in (0, 1, 2, 3, 4, 6, 7):
+            self.assertEqual(regs[t][21], 0)
+        # Low half: inactive lanes keep their original v21.
+        for t in (8, 15, 31):
+            self.assertEqual(regs[t][21], init_regs[t][21])
+        # High half: target lane 32+5=37 is INACTIVE, so it keeps its original v21 even though 32,35,40 targeted it.
+        self.assertEqual(regs[37][21], init_regs[37][21])
+        # High half: active lanes 32, 35, 40 receive nobody -> 0.
+        for t in (32, 35, 40):
+            self.assertEqual(regs[t][21], 0)
+        self.assertIn("ds_permute_b32 v21, v6, v20 offset:0", p.asm())
+
+        with f.perturbed("permute_lowest_wins"):
+            bad_regs, _ = p.model()
+            self.assertEqual(bad_regs[5][21], init_regs[0][20])
+
+    def test_permute_half_isolation_and_offset(self):
+        # Identity + offset:8 (+2 lanes) mod 32 within each 32-lane half, all lanes active.
+        p = f.Program(2, 1, 64)
+        p.ops = [{"kind": "permute", "mul": 1, "add": 0, "offset": 8, "src": 20, "dst": 22, "exec": None}]
+        base = f.Program(2, 1, 64)
+        base.ops = []
+        init_regs, _ = base.model()
+        regs, _ = p.model()
+        for t in range(64):
+            src_lane = (t & ~31) | ((t - 2) & 31)
+            self.assertEqual(regs[t][22], init_regs[src_lane][20])
 
     def test_d16_hi_read_keeps_the_low_half(self):
         p = f.Program(1, 0, 64)

@@ -143,6 +143,11 @@ class Resolve(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(r.stdout, "")      # refused before the resolve ran
 
+    def test_rejects_negative_compose_count(self):
+        result = self.resolve_cli(self.dir, "--dict", self.dict, "--compose", "-1")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--compose must be 0 or more", result.stderr)
+
     def test_compose_finds_two_word_names(self):
         text = run(["resolve", self.jsav, "--dict", self.dict, "--compose", "50"])
         self.assertIn("joaat, composed       1 more keys", text)       # SprocketCount from Sprocket + Count

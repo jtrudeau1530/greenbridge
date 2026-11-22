@@ -36,6 +36,10 @@ int main(int argc, char** argv) {
     EXPECT(SUCCEEDED(create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     EXPECT(SUCCEEDED(create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, IID_PPV_ARGS(&list7.p))));
 
+    // Null bindings exercise the public entry points without creating a pipeline or loading Vulkan.
+    list7.p->SetPipelineState(nullptr);
+    list7.p->SetGraphicsRootSignature(nullptr);
+
     // AddRef through the GCL7 pointer gives the count this test expects while the QueryInterface reference is held.
     const ULONG held = list7.p->AddRef();
     list7.p->Release();

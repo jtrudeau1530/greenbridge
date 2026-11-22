@@ -318,9 +318,103 @@ def test_v_perm_b32_selectors():
     assert failures == 0, f"{failures} v_perm_b32 check(s) failed"
 
 
+def psv0(records, size=24, truncate=False):
+    """PSV0 payload: a 24-byte runtime info, then the resource count, record size and (type, kind) records."""
+    body = struct.pack("<I", 24) + bytes(24) + struct.pack("<II", len(records), size)
+    for t, k in records:
+        rec = struct.pack("<4I", t, 0, 0, 0) + (struct.pack("<II", k, 0) if size >= 24 else b"")
+        body += rec + bytes(size - len(rec))
+    return body[:-4] if truncate else body
+
+
+def listing(lines):
+    """A .s listing with `; encoding:` comments of the right length, so pcs and branch targets are real."""
+    return "".join(f"\t{code} ; encoding: [{','.join(['0x00'] * n)}]\n" for code, n in lines)
+
+
+def test_typed_buffers_and_psv0():
+    """§8.2 #16: PSV0 counter/typed-buffer bindings, MTBUF formats and where each MUBUF V# word 3 comes from."""
+    with tempfile.TemporaryDirectory() as tmp:
+        sh = os.path.join(tmp, "shaders")
+        dx = os.path.join(sh, "dxbc")
+        dis = os.path.join(dx, "disasm")
+        os.makedirs(dis)
+        cs = listing([
+            ("s_load_dwordx4 s[8:11], s[0:1], 0x0", 8),                         # pc 0
+            ("s_mov_b32 s15, 0x38000", 8),                                      # 8: format 56, 8_8_8_8_UNORM
+            ("s_mov_b32 s19, 0x24000", 8),                                      # 16: format 36, 10_11_11_FLOAT
+            ("s_or_b32 s23, s23, 0x1000", 8),                                   # 24: computed
+            ("s_cmp_eq_u32 s11, 0", 4),                                         # 32: reads s11, writes nothing
+            ("buffer_load_format_xyzw v[0:3], v4, s[8:11], 0 idxen", 8),        # 36: memory
+            ("buffer_load_format_x v5, v4, s[12:15], 0 idxen", 8),              # 44: literal
+            ("buffer_store_format_x v5, v4, s[16:19], 0 idxen", 8),             # 52: literal, not in the table
+            ("buffer_load_format_x v6, v4, s[20:23], 0 idxen", 8),              # 60: computed
+            ("buffer_load_format_x v7, v4, s[24:27], 0 idxen", 8),              # 68: never written: shader input
+            ("s_cbranch_scc0 1", 4),                                            # 76: to 84; 80 and 84 lead blocks
+            ("s_nop 0", 4),                                                     # 80
+            ("buffer_load_format_x v8, v4, s[8:11], 0 idxen", 8),               # 84: loaded in an earlier block
+            ("buffer_load_format_x v9, v4, s[12:15], 0 idxen", 8),              # 92: literal from an earlier block
+            ("tbuffer_load_format_xy v[0:1], v4, s[8:11], 0 format:[BUF_FMT_16_16_SNORM] idxen", 8),
+            ("tbuffer_load_format_x v2, v4, s[8:11], 0 idxen", 8),             # no format: GFX10 default 8_UNORM
+            ("tbuffer_store_format_x v2, v4, s[8:11], 0 format:[BUF_FMT_10_11_11_FLOAT] idxen", 8),
+            ("s_endpgm", 4)])
+        ps = listing([("s_mov_b32 s11, 0", 4),                                    # word 3 0: FORMAT INVALID
+                      ("buffer_load_format_x v0, v1, s[0:3], 0 idxen", 8),
+                      ("buffer_load_format_x v2, v1, s[8:11], 0 idxen", 8), ("s_endpgm", 4)])
+        vs = listing([("v_mov_b32_e32 v0, v1", 4), ("s_endpgm", 4)])
+        synthetic = [
+            ("tb_cs", "cs", cs, psv0([(9, 12), (3, 10), (6, 2)])),     # counter UAV, typed buffer SRV, typed 2D UAV
+            ("tb_ps", "ps", ps, psv0([(6, 10), (6, 10)])),             # two typed buffer UAVs
+            ("tb_vs", "vs", vs, psv0([(3, 10)], size=16)),             # v0 records carry no kind
+            ("tb_gs", "gs", None, psv0([(9, 12)], truncate=True)),     # records past the end of the part
+        ]
+        index = []
+        for name, stage, text, psv in synthetic:
+            with open(os.path.join(dx, name + ".dxbc"), "wb") as f:
+                f.write(dxbc([("SFI0", struct.pack("<Q", 0)), ("OSG1", signature([0])), ("PSV0", psv)]))
+            index.append({"name": name, "file": name + ".dxbc", "stage": stage})
+            if text:
+                with open(os.path.join(dis, name + ".s"), "w", encoding="utf-8") as f:
+                    f.write(f"; {name}\n" + text)
+        with open(os.path.join(dx, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+
+        pv = F.scan_dxbc(dx, index)["psv0"]
+        check(pv["records"] == 6 and pv["unreadable"] == 1, f"PSV0: 6 records read, 1 truncated table ({pv})")
+        check(pv["shaders"] == {"uav_with_counter": 1, "typed_buffer_srv": 1, "typed_buffer_uav": 1},
+              f"PSV0 shaders with a counter UAV / typed buffer SRV / typed buffer UAV ({pv['shaders']})")
+        check(pv["records_of"] == {"uav_with_counter": 1, "typed_buffer_srv": 1, "typed_buffer_uav": 2},
+              "a typed UAV of a texture kind and a v0 record without a kind are not typed buffers")
+        check(pv["by_type"] == {"UAVStructuredWithCounter": 1, "SRVTyped": 2, "UAVTyped": 3}, f"by type {pv['by_type']}")
+
+        tb = F.scan_typed_buffers(dis, {e["name"]: e["stage"] for e in index})
+        check(tb["mtbuf"] == {"load 16_16_SNORM": 1, "load 8_UNORM": 1, "store 10_11_11_FLOAT": 1},
+              f"MTBUF formats from the instruction, 8_UNORM without format: ({tb['mtbuf']})")
+        check(tb["mubuf_word3"] == {"load computed": 1, "load earlier_literal": 1, "load earlier_memory": 1,
+                                    "load literal": 2, "load memory": 1, "load shader_input": 2,
+                                    "store literal": 1},
+              f"MUBUF word 3 by source, s_cmp is no write, a branch target starts a block ({tb['mubuf_word3']})")
+        check(tb["mubuf_literal_formats"] == {"load 8_8_8_8_UNORM": 2, "load INVALID": 1,
+                                              "store 10_11_11_FLOAT": 1}, f"literal word 3 formats ({tb['mubuf_literal_formats']})")
+        check(tb["not_in_translator"] == {"mtbuf store 10_11_11_FLOAT": 1, "mubuf_literal store 10_11_11_FLOAT": 1},
+              f"formats outside rdna2spirv.Gen.FORMATS are listed, INVALID (reads 0) is not ({tb['not_in_translator']})")
+        check(tb["shaders"] == {"mtbuf": {"cs": 1}, "mubuf": {"cs": 1, "ps": 1}, "mubuf_literal": {"cs": 1, "ps": 1},
+                                "mubuf_runtime_format": {"cs": 1, "ps": 1}}, f"shaders per stage ({tb['shaders']})")
+
+        out_json = os.path.join(tmp, "out.json")
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh, "--out", out_json],
+                           capture_output=True, text=True)
+        check(r.returncode == 0 and "PSV0 bindings: 6 records" in r.stdout and "uav_with_counter 1" in r.stdout
+              and "10_11_11_FLOAT" in r.stdout, f"CLI prints the #16 summary (rc={r.returncode})")
+        raw_json = open(out_json, encoding="utf-8").read()
+        check(all(n not in r.stdout and n not in raw_json for n, *_ in synthetic), "no shader name in stdout or JSON")
+    assert failures == 0, f"{failures} typed-buffer check(s) failed"
+
+
 if __name__ == "__main__":
     try:
         test_feature_scan()
+        test_typed_buffers_and_psv0()
         test_short_signature()
         test_part_payload_outside_container_is_unreadable()
         test_bad_shaders_folder_is_one_line()

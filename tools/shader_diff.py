@@ -177,7 +177,7 @@ def generate_program(rng, n_ops):
 
 
 def _write_listing(path, lines, with_export):
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("; shader_diff case  code 0x0..0x1000\n")
         for line in lines:
             f.write("\t" + line + "\n")

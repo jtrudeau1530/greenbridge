@@ -41,6 +41,11 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             with self.subTest(source=name):
                 self.assertTrue((ROOT / "runtime" / "test" / name).is_file())
 
+    def test_build_cmd_sets_utf8_codepage_for_ninja_showincludes(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("chcp 65001 >nul", text)
+        self.assertLess(text.index("chcp 65001 >nul"), text.index('call `"$vcvars`"'))
+
 
 if __name__ == "__main__":
     unittest.main()
