@@ -216,6 +216,59 @@ class VSqrtF32Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & 0xFFFF_FFFF
+
+    def set_vgpr(self, index: int, bits: int) -> None:
+        self.vgprs[index] = bits & 0xFFFF_FFFF
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & 0xFFFF_FFFF
+
+    def set_sgpr(self, index: int, bits: int) -> None:
+        self.sgprs[index] = bits & 0xFFFF_FFFF
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_sqrt_f32."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg32):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VSqrtF32Instruction, state: ScalarMachineState) -> int:
+        s_raw = self.resolve_operand(instr.src, state)
+
+        result_bits = oracle_v_sqrt_f32(
+            src_bits=s_raw,
+            abs_mod=instr.src.abs_mod,
+            neg_mod=instr.src.neg_mod,
+            clamp=instr.clamp,
+        )
+
+        state.set_vgpr(instr.dst.index, result_bits)
+        return result_bits
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -377,6 +430,66 @@ class TestSymbolicAST(unittest.TestCase):
             VOP3Operand(Reg32(2, RegType.VGPR)),
         )
         self.assertEqual(i1, i2)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_source(self) -> None:
+        self.state.set_vgpr(2, f32_to_bits(25.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Reg32(2, RegType.VGPR)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f32(res_bits), 5.0)
+        self.assertEqual(self.state.get_vgpr(0), res_bits)
+
+    def test_scalar_sgpr_source(self) -> None:
+        self.state.set_sgpr(4, f32_to_bits(144.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(6, RegType.VGPR),
+            src=VOP3Operand(Reg32(4, RegType.SGPR)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f32(res_bits), 12.0)
+        self.assertEqual(self.state.get_vgpr(6), res_bits)
+
+    def test_scalar_literal_source(self) -> None:
+        instr = VSqrtF32Instruction(
+            dst=Reg32(8, RegType.VGPR),
+            src=VOP3Operand(Literal32.from_float(0.0625)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f32(res_bits), 0.25)
+        self.assertEqual(self.state.get_vgpr(8), res_bits)
+
+    def test_scalar_with_modifiers_and_clamp(self) -> None:
+        self.state.set_vgpr(0, f32_to_bits(-16.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(4, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR), abs_mod=True),
+            clamp=True,
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, ONE_F32)
+        self.assertEqual(self.state.get_vgpr(4), ONE_F32)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_vgpr(0, 0x40490FDB)  # pi
+            instr = VSqrtF32Instruction(
+                dst=Reg32(2, RegType.VGPR),
+                src=VOP3Operand(Reg32(0, RegType.VGPR)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
 
 
 if __name__ == "__main__":
