@@ -1096,7 +1096,7 @@ def run_suite(a, work: str) -> int:
             problem = sampler_test(a.build, spirv_dir)
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or f"{len(SAMPLER_CASES)} S#/T# cases, 4096 pixels each exact"))
-        elif name in ("ps_texoff", "ps_texoff_implicit"):
+        elif name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
             # Texel offsets: needs vk_texture_test's texture, sampler and descriptor table (vk_harness binds none),
             # and VK_KHR_maintenance8 for the non-constant Offset; the tool exits 77 without it.
             raw = os.path.join(raw_dir, f"{name}.raw")
@@ -1108,7 +1108,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, msg))
             else:
                 with open(raw, "rb") as f:
-                    problem, covered = texoff_problem(f.read(), msg)
+                    problem, covered = texoff_problem(f.read(), msg, name=name)
                 results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
         elif name in OTHER_HARNESS:
             results.append((name, None, f"SKIP (run by {OTHER_HARNESS[name]})"))
