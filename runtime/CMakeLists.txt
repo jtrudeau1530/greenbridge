@@ -769,6 +769,7 @@ endif()
 # -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time
 # (hash-checked), or pass -DFETCHCONTENT_SOURCE_DIR_VULKANHEADERS=<path> to use a local copy without downloading.
 option(LEONIDA_VULKAN_HEADERS_FETCH "Download the pinned Khronos Vulkan-Headers release if no Vulkan headers are found" OFF)
+option(LEONIDA_REQUIRE_VULKAN "Fail the configure instead of warning when no Vulkan headers are found" OFF)
 find_package(Vulkan QUIET)
 if(NOT TARGET Vulkan::Headers)
   find_path(Vulkan_INCLUDE_DIR
@@ -1892,7 +1893,6 @@ if(TARGET Vulkan::Headers)
     add_test(NAME subgroup_size COMMAND subgroup_size_test)
   endif()
 else()
-  message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
-                 "gfx10_descriptors_test are not built. Set VULKAN_SDK, install Vulkan headers, or pass "
-                 "-DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
+  leonida_vulkan_headers_missing()
 endif()

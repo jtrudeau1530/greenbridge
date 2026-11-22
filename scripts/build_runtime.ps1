@@ -21,10 +21,12 @@ $cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
 $ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
 $cfg = if ($Debug) { "Debug" } else { "RelWithDebInfo" }
 $sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
+# With VULKAN_SDK set, a configure that still finds no Vulkan headers fails instead of dropping the Vulkan D3D12 device.
+$vk = if ($env:VULKAN_SDK) { "-DLEONIDA_REQUIRE_VULKAN=ON" } else { "" }
 
 if ((Test-Path $cmake) -and (Test-Path $ninja)) {
     $body = @"
-"$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl || exit /b 1
+"$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk || exit /b 1
 "$cmake" --build "$out" -j $jobs || exit /b 1
 "@
 } else {
