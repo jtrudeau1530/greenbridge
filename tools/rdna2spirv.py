@@ -199,6 +199,7 @@ class Gen:
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
         self.uses_ballot = False       # wave mask ballot (OpGroupNonUniformBallot)
+        self.uses_bcast_first = False  # OpGroupNonUniformBroadcastFirst (desc_lookup): the Ballot capability only
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.uses_quad = False         # s_wqm on a lane mask (OpGroupNonUniformQuadSwap)
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
@@ -7954,7 +7955,16 @@ class Gen:
                             lines + [f"         OpReturnValue {result}", "OpFunctionEnd"])
         r = self.tmp()
         self.emit(f"{r} = OpFunctionCall %uint %desc_lookup_fn " + " ".join(words))
-        return r
+        if self.emulate:
+            return r
+        # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; say so.
+        # Mesa ANV (26.2.7, Alder Lake Xe-LP) segfaults compiling a shader whose sampler index comes out of the
+        # probe loop when that sampler is used with both a float and an integer image; the broadcast avoids it.
+        # The wave64 emulation keeps no subgroup operation (x_round), so it is left out there.
+        b = self.tmp()
+        self.emit(f"{b} = OpGroupNonUniformBroadcastFirst %uint {self.cu(3)} {r}")
+        self.uses_subgroup = self.uses_bcast_first = True
+        return b
 
     def desc_probe(self, words):
         """The lookup itself: FNV-1a of the 8 dwords, then PROBES slots compared in turn."""
@@ -10039,6 +10049,7 @@ def assemble(gen):
         if any("OpGroupNonUniform" in l or "%sg_lane" in l for b in gen.blocks + list(gen.x_segs.values()) for l in b):
             raise Unsupported("wave64 emulation: a subgroup operation is left")
         gen.uses_subgroup = gen.uses_vote = gen.uses_ballot = gen.uses_wave_bits = gen.uses_quad = False
+        gen.uses_bcast_first = False
         x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
         x_zero = x_sink - x_mask           # mask and schedule words: zeroed before the first round
         x_threads = (gen.cs or gen.ms)["size"]
@@ -10116,7 +10127,7 @@ def assemble(gen):
         (["FragmentBarycentricKHR"] if bary_builtin else [])
     if gen.uses_vote:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformVote") if c not in caps]
-    if gen.uses_ballot:
+    if gen.uses_ballot or gen.uses_bcast_first:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformBallot") if c not in caps]
     if gen.uses_wave_bits:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformArithmetic") if c not in caps]
