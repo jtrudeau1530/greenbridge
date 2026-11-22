@@ -284,6 +284,18 @@ class BcDecodeTest(unittest.TestCase):
         dark = ttpf.decode_pixels(71, struct.pack("<HHI", 0xFFFF, 0x0000, 0xFFFFFFFF), 1, 1)
         self.assertLess(dark[0][0], 100)
 
+    def test_bc3_colour_ignores_endpoint_order_but_bc1_does_not(self):
+        # Row selectors 0, 1, 2, 3 (0xE4); BC3 = alpha half + the same colour half.
+        for c0, c1, bc1_row, bc3_row in (
+                (0x0000, 0xFFFF, [0.0, 255.0, 127.5, 0.0], [0.0, 255.0, 85.0, 170.0]),
+                (0xFFFF, 0xFFFF, [255.0, 255.0, 255.0, 0.0], [255.0] * 4)):
+            colour = struct.pack("<HHI", c0, c1, 0xE4E4E4E4)
+            with self.subTest(c0=c0, c1=c1):
+                bc1 = ttpf.decode_pixels(71, colour, 1, 1)
+                bc3 = ttpf.decode_pixels(77, solid_bc4(255) + colour, 1, 1)
+                self.assertEqual([p[0] for p in bc1[:4]], bc1_row)
+                self.assertEqual([p[0] for p in bc3[:4]], bc3_row)
+
     def test_metric_rewards_the_true_downsample(self):
         parent = [(0.0, 0.0, 0.0), (255.0, 0.0, 0.0), (0.0, 255.0, 0.0), (0.0, 0.0, 255.0)]
         child = [(63.75, 63.75, 63.75)]
@@ -326,6 +338,49 @@ class BcDecodeTest(unittest.TestCase):
         self.assertEqual(clamped, [(200.0, 100.0, 50.0)])
         unclamped = ttpf.block_means(pixels, 1, 1)
         self.assertEqual(unclamped, [(50.0, 25.0, 12.5)])
+
+
+class Bc3CheckTest(unittest.TestCase):
+    def run_check(self, fmt, lower_colour):
+        import io
+        from contextlib import redirect_stdout
+        # Black then white, selector 3: the high-resolution image is uniform gray 170.
+        top_colour = struct.pack("<HHI", 0, 0xFFFF, 0xFFFFFFFF)
+        layout = ttpf.surface_layout(256, 256, fmt, 7, 4096)
+        payload = bytearray(layout["size"])
+        for mip in layout["mips"]:
+            colour = top_colour if mip["index"] == 0 else lower_colour
+            block = solid_bc4(255) + colour
+            retile_to(layout, mip, block * (mip["blocks_w"] * mip["blocks_h"]), payload)
+        record = pack_etpf_record(256, 256, 6, 1, fmt, 1, 1, 4, 4096, 0x103)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bc3.ttpf")
+            write_rds5_pool(path, [record], [payload])
+            pool = ttpf.Pool(path)
+            buf = io.StringIO()
+            try:
+                with redirect_stdout(buf):
+                    code = ttpf.check(pool, 0)
+            finally:
+                pool.close()
+        return code, json.loads(buf.getvalue())
+
+    def test_gray_chain_passes_whatever_the_endpoint_order(self):
+        # Reversed endpoints with selector 2 describe the same gray as the top level.
+        gray = struct.pack("<HHI", 0xFFFF, 0, 0xAAAAAAAA)
+        for fmt in (77, 78):
+            with self.subTest(fmt=fmt):
+                code, result = self.run_check(fmt, gray)
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result["chain_error"], [0.0] * 6)
+
+    def test_black_child_under_gray_top_fails(self):
+        black = struct.pack("<HHI", 0, 0, 0)
+        for fmt in (77, 78):
+            with self.subTest(fmt=fmt):
+                code, result = self.run_check(fmt, black)
+                self.assertEqual(code, 1, result)
+                self.assertEqual(result["chain_error"], [170.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
 class SyntheticPoolTest(unittest.TestCase):
