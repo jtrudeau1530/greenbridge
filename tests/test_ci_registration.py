@@ -22,13 +22,19 @@ drift) and fails on the three ways a test goes missing without CI turning red --
 * a nested ``tests/*/test_*.cjs`` file that ``fnmatch`` matches across ``/`` but the non-recursive
   ``node --test tests/test_*.cjs`` command never runs.
 
-Only the tracked test files and the workflow are read; no game files, no build tools, no pytest.
+It also runs the ``check`` loop itself, taken from the workflow, under bash on a synthetic tree: the loop has
+to run every file and then fail, since stopping at the first failure hides the files sorted after it.
+
+Only the tracked test files and the workflow are read; no game files, no build tools, no pytest. The loop check
+needs bash (Git for Windows' on Windows) and skips without it, except on a GitHub runner.
 """
 import ast
 import fnmatch
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -66,6 +72,46 @@ def ci_rules(root):
     if re.search(r"unittest\s+discover[^\n]*-p\s", text):
         raise AssertionError("unittest discover now passes -p; this test assumes its default 'test*.py' pattern")
     return markers, pruned.rstrip("/"), loop_glob, semantic.rstrip("/"), viewer
+
+
+STDLIB_STEP = "Tests (standard library only, no game data)"
+
+
+def step_script(root, step_name):
+    """The ``run: |`` block of the workflow step called ``step_name``, dedented, exactly as CI runs it."""
+    lines = read(root, WORKFLOW).splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == f"- name: {step_name}":
+            step_indent = len(line) - len(line.lstrip()) + 2
+            for j in range(i + 1, len(lines)):
+                text = lines[j]
+                if text.strip() and len(text) - len(text.lstrip()) < step_indent:
+                    break                          # the next step: this one has no run block
+                if text.strip() == "run: |":
+                    body = []
+                    for k in range(j + 1, len(lines)):
+                        if lines[k].strip() and len(lines[k]) - len(lines[k].lstrip()) <= step_indent:
+                            break
+                        body.append(lines[k])
+                    indent = min(len(b) - len(b.lstrip()) for b in body if b.strip())
+                    return "\n".join(b[indent:] for b in body).strip("\n") + "\n"
+    raise AssertionError(f"ci.yml has no step named {step_name!r} with a `run: |` block; update "
+                         "tests/test_ci_registration.py together with the workflow")
+
+
+def git_bash():
+    """The bash GitHub's `shell: bash` uses: Git for Windows' on Windows (not WSL's), PATH's elsewhere."""
+    if os.name != "nt":
+        return shutil.which("bash")
+    git = shutil.which("git")
+    if git:
+        folder = os.path.dirname(os.path.realpath(git))
+        for _ in range(3):
+            folder = os.path.dirname(folder)
+            for candidate in (os.path.join(folder, "bin", "bash.exe"), os.path.join(folder, "usr", "bin", "bash.exe")):
+                if os.path.isfile(candidate):
+                    return candidate
+    return None
 
 
 def tracked_under_tests(root):
@@ -274,6 +320,56 @@ class RepositoryRegistrationTest(unittest.TestCase):
                                             require_test_case=True))
             self.assertFalse(has_main_guard(read(tmp, "tests/test_inequality_guard.py")))
             self.assertEqual(selected["tests/test_nested_dir/test_nested.cjs"], None)
+
+
+class StdlibLoopTest(unittest.TestCase):
+    """The check job's loop runs every file and then fails, so one failure cannot hide the files after it."""
+
+    def test_loop_runs_past_a_failure_and_names_every_failed_file(self):
+        if not git_bash():
+            # On a runner a missing bash would turn this check into a silent skip.
+            self.assertFalse(os.environ.get("GITHUB_ACTIONS"), "no bash found on the CI runner")
+            self.skipTest("needs bash (Git for Windows on Windows)")
+        script = step_script(ROOT, STDLIB_STEP)
+        markers = ci_rules(ROOT)[0]
+        failing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(1)\n"
+        passing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(0)\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "tests", "semantic"))
+            files = {
+                "tests/test_a_fails.py": failing,
+                "tests/test_b_passes.py": passing,
+                "tests/test_c_fails.py": failing,
+                "tests/test_d_pytest.py": "import pytest\n" + failing,   # the loop leaves it to pytest
+                "tests/semantic/test_e.py": failing,                    # pruned: unittest discover runs it
+            }
+            for rel, text in files.items():
+                with open(os.path.join(tmp, rel), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+            with open(os.path.join(tmp, "step.sh"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(script)
+            # The step calls `python`: a shim on PATH runs this interpreter (a POSIX box may only have `python3`).
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            shim = os.path.join(bindir, "python")
+            with open(shim, "w", encoding="utf-8", newline="\n") as f:
+                f.write("#!/bin/sh\nexec '%s' \"$@\"\n" % sys.executable.replace("'", "'\\''"))
+            os.chmod(shim, 0o755)
+            env = dict(os.environ, PYTEST_FILE_MARKERS=markers, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
+            # GitHub runs `shell: bash` as `bash --noprofile --norc -eo pipefail {0}`.
+            result = subprocess.run([git_bash(), "--noprofile", "--norc", "-eo", "pipefail", "step.sh"], cwd=tmp,
+                                    env=env, capture_output=True, text=True, timeout=120)
+        out = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, out)
+        ran = re.findall(r"^== (\S+)$", out, re.M)
+        self.assertEqual(ran, ["tests/test_a_fails.py", "tests/test_b_passes.py", "tests/test_c_fails.py"], out)
+        errors = re.findall(r"^::error file=(\S+)::", out, re.M)
+        self.assertEqual(errors, ["tests/test_a_fails.py", "tests/test_c_fails.py"], out)
+
+    def test_step_script_reads_the_check_loop(self):
+        script = step_script(ROOT, STDLIB_STEP)
+        self.assertIn('python -I "$t"', script)
+        self.assertIn("-name 'test_*.py'", script)
 
 
 if __name__ == "__main__":
