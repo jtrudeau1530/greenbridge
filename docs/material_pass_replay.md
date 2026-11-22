@@ -4,6 +4,8 @@ A stored effect can offer several ways to draw the same mesh. On one Xbox 1.0.2.
 
 ## Identify the draw
 
+To locate the example in a local 1.0.2.1 copy, filter the decoded `data.rpf` drawables to three meshes and three material slots. The first mesh has 1,656 vertices and 809 triangles. Its slot declares five textures and 46 numeric members. Select stored technique 2, pass 0, then confirm the pixel stage declares one constant buffer, one structured SRV and one four-component unsigned output. These checks distinguish the input used here from the UV example in [first_light.md](first_light.md).
+
 Follow the geometry's material-slot index to the effect, then follow the technique and pass selectors to the original program records. Use their archive offsets to distinguish programs and verify the native shader hashes before replay. On the selected vertex shader's packed-index branch, the mesh's original buffers reproduced 2,427 triangle corners in order and 1,656 object-space positions bit for bit. Swapping the first and third corner changed 1,618 indices. Changing the position-axis field eliminated every exact position match. The replay ends before the object-to-clip transform. [Effect lookup and geometry check](https://github.com/ItsNotRexed/Leonida/pull/2519#issuecomment-7085667975) · [Effect and pass reader](https://github.com/ItsNotRexed/Leonida/pull/3036)
 
 ## Follow the integer target through its reader
