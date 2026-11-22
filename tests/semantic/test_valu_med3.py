@@ -496,11 +496,15 @@ def parse_vop3_med3(asm_line: str) -> InstructionAST:
     src2_str = last_tokens[0]
     mod_tokens = [m.lower() for m in last_tokens[1:]]
 
-    clamp = "clamp" in mod_tokens
+    clamp = False
     omod = "none"
     for m in mod_tokens:
-        if m in ("mul:2", "mul:4", "div:2"):
+        if m == "clamp":
+            clamp = True
+        elif m in ("mul:2", "mul:4", "div:2"):
             omod = m
+        else:
+            raise ValueError(f"Invalid modifier: {m}")
 
     m_dst = re.match(r"^v(\d+)$", dst_str.strip())
     if not m_dst:
@@ -1228,6 +1232,87 @@ class TestValuMed3IEEE754Boundaries(unittest.TestCase):
 
         res_c = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3 clamp")
         self.assertEqual(res_c, ONE_F32)
+
+
+class TestValuMed3NegativeControls(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection test suite."""
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_f32 v0, v1, v2")
+
+    def test_syntax_rejection_invalid_opcode(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med4_f32 v0, v1, v2, v3")
+
+    def test_syntax_rejection_out_of_range_registers(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_f32 v256, v1, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_i32 v0, s106, v2, v3")
+
+    def test_syntax_rejection_destination_modifiers(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_f32 -v0, v1, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_f32 |v0|, v1, v2, v3")
+
+    def test_syntax_rejection_integer_float_modifiers(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_i32 v0, |v1|, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_u32 v0, -v1, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_i32 v0, v1, v2, v3 mul:2")
+
+    def test_syntax_rejection_invalid_omod(self):
+        with self.assertRaises(ValueError):
+            parse_vop3_med3("v_med3_f32 v0, v1, v2, v3 mul:8")
+
+    def test_mutation_detection_min_instead_of_median(self):
+        def mutated_med3_i32(a, b, c):
+            return min([s32(a), s32(b), s32(c)]) & MASK32
+
+        self.assertNotEqual(mutated_med3_i32(10, 20, 30), ref_med3_i32(10, 20, 30))
+
+    def test_mutation_detection_max_instead_of_median(self):
+        def mutated_med3_u32(a, b, c):
+            return max([u32(a), u32(b), u32(c)]) & MASK32
+
+        self.assertNotEqual(mutated_med3_u32(10, 20, 30), ref_med3_u32(10, 20, 30))
+
+    def test_mutation_detection_ignoring_signed_zero(self):
+        def mutated_med3_f32_zero(a, b, c):
+            vals = [bits_to_f32(a), bits_to_f32(b), bits_to_f32(c)]
+            vals.sort()
+            return f32_to_bits(vals[1])
+
+        golden = ref_med3_f32(NEG_ZERO_F32, POS_ZERO_F32, f32_to_bits(1.0))
+        self.assertEqual(golden, POS_ZERO_F32)
+
+    def test_mutation_detection_inverted_exec_mask(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        sim.exec = 0x00000001
+        for lane in range(32):
+            sim.set_vgpr_u32(0, lane, 0xCAFE)
+            sim.set_vgpr_u32(1, lane, 1)
+            sim.set_vgpr_u32(2, lane, 2)
+            sim.set_vgpr_u32(3, lane, 3)
+
+        results = sim.execute_asm("v_med3_i32 v0, v1, v2, v3")
+        self.assertEqual(results[0], 2)
+        self.assertEqual(results[1], 0xCAFE)
+        self.assertEqual(sim.get_vgpr_u32(0, 1), 0xCAFE)
+
+    def test_mutation_detection_corrupt_vcc(self):
+        interp = ScalarVALUInterpreter()
+        interp.vcc = 0xAA55AA55AA55AA55
+        interp.execute_asm("v_med3_f32 v0, 1.0, 2.0, 3.0")
+        self.assertEqual(interp.vcc, 0xAA55AA55AA55AA55)
 
 
 if __name__ == "__main__":
