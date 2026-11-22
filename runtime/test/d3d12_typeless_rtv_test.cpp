@@ -4,7 +4,9 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
+#include <algorithm>
 #include <array>
+#include <utility>
 #include <vector>
 #include <cstring>
 #include <limits>
@@ -25,7 +27,8 @@ struct Event {
 };
 
 bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT rect_format, bool partial,
-                    bool rewrite, bool uav, std::vector<unsigned char>& pixels) {
+                    bool rewrite, bool uav, std::vector<unsigned char>& pixels,
+                    UINT mip = 0, UINT first_layer = 0, UINT layer_count = 1, bool array = false, bool mip_chain = false) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -50,16 +53,18 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     texture.Width = width;
     texture.Height = height;
-    texture.DepthOrArraySize = texture.MipLevels = 1;
+    texture.DepthOrArraySize = array ? 4 : 1;
+    texture.MipLevels = array || mip_chain ? 3 : 1;
     texture.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     texture.SampleDesc.Count = 1;
     texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (uav) texture.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&image.p))));
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
+    const UINT count = texture.MipLevels * texture.DepthOrArraySize;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> placed(count);
     UINT64 total = 0;
-    device->GetCopyableFootprints(&texture, 0, 1, 0, &placed, nullptr, nullptr, &total);
+    device->GetCopyableFootprints(&texture, 0, count, 0, placed.data(), nullptr, nullptr, &total);
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer.Width = total;
@@ -75,7 +80,22 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE other{handle.ptr + device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
     D3D12_RENDER_TARGET_VIEW_DESC view{};
-    view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    view.ViewDimension = array ? D3D12_RTV_DIMENSION_TEXTURE2DARRAY : D3D12_RTV_DIMENSION_TEXTURE2D;
+    if (array || mip_chain) {
+        // Give every subresource a distinct sentinel before touching the selected view.
+        view.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+        for (UINT layer = 0; layer < texture.DepthOrArraySize; ++layer) {
+            for (UINT level = 0; level < texture.MipLevels; ++level) {
+                if (array) view.Texture2DArray = {level, layer, 1, 0};
+                else view.Texture2D = {level, 0};
+                device->CreateRenderTargetView(image.p, &view, handle);
+                const FLOAT seed[] = {FLOAT(11 + layer * 3 + level), 31, 73, 127};
+                list->ClearRenderTargetView(handle, seed, 0, nullptr);
+            }
+        }
+        if (array) view.Texture2DArray = {mip, first_layer, layer_count, 0};
+        else view.Texture2D = {mip, 0};
+    }
     view.Format = whole_format;
     device->CreateRenderTargetView(image.p, &view, handle);
     view.Format = rect_format;
@@ -86,7 +106,8 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
         view.Format = whole_format == DXGI_FORMAT_R8G8B8A8_UINT ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UINT;
         device->CreateRenderTargetView(image.p, &view, handle);
     }
-    const D3D12_RECT rect{1, 1, 4, 3};
+    const D3D12_RECT rect = array || mip_chain ? D3D12_RECT{mip == 2 ? 0 : 1, 0,
+        LONG(std::max(1u, width >> mip)), LONG(std::max(1u, height >> mip))} : D3D12_RECT{1, 1, 4, 3};
     if (partial) list->ClearRenderTargetView(other, part, 1, &rect);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -100,8 +121,11 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dst.pResource = readback.p;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = placed;
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    for (UINT subresource = 0; subresource < count; ++subresource) {
+        src.SubresourceIndex = subresource;
+        dst.PlacedFootprint = placed[subresource];
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
     CHECK(SUCCEEDED(list->Close()));
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
@@ -113,10 +137,14 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
-    pixels.resize(width * height * bytes);
-    for (UINT y = 0; y < height; ++y)
-        std::memcpy(pixels.data() + y * width * bytes,
-                    static_cast<unsigned char*>(mapped) + y * placed.Footprint.RowPitch, width * bytes);
+    pixels.clear();
+    for (const auto& footprint : placed) {
+        const auto& f = footprint.Footprint;
+        for (UINT y = 0; y < f.Height; ++y) {
+            const auto* row = static_cast<unsigned char*>(mapped) + footprint.Offset + y * f.RowPitch;
+            pixels.insert(pixels.end(), row, row + f.Width * bytes);
+        }
+    }
     const D3D12_RANGE none{};
     readback->Unmap(0, &none);
     return true;
@@ -205,6 +233,67 @@ int main() {
         }
         // An sRGB attachment view must not inherit an unrelated STORAGE usage from the typeless image.
         if (!compare(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UINT, true, true)) return 1;
+        // Read every mip and layer, including untouched sentinels and pixels outside the rectangle.
+        for (const auto format : formats) {
+            for (UINT mip : {0u, 1u, 2u}) {
+                for (bool partial : {false, true}) {
+                    for (const auto selection : {std::pair{0u, 1u}, std::pair{1u, 2u}, std::pair{3u, 1u}}) {
+                        std::vector<unsigned char> actual, expected;
+                        if (!clear_and_read(ours.p, format, format, partial, true, false, actual,
+                            mip, selection.first, selection.second, true) ||
+                        !clear_and_read(host.p, format, format, partial, true, false, expected,
+                            mip, selection.first, selection.second, true)) return 1;
+                        ++comparisons;
+                        if (actual.size() != expected.size()) return 1;
+                        std::size_t offset = 0;
+                        for (UINT layer = 0; layer < 4; ++layer) {
+                            for (UINT level = 0; level < 3; ++level) {
+                                const UINT w = std::max(1u, 5u >> level), h = std::max(1u, 3u >> level);
+                                for (UINT byte = 0; byte < w * h * 4; ++byte) {
+                                    const std::size_t i = offset + byte;
+                                    const bool selected = level == mip && layer >= selection.first &&
+                                    layer - selection.first < selection.second;
+                                    const int tolerance = selected && format != DXGI_FORMAT_R8G8B8A8_UINT ? 1 : 0;
+                                    if (std::abs(int(actual[i]) - int(expected[i])) > tolerance) {
+                                        std::fprintf(stderr, "array format %d mip %u partial %d byte %zu: Vulkan %u WARP %u\n",
+                                        int(format), mip, int(partial), i, unsigned(actual[i]), unsigned(expected[i]));
+                                        return 1;
+                                    }
+                                }
+                                offset += w * h * 4;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Non-array TEXTURE2D views must select higher mips too; read back the entire chain.
+        for (const auto format : formats) {
+            for (UINT mip : {1u, 2u}) {
+                for (bool partial : {false, true}) {
+                    std::vector<unsigned char> actual, expected;
+                    if (!clear_and_read(ours.p, format, format, partial, true, false, actual,
+                                        mip, 0, 1, false, true) ||
+                        !clear_and_read(host.p, format, format, partial, true, false, expected,
+                                        mip, 0, 1, false, true)) return 1;
+                    ++comparisons;
+                    if (actual.size() != expected.size()) return 1;
+                    std::size_t offset = 0;
+                    for (UINT level = 0; level < 3; ++level) {
+                        const UINT size = std::max(1u, 5u >> level) * std::max(1u, 3u >> level) * 4;
+                        const int tolerance = level == mip && format != DXGI_FORMAT_R8G8B8A8_UINT ? 1 : 0;
+                        for (UINT byte = 0; byte < size; ++byte) {
+                            if (std::abs(int(actual[offset + byte]) - int(expected[offset + byte])) > tolerance) {
+                                std::fprintf(stderr, "2D mip %u format %d partial %d level %u byte %u mismatch\n",
+                                             mip, int(format), int(partial), level, byte);
+                                return 1;
+                            }
+                        }
+                        offset += size;
+                    }
+                }
+            }
+        }
         if (mismatches) return 1;
         const auto rejects = [&](DXGI_FORMAT resource_format, const D3D12_RENDER_TARGET_VIEW_DESC* view,
                                  UINT16 mips = 1, UINT16 layers = 1) {
@@ -228,11 +317,18 @@ int main() {
         invalid.Texture2D.PlaneSlice = 1;
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid)) return 1;
         invalid.Texture2D.PlaneSlice = 0;
+        invalid.Texture2D.MipSlice = 2;
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid, 2, 1)) return 1;
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid, 1, 2)) return 1;
         invalid.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
-        invalid.Texture2DArray.ArraySize = 1;
+        invalid.Texture2DArray = {0, 1, 1, 0};
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid)) return 1;
+        for (const auto range : {std::pair{1u, UINT_MAX}, std::pair{0u, 0u}, std::pair{4u, 1u}, std::pair{3u, 2u}}) {
+            invalid.Texture2DArray = {1, range.first, range.second, 0};
+            if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid, 3, 4)) return 1;
+        }
+        invalid.Texture2DArray = {1, 1, 2, 1};
+        if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid, 3, 4)) return 1;
     }
     if (vk.validation_errors()) return 1;
     std::printf("typeless RTV: %u WARP readbacks matched, descriptor snapshots and format-cache order checked; %u unsupported/invalid views rejected\n",

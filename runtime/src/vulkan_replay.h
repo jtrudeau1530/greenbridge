@@ -686,9 +686,7 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     default: return VK_FORMAT_UNDEFINED;
     }
     if (!resource.rgba8_typeless) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.mip_levels != 1 || resource.array_layers != 1 ||
-        resource.volume || resource.depth != 1 || resource.samples != 1 ||
-        target.mip || target.first_layer || target.layer_count != 1)
+    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1 || resource.samples != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
 }
