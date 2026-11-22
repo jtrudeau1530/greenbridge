@@ -1054,15 +1054,21 @@ public:
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
-        // Shared read-lock allows concurrent prepare() lookups; when depth24_ is active, tracker_mutex_ is also
-        // acquired before prepare() so Depth24Converter::prepare/collect/retire stay serialized per execution.
-        // Otherwise tracker_mutex_ is held from emit() through submit() so emit order == submit order across queues.
+        // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
+        // prepare() only if a list actually converts a depth24_as_float copy, and otherwise right before
+        // bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and submissions stay in order.
         std::shared_lock resource_lock(context_.resource_mutex_);
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
-        if (context_.depth24_) {
-            tracker_lock.lock();
-            context_.depth24_->collect();
-        }
+        // Declared after tracker_lock so any early return after depth24_->prepare() retires uncommitted scratch/pools
+        // with ticket 0 while tracker_lock is still held.
+        struct Depth24Guard {
+            Depth24Converter* d24 = nullptr;
+            VkSemaphore progress = VK_NULL_HANDLE;
+            bool active = false;
+            ~Depth24Guard() {
+                if (active && d24) d24->retire(progress, 0);
+            }
+        } depth24_guard{context_.depth24_.get(), progress_, false};
         bindless_commit = context_.bindless_commit_;
         std::vector<PreparedList> prepared(lists.size());
         ReplayFunctions replay = context_.replay_;
@@ -1084,6 +1090,17 @@ public:
             };
             replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
                 context_.predicate_reducer_->capture(cb, p);
+            };
+        }
+        if (context_.depth24_) {
+            replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
+                                                                           std::vector<Depth24Job>& parts) {
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!depth24_guard.active) {
+                    context_.depth24_->collect();
+                    depth24_guard.active = true;
+                }
+                return context_.depth24_->prepare(job, parts);
             };
         }
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
@@ -1148,16 +1165,20 @@ public:
             discard();
             return ReplayResult::unsupported;
         }
+        if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
-            if (tracker_lock.owns_lock()) tracker_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
             if (!submitted) discard();
+            if (depth24_guard.active) {
+                context_.depth24_->retire(progress_, 0);
+                depth24_guard.active = false;
+            }
+            tracker_lock.unlock();
             if (bindless_commit) bindless_commit(submitted);
             return ReplayResult::unsupported;
         }
-        if (!tracker_lock.owns_lock()) tracker_lock.lock();
         auto next_tracker = context_.tracker_;
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
@@ -1209,7 +1230,10 @@ public:
         } else {
             discard();
         }
-        if (context_.depth24_) context_.depth24_->retire(progress_, submitted ? submitted_ : 0);
+        if (depth24_guard.active) {
+            context_.depth24_->retire(progress_, submitted ? submitted_ : 0);
+            depth24_guard.active = false;
+        }
         tracker_lock.unlock();
         if (bindless_commit) bindless_commit(submitted);
         return submitted ? ReplayResult::success : ReplayResult::unsupported;
