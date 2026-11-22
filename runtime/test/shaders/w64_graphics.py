@@ -355,6 +355,8 @@ def check(tools, spirv, name):
                 if size == 64:
                     continue
                 if tier == "C":
+                    if comparable(name, ref_words, None) != comparable(name, words, None):
+                        return "a word that must not depend on the partition differs from the 64-lane reference"
                     if not partition_dependent(name, ref_words, words):
                         return "tier C but the run equals the 64-lane reference: the detector is wrong"
                     compared = True

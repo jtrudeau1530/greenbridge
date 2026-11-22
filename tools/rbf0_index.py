@@ -243,7 +243,7 @@ def join_resource(rows, index, read, check_gap=True):
         blob += read(nxt)
         chunks += 1
         parsed = parse_rbf0(blob, string_limit=None)
-        if parsed["complete"] or parsed["status"] == "bad":
+        if parsed["status"] != "truncated":
             break
         j += 1
     return blob, chunks, parsed
@@ -433,6 +433,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
 def scan_dir(path, string_limit=16):
     """Index already-carved files. Sorting by a leading hexadecimal file name keeps archive order."""
     entries = []
+    unnamed = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
@@ -441,12 +442,18 @@ def scan_dir(path, string_limit=16):
         with open(full, "rb") as f:
             data = f.read()
         match = re.match(r"([0-9a-fA-F]{6,})", name)
-        offset = int(match.group(1), 16) if match else len(entries)
-        entries.append((offset, data))
+        if match:
+            entries.append((int(match.group(1), 16), data))
+        else:
+            unnamed.append(data)
+    next_offset = max((e[0] for e in entries), default=-1) + 1
+    for data in unnamed:
+        entries.append((next_offset, data))
+        next_offset += 1
     entries.sort(key=lambda e: e[0])
     rows = [_row(data, offset, len(data)) for offset, data in entries]
-    by_offset = {row["offset"]: data for row, (_, data) in zip(rows, entries)}
-    records = resources_from_rows(rows, lambda row: by_offset[row["offset"]], check_gap=False,
+    by_row = {id(row): data for row, (_, data) in zip(rows, entries)}
+    records = resources_from_rows(rows, lambda row: by_row[id(row)], check_gap=False,
                                   string_limit=string_limit)
     summary = summarise(rows, records, sum(len(d) for _, d in entries), 0, 0, "directory")
     summary["directory"] = path

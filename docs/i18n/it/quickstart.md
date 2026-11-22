@@ -3,7 +3,7 @@
 > [!NOTE]
 > La documentazione in inglese ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
 > [`docs/README.md`](../../README.md)) è la **fonte di riferimento**. Questa guida raccoglie solo le istruzioni
-> stabili di configurazione e compilazione (sincronizzata con il commit `4eb6155d`). Per lo stato quotidiano del
+> stabili di configurazione e compilazione (sincronizzata con il commit `49475796`). Per lo stato quotidiano del
 > progetto consulta il [`README.md`](../../../README.md).
 
 ## Che cos'è Leonida
