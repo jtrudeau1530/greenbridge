@@ -211,7 +211,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT buffer, REFIID riid, void** surface) override {
         if (!surface) return E_POINTER;
         *surface = nullptr;
-        if (buffer >= buffers_.size()) return E_INVALIDARG;
+        if (buffer >= buffers_.size()) return DXGI_ERROR_INVALID_CALL;
         return buffers_[buffer]->QueryInterface(riid, surface);
     }
 
