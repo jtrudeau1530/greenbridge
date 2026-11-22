@@ -2500,6 +2500,8 @@ public:
         // Input layout -> vertex input, by semantic.
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
+        std::uint32_t divisor_slots = 0;
         UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
         for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
             const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
@@ -2525,8 +2527,17 @@ public:
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
             // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
             if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
-            if (instance && element.InstanceDataStepRate > 1)
-                log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
+            if (instance && element.InstanceDataStepRate > 1) {
+                if (!device_.info.vertex_attribute_divisor) {
+                    log_once("instance step rates above 1 need vertexAttributeInstanceRateDivisor; rate",
+                             int(element.InstanceDataStepRate));
+                    return E_NOTIMPL;
+                }
+                if (!(divisor_slots & (1u << element.InputSlot))) {
+                    divisor_slots |= 1u << element.InputSlot;
+                    divisors.push_back({element.InputSlot, element.InstanceDataStepRate});
+                }
+            }
             if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
                 graphics_.vertex_slots |= 1u << element.InputSlot;
                 bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
@@ -2747,6 +2758,7 @@ public:
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
+        recipe_.divisors = std::move(divisors);
         recipe_.assembly = assembly;
         recipe_.raster = raster;
         recipe_.multisample = multisample;
@@ -2890,6 +2902,7 @@ private:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[2]{};  // what `stages` chain
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
         VkPipelineMultisampleStateCreateInfo multisample{};
@@ -2923,6 +2936,13 @@ private:
             rendering.stencilAttachmentFormat = graphics_.depth_format;
 
         VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT};
+        if (!r.divisors.empty()) {
+            divisor_state.vertexBindingDivisorCount = std::uint32_t(r.divisors.size());
+            divisor_state.pVertexBindingDivisors = r.divisors.data();
+            vertex_input.pNext = &divisor_state;
+        }
         vertex_input.vertexBindingDescriptionCount = std::uint32_t(r.bindings.size());
         vertex_input.pVertexBindingDescriptions = r.bindings.data();
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
@@ -7277,6 +7297,37 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
             *v13.next() = &min_lod;
         }
     }
+    const char* divisor_extension = nullptr;
+    for (const char* name :
+         {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
+        if (std::any_of(extensions.begin(), extensions.end(),
+                        [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+            divisor_extension = name;
+            break;
+        }
+    }
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_khr{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_ext{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+    if (divisor_extension) {
+        const bool is_khr = std::strcmp(divisor_extension, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) == 0;
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                        is_khr ? static_cast<void*>(&divisor_khr) : static_cast<void*>(&divisor_ext)};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.vertex_attribute_divisor =
+            (is_khr ? divisor_khr.vertexAttributeInstanceRateDivisor : divisor_ext.vertexAttributeInstanceRateDivisor) ==
+            VK_TRUE;
+        if (info.vertex_attribute_divisor) {
+            if (is_khr) {
+                divisor_khr.pNext = *v13.next();
+                *v13.next() = &divisor_khr;
+            } else {
+                divisor_ext.pNext = *v13.next();
+                *v13.next() = &divisor_ext;
+            }
+        }
+    }
     VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
     if (has_host_image_copy) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
@@ -7443,6 +7494,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     std::vector<const char*> device_extensions;
     v13.add_extensions(device_extensions);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     if (info.fragment_shader_barycentric)
