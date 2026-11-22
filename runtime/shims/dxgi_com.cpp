@@ -988,6 +988,49 @@ public:
     HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                                      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput* restrict_to_output,
                                                      IDXGISwapChain1** out) override {
+        if (out) *out = nullptr;
+        if (const HRESULT hr = check_hwnd_swap_chain(device, hwnd, desc, out); FAILED(hr)) return hr;
+        return create_swap_chain(device, hwnd, desc, restrict_to_output, out);
+    }
+
+    // What the host runtime's DXGI refuses for a D3D12 swap chain on a window (dxgi_swapchain_test compares these,
+    // RTX 5070 / 621.14): a null queue, window, description or output, an ID3D12Device in place of the queue, the
+    // bitblt effects, a scaling or alpha mode a window can't present, a flag outside the ones a D3D12 window swap chain
+    // takes (MODE_SWITCH, DISPLAY_ONLY, FRAME_LATENCY_WAITABLE_OBJECT, ALLOW_TEARING, the holographic restriction and
+    // 0x2000), a shared, read-only, discard-on-present or unordered-access buffer usage, MSAA, a buffer count outside
+    // 2..16 and a format the swap chain can't take are DXGI_ERROR_INVALID_CALL; a side above 16384 is E_INVALIDARG,
+    // only when nothing else is wrong.
+    static HRESULT check_hwnd_swap_chain(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                         IDXGISwapChain1** out) {
+        if (!device || !hwnd || !desc || !out) return DXGI_ERROR_INVALID_CALL;
+        ID3D12CommandQueue* queue = nullptr;
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return DXGI_ERROR_INVALID_CALL;
+        queue->Release();
+        if (desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
+            return DXGI_ERROR_INVALID_CALL;
+        if (desc->Scaling != DXGI_SCALING_STRETCH && desc->Scaling != DXGI_SCALING_NONE) return DXGI_ERROR_INVALID_CALL;
+        if (desc->AlphaMode != DXGI_ALPHA_MODE_UNSPECIFIED && desc->AlphaMode != DXGI_ALPHA_MODE_IGNORE)
+            return DXGI_ERROR_INVALID_CALL;
+        constexpr UINT kWindowFlags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY |
+                                      DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+                                      DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | 0x1000u | 0x2000u;
+        if (desc->Flags & ~kWindowFlags) return DXGI_ERROR_INVALID_CALL;
+        constexpr DXGI_USAGE kRefusedUsage =
+            DXGI_USAGE_SHARED | DXGI_USAGE_READ_ONLY | DXGI_USAGE_DISCARD_ON_PRESENT | DXGI_USAGE_UNORDERED_ACCESS;
+        if (desc->BufferUsage & kRefusedUsage) return DXGI_ERROR_INVALID_CALL;
+        // The host checks these before the size: MSAA 4 or one buffer at width 16385 is still INVALID_CALL.
+        if (desc->SampleDesc.Count != 1 || desc->SampleDesc.Quality != 0) return DXGI_ERROR_INVALID_CALL;
+        if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
+        if (dxgi_to_vk_format(desc->Format) == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
+        if (desc->Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || desc->Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+            return E_INVALIDARG;
+        return S_OK;
+    }
+
+    // The swap chain itself, for a window or (through its HWND) a CoreWindow. The CoreWindow path keeps only these
+    // checks: the host's rules for it (ASPECT_RATIO_STRETCH, for one) can't be compared without a real CoreWindow.
+    HRESULT create_swap_chain(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                              IDXGIOutput* restrict_to_output, IDXGISwapChain1** out) {
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
@@ -1027,7 +1070,7 @@ public:
         const HRESULT hr = interop->get_WindowHandle(&hwnd);
         interop->Release();
         if (FAILED(hr) || !hwnd) return DXGI_ERROR_INVALID_CALL;
-        return CreateSwapChainForHwnd(device, hwnd, desc, nullptr, restrict_to_output, out);
+        return create_swap_chain(device, hwnd, desc, restrict_to_output, out);
     }
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE, LUID*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND, UINT, DWORD*) override { return E_NOTIMPL; }
