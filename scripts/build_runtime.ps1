@@ -1,8 +1,12 @@
-﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores.
+﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores by default.
 # Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed, otherwise calls cl.exe directly.
 # The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
 # with -FetchSdl3, which lets CMake download the pinned SDL3 release. The cl.exe fallback never builds it.
-param([switch]$Debug, [switch]$FetchSdl3)
+param(
+    [switch]$Debug,
+    [switch]$FetchSdl3,
+    [ValidateRange(1, 2147483647)][int]$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
+)
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path $PSScriptRoot -Parent
@@ -10,7 +14,6 @@ $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
 $vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-$jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
 
 $src = Join-Path $root "runtime"
 $out = Join-Path $src "build"

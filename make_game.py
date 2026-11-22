@@ -1331,7 +1331,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     else:
         log("runtime: building")
         run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-             os.path.join(ROOT, "scripts", "build_runtime.ps1")])
+             os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs)])
         build = os.path.join(ROOT, "runtime", "build")
     artifacts = [os.path.join(build, name) for name in RUNTIME_FILES]
     for built in artifacts:
