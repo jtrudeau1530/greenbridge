@@ -24,7 +24,8 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
            "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2",
            "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
-           "cs_oob_select", "cs_oob_tail")
+           "cs_oob_select", "cs_oob_tail",
+           "ps_vcmp_f32_nan", "ps_vcmp_64", "cs_w32_andn2_exec")   # VOPC f32 NaN / 64-bit int compares, andn2 EXEC ops
 
 
 def render(name):
