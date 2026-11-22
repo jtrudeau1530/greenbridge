@@ -241,7 +241,9 @@ MIN_FREE_GB = {"shaders": 30, "assets": 300}
 def assets_exported(work: str) -> bool:
     """Whether an earlier run finished the assets stage's exports, so its space is already in use. xma.done is the
     last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
-    too. A marker counts only when it holds what mark() writes, not because a file of that name exists."""
+    too. A marker counts only when it holds what mark() writes, not because a file of that name exists.
+    xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
+    ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again."""
     audio = os.path.join(work, "assets", "audio")
     for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
         try:
@@ -250,7 +252,7 @@ def assets_exported(work: str) -> bool:
                     return False
         except (OSError, UnicodeError):
             return False
-    return True
+    return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
 
 
 def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
@@ -664,14 +666,20 @@ def mark(path: str, what: str) -> None:
         f.write(f"{what} finished\n")
 
 
-def decode_xma(ff: str, xma_dir: str) -> None:
-    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
-    temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
+def pending_xma(xma_dir: str) -> list:
+    """The XMA2 streams (.xma.wav) under xma_dir that have no decoded .wav next to them yet."""
     todo = []
     for root, _, files in os.walk(xma_dir):
         for f in files:
             if f.endswith(".xma.wav") and not os.path.isfile(os.path.join(root, f[:-8] + ".wav")):
                 todo.append(os.path.join(root, f))
+    return todo
+
+
+def decode_xma(ff: str, xma_dir: str) -> None:
+    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
+    temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
+    todo = pending_xma(xma_dir)
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")

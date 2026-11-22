@@ -555,15 +555,30 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
     OGG = "awc_opus.py finished\n"
     XMA = "rpf9dump xma finished\n"
 
-    def run_preflight(self, work, free_gb, wav=False):
+    def run_preflight(self, work, free_gb, wav=False, ffmpeg=True):
         usage = Usage(1000 * 2**30, (1000 - free_gb) * 2**30, free_gb * 2**30)
+
+        def which(cmd):
+            return None if cmd == "ffmpeg" and not ffmpeg else "/usr/bin/tool"
+
+        # The other prerequisites are faked, so the result doesn't depend on what this machine has installed (a .NET
+        # SDK, ffmpeg) and preflight always reaches the space check.
         with mock.patch("sys.version_info", (3, 12, 0)), \
-             mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+             mock.patch("shutil.which", side_effect=which), \
              mock.patch("make_game.tool_available", return_value=True), \
+             mock.patch("make_game.dotnet_sdk_ok", return_value=True), \
              mock.patch("make_game.ensure_submodule", return_value=None), \
              mock.patch("sys.stdout", io.StringIO()), \
              mock.patch("shutil.disk_usage", return_value=usage):
             make_game.preflight(["shaders", "assets"], work, wav=wav)
+
+    def write_xma(self, work, decoded):
+        """One XMA2 stream as the assets stage leaves it, with or without the .wav that ffmpeg decodes it to."""
+        bank = os.path.join(work, "assets", "audio", "xma", "bank0")
+        os.makedirs(bank, exist_ok=True)
+        for name in ("123.xma.wav",) + (("123.wav",) if decoded else ()):
+            with open(os.path.join(bank, name), "wb") as f:
+                f.write(b"RIFF")
 
     def write_markers(self, work, ogg=OGG, xma=XMA):
         audio = os.path.join(work, "assets", "audio")
@@ -610,6 +625,35 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.write_markers(work, xma=None)
             os.makedirs(os.path.join(work, "assets", "audio", "xma.done"))
             self.assertFalse(make_game.assets_exported(work))
+
+    def test_xma_streams_ffmpeg_will_decode_still_need_the_asset_space(self):
+        # xma.done is written without ffmpeg too; once ffmpeg is on PATH every run decodes the streams with no .wav.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.write_xma(work, decoded=False)
+            self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
+
+    def test_xma_streams_left_undecoded_without_ffmpeg_are_not_counted(self):
+        # Without ffmpeg nothing decodes them, so the assets stage writes nothing more.
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.write_xma(work, decoded=False)
+            self.run_preflight(work, free_gb=220, ffmpeg=False)
+
+    def test_decoded_xma_streams_need_only_the_shader_space(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.write_markers(work)
+            self.write_xma(work, decoded=True)
+            self.run_preflight(work, free_gb=220)
+
+    def test_pending_xma_lists_only_streams_without_a_wav(self):
+        with tempfile.TemporaryDirectory() as work:
+            xma = os.path.join(work, "assets", "audio", "xma")
+            self.assertEqual(make_game.pending_xma(xma), [])  # no folder yet
+            self.write_xma(work, decoded=True)
+            self.assertEqual(make_game.pending_xma(xma), [])
+            os.remove(os.path.join(xma, "bank0", "123.wav"))
+            self.assertEqual(make_game.pending_xma(xma), [os.path.join(xma, "bank0", "123.xma.wav")])
 
     def test_wav_still_counts_the_asset_space(self):
         # The WAV decode writes several times the Ogg Opus size and has no marker of its own.
