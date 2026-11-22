@@ -7862,18 +7862,17 @@ def assemble(gen):
                   "%_ptr_Function_bool_ms = OpTypePointer Function %bool",
                   "%null_v4_ms = OpConstantNull %v4float"]
         if ms and (gen.uses_clip or gen.uses_cull):     # staging arrays; the Output block only without msc
-            types += ["%_ptr_Function_float = OpTypePointer Function %float"]
+            types += ["%_ptr_Function_float = OpTypePointer Function %float",
+                      "%_ptr_Out_float_ms = OpTypePointer Output %float"]
             blk_fields = ["%v4float"]
             if gen.uses_clip:
                 types += [f"%ms_arr_clip = OpTypeArray %float {gen.cu(gen.clip_count)}",
                           "%_ptr_Fn_ms_clip = OpTypePointer Function %ms_arr_clip",
-                          "%_ptr_Out_ms_clip = OpTypePointer Output %ms_arr_clip",
                           "%null_ms_clip = OpConstantNull %ms_arr_clip"]
                 blk_fields.append("%ms_arr_clip")
             if gen.uses_cull:
                 types += [f"%ms_arr_cull_d = OpTypeArray %float {gen.cu(gen.cull_count)}",
                           "%_ptr_Fn_ms_cull_d = OpTypePointer Function %ms_arr_cull_d",
-                          "%_ptr_Out_ms_cull_d = OpTypePointer Output %ms_arr_cull_d",
                           "%null_ms_cull_d = OpConstantNull %ms_arr_cull_d"]
                 blk_fields.append("%ms_arr_cull_d")
             types += [f"%ms_vtx_blk = OpTypeStruct {' '.join(blk_fields)}",
@@ -8200,14 +8199,21 @@ def assemble(gen):
              ("%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_vtx %mli %c0" if ms_blk else
               "%mpp = OpAccessChain %_ptr_Out_v4_ms %ms_out_pos %mli"),
              "OpStore %mpp %mpv"]
+        # Clip and cull distances are copied one float at a time, not as a whole array: SPIRV-Cross (1.4.363.0)
+        # turns a whole-array store into a mesh output into a plain C array assignment, which Metal rejects
+        # ("array type 'threadgroup float[1]' is not assignable"; SHADER-155). Same result on Vulkan.
         if gen.uses_clip:
-            L += ["%mcv = OpLoad %ms_arr_clip %ms_clip",
-                  f"%mcvp = OpAccessChain %_ptr_Out_ms_clip %ms_out_vtx %mli {c(ms_clip_member)}",
-                  "OpStore %mcvp %mcv"]
+            for i in range(gen.clip_count):
+                L += [f"%mcs{i} = OpAccessChain %_ptr_Function_float %ms_clip {c(i)}",
+                      f"%mcv{i} = OpLoad %float %mcs{i}",
+                      f"%mcvp{i} = OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli {c(ms_clip_member)} {c(i)}",
+                      f"OpStore %mcvp{i} %mcv{i}"]
         if gen.uses_cull:
-            L += ["%mkv = OpLoad %ms_arr_cull_d %ms_cull_dist",
-                  f"%mkvp = OpAccessChain %_ptr_Out_ms_cull_d %ms_out_vtx %mli {c(ms_cull_member)}",
-                  "OpStore %mkvp %mkv"]
+            for i in range(gen.cull_count):
+                L += [f"%mks{i} = OpAccessChain %_ptr_Function_float %ms_cull_dist {c(i)}",
+                      f"%mkv{i} = OpLoad %float %mks{i}",
+                      f"%mkvp{i} = OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli {c(ms_cull_member)} {c(i)}",
+                      f"OpStore %mkvp{i} %mkv{i}"]
         for n in sorted(gen.ms_params):
             L += [f"%mq{n} = OpLoad %v4float %ms_param{n}",
                   f"%mqp{n} = OpAccessChain %_ptr_Out_v4_ms %ms_out_param{n} %mli", f"OpStore %mqp{n} %mq{n}"]
