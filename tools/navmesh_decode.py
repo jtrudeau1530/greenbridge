@@ -599,6 +599,7 @@ def decode_navmesh(b, nstreams, stats, deep):
         stats["quadtree"]["nodes"] += qn
         stats["quadtree"]["leaves"] += ql
         stats["quadtree"]["max_depth"] = max(stats["quadtree"]["max_depth"], qd)
+        chk["volumes_valid"] = _walk_volumes(b, vol, dc, stats)
 
     stats["flags"][flags] += 1
     stats["build"][hx(e8)] += 1
@@ -623,6 +624,37 @@ def _poly_chain(b, blocks, owner, pool):
                 has_water = True
             nxt += packed & 0xF
     return nxt == pool, has_water
+
+
+def _walk_volumes(b, vol, dc, stats):
+    """Paired 96-byte obstacle footprint records at +0xB8 (count u32@0xDC, ASSET-281)."""
+    if dc == 0:
+        return vol is None
+    if vol is None or dc % 2 != 0 or vol + 96 * dc > len(b):
+        return False
+    vstats = stats["volumes"]
+    for p in range(dc // 2):
+        o0 = vol + (2 * p) * 96
+        o1 = o0 + 96
+        if b[o0:o0 + 20] != b[o1:o1 + 20]:
+            return False
+        xyz = _f32s(b, o0 + 8, 3)
+        if xyz is None or not all(math.isfinite(v) for v in xyz):
+            return False
+        f0, vc0 = b[o0 + 0x14], b[o0 + 0x15]
+        f1, vc1 = b[o1 + 0x14], b[o1 + 0x15]
+        if f0 not in (0, 4) or f1 != 8 or vc0 not in (4, 8) or vc1 != 4:
+            return False
+        if not (_zero(b, o0 + 0x16 + 4 * vc0, o0 + 0x56) and _zero(b, o0 + 0x5A, o0 + 0x60)):
+            return False
+        if not (_zero(b, o1 + 0x16 + 4 * vc1, o1 + 0x56) and _zero(b, o1 + 0x5A, o1 + 0x60)):
+            return False
+        vstats["pairs"] += 1
+        vstats["flags"][f0] += 1
+        vstats["flags"][f1] += 1
+        vstats["vertex_counts"][vc0] += 1
+        vstats["vertex_counts"][vc1] += 1
+    return True
 
 
 # ------------------------------------------------------------------------------------------------------ grid
@@ -689,7 +721,8 @@ def new_stats():
         "navmesh": {"flags": Counter(), "build": Counter(), "totals": Counter(), "max": {}, "sectors": set(),
                     "sector_x": [inf, -inf], "sector_y": [inf, -inf], "split_blocks_max": {},
                     "tile_bounds": [[inf] * 3, [-inf] * 3], "water_bit3": Counter(),
-                    "quadtree": {"nodes": 0, "leaves": 0, "max_depth": 0}},
+                    "quadtree": {"nodes": 0, "leaves": 0, "max_depth": 0},
+                    "volumes": {"pairs": 0, "flags": Counter(), "vertex_counts": Counter()}},
         "grid": {"groups": Counter(), "extent": Counter(), "oz": Counter(), "sectors": set(), "entries_total": 0,
                  "entries_max": 0},
         "psin": {"version": Counter(), "complete": 0},
@@ -906,6 +939,8 @@ def _summary(path, mode, start, end, carver, classes, checks, stats, elapsed):
             "tile_bounds": _box(n["tile_bounds"]),
             "water_bit3": dict(n["water_bit3"]),
             "quadtree": dict(n["quadtree"]),
+            "volumes": {"pairs": n["volumes"]["pairs"], "flags": _counter(n["volumes"]["flags"]),
+                        "vertex_counts": _counter(n["volumes"]["vertex_counts"])},
         },
         "grid": {
             "groups": _counter(g["groups"]),

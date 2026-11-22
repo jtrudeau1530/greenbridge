@@ -186,7 +186,7 @@ layout, fixed `0xF0`-byte header, `14.36 GiB` / `15,420,757,856` bytes inflated 
 | `+0xA0` | 8 | `ptr64` | Spatial quadtree root (`96` B nodes, `32` B leaves) | Full tree (`2,337,904` nodes, `1,760,339` leaves, max depth `9`) valid & all leaf indices `< u32@0xC4` on `27,644 / 27,644` |
 | `+0xA8` | 8 | `ptr64` | Nullable special-link array (`32` B, count `u32@0xD4`) | Non-null iff `flags & 2` (`8,817` pages); in-bounds `27,644 / 27,644` |
 | `+0xB0` | 8 | `ptr64` | Nullable special-link index table (`u16`, count `u32@0xD8`) | Non-null iff `flags & 2`; in-bounds & all entries `< u32@0xD4` on `27,644 / 27,644` (`2` tiles have `d8 < d4`) |
-| `+0xB8` | 8 | `ptr64` | Nullable 96-byte geometric/volume array (count `u32@0xDC`) | Present on `9,425` pages (`6,246,890` records); in-bounds `27,644 / 27,644`; semantics **open** |
+| `+0xB8` | 8 | `ptr64` | Nullable 96-byte obstacle footprint array (count `u32@0xDC`) | Present on `9,425` pages (`6,246,890` records = `3,123,445` outer/inner contour pairs); in-bounds & valid `27,644 / 27,644` |
 | `+0xC0` | 4 | `u32` | Vertex count | Min `4`, max `52,608`, sum `138,041,746` |
 | `+0xC4` | 4 | `u32` | Polygon count | Min `1`, max `71,803`, sum `124,768,148` |
 | `+0xC8` | 4 | `u32` | 512 Ã— 512 sector ID (`0` if `flags & 4`) | `0` iff `flags & 4` (`162` pages); exact `136 Ã— 180 = 24,480` static grid |
@@ -234,6 +234,22 @@ The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` 
   nullable leaf pointer (`+0x2C`), four 4-byte-aligned child pointers (`+0x34..+0x53`), and 12 trailing zero
   bytes (`+0x54..+0x5F`). Each `32`-byte leaf holds `{u64 0, ptr64 poly_indices, u64 0, u64 num_polys}`.
 
+### Paired 96-byte obstacle footprint records (`+0xB8`, `6,246,890` records)
+
+On all `9,425` tiles where `u32@0xDC > 0`, `u32@0xDC` is even (`9,425 / 9,425`) and the array at `+0xB8` holds
+`3,123,445` consecutive `(outer, inner)` pairs (`6,246,890` 96-byte records). Every pair `(rec[2*p], rec[2*p + 1])`
+shares the identical 20-byte prefix `+0x00..+0x13` (`3,123,445 / 3,123,445`):
+
+| Offset | Size | Type | Verified meaning (`6,246,890 / 6,246,890` records) |
+|---:|---:|---|---|
+| `+0x00` | 8 | `u64` | 64-bit obstacle/object UID (identical across `rec[2*p]` and `rec[2*p + 1]` on `3,123,445 / 3,123,445` pairs; repeated across adjacent tiles when a footprint crosses a 128 m tile border) |
+| `+0x08` | 12 | `f32[3]` | Finite 3D world-space anchor `(x, y, z)` (`6,246,890 / 6,246,890`, identical across each pair) |
+| `+0x14` | 1 | `u8` | Contour role/flags: `0x00` (`2,750,542`) or `0x04` (`372,903`) on `rec[2*p]` (expanded outer contour), and `0x08` (`3,123,445`) on `rec[2*p + 1]` (inner core contour) on `3,123,445 / 3,123,445` pairs |
+| `+0x15` | 1 | `u8` | 2D polygon vertex count `N` (`4` on `3,123,878` records, `8` on `3,123,012` records). `(rec[2*p].N, rec[2*p + 1].N)` is `(8, 4)` on `3,123,012` pairs (chamfered octagon around an inner quad, typically expanded by `128` fixed-point units) and `(4, 4)` on `433` pairs |
+| `+0x16` | 64 | `i16[32]` | Up to 16 relative 2D `(dx, dy)` footprint vertices in signed 16-bit fixed point around `(x, y)`; trailing unused slots `+0x16 + 4*N .. +0x55` are zero on `6,246,890 / 6,246,890` |
+| `+0x56` / `+0x58` | 4 | `i16`, `u16` | Vertical/extent words (`u16@0x56` range `0..65,535`, high bit set on `1,846,885`; `u16@0x58` range `3..65,534`, high bit set on `13,629`) |
+| `+0x5A` | 6 | `u8[6]` | Trailing zero padding (`0` on `6,246,890 / 6,246,890`) |
+
 ## Band-3 `grid` resources (`27,482` resources)
 
 The final 433 MiB of `navmeshes.rpf` holds `27,482` `pgBase` resources (`+6` continuations) paired **1-to-1** with all
@@ -264,8 +280,8 @@ remain **open**.
 3. **`0DRP` unnamed structs and fields.** Several `0x7a` struct/member hashes (including `0x4712787b`, `0x57ad0b12`,
    `0xdd53676a`, `0xf2dd6348`, `0xde5f1345`, and 3 of the 4 singletons) are not yet matched to engine names.
 4. **Per-record bitfields inside `0x00010015` tiles.** `u32@0x10` bit 3's secondary trigger on `289` tiles and bit 6's
-   name, `u32@0xE8` build-stamp encoding, polygon/adjacent-edge/special-link flag bitfields, and the C++ type of the
-   96-byte `+0xB8` records remain open.
+   name, `u32@0xE8` build-stamp encoding, polygon/adjacent-edge/special-link flag bitfields, and the exact C++ class name
+   and `+0x56/+0x58` vertical unit of the paired 96-byte `+0xB8` footprint records remain open.
 5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, `u64` key encoding and `u32[N]`
    payload bits are open, as is why the final `PSIN` (version `79`) terminates before `LSNS` ends.
 
