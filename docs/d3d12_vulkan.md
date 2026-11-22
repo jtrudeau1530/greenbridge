@@ -1,7 +1,7 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers)
+render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears)
 runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
 set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
 implemented.** This is the plan for replacing the console's
@@ -152,7 +152,8 @@ What is implemented (all of it testable without the game):
 - **IR** (`runtime/src/command_list.h`): legacy barriers (transition, UAV, aliasing; split barriers record their end
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
   replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles,
-  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, and colour resolves.
+  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, colour resolves, and
+  `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat` (whole view or rectangles).
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
@@ -170,6 +171,37 @@ What is implemented (all of it testable without the game):
   and a destination offset. Depth-stencil resolves, other resolve modes, and resolves between two formats of
   one typeless family remain open. A multisampled texture copies only to one with the same sample count and has
   no footprint.
+- **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read
+  while recording as the GFX10 descriptor a shader would load (section 3.4), so the clear works with any
+  view-creation code that writes them and with descriptors the game builds itself; the GPU handle is not needed.
+  A T# gives the view's format (FORMAT plus DST_SEL, which tells BGRA from RGBA), mip and layers; a 3D view clears
+  every slice of its mip. A V# gives a byte range: its address minus the resource's `GetGPUVirtualAddress`, and
+  NUM_RECORDS bytes (stride 0, no format: raw), records (a stride: structured) or elements (a format: typed). A view
+  that reaches past the end of the buffer stops there, as the hardware's bounds check would.
+  - Values follow D3D's rules (`runtime/src/uav_clear.h`): Uint copies the low bits of each value into its channel
+    with no conversion, whatever the format's type; Float converts (UNORM/SNORM clamp and round to nearest, NaN is
+    0; 16-bit and the packed 11/10-bit floats round to nearest even). A raw or structured view takes value 0 for
+    every 32-bit word (Float: its bits). D3D11 calls Float on an integer view invalid and D3D12 does not say; here
+    the value is converted (toward zero, clamped, NaN 0) so the result is defined. These are checked against
+    hand-computed elements in `d3d12_uav_clear_test`.
+  - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
+    and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
+    elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an
+    element range `[left, right)` on row 0. A view with unaligned ends and less than one whole aligned word between
+    them (a few bytes of an 8- or 16-bit format) is refused as `unsupported`.
+  - Textures: the values become one element of the view's format, and that element is cleared into the image as
+    the value that decodes it in the image's own format, so a typeless texture viewed as UINT gets exactly the bits
+    asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)
+    and NaN payloads. A whole view is `vkCmdClearColorImage`; rectangles are `vkCmdClearAttachments` in a
+    dynamic-rendering scope, so a texture created with `ALLOW_UNORDERED_ACCESS` also gets `COLOR_ATTACHMENT` usage
+    when its format supports it. Both run in place in `GENERAL`, the UAV layout. Rectangle clears of volumes, or of
+    formats without attachment support, are refused as `unsupported`.
+  - The clear is fenced as the UAV state widened to transfers, so a following UAV barrier, transition, or enhanced
+    barrier from `SYNC_CLEAR_UNORDERED_ACCESS_VIEW` sees it.
+  - Under `SetPredication`, a whole-view texture clear runs as one rectangle through the attachment path, as
+    render-target clears do, so conditional rendering applies. Buffer clears, and texture clears that cannot use an
+    attachment, are transfers that conditional rendering does not cover; they run unconditionally and are counted
+    with the copies (`unpredicated_copies`).
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -205,6 +237,7 @@ What is implemented (all of it testable without the game):
     render-target, depth and texture formats (typeless families become mutable-format images), plus non-attachment
     3D textures with mipmapped upload, image copy and readback, and multisampled 2D textures (single-mip render
     targets or depth-stencils, in the sample counts the GPU has for the format);
+  - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views;
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
     support, format support and multisample quality levels. Other queries are logged and refused until the trace
     shows what the game asks (question 11);
@@ -327,8 +360,15 @@ level); the set is flushed at every `ExecuteCommandLists` whether or not earlier
 flush that erases keys or moves the table to a larger buffer should wait for them, or one of their lookups can
 miss: `BindlessSet::flush_needs_idle()` says when, but the queue cannot yet tell the device that it is idle.
 
-Known gaps: buffer and constant-buffer views, root signatures, PSOs, draws, volume attachment
+Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
+creation), root signatures, PSOs, draws, volume attachment
 views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
+A typed 3D color target supports default and explicit RTVs. The default covers mip 0; `FirstWSlice` and
+`WSize` select the depth slices in an explicit view's mip. `d3d12_clear_test --volume` checks full and
+rectangular clears of overlapping slice ranges against both Windows WARP and expected RGBA bytes.
+
+Known gaps: buffer and constant-buffer views, root signatures, PSOs, draws, typeless volume RTVs,
+placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); the GCL8
@@ -866,7 +906,9 @@ The trace will enumerate them.
   Partial resolve regions need a shader or a region copy.
 - Clears: a full-subresource clear maps to `vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` (UAV buffers to
   `vkCmdFillBuffer`); a rect clear uses `vkCmdClearAttachments` inside the rendering scope. UAV image clears use
-  `vkCmdClearColorImage` in `GENERAL`; non-32-bit buffer patterns need a compute clear.
+  `vkCmdClearColorImage` in `GENERAL`, and rectangles `vkCmdClearAttachments`. Buffer patterns of other sizes
+  need no compute clear: 8/16-bit elements are a 32-bit fill with copied ends, 64/128-bit ones an update doubled by
+  copies (section 3.2, UAV clears).
 - **Typed UINT RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For the currently exposed
   `R8G8B8A8_UINT`, `R32_UINT` and `R32G32B32A32_UINT` resources, convert those values numerically into
   `VkClearColorValue::uint32` for both image and rectangle clears; copying float bits gives incorrect stored
@@ -875,8 +917,8 @@ The trace will enumerate them.
   `d3d12_uint_clear_test` compares full and rectangular D3D12 readbacks with WARP over seven input sets on all
   three formats; `clear_color_test` checks both replay paths without a GPU, including unchanged float values.
   This does not add typed-view reinterpretation of typeless resources or new integer formats.
-- **RGBA8 typeless RTV clears (phase 1):** explicit UNORM, SRGB and UINT RTVs on a
-  `R8G8B8A8_TYPELESS` 2D resource with one mip, one array layer and sample count 1.
+- **RGBA8 typeless RTV clears:** explicit UNORM, SRGB and UINT RTVs on a
+  `R8G8B8A8_TYPELESS` 2D resource with sample count 1, selecting a mip and a contiguous array-layer range.
   `TargetView` captures its format by value; copies and layout tracking keep the resource's base format.
   Reinterpreted full clears use dynamic rendering because `vkCmdClearColorImage` cannot select a view format.
   Rectangle clears use the same typed attachment view. The view-cache key includes the format, and views
@@ -884,9 +926,10 @@ The trace will enumerate them.
   Same-format image clears and legacy float-only replay clients retain their existing path.
   On an RX 5700 XT, 13 synthetic full/rectangle readbacks match Windows WARP (UINT exact, normalized
   channels within one byte), including descriptor rewrites, format switches and an SRGB RTV on a UAV resource.
-  The same tests fail without this change and when the cache ignores format. CPU replay covers 22 scenarios;
-  12 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
-  typed-resource casts, mips/array expansion, MSAA and 3D typeless RTVs are outside this phase.
+  The same tests fail without this change and when the cache ignores format. CPU replay covers 31 scenarios;
+  17 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
+  typed-resource casts, MSAA and 3D typeless RTVs remain unsupported.
+  Phase 2 adds 54 mip/array and 12 non-array higher-mip readbacks against WARP, including untouched sentinels.
 - **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For integer formats (`R8G8B8A8_UINT`,
   `R32_UINT`, `R32G32B32A32_UINT`, `R8G8B8A8_SINT`, `R32_SINT`) convert those values numerically into
   `VkClearColorValue` for both image and rectangle clears; copying float bits gives incorrect stored integers
@@ -900,6 +943,12 @@ The trace will enumerate them.
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
   raw DCC metadata.
+- **G-buffer render targets stay 8-bit UNORM.** Reported by @Silliana in #603 (not reproduced here): the material
+  shaders pack data into plain bytes (the normal is octahedral-packed across three bytes of one target, and ID
+  bytes sit in another) and the lighting shaders unpack them with a `* 255` and a truncate. If the layer or a test
+  gives those targets another format (say f16 for everything), a byte is lost in many pixels: the normals go wrong
+  and the specular sparkles. Create them with the format the game asks for (`R8G8B8A8_UNORM` and the like) and don't
+  substitute a wider or float format for them.
 
 ### 4.3 Barriers and layouts
 
@@ -1205,6 +1254,26 @@ struct entry {               // 10 uints = 40 bytes
   per-thread and merge at submit. The shader only reads the table, and D3D12 already forbids modifying a descriptor
   that an in-flight command list is using, so the same rule applies.
 
+**Measured (D3D-56, `runtime/test/vk_descriptor_bench.cpp`).** Measured on an NVIDIA GeForce RTX 5080 (discrete, `0x10de:0x2c02`, subgroup 32, driver `NVIDIA 616.56`) using 64-bit Vulkan GPU timestamps (`1.000 ns` period), dispatching `4096 x 64` invocations x `64` iterations (`16.78M` single / `33.55M` T#+S# pair lookups, median of 25 reps; slow PCIe miss/latency dispatches auto-scaled below 120 ms, median of 9 reps) against `leonida::DescriptorTable` (90% T# / 10% S#) with the exact `tools/rdna2spirv.py` `desc_probe` loop:
+
+| Entries (cap / load / bytes / mean probes) | Placement | `uniform_tsharp_hit` (us/1M, Glk/s) | `uniform_pair_ts` (us/1M, Glk/s) | `divergent_tsharp_hit` (us/1M, Glk/s) | `divergent_pair_ts` (us/1M, Glk/s) | `divergent_miss` (us/1M, Glk/s) |
+|---|---|---|---|---|---|---|
+| 1k (4,096 / 24.4% / 160 KiB / 1.316) | `device_local` | 5.518 (181.23) | 4.905 (203.88) | 25.690 (38.93) | 25.166 (39.74) | 98.448 (10.16) |
+| 1k | `host_visible` | 5.882 (170.00) | 5.099 (196.11) | 27.719 (36.08) | 24.382 (41.01) | 425.987 (2.35) |
+| 1k | `host_device_local` | 5.501 (181.79) | 4.889 (204.56) | 25.978 (38.49) | 25.256 (39.59) | 99.991 (10.00) |
+| 10k (65,536 / 15.3% / 2.50 MiB / 1.310) | `device_local` | 6.235 (160.38) | 5.489 (182.17) | 37.640 (26.57) | 35.340 (28.30) | 204.462 (4.89) |
+| 10k | `host_visible` | 14.204 (70.40) | 22.025 (45.40) | 7825.638 (0.13) | 5242.728 (0.19) | 138304.047 (0.01) |
+| 10k | `host_device_local` | 6.275 (159.36) | 5.485 (182.33) | 37.464 (26.69) | 35.184 (28.42) | 204.924 (4.88) |
+| 100k (2,097,152 / 4.8% / 80.00 MiB / 1.088) | `device_local` | 5.579 (179.24) | 5.121 (195.27) | 34.840 (28.70) | 40.156 (24.90) | 203.733 (4.91) |
+| 100k | `host_visible` | 15.985 (62.56) | 42.912 (23.30) | 2011.875 (0.50) | 13465.384 (0.07) | 162129.255 (0.01) |
+| 100k | `host_device_local` | 5.594 (178.75) | 5.121 (195.27) | 72.279 (13.84) | 99.028 (10.10) | 692.188 (1.44) |
+
+Three consequences for the runtime and table layout (open on AMD/Intel/Apple GPUs via `vk_descriptor_bench`):
+
+1. **In `DEVICE_LOCAL` VRAM, the hash probe itself is cheap at all three sizes:** wave-uniform lookups run at `5.5–6.2 us / 1M` (`3.1–3.8 us / 1M` net after subtracting the `baseline_uniform` key-read dispatch), and divergent lookups hit `25.7–37.6 us / 1M` (`17.2–28.9 us / 1M` net).
+2. **`BindlessSet::create()` currently allocates PCIe `HOST_VISIBLE | HOST_COHERENT` system memory (`runtime/src/vulkan_bindless.h`):** once divergent working sets exceed cache at 10k–100k entries, `host_visible` slows down by **58x–208x** on divergent hits (**148x–335x** on T#+S# pairs, **676x–796x** on 8-probe misses). `host_device_local` (ReBAR `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) matches `device_local` within 1% at 1k–10k and is 2.1x–3.4x slower than pure `device_local` on divergent lookups at 100k (80 MiB, spilling L2) while staying 28x–234x faster than `host_visible`. Staging binding 2 to `DEVICE_LOCAL` (or preferring `DEVICE_LOCAL | HOST_VISIBLE` when small) avoids this cliff without touching the shader contract.
+3. **Power-of-two linear probing with an 8-probe hard limit inflates large tables:** `DescriptorTable` reaches only `15.3%` load at 10k (`2.50 MiB`) and `4.8%` load at 100k (`80.00 MiB`, `max_probes=5`) because any 9-probe collision forces a full 2x capacity double. Bounded-window displacement (for example Robin Hood / backshift within the existing 8-slot window) can raise load factor without changing translated shaders.
+
 ### 5.2 Per-stage code base
 
 The current 144-byte block has one 64-bit code base at dwords 34–35. A graphics pipeline has at least a vertex and
@@ -1442,8 +1511,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 - **The arena.** A single BDA arena is required by the shader contract for buffers, descriptor tables and code; the
   game's buffer working set may exceed `maxBufferSize` or PC VRAM. Host-visible arenas are slow; device-local
   arenas need staging and careful upload/readback handling. This is the main performance risk.
-- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. The GPU test proves
-  correctness, not speed. Measure early; optimise the table or cache indices without changing the shader contract.
+- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.1–3.8 us/1M` net wave-uniform, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory (current `BindlessSet::create()`) drops 58x–796x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). Staging binding 2 to `DEVICE_LOCAL` and improving slot placement within the 8-probe window are open optimisations; AMD/Intel/Apple numbers remain open via `vk_descriptor_bench`.
 - **Wave64.** On NVIDIA, wave64 shaders use the translator's 32-wide approximation; cross-half ops are approximate.
   AMD GPUs with 64-wide subgroups are exact. This is a known fidelity gap, not specific to the layer.
 - **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain

@@ -3,13 +3,17 @@ from the RDNA ISA rules in its docstring. No GPU, no llvm-mc, no game files.
 
     python -I tests/test_crosslane_fuzz.py
 """
+import argparse
 import os
 import random
 import re
+import subprocess
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
+TOOL = os.path.join(TOOLS, "crosslane_fuzz.py")
+sys.path.insert(0, TOOLS)
 import crosslane_fuzz as X  # noqa: E402
 
 
@@ -161,6 +165,28 @@ class Model(unittest.TestCase):
 
     def test_self_test(self):
         self.assertEqual(X.self_test(), 0)
+
+
+class Modes(unittest.TestCase):
+    """--modes takes native, emulate or both. Anything else used to run every program natively, wave64 included."""
+
+    def test_both_is_native_and_emulate(self):
+        self.assertEqual(X.parse_modes("both"), ["native", "emulate"])
+        self.assertEqual(X.parse_modes("native,both"), ["native", "emulate"])
+
+    def test_list_keeps_order_and_drops_repeats(self):
+        self.assertEqual(X.parse_modes(" emulate, native ,emulate,"), ["emulate", "native"])
+
+    def test_unknown_or_empty_mode_is_rejected(self):
+        for text in ("emulat", "native,wave64", "", " , "):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                X.parse_modes(text)
+
+    def test_cli_rejects_an_unknown_mode_before_running(self):
+        r = subprocess.run([sys.executable, "-I", TOOL, "--modes", "emulat", "--self-test"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("unknown mode 'emulat'", r.stderr)
 
 
 if __name__ == "__main__":
