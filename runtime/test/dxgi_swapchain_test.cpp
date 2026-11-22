@@ -473,6 +473,26 @@ int main() {
             return fail("Invalid resize changed swapchain buffers");
     }
 
+    {
+        DXGI_SWAP_CHAIN_DESC1 buffer_desc{};
+        if (FAILED(sc->GetDesc1(&buffer_desc)) || buffer_desc.BufferCount == 0)
+            return fail("GetDesc1 before testing GetBuffer indices");
+        ID3D12Resource* last = nullptr;
+        if (FAILED(sc->GetBuffer(buffer_desc.BufferCount - 1, IID_PPV_ARGS(&last))) || !last)
+            return fail("GetBuffer should return the last back buffer");
+        last->Release();
+
+        for (UINT index : {buffer_desc.BufferCount, buffer_desc.BufferCount + 1, ~0u}) {
+            void* rejected = reinterpret_cast<void*>(1);
+            const HRESULT hr = sc->GetBuffer(index, __uuidof(ID3D12Resource), &rejected);
+            if (hr != DXGI_ERROR_INVALID_CALL || rejected != nullptr) {
+                std::fprintf(stderr, "FAIL: GetBuffer(%u) returned 0x%08lx, expected DXGI_ERROR_INVALID_CALL and null\n",
+                             index, static_cast<unsigned long>(hr));
+                return 1;
+            }
+        }
+    }
+
     // Frame 1: 128x128 clear to (64, 128, 255, 255), read back all 16,384 pixels, Present.
     const float blue_ish[4] = {64.0f / 255.0f, 128.0f / 255.0f, 1.0f, 1.0f};
     if (run_clear_readback_present(128, 128, blue_ish, 64, 128, 255) != 0) return 1;
