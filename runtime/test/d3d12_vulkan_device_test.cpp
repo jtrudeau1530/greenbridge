@@ -2084,6 +2084,16 @@ int main() {
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv0{SIZE_T(rtv_start)}, rtv1{SIZE_T(rtv_start + increment)},
             rtv565{SIZE_T(rtv_start + 2 * increment)}, dsv0{SIZE_T(dsv_start)};
 
+        // CBV/SRV/UAV descriptor heap test.
+        D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
+                                                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        Ref<ID3D12DescriptorHeap> srv_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
+        const std::uint64_t srv_start = reinterpret_cast<XboxHeapHandleFn>(slot(srv_heap.p, 9))(srv_heap.p);
+        EXPECT(srv_start != 0);
+        const D3D12_CPU_DESCRIPTOR_HANDLE cbv0{SIZE_T(srv_start)}, srv0{SIZE_T(srv_start + increment)},
+            uav0{SIZE_T(srv_start + 2 * increment)};
+
         // Resources: the render target through slot 76 with the Xbox tiled layout word, the others through the
         // PC CreateCommittedResource.
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -2128,6 +2138,24 @@ int main() {
         EXPECT(volume->GetDesc().MipLevels == 5);
         EXPECT(rt_resource->GetDesc().Width == size && rt_resource->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         EXPECT(rt::d3d12::vulkan_image(rt_resource.p) && !rt::d3d12::vulkan_image(upload.p));
+
+        // Populate CBV, SRV and UAV in the shader-visible heap and verify the 32-byte descriptors.
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc{0x12340000ULL, 256};
+        device->CreateConstantBufferView(&cbv_desc, cbv0);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(untouched.p, &srv_desc, srv0);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+        uav_desc.Format = DXGI_FORMAT_R32_UINT;
+        uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav_desc.Buffer.NumElements = 64;
+        device->CreateUnorderedAccessView(upload.p, nullptr, &uav_desc, uav0);
+        EXPECT(*reinterpret_cast<const std::uint32_t*>(cbv0.ptr) == 1);  // CBV
+        EXPECT(*reinterpret_cast<const std::uint32_t*>(srv0.ptr) == 2);  // SRV
+        EXPECT(*reinterpret_cast<const std::uint32_t*>(uav0.ptr) == 3);  // UAV
 
         // Upload buffers are mapped and zeroed.
         std::uint8_t* up = nullptr;
