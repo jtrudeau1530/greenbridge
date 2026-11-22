@@ -2224,6 +2224,21 @@ HRESULT command_queue(ID3D12Device* device, D3D12_COMMAND_QUEUE_DESC desc) {
     return released(device->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), &out), &out);
 }
 
+// CreateCommandSignature without a root signature. Each argument is only its type; a CONSTANT one sets one value.
+HRESULT command_signature(ID3D12Device* device, UINT stride, std::initializer_list<D3D12_INDIRECT_ARGUMENT_TYPE> types,
+                          UINT node_mask = 0) {
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args;
+    for (const D3D12_INDIRECT_ARGUMENT_TYPE type : types) {
+        D3D12_INDIRECT_ARGUMENT_DESC arg{};
+        arg.Type = type;
+        if (type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT) arg.Constant.Num32BitValuesToSet = 1;
+        args.push_back(arg);
+    }
+    const D3D12_COMMAND_SIGNATURE_DESC desc{stride, UINT(args.size()), args.data(), node_mask};
+    void* out = nullptr;
+    return released(device->CreateCommandSignature(&desc, nullptr, __uuidof(ID3D12CommandSignature), &out), &out);
+}
+
 HRESULT fence(ID3D12Device* device, D3D12_FENCE_FLAGS flags, REFIID riid = __uuidof(ID3D12Fence)) {
     void* out = nullptr;
     return released(device->CreateFence(0, flags, riid, &out), &out);
@@ -2952,6 +2967,78 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command queue: copy", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COPY}); }},
         {"command queue: high priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_HIGH});
+         }},
+        // CreateCommandSignature (no root signature). A null description faults in the host runtime, so it is not
+        // compared.
+        {"command signature: null output", [](ID3D12Device* d) {
+             const D3D12_INDIRECT_ARGUMENT_DESC arg{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+             const D3D12_COMMAND_SIGNATURE_DESC desc{16, 1, &arg, 0};
+             return d->CreateCommandSignature(&desc, nullptr, __uuidof(ID3D12CommandSignature), nullptr);
+         }},
+        {"command signature: wrong interface", [](ID3D12Device* d) {
+             const D3D12_INDIRECT_ARGUMENT_DESC arg{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+             const D3D12_COMMAND_SIGNATURE_DESC desc{16, 1, &arg, 0};
+             void* out = nullptr;
+             return released(d->CreateCommandSignature(&desc, nullptr, __uuidof(ID3D12Fence), &out), &out);
+         }},
+        {"command signature: draw", [](ID3D12Device* d) {
+             return command_signature(d, 16, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});
+         }},
+        {"command signature: draw indexed", [](ID3D12Device* d) {
+             return command_signature(d, 20, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED});
+         }},
+        {"command signature: dispatch", [](ID3D12Device* d) {
+             return command_signature(d, 12, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH});
+         }},
+        {"command signature: dispatch, stride 64", [](ID3D12Device* d) {
+             return command_signature(d, 64, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH});
+         }},
+        {"command signature: no arguments", [](ID3D12Device* d) { return command_signature(d, 16, {}); }},
+        {"command signature: stride 0", [](ID3D12Device* d) {
+             return command_signature(d, 0, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});
+         }},
+        {"command signature: stride 18", [](ID3D12Device* d) {
+             return command_signature(d, 18, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});
+         }},
+        {"command signature: draw stride 12", [](ID3D12Device* d) {
+             return command_signature(d, 12, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});
+         }},
+        {"command signature: draw indexed stride 16", [](ID3D12Device* d) {
+             return command_signature(d, 16, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED});
+         }},
+        {"command signature: two draws", [](ID3D12Device* d) {
+             return command_signature(d, 32, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});
+         }},
+        {"command signature: draw then dispatch", [](ID3D12Device* d) {
+             return command_signature(d, 28,
+                                      {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH});
+         }},
+        {"command signature: vertex buffer view only", [](ID3D12Device* d) {
+             return command_signature(d, 16, {D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW});
+         }},
+        {"command signature: draw before a vertex buffer view", [](ID3D12Device* d) {
+             return command_signature(d, 32, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                                              D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW});
+         }},
+        {"command signature: constant without a root signature", [](ID3D12Device* d) {
+             return command_signature(d, 20,
+                                      {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});
+         }},
+        {"command signature: UAV without a root signature", [](ID3D12Device* d) {
+             return command_signature(d, 20, {D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW,
+                                              D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH});
+         }},
+        {"command signature: type 99", [](ID3D12Device* d) {
+             return command_signature(d, 16, {D3D12_INDIRECT_ARGUMENT_TYPE(99)});
+         }},
+        {"command signature: type 99 before a draw", [](ID3D12Device* d) {
+             return command_signature(d, 32, {D3D12_INDIRECT_ARGUMENT_TYPE(99), D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});
+         }},
+        {"command signature: node mask 1", [](ID3D12Device* d) {
+             return command_signature(d, 16, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}, 1);
+         }},
+        {"command signature: node mask 2", [](ID3D12Device* d) {
+             return command_signature(d, 16, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW}, 2);
          }},
         {"command queue: disable GPU timeout", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT});
