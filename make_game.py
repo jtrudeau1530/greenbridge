@@ -59,7 +59,13 @@ def below_normal() -> None:
     """Keep the PC usable while a long build runs."""
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.argtypes = ()
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k32.SetPriorityClass.restype = wintypes.BOOL
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)
 
 
@@ -228,6 +234,17 @@ def default_out() -> str:
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
 
+def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
+    """Why the pipelines stage can't run yet. Kept here so preflight can fail before a long shader build;
+    pipelines() prints its own, more detailed message when the stage is reached. On Windows the runtime stage
+    only builds the checker when VULKAN_SDK is set (scripts/build_runtime.ps1)."""
+    if runtime_selected:
+        return ("VULKAN_SDK (the runtime stage builds vk_pipeline_check only when it is set, and the pipelines "
+                "stage needs that executable)")
+    return ("vk_pipeline_check (needed by the pipelines stage; run the runtime stage on Windows, or build it "
+            "with CMake as described in README.md)")
+
+
 def preflight(stages: list, work: str, wav: bool = False) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if os.name != "nt":
@@ -258,6 +275,12 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
         ensure_submodule()
     if "runtime" in stages and not visual_cpp_tools_ok():
         missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+    # The pipelines stage needs a checker the runtime stage builds (on Windows only with VULKAN_SDK set).
+    # Without this check a build with shaders and pipelines spends hours before failing at the very end.
+    if "pipelines" in stages and not pipeline_check_exe():
+        runtime_building = "runtime" in stages and os.name == "nt"
+        if not runtime_building or not os.environ.get("VULKAN_SDK"):
+            missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
@@ -611,9 +634,14 @@ def runtime(game: str, out: str, v: dict) -> None:
     log("runtime: building")
     run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
          os.path.join(ROOT, "scripts", "build_runtime.ps1")])
-    built = os.path.join(ROOT, "runtime", "build", "gta6rt.exe")
+    artifacts = [os.path.join(ROOT, "runtime", "build", name)
+                 for name in ("gta6rt.exe", "gta6rt_tls_host.dll")]
+    for built in artifacts:
+        if not os.path.isfile(built):
+            fail(f"runtime: build did not produce {built}")
     os.makedirs(out, exist_ok=True)
-    shutil.copy2(built, os.path.join(out, "gta6rt.exe"))
+    for built in artifacts:
+        shutil.copy2(built, out)
     with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8") as f:
         f.write(os.path.abspath(game))
     if not os.path.isfile(os.path.join(game, v["expected_exe"])):
@@ -679,6 +707,14 @@ def main() -> int:
                          "32-wide GPUs: NVIDIA, Intel). auto (default) turns it on unless vulkaninfo shows that "
                          "every GPU has 64-wide subgroups")
     a = ap.parse_args()
+    stages = STAGES
+    if a.stages is not None:
+        stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+        if not stages:
+            ap.error("--stages must select at least one stage from: " + ",".join(STAGES))
+        for s in stages:
+            if s not in STAGES:
+                ap.error(f"--stages: unknown stage '{s}' (choose from: {','.join(STAGES)})")
     below_normal()
     if a.find:
         found = find_dumps()
@@ -703,13 +739,7 @@ def main() -> int:
             inside = False
         if inside:
             fail("--out and --work must be outside the game folder.")
-    stages = STAGES
-    if a.stages is not None:
-        stages = [s.strip() for s in a.stages.split(",") if s.strip()]
-        for s in stages:
-            if s not in STAGES:
-                fail(f"unknown stage '{s}'")
-    elif os.name != "nt":
+    if a.stages is None and os.name != "nt":
         stages = [s for s in stages if s not in WINDOWS_ONLY]
         log(f"{', '.join(WINDOWS_ONLY)}: left out, it builds on Windows only for now")
     preflight(stages, work, a.wav)
