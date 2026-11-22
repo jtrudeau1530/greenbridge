@@ -797,6 +797,12 @@ if(TARGET Vulkan::Headers)
     # Emulation of R9G9B9E5_SHAREDEXP UAV textures as mutable R32_UINT on GPUs without E5B9G9R9 storage:
     # format support, 1D/2D/3D/reserved creation, SRV/UAV T#s, WARP differential UAV clears, cross-backing copies,
     # and set-0 storage write -> E5B9G9R9 sampled HDR round-trip.
+    add_executable(d3d12_d24_support_test test/d3d12_d24_support_test.cpp)
+    target_link_libraries(d3d12_d24_support_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_d24_support_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_d24_support_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_d24_support COMMAND d3d12_d24_support_test)
+    set_tests_properties(d3d12_d24_support PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(d3d12_r9g9b9e5_uav_test test/d3d12_r9g9b9e5_uav_test.cpp)
     target_link_libraries(d3d12_r9g9b9e5_uav_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
