@@ -705,8 +705,11 @@ def test_gather4_l_run_time_lod_bounds_clamp_without_fclamp(make_shader):
     text = shader.translate()
     shader.validate(text)
     defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
-    rounded, = (expr for expr in defs.values() if " RoundEven " in expr)
-    clamp = defs[rounded.split()[-1]].split()
+    # The LOD rounds as Floor(lod + 0.5) (ties up, SHADER-152); the lod it adds the half to is the clamp's FMin.
+    biased, = (defs[e.split()[-1]].split() for e in defs.values()
+               if " Floor " in e and defs.get(e.split()[-1], "").startswith("OpFAdd %float ")
+               and defs[e.split()[-1]].endswith(" %fhalf_g"))
+    clamp = defs[biased[2]].split()
     assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FMin"]
     assert "FMax" in text
     assert "FClamp" not in text
