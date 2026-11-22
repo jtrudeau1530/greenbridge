@@ -51,10 +51,12 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -610,9 +612,21 @@ int main(int argc, char** argv) {
         auto number = [&](auto& dest) {
             const auto text = value();
             if (text.empty()) return false;
-            const auto end = text.data() + text.size();
-            const auto [ptr, ec] = std::from_chars(text.data(), end, dest);
-            return ec == std::errc{} && ptr == end;
+            if constexpr (std::is_floating_point_v<std::decay_t<decltype(dest)>>) {
+                // Apple's libc++ has no floating-point from_chars overload. Parse the whole token with strtod,
+                // as shader_library.h does for JSON numbers; --slow also checks isfinite and >= 0 below.
+                const std::string token(text);
+                char* end = nullptr;
+                errno = 0;
+                const double parsed = std::strtod(token.c_str(), &end);
+                if (errno == ERANGE || end != token.c_str() + token.size()) return false;
+                dest = static_cast<std::decay_t<decltype(dest)>>(parsed);
+                return true;
+            } else {
+                const auto end = text.data() + text.size();
+                const auto [ptr, ec] = std::from_chars(text.data(), end, dest);
+                return ec == std::errc{} && ptr == end;
+            }
         };
         bool valid = true;
         if (a == "--jobs") {
