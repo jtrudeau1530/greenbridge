@@ -315,7 +315,7 @@ def centre_agreement(data, group, positions):
         if len(pts) != vc:
             raise PageError("meshlet references a vertex past its block")
         stored, size = meshlet_centre(w2, w3), centre_step(w2)
-        out["coarse_steps"] += size > 0.0625
+        out["coarse_steps"] += (w2 >> 28) & 1
         for i in range(3):
             step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) / size)
             out["axes_exact"] += step == 0

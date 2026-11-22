@@ -277,12 +277,12 @@ of the 347 groups with a type-1 normal have fewer than 5% opposed, and 2% are mo
 which fits mirrored parts. The rest may be groups that the span rule binds to the wrong block.
 
 **Meshlet record words +8/+12 hold the meshlet's centre.** Three 12-bit fields give x, y and z: w2 bits 0-11,
-w2 bits 12-23 and w3 bits 0-11. Each is in 1/16 m steps around 2047, so the centre is `(field − 2047) / 16`, over
-±128 m, and the default `0x007FF7FF / 0x7FF` is the origin. When w2 bit 28 is set, the step is 1/8 m instead,
-`(field − 2047) / 8` over ±256 m (below). `tools/meshlet_page.py --centres` compares each stored
+w2 bits 12-23 and w3 bits 0-11. Each counts steps around 2047: the centre is `(field − 2047) × step`, with a step of
+1/16 m (±128 m), or 1/8 m (±256 m) when w2 bit 28 is set (below). The default `0x007FF7FF / 0x7FF` is the origin.
+`tools/meshlet_page.py --centres` compares each stored
 centre with the centre of its meshlet's vertex box, using the `42 40` positions above. Over all 1,569 streams:
 
-| Meshlets | Default words | Axes | Same 1/16 m step | Within one step |
+| Meshlets | Default words | Axes | Same step | Within one step |
 |---:|---:|---:|---:|---:|
 | 142,613 | 68 | 427,839 | 214,204 (50.1%) | 307,158 (71.8%) |
 
