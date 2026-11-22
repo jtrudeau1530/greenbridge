@@ -1418,6 +1418,71 @@ bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physi
     return false;
 }
 
+// FORMAT_SUPPORT bits that D3D12 defines per format rather than per GPU, for every format both the layer and the
+// host PC runtime on the same adapter support. The layer must not claim them where the format's rules forbid them
+// (1D block-compressed, 3D depth, integer resolves, TYPELESS formats used as anything but storage, depth formats as
+// shader resources), and must report the ones it provides: mips, gathers wherever it samples, typed UAV loads
+// wherever it stores, and R32_UINT atomics. Hardware-dependent bits (render targets, filtering, typed UAV formats)
+// are left to the Vulkan driver.
+int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo& info) {
+    Ref<ID3D12Device> host;
+    std::string adapter;
+    if (!create_host_device_for_physical(info.instance, info.physical, info.get_instance_proc, host, adapter)) {
+        std::printf("FORMAT_SUPPORT comparison: no host D3D12 device, skipped\n");
+        return 0;
+    }
+    constexpr UINT dims = D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+                          D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE;
+    constexpr UINT storage_only = dims | D3D12_FORMAT_SUPPORT1_MIP | D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
+    constexpr UINT format_rules = D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE3D |
+                                  D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
+    constexpr UINT shader_reads = D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+                                  D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
+    constexpr UINT atomics = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
+                             D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+                             D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
+                             D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+    int mismatches = 0;
+    unsigned compared = 0;
+    const auto fail = [&](int format, const char* what, UINT o1, UINT o2, UINT h1, UINT h2) {
+        if (mismatches++ < 32)
+            std::fprintf(stderr, "FORMAT_SUPPORT format %d: %s (layer %08x/%08x, host %08x/%08x)\n", format, what,
+                         o1, o2, h1, h2);
+    };
+    for (int f = 1; f <= DXGI_FORMAT_A4B4G4R4_UNORM; ++f) {
+        if (f > DXGI_FORMAT_V408 && f < DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE) continue;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT o{DXGI_FORMAT(f)}, h{DXGI_FORMAT(f)};
+        if (FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &o, sizeof(o))) ||
+            FAILED(host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &h, sizeof(h))))
+            continue;
+        const UINT o1 = UINT(o.Support1), o2 = UINT(o.Support2), h1 = UINT(h.Support1), h2 = UINT(h.Support2);
+        if (!o1 || !h1) continue;  // one side has the format but not a single use for it
+        ++compared;
+        if (o1 & format_rules & ~h1) fail(f, "1D, 3D, resolve or depth-stencil the format can't have", o1, o2, h1, h2);
+        // A host answer of nothing but dimensions, mips and casts is a TYPELESS (storage-only) format.
+        if ((h1 & dims) && !(h1 & ~storage_only) && !(h2 & ~UINT(D3D12_FORMAT_SUPPORT2_TILED)) &&
+            ((o1 & ~storage_only) || o2))
+            fail(f, "a storage-only (TYPELESS) format reported with uses of its own", o1, o2, h1, h2);
+        if ((h1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) && (o1 & shader_reads & ~h1))
+            fail(f, "a depth format reported as a shader resource", o1, o2, h1, h2);
+        if ((h1 & D3D12_FORMAT_SUPPORT1_MIP) && (o1 & (dims | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL)) &&
+            !(o1 & D3D12_FORMAT_SUPPORT1_MIP))
+            fail(f, "no MIP where the host has mips", o1, o2, h1, h2);
+        // A8_UNORM reads through a swizzled R8 view, and gathers through that swizzle aren't verified: no gather.
+        if (f != DXGI_FORMAT_A8_UNORM &&
+            bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != bool(o1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER))
+            fail(f, "gather and sample disagree", o1, o2, h1, h2);
+        if (bool(o2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != bool(o2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD))
+            fail(f, "typed UAV load and store disagree", o1, o2, h1, h2);
+        if (f == DXGI_FORMAT_R32_UINT && (o1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+            (o2 & atomics) != atomics)
+            fail(f, "R32_UINT typed UAV without its atomics", o1, o2, h1, h2);
+    }
+    std::printf("FORMAT_SUPPORT against the host on %s: %u formats compared, %d mismatches\n", adapter.c_str(),
+                compared, mismatches);
+    return mismatches;
+}
+
 // D3D-86: validate CheckFeatureSupport(D3D12_OPTIONS2..21 except 6/8/10/12/17), check size/null refusals and local
 // invariants, and verify conservative compatibility against the host PC D3D12 runtime on the same adapter.
 int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo& info) {
@@ -2026,6 +2091,8 @@ int main() {
 
         const int options_mismatches = compare_feature_options(device.p, info);
         EXPECT(options_mismatches == 0);
+        const int format_support_mismatches = compare_format_support(device.p, info);
+        EXPECT(format_support_mismatches == 0);
 
         // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
         EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);
