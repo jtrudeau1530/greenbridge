@@ -197,16 +197,22 @@ def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[i
 
 
 def _logical_obj_lines(text: str) -> Iterator[str]:
-    """Yield OBJ logical lines, joining trailing-backslash continuations with a space."""
+    """Yield OBJ logical lines, joining trailing-backslash continuations with a space.
+
+    A '#' starts an inline comment. A backslash inside that comment does not continue the line;
+    a backslash in the code before the comment does.
+    """
     pending = ""
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
         if not line or line.lstrip().startswith("#"):
             continue
-        if line.endswith("\\"):
-            pending += line[:-1].rstrip() + " "
+        code, _, _comment = line.partition("#")
+        code = code.rstrip()
+        if code.endswith("\\"):
+            pending += code[:-1].rstrip() + " "
             continue
-        yield pending + line
+        yield pending + code
         pending = ""
     if pending:
         yield pending

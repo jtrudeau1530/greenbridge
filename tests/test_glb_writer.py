@@ -977,6 +977,29 @@ f 1//1 2//2 3//3
         ])
         self.assertEqual(glb_writer.parse_obj(obj_text, is_path=False, up_axis="y"), [])
 
+    def test_parse_obj_inline_comment_backslash_does_not_continue(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "v 1 1 0",
+            "f 1 2 3 # keep this comment \\",
+            "f 1 2 4",
+        ])
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2, 0, 1, 3])
+
+    def test_parse_obj_continuation_before_inline_comment(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "f 1 2 \\ # split before the comment",
+            "3",
+        ])
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2])
+
     def test_compute_bounds_calculation(self):
         prims = [
             {"positions": [(-5.0, 1.0, 2.0), (10.0, -3.0, 8.0)]},
