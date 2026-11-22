@@ -162,6 +162,201 @@ f16_to_float = h2f
 float_to_f16 = f2h
 
 
+def pack_f16x2(lo: int, hi: int) -> int:
+    return (lo & 0xFFFF) | ((hi & 0xFFFF) << 16)
+
+
+def unpack_f16x2(dword: int) -> tuple[int, int]:
+    return dword & 0xFFFF, (dword >> 16) & 0xFFFF
+
+
+def ref_pk_floor(dword: int) -> int:
+    lo, hi = unpack_f16x2(dword)
+    return pack_f16x2(ref_floor(lo), ref_floor(hi))
+
+
+def ref_pk_ceil(dword: int) -> int:
+    lo, hi = unpack_f16x2(dword)
+    return pack_f16x2(ref_ceil(lo), ref_ceil(hi))
+
+
+def ref_pk_trunc(dword: int) -> int:
+    lo, hi = unpack_f16x2(dword)
+    return pack_f16x2(ref_trunc(lo), ref_trunc(hi))
+
+
+def ref_pk_rndne(dword: int) -> int:
+    lo, hi = unpack_f16x2(dword)
+    return pack_f16x2(ref_rndne(lo), ref_rndne(hi))
+
+
+class SimdWavefront:
+    """RDNA2 SIMD Wavefront state holding per-lane VGPRs, SGPRs, and 64-bit EXEC mask."""
+
+    def __init__(self, wave_size: int = 64, initial_exec: int = 0xFFFFFFFFFFFFFFFF) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave size: {wave_size}")
+        self.wave_size = wave_size
+        self.vgpr: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgpr: list[int] = [0] * 106
+        self.mask_all = (1 << wave_size) - 1
+        self.exec_mask: int = initial_exec & self.mask_all
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & self.mask_all
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def set_vgpr(self, lane: int, reg: int, val: int) -> None:
+        self.vgpr[lane][reg & 0xFF] = val & 0xFFFFFFFF
+
+    def get_vgpr(self, lane: int, reg: int) -> int:
+        return self.vgpr[lane][reg & 0xFF]
+
+    def set_sgpr(self, reg: int, val: int) -> None:
+        if not (0 <= reg < 106):
+            raise IndexError(f"SGPR index {reg} out of range")
+        self.sgpr[reg] = val & 0xFFFFFFFF
+
+    def get_sgpr(self, reg: int) -> int:
+        if not (0 <= reg < 106):
+            raise IndexError(f"SGPR index {reg} out of range")
+        return self.sgpr[reg]
+
+
+class F16RoundingInterpreter:
+    """Deterministic instruction interpreter for RDNA2 VALU f16 rounding and SIMD wavefront ops."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        self.wave = SimdWavefront(wave_size=wave_size)
+
+    def parse_reg(self, token: str) -> tuple[str, int]:
+        token = token.strip().lower()
+        if token.startswith("v") and token[1:].isdigit():
+            return "vgpr", int(token[1:])
+        if token.startswith("s") and token[1:].isdigit():
+            return "sgpr", int(token[1:])
+        raise ValueError(f"Unrecognized register name: {token}")
+
+    def parse_imm(self, token: str) -> int:
+        token = token.strip()
+        if token.startswith("0x") or token.startswith("-0x"):
+            return int(token, 16) & 0xFFFFFFFF
+        try:
+            return int(token) & 0xFFFFFFFF
+        except ValueError:
+            f_val = float(token)
+            return f2h(f_val)
+
+    def read_operand_half(self, token: str, lane: int, hi: int) -> int:
+        token = token.strip()
+        is_neg = token.startswith("-")
+        if is_neg:
+            token = token[1:].strip()
+        is_abs = token.startswith("|") and token.endswith("|")
+        if is_abs:
+            token = token[1:-1].strip()
+
+        if token.startswith("v") and token[1:].isdigit():
+            reg_val = self.wave.get_vgpr(lane, int(token[1:]))
+            half = (reg_val >> 16) & 0xFFFF if hi else reg_val & 0xFFFF
+        elif token.startswith("s") and token[1:].isdigit():
+            reg_val = self.wave.get_sgpr(int(token[1:]))
+            half = (reg_val >> 16) & 0xFFFF if hi else reg_val & 0xFFFF
+        else:
+            imm = self.parse_imm(token)
+            half = imm & 0xFFFF
+
+        if is_abs:
+            half &= 0x7FFF
+        if is_neg:
+            half ^= 0x8000
+        return half
+
+    def execute_line(self, line: str) -> None:
+        line = line.split(";")[0].strip()
+        if not line:
+            return
+        parts = line.split(None, 1)
+        mnemonic = parts[0].lower()
+        rest = parts[1] if len(parts) > 1 else ""
+
+        if mnemonic == "s_mov_b32":
+            dst, src = [t.strip() for t in rest.split(",")]
+            dst_type, dst_idx = self.parse_reg(dst)
+            if dst_type == "sgpr":
+                val = self.wave.get_sgpr(int(src[1:])) if (src.startswith("s") and src[1:].isdigit()) else self.parse_imm(src)
+                self.wave.set_sgpr(dst_idx, val)
+            return
+
+        if mnemonic in ("s_mov_b64", "s_mov_b32_exec"):
+            dst, src = [t.strip() for t in rest.split(",")]
+            if dst.lower() in ("exec", "exec_lo"):
+                val = int(src, 16) if (src.startswith("0x") or src.startswith("-0x")) else int(src)
+                self.wave.set_exec(val)
+            return
+
+        if mnemonic == "v_mov_b32":
+            dst, src = [t.strip() for t in rest.split(",")]
+            dst_type, dst_idx = self.parse_reg(dst)
+            for lane in range(self.wave.wave_size):
+                if not self.wave.is_lane_active(lane):
+                    continue
+                if src.startswith("v") and src[1:].isdigit():
+                    val = self.wave.get_vgpr(lane, int(src[1:]))
+                elif src.startswith("s") and src[1:].isdigit():
+                    val = self.wave.get_sgpr(int(src[1:]))
+                else:
+                    val = self.parse_imm(src)
+                self.wave.set_vgpr(lane, dst_idx, val)
+            return
+
+        base_op = mnemonic.replace("_e32", "").replace("_e64", "")
+        if base_op in OPS:
+            _, ref_fn = OPS[base_op]
+            m_opsel = re.search(r"op_sel:\[(\d+),(\d+)\]", rest, re.IGNORECASE)
+            src_hi = int(m_opsel.group(1)) if m_opsel else 0
+            dst_hi = int(m_opsel.group(2)) if m_opsel else 0
+            has_clamp = bool(re.search(r"\bclamp\b", rest, re.IGNORECASE))
+            has_mul2 = bool(re.search(r"\bmul:2\b", rest, re.IGNORECASE))
+            has_mul4 = bool(re.search(r"\bmul:4\b", rest, re.IGNORECASE))
+            has_div2 = bool(re.search(r"\bdiv:2\b", rest, re.IGNORECASE))
+
+            clean = re.sub(r"(?:op_sel:\[\d+,\d+\]|clamp|mul:2|mul:4|div:2)", "", rest, flags=re.IGNORECASE)
+            operands = [t.strip() for t in clean.split(",") if t.strip()]
+            dst_tok, src_tok = operands[0], operands[1]
+            dst_type, dst_idx = self.parse_reg(dst_tok)
+
+            for lane in range(self.wave.wave_size):
+                if not self.wave.is_lane_active(lane):
+                    continue
+                src_half = self.read_operand_half(src_tok, lane, src_hi)
+                res_half = ref_fn(src_half)
+                if has_mul2 or has_mul4 or has_div2 or has_clamp:
+                    val = h2f(res_half)
+                    if has_mul2:
+                        val *= 2.0
+                    elif has_mul4:
+                        val *= 4.0
+                    elif has_div2:
+                        val *= 0.5
+                    if has_clamp:
+                        val = max(0.0, min(1.0, val)) if not math.isnan(val) else 0.0
+                    res_half = f2h(val)
+
+                old_val = self.wave.get_vgpr(lane, dst_idx)
+                new_val = merge_half(old_val, res_half, dst_hi)
+                self.wave.set_vgpr(lane, dst_idx, new_val)
+            return
+
+        raise ValueError(f"Unsupported mnemonic: {mnemonic}")
+
+    def execute_program(self, lines: list[str]) -> None:
+        for line in lines:
+            self.execute_line(line)
+
+
 OPS = {
     "v_floor_f16": ("Floor", ref_floor),
     "v_ceil_f16": ("Ceil", ref_ceil),
@@ -448,6 +643,144 @@ class F16RoundingExecutionTests(unittest.TestCase):
         got = si.run_fragment(sabotaged)["%out_mrt0"][0]
         self.assertNotEqual(got, merge_half(OLD, H_2P0, 0))
         self.assertEqual(got, merge_half(OLD, H_3P0, 0))
+
+
+class PackedF16SimdTests(unittest.TestCase):
+    """Packed half-precision floating-point rounding and multi-lane SIMD tests.
+
+    Models:
+      - Packed pairs: v_pk_floor_f16 and v_pk_ceil_f16 behavior processing two 16-bit
+        halfwords packed into a 32-bit dword.
+      - SIMD Wavefront execution across 32 and 64 lanes.
+      - Inactive lane preservation under EXEC execution masks.
+      - End-to-end RDNA2 packed SIMD emulation via op_sel:[0,0] and op_sel:[1,1].
+      - Negative rejection test for unsupported packed pseudo-opcodes in translator.
+    """
+
+    def test_packed_floor_and_ceil_reference_oracle(self):
+        """Packed half-precision oracle validates low and high halves independently."""
+        pairs = [
+            (H_1P5, H_2P5),
+            (H_NEG_0P5, H_0P5),
+            (H_SUB_MIN, H_NEG_SUB_MIN),
+            (H_1022P5, H_1023P5),
+            (H_POS_ZERO, H_NEG_ZERO),
+            (H_POS_INF, H_NEG_INF),
+            (H_0P25, H_NEG_0P75),
+        ]
+        for lo, hi in pairs:
+            dword = pack_f16x2(lo, hi)
+            with self.subTest(lo=hex(lo), hi=hex(hi)):
+                exp_floor = pack_f16x2(ref_floor(lo), ref_floor(hi))
+                exp_ceil = pack_f16x2(ref_ceil(lo), ref_ceil(hi))
+                exp_trunc = pack_f16x2(ref_trunc(lo), ref_trunc(hi))
+                exp_rndne = pack_f16x2(ref_rndne(lo), ref_rndne(hi))
+                self.assertEqual(ref_pk_floor(dword), exp_floor)
+                self.assertEqual(ref_pk_ceil(dword), exp_ceil)
+                self.assertEqual(ref_pk_trunc(dword), exp_trunc)
+                self.assertEqual(ref_pk_rndne(dword), exp_rndne)
+
+    def test_simd_wavefront_uniform_packed_execution(self):
+        """Simulate packed floor and ceil across all 64 lanes of a SIMD wavefront."""
+        interp = F16RoundingInterpreter(wave_size=64)
+        v1 = pack_f16x2(H_1P5, H_NEG_2P5)
+        # Low half floor(1.5)=1.0, high half floor(-2.5)=-3.0
+        interp.execute_program([
+            f"v_mov_b32 v1, {v1:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "v_floor_f16_e64 v0, v1 op_sel:[0,0]",
+            "v_floor_f16_e64 v0, v1 op_sel:[1,1]",
+        ])
+        expected_floor = ref_pk_floor(v1)
+        for lane in range(64):
+            self.assertEqual(interp.wave.get_vgpr(lane, 0), expected_floor, f"Lane {lane} floor mismatch")
+
+        # Ceil sequence: ceil(1.5)=2.0, ceil(-2.5)=-2.0
+        interp.execute_program([
+            f"v_mov_b32 v1, {v1:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "v_ceil_f16_e64 v0, v1 op_sel:[0,0]",
+            "v_ceil_f16_e64 v0, v1 op_sel:[1,1]",
+        ])
+        expected_ceil = ref_pk_ceil(v1)
+        for lane in range(64):
+            self.assertEqual(interp.wave.get_vgpr(lane, 0), expected_ceil, f"Lane {lane} ceil mismatch")
+
+    def test_simd_wavefront_divergent_lanes(self):
+        """Each lane in a 64-lane wave processes distinct packed half-precision pairs."""
+        interp = F16RoundingInterpreter(wave_size=64)
+        per_lane_inputs = []
+        for lane in range(64):
+            lo_val = float(lane % 8) + 0.5
+            hi_val = -(float(lane // 8) + 0.5)
+            h_lo = f2h(lo_val)
+            h_hi = f2h(hi_val)
+            dword = pack_f16x2(h_lo, h_hi)
+            per_lane_inputs.append(dword)
+            interp.wave.set_vgpr(lane, 1, dword)
+            interp.wave.set_vgpr(lane, 0, OLD)
+
+        interp.execute_program([
+            "v_floor_f16_e64 v0, v1 op_sel:[0,0]",
+            "v_floor_f16_e64 v0, v1 op_sel:[1,1]",
+        ])
+        for lane in range(64):
+            expected = ref_pk_floor(per_lane_inputs[lane])
+            self.assertEqual(interp.wave.get_vgpr(lane, 0), expected, f"Divergent lane {lane} floor mismatch")
+
+    def test_simd_wavefront_exec_mask_inactive_lanes_preserved(self):
+        """Inactive lanes under EXEC mask must strictly retain their previous values."""
+        interp = F16RoundingInterpreter(wave_size=64)
+        v1 = pack_f16x2(H_1P5, H_NEG_1P5)
+        # Enable only lower 32 lanes (exec = 0x00000000FFFFFFFF)
+        for lane in range(64):
+            interp.wave.set_vgpr(lane, 0, OLD)
+            interp.wave.set_vgpr(lane, 1, v1)
+
+        interp.execute_program([
+            "s_mov_b64 exec, 0x00000000FFFFFFFF",
+            "v_floor_f16_e64 v0, v1 op_sel:[0,0]",
+            "v_floor_f16_e64 v0, v1 op_sel:[1,1]",
+        ])
+
+        expected_floor = ref_pk_floor(v1)
+        for lane in range(32):
+            self.assertEqual(interp.wave.get_vgpr(lane, 0), expected_floor, f"Active lane {lane} failed")
+        for lane in range(32, 64):
+            self.assertEqual(interp.wave.get_vgpr(lane, 0), OLD, f"Inactive lane {lane} was modified")
+
+    def test_end_to_end_rdna2_simd_packed_sequence(self):
+        """End-to-end translation and execution of RDNA2 packed f16 floor/ceil sequences."""
+        samples = [
+            pack_f16x2(H_1P5, H_2P5),
+            pack_f16x2(H_NEG_0P5, H_0P75),
+            pack_f16x2(H_1022P5, H_1023P5),
+            pack_f16x2(H_SUB_MIN, H_NEG_SUB_MIN),
+        ]
+        for dword in samples:
+            with self.subTest(dword=hex(dword)):
+                got_floor = run_ps([
+                    f"v_mov_b32 v1, {dword:#x}",
+                    f"v_mov_b32 v0, {OLD:#x}",
+                    "v_floor_f16_e64 v0, v1 op_sel:[0,0]",
+                    "v_floor_f16_e64 v0, v1 op_sel:[1,1]",
+                ])
+                self.assertEqual(got_floor, ref_pk_floor(dword))
+
+                got_ceil = run_ps([
+                    f"v_mov_b32 v1, {dword:#x}",
+                    f"v_mov_b32 v0, {OLD:#x}",
+                    "v_ceil_f16_e64 v0, v1 op_sel:[0,0]",
+                    "v_ceil_f16_e64 v0, v1 op_sel:[1,1]",
+                ])
+                self.assertEqual(got_ceil, ref_pk_ceil(dword))
+
+    def test_unsupported_packed_pseudo_opcodes_rejected(self):
+        """In RDNA2 ISA, packed rounding is achieved via scalar half ops; packed mnemonics are unsupported."""
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_ps(["v_pk_floor_f16 v0, v1"])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_ps(["v_pk_ceil_f16 v0, v1"])
 
 
 class FractF16TranslationTests(unittest.TestCase):
