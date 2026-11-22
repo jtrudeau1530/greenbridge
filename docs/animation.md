@@ -665,7 +665,7 @@ happens to fit the header rule. The kind names are not resolved:
 
 So humanoid clips bind to the fragment skeleton, not to a `RIG` block. The rig tables look like per-rig bone or
 channel subsets (the RBF0 groups are `deformation`, `pose`, `identity`, `facial` and others); that reading is not
-measured. The auxiliary table on the second `0DRP` page is [framed above](#packed-clip-streams). Which model
+measured. The auxiliary table on the second `0DRP` page is [framed above](#auxiliary-tables-on-the-second-system-page). Which model
 or skeleton each non-humanoid clip dictionary drives remains open.
 
 ### Can the fragment bone names identify a clip's model? (ASSET-158)
