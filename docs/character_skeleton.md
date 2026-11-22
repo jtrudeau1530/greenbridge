@@ -391,7 +391,8 @@ The model binding is also decoded. `PERSCHARS_INFO` (`data.rpf@0x1AA5F000`, reco
 `Name = 0x03A885E6` (`mandy`) to `ModelSetName = 0x03A885E6`; `CPedModelInfo__InitData`
 (`packs.rpf@0x11D1FF000`, record 1219) maps that link to `cs_mandy` (`0xD7C0CDFF`). `cs_mandy`
 is a live model id — a `story000.rpf` cutscene actor/voice table uses it — but there is **no
-named `cs_mandy` drawable**. Its 64-bit `ModelName` is `0x009B33B7D7C0CDFF`, and its `FragName`
+named `cs_mandy` drawable**. The `cs_mandy` ID above is the 32-bit `ModelName` at row offset
+`+0x0C` (schema type `0x4D`). The adjacent 64-bit `FragName` at `+0x10` (type `0x4F`)
 `0xC9888B65009B33B7` is the shared female cutscene base, carried by **904** female rows:
 `player_story000_00` (Lucia's model id `0xE472B687`), `cs_monalisa` (`0x9CB9BCC6`) and
 `cs_mandy` (`0xD7C0CDFF`), plus 901 others. No ped-model row carries `joaat("cs_lucia")`
@@ -421,8 +422,8 @@ ids, not model names. The archetype-to-component-set lookup remains unidentified
 **Component variation (ASSET-279).** At `packs.rpf@0x11D1FF000`, the first 16 inflated 64 KiB
 pages cover the instance blocks and row schema and end inside LSNS. The 16-byte root has one
 array of 2,714 model rows, each 384 bytes. The row schema has no array or map, and both struct
-pointers (row offsets `+0x118` and `+0x178`) are null in every row. Across all rows, 906 share
-record 1219's 64-bit fragment field at `+0x10`; the 904 count above is for female rows.
+pointers (row offsets `+0x118` and `+0x178`) are null in every row. Only record 1219 carries its `ModelName` in this table. Its `FragName`
+occurs in 906 rows, including the 904 female rows counted above.
 This layout provides no inline array or live struct pointer for either nine-entry table.
 
 At `data.rpf@0x1B076000`, the PSIN walker reached 25 structures across all seven blocks
