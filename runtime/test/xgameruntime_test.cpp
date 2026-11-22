@@ -352,6 +352,38 @@ void check_run_time_load() {
               "slot 3 (preferred UDP port) has no answer offline; slot 20 (IXNetworkingImpl2) is E_NOTIMPL");
         release(n);
     }
+
+    // XSystemImpl, asked for as libHttpClient.GDK.dll does: the class id with IXSystemImpl5's interface id.
+    const GUID system_cls = {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};
+    const GUID system5 = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
+    void* sy = nullptr;
+    check(query(&system_cls, system5, &sy) == S_OK && sy, "QueryApiImpl hands out XSystemImpl for IXSystemImpl5");
+    if (sy) {
+        using IdQuery = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*, size_t*);
+        char buf[64] = {};
+        size_t used = 0;
+        check(reinterpret_cast<IdQuery>(slot(sy, 3))(sy, sizeof(buf), buf, &used) == S_OK && used == 39 &&
+                  std::strlen(buf) == 38,
+              "slot 3 (XSystemGetConsoleId): the 39-byte placeholder");
+        check(reinterpret_cast<IdQuery>(slot(sy, 4))(sy, sizeof(buf), buf, &used) == S_OK &&
+                  std::strcmp(buf, "RETAIL") == 0 && used == 7,
+              "slot 4 (XSystemGetXboxLiveSandboxId): RETAIL");
+        check(reinterpret_cast<IdQuery>(slot(sy, 5))(sy, sizeof(buf), buf, &used) == S_OK && used == 45 &&
+                  reinterpret_cast<IdQuery>(slot(sy, 5))(sy, 44, buf, &used) ==
+                      HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+                  reinterpret_cast<IdQuery>(slot(sy, 5))(sy, 45, nullptr, &used) == E_INVALIDARG,
+              "slot 5 (XSystemGetAppSpecificDeviceId): 45 bytes; a short or null buffer is refused");
+        using Track = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
+        using IsValid = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
+        using Bandwidth = HRESULT(STDMETHODCALLTYPE*)(void*, bool);
+        int ctx = 0;
+        check(reinterpret_cast<Track>(slot(sy, 6))(sy, &ctx, &ctx) == S_OK &&
+                  reinterpret_cast<IsValid>(slot(sy, 7))(sy, &ctx) == S_OK &&
+                  reinterpret_cast<IsValid>(slot(sy, 7))(sy, nullptr) == E_INVALIDARG &&
+                  reinterpret_cast<Bandwidth>(slot(sy, 8))(sy, true) == S_OK,
+              "slots 6-8 (handle tracking, handle check, download bandwidth) answer offline");
+        release(sy);
+    }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
     HMODULE k32 = load_w(L"kernel32.dll");
