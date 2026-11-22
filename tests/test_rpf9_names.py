@@ -63,6 +63,27 @@ def make_archive(path, magic=b"RPF9"):
     return [a, b, c, d]
 
 
+def bink2(inner=b"", total=96, w=64, h=48, rev=b"i"):
+    """A synthetic Bink 2 video: 'KB2' + revision, u32 size-8, width/height at +0x14, then ``inner``."""
+    v = bytearray(total)
+    v[0:4] = b"KB2" + rev
+    struct.pack_into("<I", v, 4, total - 8)
+    struct.pack_into("<II", v, 0x14, w, h)
+    v[0x20:0x20 + len(inner)] = inner
+    return bytes(v)
+
+
+def make_blob(path, *parts):
+    """An RPF9 archive whose data area (at 0x40) is ``parts`` laid end to end, then 4096 zero bytes."""
+    body = b"".join(parts)
+    data = bytearray(0x40 + len(body) + 4096)
+    data[0:4] = b"RPF9"
+    struct.pack_into("<I", data, 4, 0x40)
+    data[0x40:0x40 + len(body)] = body
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 class NamesTest(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args],
@@ -173,6 +194,76 @@ class NamesTest(unittest.TestCase):
                 self.assertTrue(created[0].closed)
                 os.remove(arc)
                 self.assertFalse(os.path.exists(arc))
+
+    def test_bink2_video_is_skipped_with_its_embedded_stream(self):
+        before = stream(b"before.#dr")
+        inner = stream(b"hidden.#ft")
+        video = bink2(inner, total=0x20 + len(inner) + 16)
+        after = stream(b"after.#dd")
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "v.rpf")
+            make_blob(arc, before, bytes(5), video, after)
+            rows, summary = rpf9_names.scan_archive(arc)
+        names = sorted(n for row in rows for n in row["names"])
+        self.assertEqual(names, ["after.#dd", "before.#dr"], summary)
+        self.assertEqual(summary["streams"], 2, summary)
+        self.assertEqual(summary["bink2_files"], 1, summary)
+        self.assertEqual(summary["bink2_bytes"], len(video), summary)
+        self.assertEqual(sum(r["stored"] for r in rows), len(before) + len(after))
+        self.assertEqual(summary["zero_padding"] + summary["unread_bytes"] + len(before) + len(after)
+                         + summary["bink2_bytes"], summary["span"], summary)
+        self.assertEqual(summary["zero_padding"], 5 + 4096, summary)
+        self.assertEqual(summary["unread_bytes"], 0, summary)
+
+    def test_bink2_gap_before_video_counts_as_unread(self):
+        video = bink2()
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "v.rpf")
+            make_blob(arc, b"junk!", video)
+            rows, summary = rpf9_names.scan_archive(arc)
+        self.assertEqual(summary["bink2_files"], 1, summary)
+        self.assertEqual(summary["unread_bytes"], 5, summary)
+        self.assertEqual(summary["zero_padding"], 4096, summary)
+        self.assertEqual(summary["unread_bytes"] + summary["zero_padding"] + summary["bink2_bytes"],
+                         summary["span"], summary)
+
+    def test_implausible_bink2_header_is_not_a_video(self):
+        good = stream(b"real.#dr")
+        bad_headers = {
+            "zero_width": bink2(w=0),
+            "huge_height": bink2(h=9000),
+            "runs_past_end": bink2()[:4] + struct.pack("<I", 1 << 20) + bink2()[8:],
+            "too_short": bink2()[:4] + struct.pack("<I", 8) + bink2()[8:],
+        }
+        for label, bad in bad_headers.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                arc = os.path.join(tmp, "v.rpf")
+                make_blob(arc, bad, good)
+                rows, summary = rpf9_names.scan_archive(arc)
+                self.assertEqual(summary["bink2_files"], 0, summary)
+                self.assertEqual(summary["bink2_bytes"], 0, summary)
+                self.assertEqual([n for r in rows for n in r["names"]], ["real.#dr"], summary)
+                self.assertEqual(summary["zero_padding"] + summary["unread_bytes"] + len(good),
+                                 summary["span"], summary)
+
+    def test_limit_bounds_inflation_to_the_window(self):
+        first = stream(b"first.#dr")
+        second = stream(b"second.#ft")
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "l.rpf")
+            make_blob(arc, first, second)
+            rows, summary = rpf9_names.scan_archive(arc, limit=len(first) - 1)
+            self.assertEqual(rows, [])
+            self.assertEqual(summary["streams"], 0, summary)
+            self.assertEqual(summary["span"], len(first) - 1)
+            self.assertEqual(summary["unread_bytes"], len(first) - 1, summary)
+            self.assertEqual(summary["zero_padding"], 0, summary)
+            rows, summary = rpf9_names.scan_archive(arc, limit=len(first))
+            self.assertEqual([n for r in rows for n in r["names"]], ["first.#dr"], summary)
+            self.assertEqual(rows[0]["stored"], len(first))
+            self.assertEqual(summary["streams"], 1, summary)
+            self.assertEqual(summary["span"], len(first), summary)
+            self.assertEqual(summary["zero_padding"] + summary["unread_bytes"], 0, summary)
 
     def _assert_validation_error_closes_mmap(self, arc, start, message):
         """Assert scan_archive raises ValueError and closes its mmap before returning."""

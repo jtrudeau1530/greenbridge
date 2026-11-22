@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import zlib
 from http.server import HTTPServer, ThreadingHTTPServer
 
@@ -1810,6 +1811,113 @@ class WorldBuildTest(unittest.TestCase):
                 world_build.build_world(missing, out_dir)
             p = self._run_cli(missing, out_dir)
             self.assertNotEqual(p.returncode, 0)
+
+
+class WorldBuildStagingTest(unittest.TestCase):
+    """A rebuild that fails or is interrupted must leave the previous world.json and its chunks as they were."""
+
+    _snapshot = staticmethod(WorldBuildTest._output_snapshot)
+
+    @staticmethod
+    def _failing_write_glb(exc: BaseException, fail_on_call: int = 2):
+        """Wrap the real write_glb so that call number `fail_on_call` raises `exc` instead of writing."""
+        real = glb_writer.write_glb
+        lock = threading.Lock()
+        calls = [0]
+
+        def write_glb(path, *args, **kwargs):
+            with lock:
+                calls[0] += 1
+                n = calls[0]
+            if n == fail_on_call:
+                raise exc
+            return real(path, *args, **kwargs)
+
+        return write_glb
+
+    def _previous_world(self, tmp: str) -> tuple[str, str, dict]:
+        # The previous world is untextured; the failing rebuild embeds textures, so every chunk it
+        # would publish differs from the one on disk and an early overwrite shows up in the snapshot.
+        assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+        _write_synthetic_assets(assets, origin_overlap=False)
+        world_build.build_world(assets, output, textures=False)
+        before = self._snapshot(output)
+        self.assertEqual(sum(1 for k in before if k.startswith("chunks" + os.sep)), 2)
+        return assets, output, before
+
+    def test_successful_build_publishes_every_chunk_and_world_json(self):
+        for jobs in (1, 4):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+                _write_synthetic_assets(assets, origin_overlap=False)
+                result = world_build.build_world(assets, output, jobs=jobs)
+                with open(os.path.join(output, "world.json"), encoding="utf-8") as f:
+                    document = json.load(f)
+                self.assertEqual(document, result)
+                self.assertEqual(len(document["chunks"]), 2)
+                for chunk in document["chunks"]:
+                    with open(_chunk_disk_path(output, chunk["url"]), "rb") as f:
+                        parse_and_validate_glb(f.read())
+                self.assertEqual(sorted(os.listdir(output)), ["chunks", "world.json"])
+                self.assertEqual(sorted(os.listdir(os.path.join(output, "chunks"))),
+                                 sorted(f"{c['id']}.glb" for c in document["chunks"]))
+
+    def test_failed_chunk_write_leaves_existing_world_untouched(self):
+        failures = (glb_writer.GlbError("synthetic broken asset"), OSError("synthetic write error"),
+                    KeyboardInterrupt())
+        for exc in failures:
+            for jobs in (1, 4):
+                with self.subTest(exc=type(exc).__name__, jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                    assets, output, before = self._previous_world(tmp)
+                    with unittest.mock.patch.object(glb_writer, "write_glb", self._failing_write_glb(exc)):
+                        with self.assertRaises(type(exc)):
+                            world_build.build_world(assets, output, jobs=jobs)
+                    self.assertEqual(self._snapshot(output), before)
+
+    def test_failed_first_build_leaves_no_output_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            _write_synthetic_assets(assets, origin_overlap=False)
+            with unittest.mock.patch.object(glb_writer, "write_glb", self._failing_write_glb(OSError("disk full"))):
+                with self.assertRaises(OSError):
+                    world_build.build_world(assets, output)
+            self.assertFalse(os.path.exists(output))
+
+    def test_corrupt_staged_chunk_is_rejected_before_publishing(self):
+        real = glb_writer.write_glb
+
+        def truncating_write_glb(path, *args, **kwargs):
+            info = real(path, *args, **kwargs)
+            with open(path, "r+b") as f:
+                f.truncate(16)
+            return info
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            with unittest.mock.patch.object(glb_writer, "write_glb", truncating_write_glb):
+                with self.assertRaises(ValueError):
+                    world_build.build_world(assets, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def test_world_json_write_failure_restores_previous_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            with unittest.mock.patch.object(world_build, "_write_json_atomic",
+                                            side_effect=OSError("synthetic world.json write error")):
+                with self.assertRaises(OSError):
+                    world_build.build_world(assets, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def test_staging_left_by_a_killed_build_is_removed_on_the_next_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            _write_synthetic_assets(assets, origin_overlap=False)
+            leftover = os.path.join(output, world_build.CHUNK_STAGING_PREFIX + "killed")
+            os.makedirs(leftover)
+            with open(os.path.join(leftover, "c_0_0.glb"), "wb") as f:
+                f.write(b"partial")
+            world_build.build_world(assets, output)
+            self.assertEqual(sorted(os.listdir(output)), ["chunks", "world.json"])
 
 
 # ---------------------------------------------------------------------------

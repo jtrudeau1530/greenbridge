@@ -251,6 +251,8 @@ def main(argv=None):
             index = json.load(f)
     except (OSError, ValueError) as e:
         sys.exit(f"cannot read {idx_path}: {e}")
+    if not isinstance(index, dict):
+        sys.exit(f"cannot read {idx_path}: expected a JSON object of shader -> metadata entries")
     written = generate_for_index(spirv_dir, index)
     print(f"wrote {len(written)} stubs to {os.path.join(spirv_dir, 'stubs')}")
     return 0

@@ -238,8 +238,9 @@ def _psin_state(b):
             return False, count, False
         at += size
         count += 1
-    if count and at == len(b):
-        return True, count, False
+    if at == len(b):
+        # Ends exactly here: complete with at least one section; a bare header is incomplete, not continued.
+        return count > 0, count, False
     return False, count, True
 
 

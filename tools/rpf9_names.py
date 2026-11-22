@@ -81,6 +81,8 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
             zero = 0
             unread = 0
             streams = 0
+            bink2_files = 0
+            bink2_bytes = 0
             name_hits = 0
             unique = {}
             t0 = time.time()
@@ -90,15 +92,31 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                     break
                 s = mt.start()
                 if m[s:s + 3] == b"KB2":
-                    pos = s + 3
+                    # Same header test as rpf9_carve.py: u32 size-8 at +4, width/height at +0x14.
+                    if s + 0x1C > end:   # header cut off by the end of the window: not a video
+                        pos = s + 1
+                        continue
+                    blen = struct.unpack_from("<I", m, s + 4)[0] + 8
+                    w, h = struct.unpack_from("<II", m, s + 0x14)
+                    if not (64 <= blen <= end - s and 16 <= w <= 8192 and 16 <= h <= 8192):
+                        pos = s + 1
+                        continue
+                    gap = m[last:s]
+                    if gap.count(0) == len(gap):
+                        zero += len(gap)
+                    else:
+                        unread += len(gap)
+                    bink2_files += 1
+                    bink2_bytes += blen
+                    last = pos = s + blen
                     continue
                 d = zlib.decompressobj()
                 prefix = bytearray()
                 total = 0
                 p = s
                 try:
-                    while not d.eof and p < size:
-                        chunk = m[p:p + (1 << 20)]
+                    while not d.eof and p < end:
+                        chunk = m[p:min(p + (1 << 20), end)]
                         if not chunk:
                             break
                         data = d.decompress(chunk)
@@ -163,6 +181,8 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                 "types": list(types),
                 "zero_padding": zero,
                 "unread_bytes": unread,
+                "bink2_files": bink2_files,
+                "bink2_bytes": bink2_bytes,
             }
             return rows, summary
 

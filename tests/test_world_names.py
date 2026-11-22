@@ -231,6 +231,23 @@ class ResolveTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_xml_unterminated_comment_keeps_later_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = os.path.join(tmp, "concat.xml")
+            with open(xml, "w", encoding="utf-8") as handle:
+                handle.write("<root><name>First</name><!-- cut off here\n"
+                             '<?xml version="1.0"?><root><name>RealName</name>'
+                             "<filename>x/Real.rpf</filename></root>")
+            d = WN.NameDictionary()
+            d.add_xml(xml)
+            self.assertEqual(sorted(n for names in d.to_json()["names"].values() for n in names),
+                             ["First", "Real", "Real.rpf", "RealName"])
+
+    def test_xml_unescape_is_strict(self):
+        self.assertEqual(WN._xml_unescape("A&amp;B&#x26;C&#38;D&lt;"), "A&B&C&D<")
+        for text in ("Tom&notes", "R&reg_x", "A&nbsp;B", "A&B"):
+            self.assertEqual(WN._xml_unescape(text), text)
+
     def test_build_xml_decodes_names_and_ignores_comments(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml = os.path.join(tmp, "names.xml")
