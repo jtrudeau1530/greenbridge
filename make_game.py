@@ -739,7 +739,8 @@ WAVE64_MODES = ("auto", "on", "off")
 
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
-                  ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"))
+                  ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
+                  ("--f16-interp-fallback", "f16_interp_fallback"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -805,6 +806,18 @@ def runtime_gpu_native64():
                            capture_output=True, text=True, timeout=60)
         return bool(json.loads(r.stdout.strip().splitlines()[-1])["native64"])
     except (OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError):
+        return None
+
+
+def runtime_gpu_per_vertex():
+    """per_vertex_inputs as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
+    driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        v = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
+        return None if v is None else bool(v)
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
 
 
@@ -1202,6 +1215,9 @@ def main() -> int:
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
                          "without VK_KHR_maintenance8")
+    ap.add_argument("--f16-interp-fallback", action="store_true",
+                    help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
+                         "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
@@ -1267,6 +1283,10 @@ def main() -> int:
                 "(or pass --runtime-build)")
     emulate = "shaders" in stages and wave64_emulate(a.wave64_emulate)
     keep_emulated = a.wave64_emulate == "auto"
+    if "shaders" in stages and not a.f16_interp_fallback and runtime_gpu_per_vertex() is False:
+        log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
+            "fragmentShaderBarycentric): translating with --f16-interp-fallback")
+        a.f16_interp_fallback = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
