@@ -959,5 +959,55 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(root0, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_square_root_precision(self) -> None:
+        # Smallest subnormal: 2^-24 -> sqrt(2^-24) = 2^-12 = 0x0C00
+        min_sub = 0x0001
+        res = ref_sqrt_clamp_f16(min_sub)
+        self.assertEqual(res, 0x0C00)
+        self.assertFalse(is_subnormal(res))
+        self.assertEqual(bits_to_f16(res), 2.0 ** -12)
+
+        # 4 * 2^-24 -> sqrt is 2 * 2^-12 = 2^-11 = 0x1000
+        sub_four = 0x0004
+        res_four = ref_sqrt_clamp_f16(sub_four)
+        self.assertEqual(res_four, 0x1000)
+        self.assertEqual(bits_to_f16(res_four), 2.0 ** -11)
+
+    def test_subnormal_produces_normal(self) -> None:
+        for sub in [0x0001, 0x0002, 0x0010, 0x0100, 0x03FF]:
+            with self.subTest(sub=hex(sub)):
+                res = ref_sqrt_clamp_f16(sub)
+                self.assertFalse(is_subnormal(res))
+                _, exp, _ = split_f16_bits(res)
+                self.assertGreater(exp, 0)
+
+    def test_nan_clamping_to_zero(self) -> None:
+        # In RDNA2 clamp mode, all NaNs clamp to +0.0
+        self.assertEqual(ref_sqrt_clamp_f16(CANONICAL_QNAN), POS_ZERO)
+        self.assertEqual(ref_sqrt_clamp_f16(0x7C05), POS_ZERO)  # SNaN
+        self.assertEqual(ref_sqrt_clamp_f16(0x7EFF), POS_ZERO)  # Arbitrary payload QNaN
+        self.assertEqual(ref_sqrt_clamp_f16(0xFEFF), POS_ZERO)  # Negative QNaN
+
+    def test_negative_boundary_clamping(self) -> None:
+        self.assertEqual(ref_sqrt_clamp_f16(0xBC00), POS_ZERO)  # -1.0
+        self.assertEqual(ref_sqrt_clamp_f16(0x8001), POS_ZERO)  # Negative subnormal
+        self.assertEqual(ref_sqrt_clamp_f16(NEG_INF), POS_ZERO)
+        self.assertEqual(ref_sqrt_clamp_f16(NEG_ZERO), POS_ZERO)
+
+    def test_positive_inf_clamping_to_one(self) -> None:
+        self.assertEqual(ref_sqrt_clamp_f16(POS_INF), ONE_F16)
+
+    def test_round_to_nearest_even_ties(self) -> None:
+        # Test values strictly within [0.0, 1.0]
+        for val in [0.0625, 0.25, 0.5, 0.75, 1.0]:
+            bits = f16_to_bits(val)
+            res = ref_sqrt_clamp_f16(bits)
+            expected = f16_to_bits(min(1.0, math.sqrt(val)))
+            self.assertEqual(res, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
