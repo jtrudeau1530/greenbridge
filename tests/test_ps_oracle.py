@@ -148,6 +148,113 @@ class BinaryFile(unittest.TestCase):
             self.assertEqual(P.read_binaries(p), bins)
 
 
+def _radv(code, exec_size=None, info_size=600, wave=64, stage=4, next_stage=0xFF, vgprs=8, sgprs=108,
+          stats=b"", ir=b"", tail=b"", btype=0):
+    """One RADV stage binary laid out as radv_shader_serialize writes it (Mesa 26.3 radv_pipeline_cache.c): type,
+    ac_shader_config, radv_shader_info (its size changes between Mesa versions; wave_size, ngg_lds_scratch_size,
+    stage, next_stage at the end here), total_size, 4 bytes of padding, the six sizes, then stats, code, ir."""
+    granule = 8 if wave == 32 else 4
+    rsrc1 = (vgprs - 1) // granule | 0xC0 << 12 | 1 << 21                 # VGPRS, FLOAT_MODE, DX10_CLAMP
+    config = struct.pack("<10I4x3I", sgprs, vgprs, 0, 0, 0, 0, 2, 2, 0xC0, 0, rsrc1, 4, 0)
+    info = bytearray(info_size)
+    info[-8:-4] = bytes([wave, 0, stage, next_stage])
+    base = struct.pack("<I", btype) + config + bytes(info)
+    exec_size = len(code) if exec_size is None else exec_size
+    total = len(base) + 4 + (-(len(base) + 4) % 8) + 24 + len(stats) + len(code) + len(ir)
+    head = base + struct.pack("<I", total) + b"\xab\x55\0\0" * (-(len(base) + 4) % 8 // 4)
+    head += struct.pack("<6I", len(code), exec_size, len(ir), 0, len(stats), 0)
+    return head + stats + code + ir + tail
+
+
+class RadvBinary(unittest.TestCase):
+    CODE = S_ENDPGM + P.S_CODE_END * 4
+
+    def test_fields_are_found_whatever_the_info_size(self):
+        for info_size in (600, 404, 1000):
+            with self.subTest(info_size=info_size):
+                data = _radv(self.CODE, exec_size=4, info_size=info_size, stats=b"S" * 12, ir=b"ir\0", tail=b"T" * 9)
+                lay = P.radv_layout(data)
+                self.assertEqual(data[lay.code:lay.code + lay.code_size], self.CODE)
+                self.assertEqual((lay.exec_size, lay.vgprs, lay.sgprs, lay.wave, lay.is_ps), (4, 8, 108, 64, True))
+
+    def test_wave32_and_the_vertex_stage(self):
+        self.assertEqual(P.radv_layout(_radv(self.CODE, wave=32, vgprs=16)).wave, 32)
+        self.assertFalse(P.radv_layout(_radv(self.CODE, stage=0, next_stage=4)).is_ps)
+
+    def test_patch_replaces_the_code_and_raises_the_counts(self):
+        data = _radv(self.CODE, exec_size=4, stats=b"S" * 12, ir=b"ir\0", tail=b"T" * 9)
+        new = S_ENDPGM * 7
+        out = P.patch_radv_ps(data, new, ["v_mov_b32 v40, s90", "s_endpgm"])
+        lay = P.radv_layout(out)
+        self.assertEqual(out[lay.code:lay.code + lay.exec_size], new)
+        self.assertEqual(set(struct.unpack_from(f"<{(lay.code_size - len(new)) // 4}I", out, lay.code + len(new))),
+                         {0xBF9F0000})
+        self.assertEqual((lay.vgprs, lay.sgprs), (44, 108))         # v40 -> 41 VGPRs, rounded to the wave64 granule 4
+        rsrc1 = struct.unpack_from("<I", out, lay.rsrc1_at)[0]
+        self.assertEqual(rsrc1, 43 // 4 | 0xC0 << 12 | 1 << 21)
+        self.assertEqual(out[lay.code - 12:lay.code], b"S" * 12)       # stats stay before the code
+        self.assertTrue(out.endswith(b"ir\0" + b"T" * 9))                # ir and the debug tail stay after it
+        self.assertEqual(len(out), len(data) + lay.code_size - len(self.CODE))
+
+    def test_counts_are_never_lowered(self):
+        out = P.patch_radv_ps(_radv(self.CODE, wave=32, vgprs=24), S_ENDPGM, ["v_mov_b32 v1, v0"])
+        lay = P.radv_layout(out)
+        self.assertEqual((lay.vgprs, lay.wave), (24, 32))
+        self.assertEqual(struct.unpack_from("<I", out, lay.rsrc1_at)[0] & 0x3F, 23 // 8)
+
+    def test_unknown_layouts_are_refused(self):
+        for bad in (_radv(self.CODE, btype=1), _radv(self.CODE)[:-4], _radv(self.CODE)[:60] + bytes(8)):
+            with self.subTest(n=len(bad)), self.assertRaises(P.Unavailable):
+                P.radv_layout(bad)
+
+    def test_the_pixel_stage_is_picked(self):
+        bins = [(32, b"k" * 32, _radv(self.CODE, stage=0, next_stage=4)), (32, b"q" * 32, _radv(self.CODE))]
+        self.assertEqual(P.radv_ps_index(bins), 1)
+        with self.assertRaises(P.Unavailable):
+            P.radv_ps_index(bins[:1])
+
+    def test_architecture(self):
+        self.assertEqual(P.radv_arch("AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO) (subgroup 32..64)"), "gfx1036")
+        self.assertEqual(P.radv_arch("AMD Custom GPU 0405 (RADV VANGOGH)"), "gfx1033")
+        for name, chip in (("AMD Radeon RX 9070 XT (RADV GFX1201) (subgroup 32..64)", "GFX1201"),
+                           ("AMD Radeon RX 7900 XTX (RADV NAVI31)", "NAVI31")):
+            with self.subTest(chip=chip), self.assertRaisesRegex(P.Unavailable, f"unsupported architecture.*{chip}"):
+                P.radv_arch(name)
+        with self.assertRaisesRegex(P.Unavailable, "not RADV"):
+            P.radv_arch("NVIDIA GeForce RTX 3090")
+
+
+class RadvOracleWithoutGpu(unittest.TestCase):
+    """The Oracle on a stand-in vk_harness that hands back RADV binaries: the RDNA4 refusal and --set."""
+
+    def _oracle(self, device):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        for name in ("vk_harness", "vs.spv", "ps.spv"):
+            open(os.path.join(d.name, name), "wb").close()
+        bins = [(32, b"k" * 32, _radv(RadvBinary.CODE, stage=0, next_stage=4)), (32, b"q" * 32, _radv(RadvBinary.CODE))]
+
+        def fake(exe, vs, ps, out_raw, size, env):
+            P.write_binaries(env["VKH_BINARY_OUT"], bins)
+            with open(out_raw, "wb") as f:
+                f.write(bytes(16 * size[0] * size[1]))
+            return type("R", (), {"returncode": 0, "stderr": f"device: {device}\n"})()
+        old, P.run_harness = P.run_harness, fake
+        self.addCleanup(setattr, P, "run_harness", old)
+        return P.Oracle(d.name, os.path.join(d.name, "vs.spv"), os.path.join(d.name, "ps.spv"), size=(2, 1),
+                        work=os.path.join(d.name, "w"))
+
+    def test_rdna2_is_taken(self):
+        o = self._oracle("AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO) (subgroup 32..64)")
+        self.assertEqual((o.backend, o.wave64, o.ps_index), ("radv", True, 1))
+        with self.assertRaisesRegex(ValueError, "--set"):
+            o.run(["s_endpgm"], [(".graphics_registers/.spi_ps_in_control/.num_interps", 2)])
+
+    def test_rdna4_is_refused(self):
+        with self.assertRaisesRegex(P.Unavailable, "unsupported architecture.*GFX1201"):
+            self._oracle("AMD Radeon RX 9070 XT (RADV GFX1201) (subgroup 32..64)")
+
+
 class Cli(unittest.TestCase):
     def test_nothing_to_do_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as cm:
@@ -169,15 +276,24 @@ class OnHardware(unittest.TestCase):
             o = P.Oracle(os.environ["LEONIDA_PS_ORACLE_BUILD"], template="interp2", size=(4, 1))
         except P.Unavailable as e:
             self.skipTest(str(e))
+        body = ["s_mov_b32 m0, s2", "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                "v_interp_mov_f32_e32 v3, p0, attr0.x", "v_interp_mov_f32_e32 v4, p10, attr0.x",
+                "v_mov_b32_e32 v40, {}", "v_mov_b32_e32 v5, v40", "exp mrt0, v2, v3, v4, v5 done vm", "s_endpgm"]
         try:
-            px = o.run(["s_mov_b32 m0, s2", "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
-                        "v_interp_mov_f32_e32 v3, p0, attr0.x", "v_interp_mov_f32_e32 v4, p10, attr0.x",
-                        "v_mov_b32_e32 v40, 0x12345678", "v_mov_b32_e32 v5, v40",
-                        "exp mrt0, v2, v3, v4, v5 done vm", "s_endpgm"])
+            px = o.run([ln.format("0x12345678") for ln in body])
+            # a second patch must change the result: nothing of the first one is cached by the driver
+            again = o.run([ln.format("0x9abcdef0") for ln in body])
         finally:
             o.close()
         want_u = [0x3E000000, 0x3EC00000, 0x3F200000, 0x3F600000]    # 0.125, 0.375, 0.625, 0.875
-        self.assertEqual(px, [[u, 0, 0x40000000, 0x12345678] for u in want_u])
+        p10 = 0x40000000                                              # 2.0
+        if o.backend == "radv":
+            # Mesa moves the template's in0 + in1 into the vertex shader: one parameter, attr0 = (2u, 2v, 0, 1)
+            want_u = [0x3E800000, 0x3F400000, 0x3FA00000, 0x3FE00000]  # 0.25, 0.75, 1.25, 1.75
+            p10 = 0x40800000                                          # 4.0
+        self.assertEqual(px, [[u, 0, p10, 0x12345678] for u in want_u])
+        self.assertEqual(again, [[u, 0, p10, 0x9ABCDEF0] for u in want_u])
+        self.assertNotEqual(o.template_pixels, px)                     # the template's own shader gives other words
 
 
 if __name__ == "__main__":

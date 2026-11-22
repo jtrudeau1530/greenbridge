@@ -1664,6 +1664,34 @@ driver returns two blobs) and the tool exits 77. Limits: one draw of one triangl
 stage is the template's, compiled by the driver; the SPI behaviour comes from the driver's metadata, so a `--set`
 the hardware does not support is not refused here.
 
+**On Linux (RADV).** Mesa's RADV returns the pipeline as one binary per stage, as `radv_shader_serialize` writes it
+(Mesa 26.3 `radv_pipeline_cache.c`, structs in `radv_shader.h`): a type word, `struct ac_shader_config` (`num_sgprs`,
+`num_vgprs`, ..., `rsrc1`), `struct radv_shader_info`, `total_size`, then `code_size`, `exec_size` and the other
+sizes, then stats, code, IR and disassembly. The info struct's size changes between Mesa versions, so the tool finds
+the fields from their values: the size block whose sizes add up to `total_size`, the pixel stage from the
+`wave_size, ., stage = 4 (fragment), next_stage = none` bytes in the info, and `rsrc1` as the config word whose
+VGPRS field is `(num_vgprs - 1) / (wave32 ? 8 : 4)` (`radv_postprocess_binary_config`) and whose FLOAT_MODE equals
+`float_mode`. A layout where these do not agree is refused (exit 77), not guessed. The code is replaced, the sizes
+are fixed, and `num_vgprs`/`num_sgprs` and rsrc1's VGPRS are raised; RADV builds an imported binary with
+`radv_shader_create_uncached` (no cache lookup by key) and programs `SPI_SHADER_PGM_RSRC1_PS` from `rsrc1`. Two
+limits: `--set` is refused (RADV keeps the SPI setup in its own structs, so a template has to ask for what it
+needs), and only GFX10 (RDNA1/RDNA2) devices are taken, from the chip name RADV puts in the device name; GFX11 and
+later interpolate with `lds_param_load` instead of `v_interp_*`, so e.g. an RX 9070 XT (`RADV GFX1201`) gets
+`unsupported architecture` and exit 77.
+
+Mesa optimises varyings across stages, so a template's parameter layout can differ from the Windows driver's:
+RADV moves `interp2`'s `in0 + in1` into the vertex shader and the pixel shader reads one parameter, attr0 =
+(2u, 2v, 0, 1); `--show-template` shows the layout a run gets.
+
+```sh
+LEONIDA_VK_DEVICE=raphael python -I tools/ps_oracle.py --build <runtime build> --template interp2 --show-template
+```
+
+Checked on the Ryzen 7 9800X3D iGPU (`RADV RAPHAEL_MENDOCINO`, gfx1036, wave64 pixel stage, Mesa 26.3.1, CachyOS):
+the Windows check's `attr0.x` code (with `v40`, past the template's 8 VGPRs) gives u = 0.25, 0.75, 1.25, 1.75,
+P0 = 0 and P10 = 4.0 for the single parameter, and a second patch with another constant changes the result (nothing
+is cached).
+
 
 ## Coverage plan and cost
 
