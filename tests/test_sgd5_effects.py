@@ -95,17 +95,27 @@ class EffectsTest(unittest.TestCase):
             self.assertEqual(query(), [])
             effects = query("--list-effects")
             self.assertEqual([entry["effect"] for entry in effects], ["Bulb", "Bulb", "Dark"])
+            self.assertEqual(effects[0]["shader_hash"], "0CF39D0D")
             named, empty = query("--effect", effects[0]["effect"])
+            self.assertEqual(query("--shader-hash", "0CF39D0D"), [named, empty])
             self.assertEqual([named["effect_offset"], empty["effect_offset"]],
                              [entry["effect_offset"] for entry in effects[:2]])
             self.assertEqual(empty["techniques"], [])
             self.assertEqual([(t["technique_index"], t["pass_count"]) for t in named["techniques"]], [(0, 1), (1, 2)])
             resolved = query("--effect", named["effect"], "--technique", named["techniques"][0]["technique"])
+            self.assertEqual(query("--shader-hash", "0xcf39d0d", "--technique", "Glow"), resolved)
             self.assertEqual([len(match["passes"]) for match in resolved], [1, 2])
             self.assertEqual(resolved[0]["passes"][0][0]["record_offset"], data.index(label("Light")))
-            for bad in [("--technique", "Glow"), ("--list-effects", "--effect", "Bulb"), ("--effect", "Absent")]:
+            for bad in [("--technique", "Glow"), ("--list-effects", "--effect", "Bulb"), ("--effect", "Absent"),
+                        ("--shader-hash", "00000000"), ("--shader-hash", "100000000"), ("--shader-hash", "oops")]:
                 with self.subTest(bad=bad), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     query(*bad)
+
+    def test_material_hash_preserves_all_matching_effect_records(self):
+        data, layout = database({}, [effect("Bulb"), effect("bulb")])
+        report = sgd5_effects.read_database(io.BytesIO(data), layout, shader_hash=0x0CF39D0D)
+        self.assertEqual([m["effect"] for m in report["matches"]], ["Bulb", "bulb"])
+        self.assertNotEqual(report["matches"][0]["effect_offset"], report["matches"][1]["effect_offset"])
 
     def test_duplicate_names_resolve_per_effect_technique_and_pass(self):
         # Both length bytes are printable. The carver includes the program's

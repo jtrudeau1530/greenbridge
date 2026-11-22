@@ -4,6 +4,7 @@ python -I tools/sgd5_effects.py PATH/TO/shaders.rpf
 python -I tools/sgd5_effects.py PATH/TO/shaders.rpf --list-effects
 python -I tools/sgd5_effects.py PATH/TO/shaders.rpf --effect NAME
 python -I tools/sgd5_effects.py PATH/TO/shaders.rpf --effect NAME --technique NAME
+python -I tools/sgd5_effects.py PATH/TO/shaders.rpf --shader-hash HEX --technique NAME
 
 The default JSON contains only aggregate counts. A named query also returns
 the database, group, ordinal and archive offsets of the selected programs.
@@ -11,6 +12,7 @@ Group 0 contains vertex and mesh programs, 1 pixel, 2 geometry and 5 compute.
 Groups 3 and 4 are empty in this build. All returned offsets are absolute.
 Use carve_offset to join to shader_carve's index.json by offset. Repeated
 effect or technique names return every match with its offset and row index.
+--shader-hash accepts the Materials[].Shader hex value from an rpf9dump model manifest.
 This reads plain metadata in place. Runtime selection of a technique is unknown.
 """
 import argparse
@@ -21,6 +23,7 @@ import struct
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hashdict import joaat
 from shader_carve import ENTRY
 
 # SGD5 signature, first native group count, end of the padded effect region.
@@ -168,7 +171,7 @@ def techniques(data, lists, pos, boundary):
         raise ValueError("technique pass counts do not sum to the table count")
 
 
-def read_database(stream, layout, effect=None, technique=None, *, list_effects=False):
+def read_database(stream, layout, effect=None, technique=None, *, list_effects=False, shader_hash=None):
     database, first_group, end = layout
     stream.seek(database)
     if stream.read(4) != b"SGD5":
@@ -191,22 +194,25 @@ def read_database(stream, layout, effect=None, technique=None, *, list_effects=F
               "named_effects": 0, "techniques": 0, "passes": 0, "matches": []}
     ends = [header[0] for header in headers[1:]] + [len(data)]
     for (start, name, lists, pos), boundary in zip(headers, ends):
+        key = joaat(name)
+        selected = name == effect or key == shader_hash
         if list_effects:
-            result["matches"].append({"effect": name, "effect_offset": base + start})
+            result["matches"].append({"effect": name, "shader_hash": f"{key:08X}", "effect_offset": base + start})
         listing = []
         for index, (stored_name, passes) in enumerate(techniques(data, lists, pos, boundary)):
             result["named_effects"] += index == 0
             result["techniques"] += 1
             result["passes"] += len(passes)
-            if name != effect:
+            if not selected:
                 continue
             if technique is None:
                 listing.append({"technique": stored_name, "technique_index": index, "pass_count": len(passes)})
             elif stored_name == technique:
                 resolved = [[program_identity(stream, g, ordinal, groups[g][ordinal]) for g, ordinal in row]
                             for row in passes]
-                result["matches"].append({"effect_offset": base + start, "technique_index": index, "passes": resolved})
-        if name == effect and technique is None:
+                result["matches"].append({"effect": name, "effect_offset": base + start,
+                                          "technique_index": index, "passes": resolved})
+        if selected and technique is None:
             result["matches"].append({"effect": name, "effect_offset": base + start, "techniques": listing})
     return result
 
@@ -216,16 +222,23 @@ def main(argv=None):
     parser.add_argument("archive", type=Path)
     query = parser.add_mutually_exclusive_group()
     query.add_argument("--list-effects", action="store_true", help="list effect names and archive offsets locally")
-    query.add_argument("--effect", help="list techniques for this exact effect name")
+    query.add_argument("--effect", help="exact effect name, or list its techniques when --technique is omitted")
+    query.add_argument("--shader-hash", metavar="HEX", help="hexadecimal Materials[].Shader value from rpf9dump")
     parser.add_argument("--technique", help="exact technique name from that effect")
     args = parser.parse_args(argv)
-    if args.technique is not None and args.effect is None:
-        parser.error("--technique requires --effect")
+    shader_hash = None
+    if args.shader_hash is not None:
+        if not re.fullmatch(r"(?:0[xX])?[0-9a-fA-F]{1,8}", args.shader_hash):
+            parser.error("--shader-hash expects up to eight hexadecimal digits")
+        shader_hash = int(args.shader_hash, 16)
+    if args.technique is not None and args.effect is None and shader_hash is None:
+        parser.error("--technique requires --effect or --shader-hash")
     try:
         with args.archive.open("rb") as stream:
-            results = [read_database(stream, layout, args.effect, args.technique, list_effects=args.list_effects)
+            results = [read_database(stream, layout, args.effect, args.technique,
+                                     list_effects=args.list_effects, shader_hash=shader_hash)
                        for layout in DATABASES]
-        if args.effect is not None and not any(row["matches"] for row in results):
+        if (args.effect is not None or shader_hash is not None) and not any(row["matches"] for row in results):
             parser.error("no matching effect or technique; use --list-effects, then --effect NAME")
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
