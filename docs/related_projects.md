@@ -51,6 +51,20 @@ tables or comments into Leonida. If a format fact learned from it is useful, ver
 write our own implementation. The model-recovery gap measured in [models.md](models.md) is in that submodule; the
 fix should go upstream, not into a copy.
 
+## meetox80/6stars
+
+<https://github.com/meetox80/6stars>
+
+A macOS Swift/Metal engine that reads the world from RPF9, with its own archive index and format readers.
+
+**Licence: none.** There is no `LICENSE` file and GitHub reports no licence, so all rights are reserved.
+**No 6stars code, comments, identifiers or tables may be copied into Leonida.**
+
+**What we use it for:** corroboration. Its RPF9 stream-boundary predicate and PRD0 member type codes were
+re-measured against this package before entering [rpf.md](rpf.md) and [world.md](world.md); its navmesh
+road/pavement bit labels did not reproduce and are not used. The navmesh polygon `+4` packing it reads is the one
+our decoder already validates ([navmesh.md](navmesh.md)).
+
 ## p-portela/SCARAB
 
 <https://github.com/p-portela/SCARAB>
