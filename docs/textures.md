@@ -861,6 +861,35 @@ via `bcpack.decode_with_info`).
   - **BC6H (`codec 6`):** **268 / 268** chunks (100%) decode in provisional mode (`0` strict because every chunk references built-in history, `0` refused).
   - **BC7 (`codec 7`):** **583 / 5,167** chunks (11.3%) decode in strict mode; **5,150 / 5,167** (99.67%) decode in provisional mode; **17 / 5,167** (0.33%) cleanly refuse when unknown built-in history references exceed the consistency budget.
 
+## What `textures.rpf` holds
+
+The 192.6 MB archive has no composition table elsewhere in the docs (only census rows). `tools/rpf9_carve.py`
+reads 97.8% of its data span as 2,749 checksum-validated zlib streams (188.3 MB stored, 487.9 MB inflated;
+1.8% zero padding, 0.5% unread). By inflated size the streams fall into two groups:
+
+| Group | Streams | Inflated | Content |
+|---|---:|---:|---|
+| 400-byte + 32,768-byte pairs | 1,313 + 1,313 (+2 lone 400-byte) | 43.6 MB | a small texture-dictionary resource: system page, then graphics page |
+| everything else | 121 | 444.4 MB (91%) | 11 streams of 16 MB or more (largest 32 MB), 16 of exactly 64 KiB, 62 under 64 KiB |
+
+**The pairs are one template, filled 1,313 times.** Every 400-byte stream is immediately followed by a 32,768-byte
+one, and the 8 bytes stored just before 1,312 of the large streams are identical. The 400-byte system pages
+have only 4 distinct contents, and 1,312 of the 1,315 are byte-identical: a dictionary of two textures, each
+described as 128 x 128 with format code `0x5f` (95, `DXGI_FORMAT_BC6H_UF16` if the codes are DXGI numbers, as
+for the BC1/BC7 codes elsewhere in this document), one name per texture. Two 128 x 128 BC6H textures are
+2 x 16,384 = 32,768 bytes, exactly the graphics-page size. The graphics pages differ: 1,117 distinct contents
+among the 1,313 (the most repeated one 60 times). So the archive stores 1,313 instances of one HDR texture pair
+with per-instance data, the shape of a per-tile or per-cell map. One of the other three header variants describes
+172 x 172 textures with code `0x62` (98, BC7).
+
+**The 121 other streams** start with no known magic (`RDS5`, `0DRP`, `TTPF`, `RSC8`, `PSIN`, `RBF0`, DDS) in
+their first 4 KiB, and the large ones are high-entropy (7.3 to 7.7 bits per byte over the first 64 KiB, except
+one at 4.1). They are left as opaque raw data here; matching them to the `data/ttdb` texture pools is the
+obvious next check.
+
+Not measured here (hypothesis): what the 1,313 texture pairs are keyed by, and whether the format codes are
+DXGI values (the exact-size match supports it).
+
 ## Next step
 
 1. **Port BC6H/BC7 BCPack decoders to `TtpfReader` (`rpf9-explorer` / `tools/rpf9dump`).**
