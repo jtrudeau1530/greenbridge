@@ -2250,6 +2250,21 @@ int compare_invalid_arguments(ID3D12Device* ours) {
     struct Case {
         const char* name;
         InvalidCase call;
+        bool (*comparable)(ID3D12Device*) = nullptr;
+    };
+    const auto device10 = [](ID3D12Device* d) {
+        Ref<ID3D12Device10> newer;
+        return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
+    };
+    const auto not_elevated = [](ID3D12Device*) {
+        HANDLE token = nullptr;
+        TOKEN_ELEVATION elevation{};
+        DWORD size = 0;
+        const bool elevated = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+                              GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+                              elevation.TokenIsElevated;
+        if (token) CloseHandle(token);
+        return !elevated;
     };
     static const Case cases[] = {
         // CreateCommittedResource: arguments.
@@ -2327,7 +2342,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: upload buffer in COMMON", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_COMMON);
-         }},
+         }, +device10},
         {"committed: upload buffer in COPY_DEST", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST);
          }},
@@ -2453,7 +2468,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"committed: BC1 6x6 top mip", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT},
                               texture_desc(6, 6, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE));
-         }},
+         }, host_supports_unaligned_block_textures},
         {"committed: render target and depth stencil", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT},
                               texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT,
@@ -2525,7 +2540,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: readback buffer in COMMON", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_READBACK}, buffer_desc(256), D3D12_RESOURCE_STATE_COMMON);
-         }},
+         }, +device10},
         {"committed: readback buffer with UAV", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -2685,7 +2700,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: heap flag HARDWARE_PROTECTED on a texture", [](ID3D12Device* d) {
              return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_HARDWARE_PROTECTED);
-         }},
+         }, +device10},
         {"committed: heap flag ALLOW_WRITE_WATCH on a buffer", [](ID3D12Device* d) {
              return with_heap_flags(d, buffer_desc(256), D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH);
          }},
@@ -2740,7 +2755,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }},
+         }, +device10},
         {"committed: resource flag 0x200 on a buffer", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(0x200);
@@ -2768,15 +2783,15 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"committed: resource flag RAYTRACING_ACCELERATION_STRUCTURE on a texture", [](ID3D12Device* d) {
              auto desc = rgba8(D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }},
+         }, +device10},
         {"committed: resource flag 0x400 on a buffer", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(0x400);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }},
+         }, +device10},
         {"committed: resource flag 0x400 on a texture", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAGS(0x400)));
-         }},
+         }, +device10},
         // A null output is a capability check; with invalid arguments too, the host's answer says which comes first.
         {"committed: heap type 99, null output", [](ID3D12Device* d) {
              const H heap{D3D12_HEAP_TYPE(99)};
@@ -2829,7 +2844,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"descriptor heap: shader-visible 2049 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2049,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
-         }},
+         }, +device10},
         {"descriptor heap: shader-visible 2048 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
@@ -2874,7 +2889,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command queue: global realtime priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME});
-         }},
+         }, +not_elevated},
         {"command queue: compute", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COMPUTE}); }},
         {"command queue: copy", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COPY}); }},
         {"command queue: high priority", [](ID3D12Device* d) {
@@ -2964,6 +2979,11 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
         if (a == b) continue;
+        if (c.comparable && !c.comparable(host.p)) {
+            std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
+                        a, b);
+            continue;
+        }
         ++mismatches;
         std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
     }
