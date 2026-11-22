@@ -57,6 +57,7 @@ MAX_LIST_BYTES = 16 << 20
 HEIGHT_HINTS = (("_720", 720), ("_1080", 1080), ("_1440", 1440), ("_4k", 2160))
 CONFIDENCES = ("verified", "anchored", "bracketed", "positional")
 FIELDS = ["source", "offset", "size", "path", "confidence", "width", "height", "frames"]
+REPORT_FIELDS = ["source", "offset", "size", "width", "height", "frames"]
 
 PIN_SCORE = 50.0
 HINT_SCORE = 3.0
@@ -135,15 +136,32 @@ def load_streams(source):
     lower = source.lower()
     if os.path.isfile(source) and lower.endswith(".json"):
         with open(source, encoding="utf-8") as fh:
-            rows = json.load(fh)["streams"]
+            doc = json.load(fh)
+        if not isinstance(doc, dict) or not isinstance(doc.get("streams"), list):
+            raise ValueError("expected a JSON object with a 'streams' list")
+        rows = doc["streams"]
+        label, start = "stream {i}", 1
     elif os.path.isfile(source) and lower.endswith(".csv"):
         with open(source, encoding="utf-8", newline="") as fh:
-            rows = list(csv.DictReader(fh))
+            reader = csv.DictReader(fh)
+            header = reader.fieldnames or []
+            missing = [f for f in REPORT_FIELDS if f not in header]
+            if missing:
+                raise ValueError(f"CSV header is missing required fields: {', '.join(missing)}")
+            rows = list(reader)
+        label, start = "row {i}", 2
     else:
         rows, _summary = bink_index.scan_target(source)
-    out = [{"source": r["source"], "offset": _int(r["offset"]), "size": _int(r["size"]),
-            "width": _int(r["width"]), "height": _int(r["height"]), "frames": _int(r["frames"])}
-           for r in rows]
+        label, start = "stream {i}", 1
+    out = []
+    for j, row in enumerate(rows):
+        try:
+            out.append({"source": row["source"], "offset": _int(row["offset"]), "size": _int(row["size"]),
+                        "width": _int(row["width"]), "height": _int(row["height"]), "frames": _int(row["frames"])})
+        except (KeyError, ValueError, TypeError, OverflowError) as error:
+            raise ValueError(f"{label.format(i=start + j)} is missing or unusable: {error}") from None
+        if not isinstance(out[-1]["source"], str):
+            raise ValueError(f"{label.format(i=start + j)} has a non-string source")
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
     return out
@@ -308,7 +326,11 @@ def main(argv=None):
         ap.error("--out must not overwrite an input")
 
     names = read_mount_lists(a.mount)
-    streams = load_streams(a.source)
+    try:
+        streams = load_streams(a.source)
+    except (OSError, csv.Error, ValueError) as error:
+        print(f"bink_names: error: {a.source}: {error}", file=sys.stderr)
+        return 1
     try:
         rows, unmatched = name_streams(names, streams, load_pins(a.pins), a.max_skip)
     except ValueError as error:
