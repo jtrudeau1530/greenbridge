@@ -112,7 +112,9 @@ The character export requested 215 texture keys and matched **184**. The only sR
 `0x8ADB8480` is `materialid` (an ID/palette map, declared but unbound on the jacket). The garment
 shaders (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`) do not declare a `0xC8E8C282` slot at all, so no
 clothing item in this wardrobe has an albedo. A part without one keeps a flat colour; it must not
-be painted with `speculartex` or an ORM map.
+be painted with `speculartex` or an ORM map. The garments' `_COLOR0` vertex data is baked shading
+(alpha 255 on every vertex), not a tint; `materialid` is unbound on all four, and the shader
+declares no tint or palette slot. No authored base colour exists to recover.
 
 The hands and feet keys (`0x4D89F2311DBBB7A8`, `0xA54D9F8B51CA6034`) did not resolve in the
 scanned TTPF pools. The head drawable has no material texture reference, but its face is selected by
