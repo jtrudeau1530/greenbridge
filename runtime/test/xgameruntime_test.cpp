@@ -294,63 +294,62 @@ void check_run_time_load() {
         release(e);
     }
 
-    const GUID networking_cls = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
-    void* n = get(networking_cls);
-    check(n != nullptr, "QueryApiImpl hands out XNetworkingImpl for its class id");
+    // XNetworkingImpl, asked for as XCurl.dll does: the class id with IXNetworkingImpl2's interface id.
+    const GUID networking = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+    const GUID networking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
+    const HRESULT no_network = HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE);
+    void* n = nullptr;
+    check(query(&networking, networking2, &n) == S_OK && n, "QueryApiImpl hands out XNetworkingImpl for IXNetworkingImpl2");
+    void* n1 = nullptr;
+    check(query(&networking, networking, &n1) == S_OK && n1 == n, "and the same object for IXNetworkingImpl");
+    if (n1) release(n1);
     if (n) {
-        void* again = get(networking_cls);
-        check(again == n, "XNetworkingImpl is one process-wide object");
-        release(again);
-
-        // Slot 15: XNetworkingGetConnectivityHint
-        struct ConnectivityHint {
-            uint32_t level;
-            uint32_t cost;
-            uint32_t iana_type;
-            bool network_initialized;
-            bool approaching_limit;
-            bool over_limit;
-            bool roaming;
-        } hint{};
-        using GetHint = HRESULT(STDMETHODCALLTYPE*)(void*, ConnectivityHint*);
-        check(reinterpret_cast<GetHint>(slot(n, 15))(n, nullptr) == E_POINTER,
-              "slot 15 rejects null pointer with E_POINTER");
-        check(reinterpret_cast<GetHint>(slot(n, 15))(n, &hint) == S_OK && hint.network_initialized &&
-                  hint.level == 3 && hint.cost == 1,
-              "slot 15 is XNetworkingGetConnectivityHint reporting initialized network and internet access");
-
-        // Slot 14: XNetworkingVerifyServerCertificate
-        using VerifyCert = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
-        check(reinterpret_cast<VerifyCert>(slot(n, 14))(n, nullptr, nullptr) == S_OK,
-              "slot 14 is XNetworkingVerifyServerCertificate returning S_OK offline");
-
-        // Slot 16 & 17: XNetworkingRegisterConnectivityHintChanged and Unregister
-        using RegisterHint = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
-        using UnregisterHint = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
-        XTaskQueueRegistrationToken tok1{0}, tok2{0};
-        check(reinterpret_cast<RegisterHint>(slot(n, 16))(n, nullptr, nullptr, nullptr, &tok1) == S_OK &&
-                  reinterpret_cast<RegisterHint>(slot(n, 16))(n, nullptr, nullptr, nullptr, &tok2) == S_OK &&
-                  tok1.token != tok2.token && tok1.token > 0,
-              "slot 16 registers connectivity hint callbacks and hands out tokens");
-        check(reinterpret_cast<UnregisterHint>(slot(n, 17))(n, tok1, false) == true &&
-                  reinterpret_cast<UnregisterHint>(slot(n, 17))(n, tok2, true) == true,
-              "slot 17 unregisters connectivity hint callbacks");
-
-        // Slots 11-13: Async security info query
-        using QuerySecAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*, XAsyncBlock*);
-        using QuerySecSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
-        using QuerySecResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, size_t*, uint8_t*, void**);
-        check(reinterpret_cast<QuerySecAsync>(slot(n, 11))(n, L"https://example.com", nullptr) == S_OK,
-              "slot 11 is XNetworkingQuerySecurityInformationForUrlUtf16Async");
-        size_t sec_size = 42;
-        check(reinterpret_cast<QuerySecSize>(slot(n, 12))(n, nullptr, &sec_size) == S_OK && sec_size == 0,
-              "slot 12 is XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize returning 0 bytes");
-        size_t used = 42;
-        void* sec_info = reinterpret_cast<void*>(1);
-        check(reinterpret_cast<QuerySecResult>(slot(n, 13))(n, nullptr, 0, &used, nullptr, &sec_info) == S_OK &&
-                  used == 0 && sec_info == nullptr,
-              "slot 13 is XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult returning S_OK with null result");
-
+        struct Hint {
+            uint32_t level, cost, iana;
+            bool initialized, approaching, over, roaming;
+        } hint{9, 9, 9, false, true, true, true};
+        using GetHint = HRESULT(STDMETHODCALLTYPE*)(void*, Hint*);
+        check(reinterpret_cast<GetHint>(slot(n, 15))(n, &hint) == S_OK && hint.level == 1 && hint.cost == 0 &&
+                  hint.initialized && !hint.approaching && !hint.over && !hint.roaming,
+              "slot 15 (XNetworkingGetConnectivityHint): initialized, no connectivity");
+        XAsyncBlock block{};
+        using SecurityAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*, XAsyncBlock*);
+        using ResultSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
+        size_t size = 99;
+        check(reinterpret_cast<SecurityAsync>(slot(n, 11))(n, L"https://example.invalid/", &block) == S_OK &&
+                  XAsyncGetStatus(&block, true) == no_network &&
+                  reinterpret_cast<ResultSize>(slot(n, 12))(n, &block, &size) == no_network && size == 0,
+              "slots 11/12 (UTF-16 URL security info): the async call completes with no network");
+        // Slots 10/13 in Microsoft's order: (async, bufferByteCount, bufferByteCountUsed*, buffer*, information**).
+        // A sentinel buffer must stay untouched; the two outputs are written where they are, not into the buffer.
+        using SecurityResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, size_t*, uint8_t*, void**);
+        for (int s : {10, 13}) {
+            uint8_t buffer[32];
+            std::memset(buffer, 0xA5, sizeof(buffer));
+            size_t used = 77;
+            void* info = &used;
+            const HRESULT hr = reinterpret_cast<SecurityResult>(slot(n, s))(n, &block, sizeof(buffer), &used, buffer, &info);
+            bool untouched = true;
+            for (uint8_t byte : buffer) untouched = untouched && byte == 0xA5;
+            check(hr == no_network && used == 0 && info == nullptr && untouched,
+                  s == 10 ? "slot 10 (ANSI result): outputs zeroed in place, the caller's buffer untouched"
+                          : "slot 13 (UTF-16 result): outputs zeroed in place, the caller's buffer untouched");
+        }
+        using Verify = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
+        check(reinterpret_cast<Verify>(slot(n, 14))(n, nullptr, nullptr) == no_network,
+              "slot 14 (XNetworkingVerifyServerCertificate) fails offline");
+        XTaskQueueRegistrationToken token{};
+        using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+        using Unregister = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
+        check(reinterpret_cast<Register>(slot(n, 16))(n, nullptr, nullptr, nullptr, &token) == S_OK && token.token &&
+                  reinterpret_cast<Unregister>(slot(n, 17))(n, token, true),
+              "slots 16/17 register and unregister a connectivity-hint callback");
+        uint16_t port = 7;
+        using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);
+        using NotImpl = HRESULT(STDMETHODCALLTYPE*)(void*);
+        check(reinterpret_cast<QueryPort>(slot(n, 3))(n, &port) == no_network && port == 0 &&
+                  reinterpret_cast<NotImpl>(slot(n, 20))(n) == E_NOTIMPL,
+              "slot 3 (preferred UDP port) has no answer offline; slot 20 (IXNetworkingImpl2) is E_NOTIMPL");
         release(n);
     }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
