@@ -87,6 +87,75 @@ class SimpleNameTest(unittest.TestCase):
         self.assertEqual(rtti_scan.simple_name(".?AVIncompleteString"), ".?AVIncompleteString")
         self.assertEqual(rtti_scan.simple_name(""), "")
 
+    # The expected names below are what dbghelp's UnDecorateSymbolName prints for these hand-written names, without
+    # the class/struct/enum keywords, `__cdecl`, `__ptr64` and a local class's function signature.
+    def test_template_arguments_are_not_scopes(self):
+        for mangled, name in (
+            (".?AV?$Pool@H@mem@@", "mem::Pool<int>"),      # was reported as mem::H::?$Pool
+            (".?AV?$Map@_KPEBD@util@@", "util::Map<unsigned __int64, char const *>"),
+            (".?AV?$Flags@W4Mode@gfx@@@gfx@@", "gfx::Flags<gfx::Mode>"),
+            (".?AV?$Fixed@$0BA@$0?0$00@math@@", "math::Fixed<16, -1, 1>"),
+            (".?AV?$Tuple@$$V@core@@", "core::Tuple<>"),
+            (".?AV?$Tuple@HN$$QEAM@core@@", "core::Tuple<int, double, float &&>"),
+            (".?AVInner@?$Outer@_N@core@@", "core::Outer<bool>::Inner"),
+        ):
+            with self.subTest(mangled=mangled):
+                self.assertEqual(rtti_scan.simple_name(mangled), name)
+
+    def test_back_references(self):
+        # Inside a template the digits count that template's own names: 0 is Pair, 1 Node, 2 scene.
+        self.assertEqual(rtti_scan.simple_name(".?AV?$Pair@VNode@scene@@VEdge@2@@scene@@"),
+                         "scene::Pair<scene::Node, scene::Edge>")
+        # A template that was named once is one back-reference: 2 is List<int>.
+        self.assertEqual(rtti_scan.simple_name(".?AV?$Wrap@VIterator@?$List@H@core@@V123@@core@@"),
+                         "core::Wrap<core::List<int>::Iterator, core::List<int>::Iterator>")
+
+    def test_pointer_reference_array_and_function_arguments(self):
+        for mangled, name in (
+            (".?AV?$Callback@$$A6AXAEBUEvent@ui@@H@Z@ui@@", "ui::Callback<void (ui::Event const &, int)>"),
+            (".?AV?$Sink@P6AXPEAX0@_E@io@@", "io::Sink<void (*)(void *, void *) noexcept>"),
+            (".?AV?$Span@AEAY03$$CBH@io@@", "io::Span<int const (&)[4]>"),
+            (".?AV?$Ref@AEBQEAUNode@scene@@@scene@@", "scene::Ref<scene::Node * const &>"),
+            # A pointer to a function pointer or to an array goes inside the brackets, not after them.
+            (".?AV?$Cb@PEAP6AXH@Z@lab@@", "lab::Cb<void (**)(int)>"),
+            (".?AV?$Cb@QEAP6AXH@Z@lab@@", "lab::Cb<void (** const)(int)>"),
+            (".?AV?$Cb@P6AP6AXH@ZXZ@lab@@", "lab::Cb<void (*(*)(void))(int)>"),
+            (".?AV?$Cb@AEAY03P6AXH@Z@lab@@", "lab::Cb<void (*(&)[4])(int)>"),
+            (".?AV?$Cb@PEAY03$$CBH@lab@@", "lab::Cb<int const (*)[4]>"),
+            (".?AV?$Arr@$$BY01H@lab@@", "lab::Arr<int [2]>"),
+        ):
+            with self.subTest(mangled=mangled):
+                self.assertEqual(rtti_scan.simple_name(mangled), name)
+
+    def test_anonymous_namespace_and_local_classes(self):
+        for mangled, name in (
+            (".?AVWorker@?A0x1234abcd@jobs@@", "jobs::`anonymous namespace'::Worker"),
+            (".?AV<lambda_1>@?1??Run@Task@jobs@@QEAAXH@Z@", "`jobs::Task::Run'::`2'::<lambda_1>"),
+            (".?AV<lambda_1>@?0???0Task@jobs@@QEAA@XZ@", "`jobs::Task::Task'::`1'::<lambda_1>"),
+            (".?AV<lambda_1>@?0???RTask@jobs@@QEBAHH@Z@", "`jobs::Task::operator()'::`1'::<lambda_1>"),
+            # A conversion operator is named after the type it returns: two of them in one class stay apart.
+            (".?AVX@?0???BObj@@QEBAHXZ@", "`Obj::operator int'::`1'::X"),
+            (".?AVX@?0???BObj@@QEBAP6AXH@ZXZ@", "`Obj::operator void (*)(int)'::`1'::X"),
+            (".?AV<lambda_2>@?5???$Each@H@List@core@@SA_NPEBVNode@2@0@Z@", "`core::List::Each<int>'::`6'::<lambda_2>"),
+            (".?AV?$Holder@V<lambda_1>@?1??Run@Task@jobs@@QEAAXH@Z@H@jobs@@",
+             "jobs::Holder<`jobs::Task::Run'::`2'::<lambda_1>, int>"),
+        ):
+            with self.subTest(mangled=mangled):
+                self.assertEqual(rtti_scan.simple_name(mangled), name)
+
+    def test_enum_and_union(self):
+        self.assertEqual(rtti_scan.simple_name(".?AW4Mode@gfx@@"), "gfx::Mode")
+        self.assertEqual(rtti_scan.simple_name(".?ATBits@gfx@@"), "gfx::Bits")
+
+    def test_a_form_that_is_not_read_stays_mangled(self):
+        # No made-up scope chain: a pointer to a member function, a template cut short, a name that never ends,
+        # an array with a negative number of dimensions or a negative size.
+        for mangled in (".?AV?$Bind@P8Task@jobs@@EAAXXZ@jobs@@", ".?AV?$Pool@@", ".?AV?$Pool@H@", ".?AV9@@",
+                        ".?AV?$Arr@$$BY?0H@lab@@", ".?AV?$Arr@$$BY0?1H@lab@@", ".?AV?$Arr@AEAY?0H@lab@@",
+                        ".?AV" + "?$A@V" * 5000 + "@"):
+            with self.subTest(mangled=mangled[:40]):
+                self.assertEqual(rtti_scan.simple_name(mangled), mangled)
+
 
 class RttiScanCoreTest(unittest.TestCase):
     def setUp(self):
@@ -193,6 +262,31 @@ class RttiScanCoreTest(unittest.TestCase):
         self.assertEqual(vt_info["class"], "Dog")
         self.assertEqual(vt_info["offset_in_object"], 0)
         self.assertEqual(vt_info["slots"], 3)
+
+    def test_class_local_to_a_function_and_template_base(self):
+        """A class declared inside a function has a name that ends with the function's `Z@`, not `@@`: its type
+        descriptor used to be missed, and with it the class and its vtable."""
+        local = b".?AVJob@?1??Run@Task@jobs@@QEAAXH@Z@"
+        base = b".?AV?$Base@H@jobs@@"
+        rdata = bytearray(0x1000)
+        rdata[0x010:0x010 + len(base)] = base                 # TD at RVA 0x2000
+        rdata[0x050:0x050 + len(local)] = local               # TD at RVA 0x2040
+        rdata[0x210:0x21A] = b".?AVNoise@"                    # one '@' after a plain name: not a descriptor name
+        rdata[0x080:0x09C] = struct.pack("<IIiiiII", 0x2000, 0, 0, 0, 0, 0, 0)     # BCD of the base
+        rdata[0x0A0:0x0BC] = struct.pack("<IIiiiII", 0x2040, 1, 0, 0, 0, 0, 0)     # BCD of the local class
+        rdata[0x0C0:0x0C8] = struct.pack("<II", 0x20A0, 0x2080)
+        rdata[0x0D0:0x0E0] = struct.pack("<4I", 0, 0, 2, 0x20C0)
+        rdata[0x0E0:0x0F8] = struct.pack("<6I", 1, 0, 0, 0x2040, 0x20D0, 0x20E0)
+        rdata[0x0F8:0x100] = struct.pack("<Q", self.image_base + 0x20E0)
+        rdata[0x100:0x110] = struct.pack("<QQ", self.image_base + 0x1000, 0)
+
+        scanned = rtti_scan.scan_pe64_rtti(make_synthetic_pe(text_bytes=b"\xc3" * 0x100, rdata_bytes=bytes(rdata)))
+
+        self.assertEqual(scanned["type_descriptors"], 2)
+        self.assertEqual([(c["name"], c["mangled"], c["bases"]) for c in scanned["classes"]],
+                         [("`jobs::Task::Run'::`2'::Job", local.decode(), ["jobs::Base<int>"])])
+        self.assertEqual([(v["rva"], v["class"], v["slots"]) for v in scanned["vtables"]],
+                         [(0x2100, "`jobs::Task::Run'::`2'::Job", 1)])
 
     def test_multiple_and_virtual_inheritance(self):
         rdata = bytearray(0x1000)
