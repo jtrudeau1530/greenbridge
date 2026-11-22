@@ -29,7 +29,7 @@ from check import Skip, clip_test, fmt_1010102_test, fmt_xy_xyz_test
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
-                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
+                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -546,7 +546,7 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
-              "ps_gather_wrap": "vs_ids.asm", "ps_ssharp": "vs_ids.asm",
+              **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm"}
@@ -1009,8 +1009,8 @@ def run_suite(a, work: str) -> int:
                 results.append((name, ok, detail))
             else:
                 results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
-        elif name == "ps_gather_wrap":
-            # SHADER-36: image_gather4_l_o under wrap/mirror/clamp/mirror-once S#s; every pixel holds GATHER_WRAP.
+        elif name in TEXTURE_CONSTANTS:
+            expected = TEXTURE_CONSTANTS[name]
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             try:
@@ -1022,12 +1022,12 @@ def run_suite(a, work: str) -> int:
             bad = 4096
             if rc == 0 and os.path.isfile(raw):
                 data = Path(raw).read_bytes()
-                bad = 4096 if len(data) != 64 * 64 * 16 else sum(q != GATHER_WRAP for q in struct.iter_unpack("<4f", data))
+                bad = 4096 if len(data) != 64 * 64 * 16 else sum(q != expected for q in struct.iter_unpack("<4f", data))
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             else:
                 results.append((name, rc == 0 and bad == 0, "4096/4096 pixels exact" if bad == 0 else
-                                f"{bad} pixels differ from {GATHER_WRAP}: {msg.splitlines()[-1] if msg else ''}"))
+                                f"{bad} pixels differ from {expected}: {msg.splitlines()[-1] if msg else ''}"))
         elif name == "ps_tex":
             # A texture through the descriptor hash table and the bindless set. vk_bindless_test compares the
             # pixels itself, and exits 77 where the device lacks a feature the set or the shader needs.
