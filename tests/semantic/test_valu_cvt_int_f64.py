@@ -362,6 +362,76 @@ class VCvtInstruction:
         return s
 
 
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+from dataclasses import field
+from typing import List
+
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront execution thread."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def read_reg(self, kind: RegKind, index: int, count: int = 1) -> int:
+        if index < 0 or index + count > 256:
+            raise IndexError(f"Register index {index} + count {count} out of bounds [0, 256)")
+        regs = self.vgprs if kind == RegKind.VGPR else self.sgprs
+        if count == 1:
+            return regs[index] & MASK32
+        elif count == 2:
+            return words_to_f64_bits(regs[index], regs[index + 1])
+        raise ValueError(f"Unsupported register count: {count}")
+
+    def write_reg(self, kind: RegKind, index: int, count: int, value: int) -> None:
+        if index < 0 or index + count > 256:
+            raise IndexError(f"Register index {index} + count {count} out of bounds [0, 256)")
+        regs = self.vgprs if kind == RegKind.VGPR else self.sgprs
+        if count == 1:
+            regs[index] = value & MASK32
+        elif count == 2:
+            lo, hi = f64_bits_to_words(value)
+            regs[index] = lo
+            regs[index + 1] = hi
+        else:
+            raise ValueError(f"Unsupported register count: {count}")
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for integer <-> float64 conversions."""
+
+    def resolve_operand(self, op: VOP1Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Register):
+            return state.read_reg(op.source.kind, op.source.index, op.source.count)
+        elif isinstance(op.source, (Literal32, Literal64)):
+            return op.source.bits
+        raise TypeError(f"Unknown operand source type: {type(op.source)}")
+
+    def step(self, instr: VCvtInstruction, state: ScalarMachineState) -> int:
+        # Atomic operand read phase
+        raw_src = self.resolve_operand(instr.src0, state)
+
+        # Execution phase via reference mathematical oracle
+        if instr.opcode == Opcode.V_CVT_F64_I32:
+            res = oracle_v_cvt_f64_i32(raw_src, clamp=instr.clamp)
+        elif instr.opcode == Opcode.V_CVT_F64_U32:
+            res = oracle_v_cvt_f64_u32(raw_src, clamp=instr.clamp)
+        elif instr.opcode == Opcode.V_CVT_I32_F64:
+            res = oracle_v_cvt_i32_f64(raw_src, abs_mod=instr.src0.abs_mod, neg_mod=instr.src0.neg_mod)
+        elif instr.opcode == Opcode.V_CVT_U32_F64:
+            res = oracle_v_cvt_u32_f64(raw_src, abs_mod=instr.src0.abs_mod, neg_mod=instr.src0.neg_mod)
+        else:
+            raise NotImplementedError(f"Unsupported opcode {instr.opcode}")
+
+        # Destination write-back phase
+        state.write_reg(instr.dst.kind, instr.dst.index, instr.dst.count, res)
+        return res
+
+
 # ==============================================================================
 # Unit Tests: Mathematical Model and Reference Oracles
 # ==============================================================================
@@ -655,6 +725,95 @@ class TestSymbolicAST(unittest.TestCase):
             src0=VOP1Operand(Literal32(42)),
         )
         self.assertEqual(inst_a, inst_b)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_v_cvt_f64_i32(self) -> None:
+        # Load signed int -42 in v4
+        self.state.write_reg(RegKind.VGPR, 4, 1, i32_to_u32(-42))
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_I32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Register(RegKind.VGPR, 4, count=1)),
+        )
+        res = self.interp.step(inst, self.state)
+        self.assertEqual(res, f64_to_bits(-42.0))
+        self.assertEqual(self.state.read_reg(RegKind.VGPR, 0, count=2), f64_to_bits(-42.0))
+
+        # With clamp: negative int clamps to +0.0
+        inst_clamp = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_I32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=VOP1Operand(Register(RegKind.VGPR, 4, count=1)),
+            clamp=True,
+        )
+        res_clamp = self.interp.step(inst_clamp, self.state)
+        self.assertEqual(res_clamp, POS_ZERO_64)
+
+    def test_scalar_v_cvt_f64_u32(self) -> None:
+        # From SGPR literal / constant: 0x8000_0000 = 2147483648
+        self.state.write_reg(RegKind.SGPR, 12, 1, 0x8000_0000)
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_F64_U32,
+            dst=Register(RegKind.VGPR, 6, count=2),
+            src0=VOP1Operand(Register(RegKind.SGPR, 12, count=1)),
+        )
+        res = self.interp.step(inst, self.state)
+        self.assertEqual(res, f64_to_bits(2147483648.0))
+        self.assertEqual(self.state.read_reg(RegKind.VGPR, 6, count=2), f64_to_bits(2147483648.0))
+
+    def test_scalar_v_cvt_i32_f64(self) -> None:
+        # Load double 123.75 into v[2:3]
+        self.state.write_reg(RegKind.VGPR, 2, 2, f64_to_bits(123.75))
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2)),
+        )
+        res = self.interp.step(inst, self.state)
+        self.assertEqual(res, 123)
+        self.assertEqual(self.state.read_reg(RegKind.VGPR, 0, count=1), 123)
+
+        # With neg modifier: -123.75 -> -123
+        inst_neg = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 1, count=1),
+            src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2), neg_mod=True),
+        )
+        res_neg = self.interp.step(inst_neg, self.state)
+        self.assertEqual(res_neg, i32_to_u32(-123))
+
+    def test_scalar_v_cvt_u32_f64(self) -> None:
+        # Load float -999.0 in s[4:5], with abs modifier -> 999
+        self.state.write_reg(RegKind.SGPR, 4, 2, f64_to_bits(-999.0))
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_U32_F64,
+            dst=Register(RegKind.VGPR, 8, count=1),
+            src0=VOP1Operand(Register(RegKind.SGPR, 4, count=2), abs_mod=True),
+        )
+        res = self.interp.step(inst, self.state)
+        self.assertEqual(res, 999)
+        self.assertEqual(self.state.read_reg(RegKind.VGPR, 8, count=1), 999)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.write_reg(RegKind.VGPR, 0, 2, f64_to_bits(42.8))
+            inst = VCvtInstruction(
+                opcode=Opcode.V_CVT_I32_F64,
+                dst=Register(RegKind.VGPR, 2, count=1),
+                src0=VOP1Operand(Register(RegKind.VGPR, 0, count=2)),
+            )
+            runs.append(self.interp.step(inst, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
+        self.assertEqual(runs[0], 42)
 
 
 if __name__ == "__main__":
