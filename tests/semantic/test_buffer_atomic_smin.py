@@ -262,6 +262,158 @@ class Program:
         return "\n".join(inst.to_assembly() for inst in self.instructions)
 
 
+class ScalarBufferInterpreter:
+    """Deterministic scalar interpreter for buffer_atomic_smin."""
+
+    def __init__(self, mem_size: int = 65536) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.mem: BufferMemory = BufferMemory(mem_size)
+        self.vcc: int = 0
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        return (self.vgprs[idx] if kind == RegKind.VGPR else self.sgprs[idx]) & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def set_buffer_descriptor(self, sgpr_base: int, desc: BufferResourceDescriptor) -> None:
+        d0, d1, d2, d3 = desc.to_dwords()
+        self.write_reg_u32(RegKind.SGPR, sgpr_base + 0, d0)
+        self.write_reg_u32(RegKind.SGPR, sgpr_base + 1, d1)
+        self.write_reg_u32(RegKind.SGPR, sgpr_base + 2, d2)
+        self.write_reg_u32(RegKind.SGPR, sgpr_base + 3, d3)
+
+    def get_buffer_descriptor(self, sgpr_base: int) -> BufferResourceDescriptor:
+        d0 = self.read_reg_u32(RegKind.SGPR, sgpr_base + 0)
+        d1 = self.read_reg_u32(RegKind.SGPR, sgpr_base + 1)
+        d2 = self.read_reg_u32(RegKind.SGPR, sgpr_base + 2)
+        d3 = self.read_reg_u32(RegKind.SGPR, sgpr_base + 3)
+        return BufferResourceDescriptor.from_dwords(d0, d1, d2, d3)
+
+    def step(self, inst: Instruction) -> None:
+        if inst.opcode != Opcode.BUFFER_ATOMIC_SMIN:
+            raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+        vdata_val = self.read_reg_u32(RegKind.VGPR, inst.vdata.index)
+        vaddr_val = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
+        soffset_val = (
+            self.read_reg_u32(RegKind.SGPR, inst.soffset.index)
+            if isinstance(inst.soffset, Register)
+            else (inst.soffset & MASK32)
+        )
+        desc = self.get_buffer_descriptor(inst.srsrc.index)
+
+        ret_val, _ = ref_buffer_atomic_smin(
+            mem=self.mem,
+            desc=desc,
+            soffset=soffset_val,
+            vaddr=vaddr_val,
+            cmp_val=vdata_val,
+            inst_offset=inst.mods.offset,
+            glc=inst.mods.glc,
+            offen=inst.mods.offen,
+        )
+
+        if inst.mods.glc:
+            self.write_reg_u32(RegKind.VGPR, inst.vdata.index, ret_val)
+
+
+class TestBufferAtomicSminScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_scalar_smin_positive_numbers(self) -> None:
+        # Initial memory has 50
+        self.interp.mem.write_u32(0, 50)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 30)  # vdata = 30
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)   # vaddr = 0
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.mem.read_u32(0), 30)
+        # Without glc, vdata in v0 remains 30
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 30)
+
+    def test_scalar_smin_negative_numbers(self) -> None:
+        self.interp.mem.write_u32(0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, u32(-50))
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+        self.assertEqual(s32(self.interp.mem.read_u32(0)), -50)
+
+    def test_scalar_smin_with_glc_return(self) -> None:
+        self.interp.mem.write_u32(16, 25)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 10)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 16)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        # Memory updated to min(25, 10) = 10
+        self.assertEqual(self.interp.mem.read_u32(16), 10)
+        # v0 receives pre-op return value (25)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 25)
+
+    def test_scalar_smin_oob_handling(self) -> None:
+        self.interp.mem.write_u32(0, 99)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 5)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 2048)  # OOB
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        # Memory at 0 untouched
+        self.assertEqual(self.interp.mem.read_u32(0), 99)
+        # glc on OOB returns 0 to vdata
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0)
+
+
 class TestBufferAtomicSminAST(unittest.TestCase):
     """Unit tests for symbolic AST opcode definitions and typed expressions."""
 
