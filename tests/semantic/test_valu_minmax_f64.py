@@ -932,5 +932,129 @@ class TestValuMinMaxF64SIMD(unittest.TestCase):
             self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), expected)
 
 
+class TestValuMinMaxF64RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_aliasing_dst_equals_src0(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # v[0:1] = 10.0, v[2:3] = 2.0
+        interp.write_reg_u64(RegKind.VGPR, 0, POS_TEN_F64)
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_TWO_F64)
+
+        # v[0:1] = min(v[0:1], v[2:3])
+        inst = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=2),
+            src1=Register(RegKind.VGPR, 2, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_TWO_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 0), POS_TWO_F64)
+        # v[2:3] preserved
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 2), POS_TWO_F64)
+
+    def test_aliasing_dst_equals_src1(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # v[0:1] = 10.0, v[2:3] = 2.0
+        interp.write_reg_u64(RegKind.VGPR, 0, POS_TEN_F64)
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_TWO_F64)
+
+        # v[2:3] = max(v[0:1], v[2:3])
+        inst = Instruction(
+            opcode=Opcode.V_MAX_F64,
+            dst=Register(RegKind.VGPR, 2, count=2),
+            src0=Register(RegKind.VGPR, 0, count=2),
+            src1=Register(RegKind.VGPR, 2, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_TEN_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 2), POS_TEN_F64)
+        # v[0:1] preserved
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 0), POS_TEN_F64)
+
+    def test_aliasing_all_operands_same(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u64(RegKind.VGPR, 0, NEG_TWO_F64)
+
+        # v[0:1] = min(v[0:1], v[0:1]) with abs modifier on src0
+        inst = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=2),
+            src1=Register(RegKind.VGPR, 0, count=2),
+            src0_mods=OperandModifiers(abs_val=True),
+        )
+        # min(|-2.0|, -2.0) = min(2.0, -2.0) = -2.0
+        res = interp.step(inst)
+        self.assertEqual(res, NEG_TWO_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 0), NEG_TWO_F64)
+
+    def test_overlapping_unaligned_register_pairs(self) -> None:
+        # Test read-before-write safety across overlapping register allocations:
+        # dst = v[1:2], src0 = v[0:1], src1 = v[2:3]
+        interp = ScalarVALUInterpreter()
+        # Set up registers v0, v1, v2, v3
+        # v[0:1] = 1.0 (lo=0, hi=0x3ff00000) -> v0=0, v1=0x3ff00000
+        interp.write_reg_u64(RegKind.VGPR, 0, POS_ONE_F64)
+        # v[2:3] = 2.0 (lo=0, hi=0x40000000) -> v2=0, v3=0x40000000
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_TWO_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_MAX_F64,
+            dst=Register(RegKind.VGPR, 1, count=2),
+            src0=Register(RegKind.VGPR, 0, count=2),
+            src1=Register(RegKind.VGPR, 2, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_TWO_F64)
+        # dst v[1:2] now holds POS_TWO_F64: v1=0, v2=0x40000000
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 1), POS_TWO_F64)
+        # v0 and v3 remained undisturbed
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 3), 0x40000000)
+
+    def test_unmodified_registers_preserved(self) -> None:
+        interp = ScalarVALUInterpreter()
+        for idx in range(10, 20):
+            interp.write_reg_u32(RegKind.VGPR, idx, 0x11110000 + idx)
+
+        inst = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(1.0),
+            src1=Immediate(2.0),
+        )
+        interp.step(inst)
+
+        for idx in range(10, 20):
+            self.assertEqual(interp.read_reg_u32(RegKind.VGPR, idx), 0x11110000 + idx)
+
+    def test_simd_aliasing_with_divergent_exec_mask(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        exec_mask = 0x0000000F  # First 4 lanes active
+        simd.set_exec_mask(exec_mask)
+
+        # In all lanes: v[0:1] = 10.0, v[2:3] = 1.0
+        for lane in range(32):
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 0, POS_TEN_F64)
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 2, POS_ONE_F64)
+
+        # v[0:1] = min(v[0:1], v[2:3])
+        inst = Instruction(
+            opcode=Opcode.V_MIN_F64,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=2),
+            src1=Register(RegKind.VGPR, 2, count=2),
+        )
+        simd.step(inst)
+
+        for lane in range(32):
+            if lane < 4:
+                self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), POS_ONE_F64)
+            else:
+                self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), POS_TEN_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
