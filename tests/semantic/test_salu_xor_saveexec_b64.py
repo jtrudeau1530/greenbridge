@@ -230,6 +230,46 @@ class SXorSaveExecB64AST:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    """Result of executing a single SALU instruction."""
+    saved_exec: int
+    new_exec: int
+    scc: int
+
+
+class ScalarSALUInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 SALU instructions."""
+
+    def resolve_src64(self, src: Union[Register, LiteralConstant64], state: SALUArchitecturalState) -> int:
+        if isinstance(src, Register):
+            return state.read_sgpr_u64(src.index)
+        elif isinstance(src, LiteralConstant64):
+            return src.val & MASK64
+        else:
+            raise TypeError(f"Unsupported source operand type: {type(src)}")
+
+    def step(self, instr: SXorSaveExecB64AST, state: SALUArchitecturalState) -> ExecutionResult:
+        # 1. Atomic read phase
+        src0_val = self.resolve_src64(instr.src0, state)
+        current_exec = state.exec_mask
+
+        # 2. Computation phase via mathematical oracle
+        saved_exec, new_exec, scc = oracle_s_xor_saveexec_b64(current_exec, src0_val)
+
+        # 3. Atomic write-back phase
+        state.write_sgpr_u64(instr.dst.index, saved_exec)
+        state.exec_mask = new_exec
+        state.scc = scc
+
+        return ExecutionResult(saved_exec=saved_exec, new_exec=new_exec, scc=scc)
+
+
+
+# ==============================================================================
 # Unit Tests: Phase 1 Oracle and Architectural Model
 # ==============================================================================
 
@@ -378,6 +418,96 @@ class TestSXorSaveExecB64AST(unittest.TestCase):
             Register(RegKind.SGPR, 106, count=2)
         with self.assertRaises(ValueError):
             Register(RegKind.SGPR, 105, count=2)  # 105+2 = 107 > 106
+
+
+class TestScalarSALUInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+        self.state = SALUArchitecturalState()
+
+    def test_scalar_execution_step(self) -> None:
+        self.state.exec_mask = 0xFFFF_0000_FFFF_0000
+        self.state.write_sgpr_u64(2, 0x0000_FFFF_FFFF_0000)
+        instr = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.SGPR, 2, count=2),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res.saved_exec, 0xFFFF_0000_FFFF_0000)
+        self.assertEqual(res.new_exec, 0xFFFF_FFFF_0000_0000)
+        self.assertEqual(res.scc, 1)
+
+        # Architectural state verification
+        self.assertEqual(self.state.read_sgpr_u64(4), 0xFFFF_0000_FFFF_0000)
+        self.assertEqual(self.state.exec_mask, 0xFFFF_FFFF_0000_0000)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_scalar_step_with_literal_constant(self) -> None:
+        self.state.exec_mask = 0xAAAA_AAAA_AAAA_AAAA
+        lit = LiteralConstant64(0x5555_5555_5555_5555)
+        instr = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 0, count=2),
+            src0=lit,
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res.saved_exec, 0xAAAA_AAAA_AAAA_AAAA)
+        self.assertEqual(res.new_exec, 0xFFFF_FFFF_FFFF_FFFF)
+        self.assertEqual(res.scc, 1)
+        self.assertEqual(self.state.read_sgpr_u64(0), 0xAAAA_AAAA_AAAA_AAAA)
+        self.assertEqual(self.state.exec_mask, ALL_LANES_W64)
+
+    def test_sequential_saveexec_chaining(self) -> None:
+        """Chain multiple saveexec instructions toggling masks."""
+        # Initial: EXEC = all ones
+        self.state.exec_mask = ALL_LANES_W64
+        # Step 1: invert lower half -> s[0:1] receives all ones, EXEC becomes upper half
+        inst1 = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 0, count=2),
+            src0=LiteralConstant64(LOWER_HALF_W64),
+        )
+        res1 = self.interp.step(inst1, self.state)
+        self.assertEqual(res1.saved_exec, ALL_LANES_W64)
+        self.assertEqual(self.state.exec_mask, UPPER_HALF_W64)
+        self.assertEqual(self.state.read_sgpr_u64(0), ALL_LANES_W64)
+
+        # Step 2: invert all ones -> s[2:3] receives upper half, EXEC becomes lower half
+        inst2 = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 2, count=2),
+            src0=LiteralConstant64(ALL_LANES_W64),
+        )
+        res2 = self.interp.step(inst2, self.state)
+        self.assertEqual(res2.saved_exec, UPPER_HALF_W64)
+        self.assertEqual(self.state.exec_mask, LOWER_HALF_W64)
+        self.assertEqual(self.state.read_sgpr_u64(2), UPPER_HALF_W64)
+
+    def test_deterministic_replay(self) -> None:
+        """Verify strict determinism across multiple interpreter runs."""
+        results = []
+        for _ in range(50):
+            st = SALUArchitecturalState()
+            st.exec_mask = 0x0123_4567_89AB_CDEF
+            st.write_sgpr_u64(10, 0xFEDC_BA98_7654_3210)
+            inst = SXorSaveExecB64AST(
+                dst=Register(RegKind.SGPR, 20, count=2),
+                src0=Register(RegKind.SGPR, 10, count=2),
+            )
+            r = self.interp.step(inst, st)
+            results.append((r.saved_exec, r.new_exec, r.scc, st.read_sgpr_u64(20)))
+        self.assertTrue(all(item == results[0] for item in results))
+
+    def test_scc_cleared_on_zero_result(self) -> None:
+        self.state.exec_mask = 0x1111_2222_3333_4444
+        self.state.write_sgpr_u64(0, 0x1111_2222_3333_4444)
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.SGPR, 0, count=2),
+        )
+        res = self.interp.step(inst, self.state)
+        self.assertEqual(res.new_exec, 0)
+        self.assertEqual(res.scc, 0)
+        self.assertEqual(self.state.scc, 0)
 
 
 if __name__ == "__main__":
