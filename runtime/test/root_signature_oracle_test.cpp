@@ -5,7 +5,7 @@
 // and requires rt::rootsig::parse_rts0 to recover the same model. If the
 // hypothesis layout in root_signature.cpp ever disagrees with the real
 // serializer, this fails loudly here instead of corrupting draws silently.
-// Versions 1.0, 1.1 and 1.2 are each checked with static samplers.
+// Versions 1.0, 1.1 and 1.2 are each checked with static samplers (1.2 only where the host serializes it).
 // NOT portable: runs on Windows CI only, like root_sig_test.cpp.
 #include <windows.h>
 #include <d3d12.h>
@@ -229,6 +229,18 @@ int main() {
     v11.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
     v11.Desc_1_1 = {2, params1, 2, samplers0, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     serialize(v11, Version::V1_1, "1.1 with static samplers", false);
+
+    // The 1.2 cases below need a host that serializes 1.2. Windows 10's built-in d3d12.dll stops at 1.1 and rejects
+    // even an empty 1.2 description; their sampler flags have no 1.1 form, so they are skipped there.
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty12{};
+    empty12.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+    Blobs probe;
+    if (FAILED(D3D12SerializeVersionedRootSignature(&empty12, &probe.blob, &probe.error))) {
+        std::printf("SKIP 1.2 with sampler flags, 1.2 with non-normalized coordinates (the host d3d12.dll can't "
+                    "serialize root signature 1.2, e.g. Windows 10)\n");
+        if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);
+        return g_failures == 0 ? 0 : 1;
+    }
 
     // 1.2: a UINT border colour on one sampler, no flags on the other.
     samplers[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT;

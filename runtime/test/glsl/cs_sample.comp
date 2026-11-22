@@ -6,6 +6,8 @@
 // eight probes, a miss is index 0; an S# key is its four dwords and four of 0xFFFFFFFF), samples the 2D image
 // array at binding 0 with the sampler array at binding 1, and writes
 //   result[first + i] = the texel at ((i % 8) + 0.5, (i / 8) + 0.5) / 8 + (1, 0), as RGBA8 with red in the low byte.
+// With `integer` set the image is an integer one (an R8G8B8A8_UINT view, read through the same binding as a
+// utexture2D), and each channel is stored as its value clamped to 255: a UINT border colour shows as 0 or 1.
 // The whole tile to the right in U: a sampler that wraps in U gives the texel at the same place in the image,
 // one that clamps (as the fallback sampler at index 0 does) the image's right edge. So the result shows that
 // the S# was found, not only the T#.
@@ -18,9 +20,11 @@ layout(push_constant) uniform Descriptors {
     uint tsharp[8];
     uint ssharp[4];
     uint first;
+    uint integer;
 } pc;
 
 layout(set = 0, binding = 0) uniform texture2D images[];
+layout(set = 0, binding = 0) uniform utexture2D uimages[];
 layout(set = 0, binding = 1) uniform sampler samplers[];
 layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
     uint map[];  // mask, then 10 uints per slot: key[8], index, pad
@@ -51,6 +55,11 @@ void main() {
     }
     const uint image = lookup(image_key), smp = lookup(sampler_key);
     const vec2 uv = (vec2(i % 8, i / 8) + 0.5) / 8.0 + vec2(1.0, 0.0);
-    const vec4 texel = textureLod(sampler2D(images[image], samplers[smp]), uv, 0.0);
-    result[pc.first + i] = packUnorm4x8(texel);
+    if (pc.integer != 0) {
+        const uvec4 t = min(textureLod(usampler2D(uimages[image], samplers[smp]), uv, 0.0), uvec4(255));
+        result[pc.first + i] = t.r | (t.g << 8) | (t.b << 16) | (t.a << 24);
+    } else {
+        const vec4 texel = textureLod(sampler2D(images[image], samplers[smp]), uv, 0.0);
+        result[pc.first + i] = packUnorm4x8(texel);
+    }
 }

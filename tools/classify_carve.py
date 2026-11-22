@@ -50,7 +50,14 @@ def index_rows(path):
 
 
 def main():
+    if len(sys.argv) != 2:
+        print("usage: python -I classify_carve.py <work>\\carve", file=sys.stderr)
+        return 2
     root = sys.argv[1]
+    if not os.path.isdir(root):
+        what = "is not a folder" if os.path.exists(root) else "does not exist"
+        print(f"{root}: {what}; give the carve folder (the one with an index.json per archive)", file=sys.stderr)
+        return 2
     per = {}
     total = defaultdict(lambda: [0, 0])
     for name in sorted(os.listdir(root)):

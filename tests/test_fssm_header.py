@@ -165,6 +165,26 @@ class CliTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_missing_path_is_one_line(self):
+        missing = os.path.join(self.dir, "missing")
+        p = subprocess.run([sys.executable, "-I", TOOL, missing], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn(missing, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout, "")
+
+    def test_limit_counts_from_the_start(self):
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json", "--limit", "1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm"])
+        # A negative limit sliced from the end (paths[:-1] dropped b.fssm) instead of being refused.
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "-1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("must be 0 or more", p.stderr)
+        self.assertEqual(p.stdout, "")
+
     def test_text_tally(self):
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
