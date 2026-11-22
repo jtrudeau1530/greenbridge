@@ -47,6 +47,8 @@ VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
 WINDOWS_ONLY = ("runtime",)   # off Windows: the clang-cl + xwin cross-build, or --runtime-build
 CROSS_TOOLS = ("clang-cl", "lld-link", "llvm-lib", "llvm-rc", "llvm-mt")
+CROSS_VARS = {"C_COMPILER": "clang-cl", "CXX_COMPILER": "clang-cl", "LINKER": "lld-link", "AR": "llvm-lib",
+              "RC_COMPILER": "llvm-rc", "MT": "llvm-mt"}   # the toolchain's CMAKE_<var> defaults
 XWIN_DEFAULT = os.path.join("~", ".local", "share", "xwin-sdk")
 RUNTIME_FILES = ("gta6rt.exe", "gta6rt_tls_host.dll")
 # Archives scanned for models and texture dictionaries, small to large.
@@ -391,9 +393,36 @@ def xwin_dir() -> "str | None":
     return d if os.path.isdir(os.path.join(d, "VC", "Tools", "MSVC")) and sdk else None
 
 
-def clang_cl_major() -> "int | None":
+def cross_tool_suffix() -> "str | None":
+    """"" for the unversioned LLVM tools, "-N" for the newest full set named like clang-cl-21, else None."""
+    if all(shutil.which(t) for t in CROSS_TOOLS):
+        return ""
+    for n in range(40, 18, -1):
+        if all(shutil.which(f"{t}-{n}") for t in CROSS_TOOLS):
+            return f"-{n}"
+    return None
+
+
+def cross_build_dir() -> str:
+    return os.path.join(ROOT, "runtime", "build", "windows")
+
+
+def cached_cross_compiler() -> "str | None":
+    """The compiler an existing runtime/build/windows was configured with, if it is still there."""
     try:
-        r = subprocess.run(["clang-cl", "--version"], capture_output=True, text=True, errors="replace", timeout=60)
+        with open(os.path.join(cross_build_dir(), "CMakeCache.txt"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("CMAKE_CXX_COMPILER:"):
+                    path = line.split("=", 1)[1].strip()
+                    return path if os.path.isfile(path) else None
+    except OSError:
+        pass
+    return None
+
+
+def clang_cl_major(exe: str = "clang-cl") -> "int | None":
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.search(r"clang version (\d+)", r.stdout)
@@ -405,11 +434,14 @@ def cross_build_missing() -> list:
     missing = []
     if not shutil.which("cmake"):
         missing.append("CMake 3.24 or newer")
-    absent = [t for t in CROSS_TOOLS if not shutil.which(t)]
-    if absent:
-        missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm)")
-    else:
-        major = clang_cl_major()
+    cached = cached_cross_compiler()
+    suffix = None if cached else cross_tool_suffix()
+    if suffix is None and not cached:
+        absent = [t for t in CROSS_TOOLS if not shutil.which(t)]
+        missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm), by these names or all five "
+                       "with one version suffix such as clang-cl-21")
+    elif suffix is not None:
+        major = clang_cl_major(f"clang-cl{suffix}")
         if major is not None and major < 19:
             missing.append(f"clang-cl 19 or newer (this one is {major}; the MSVC STL from xwin rejects older Clang)")
     if not xwin_dir():
@@ -906,10 +938,10 @@ exec "${WINE:-wine}" "$here/gta6rt.exe" "$@"
 """
 
 
-def cmake_configure(build: str, *config: str, hint: str = "") -> None:
-    """Configure runtime/ in build; the generator and build type are chosen only for a new build folder."""
+def cmake_configure(build: str, *config: str, hint: str = "", first: tuple = ()) -> None:
+    """Configure runtime/ in build; the generator, build type and `first` apply only to a new build folder."""
     fresh = [] if os.path.isfile(os.path.join(build, "CMakeCache.txt")) else [
-        *(["-G", "Ninja"] if shutil.which("ninja") else []), "-DCMAKE_BUILD_TYPE=RelWithDebInfo"]
+        *(["-G", "Ninja"] if shutil.which("ninja") else []), "-DCMAKE_BUILD_TYPE=RelWithDebInfo", *first]
     run(["cmake", "-S", os.path.join(ROOT, "runtime"), "-B", build, *fresh, *config], hint=hint)
 
 
@@ -922,9 +954,11 @@ def cross_configure() -> str:
     if not xwin:
         fail("runtime: no xwin SDK in XWIN_DIR or ~/.local/share/xwin-sdk (docs/testing.md, "
              "\"The Windows runtime on Linux\"), and no --runtime-build.")
-    build = os.path.join(ROOT, "runtime", "build", "windows")
+    build = cross_build_dir()
+    suffix = cross_tool_suffix() or ""
+    tools = tuple(f"-DCMAKE_{var}={name}{suffix}" for var, name in CROSS_VARS.items()) if suffix else ()
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
-                    f"-DXWIN_DIR={xwin}", hint="CMake's error above says what the cross-build lacks "
+                    f"-DXWIN_DIR={xwin}", first=tools, hint="CMake's error above says what the cross-build lacks "
                     "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
                     "runtime from --stages (the default without it: check,shaders,assets,pipelines).")
     return build

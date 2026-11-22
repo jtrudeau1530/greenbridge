@@ -107,11 +107,25 @@ class CrossBuildMissingTest(unittest.TestCase):
         os.makedirs(os.path.join(self.sdk, "VC", "Tools", "MSVC"))
         os.makedirs(os.path.join(self.sdk, "Windows Kits", "10", "Lib", "10.0.26100", "um", "x64"))
 
-    def missing(self, have=("cmake", *make_game.CROSS_TOOLS), major=23, sdk=None):
+    def missing(self, have=("cmake", *make_game.CROSS_TOOLS), major=23, sdk=None, cached=None):
         with mock.patch.object(make_game.shutil, "which", side_effect=lambda t: f"/usr/bin/{t}" if t in have else None), \
-                mock.patch.object(make_game, "clang_cl_major", return_value=major), \
+                mock.patch.object(make_game, "clang_cl_major", return_value=major) as self.major, \
+                mock.patch.object(make_game, "cached_cross_compiler", return_value=cached), \
                 mock.patch.dict(os.environ, {"XWIN_DIR": sdk if sdk is not None else self.sdk}):
             return make_game.cross_build_missing()
+
+    def test_a_full_versioned_set_counts(self):
+        self.assertEqual(self.missing(have=("cmake", *(f"{t}-21" for t in make_game.CROSS_TOOLS))), [])
+        self.major.assert_called_once_with("clang-cl-21")
+
+    def test_versions_are_not_mixed(self):
+        have = ("cmake", "clang-cl-21", "lld-link-21", "llvm-lib-21", "llvm-rc-21", "llvm-mt-20")
+        (item,) = self.missing(have=have)
+        self.assertIn("one version suffix such as clang-cl-21", item)
+
+    def test_a_configured_build_folder_needs_no_tools_on_path(self):
+        self.assertEqual(self.missing(have=("cmake",), cached="/usr/lib/llvm-21/bin/clang-cl"), [])
+        self.major.assert_not_called()
 
     def test_everything_there(self):
         self.assertEqual(self.missing(), [])
@@ -216,6 +230,22 @@ class RuntimePackagingTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.out))
 
 
+class CachedCrossCompilerTest(unittest.TestCase):
+    def test_reads_the_compiler_from_the_cache(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        build = os.path.join(root, "runtime", "build", "windows")
+        os.makedirs(build)
+        compiler = os.path.join(root, "clang-cl-21")
+        with open(os.path.join(build, "CMakeCache.txt"), "w", encoding="utf-8") as f:
+            f.write(f"CMAKE_BUILD_TYPE:STRING=RelWithDebInfo\nCMAKE_CXX_COMPILER:FILEPATH={compiler}\n")
+        with mock.patch.object(make_game, "ROOT", root):
+            self.assertIsNone(make_game.cached_cross_compiler())
+            open(compiler, "w").close()
+            self.assertEqual(make_game.cached_cross_compiler(), compiler)
+        with mock.patch.object(make_game, "ROOT", os.path.join(root, "nowhere")):
+            self.assertIsNone(make_game.cached_cross_compiler())
+
+
 class CrossBuildTest(unittest.TestCase):
     def setUp(self):
         self.root = self.enterContext(tempfile.TemporaryDirectory())
@@ -224,7 +254,7 @@ class CrossBuildTest(unittest.TestCase):
         self.out = os.path.join(self.root, "out")
         os.makedirs(self.game)
 
-    def runtime(self, xwin="/sdk", ninja=True):
+    def runtime(self, xwin="/sdk", ninja=True, suffix=""):
         def fake_run(args, hint="", **kw):
             if args[1] == "--build":
                 os.makedirs(self.build, exist_ok=True)
@@ -235,6 +265,7 @@ class CrossBuildTest(unittest.TestCase):
                 mock.patch.object(make_game, "ROOT", self.root), \
                 mock.patch.object(make_game, "xwin_dir", return_value=xwin), \
                 mock.patch.object(make_game.shutil, "which", side_effect=lambda t: "/usr/bin/ninja" if ninja else None), \
+                mock.patch.object(make_game, "cross_tool_suffix", return_value=suffix), \
                 mock.patch.object(make_game, "run", side_effect=fake_run) as self.run_mock, \
                 mock.patch.object(make_game, "log"):
             make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, None, 4)
@@ -252,6 +283,14 @@ class CrossBuildTest(unittest.TestCase):
             with open(os.path.join(self.out, name), "rb") as f:
                 self.assertEqual(f.read(), name.encode())
         self.assertTrue(os.path.isfile(os.path.join(self.out, "gta6rt.sh")))
+
+    def test_versioned_tools_are_passed_to_a_new_build_folder_only(self):
+        configure, _ = self.runtime(suffix="-21")
+        for var, name in make_game.CROSS_VARS.items():
+            self.assertIn(f"-DCMAKE_{var}={name}-21", configure)
+        open(os.path.join(self.build, "CMakeCache.txt"), "w").close()
+        configure, _ = self.runtime(suffix="-21")
+        self.assertFalse(any(a.startswith("-DCMAKE_CXX_COMPILER") for a in configure))
 
     def test_without_ninja_cmake_picks_the_generator(self):
         configure, _ = self.runtime(ninja=False)
