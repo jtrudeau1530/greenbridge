@@ -195,7 +195,10 @@ class LdsCasAtomics(unittest.TestCase):
 
         # Verify Workgroup-scope CAS loop emission and absence of float atomic capabilities.
         spv = translate(["v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v3, 0x3f800000", "ds_min_rtn_f32 v5, v1, v3"])
-        self.assertIn("OpAtomicCompareExchange %uint", spv)
+        exchange, = (line.split("OpAtomicCompareExchange ")[1].split()
+                     for line in spv.splitlines() if "OpAtomicCompareExchange " in line)
+        loads = [line.split("OpAtomicLoad ")[1].split() for line in spv.splitlines() if "OpAtomicLoad " in line]
+        self.assertEqual(loads, [exchange[:4]])  # type, pointer, scope, memory semantics
         self.assertIn("OpLoopMerge", spv)
         self.assertIn("OpExtInst %float %glsl NMin", spv)
         self.assertNotIn("AtomicFloat", spv)

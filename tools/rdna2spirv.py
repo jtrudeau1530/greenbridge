@@ -2979,7 +2979,7 @@ class Gen:
                 self.emit(f"{val_f} = OpBitcast %float {val}")
             lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
             init = self.tmp()
-            self.emit(f"{init} = OpLoad %uint {p}")
+            self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
             self.emit(f"OpBranch {lbl_hdr}")
             self.emit(f"{lbl_hdr} = OpLabel")
             cur, got = self.tmp(), self.tmp()
