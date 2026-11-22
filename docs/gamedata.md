@@ -390,6 +390,36 @@ A runtime consumer needs:
 - strict handling of the 9 tail-only and 1 unattributed blocks: they are incomplete evidence, not documents
   to guess at.
 
+## Custom clouds
+
+One `CustomClouds` document places individual weather clouds over the world. Counts and ranges; no values or
+names:
+
+| Path | Count | Content |
+|---|---:|---|
+| `CustomCloudGroupList/Item` | 26 | `Name` (26 distinct), `Position` (`x`, `y`), `CustomCloudList` |
+| `.../CustomCloudList/Item` | 630 | `Name` (429 distinct), `Position` (`x`, `y`), `Density`, `Rain`, `Fog`, `FogHeight`, `StrikeChance`, `BurstChance`, `CoverageMinMax` (`x`, `y`), and five booleans `Nimbus0`, `Nimbus1`, `Cumulus`, `Stratus`, `CirroStratus` |
+
+Measured over the 630 clouds:
+
+- **Positions are absolute world x/y.** Every group `Position` is (0, 0), so the group offset cannot be
+  distinguished from none, and cloud positions span x -33,515 to 28,596 and y -31,920 to 37,612. 386 of the 630
+  fall inside the 2D box of the world grid atlases (x -13,312..3,072, y -9,216..24,576; #1180); 136 lie more than
+  20,000 units from the origin, far outside the map placements. There is no z component.
+- **Groups** hold 1 to 74 clouds (median 18).
+- **Cloud types are flags, not weights.** Per cloud the number of `true` flags is 0 (91 clouds), 1 (418), 2 (55),
+  3 (26), 4 (3) or 5 (37). Clouds per type: `Cumulus` 357, `Nimbus0` 158, `Nimbus1` 131, `CirroStratus` 84,
+  `Stratus` 73.
+- **`CoverageMinMax` is a distance range, not a fraction**: min <= max in all 630, values 0 to 30,000, medians 200
+  (min) and 2,000 (max), so it reads as an inner/outer radius in world units.
+- `StrikeChance` and `BurstChance` are within 0..1 in all 630. `Rain` and `Fog` are within -1..1 (median 0),
+  `Density` within -100..100 (median 0.5) and `FogHeight` within -100..300: signed values, so these act as
+  offsets or overrides with a sign, not plain amounts.
+
+Not measured here (hypothesis): how a cloud's radius range blends with the weather's `CloudType` and cloud maps,
+what a negative `Rain`/`Fog`/`Density` means (subtracting from the weather, or "unset"), and what the two
+`Nimbus` flags distinguish.
+
 ## XML catalog
 
 `tools/gamedata_xml.py` turns a carve into a per-file and per-root catalog. It is stdlib-only and rebuilds
