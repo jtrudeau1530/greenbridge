@@ -558,6 +558,22 @@ class ShortStreamEndsTheResource(unittest.TestCase):
             f.write(blob[CHUNK:])
         self.assertEqual(anim_index.collect_rbf0_dir(self.root), blob)
 
+    def test_directory_rigs_skips_json_and_csv_reports(self):
+        blob = self.rbf0 + bytes(CHUNK + 100 - len(self.rbf0))
+        with open(os.path.join(self.root, "000000.bin"), "wb") as f:
+            f.write(blob[:CHUNK])
+        with open(os.path.join(self.root, "010000.bin"), "wb") as f:
+            f.write(blob[CHUNK:])
+        with open(os.path.join(self.root, "020000.bin"), "wb") as f:
+            f.write(skeleton())
+        for report in ("index.json", "report.CSV"):
+            with open(os.path.join(self.root, report), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{\"name\": \"SKEL_FakeReportBone\"}\n" * 4)
+        self.assertEqual(anim_index.collect_rbf0_dir(self.root), blob)
+        skels = anim_index.collect_skeletons_dir(self.root)
+        self.assertEqual([s["offset"] for s in skels], [0x20000])
+        self.assertEqual(skels[0]["names"], ["SKEL_Neck", "SKEL_Spine"])
+
 
 if __name__ == "__main__":
     unittest.main()
