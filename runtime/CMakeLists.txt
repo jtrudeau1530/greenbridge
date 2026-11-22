@@ -379,6 +379,16 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # The same game with no .reloc, at the default EXE base, as RT-22 asks about the real one: it can only run at
+    # 0x140000000, which arm64 Wine on macOS uses for itself (src/base_reservation.h).
+    add_executable(tiny_game_fixed test/fixtures/tiny_game.cpp)
+    target_link_libraries(tiny_game_fixed PRIVATE xgameruntime_stub)
+    target_compile_definitions(tiny_game_fixed PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(tiny_game_fixed PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(tiny_game_fixed PRIVATE /FIXED /DYNAMICBASE:NO /BASE:0x140000000)
+    set_target_properties(tiny_game_fixed PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
@@ -570,6 +580,13 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
     set_tests_properties(run_tiny_game_exit_code PROPERTIES WILL_FAIL TRUE)
+    # Without relocations it can only run at 0x140000000 (base_reservation.h), so exiting 0 means it got there; the
+    # game's exit code comes back through the relaunch both ways.
+    add_test(NAME run_tiny_game_fixed COMMAND gta6rt --run $<TARGET_FILE:tiny_game_fixed> -- hello 42)
+    add_test(NAME run_tiny_game_fixed_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game_fixed> -- wrong args)
+    set_tests_properties(run_tiny_game_fixed_exit_code PROPERTIES
+      WILL_FAIL TRUE
+      FAIL_REGULAR_EXPRESSION "preferred base is taken|error:")
     # Two modes at once are refused before anything is mapped (#886). The stand-in game's own arguments are passed,
     # so a gta6rt that ignored the conflict would run it, print "running" and exit 0.
     foreach(modes "dry-run;run" "dry-run;init" "init;run")
