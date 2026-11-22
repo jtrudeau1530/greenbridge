@@ -5772,6 +5772,10 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
     return VK_NULL_HANDLE;
 }
 
+bool color_resolve_format_is_integer(DXGI_FORMAT format) {
+    return DeviceState::numeric_class(vulkan_format(format, false).format) != 0;
+}
+
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
     if (!dst || !src) return false;
     const Format requested = vulkan_format(format, false);

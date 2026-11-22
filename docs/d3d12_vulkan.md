@@ -220,7 +220,8 @@ What is implemented (all of it testable without the game):
   a depth write by the rasteriser works on D32 and may differ from D24 by up to the 24-bit step, and a depth
   texture sampled in a shader sees the float; only copies, clears and readbacks are bit-exact.
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
-  subresource into a single-sampled one of the same size and format. `ResolveSubresourceRegion` uses the same
+  subresource into a single-sampled one of the same size and format. Integer colour formats in the requested
+  format or either resource are refused at recording; `Close` fails. `ResolveSubresourceRegion` uses the same
   Vulkan operation for non-integer colour with average mode, taking a source rectangle (or the entire subresource)
   and a destination offset. A `ResolveSubresourceRegion` of one depth or stencil plane (the subresource's plane
   slice, the same on both sides) runs in a rendering scope of its own with no draws: the multisampled plane is the

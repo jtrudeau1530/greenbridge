@@ -1388,6 +1388,64 @@ int compare_depth_multisample_quality_levels(ID3D12Device* ours, VkSampleCountFl
     return mismatches;
 }
 
+bool check_plain_resolve_formats(ID3D12Device* device) {
+    struct Case { DXGI_FORMAT format; bool valid; bool depth = false; DXGI_FORMAT requested = DXGI_FORMAT_UNKNOWN; };
+    constexpr Case cases[] = {
+        {DXGI_FORMAT_R8G8B8A8_UINT, false},
+        {DXGI_FORMAT_R8G8B8A8_SINT, false},
+        {DXGI_FORMAT_R32_UINT, false},
+        {DXGI_FORMAT_R32_SINT, false},
+        {DXGI_FORMAT_R32G32B32A32_SINT, false},
+        {DXGI_FORMAT_R8G8B8A8_UINT, false, false, DXGI_FORMAT_R8G8B8A8_UNORM},
+        {DXGI_FORMAT_R8G8B8A8_UNORM, true},
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, true},
+        {DXGI_FORMAT_D32_FLOAT, true, true},
+    };
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                         IID_PPV_ARGS(&list.p)))) return false;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    bool ok = true;
+    unsigned tested = 0, skipped = 0;
+    for (const auto& c : cases) {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{c.format, 4};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality))))
+            return false;
+        if (!quality.NumQualityLevels) {
+            std::printf("plain resolve format %d: 4x MSAA unsupported, skipped\n", int(c.format));
+            ++skipped;
+            continue;
+        }
+        auto desc = texture_desc(8, 8, c.format, c.depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                                                         : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        desc.SampleDesc.Count = 4;
+        Ref<ID3D12Resource> src, dst;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                    D3D12_RESOURCE_STATE_RESOLVE_SOURCE, nullptr,
+                                                    IID_PPV_ARGS(&src.p)))) return false;
+        desc.SampleDesc.Count = 1;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                    D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+                                                    IID_PPV_ARGS(&dst.p)))) return false;
+        const DXGI_FORMAT requested = c.requested == DXGI_FORMAT_UNKNOWN ? c.format : c.requested;
+        list->ResolveSubresource(dst.p, 0, src.p, 0, requested);
+        const HRESULT result = list->Close();
+        if (result != (c.valid ? S_OK : E_INVALIDARG)) {
+            std::fprintf(stderr, "plain resolve format %d: Close returned 0x%08lx, expected 0x%08lx\n",
+                         int(c.format), static_cast<unsigned long>(result),
+                         static_cast<unsigned long>(c.valid ? S_OK : E_INVALIDARG));
+            ok = false;
+        }
+        ++tested;
+        if (FAILED(list->Reset(allocator.p, nullptr))) return false;
+    }
+    if (FAILED(list->Close())) return false;
+    std::printf("plain resolve format validation: %u tested, %u unsupported cases skipped\n", tested, skipped);
+    return ok;
+}
+
 // Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
 // sample count and region form. A host-unsupported combination is a deliberate skip; a mismatch in advertised
 // support or in the resulting pixels is a failure. The region forms need ID3D12GraphicsCommandList7 on the host;
@@ -3230,6 +3288,7 @@ int main() {
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
         EXPECT(rt::d3d12_xs::is_device_proxy(device.p));
         EXPECT(rt::d3d12_xs::device_proxy_slot_count(device.p) == 80);  // ID3D12Device11
+        EXPECT(check_plain_resolve_formats(device.p));
 
         {
             Ref<ID3D12Device11> device11;
