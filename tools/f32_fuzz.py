@@ -22,7 +22,7 @@ With --oracle hw (or translator,hw) the same programs also run natively on an AM
 the hardware is judged against F32Model: match / mismatch where the model has an answer, "known deviation" where the
 hardware equals an analysed alternative (omod turns -0 into +0), and informational tables where the model declines
 (denormals under four MODE settings, NaN payloads, clamp of NaN, omod under IEEE/denormal modes). GFX10.1-only opcodes
-(v_mad_f32, v_mac_f32, v_madak_f32, v_mad_legacy_f32) are skipped on gfx1030/GFX11 with a reason, never substituted.
+(v_mad_f32, v_mac_f32, v_madak_f32, v_madmk_f32, v_mad_legacy_f32) are skipped on gfx1030/GFX11 with a reason, never substituted.
 v_min/max/min3/max3/med3_f32 are hardware-only ops. Exit 77 when the hardware tools are missing. See
 docs/shader_validation.md ("32-bit float VALU on the GPU").
 
@@ -398,7 +398,7 @@ def apply_out_mods(r, mods):
 
 
 # ---- op table: name -> (sources, kind, model) ----
-# kinds: "f" float source (takes neg/abs), "u" integer source, "k" literal float constant (fmaak/madak).
+# kinds: "f" float source (takes neg/abs), "u" integer source, "k" literal float constant (fmaak/fmamk/madak/madmk).
 
 def _op(srcs, fn, mods=True, sel="any", hw_only=False):
     return {"srcs": srcs, "fn": fn, "mods": mods, "sel": sel, "hw_only": hw_only}
