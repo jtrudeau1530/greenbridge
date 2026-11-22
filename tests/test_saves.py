@@ -455,6 +455,46 @@ class MalformedJsavTest(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(out, "blocks")))
             self.assertEqual(rd(source), bytes(bad))
 
+    def test_appended_block_is_not_part_of_the_outer_json_body(self):
+        original, _, blocks = make_jsav()
+        data = bytearray(original + blocks[0])
+        struct.pack_into("<I", data, saves.JSAV_HDR + 12, len(original))
+        with self.assertRaisesRegex(ValueError, r"JSAV entry 0.*outside.*body"):
+            saves.parse_jsav(bytes(data))
+
+    def test_invalid_json_and_trailing_data_produce_no_partial_exports(self):
+        original, _, _ = make_jsav()
+        body_end = len(original.rstrip(b"\0"))
+        cases = {
+            "second document": original + b'{"extra":1}',
+            "malformed document": original[:body_end - 1] + b"]",
+            "invalid UTF-8": original + b"\xff",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, data in cases.items():
+                with self.subTest(name=name):
+                    source = os.path.join(tmp, "bad.jsav")
+                    out = os.path.join(tmp, name)
+                    index = os.path.join(out, "index.json")
+                    write(source, data)
+                    write(index, b"previous complete export")
+                    for command in (("extract", source, out), ("diff", source, source)):
+                        result = subprocess.run([sys.executable, "-I", TOOL, *command],
+                                                capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                        self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(rd(index), b"previous complete export")
+                    self.assertFalse(os.path.exists(os.path.join(out, "blocks")))
+
+    def test_json_end_uses_utf8_bytes_and_allows_whitespace_before_padding(self):
+        block = json.dumps({"message": "\u0105\u6f22"}, ensure_ascii=False).encode("utf-8")
+        original = saves.build_jsav(3, 1, [1], [1], [block])
+        end = len(original.rstrip(b"\0"))
+        data = original[:end] + b"\r\n\t " + b"\0" * 16
+        header, entries = saves.parse_jsav(data)
+        self.assertEqual(header["body_end"], end)
+        self.assertEqual(saves.jsav_blocks(data, entries), [block])
+
     def test_header_shorter_than_16_bytes_is_rejected(self):
         with self.assertRaises(ValueError) as ctx:
             saves.parse_jsav(b"JSAV")
