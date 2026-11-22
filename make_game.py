@@ -23,8 +23,9 @@ Stages, in order (each skips work that is already done, so a stopped build conti
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
               clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh starts it with Wine; --runtime-build DIR
               takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
-    pipelines create every translated shader on your GPU's driver (and every compute pipeline), report anything
-              the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
+    pipelines create every translated shader on your GPU's driver as a pipeline, report anything the driver
+              rejects or that has to be skipped, and save the pipeline cache next to the port (the runtime doesn't
+              load that cache yet)
 """
 import argparse
 import functools
