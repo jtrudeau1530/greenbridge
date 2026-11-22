@@ -699,6 +699,33 @@ on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU be
 `idxen offen` and offset-only soffset forms are new on gfx1150). The one difference is `v_pack_b32_f16` quieting
 signaling NaNs (only signaling NaN halves are not judged; a quiet NaN is compared). The default translator path of `mem` ran on the Radeon 880M (`VK_LOADER_DRIVERS_SELECT=*amd*`, `vk_compute_test` built with g++ as in the lab script): `--family mem --programs 200 --seed 1` gave 400 of 400 programs (native wave64 and wave32) matching the model, 0 not translated, 0 harness errors, so the translator agrees with the model on the OOB_SELECT, straddle, `s_load` and `s_buffer_load` rules there. On the RTX 5070 `vk_compute_test` loses the device (-4) for this and for the unchanged generator of `main`, so use the AMD device.
 
+### Packed and 16-bit integer VALU (`tools/pk16_diff.py`)
+
+`valu_fuzz.py --family f16` runs the 16-bit shifts, `v_add/sub_nc_u16`, `v_mul_lo_u16` and the 16-bit min/max on
+the GPU with VGPR sources. `tools/pk16_diff.py` adds the packed integer ops (`v_pk_add/sub_u16/i16`,
+`v_pk_mul_lo_u16`, `v_pk_min/max_u16/i16`, `v_pk_mad_u16/i16` and the packed shifts) with `op_sel`, `op_sel_hi` and
+`clamp`, and the 16-bit VOP3 ops (`v_add/sub_nc_i16`, `v_min3/max3/med3_u16/i16`, `v_mad_u16/i16` next to the ones
+above) with `op_sel` on every source and on the destination half and `clamp`. Sources are VGPRs, SGPRs, integer and
+float inline constants and literals within the constant-bus limits. It runs one lane through
+`tests/semantic/spirv_mini_interp.py` against its own ISA model, with the shrinking, skips and exit codes of
+`salu_diff.py`. A constant whose high half a packed add/sub/mul/min/max/mad reads is left out unless `--known` (the
+translator rejects it; #2224 changes that).
+
+Measured on an RDNA2 iGPU (gfx1036) with `--oracle hw`: 2,300 programs, the `--known` forms included, match the
+model. A 16-bit VOP3 op keeps the other half of its destination. A constant source is its 32-bit value split like a
+register: `-16` is `0xfff0`/`0xffff`, `1.0` is `0x0000`/`0x3f80` (f32 bits, unlike the f16 ops), and a literal of a
+16-bit VOP3 op has 16 bits (`0xffff` with `op_sel` reads 0). The VOP2-named 16-bit ops (`v_mul_lo_u16`,
+`v_min/max_*16`, the shifts) only have a VOP3 encoding on GFX10, and the generator writes them with `_e64`, because
+without encoding bytes the translator reads a bare mnemonic as the VOP2 write that zeroes the high half. For the same
+reason, rules that depend on the encoding bytes, such as a literal's 12-byte VOP3 encoding (SHADER-208), are out of
+its reach.
+
+```
+python -I tools/pk16_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/pk16_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_pk16_diff.py
+```
+
 ### Wave and cross-lane ops on the GPU (`tools/crosslane_fuzz.py`, FUZZ-7)
 
 Cross-lane ops read other lanes, so like FUZZ-6 this runs on the GPU and not in the one-lane interpreter.
