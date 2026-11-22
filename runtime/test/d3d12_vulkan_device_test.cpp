@@ -2015,6 +2015,14 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                    IID_PPV_ARGS(&list.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+        // Every wait on `fence` goes through this: a hand-picked value that is reused or lower than an earlier one
+        // makes SetEventOnCompletion return at once, and the block then reads results the GPU hasn't written.
+        UINT64 fence_last = 0;
+        const auto submit_and_wait = [&] {
+            const UINT64 v = ++fence_last;
+            return SUCCEEDED(queue->Signal(fence.p, v)) && SUCCEEDED(fence->SetEventOnCompletion(v, nullptr)) &&
+                   fence->GetCompletedValue() >= v;
+        };
         {
             Ref<ID3D12Device> parent;
             EXPECT(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
@@ -2264,9 +2272,7 @@ int main() {
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
-        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));  // null event: blocks until done
-        EXPECT(fence->GetCompletedValue() == 1);
+        EXPECT(submit_and_wait());  // null event: blocks until done
 
         for (UINT row = 0; row < size; ++row) {
             for (UINT col = 0; col < size; ++col) {
@@ -2370,8 +2376,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)));
-        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+        EXPECT(submit_and_wait());
 
         for (UINT row = 0; row < size; ++row)
             for (UINT col = 0; col < size; ++col)
@@ -2427,7 +2432,7 @@ int main() {
             EXPECT(SUCCEEDED(list->Close()));
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            EXPECT(submit_and_wait());
             const std::array<std::uint8_t, 4> untouched_bytes{0xcd, 0xcd, 0xcd, 0xcd};
             for (UINT z = 0; z < 8; ++z)
                 for (UINT y = 0; y < 3; ++y)
@@ -2496,7 +2501,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+            EXPECT(submit_and_wait());
             const std::uint8_t resolved_green[4] = {0, 255, 0, 255};
             for (UINT row = 0; row < size; ++row)
                 for (UINT col = 0; col < size; ++col)
@@ -2526,7 +2531,7 @@ int main() {
             list->ResourceBarrier(2, resolve_barriers);
             D3D12_RECT region{1, 2, 5, 5};
             const auto region_copy = subresource(region_target.p, 0), region_out = footprint(readback.p, region_place);
-            const auto resolve_and_readback = [&](UINT x, D3D12_RECT* rect, UINT64 fence_value) {
+            const auto resolve_and_readback = [&](UINT x, D3D12_RECT* rect) {
                 list7->ResolveSubresourceRegion(region_target.p, 0, x, 1, msaa.p, 0, rect, region_format,
                                                 D3D12_RESOLVE_MODE_AVERAGE);
                 const auto to_copy = transition(region_target.p, D3D12_RESOURCE_STATE_RESOLVE_DEST,
@@ -2536,10 +2541,9 @@ int main() {
                 if (list->Close() != S_OK) return false;
                 queue->ExecuteCommandLists(1, lists);
                 return rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success &&
-                       SUCCEEDED(queue->Signal(fence.p, fence_value)) &&
-                       SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr));
+                       submit_and_wait();
             };
-            EXPECT(resolve_and_readback(4, &region, 5));
+            EXPECT(resolve_and_readback(4, &region));
             const std::uint8_t resolved_red[4] = {255, 0, 0, 255}, resolved_blue[4] = {0, 0, 255, 255};
             for (UINT row = 0; row < region_height; ++row)
                 for (UINT col = 0; col < region_width; ++col) {
@@ -2555,7 +2559,7 @@ int main() {
             const auto to_resolve = transition(region_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                                D3D12_RESOURCE_STATE_RESOLVE_DEST);
             list->ResourceBarrier(1, &to_resolve);
-            EXPECT(resolve_and_readback(1, nullptr, 6));
+            EXPECT(resolve_and_readback(1, nullptr));
             for (UINT row = 0; row < region_height; ++row)
                 for (UINT col = 0; col < region_width; ++col) {
                     const bool in_source = row >= 1 && col >= 1 && col < 9;
@@ -2620,7 +2624,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)) && SUCCEEDED(fence->SetEventOnCompletion(7, nullptr)));
+            EXPECT(submit_and_wait());
             report("atomic copy UINT", 0, down + 256, reinterpret_cast<const std::uint8_t*>(&value32), 4);
             report("atomic copy UINT64", 0, down + 264, reinterpret_cast<const std::uint8_t*>(&value64), 8);
             const std::uint8_t cd[4] = {0xcd, 0xcd, 0xcd, 0xcd};
@@ -2939,7 +2943,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 9)) && SUCCEEDED(fence->SetEventOnCompletion(9, nullptr)));
+            EXPECT(submit_and_wait());
             for (UINT row = 0; row < size; ++row)
                 for (UINT col = 0; col < size; ++col) {
                     report("reserved texel", row * size + col,
@@ -3013,7 +3017,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)) && SUCCEEDED(fence->SetEventOnCompletion(10, nullptr)));
+            EXPECT(submit_and_wait());
 
             const UINT64 t0 = u64(ts_at), t1 = u64(ts_at + 8);
             EXPECT(t0 != 0 && t0 != 0xcdcdcdcdcdcdcdcdull && t1 >= t0);
@@ -3031,7 +3035,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 11)) && SUCCEEDED(fence->SetEventOnCompletion(11, nullptr)));
+            EXPECT(submit_and_wait());
             EXPECT(u64(again_at) >= t1 && u64(again_at + 8) == t1);
 
             // Lists that break the rules. Close reports what it can see; the rest is refused at execution, and
