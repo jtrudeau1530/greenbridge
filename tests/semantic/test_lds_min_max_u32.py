@@ -759,5 +759,114 @@ class TestRegisterAliasing(unittest.TestCase):
                 self.assertEqual(lds.read_dword(lane), 100)
 
 
+@dataclasses.dataclass
+class LDSStatusFlags:
+    """Architectural status flags, wrapping conditions, and bank metrics for LDS operations."""
+    carry_out: bool = False
+    unaligned_address: bool = False
+    oob_wrapped: bool = False
+    bank_conflicts: int = 0
+    address_collisions: int = 0
+
+
+def evaluate_status_flags(
+    wave: SIMDWaveState,
+    inst: DSMinMaxU32Instruction,
+) -> LDSStatusFlags:
+    """Evaluate architectural flags, address wrap conditions, and bank conflicts."""
+    flags = LDSStatusFlags()
+    active_lanes = [l for l in range(wave.wave_size) if wave.is_lane_active(l)]
+
+    bank_to_dwords: Dict[int, set[int]] = {}
+    dword_to_lanes: Dict[int, list[int]] = {}
+
+    for lane in active_lanes:
+        addr = wave.get_vgpr(lane, inst.vaddr)
+        off = inst.offset.value
+
+        if (addr + off) > MASK32:
+            flags.carry_out = True
+
+        effective_byte = (addr + off) & MASK32
+        if (effective_byte & 3) != 0:
+            flags.unaligned_address = True
+
+        if effective_byte >= wave.lds.size_bytes:
+            flags.oob_wrapped = True
+
+        dword_idx = wave.lds.get_dword_index(addr, off)
+        bank_idx = wave.lds.get_bank(dword_idx)
+
+        bank_to_dwords.setdefault(bank_idx, set()).add(dword_idx)
+        dword_to_lanes.setdefault(dword_idx, []).append(lane)
+
+    for bank, dword_set in bank_to_dwords.items():
+        if len(dword_set) > 1:
+            flags.bank_conflicts += (len(dword_set) - 1)
+
+    for dword, lanes in dword_to_lanes.items():
+        if len(lanes) > 1:
+            flags.address_collisions += (len(lanes) - 1)
+
+    return flags
+
+
+class TestStatusFlagsAndBankConflicts(unittest.TestCase):
+    """Unit tests for status flags, bank conflicts, and address wrap conditions."""
+
+    def test_address_carry_out_generation(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 0xFFFFFFFF)
+        wave.set_vgpr(0, VGPR(2), 50)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, vaddr=VGPR(1), vdata=VGPR(2), offset=OffsetImmediate(16))
+        flags = evaluate_status_flags(wave, inst)
+
+        self.assertTrue(flags.carry_out)
+
+    def test_unaligned_byte_address_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 7)
+        wave.set_vgpr(0, VGPR(2), 50)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, vaddr=VGPR(1), vdata=VGPR(2))
+        flags = evaluate_status_flags(wave, inst)
+
+        self.assertTrue(flags.unaligned_address)
+
+    def test_oob_address_wrapping_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 70000)
+        wave.set_vgpr(0, VGPR(2), 50)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MAX_U32, vaddr=VGPR(1), vdata=VGPR(2))
+        flags = evaluate_status_flags(wave, inst)
+
+        self.assertTrue(flags.oob_wrapped)
+
+    def test_bank_conflicts_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x7)
+        wave.set_vgpr(0, VGPR(1), 0 * 4)   # bank 0
+        wave.set_vgpr(1, VGPR(1), 32 * 4)  # bank 0
+        wave.set_vgpr(2, VGPR(1), 64 * 4)  # bank 0
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, vaddr=VGPR(1), vdata=VGPR(2))
+        flags = evaluate_status_flags(wave, inst)
+
+        self.assertEqual(flags.bank_conflicts, 2)
+        self.assertEqual(flags.address_collisions, 0)
+
+    def test_address_collisions_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xF)
+        for l in range(4):
+            wave.set_vgpr(l, VGPR(1), 40)
+
+        inst = DSMinMaxU32Instruction(DSOpcode.DS_MAX_U32, vaddr=VGPR(1), vdata=VGPR(2))
+        flags = evaluate_status_flags(wave, inst)
+
+        self.assertEqual(flags.address_collisions, 3)
+        self.assertEqual(flags.bank_conflicts, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
