@@ -746,13 +746,24 @@ def translate(work, emulate):
     return out, r.stdout + r.stderr
 
 
-def run_gpu(exe, spv, prog, work):
-    words = prog.group * len(OUT_REGS)
+def gpu_env(prog, emulate, dump, base=None):
+    """vk_compute_test's environment (FUZZ-6, tools/lds_fuzz.py): VKC_OUT_WORDS sizes the buffer, VKC_DUMP gets its
+    raw bytes. A wave32 program, or a wave64 one translated with --wave64-emulate, is written for 32-wide subgroups,
+    so it asks for them with VKC_SUBGROUP_SIZE=32, as lds_fuzz.py and valu_fuzz.py do (FUZZ-13): on AMD, whose
+    compute default is 64, a group over 32 would otherwise run as one 64-wide subgroup and mismatch in wave 1.
+    A native wave64 program keeps the device default (--w64-native runs it on whatever the GPU has)."""
+    env = dict(os.environ if base is None else base, VKC_OUT_WORDS=str(max(prog.group * len(OUT_REGS), 64)),
+               VKC_DUMP=dump)
+    if prog.wave == 32 or emulate:
+        env["VKC_SUBGROUP_SIZE"] = "32"
+    return env
+
+
+def run_gpu(exe, spv, prog, work, emulate):
     dump = os.path.join(work, "dump.bin")
     if os.path.exists(dump):
         os.remove(dump)                 # never compare a stale dump
-    # vk_compute_test (FUZZ-6, tools/lds_fuzz.py): VKC_OUT_WORDS sizes the buffer, VKC_DUMP gets its raw bytes.
-    env = dict(os.environ, VKC_OUT_WORDS=str(max(words, 64)), VKC_DUMP=dump)
+    env = gpu_env(prog, emulate, dump)
     r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=60)
     if not os.path.exists(dump):
         raise RuntimeError(f"vk_compute_test gave no dump for {prog.name}: {r.stdout}{r.stderr}")
@@ -807,7 +818,7 @@ def still_fails(prog, ops, mode, ctx):
         spv = os.path.join(spdir, prog.name + ".spv")
         if not os.path.exists(spv):
             return False
-        bad, hyp = compare(prog, run_gpu(exe, spv, prog, work), ops)
+        bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
         return bool(bad) and not hyp
 
 
@@ -895,7 +906,7 @@ def main():
                     st["rejected"] += 1
                     fails.append((p, mode, "not translated", None))
                     continue
-                bad, hyp = compare(p, run_gpu(args.exe, spv, p, work))
+                bad, hyp = compare(p, run_gpu(args.exe, spv, p, work, mode == "emulate"))
                 if not bad:
                     st["match"] += 1
                 elif hyp:
