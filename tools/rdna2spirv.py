@@ -1832,7 +1832,10 @@ class Gen:
         """image_get_lod vD, vaddr, T#, S#: (clamped lod, unclamped lod) like OpImageQueryLod (2D, 2D array). For
         arrays the query takes only the 2D coordinate; the layer doesn't affect the LOD."""
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
-        if dim not in ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D_ARRAY") or self.stage != "ps" or "a16" in mods:
+        if dim not in ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D_ARRAY") or self.stage != "ps":
+            raise Unsupported("image_get_lod form")
+        a16 = "a16" in mods
+        if a16 and ("tfe" in mods or "lwe" in mods):
             raise Unsupported("image_get_lod form")
         arr = dim.endswith("_ARRAY")
         if arr:
@@ -1849,9 +1852,17 @@ class Gen:
         self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
         self.emit(f"{smp} = OpLoad %smp {sp}")
         self.emit(f"{si} = OpSampledImage {'%simg2da' if arr else '%simg2d'} {img} {smp}")
-        f = [self.tof(self.load_reg("vgpr", r)) for r in addr[:2]]
-        uv, lod = self.tmp(), self.tmp()
-        self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+        if a16:
+            # U and V occupy the low and high halves of the first address VGPR. The array layer
+            # is a separate address component and does not contribute to the LOD derivatives.
+            packed = self.load_reg("vgpr", addr[0])
+            uv = self.tmp()
+            self.emit(f"{uv} = OpExtInst %v2float %glsl UnpackHalf2x16 {packed}")
+        else:
+            f = [self.tof(self.load_reg("vgpr", r)) for r in addr[:2]]
+            uv = self.tmp()
+            self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+        lod = self.tmp()
         self.emit(f"{lod} = OpImageQueryLod %v2float {si} {uv}")
         self.uses_query = True
         out = 0
