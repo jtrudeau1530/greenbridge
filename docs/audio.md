@@ -238,22 +238,22 @@ The dictionary comes from two kinds of input:
 - `--conversations`: conversation data, which pairs a dialogue key with its line labels as
   `<ROOT>AU_<XXXX>\0<LABEL>\0`. A key with N distinct labels yields the waves `<key>_01` .. `<key>_<N>`. Wave `_01`
   speaks the first label, `_02` the second, and so on. In 1.0.2.1 the pairs are in 594 carved `story000.rpf`
-  streams, 4 `shared_minigame000.rpf` streams and 2 `data.rpf` streams, and they give 136,788 wave names.
+  streams, 4 `shared_minigame000.rpf` streams, 2 `data.rpf` streams and 1 `story000_restofworld.rpf` stream, and
+  they give 138,104 wave names.
 
-Measured on the 1.0.2.1 package (2026-11-22). The dictionary is about 2.9 million harvested identifiers plus the
-conversation waves:
+Measured on the 1.0.2.1 package (2026-11-22) with 2,455,498 distinct lowercase words: identifiers harvested from the
+carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves:
 
 | Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
 |---|---:|---:|---:|---:|---:|---:|
 | `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
-| `story000.rpf` | 63,861 | 234,458 | 172,781 | 119,492 | 53,289 | 62 |
+| `story000.rpf` | 63,861 | 234,458 | 173,800 | 120,511 | 53,289 | 62 |
 | `shared_minigame000.rpf` | 638 | 4,334 | 1,957 | 1,957 | 0 | 3 |
 
-`story000.rpf` is 73.7% named: dialogue is named almost entirely, because conversation data lists every key.
+`story000.rpf` is 74.1% named: dialogue is named almost entirely, because conversation data lists every key.
 `audio.rpf` is 5.7% named. Its sound effects, ambience and music have no list, so only numbered families are
-found. Adding 1,319 more dialogue words that exist only as harvested strings (not in any conversation pair) brings
-`story000.rpf` to 173,800. When two accepted families claim the same id in one bank (3 rows), the first family in
-sorted base order keeps it.
+found. Without the one `story000_restofworld.rpf` conversation stream, 1,019 dialogue streams stay unnamed. When two
+accepted families claim the same id in one bank (3 rows), the first family in sorted base order keeps it.
 
 The output names game files: keep it local, and do not commit it or attach it to an issue.
 
