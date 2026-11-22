@@ -30,6 +30,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            # TEST-175: GPU fixtures for the docs/design.md rules that were checked on the CPU only
            "ps_cmp_nlg", "ps_cvt_off", "ps_fmac_f16_mods", "ps_vop3_const_mods", "ps_interp_f32_mods", "ps_interp_mov_mods",
            "ps_f16_pack_mods",          # v_pack_b32_f16 neg/abs (SHADER-260)
+           "ps_sdwa_f16_const",         # SDWA src_sel on an f16 inline constant (measured on gfx1036)
            "cs_w64x_andn2_exec",   # s_andn2_saveexec_b64 / s_andn2_wrexec_b64 (test_andn2_exec_b64.py)
            "cs_w64x_saveexec_b64",   # s_and/s_or/s_andn2_saveexec_b64, s_andn2_wrexec_b64 (test_saveexec_b64.py)
            "ps_valu16_mad", "ps_valu16_subrev")   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
