@@ -918,8 +918,15 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("no such plane in this texture; plane", int(view.plane));
         return false;
     }
-    if (stencil && view.format != DXGI_FORMAT_X24_TYPELESS_G8_UINT && view.format != DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) {
-        log_once("a stencil-plane view needs a stencil view format; format", int(view.format));
+    // Each stencil view format belongs to its own DXGI family only, as in D3D12: the family is the texture's DXGI
+    // format, not the Vulkan format behind it (a D24 texture may be D32_SFLOAT_S8_UINT underneath).
+    const bool stencil_format_fits =
+        (view.format == DXGI_FORMAT_X24_TYPELESS_G8_UINT &&
+         (desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT)) ||
+        (view.format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT &&
+         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT));
+    if (stencil && !stencil_format_fits) {
+        log_once("a stencil-plane view needs its texture family's stencil view format; format", int(view.format));
         return false;
     }
     // Every view here is a 2D one (plain, array or cube), which a volume or a multisampled image cannot back.
