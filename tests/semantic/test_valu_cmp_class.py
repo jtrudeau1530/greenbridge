@@ -688,5 +688,232 @@ class TestValuCmpClassScalarInterpreter(unittest.TestCase):
         self.assertEqual(len(interp.trace), 2)
 
 
+# ---------------------------------------------------------------------------
+# SIMD Wavefront Interpreter (Multi-Lane Divergence & 32/64-Bit EXEC Masking)
+# ---------------------------------------------------------------------------
+
+class SIMDWavefrontInterpreter:
+    """Multi-lane SIMD interpreter modeling Wave32 and Wave64 execution on RDNA2."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size} (must be 32 or 64)")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+
+    def set_exec_mask(self, mask: int) -> None:
+        valid_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & valid_mask
+
+    def read_lane_reg_u32(self, lane: int, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            if idx < 0 or idx >= 256:
+                raise IndexError(f"VGPR index out of bounds: {idx}")
+            return self.vgprs[lane][idx] & MASK32
+        elif kind == RegKind.SGPR:
+            if idx < 0 or idx >= 106:
+                raise IndexError(f"SGPR index out of bounds: {idx}")
+            return self.sgprs[idx] & MASK32
+        elif kind == RegKind.SPECIAL and idx == 0:
+            return self.vcc & MASK32
+        raise IndexError(f"Unsupported register domain: {kind.value}{idx}")
+
+    def write_lane_reg_u32(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            if idx < 0 or idx >= 256:
+                raise IndexError(f"VGPR index out of bounds: {idx}")
+            self.vgprs[lane][idx] = val32
+        elif kind == RegKind.SGPR:
+            if idx < 0 or idx >= 106:
+                raise IndexError(f"SGPR index out of bounds: {idx}")
+            self.sgprs[idx] = val32
+        elif kind == RegKind.SPECIAL and idx == 0:
+            self.vcc = (self.vcc & ~MASK32) | val32
+        else:
+            raise IndexError(f"Unsupported register domain: {kind.value}{idx}")
+
+    def read_lane_reg_u64(self, lane: int, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.SPECIAL and idx == 0:
+            return self.vcc & MASK64
+        lo = self.read_lane_reg_u32(lane, kind, idx)
+        hi = self.read_lane_reg_u32(lane, kind, idx + 1)
+        return ((hi & MASK32) << 32) | (lo & MASK32)
+
+    def write_lane_reg_u64(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val64 = val & MASK64
+        if kind == RegKind.SPECIAL and idx == 0:
+            self.vcc = val64
+            return
+        lo = val64 & MASK32
+        hi = (val64 >> 32) & MASK32
+        self.write_lane_reg_u32(lane, kind, idx, lo)
+        self.write_lane_reg_u32(lane, kind, idx + 1, hi)
+
+    def read_lane_operand_f32(self, lane: int, op: Register | Immediate, mods: OperandModifiers) -> int:
+        if isinstance(op, Immediate):
+            raw = op.bits & MASK32
+        elif isinstance(op, Register):
+            raw = self.read_lane_reg_u32(lane, op.kind, op.index)
+        else:
+            raise TypeError(f"Unsupported operand type: {type(op)}")
+        return apply_f32_modifiers(raw, neg=mods.neg, abs_val=mods.abs_val)
+
+    def read_lane_operand_f64(self, lane: int, op: Register | Immediate, mods: OperandModifiers) -> int:
+        if isinstance(op, Immediate):
+            raw = op.bits & MASK64
+        elif isinstance(op, Register):
+            raw = self.read_lane_reg_u64(lane, op.kind, op.index)
+        else:
+            raise TypeError(f"Unsupported operand type: {type(op)}")
+        return apply_f64_modifiers(raw, neg=mods.neg, abs_val=mods.abs_val)
+
+    def read_lane_operand_u32(self, lane: int, op: Register | Immediate) -> int:
+        if isinstance(op, Immediate):
+            return op.bits & MASK32
+        elif isinstance(op, Register):
+            return self.read_lane_reg_u32(lane, op.kind, op.index)
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(self, inst: Instruction) -> int:
+        """Executes a v_cmp_class instruction across all wavefront lanes governed by EXEC mask."""
+        # 1. Latch inputs for all lanes (read-before-write semantics)
+        lane_inputs: list[tuple[int, int]] = []
+        for lane in range(self.wave_size):
+            if inst.opcode == Opcode.V_CMP_CLASS_F32:
+                s0 = self.read_lane_operand_f32(lane, inst.src0, inst.src0_mods)
+            else:
+                s0 = self.read_lane_operand_f64(lane, inst.src0, inst.src0_mods)
+            s1 = self.read_lane_operand_u32(lane, inst.src1)
+            lane_inputs.append((s0, s1))
+
+        # 2. Compute comparison bitmask. Inactive lanes strictly yield 0 in comparison mask.
+        res_mask = 0
+        for lane in range(self.wave_size):
+            is_active = bool((self.exec_mask >> lane) & 1)
+            if not is_active:
+                continue
+            s0, s1 = lane_inputs[lane]
+            if inst.opcode == Opcode.V_CMP_CLASS_F32:
+                matched = ref_cmp_class_f32(s0, s1)
+            else:
+                matched = ref_cmp_class_f64(s0, s1)
+            if matched:
+                res_mask |= (1 << lane)
+
+        # 3. Write mask to destination register
+        if inst.dst.is_vcc:
+            self.vcc = res_mask
+        elif inst.dst.is_sgpr:
+            if inst.dst.count == 2:
+                self.write_lane_reg_u64(0, RegKind.SGPR, inst.dst.index, res_mask)
+            else:
+                self.write_lane_reg_u32(0, RegKind.SGPR, inst.dst.index, res_mask & MASK32)
+        else:
+            raise ValueError(f"Invalid comparison destination: {inst.dst}")
+
+        return res_mask
+
+
+class TestValuCmpClassSIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_uniform_execution(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, POS_ZERO_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Immediate(CLASS_MASK_ZERO),
+        )
+        res_mask = simd.step(inst)
+        self.assertEqual(res_mask, 0xFFFFFFFF)
+        self.assertEqual(simd.vcc, 0xFFFFFFFF)
+
+    def test_wave64_multi_lane_divergence(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        # Even lanes: +0.0 (matches CLASS_POS_ZERO)
+        # Odd lanes: +1.0 (does not match CLASS_POS_ZERO)
+        expected_mask = 0
+        for lane in range(64):
+            if lane % 2 == 0:
+                simd.write_lane_reg_u64(lane, RegKind.VGPR, 2, POS_ZERO_F64)
+                expected_mask |= (1 << lane)
+            else:
+                simd.write_lane_reg_u64(lane, RegKind.VGPR, 2, POS_ONE_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src1=Immediate(CLASS_POS_ZERO),
+        )
+        res_mask = simd.step(inst)
+        self.assertEqual(res_mask, expected_mask)
+        self.assertEqual(simd.vcc, expected_mask)
+
+    def test_exec_masking_partial(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        # Only low 16 lanes active
+        exec_mask = 0x0000FFFF
+        simd.set_exec_mask(exec_mask)
+
+        # All lanes hold NaN
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, QNAN_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Immediate(CLASS_MASK_NAN),
+        )
+        res_mask = simd.step(inst)
+        # Inactive high 16 lanes must be 0
+        self.assertEqual(res_mask, 0x0000FFFF)
+
+    def test_exec_masking_all_inactive(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.set_exec_mask(0)
+
+        for lane in range(64):
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 0, POS_INF_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=2),
+            src1=Immediate(CLASS_MASK_INF),
+        )
+        res_mask = simd.step(inst)
+        self.assertEqual(res_mask, 0)
+        self.assertEqual(simd.vcc, 0)
+
+    def test_scalar_sgpr_mask_broadcast(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        # s4 holds mask for CLASS_POS_NORMAL
+        simd.write_lane_reg_u32(0, RegKind.SGPR, 4, CLASS_POS_NORMAL)
+
+        # Lanes 0..9 hold 1.0 (POS_NORMAL), others hold 0.0
+        for lane in range(32):
+            val = POS_ONE_F32 if lane < 10 else POS_ZERO_F32
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, val)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Register(RegKind.SGPR, 4, count=1),
+        )
+        res_mask = simd.step(inst)
+        self.assertEqual(res_mask, 0x3FF)
+
+
 if __name__ == "__main__":
     unittest.main()
