@@ -972,6 +972,29 @@ class TestGlbWriterMainCli(unittest.TestCase):
                 ret = glb_writer.main([bad_obj, glb_path])
             self.assertEqual(ret, 1)
 
+    def test_main_cli_refuses_to_overwrite_the_input(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            obj_path = os.path.join(tmp_dir, "input.obj")
+            text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
+            with open(obj_path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            links = [obj_path]
+            try:
+                link = os.path.join(tmp_dir, "alias.obj")
+                os.link(obj_path, link)
+                links.append(link)
+            except (OSError, NotImplementedError):
+                pass
+            for out in links:
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    ret = glb_writer.main([obj_path, out])
+                self.assertEqual(ret, 1)
+                self.assertIn("overwrite the input", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+                with open(obj_path, encoding="utf-8", newline="") as f:
+                    self.assertEqual(f.read(), text)
+
 
 if __name__ == "__main__":
     unittest.main()
