@@ -403,7 +403,12 @@ class ScanTest(unittest.TestCase):
             self.assertEqual(T.main([os.path.join(self.tmp.name, "missing.rpf")]), 2)
             self.assertEqual(T.main([self.rpf, "--jobs", "0"]), 2)
             self.assertEqual(T.main([self.rpf, "--entities", os.path.join(self.tmp.name, "none.jsonl")]), 2)
-        self.assertEqual(len(err.getvalue().strip().splitlines()), 3)
+            self.assertEqual(T.main([self.rpf, "--limit", "0"]), 2)
+            self.assertEqual(T.main([self.rpf, "--limit", "-1"]), 2)
+        lines = err.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(lines[3], "ERROR: --limit must be at least 1")
+        self.assertEqual(lines[4], "ERROR: --limit must be at least 1")
 
 
 if __name__ == "__main__":
