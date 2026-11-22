@@ -14,8 +14,19 @@
 // of the back buffer is scaled to the window), a blank present (the window cleared to black), a swapchain format
 // that follows the source (an sRGB source gets an sRGB swapchain, so the blit's decode and encode cancel; every
 // other source gets a UNORM one), and an optional capture that copies each presented frame to host memory.
+//
+// Tearing on request (PresentX's ImmediateThresholdPercent): with VK_KHR_swapchain_maintenance1 (or the EXT original)
+// the vsync swapchain is created with FIFO plus IMMEDIATE (FIFO_RELAXED when the surface cannot switch to IMMEDIATE),
+// and a present that asks for it is queued in that mode alone. Without the extension, or without either mode, a
+// request is ignored and the frame waits for the vblank.
 
 #include "vulkan_backend.h"
+
+// Both extension names share the structures (the KHR one was promoted from the EXT one); headers older than the
+// promotion do not have the KHR types, and the presenter then never tears.
+#if defined(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
+#define LEONIDA_SWAPCHAIN_MAINTENANCE1 1
+#endif
 
 #include <algorithm>
 #include <array>
@@ -62,13 +73,16 @@ inline bool blit_unsupported_format(VkFormat format) {
 class VulkanPresenter {
 public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
-                    VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface)
-        : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface) {
+                    VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
+                    bool swapchain_maintenance1 = false)
+        : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
+          maintenance1_(swapchain_maintenance1) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceFormatsKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfacePresentModesKHR)
+        LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilities2KHR)
         LEONIDA_INSTANCE_FN(vkDestroySurfaceKHR)
         LEONIDA_INSTANCE_FN(vkGetDeviceProcAddr)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceMemoryProperties)
@@ -141,6 +155,13 @@ public:
     VkExtent2D extent() const { return extent_; }
     VkFormat format() const { return format_; }
     std::uint64_t presented() const { return presented_; }
+    // The present mode a tearing present uses (IMMEDIATE, else FIFO_RELAXED) while the current swapchain was created
+    // for it, else VK_PRESENT_MODE_MAX_ENUM_KHR: ImmediateThresholdPercent cannot be honoured then.
+    VkPresentModeKHR tear_mode() const { return tear_mode_; }
+    bool tear_supported() const { return tear_mode_ != VK_PRESENT_MODE_MAX_ENUM_KHR; }
+    // Whether the last present was queued in the tearing mode, and how many were.
+    bool last_present_tore() const { return last_tore_; }
+    std::uint64_t tear_presents() const { return tear_presents_; }
 
     // Blits the colour texture `source` (mip 0, layer 0, in D3D12's PRESENT state) to the window and presents it.
     // `source_rect`, when given, limits the blit to that part of the texture (stretched to the whole window); it
@@ -155,7 +176,10 @@ public:
     // wait on a fence nothing will signal: an empty batch takes the acquire semaphore and signals the frame's fence,
     // and the swapchain is recreated next time, which gives back the image that was never presented. If even that
     // batch fails, the presenter stops (ok() is false) and its owner has to make a new one.
-    VkResult present(ResourceId source, bool vsync, const PresentRect* source_rect = nullptr) {
+    //
+    // `tear` (only with vsync): queue the present in tear_mode() instead of FIFO when the swapchain can, so a frame
+    // that missed its vblank is shown at once; last_present_tore() says whether it was.
+    VkResult present(ResourceId source, bool vsync, const PresentRect* source_rect = nullptr, bool tear = false) {
         ResourceBinding binding;
         {
             std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
@@ -173,7 +197,7 @@ public:
                             std::uint32_t(source_rect->right) > binding.width ||
                             std::uint32_t(source_rect->bottom) > binding.height))
             return VK_ERROR_UNKNOWN;
-        return submit(&binding, source, vsync, source_rect, detail::is_srgb_format(binding.format));
+        return submit(&binding, source, vsync, source_rect, detail::is_srgb_format(binding.format), tear);
     }
 
     // Polled while a present waits for a swapchain image (every 50 ms): when it returns true the present gives up with
@@ -181,7 +205,9 @@ public:
     void set_abort(std::function<bool()> abort) { abort_ = std::move(abort); }
 
     // Presents a black frame: the swapchain image cleared, nothing read. PresentX with no planes.
-    VkResult present_blank(bool vsync) { return submit(nullptr, ResourceId{}, vsync, nullptr, swapchain_srgb_); }
+    VkResult present_blank(bool vsync, bool tear = false) {
+        return submit(nullptr, ResourceId{}, vsync, nullptr, swapchain_srgb_, tear);
+    }
 
     // From now on every presented frame is also copied to host memory (the swapchain gets TRANSFER_SRC usage), for
     // read_back(). False when the surface cannot do it or its format is not 8 bits per channel with 4 channels.
@@ -211,7 +237,8 @@ public:
 
     // Shared by present() and present_blank(). `binding` null: clear instead of blit.
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
-                    bool srgb) {
+                    bool srgb, bool tear = false) {
+        last_tore_ = false;
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
         if (vsync != vsync_ || stale_ || srgb != swapchain_srgb_) {
             // The swapchain's colour encoding is only recorded once the new swapchain exists, so a failed
@@ -270,6 +297,19 @@ public:
         present.swapchainCount = 1;
         present.pSwapchains = &swapchain_;
         present.pImageIndices = &image;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        // The swapchain was created with FIFO and tear_mode_ (both come from the same recreate).
+        VkSwapchainPresentModeInfoKHR present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR};
+        const bool tearing = tear && vsync_ && tear_supported();
+        if (tearing) {
+            present_mode.swapchainCount = 1;
+            present_mode.pPresentModes = &tear_mode_;
+            present.pNext = &present_mode;
+        }
+#else
+        const bool tearing = false;
+        (void)tear;
+#endif
         VkResult submitted, result = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
@@ -280,7 +320,13 @@ public:
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
-        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) ++presented_;
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+            ++presented_;
+            if (tearing) {
+                last_tore_ = true;
+                ++tear_presents_;
+            }
+        }
         if (capture_ && capture_ptr_) {
             captured_ = true;
             captured_extent_ = extent_;
@@ -520,6 +566,7 @@ private:
             vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
         }
         stale_ = true;  // until this succeeds
+        tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
         VkSwapchainKHR old = swapchain_;
@@ -595,6 +642,19 @@ private:
         info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         if (!(caps.supportedCompositeAlpha & info.compositeAlpha)) info.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
         info.presentMode = mode;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        // A vsync swapchain that can also be presented in IMMEDIATE (or FIFO_RELAXED), switched per present.
+        VkSwapchainPresentModesCreateInfoKHR switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR};
+        std::array<VkPresentModeKHR, 2> switchable_modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAX_ENUM_KHR};
+        VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
+        if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
+        if (tear != VK_PRESENT_MODE_MAX_ENUM_KHR) {
+            switchable_modes[1] = tear;
+            switchable.presentModeCount = 2;
+            switchable.pPresentModes = switchable_modes.data();
+            info.pNext = &switchable;
+        }
+#endif
         info.clipped = VK_TRUE;
         info.oldSwapchain = old;
         VkSwapchainKHR fresh = VK_NULL_HANDLE;
@@ -620,6 +680,9 @@ private:
             ready.push_back(semaphore);
         }
         swapchain_ = fresh;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        tear_mode_ = tear;
+#endif
         images_ = std::move(images);
         ready_ = std::move(ready);
         format_ = chosen.format;
@@ -636,6 +699,59 @@ private:
         return true;
     }
 
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+    // The mode a FIFO swapchain can also present in, so that a late frame can be shown at once: IMMEDIATE, else
+    // FIFO_RELAXED, each only if the surface lists it and reports it compatible with FIFO (VK_KHR_surface_maintenance1).
+    // `min_images` is raised to what that mode needs too. The mode must also accept the swapchain's image usage and
+    // extent (its capabilities can differ from FIFO's). MAX_ENUM when there is none or the extension is not in use.
+    VkPresentModeKHR find_tear_mode(const std::vector<VkPresentModeKHR>& modes, std::uint32_t& min_images,
+                                    VkImageUsageFlags usage, VkExtent2D extent) {
+        if (!maintenance1_ || !vkGetPhysicalDeviceSurfaceCapabilities2KHR_) return VK_PRESENT_MODE_MAX_ENUM_KHR;
+        // The capabilities of the surface for one present mode, and the modes it can switch to from there.
+        const auto ask = [&](VkPresentModeKHR asked, VkSurfaceCapabilitiesKHR& caps,
+                             std::array<VkPresentModeKHR, 16>* compatible, std::uint32_t* compatible_count) {
+            VkSurfacePresentModeKHR for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR};
+            for_mode.presentMode = asked;
+            VkPhysicalDeviceSurfaceInfo2KHR surface_info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &for_mode};
+            surface_info.surface = surface_;
+            VkSurfacePresentModeCompatibilityKHR compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR};
+            if (compatible) {
+                compat.presentModeCount = std::uint32_t(compatible->size());
+                compat.pPresentModes = compatible->data();
+            }
+            VkSurfaceCapabilities2KHR out{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, compatible ? &compat : nullptr};
+            if (vkGetPhysicalDeviceSurfaceCapabilities2KHR_(physical_, &surface_info, &out) != VK_SUCCESS) return false;
+            caps = out.surfaceCapabilities;
+            if (compatible_count) *compatible_count = std::min<std::uint32_t>(compat.presentModeCount, 16);
+            return true;
+        };
+        VkSurfaceCapabilitiesKHR fifo_caps{};
+        std::array<VkPresentModeKHR, 16> compatible{};
+        std::uint32_t compatible_count = 0;
+        if (!ask(VK_PRESENT_MODE_FIFO_KHR, fifo_caps, &compatible, &compatible_count)) return VK_PRESENT_MODE_MAX_ENUM_KHR;
+        for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR}) {
+            if (std::find(modes.begin(), modes.end(), wanted) == modes.end() ||
+                std::find(compatible.begin(), compatible.begin() + compatible_count, wanted) ==
+                    compatible.begin() + compatible_count)
+                continue;
+            VkSurfaceCapabilitiesKHR mode_caps{};
+            if (!ask(wanted, mode_caps, nullptr, nullptr)) continue;
+            if ((mode_caps.supportedUsageFlags & usage) != usage) continue;
+            if (extent.width < mode_caps.minImageExtent.width || extent.height < mode_caps.minImageExtent.height ||
+                extent.width > mode_caps.maxImageExtent.width || extent.height > mode_caps.maxImageExtent.height)
+                continue;
+            // One image count that every mode of the swapchain accepts.
+            std::uint32_t count = std::max({min_images, fifo_caps.minImageCount, mode_caps.minImageCount});
+            const std::uint32_t most = std::min(fifo_caps.maxImageCount ? fifo_caps.maxImageCount : UINT32_MAX,
+                                                mode_caps.maxImageCount ? mode_caps.maxImageCount : UINT32_MAX);
+            if (count > most) continue;
+            min_images = count;
+            return wanted;
+        }
+        return VK_PRESENT_MODE_MAX_ENUM_KHR;
+    }
+#endif
+
     // Destroys a swapchain that is being replaced (or the last one), with the per-image semaphores that went with it.
     void release(VkSwapchainKHR swapchain) {
         const VkDevice device = context_.device();
@@ -651,6 +767,10 @@ private:
     VkPhysicalDevice physical_;
     VkQueue queue_;
     VkSurfaceKHR surface_;
+    bool maintenance1_ = false;  // VK_KHR/EXT_swapchain_maintenance1 (and the surface extension) are enabled
+    VkPresentModeKHR tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;  // set with the swapchain, see tear_mode()
+    bool last_tore_ = false;
+    std::uint64_t tear_presents_ = 0;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkExtent2D extent_{};
@@ -680,6 +800,7 @@ private:
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR vkGetPhysicalDeviceSurfaceFormatsKHR_ = nullptr;
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR vkGetPhysicalDeviceSurfacePresentModesKHR_ = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR vkGetPhysicalDeviceSurfaceCapabilities2KHR_ = nullptr;
     PFN_vkDestroySurfaceKHR vkDestroySurfaceKHR_ = nullptr;
     PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr_ = nullptr;
     PFN_vkCreateSwapchainKHR vkCreateSwapchainKHR_ = nullptr;
