@@ -1,4 +1,4 @@
-"""FSSM container facts cross-checked against SCARAB, plus a repro for a duplicate-XBCH loss.
+"""FSSM container facts cross-checked against SCARAB, plus the duplicate-XBCH payload cases.
 
 The two code-range facts are measured on the 26,503-container corpus; the blobs below are synthetic and
 only reproduce the layout, so the test needs no game data:
@@ -8,10 +8,10 @@ only reproduce the layout, so the test needs no game data:
   * `code_end` at `0xE8` can be the `0xDEADBEEFDEADBEEF` "unset" sentinel (17/26,503 blobs). The code
     range must then come from the last `s_endpgm`, not from `code_end`.
 
-The third test is a repro, not a passing check: `fssm_unpack.xdat_entries` keys entries by tag, so a
-container with two tag-0x0D (`XBCH`) entries keeps only the last. 195/26,503 containers have exactly
-that shape and the two payloads differ. Fixing `fssm_unpack.py` is out of scope for this change, so the
-test is marked expectedFailure.
+`fssm_unpack` also has to keep both payloads of a container with two tag-0x0D (`XBCH`) entries:
+195/26,503 containers have exactly that shape and the two payloads differ. `xdat_entries_all` keeps
+them in directory order, `xdat_entries` keeps the last per tag for old callers, and `unpack()` defaults
+to the last payload with `payload="first"` selecting the first.
 
     python -I tests/test_fssm_crosscheck.py
 """
@@ -121,19 +121,35 @@ class DuplicateXbchTest(unittest.TestCase):
     def container(first: bytes, second: bytes) -> bytes:
         return dxbc_with([(0x12, b"hash"), (0x0D, first), (0x0D, second), (0x07, b"stub")])
 
-    def test_unpack_currently_keeps_only_the_last_entry(self):
+    def dxil(self, first: bytes, second: bytes) -> bytes:
+        return fssm_unpack.parts(self.container(first, second))[b"DXIL"]
+
+    def test_xdat_entries_all_preserves_both_payloads_in_order(self):
         first, second = fssm(0x11), fssm(0x22)
         self.assertNotEqual(first, second)
-        data, _ = fssm_unpack.unpack(self.container(first, second))
-        self.assertEqual(data, second)     # current last-wins behaviour; the first payload is lost
+        entries = fssm_unpack.xdat_entries_all(self.dxil(first, second))
+        self.assertEqual([tag for tag, _ in entries], [0x12, 0x0D, 0x0D, 0x07])
+        # Entries hold the compressed XBCH payload: both must decompress to their own FSSM blob.
+        blobs = [zlib.decompress(payload[24:]) for tag, payload in entries if tag == 0x0D]
+        self.assertEqual(blobs, [first, second])
 
-    @unittest.expectedFailure
-    def test_duplicate_tag_0d_is_preserved(self):
-        """BUG: xdat_entries is a dict, so the second tag-0x0D entry overwrites the first."""
-        dxil = fssm_unpack.parts(self.container(fssm(0x11), fssm(0x22)))[b"DXIL"]
-        entries = fssm_unpack.xdat_entries(dxil)
-        self.assertIsInstance(entries[0x0D], list)
-        self.assertEqual(len(entries[0x0D]), 2)
+    def test_xdat_entries_keeps_the_last_payload_per_tag(self):
+        first, second = fssm(0x11), fssm(0x22)
+        entries = fssm_unpack.xdat_entries(self.dxil(first, second))
+        self.assertEqual(sorted(entries), [0x07, 0x0D, 0x12])
+        # The single-value view is kept for old callers: last entry wins, as before the fix.
+        self.assertEqual(zlib.decompress(entries[0x0D][24:]), second)
+
+    def test_unpack_selects_first_or_last_payload(self):
+        first, second = fssm(0x11), fssm(0x22)
+        container = self.container(first, second)
+        self.assertEqual(fssm_unpack.unpack(container)[0], second)                 # default: last
+        self.assertEqual(fssm_unpack.unpack(container, payload="last")[0], second)
+        self.assertEqual(fssm_unpack.unpack(container, payload="first")[0], first)
+
+    def test_unpack_rejects_an_unknown_payload_choice(self):
+        with self.assertRaises(ValueError):
+            fssm_unpack.unpack(self.container(fssm(0x11), fssm(0x22)), payload="middle")
 
 
 if __name__ == "__main__":
