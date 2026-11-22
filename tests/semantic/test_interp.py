@@ -157,6 +157,21 @@ class InterpreterTests(unittest.TestCase):
                 with self.assertRaises(si.UnsupportedConstruct):
                     si.run_fragment(body)
 
+    def test_64bit_operand_below_2_32_is_rejected(self):
+        # A 64-bit operand is rejected by its type width, not its value: signed 2**31 in a 64-bit int would
+        # otherwise convert as -2147483648.0 under OpConvertSToF (follow-up to #346).
+        text = HEADER.replace("%c0 = OpConstant %uint 0",
+                              "%ulong = OpTypeInt 64 0\n%long = OpTypeInt 64 1\n"
+                              "%cl_one = OpConstant %ulong 1\n%cl_2p31 = OpConstant %long 2147483648\n"
+                              "%c0 = OpConstant %uint 0")
+        for op in ("OpConvertUToF", "OpConvertSToF"):
+            for src in ("%cl_one", "%cl_2p31"):
+                with self.subTest(op=op, src=src):
+                    body = text + (f"%x = {op} %float {src}\n"
+                                   "%res = OpBitcast %uint %x\nOpStore %out %res\n" + FOOTER)
+                    with self.assertRaises(si.UnsupportedConstruct):
+                        si.run_fragment(body)
+
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
         self.assertEqual(run_word("%x = OpExtInst %float %glsl RoundEven %f2p5\n%res = OpBitcast %uint %x\n"),
