@@ -2252,8 +2252,6 @@ int main() {
                    E_INVALIDARG);
         }
         {
-            // Device5 methods answered as on a device without the feature (no meta commands, no serialized
-            // acceleration structures of ours).
             Ref<ID3D12Device5> device5;
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p))));
             UINT meta_count = 7;
@@ -3381,7 +3379,6 @@ int main() {
         EXPECT(cpu_copies(device.p, d.bc, host ? "host image copy" : "staging copy") == 0);
     }
 
-    // RemoveDevice on a device of its own, since a removed device stays removed.
     {
         Ref<ID3D12Device> removable;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&removable.p))));
