@@ -622,6 +622,8 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_com_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_com COMMAND d3d12_com_test)
+    set_tests_properties(d3d12_com PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(d3d12_shader_views_test test/d3d12_shader_views_test.cpp)
     target_link_libraries(d3d12_shader_views_test PRIVATE gta6rt_d3d12_com)
@@ -661,6 +663,8 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_uav_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_uav_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_uav_clear COMMAND d3d12_uav_clear_test)
+    set_tests_properties(d3d12_uav_clear PROPERTIES SKIP_RETURN_CODE 77)
 
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
@@ -683,12 +687,16 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_method_variants_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_method_variants_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_method_variants_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_method_variants COMMAND d3d12_method_variants_test)
+    set_tests_properties(d3d12_method_variants PROPERTIES SKIP_RETURN_CODE 77)
 
     # CreateSampler2 (D3D-28) against CreateSampler, and its refusals against the host's PC runtime.
     add_executable(d3d12_sampler2_test test/d3d12_sampler2_test.cpp)
     target_link_libraries(d3d12_sampler2_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_sampler2_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_sampler2_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_sampler2 COMMAND d3d12_sampler2_test)
+    set_tests_properties(d3d12_sampler2 PROPERTIES SKIP_RETURN_CODE 77)
 
     # Descriptors through the proxy: copies between heaps, what texture views and samplers write into their slots,
     # and (where glslangValidator is found) a compute shader the test runs on the device's bindless set, which
@@ -697,6 +705,8 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_descriptor_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_descriptor_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_descriptor_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_descriptor COMMAND d3d12_descriptor_test)
+    set_tests_properties(d3d12_descriptor PROPERTIES SKIP_RETURN_CODE 77)
     if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
     endif()
@@ -725,18 +735,24 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_clear COMMAND d3d12_clear_test)
+    set_tests_properties(d3d12_clear PROPERTIES SKIP_RETURN_CODE 77)
 
     # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)
     target_link_libraries(d3d12_typeless_rtv_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_typeless_rtv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_typeless_rtv_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_typeless_rtv COMMAND d3d12_typeless_rtv_test)
+    set_tests_properties(d3d12_typeless_rtv PROPERTIES SKIP_RETURN_CODE 77)
 
     # ID3D12Resource::GetDesc against the host runtime and WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_resource_desc_test test/d3d12_resource_desc_test.cpp)
     target_link_libraries(d3d12_resource_desc_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_resource_desc_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_resource_desc_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_resource_desc COMMAND d3d12_resource_desc_test)
+    set_tests_properties(d3d12_resource_desc PROPERTIES SKIP_RETURN_CODE 77)
 
     # ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc (node masks, resolved heap flags) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.

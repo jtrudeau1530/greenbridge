@@ -263,7 +263,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     vktest::Device vk;
-    if (!vk.create()) return 1;
+    const auto device_status = vk.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     const unsigned errors_before = vk.validation_errors();
     unsigned cases_checked = 0;
     const auto compare = [&]() -> int {
