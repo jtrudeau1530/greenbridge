@@ -292,7 +292,7 @@ def collect_skeletons_dir(path):
     out = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or os.path.getsize(full) > 16384:
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")) or os.path.getsize(full) > 16384:
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -308,9 +308,9 @@ def collect_skeletons_dir(path):
 def collect_rbf0_dir(path):
     """The same continuation rule for a carved directory sorted by offset."""
     entries = []
-    for name in os.listdir(path):
+    for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         m = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1), 16) if m else len(entries)
