@@ -1081,10 +1081,15 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     VkFormat named = resource.format();
-    if (volume && (vulkan_format(desc.Format, false).typeless ||
-                   (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format))) {
-        log_once("volume SRV requires a typed resource and matching view format; resource format", int(desc.Format));
-        return false;
+    if (volume) {
+        const bool compatible = vulkan_format(desc.Format, false).typeless
+            ? desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
+              (view.format == DXGI_FORMAT_R8G8B8A8_UNORM || view.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+            : view.format == DXGI_FORMAT_UNKNOWN || view.format == desc.Format;
+        if (!compatible) {
+            log_once("unsupported volume SRV format for this resource:", int(view.format));
+            return false;
+        }
     }
     // The depth plane of a depth-stencil texture, as R24_UNORM_X8_TYPELESS (D24S8) or R32_FLOAT_X8X24_TYPELESS
     // (D32S8): the texture's own depth format, whose T# code is the console's depth format (8_24_UNORM or

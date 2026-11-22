@@ -385,13 +385,15 @@ side inwards:
   `DEPTH_STENCIL_READ_ONLY_OPTIMAL` and is not handled.
 
 A typed single-sampled 3D texture can use a default SRV or an explicit `TEXTURE3D` SRV of the same format.
+An `R8G8B8A8_TYPELESS` volume supports explicit `R8G8B8A8_UNORM` and `R8G8B8A8_UNORM_SRGB` SRVs.
+The sRGB view decodes RGB and preserves linear alpha. A typeless volume requires an explicit typed view.
 The T# records the base depth and the view's mip range. Binding 6 holds the 3D Vulkan view, which has one
 array layer. `d3d12_descriptor_test` checks samples at four W coordinates through two views of the same
 volume. A nonzero `ResourceMinLODClamp` on a 3D view is logged and leaves a null descriptor.
 
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
-views of 1D and multisampled textures, 3D storage views and typeless volume SRVs; depth-plane views (`R24_UNORM_X8_TYPELESS`,
+views of 1D and multisampled textures, 3D storage views and other typeless volume formats; depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect, each on its own family only (the other family's is a null descriptor, as D3D12 refuses it), and
 stencil-plane views (`PlaneSlice` 1, as
