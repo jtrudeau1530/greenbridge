@@ -27,10 +27,13 @@ def texture_dictionary_rpf(path):
     # bytes into a 4 KiB page, where the recovery scan looks) inflating to a 1-texture dictionary
     # (R8_UNORM 4x4, one mip, inline name "probe"), then zero padding to the next 16-byte boundary and a
     # zlib graphics block inflating to the 4096 bytes the descriptor allocates. System pointers use base
-    # 0x50000000 and graphics pointers 0x60000000, matching RageTextureDecoder's pointer checks.
+    # 0x50000000 and graphics pointers 0x60000000, matching RageTextureDecoder's pointer checks. The
+    # resource page-count block sits at 0x48, inside the free 16 bytes below the descriptor at 0x50: it
+    # must not overlap the descriptor, whose width field at t+0x38 the decoder validates against the
+    # allocation ("Descriptor allocation disagrees with AMD mip layout").
     t = 0x50                                    # the one texture descriptor, 0x70 bytes
     system = bytearray(0xD0)
-    system[0x08:0x10] = struct.pack("<Q", 0x50000000 + 0x80)          # -> resource page counts
+    system[0x08:0x10] = struct.pack("<Q", 0x50000000 + 0x40)          # -> resource page counts (at 0x48)
     system[0x20:0x28] = struct.pack("<Q", 0x50000000 + 0xB0)          # -> name hashes
     system[0x28:0x2A] = struct.pack("<H", 1)                          # dictionary count
     system[0x30:0x38] = struct.pack("<Q", 0x50000000 + 0xB8)          # -> texture pointer array
@@ -45,7 +48,7 @@ def texture_dictionary_rpf(path):
     system[t + 0x3A:t + 0x3C] = struct.pack("<H", 4)                  # height
     system[t + 0x3C:t + 0x3E] = struct.pack("<H", 1)                  # depth
     system[t + 0x3E:t + 0x43] = bytes([1, 61, 5, 0, 1])               # 2D, R8_UNORM, tag 5, -, 1 mip
-    system[0x88:0x8A] = bytes([1, 1])                                 # system/graphics resource pages
+    system[0x48:0x4A] = bytes([1, 1])                                 # system/graphics resource pages
     system[0xB0:0xB4] = struct.pack("<I", 0x11111111)                 # name hash
     system[0xB8:0xC0] = struct.pack("<Q", 0x50000000 + t)             # pointer to the texture descriptor
     system[0xC0:0xC8] = struct.pack("<Q", 0)                          # descriptor: inline name follows
@@ -92,6 +95,7 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             blocker.mkdir(parents=True)          # the write of this one DDS fails
             failed = run("textures", src, root / "out")
             self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertFalse(dds.exists(), failed.stdout)          # the blocked write must not have succeeded
             self.assertFalse((sub / "manifest.json").exists(), failed.stdout)
             self.assertFalse((sub / "manifest.json.partial").exists())
             blocker.rmdir()
