@@ -380,7 +380,6 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_A2B10G10R10_UINT_PACK32:
     case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_R8G8B8A8_SNORM:
@@ -405,7 +404,6 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R8G8_SINT:
     case VK_FORMAT_R16_SFLOAT:
     case VK_FORMAT_R16_UNORM:
-    case VK_FORMAT_R5G6B5_UNORM_PACK16:
     case VK_FORMAT_D16_UNORM: return {2, 1};
     case VK_FORMAT_R8_UNORM: return {1, 1};
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
