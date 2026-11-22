@@ -41,6 +41,7 @@ import struct
 import sys
 import tempfile
 import zlib
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -266,14 +267,23 @@ def quat_rotate(q, v):
     return [v[0] + w * tx + (y * tz - z * ty), v[1] + w * ty + (z * tx - x * tz), v[2] + w * tz + (x * ty - y * tx)]
 
 
-def place(local, direction, position, rotation, scale_xy, scale_z):
+def place(
+    local: Sequence[float],
+    direction: Sequence[float] | None,
+    position: Sequence[float],
+    rotation: Sequence[float],
+    scale_xy: float | None,
+    scale_z: float | None,
+) -> tuple[list[float], list[float] | None]:
     """World position and direction of a model-space light under an entity's stored transform.
 
     The stored quaternion is the inverse of the entity rotation (docs/world.md), so it is conjugated here.
     """
     x, y, z, w = rotation
     q = (-x, -y, -z, w)
-    scaled = [local[0] * scale_xy, local[1] * scale_xy, local[2] * scale_z]
+    xy = 1.0 if scale_xy is None else scale_xy
+    z_scale = 1.0 if scale_z is None else scale_z
+    scaled = [local[0] * xy, local[1] * xy, local[2] * z_scale]
     p = quat_rotate(q, scaled)
     return [position[0] + p[0], position[1] + p[1], position[2] + p[2]], (quat_rotate(q, direction) if direction else None)
 
@@ -529,7 +539,7 @@ def inspect_resource(data, lights_out=False):
                     for L in lights:
                         local = [off[k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
                         p, d = place(local, L.get("direction"), t["position"], t["rotation"],
-                                     t["scaleXY"] or 1.0, t["scaleZ"] or 1.0)
+                                     t["scaleXY"], t["scaleZ"])
                         world.append(_light_row(p, d, L, "entity", t["archetypeName"]))
                 st["lights_entity_in_map_placed"] += len(lights)
         out["lights"] = st
@@ -687,7 +697,7 @@ def summarize(total, entities=None, lights_out=None):
                         for L in ls:
                             local = [L["offset"][k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
                             p, d = place(local, L.get("direction"), e["position"], e["rotation"],
-                                         e.get("scale_xy") or 1.0, e.get("scale_z") or 1.0)
+                                         e.get("scale_xy"), e.get("scale_z"))
                             out.write(json.dumps(_light_row(p, d, L, "archetype", a),
                                                  separators=(",", ":")) + "\n")
     finally:
@@ -748,6 +758,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.jobs < 1:
         print("ERROR: --jobs must be at least 1", file=sys.stderr)
+        return 2
+    if a.limit is not None and a.limit < 1:
+        print("ERROR: --limit must be at least 1", file=sys.stderr)
         return 2
     if not os.path.isfile(a.archive):
         print(f"ERROR: {a.archive}: no such file", file=sys.stderr)

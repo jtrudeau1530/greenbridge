@@ -84,6 +84,89 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
     assert.equal(attributes.get('role'), 'alert');
 });
 
+async function freecamFixture() {
+    const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
+    const canvas = {
+        addEventListener: (type, handler) => canvasEvents.set(type, handler),
+        requestPointerLock: async () => { throw new Error('pointer lock unavailable'); },
+    };
+    const start = { classList: { add() {}, toggle() {} } };
+    const document = {
+        pointerLockElement: null,
+        getElementById: id => id === 'start' ? start : { insertAdjacentHTML() {} },
+        addEventListener: (type, handler) => documentEvents.set(type, handler),
+    };
+    const source = viewerModule.split('// ---------- freecam ----------')[1].split('// ---------- chunk streaming ----------')[0];
+    const state = await vm.runInNewContext(`(async () => { ${source}\nreturn { yaw: () => yaw, keys }; })()`, {
+        THREE: { MathUtils: { clamp: (x, min, max) => Math.min(Math.max(x, min), max) } },
+        renderer: { domElement: canvas }, document,
+        addEventListener: (type, handler) => windowEvents.set(type, handler),
+        loadWorld: async () => ({}),
+    });
+    return {
+        ...state,
+        fallback: () => start.onclick(),
+        lock() { document.pointerLockElement = canvas; documentEvents.get('pointerlockchange')(); },
+        down: button => canvasEvents.get('mousedown')({ button }),
+        up: button => windowEvents.get('mouseup')({ button }),
+        move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
+        key: code => windowEvents.get('keydown')({ code }),
+        blur: () => windowEvents.get('blur')(),
+    };
+}
+
+test('drag-to-look requires a primary press and ignores a secondary release', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.down(2);
+    cam.move(2);
+    assert.equal(cam.yaw(), 0);
+    cam.down(0);
+    cam.move(1);
+    const afterDrag = cam.yaw();
+    assert.ok(afterDrag < 0);
+    cam.up(2);
+    cam.move(1);
+    assert.ok(cam.yaw() < afterDrag);
+    cam.up(0);
+    const afterRelease = cam.yaw();
+    cam.move(0);
+    assert.equal(cam.yaw(), afterRelease);
+});
+
+test('drag-to-look ends on the first move after a missed mouseup', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.down(0);
+    cam.move(1);
+    const yaw = cam.yaw();
+    cam.move(0);
+    assert.equal(cam.yaw(), yaw);
+    cam.move(1);
+    assert.equal(cam.yaw(), yaw, 'a new press must start on the canvas');
+});
+
+test('window blur clears pressed movement keys and ends drag-to-look', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.key('KeyW');
+    cam.down(0);
+    cam.move(1);
+    const yaw = cam.yaw();
+    assert.equal(cam.keys.has('KeyW'), true);
+    cam.blur();
+    assert.equal(cam.keys.size, 0);
+    cam.move(1);
+    assert.equal(cam.yaw(), yaw);
+});
+
+test('pointer lock turns the camera without a pressed mouse button', async () => {
+    const cam = await freecamFixture();
+    cam.lock();
+    cam.move(0);
+    assert.ok(cam.yaw() < 0);
+});
+
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
     const chunks = [worldChunk, { id: 'other', url: 'other.glb', bounds: [5, 6, 7, 8, 9, 10] }];
     const handlers = new Map();
@@ -485,3 +568,18 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     assert.equal(f.requests.at(-1).url, 'slod1.glb');
 });
 
+
+// The camera link in the URL hash (#cam=x,y,z,yaw,pitch) must round-trip and reject anything malformed.
+const helperSource = html.slice(html.indexOf('// Camera in the URL hash'), html.indexOf('async function loadWorld()'));
+const camHelpers = vm.runInNewContext(helperSource + '\n({ parseCamHash, formatCamHash })');
+
+test('camera hash round-trips and malformed hashes are ignored', () => {
+    const hash = camHelpers.formatCamHash([12.34, -5, 600], 1.5, -0.25);
+    assert.equal(hash, '#cam=12.3,-5.0,600.0,1.500,-0.250');
+    const cam = camHelpers.parseCamHash(hash);
+    assert.deepEqual(JSON.parse(JSON.stringify(cam)), { pos: [12.3, -5, 600], yaw: 1.5, pitch: -0.25 });
+    for (const bad of ['', '#', '#cam=', '#cam=1,2,3', '#cam=1,2,3,4,x', '#cam=1,2,3,4,Infinity',
+                       '#cam=1,2,,4,5', '#cam=1,2,3,4,5,6', '#other=1,2,3,4,5', undefined, null]) {
+        assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
+    }
+});

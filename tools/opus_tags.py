@@ -85,6 +85,8 @@ def retag(data: bytes, packet: bytes) -> bytes:
     segments = data[tags_at + 27:tags_at + 27 + data[tags_at + 26]]
     if not segments or segments[-1] == 255:
         raise ValueError("the OpusTags packet continues past page 1")
+    if any(segment != 255 for segment in segments[:-1]):
+        raise ValueError("the OpusTags page contains another packet")
     serial, seq = struct.unpack_from("<II", data, tags_at + 14)
     if seq != 1:
         raise ValueError("the OpusTags page is not page 1")
@@ -92,23 +94,19 @@ def retag(data: bytes, packet: bytes) -> bytes:
 
 
 def load_names(path, source=None):
-    """{bank label: {29-bit stream id: name}} from awc_names.py CSV. A bank read from an audio_manifest.json is
-    labelled with its archive path, ".awc" included; that is dropped so it matches awc_opus.py's folder."""
+    """{bank label: {29-bit stream id: name}} from awc_names.py CSV."""
     out = collections.defaultdict(dict)
-    with open(path, encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             if source and row.get("source") != source:
                 continue
-            bank = row["bank"].replace("\\", "/")
-            if bank.lower().endswith(".awc"):
-                bank = bank[:-4]
-            out[bank][int(row["stream_id"], 16) & 0x1FFFFFFF] = row["name"]
+            out[row["bank"].replace("\\", "/")][int(row["stream_id"], 16) & 0x1FFFFFFF] = row["name"]
     return dict(out)
 
 
 def load_dialogue(path):
     """{wave: row} from text_tables.py dialogue CSV, and the language codes in column order."""
-    with open(path, encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         langs = [f[5:] for f in reader.fieldnames or [] if f.startswith("text_")]
         return {row["wave"].lower(): row for row in reader}, langs
@@ -117,7 +115,7 @@ def load_dialogue(path):
 def comments(name, line, langs):
     out = [("TITLE", name)]
     if line:
-        texts = [(lang, clean(line.get(f"text_{lang}", ""))) for lang in langs]
+        texts = [(lang, clean(line.get(f"text_{lang}") or "")) for lang in langs]
         texts = [(lang, t) for lang, t in texts if t]
         main = dict(texts).get("en") or (texts[0][1] if texts else "")
         out += [("LABEL", line.get("label", "")), ("SPEAKER", line.get("speaker", "")), ("SUBTITLE", main)]
@@ -126,12 +124,16 @@ def comments(name, line, langs):
 
 
 def bank_names(names, rel_dir):
-    """The stream names of the bank in `rel_dir`, trying shorter paths from the left when the full path is unknown."""
+    """The stream names of the bank in `rel_dir`, trying shorter paths from the left when the full path is unknown.
+    Each path is tried as is, then with ".awc": awc_names.py labels a bank read from an audio_manifest.json with
+    its archive path, extension included, while awc_opus.py's folder has none. A label as is wins."""
     parts = rel_dir.split("/")
     for i in range(len(parts)):
-        found = names.get("/".join(parts[i:]))
-        if found is not None:
-            return found
+        path = "/".join(parts[i:])
+        for label in (path, path + ".awc"):
+            found = names.get(label)
+            if found is not None:
+                return found
     return None
 
 
