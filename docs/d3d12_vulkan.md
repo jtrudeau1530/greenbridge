@@ -315,9 +315,15 @@ side inwards:
   while it is also bound read-only (`DEPTH_READ` with a shader-resource state) is in
   `DEPTH_STENCIL_READ_ONLY_OPTIMAL` and is not handled.
 
+A typed single-sampled 3D texture can use a default SRV or an explicit `TEXTURE3D` SRV of the same format.
+The T# records the base depth and the view's mip range. Binding 6 holds the 3D Vulkan view, which has one
+array layer. `d3d12_descriptor_test` checks samples at four W coordinates through two views of the same
+volume. A nonzero `ResourceMinLODClamp` on a 3D view is logged and leaves a null descriptor.
+
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
-views of 1D, 3D and multisampled textures and of the stencil plane; descriptors the game writes itself, which need
+views of 1D and multisampled textures, 3D storage views, typeless volume SRVs and views of the stencil plane;
+descriptors the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
 of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan

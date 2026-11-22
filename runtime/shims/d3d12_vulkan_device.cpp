@@ -865,20 +865,31 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("views of the stencil plane are not supported; plane", int(view.plane));
         return false;
     }
-    // Every view here is a 2D one (plain, array or cube), which a volume or a multisampled image cannot back.
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count > 1) {
-        log_once("shader views of 3D and multisampled textures are not supported; dimension", int(desc.Dimension));
+    const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if ((volume != (view.type == g::ImageType::image_3d)) ||
+        (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) || desc.SampleDesc.Count > 1) {
+        log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
+        return false;
+    }
+    if (volume && (view.min_lod != 0 || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))) {
+        log_once("volume SRV requires shader access and a zero ResourceMinLODClamp; flags", int(desc.Flags));
         return false;
     }
     VkFormat named = resource.format();
     if (view.format != DXGI_FORMAT_UNKNOWN) named = vulkan_format(view.format, false).format;
+    if (volume && (vulkan_format(desc.Format, false).typeless ||
+                   (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format))) {
+        log_once("volume SRV requires a typed resource and matching view format; resource format", int(desc.Format));
+        return false;
+    }
     const std::uint32_t code = g::format_from_vulkan(named);
     const VkFormat view_format = code ? g::vulkan_view_format(resource.format(), code) : VK_FORMAT_UNDEFINED;
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
         return false;
     }
-    if (view.first_mip >= desc.MipLevels || view.first_layer >= desc.DepthOrArraySize) {
+    const UINT layers = volume ? 1 : desc.DepthOrArraySize;
+    if (view.first_mip >= desc.MipLevels || view.first_layer >= layers) {
         log_once("view starts past the texture's mips or layers; first mip", int(view.first_mip));
         return false;
     }
@@ -888,10 +899,11 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     out.type = view.type;
     out.width = std::uint32_t(desc.Width);
     out.height = desc.Height;
+    out.depth = volume ? desc.DepthOrArraySize : 1;
     out.first_mip = view.first_mip;
     out.mip_count = std::min<UINT>(view.mip_count, desc.MipLevels - view.first_mip);
     out.first_layer = view.first_layer;
-    out.layer_count = std::min<UINT>(view.layer_count, desc.DepthOrArraySize - view.first_layer);
+    out.layer_count = std::min<UINT>(view.layer_count, layers - view.first_layer);
     if (view.type == g::ImageType::cube) out.layer_count -= out.layer_count % 6;  // whole cubes
     out.resource_mips = desc.MipLevels;
     out.min_lod = view.min_lod;
@@ -1290,11 +1302,20 @@ public:
         if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
         TextureView view{};
         if (!desc) {
-            if (r->desc().DepthOrArraySize > 1) view.type = leonida::gfx10::ImageType::image_2d_array;
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                view.type = leonida::gfx10::ImageType::image_3d;
+            else if (r->desc().DepthOrArraySize > 1)
+                view.type = leonida::gfx10::ImageType::image_2d_array;
         } else {
             view.format = desc->Format;
             view.mapping = desc->Shader4ComponentMapping;
             switch (desc->ViewDimension) {
+            case D3D12_SRV_DIMENSION_TEXTURE3D:
+                view.type = leonida::gfx10::ImageType::image_3d;
+                view.first_mip = desc->Texture3D.MostDetailedMip;
+                view.mip_count = desc->Texture3D.MipLevels;
+                view.min_lod = desc->Texture3D.ResourceMinLODClamp;
+                break;
             case D3D12_SRV_DIMENSION_TEXTURE2D:
                 view.first_mip = desc->Texture2D.MostDetailedMip;
                 view.mip_count = desc->Texture2D.MipLevels;

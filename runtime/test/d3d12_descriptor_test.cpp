@@ -8,6 +8,7 @@
 //     and with a slot holding bytes no view was made for, which must give the fallback image. The sampler wraps
 //     in U and the shader samples one tile to the right, so a missed S# would show as well (the fallback
 //     sampler clamps).
+//   - Default and mip-1 volume SRVs: sample a 4x4x4 grid through each view of one uploaded 8x8x4 texture.
 //   - UINT border colours (#538, Vonsek's case): an R8G8B8A8_UINT texture sampled one tile to the right through
 //     CreateSampler2 samplers that clamp to a UINT (0,0,0,0) and (1,1,1,1) border, and a float white border on
 //     the UNORM texture. Every texel is the border: 0, 1 and 255 in each channel. Both white borders are built in
@@ -335,7 +336,7 @@ int main() {
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         const UINT sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         Ref<ID3D12DescriptorHeap> view_heap, sampler_heap;
-        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 10,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&view_heap.p))));
         heap_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -488,16 +489,41 @@ int main() {
         read_view.Texture2D.MostDetailedMip = 2;
         device->CreateShaderResourceView(writable.p, &read_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
-        // A volume has no 2D view: neither the default view nor an explicit one may become a 2D-array T#.
+        // A volume has a depth, one Vulkan array layer and a view-relative mip range.
         D3D12_RESOURCE_DESC volume_desc = texture_desc;
         volume_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         volume_desc.DepthOrArraySize = 4;
+        volume_desc.MipLevels = 2;
         Ref<ID3D12Resource> volume;
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &volume_desc,
-                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&volume.p))));
-        std::memset(view_bytes(null_slot), 0x77, step);
-        device->CreateShaderResourceView(volume.p, nullptr, view_slot(null_slot));
+        constexpr UINT volume_all = 8, volume_mip = 9;
+        device->CreateShaderResourceView(volume.p, nullptr, view_slot(volume_all));
+        g::Image vol{};
+        EXPECT(image_at(volume_all, vol) && vol.type == g::ImageType::image_3d);
+        EXPECT(vol.width == size && vol.height == size && vol.depth == 4 && vol.layer_count == 1);
+        EXPECT(vol.first_mip == 0 && vol.mip_count == 2);
+        D3D12_SHADER_RESOURCE_VIEW_DESC volume_view{};
+        volume_view.Format = volume_desc.Format;
+        volume_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        volume_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        volume_view.Texture3D = {1, 1, 0};
+        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(volume_mip));
+        EXPECT(image_at(volume_mip, vol) && vol.type == g::ImageType::image_3d);
+        EXPECT(vol.first_mip == 1 && vol.mip_count == 1 && vol.depth == 4 && vol.resource_mips == 2);
+        volume_view.Texture3D.MostDetailedMip = 2;
+        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
+        volume_view.Texture3D.MostDetailedMip = 0;
+        device->CreateShaderResourceView(texture.p, &volume_view, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
+        volume_view.Texture3D.ResourceMinLODClamp = 0.5f;
+        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
+        volume_view.Texture3D.ResourceMinLODClamp = 0;
+        volume_view.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
         D3D12_SHADER_RESOURCE_VIEW_DESC flat_view{};
         flat_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -507,7 +533,19 @@ int main() {
         std::memset(view_bytes(null_slot), 0x77, step);
         device->CreateShaderResourceView(volume.p, &flat_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
-        volume.reset();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT volume_placed[2]{};
+        device->GetCopyableFootprints(&volume_desc, 0, 2, 4096, volume_placed, nullptr, nullptr, nullptr);
+        for (UINT mip = 0; mip < 2; ++mip) {
+            const auto& fp = volume_placed[mip].Footprint;
+            for (UINT z = 0; z < fp.Depth; ++z)
+                for (UINT y = 0; y < fp.Height; ++y)
+                    for (UINT x = 0; x < fp.Width; ++x) {
+                        const std::uint8_t rgba[]{std::uint8_t(x * 19), std::uint8_t(y * 23),
+                                                  std::uint8_t(z * 53), std::uint8_t(mip ? 101 : 237)};
+                        const auto offset = volume_placed[mip].Offset + (z * fp.Height + y) * fp.RowPitch + 4 * x;
+                        std::memcpy(static_cast<std::uint8_t*>(mapped) + offset, rgba, 4);
+                    }
+        }
         cube.reset();
         writable.reset();
 
@@ -533,10 +571,17 @@ int main() {
         to_texture.pResource = uint_texture.p;
         from_upload.PlacedFootprint = uint_placed;
         list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        to_texture.pResource = volume.p;
+        for (UINT mip = 0; mip < 2; ++mip) {
+            to_texture.SubresourceIndex = mip;
+            from_upload.PlacedFootprint = volume_placed[mip];
+            list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        }
         const D3D12_RESOURCE_BARRIER sampled[] = {
             transition(texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
-        list->ResourceBarrier(2, sampled);
+            transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+        list->ResourceBarrier(UINT(std::size(sampled)), sampled);
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -559,6 +604,26 @@ int main() {
         }
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
+
+        SampleKeys volumes[2]{};
+        std::array<std::uint8_t, 2 * bytes> volume_pixels{};
+        for (UINT mip = 0; mip < 2; ++mip) {
+            std::memcpy(volumes[mip].tsharp, view_bytes(mip ? volume_mip : volume_all), sizeof(volumes[mip].tsharp));
+            std::memcpy(volumes[mip].ssharp, sampler_bytes, sizeof(volumes[mip].ssharp));
+            volumes[mip].first = mip * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, volumes, volume_pixels.data()));
+        unsigned volume_errors = 0;
+        for (UINT mip = 0; mip < 2; ++mip)
+            for (UINT i = 0; i < texels; ++i) {
+                const UINT x = i % 4, y = (i / 4) % 4, z = i / 16;
+                const std::uint8_t expected[]{
+                    std::uint8_t((mip ? x : 2 * x + 1) * 19), std::uint8_t((mip ? y : 2 * y + 1) * 23),
+                    std::uint8_t((mip ? z / 2 : z) * 53), std::uint8_t(mip ? 101 : 237)};
+                if (std::memcmp(&volume_pixels[(mip * texels + i) * 4], expected, 4)) ++volume_errors;
+            }
+        std::printf("volume SRVs: %u of %u sampled RGBA texels differ\n", volume_errors, 2 * texels);
+        EXPECT(volume_errors == 0);
 
         // The border samplers, one tile to the right: every texel is the border.
         SampleKeys border_keys[3] = {};
@@ -590,6 +655,7 @@ int main() {
 #endif
 
         upload.reset();
+        volume.reset();
         uint_texture.reset();
         view_heap.reset();
         sampler_heap.reset();
