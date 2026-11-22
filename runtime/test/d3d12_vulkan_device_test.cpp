@@ -320,6 +320,7 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
 
 // The host PC runtime's D3D12 device to compare answers with: the default adapter, or the one LEONIDA_HOST_ADAPTER
 // names ("warp", or part of an adapter's name); false if there is none.
+// Under Wine there is none (copycmp::create_host).
 bool create_host_device(Ref<ID3D12Device>& host) {
     copycmp::Ptr<ID3D12Device> device;
     std::string name;
@@ -1126,6 +1127,7 @@ int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts)
 // highest supported value clamped to what the layer can honour (DXIL 1.0, root signature 1.1). Returns the number
 // of mismatches, or -1 when the host has no D3D12 device.
 int compare_feature_support(ID3D12Device* ours) {
+    if (copycmp::host_is_wine()) return -1;
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
                                     reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
@@ -1232,6 +1234,7 @@ int compare_feature_support(ID3D12Device* ours) {
 bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physical,
                                      PFN_vkGetInstanceProcAddr instance_proc, Ref<ID3D12Device>& host,
                                      std::string& adapter_name) {
+    if (copycmp::host_is_wine()) return false;
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
                                     reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
