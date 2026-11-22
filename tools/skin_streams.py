@@ -325,12 +325,15 @@ def validate(mesh, gfx, layout):
                     t["weighted-components"] += 1
                     if idx >= mesh.bones:
                         t["components-out-of-range"] += 1
-            else:  # 4-byte index rows, masked by the matching weight row
+            else:  # four 8-bit or 16-bit indices per vertex, masked by the matching weights
+                wide = len(row) == 8 * n
                 for v in range(n):
-                    for c in range(4):
-                        if weights is None or weights[4 * v + c]:
+                    base = 4 * v
+                    joints = struct.unpack_from("<4H", row, 2 * base) if wide else row[base:base + 4]
+                    for c, joint in enumerate(joints):
+                        if weights is None or weights[base + c]:
                             t["weighted-components"] += 1
-                            if row[4 * v + c] >= mesh.bones:
+                            if joint >= mesh.bones:
                                 t["components-out-of-range"] += 1
     return t
 

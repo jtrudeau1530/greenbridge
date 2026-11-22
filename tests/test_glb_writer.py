@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -475,6 +476,56 @@ class TestGlbMaterialsAndTextures(unittest.TestCase):
 class TestGlbWriterValidationAndErrors(unittest.TestCase):
     """Tests error cases and validation in build_glb and helper functions."""
 
+    def test_each_position_has_three_components_before_normals_are_generated(self):
+        # The total is nine floats, but flattening these rows moves 9 into the next vertex's X.
+        positions = [(0.0, 0.0, 0.0, 9.0), (1.0, 0.0), (0.0, 1.0, 0.0)]
+        for code in (glb_writer._FLOAT32_CODE, None):
+            for has_normals in (False, True):
+                with self.subTest(packing=code, has_normals=has_normals):
+                    prim = _simple_triangle_primitive(has_normals=has_normals)
+                    prim["positions"] = positions
+                    with mock.patch.object(glb_writer, "_FLOAT32_CODE", code):
+                        with self.assertRaisesRegex(glb_writer.GlbError, "expected 3 floats per vertex"):
+                            glb_writer.build_glb([prim])
+
+    def test_invalid_indices_without_normals_raise_glb_error(self):
+        for invalid in (3, -4):
+            with self.subTest(index=invalid):
+                prim = _simple_triangle_primitive(has_normals=False)
+                prim["indices"] = [0, 1, invalid]
+                with self.assertRaisesRegex(glb_writer.GlbError, "index out of range"):
+                    glb_writer.build_glb([prim])
+
+    def test_valid_triangle_packing_with_generated_and_explicit_normals(self):
+        positions = struct.pack("<9f", 0, 0, 0, 1, 0, 0, 0, 1, 0)
+        normals = struct.pack("<9f", 0, 0, 1, 0, 0, 1, 0, 0, 1)
+        indices = struct.pack("<3H", 0, 1, 2)
+        for code in (glb_writer._FLOAT32_CODE, None):
+            for has_normals in (False, True):
+                with self.subTest(packing=code, has_normals=has_normals):
+                    prim = _simple_triangle_primitive(has_normals=has_normals)
+                    with mock.patch.object(glb_writer, "_FLOAT32_CODE", code):
+                        packed = glb_writer.pack_primitive(prim)
+                    self.assertEqual(packed["positions"], positions)
+                    self.assertEqual(packed["normals"], normals)
+                    self.assertEqual(packed["indices"], indices)
+                    self.assertEqual(packed["min"], [0.0, 0.0, 0.0])
+                    self.assertEqual(packed["max"], [1.0, 1.0, 0.0])
+
+    def test_malformed_positions_do_not_replace_an_existing_glb(self):
+        prim = _simple_triangle_primitive()
+        prim["positions"] = [(0.0, 0.0, 0.0, 9.0), (1.0, 0.0), (0.0, 1.0, 0.0)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "model.glb")
+            previous = glb_writer.build_glb([_simple_triangle_primitive()])
+            with open(path, "wb") as f:
+                f.write(previous)
+            with self.assertRaisesRegex(glb_writer.GlbError, "expected 3 floats per vertex"):
+                glb_writer.write_glb(path, [prim])
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), previous)
+            self.assertEqual(os.listdir(folder), ["model.glb"])
+
     def test_empty_primitives_raises_error(self):
         with self.assertRaises(glb_writer.GlbError):
             glb_writer.build_glb([])
@@ -671,6 +722,21 @@ class TestWriteGlbFilesystem(unittest.TestCase):
 class TestObjParserAndBounds(unittest.TestCase):
     """Tests Wavefront OBJ parsing, coordinate transforms, UV flipping, and bounds."""
 
+    def test_utf8_bom_preserves_first_obj_record(self) -> None:
+        text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
+        expected = glb_writer.parse_obj(text, is_path=False)
+        self.assertEqual(expected[0]["indices"], [0, 1, 2])
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "triangle.obj")
+            with open(source, "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write(text)
+            with self.subTest(source="file"):
+                self.assertEqual(glb_writer.parse_obj(source), expected)
+
+        with self.subTest(source="in-memory text"):
+            self.assertEqual(glb_writer.parse_obj("\ufeff" + text, is_path=False), expected)
+
     def test_parse_obj_zup_to_yup(self):
         # OBJ coordinate (1, 2, 3) in Z-up becomes (1, 3, -2) in glTF Y-up
         obj_text = "\n".join([
@@ -717,6 +783,31 @@ class TestObjParserAndBounds(unittest.TestCase):
         self.assertAlmostEqual(uvs[1][1], 0.8)   # 1.0 - 0.2
         self.assertAlmostEqual(uvs[2][0], 0.0)
         self.assertAlmostEqual(uvs[2][1], 0.0)   # 1.0 - 1.0
+
+    def test_glb_preserves_finite_obj_normal_directions(self) -> None:
+        obj = """\
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vn 1e-200 0 0
+vn 1.7e308 0 1.7e308
+vn 5e-324 0 5e-324
+f 1//1 2//2 3//3
+"""
+        primitives = glb_writer.parse_obj(obj, is_path=False, up_axis="y")
+        data = glb_writer.build_glb(primitives)
+        gltf = glb_writer.read_glb_summary(data)["json"]
+        normal_idx = gltf["meshes"][0]["primitives"][0]["attributes"]["NORMAL"]
+        normals = gltf["accessors"][normal_idx]
+        view = gltf["bufferViews"][normals["bufferView"]]
+        json_len, = struct.unpack_from("<I", data, 12)
+        offset = 28 + json_len + view.get("byteOffset", 0) + normals.get("byteOffset", 0)
+        values = struct.unpack_from("<9f", data, offset)
+
+        h = math.sqrt(0.5)
+        for i, expected in enumerate((1.0, 0.0, 0.0, h, 0.0, h, h, 0.0, h)):
+            with self.subTest(component=i):
+                self.assertAlmostEqual(values[i], expected, places=7)
 
     def test_parse_obj_generated_normals_cross_uv_seams(self):
         # The second triangle has twice the area of the first and a different UV

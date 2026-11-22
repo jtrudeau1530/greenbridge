@@ -12,11 +12,12 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "manifest_verifier.py")
@@ -101,6 +102,27 @@ class TestManifestVerifier(unittest.TestCase):
         for rel in items:
             self.assertNotIn("\\", rel)
 
+    def test_posix_backslash_filename_cannot_match_a_nested_path(self) -> None:
+        payload = b"same bytes as the expected file"
+        nested = "nested/echo.bin"
+        literal_name = r"nested\echo.bin"
+        self.write_manifest(self.manifest_path, {nested: payload})
+
+        # Simulate POSIX directory entries even on Windows, where a filename cannot contain a literal backslash.
+        target = "/target"
+        posix_os = Mock(sep="/", path=Mock(wraps=posixpath))
+        posix_os.path.isdir.return_value = True
+        posix_os.path.isfile.side_effect = os.path.isfile
+        posix_os.path.getsize.return_value = len(payload)
+        posix_os.walk.return_value = [(target, [], [literal_name])]
+        with (patch.object(mv, "os", posix_os),
+              patch.object(mv, "sha256_file", return_value=hashlib.sha256(payload).hexdigest()) as hash_file):
+            report = mv.verify_manifest(target, self.manifest_path)
+        self.assertFalse(report.passed)
+        self.assertEqual(report.missing, [nested])
+        self.assertEqual(report.untracked, [literal_name])
+        hash_file.assert_not_called()
+
     def test_load_manifest_valid_and_case_insensitive(self) -> None:
         manifest_upper = os.path.join(self.root, "manifest_upper.json")
         self.write_manifest(manifest_upper, self.payloads, upper_hash=True)
@@ -149,6 +171,25 @@ class TestManifestVerifier(unittest.TestCase):
                     mv.load_manifest(bad_path)
                 self.assertIn(bad_path, str(cm.exception))
                 self.assertIn("nested/a.bin", str(cm.exception))
+
+    def test_cli_rejects_duplicate_json_keys(self) -> None:
+        digest = hashlib.sha256(self.payloads["alpha.bin"]).hexdigest()
+        entries = f'{{"alpha.bin": "wrong", "alpha.bin": "{digest}"}}'
+        cases = (
+            ("alpha.bin", entries),
+            ("alpha.bin", f'{{"files": {entries}}}'),
+            ("files", '{"files": {"missing.bin": "wrong"}, "files": {}}'),
+            ("sha256", f'{{"files": {{"alpha.bin": {{"sha256": "wrong", "sha256": "{digest}"}}}}}}'),
+        )
+        for key, document in cases:
+            with self.subTest(document=document):
+                with open(self.manifest_path, "w", encoding="utf-8") as f:
+                    f.write(document)
+                result = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--quiet")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("duplicate JSON key", result.stderr)
+                self.assertIn(repr(key), result.stderr)
+                self.assertIn(self.manifest_path, result.stderr)
 
     def test_load_manifest_single_spelling_control(self) -> None:
         digest = hashlib.sha256(b"x").hexdigest()

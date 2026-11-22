@@ -22,9 +22,8 @@
 
 #include "vulkan_backend.h"
 
-// Both extension names share the structures (the KHR one was promoted from the EXT one); headers older than the
-// promotion do not have the KHR types, and the presenter then never tears.
-#if defined(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
+// Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
+#if defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
 #define LEONIDA_SWAPCHAIN_MAINTENANCE1 1
 #endif
 
@@ -225,11 +224,12 @@ public:
     }
 
     // The last presented frame as the swapchain stores it (4 bytes a texel, rows tightly packed, format() order).
-    // Waits for the frame to finish. False when nothing was presented since enable_capture().
+    // Waits for the frame to finish. False if no captured frame is available or the wait fails.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
         if (!capture_ || !capture_ptr_ || !captured_) return false;
         const Frame& frame = frames_[(frame_index_ + frames_.size() - 1) % frames_.size()];
-        vkWaitForFences_(context_.device(), 1, &frame.done, VK_TRUE, UINT64_MAX);
+        if (vkWaitForFences_(context_.device(), 1, &frame.done, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            return false;
         pixels.assign(capture_ptr_, capture_ptr_ + std::size_t(captured_extent_.width) * captured_extent_.height * 4);
         if (extent) *extent = captured_extent_;
         if (format) *format = captured_format_;
@@ -315,7 +315,7 @@ public:
         present.pImageIndices = &image;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // The swapchain was created with FIFO and tear_mode_ (both come from the same recreate).
-        VkSwapchainPresentModeInfoKHR present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR};
+        VkSwapchainPresentModeInfoEXT present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT};
         const bool tearing = tear && vsync_ && tear_supported();
         if (tearing) {
             present_mode.swapchainCount = 1;
@@ -694,7 +694,7 @@ private:
         info.presentMode = mode;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // A vsync swapchain that can also be presented in IMMEDIATE (or FIFO_RELAXED), switched per present.
-        VkSwapchainPresentModesCreateInfoKHR switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR};
+        VkSwapchainPresentModesCreateInfoEXT switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT};
         std::array<VkPresentModeKHR, 2> switchable_modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAX_ENUM_KHR};
         VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
         if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
@@ -762,11 +762,11 @@ private:
         // The capabilities of the surface for one present mode, and the modes it can switch to from there.
         const auto ask = [&](VkPresentModeKHR asked, VkSurfaceCapabilitiesKHR& caps,
                              std::array<VkPresentModeKHR, 16>* compatible, std::uint32_t* compatible_count) {
-            VkSurfacePresentModeKHR for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR};
+            VkSurfacePresentModeEXT for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT};
             for_mode.presentMode = asked;
             VkPhysicalDeviceSurfaceInfo2KHR surface_info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &for_mode};
             surface_info.surface = surface_;
-            VkSurfacePresentModeCompatibilityKHR compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR};
+            VkSurfacePresentModeCompatibilityEXT compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT};
             if (compatible) {
                 compat.presentModeCount = std::uint32_t(compatible->size());
                 compat.pPresentModes = compatible->data();

@@ -153,6 +153,16 @@ struct hash, byte size, `u64` pointer. The pointers are `0x50000000 | file offse
 reach an appended graphics page. Fields are not named on disk. Their 32-bit hashes are the **case-sensitive
 joaat** of the engine names; matching those hashes is how the fields below were identified.
 
+The member `type` byte uses the PSIN type enum ([psin.md](psin.md#layouts)). Measured in the `CMapData`
+(`d3593fa6`) and `CEntityDef` (`ce501483`) member tables of three carved `levels.rpf` maps: `0x34` is the
+`4×f32` quaternion (`rotation`), `0x32` a 12-byte vec3 (`position`), `0x33` its 16-byte padded form (the four
+extent triples), `0x21` f32 (`scaleXY`, `scaleZ`, `lodDist`, `childLodDist`), `0x12` i16 (`parentIndex`,
+`parentInstance`), `0x15` u32 (`flags`, `numChildren`), `0x08` u64 (`entity id`), `0x60` an 8-bit enum
+(`lodLevel`, `priorityLevel`), `0x4A` a u32 name hash, `0x52` and `0x5C` the two array forms, and `0x05` a struct
+reference whose `extra` word is the referenced struct hash. `0x0C` is a 16-byte vector in the PSIN table but did
+not occur in these schemas. 6stars independently reads these members with the same codes; no code or table was
+copied, and its repository has no licence.
+
 Every 0x7a header is checked the same way: the struct/instance table pointers must lie inside the stream, every
 struct's member table must lie inside the stream, and at least one block must have a known struct and a
 resolvable pointer. A block whose struct hash is not in the table is kept opaque rather than guessed (some

@@ -670,6 +670,36 @@ class NavmeshDecodeTest(unittest.TestCase):
                 with open(archive, "rb") as f:
                     self.assertEqual(f.read(), original, f"{flag} touched the input")
 
+    def test_cli_protects_carved_inputs_from_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            source = os.path.join(carve, "000000.bin")
+            original = build_navmesh()[0]
+            with open(source, "wb") as f:
+                f.write(original)
+            alias = os.path.join(tmp, "alias.csv")
+            os.link(source, alias)
+
+            out = os.path.join(carve, "report.json")
+            csv_path = os.path.join(carve, "report.csv")
+            command = [sys.executable, "-I", TOOL, carve, "--quiet"]
+            for _ in range(2):
+                result = subprocess.run([*command, "--out", out, "--csv", csv_path],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            for flag, target in (("--out", source), ("--csv", source), ("--csv", alias)):
+                with self.subTest(flag=flag, target=target):
+                    with open(source, "wb") as f:
+                        f.write(original)
+                    result = subprocess.run([*command, flag, target], cwd=tmp,
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("would overwrite the input", result.stderr)
+                    with open(source, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty.rpf")

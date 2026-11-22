@@ -693,15 +693,21 @@ def scan_archive(carve, arch):
             d = int(q[k + 4]).to_bytes(8, "little")
             w, h, depth = int.from_bytes(d[0:2], "little"), int.from_bytes(d[2:4], "little"), int.from_bytes(d[4:6], "little")
             fmt = d[7]
-            if fmt not in DXGI or not (4 <= w <= 16384 and 4 <= h <= 16384 and 1 <= depth <= 2048):
+            if fmt not in DXGI or not (1 <= w <= 16384 and 1 <= h <= 16384 and 1 <= depth <= 2048):
+                continue
+            flags = int(q[k + 5])
+            mips = (flags >> 16) & 0xFF
+            dtype = int(q[k - 1])
+            # Small dimensions need the known texture type and a mip count that fits the extent.
+            if min(w, h) < 4 and (dtype != 0x980 or not 1 <= mips <= calc_mipmap_count(w, h, depth)):
                 continue
             # Real texture data is 256-byte aligned (4 KB in every verified case); unaligned hits are other structs.
             if (int(q[k]) & 0xFF) != 0:
                 continue
             out.append({"archive": arch, "cpu": v["off"], "gpu": g["off"], "gpu_size": g["size"], "gpu_chain": chain,
                         "data_off": int(q[k]) & 0x0FFFFFFF, "w": w, "h": h, "depth": depth, "b6": d[6], "fmt": fmt,
-                        "fmt_name": DXGI.get(fmt, f"dxgi{fmt}"), "flags": int(q[k + 5]), "packed": int(q[k - 2]),
-                        "dtype": int(q[k - 1]), "mips": (int(q[k + 5]) >> 16) & 0xFF, "q_index": k})
+                        "fmt_name": DXGI.get(fmt, f"dxgi{fmt}"), "flags": flags, "packed": int(q[k - 2]),
+                        "dtype": dtype, "mips": mips, "q_index": k})
     return out
 
 
