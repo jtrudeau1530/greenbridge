@@ -855,7 +855,7 @@ def decode_index_runs(blob, grid_entries=None):
     groups = 0
     hashes = set()
     values = 0
-    index_max = 0
+    index_max = None
     ascending = True
     marker_ok = True
     while at < len(vals):
@@ -873,7 +873,8 @@ def decode_index_runs(blob, grid_entries=None):
         if any(run[i] >= run[i + 1] for i in range(len(run) - 1)):
             ascending = False
         if run:
-            index_max = max(index_max, run[-1])
+            run_max = max(run)
+            index_max = run_max if index_max is None else max(index_max, run_max)
         values += length
         at += 3 + length
         groups += 1
@@ -888,7 +889,7 @@ def decode_index_runs(blob, grid_entries=None):
     if grid_entries is None:
         out["indices_within_grid"] = None
     else:
-        out["indices_within_grid"] = index_max < grid_entries
+        out["indices_within_grid"] = True if index_max is None else index_max < grid_entries
     return out
 
 

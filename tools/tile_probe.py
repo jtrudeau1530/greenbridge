@@ -72,10 +72,10 @@ def layout(nblocks, wblocks, mode, bpe):
     return y * wblocks + x
 
 
-def score(img):
-    dx = np.abs(np.diff(img, axis=1)).mean()
-    dy = np.abs(np.diff(img, axis=0)).mean()
-    return dx + dy
+def score(img: np.ndarray) -> float:
+    """Sum the mean color differences along axes with neighboring blocks."""
+    return float(sum(np.abs(np.diff(img, axis=axis)).mean()
+                     for axis in (1, 0) if img.shape[axis] > 1))
 
 
 def probe(data: bytes, offset=0):

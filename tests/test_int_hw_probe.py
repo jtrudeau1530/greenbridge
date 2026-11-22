@@ -121,6 +121,40 @@ class IntHwProbeTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("WAVE_DIFF", out.getvalue())
 
+    def test_json_preflight_rejects_bad_paths_before_hw_or_translator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing_file = os.path.join(tmp, "not_a_dir")
+            Path(existing_file).write_text("x", encoding="utf-8")
+            bad_paths = [
+                "",
+                "   ",
+                tmp,
+                os.path.join(existing_file, "out.json"),
+                os.path.join(existing_file, "nested", "out.json"),
+            ]
+            for bad in bad_paths:
+                with self.subTest(json_path=bad):
+                    err = io.StringIO()
+                    with unittest.mock.patch.object(probe, "run_translator", side_effect=AssertionError("ran translator")), \
+                         unittest.mock.patch.object(probe, "run_hw", side_effect=AssertionError("opened hw_oracle")), \
+                         unittest.mock.patch.object(hw_runner, "open_oracle", side_effect=AssertionError("opened oracle")), \
+                         redirect_stderr(err):
+                        rc = probe.main(["--oracle", "both", "--group", "salu_bfe_past31", "--json", bad])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("ERROR:", err.getvalue())
+
+    def test_json_write_oserror_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "out.json")
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(probe, "run_translator", return_value={"s_bfe_i32_past31": [0], "s_bfe_u32_past31": [0], "s_bfe_i32_width0": [0]}), \
+                 unittest.mock.patch("builtins.open", side_effect=OSError("disk full")), \
+                 redirect_stdout(out), redirect_stderr(err):
+                rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertIn("disk full", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

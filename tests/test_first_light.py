@@ -11,17 +11,23 @@ all-opaque and swapped-UV negatives stay red.
 The image is written to the directory as image_first_light.raw/.ppm; no game data is in the repository.
 """
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
+from pathlib import Path
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import first_light as fl
+from spirv_stubs import build_ps_stub, build_vs_stub
 
 CLEAR = fl.CLEAR
 check_image = fl.check_image
@@ -39,6 +45,26 @@ def harness() -> str | None:
         if path and os.path.isfile(path):
             return path
     return None
+
+
+class MeshOutputTests(unittest.TestCase):
+    def test_fit_keeps_relative_depth_for_an_offset_mesh(self) -> None:
+        import tempfile
+
+        vertices = [(-2.0, -1.0, 900.0, 0.0, 0.0),
+                    (2.0, -1.0, 901.0, 1.0, 0.0),
+                    (0.0, 1.0, 902.0, 0.5, 1.0)]
+        fitted = fl.fit(vertices, 128, 128, True, False)
+        with tempfile.TemporaryDirectory() as directory:
+            mesh = os.path.join(directory, "mesh.bin")
+            fl.write_mesh(mesh, fitted, [0, 1, 2])
+            with open(mesh, "rb") as handle:
+                encoded = handle.read()
+
+        records = encoded[fl.MESH_HEADER.size:fl.MESH_HEADER.size + 3 * 20]
+        depth = b"".join(records[offset + 8:offset + 12] for offset in (0, 20, 40))
+        self.assertEqual(depth, struct.pack("<3f", 0.05, 0.5, 0.95))
+        self.assertEqual(encoded[-12:], struct.pack("<3I", 0, 1, 2))
 
 
 class FirstLightTests(unittest.TestCase):
@@ -121,6 +147,51 @@ class FirstLightTests(unittest.TestCase):
             )
 
 
+class ShaderPreparationTests(unittest.TestCase):
+    def test_same_display_name_keeps_both_stage_files(self) -> None:
+        modules = {"vs": build_vs_stub([0]), "ps": build_ps_stub([0])}
+        entries = [
+            {"name": "shared", "file": "shared.dxbc", "stage": "vs"},
+            {"name": "shared", "file": "shared~1.dxbc", "stage": "ps"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            dxbc = work / "shaders" / "dxbc"
+            dxbc.mkdir(parents=True)
+            (dxbc / "index.json").write_text(json.dumps(entries), encoding="utf-8", newline="\n")
+            for entry in entries:
+                (dxbc / entry["file"]).write_bytes(entry["stage"].encode("ascii"))
+
+            def write_translation(argv: list[str]) -> None:
+                if Path(argv[0]).name != "rdna2spirv.py":
+                    return
+                staged = work / "first_light" / "dxbc"
+                picked = json.loads((staged / "index.json").read_text(encoding="utf-8"))
+                self.assertEqual(picked, entries)
+                spirv = Path(argv[argv.index("--out") + 1])
+                spirv.mkdir()
+                index = {}
+                for entry in picked:
+                    stage = entry["stage"]
+                    self.assertEqual((staged / entry["file"]).read_bytes(), stage.encode("ascii"))
+                    stem = Path(entry["file"]).stem
+                    (spirv / f"{stem}.spv").write_bytes(modules[stage])
+                    index[stem] = {"stage": stage, "fssm_sha256": stage + "-fixture"}
+                (spirv / "index.json").write_text(json.dumps(index), encoding="utf-8", newline="\n")
+
+            with patch.object(fl, "run", side_effect=write_translation), redirect_stdout(io.StringIO()):
+                self.assertEqual(fl.main(["--game", tmp, "--work", tmp, "--no-fit",
+                                          "--vs", "shared", "--ps", "shared"]), 0)
+            out = work / "first_light" / "out"
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            runtime_index = json.loads((out / "index.json").read_text(encoding="utf-8"))
+            for stage, module in modules.items():
+                self.assertEqual((out / manifest["files"][stage]).read_bytes(), module)
+                self.assertEqual((out / f"{stage}.dxbc").read_bytes(), stage.encode("ascii"))
+                self.assertEqual(runtime_index[stage]["fssm_sha256"], stage + "-fixture")
+                self.assertEqual(manifest[stage]["fssm_sha256"], stage + "-fixture")
+
+
 class OracleTests(unittest.TestCase):
     """The readback oracle on synthetic images: the controls run without a GPU or a game package."""
 
@@ -160,6 +231,46 @@ class OracleTests(unittest.TestCase):
     def test_rejects_a_short_image(self):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
+
+
+class ReadObjTests(unittest.TestCase):
+    """Wavefront OBJ parsing in tools/first_light.py without a GPU or game package."""
+
+    def _write_obj(self, text: str) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "mesh.obj")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return path
+
+    def test_negative_relative_indices_inline_comments_and_continuations(self):
+        positive = self._write_obj(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+            "vt 0.1 0.2\nvt 0.3 0.4\nvt 0.5 0.6\n"
+            "f 1/1 2/2 3/3\n"
+        )
+        relative = self._write_obj(
+            "v 0 0 0 # origin\n"
+            "v 1 0 0\n"
+            "v 0 1 0\n"
+            "vt 0.1 0.2 # uv0\n"
+            "vt 0.3 0.4\n"
+            "vt 0.5 0.6\n"
+            "f -3/-3 \\\n"
+            "  -2/-2 -1/-1 # trailing comment\n"
+        )
+        self.assertEqual(fl.read_obj(relative), fl.read_obj(positive))
+
+    def test_rejects_zero_and_out_of_range_vertex_indices(self):
+        for bad in (
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 4\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -4 -2 -1\n",
+            "v 0 0\nf 1 1 1\n",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                fl.read_obj(self._write_obj(bad))
 
 
 if __name__ == "__main__":
