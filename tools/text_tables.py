@@ -7,11 +7,14 @@ continuation streams):
 
 ```
 descriptor   ptr index | u32 | u32 0x10 | ptr | 01 01 00 00 | u32 hash_bytes | ptr hash
-             | u32 0x10 | u32 blob_bytes | ptr blob
+             | u32 0x10 | u32 blob_bytes | ptr blob | ... more 16-byte entries
 hash entry   16 bytes: u32 joaat(lowercase label), u32 0, u8 1, u8[2], u24 index (at +11), u8
-index entry  16 bytes: u64, u64 (blob offset << 20 | flags)
-blob         NUL-terminated UTF-8 strings
+index entry  16 bytes: u64, u64 (blob offset << 20 | flags, blob chunk = flags & 3)
+blob         NUL-terminated UTF-8 strings, in one or more chunks
 ```
+
+From the blob entry on, the descriptor is a run of 16-byte entries (u32 tag, u32 bytes, pointer). A blob of more than
+1 MiB is split into several tag-0x10 chunks, and an index entry names its chunk in its low bits (docs/text.md).
 
 Conversation data pairs a dialogue key with its line labels as ``<ROOT>AU_<XXXX>\\0<LABEL>\\0``. A key with N distinct
 labels has the audio waves ``<key>_01`` .. ``<key>_<N>`` (the stream names ``awc_names.py`` matches): wave ``_01``
@@ -61,6 +64,8 @@ RESOURCE_MAGIC = b"0DRP"
 RPF9_MAGIC = b"9FPR"
 ARCHIVE_ALIGN = 0x1000
 BLOCK = 65536
+BLOB_TAG = 0x10                 # descriptor entry tag of a string blob chunk
+CHUNK_MASK = 3                  # an index entry's blob chunk, in the low bits of its second word
 MAX_RESOURCE_BYTES = 256 << 20
 CONVERSATION_PAIR = re.compile(rb"([A-Z0-9_]{2,40}AU_[A-Z]{4})\x00([A-Za-z0-9_]{3,80})\x00")
 _PTR = rb"(.{3}[\x50-\x5f])\x00\x00\x00\x00"
@@ -101,15 +106,35 @@ def _ptr(b4: bytes) -> int:
     return struct.unpack("<I", b4)[0] & 0x0FFFFFFF
 
 
+def blob_chunks(buf: bytes, at: int) -> list:
+    """(start, end) of each string blob chunk, reading descriptor entries from ``at`` (the first blob entry).
+
+    A descriptor entry is 16 bytes: u32 tag, u32 bytes, resource pointer. The run ends at the first 16 bytes that are
+    not an entry. Every tag-0x10 entry in it is a blob chunk, in order. A chunk that runs past the resource ends the
+    list, so the first chunk must fit for the table to be read.
+    """
+    chunks = []
+    while at + 16 <= len(buf):
+        tag, size, lo, hi = struct.unpack_from("<IIII", buf, at)
+        if hi or lo >> 28 != 5:
+            break
+        if tag == BLOB_TAG:
+            start = lo & 0x0FFFFFFF
+            if start + size > len(buf):
+                break
+            chunks.append((start, start + size))
+        at += 16
+    return chunks
+
+
 def string_tables(buf: bytes):
     """Yield {label hash: text} for every string table in one logical resource."""
     for m in DESCRIPTOR.finditer(buf):
         index = _ptr(m.group(1))
         hash_bytes = struct.unpack("<I", m.group(2))[0]
         hashes = _ptr(m.group(3))
-        blob_bytes = struct.unpack("<I", m.group(4))[0]
-        blob = _ptr(m.group(5))
-        if not (0 < hash_bytes < len(buf) and hashes + hash_bytes <= len(buf) and blob + blob_bytes <= len(buf)):
+        chunks = blob_chunks(buf, m.end() - 16)
+        if not (0 < hash_bytes < len(buf) and hashes + hash_bytes <= len(buf) and chunks):
             continue
         out = {}
         for o in range(hashes, hashes + hash_bytes - 15, 16):
@@ -120,9 +145,13 @@ def string_tables(buf: bytes):
             at = index + 16 * i + 8
             if at + 8 > len(buf):
                 continue
-            start = blob + (struct.unpack_from("<Q", buf, at)[0] >> 20)
-            end = buf.find(b"\0", start, blob + blob_bytes)
-            if blob <= start <= end:
+            ref = struct.unpack_from("<Q", buf, at)[0]
+            if ref & CHUNK_MASK >= len(chunks):
+                continue
+            lo, hi = chunks[ref & CHUNK_MASK]
+            start = lo + (ref >> 20)
+            end = buf.find(b"\0", start, hi)
+            if lo <= start <= end:
                 out[h] = buf[start:end].decode("utf-8", "replace")
         if out:
             yield out
