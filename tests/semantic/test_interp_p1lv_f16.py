@@ -865,5 +865,107 @@ class InterpP1lvSimdMultiLaneTests(unittest.TestCase):
                 self.assertAlmostEqual(bits_to_f32(mrt1[0]), want_z_lo_f32, delta=1e-4)
 
 
+class InterpP1lvSubnormalAndClippingTests(unittest.TestCase):
+    """Subnormal weights, denormal attribute preservation, and clipping boundary tests."""
+
+    def test_subnormal_f16_attribute_interpolation(self):
+        p0 = bits_to_f16(0x0002)
+        p1 = bits_to_f16(0x0004)
+        p2 = bits_to_f16(0x0008)
+
+        _, res_mid = v_interp_p1lv_eval_ref(0.5, 0.0, p0, p1, p2)
+        self.assertEqual(res_mid, 0x0003)
+
+        _, res_v0 = v_interp_p1lv_eval_ref(0.0, 0.0, p0, p1, p2)
+        self.assertEqual(res_v0, 0x0002)
+
+        _, res_v2 = v_interp_p1lv_eval_ref(0.0, 0.5, p0, p1, p2)
+        self.assertEqual(res_v2, 0x0005)
+
+    def test_subnormal_barycentric_weights(self):
+        p0, p1, p2 = 5.0, 25.0, 50.0
+        subnormal_w = 1e-15
+        _, res = v_interp_p1lv_eval_ref(subnormal_w, subnormal_w, p0, p1, p2)
+        self.assertEqual(res, f16_to_bits(5.0))
+
+    def test_subnormal_to_normal_transition(self):
+        p0 = 0.0
+        p1 = bits_to_f16(0x0400)
+        p2 = 0.0
+
+        _, res_half = v_interp_p1lv_eval_ref(0.5, 0.0, p0, p1, p2)
+        self.assertEqual(res_half, 0x0200)
+
+        _, res_quarter = v_interp_p1lv_eval_ref(0.25, 0.0, p0, p1, p2)
+        self.assertEqual(res_quarter, 0x0100)
+
+        _, res_one = v_interp_p1lv_eval_ref(1.0, 0.0, p0, p1, p2)
+        self.assertEqual(res_one, 0x0400)
+
+    def test_hypotenuse_boundary_clipping(self):
+        p0, p1, p2 = 10.0, 20.0, 30.0
+        for i_c, j_c in [(0.5, 0.5), (0.25, 0.75), (0.0, 1.0), (1.0, 0.0)]:
+            with self.subTest(i=i_c, j=j_c):
+                _, got_bits = v_interp_p1lv_eval_ref(i_c, j_c, p0, p1, p2)
+                expected_val = i_c * p1 + j_c * p2
+                self.assertEqual(got_bits, f16_to_bits(expected_val))
+
+    def test_extreme_extrapolation_and_clamp_boundaries(self):
+        p0, p1, p2 = 0.5, 1.5, 2.5
+        _, clamped_low = v_interp_p1lv_eval_ref(-2.0, 0.5, p0, p1, p2, clamp=True)
+        self.assertEqual(clamped_low, 0x0000)
+
+        _, unclamped_low = v_interp_p1lv_eval_ref(-2.0, 0.5, p0, p1, p2, clamp=False)
+        self.assertLess(bits_to_f16(unclamped_low), 0.0)
+
+        _, clamped_high = v_interp_p1lv_eval_ref(5.0, 2.0, p0, p1, p2, clamp=True)
+        self.assertEqual(clamped_high, 0x3C00)
+
+        _, unclamped_high = v_interp_p1lv_eval_ref(5.0, 2.0, p0, p1, p2, clamp=False)
+        self.assertGreater(bits_to_f16(unclamped_high), 1.0)
+
+    def test_negative_zero_clamping(self):
+        p0, p1, p2 = -0.1, -0.2, -0.5
+        _, res_bits = v_interp_p1lv_eval_ref(0.3, 0.3, p0, p1, p2, clamp=True)
+        self.assertEqual(res_bits, 0x0000)
+        self.assertNotEqual(res_bits, 0x8000)
+
+
+class InterpP1lvNegativeControlsTests(unittest.TestCase):
+    """Negative controls and mutation detection tests for half-precision interpolation."""
+
+    def test_mutation_axis_swap_detection(self):
+        p0, p1, p2 = 1.0, 5.0, 20.0
+        i_c, j_c = 0.2, 0.7
+        _, normal_bits = v_interp_p1lv_eval_ref(i_c, j_c, p0, p1, p2)
+        _, swapped_bits = v_interp_p1lv_eval_ref(j_c, i_c, p0, p1, p2)
+        self.assertNotEqual(normal_bits, swapped_bits)
+
+    def test_mutation_half_selection_detection(self):
+        packed = pack_f16(1.5, 45.0)
+        lo, hi = unpack_f16_halves(packed)
+        self.assertEqual(lo, 1.5)
+        self.assertEqual(hi, 45.0)
+        self.assertNotEqual(lo, hi)
+
+    def test_mutation_clamp_removal_detection(self):
+        p0, p1, p2 = 2.0, 4.0, 6.0
+        _, clamped = v_interp_p1lv_eval_ref(0.5, 0.5, p0, p1, p2, clamp=True)
+        _, unclamped = v_interp_p1lv_eval_ref(0.5, 0.5, p0, p1, p2, clamp=False)
+        self.assertEqual(clamped, 0x3C00)
+        self.assertNotEqual(unclamped, clamped)
+
+    def test_mutation_rtz_vs_nearest_even(self):
+        val = 1.0 + 2.0**-11
+        rne_bits = f16_to_bits(val)
+        self.assertEqual(rne_bits, 0x3C00)
+
+        val_odd = 1.0 + 2.0**-10 + 2.0**-11
+        rne_odd_bits = f16_to_bits(val_odd)
+        self.assertEqual(rne_odd_bits, 0x3C02)
+        rtz_odd_bits = 0x3C01
+        self.assertNotEqual(rne_odd_bits, rtz_odd_bits)
+
+
 if __name__ == "__main__":
     unittest.main()
