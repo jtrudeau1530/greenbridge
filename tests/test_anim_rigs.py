@@ -130,5 +130,67 @@ class RigDictionaryTest(unittest.TestCase):
         self.assertNotIn("tables", json.dumps(doc["rig_dictionaries"]))
 
 
+class ReportPathTests(unittest.TestCase):
+    """The output .json must not replace the archive or the --rigs input."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.rpf = os.path.join(self.tmp.name, "synthetic.rpf")
+        self.rigs = os.path.join(self.tmp.name, "rigs.json")
+        with open(self.rigs, "w", encoding="utf-8") as f:
+            json.dump(RIGSETS, f)
+        streams = [rig_dictionary(name, rigs) for name, rigs in RIGS.items()] + [two_sequence_dictionary()]
+        write_rpf(self.rpf, streams)
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+
+    def test_out_must_not_overwrite_the_archive(self):
+        with open(self.rpf, "rb") as f:
+            before = f.read()
+        r = self.run_tool(self.rpf, self.rpf)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("would overwrite the input archive", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_out_must_not_overwrite_the_rigs_input(self):
+        with open(self.rigs, encoding="utf-8") as f:
+            before = f.read()
+        r = self.run_tool(self.rpf, self.rigs, "--rigs", self.rigs)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("would overwrite the --rigs input", r.stderr)
+        with open(self.rigs, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_out_must_be_a_file(self):
+        folder = os.path.join(self.tmp.name, "out")
+        os.makedirs(folder)
+        r = self.run_tool(self.rpf, folder)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("is a folder, not a file", r.stderr)
+
+    def test_missing_report_folder_is_created(self):
+        out = os.path.join(self.tmp.name, "reports", "deeper", "out.json")
+        r = self.run_tool(self.rpf, out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("rig_dictionaries", json.load(f))
+
+    def test_a_failed_report_write_is_one_line(self):
+        blocker = os.path.join(self.tmp.name, "not_a_folder")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        out = os.path.join(blocker, "out.json")
+        r = self.run_tool(self.rpf, out)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("ERROR: cannot write", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
+
+
 if __name__ == "__main__":
     unittest.main()

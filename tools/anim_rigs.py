@@ -134,6 +134,16 @@ def join_rbf0(dicts, rigs):
     return dict(sorted(c.items()))
 
 
+def same_report_path(first, second):
+    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive", help="anim.rpf")
@@ -142,6 +152,12 @@ def main():
     ap.add_argument("--start", type=anim_index.offset, help="first byte to scan (default: the RPF data start)")
     ap.add_argument("--limit", type=anim_index.byte_count, help="number of bytes to scan")
     a = ap.parse_args()
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a file")
+    if same_report_path(a.out, a.archive):
+        ap.error(f"{a.out} would overwrite the input archive")
+    if a.rigs and same_report_path(a.out, a.rigs):
+        ap.error(f"{a.out} would overwrite the --rigs input")
     try:
         dicts, summary = scan(a.archive, a.start, a.limit)
         if a.rigs:
@@ -153,10 +169,12 @@ def main():
         sys.exit(f"{e.filename or a.archive}: {e.strerror or e}")
     rows = [{k: v for k, v in d.items() if k != "entries"} | {"entries": len(d.get("entries", ()))} for d in dicts]
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "rig_dictionaries": rows}, f, indent=1)
     except OSError as e:
-        sys.exit(f"{a.out}: cannot write: {e.strerror or e}")
+        print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     c = summary["counts"]
     print(json.dumps({k: c.get(k, 0) for k in ("rig_dictionaries", "entries", "entries_with_block", "tables")}))
     if "rbf0_join" in summary:
