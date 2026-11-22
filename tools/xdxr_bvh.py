@@ -719,6 +719,14 @@ def validate(data, expect_bottom=None):
 
 
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
+def _case_names(directory):
+    """Find cases using a literal directory and the usual JSON filename pattern."""
+    import glob
+    import os
+    pattern = os.path.join(glob.escape(os.fspath(directory)), "*.json")
+    return sorted(os.path.splitext(os.path.basename(path))[0] for path in glob.glob(pattern))
+
+
 def _load_case(directory, name):
     import json
     with open(f"{directory}/{name}.json", encoding="utf-8") as fh:
@@ -733,9 +741,7 @@ def _load_case(directory, name):
 
 def check_build(directory, rays=300, seed=1):
     """Validate every <case>.bin of a GPU build and trace rays against brute force. Returns a list of problems."""
-    import glob
-    import os
-    names = sorted(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(f"{directory}/*.json"))
+    names = _case_names(directory)
     if not names:
         return [f"no cases in {directory}"]
     problems = []
@@ -862,8 +868,7 @@ def main(argv=None):
     if a.cmd == "check-build":
         if a.rays < 1:
             ap.error("--rays must be at least 1")
-        import glob
-        if not glob.glob(f"{a.dir}/*.json"):
+        if not _case_names(a.dir):
             print(f"no cases in {a.dir}: skipped (the build step skipped or did not run)")
             return 77                                   # ctest SKIP_RETURN_CODE
         problems = check_build(a.dir, a.rays)
