@@ -1026,3 +1026,33 @@ def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
     spv2 = sh2.translate()
     sh2.validate(spv2)
     assert "PackHalf2x16" not in spv2
+
+
+WAVE64_SCMP_MASK_CASES = """\
+; mattr: +wavefrontsize64,-wavefrontsize32
+v_cmp_lt_u32_e64 vcc, v0, 17
+s_and_b64 s[6:7], vcc, exec
+s_cmp_eq_u32 vcc_lo, vcc_hi
+s_cmp_lg_u32 exec_lo, exec_hi
+s_cmp_eq_u32 s6, s7
+s_cmp_eq_u32 vcc_lo, 0x80000003
+s_cmp_lt_u32 exec_hi, s4
+s_cmp_gt_i32 s6, 0
+s_cmp_eq_u64 vcc, s[4:5]
+s_cmp_lg_u64 exec, 0x12345678
+s_endpgm
+"""
+
+
+@pytest.mark.parametrize("emulate", [False, True], ids=["wave64", "wave64-emulate"])
+def test_wave64_scmp_mask_halves_and_scalars_validate(emulate, make_shader, monkeypatch):
+    """Opposite-half s_cmp_*_u32, ordering compares on mask halves, and mask-vs-scalar/imm u32/u64
+    compares translate and pass spirv-val in both native wave64 and --wave64-emulate modes."""
+    shader = make_shader(WAVE64_SCMP_MASK_CASES, name="cs_w64_scmp_masks")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", emulate)
+    spv = shader.translate()
+    shader.validate(spv)
+    if emulate:
+        assert "OpGroupNonUniform" not in spv
+    else:
+        assert "OpGroupNonUniformBitwiseOr" in spv
