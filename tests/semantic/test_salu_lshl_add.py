@@ -429,6 +429,188 @@ class TestSccCarryAndWrapping(unittest.TestCase):
                 self.assertEqual(got, want)
 
 
+class TestShiftBoundaryAndAliasing(unittest.TestCase):
+    """Validation of register aliasing, literal constants, and extreme bit boundary patterns."""
+
+    def test_register_aliasing_dst_src0(self):
+        # Destination register aliases source 0 (D == S0): s_lshlN_add_u32 s0, s0, s1
+        for n in (1, 2, 3, 4):
+            x = 0x1234
+            y = 0x5678
+            lines = [
+                f"s_mov_b32 s0, {x:#x}",
+                f"s_mov_b32 s1, {y:#x}",
+                f"s_lshl{n}_add_u32 s0, s0, s1",
+                "v_mov_b32 v0, s0",
+                "v_mov_b32 v1, s1",
+            ]
+            got_d, got_s1 = run_lines(lines)
+            expected_d, _ = ref_s_lshl_add_u32(n, x, y)
+            self.assertEqual(got_d, expected_d)
+            self.assertEqual(got_s1, y)  # S1 must remain unmodified
+
+    def test_register_aliasing_dst_src1(self):
+        # Destination register aliases source 1 (D == S1): s_lshlN_add_u32 s0, s1, s0
+        for n in (1, 2, 3, 4):
+            x = 0x2000
+            y = 0x0042
+            lines = [
+                f"s_mov_b32 s1, {x:#x}",
+                f"s_mov_b32 s0, {y:#x}",
+                f"s_lshl{n}_add_u32 s0, s1, s0",
+                "v_mov_b32 v0, s0",
+                "v_mov_b32 v1, s1",
+            ]
+            got_d, got_s1 = run_lines(lines)
+            expected_d, _ = ref_s_lshl_add_u32(n, x, y)
+            self.assertEqual(got_d, expected_d)
+            self.assertEqual(got_s1, x)  # S1 must remain unmodified
+
+    def test_register_aliasing_src0_src1(self):
+        # Source 0 aliases source 1 (S0 == S1): s_lshlN_add_u32 s0, s1, s1
+        # Mathematically computes s1 * ((1 << n) + 1):
+        # N=1: * 3; N=2: * 5; N=3: * 9; N=4: * 17
+        factors = {1: 3, 2: 5, 3: 9, 4: 17}
+        for n in (1, 2, 3, 4):
+            val = 0x1111
+            lines = [
+                f"s_mov_b32 s1, {val:#x}",
+                f"s_lshl{n}_add_u32 s0, s1, s1",
+                "v_mov_b32 v0, s0",
+                "v_mov_b32 v1, s1",
+            ]
+            got_d, got_s1 = run_lines(lines)
+            expected_d = (val * factors[n]) & MASK32
+            self.assertEqual(got_d, expected_d)
+            self.assertEqual(got_s1, val)
+
+    def test_register_aliasing_three_way(self):
+        # Full three-way aliasing (D == S0 == S1): s_lshlN_add_u32 s0, s0, s0
+        factors = {1: 3, 2: 5, 3: 9, 4: 17}
+        for n in (1, 2, 3, 4):
+            val = 0x01020304
+            lines = [
+                f"s_mov_b32 s0, {val:#x}",
+                f"s_lshl{n}_add_u32 s0, s0, s0",
+                "v_mov_b32 v0, s0",
+                "v_mov_b32 v1, 0",
+            ]
+            got_d, _ = run_lines(lines)
+            expected_d = (val * factors[n]) & MASK32
+            self.assertEqual(got_d, expected_d)
+
+    def test_inline_constants_and_literals(self):
+        # SALU supports immediate/literal constants in S0 and S1
+        # Literal in S0:
+        got = run_lines([
+            "s_mov_b32 s1, 100",
+            "s_lshl1_add_u32 s0, 7, s1",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+        ])
+        self.assertEqual(got[0], 7 * 2 + 100)
+
+        # Literal in S1:
+        got2 = run_lines([
+            "s_mov_b32 s0, 50",
+            "s_lshl2_add_u32 s0, s0, 42",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+        ])
+        self.assertEqual(got2[0], 50 * 4 + 42)
+
+        # Negative inline constant (-1):
+        got3 = run_lines([
+            "s_mov_b32 s1, 5",
+            "s_lshl3_add_u32 s0, -1, s1",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+        ])
+        expected3, _ = ref_s_lshl_add_u32(3, -1, 5)
+        self.assertEqual(got3[0], expected3)
+
+    def test_walking_bit_patterns(self):
+        # Walk a 1-bit through all 32 positions of S0 across all four shift scales
+        for n in (1, 2, 3, 4):
+            for k in range(32):
+                s0 = 1 << k
+                res, scc = ref_s_lshl_add_u32(n, s0, 0)
+                expected_shifted = (s0 << n) & MASK32
+                expected_scc = 1 if (k >= (32 - n)) else 0
+                self.assertEqual(res, expected_shifted)
+                self.assertEqual(scc, expected_scc)
+
+    def test_alternating_bit_patterns(self):
+        for n in (1, 2, 3, 4):
+            # 0xAAAAAAAA (1010...) and 0x55555555 (0101...)
+            s0 = 0xAAAAAAAA
+            s1 = 0x55555555
+            want = ref_s_lshl_add_u32(n, s0, s1)
+            got = run_op(n, s0, s1, scc_in=0)
+            self.assertEqual(got, want)
+
+
+class TestNegativeControls(unittest.TestCase):
+    """Negative controls ensuring mutated arithmetic or missing overflow checks fail assertions."""
+
+    def test_bitwise_or_mutation_is_detected(self):
+        # Mutating (shifted + S1) to (shifted | S1) must be detected when bits collide
+        s0 = 3
+        s1 = 4
+        # For N=2: (3 << 2) = 12 (0b1100). S1 = 4 (0b0100).
+        # ADD: 12 + 4 = 16 (0b10000)
+        # OR:  12 | 4 = 12 (0b01100)
+        correct_res, _ = ref_s_lshl_add_u32(2, s0, s1)
+        mutated_or = ((s0 << 2) | s1) & MASK32
+        self.assertEqual(correct_res, 16)
+        self.assertEqual(mutated_or, 12)
+        self.assertNotEqual(correct_res, mutated_or)
+
+    def test_missing_shift_out_carry_mutation_is_detected(self):
+        # If SCC only checks (shifted + s1) > 0xFFFFFFFF and ignores shifted-out bits:
+        s0 = 0x80000000
+        s1 = 0
+        _, correct_scc = ref_s_lshl_add_u32(1, s0, s1)
+        # Mutated: only checks 32-bit addition carry
+        shifted_low = (s0 << 1) & MASK32
+        mutated_scc = 1 if (shifted_low + s1 > MASK32) else 0
+        self.assertEqual(correct_scc, 1)
+        self.assertEqual(mutated_scc, 0)
+        self.assertNotEqual(correct_scc, mutated_scc)
+
+    def test_missing_addition_carry_mutation_is_detected(self):
+        # If SCC only checks shifted-out bits and ignores addition carry:
+        s0 = 1
+        s1 = 0xFFFFFFFF
+        _, correct_scc = ref_s_lshl_add_u32(1, s0, s1)
+        # Mutated: only checks shifted-out bits
+        shifted_out = (s0 & MASK32) >> 31
+        mutated_scc = 1 if (shifted_out != 0) else 0
+        self.assertEqual(correct_scc, 1)
+        self.assertEqual(mutated_scc, 0)
+        self.assertNotEqual(correct_scc, mutated_scc)
+
+    def test_shift_amount_mutation_is_detected(self):
+        # Mutating shift amount N to N+1 produces wrong scaled address
+        s0 = 10
+        s1 = 5
+        correct_n2, _ = ref_s_lshl_add_u32(2, s0, s1)  # 10 * 4 + 5 = 45
+        mutated_n3, _ = ref_s_lshl_add_u32(3, s0, s1)  # 10 * 8 + 5 = 85
+        self.assertEqual(correct_n2, 45)
+        self.assertEqual(mutated_n3, 85)
+        self.assertNotEqual(correct_n2, mutated_n3)
+
+    def test_unmasked_modulo_overflow_is_detected(self):
+        # Failing to mask with & 0xFFFFFFFF yields values >= 2^32
+        s0 = 0x80000000
+        s1 = 1
+        correct_res, _ = ref_s_lshl_add_u32(1, s0, s1)
+        unmasked = (s0 << 1) + s1
+        self.assertEqual(correct_res, 1)
+        self.assertEqual(unmasked, (1 << 32) + 1)
+        self.assertNotEqual(correct_res, unmasked)
+
+
 class LshlAddTests(unittest.TestCase):
     def test_reference(self):
         self.assertEqual(ref(2, 3, 4), (16, 0))
