@@ -120,6 +120,19 @@ documented error for a class the runtime doesn't provide. The class method layou
 boot with the executable lists the interfaces to implement next. `xgameruntime_test` drives this path through the
 api-set binding `XCurl.dll` uses.
 
+Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
+xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
+
+| Module | Runtime classes referenced (highest interface id present) |
+|---|---|
+| `XCurl.dll` | `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` (`IXNetworkingImpl2`) |
+| `libHttpClient.GDK.dll` | 24 of the 24 documented classes, each GUID once, the pattern of a linked id table rather than of use. Highest interfaces: `IXSystemImpl5`, `IXUserImpl5` (not 6), `IXGameImpl3`, `IXStoreImpl6`, `IXPackageImpl3` (not 4), `IXGameUiImpl4`, `IXGameSaveImpl3`, `IXGameStreamingImpl3`, `IXPersistentLocalStorageImpl3`, `IXUserDeviceImpl2`, `IXNetworkingImpl2` |
+| every other `.dll` | none |
+
+So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
+`libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
+`IXUserImpl6`. The executable's own set is still unmeasured. `QueryApiImpl`'s log gives it on the first boot.
+
 What this does not cover: a title that `LoadLibrary`s one of the package's bundled DLLs (`Bink2Scarlett.dll`,
 `XboxBvhBuilder.dll`, the FidelityFX DLLs) still gets the host loader, which loads the Xbox build without the
 registry's bindings for its own console imports (`xmem.dll`, `d3d12_xs.dll`).
