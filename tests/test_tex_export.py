@@ -173,7 +173,9 @@ def build_case(eq, tmp_path, fmt, top_first):
     return carve, top.tobytes()
 
 
-@pytest.mark.parametrize("fmt,name", [(10, "R16G16B16A16_FLOAT"), (28, "R8G8B8A8_UNORM")])
+@pytest.mark.parametrize("fmt,name", [(10, "R16G16B16A16_FLOAT"), (28, "R8G8B8A8_UNORM"),
+                                      # Pillow 13.0.0 cannot decode these three: scored on raw elements instead
+                                      (81, "BC4_SNORM"), (87, "B8G8R8A8_UNORM"), (91, "B8G8R8A8_UNORM_SRGB")])
 @pytest.mark.parametrize("top_first", [True, False])
 def test_export_picks_the_top_mip_placement_and_writes_dds(eq, tmp_path, fmt, name, top_first):
     if fmt in T.PILLOW_OK:
@@ -273,6 +275,21 @@ def test_bc2_srgb_is_scored_as_bc2():
     pytest.importorskip("PIL")
     payload = noise(4 * 4 * 16)
     assert T.score_image(16, 16, 75, payload, 16) == T.score_image(16, 16, 74, payload, 16)
+
+
+@pytest.mark.parametrize("fmt", [81, 87, 91])
+def test_score_falls_back_to_raw_elements_when_pillow_cannot_decode(monkeypatch, fmt):
+    PIL_Image = pytest.importorskip("PIL.Image")
+    bpe, blk = T.FMT[fmt]
+
+    def unimplemented(*args, **kwargs):
+        raise NotImplementedError(f"Unimplemented DXGI format {fmt}")
+    monkeypatch.setattr(PIL_Image, "open", unimplemented)
+    payload = noise(4 * 4 * bpe, seed=fmt)
+    score = T.score_image(4 * blk, 4 * blk, fmt, payload, bpe)
+    assert 0 < score < 1e6
+    monkeypatch.setattr(T, "PILLOW_OK", set())  # the branch formats outside PILLOW_OK take
+    assert score == T.score_image(4 * blk, 4 * blk, fmt, payload, bpe)
 
 
 def test_single_element_has_no_edge_transitions():
