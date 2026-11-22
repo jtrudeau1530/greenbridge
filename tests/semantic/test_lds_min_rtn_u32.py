@@ -19,6 +19,8 @@ Semantics:
 Standard library Python only; zero third-party dependencies; zero game data.
 """
 
+import dataclasses
+import enum
 import math
 import struct
 import unittest
@@ -231,6 +233,235 @@ class TestDSMinRtnU32OracleAndModel(unittest.TestCase):
         old3 = lds.atomic_min_rtn_u32(0x0FC, 0x0200, offset=4)
         self.assertEqual(old3, 0x0500)
         self.assertEqual(lds.read_by_byte_addr(0x100), 0x0200)
+
+
+class DSOpcode(str, enum.Enum):
+    """Opcode enumerations for LDS atomic minimum operations."""
+    DS_MIN_U32 = "ds_min_u32"
+    DS_MIN_RTN_U32 = "ds_min_rtn_u32"
+
+    @property
+    def is_return(self) -> bool:
+        """True if instruction returns prior LDS value to destination VGPR."""
+        return self == DSOpcode.DS_MIN_RTN_U32
+
+    @property
+    def is_min(self) -> bool:
+        """True if operation performs unsigned 32-bit minimum."""
+        return True
+
+
+class RegKind(enum.Enum):
+    """Register kinds in RDNA2 architecture."""
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Architectural register representation with kind and hardware index."""
+    kind: RegKind
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+        elif self.kind == RegKind.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+
+    def __str__(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+def vgpr(index: int) -> Register:
+    """Convenience helper to create a VGPR."""
+    return Register(RegKind.VGPR, index)
+
+
+def sgpr(index: int) -> Register:
+    """Convenience helper to create an SGPR."""
+    return Register(RegKind.SGPR, index)
+
+
+@dataclasses.dataclass(frozen=True)
+class OffsetImmediate:
+    """Unsigned 16-bit byte offset immediate [0, 65535]."""
+    value: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.value <= 65535):
+            raise ValueError(f"Offset immediate out of range [0, 65535]: {self.value}")
+
+    def __str__(self) -> str:
+        return f"offset:{self.value}" if self.value != 0 else ""
+
+
+@dataclasses.dataclass(frozen=True)
+class DSMinRtnU32Instruction:
+    """Symbolic AST node representing an RDNA2 ds_min_rtn_u32 instruction."""
+    opcode: DSOpcode
+    vdst: Optional[Register]
+    vaddr: Register
+    vdata0: Register
+    offset: OffsetImmediate = OffsetImmediate(0)
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if self.opcode.is_return and self.vdst is None:
+            raise ValueError(f"Returning opcode {self.opcode.value} requires destination vdst")
+        if self.vdst is not None and self.vdst.kind != RegKind.VGPR:
+            raise ValueError(f"Destination register must be VGPR, got {self.vdst.kind}")
+        if self.vaddr.kind != RegKind.VGPR:
+            raise ValueError(f"Address register must be VGPR, got {self.vaddr.kind}")
+        if self.vdata0.kind != RegKind.VGPR:
+            raise ValueError(f"Data operand register must be VGPR, got {self.vdata0.kind}")
+
+    def __str__(self) -> str:
+        parts = [self.opcode.value]
+        if self.vdst is not None:
+            parts.append(str(self.vdst) + ",")
+        parts.append(str(self.vaddr) + ",")
+        parts.append(str(self.vdata0))
+        if self.offset.value != 0:
+            parts.append(str(self.offset))
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+
+@dataclasses.dataclass
+class Program:
+    """Sequence of symbolic instructions."""
+    instructions: List[DSMinRtnU32Instruction] = dataclasses.field(default_factory=list)
+
+    def add(self, inst: DSMinRtnU32Instruction) -> None:
+        self.instructions.append(inst)
+
+    def __len__(self) -> int:
+        return len(self.instructions)
+
+    def __iter__(self):
+        return iter(self.instructions)
+
+
+class TestDSMinRtnU32AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instruction_creation(self) -> None:
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+            offset=OffsetImmediate(8),
+            gds=False,
+        )
+        self.assertEqual(inst.opcode, DSOpcode.DS_MIN_RTN_U32)
+        self.assertEqual(inst.vdst, vgpr(0))
+        self.assertEqual(inst.vaddr, vgpr(1))
+        self.assertEqual(inst.vdata0, vgpr(2))
+        self.assertEqual(inst.offset.value, 8)
+        self.assertFalse(inst.gds)
+
+    def test_ast_string_representation(self) -> None:
+        inst_offset = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(5),
+            vaddr=vgpr(6),
+            vdata0=vgpr(7),
+            offset=OffsetImmediate(16),
+            gds=False,
+        )
+        self.assertEqual(str(inst_offset), "ds_min_rtn_u32 v5, v6, v7 offset:16")
+
+        inst_no_offset = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+            offset=OffsetImmediate(0),
+            gds=False,
+        )
+        self.assertEqual(str(inst_no_offset), "ds_min_rtn_u32 v0, v1, v2")
+
+        inst_gds = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+            offset=OffsetImmediate(4),
+            gds=True,
+        )
+        self.assertEqual(str(inst_gds), "ds_min_rtn_u32 v0, v1, v2 offset:4 gds")
+
+    def test_ast_immutability(self) -> None:
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            inst.opcode = DSOpcode.DS_MIN_U32  # type: ignore
+
+    def test_ast_validation_errors(self) -> None:
+        # Invalid VGPR indices
+        with self.assertRaises(ValueError):
+            vgpr(-1)
+        with self.assertRaises(ValueError):
+            vgpr(256)
+
+        # Invalid Offset
+        with self.assertRaises(ValueError):
+            OffsetImmediate(-1)
+        with self.assertRaises(ValueError):
+            OffsetImmediate(65536)
+
+        # Returning opcode without vdst
+        with self.assertRaises(ValueError):
+            DSMinRtnU32Instruction(
+                opcode=DSOpcode.DS_MIN_RTN_U32,
+                vdst=None,
+                vaddr=vgpr(0),
+                vdata0=vgpr(1),
+            )
+
+        # Non-VGPR registers in operands
+        with self.assertRaises(ValueError):
+            DSMinRtnU32Instruction(
+                opcode=DSOpcode.DS_MIN_RTN_U32,
+                vdst=sgpr(0),
+                vaddr=vgpr(1),
+                vdata0=vgpr(2),
+            )
+        with self.assertRaises(ValueError):
+            DSMinRtnU32Instruction(
+                opcode=DSOpcode.DS_MIN_RTN_U32,
+                vdst=vgpr(0),
+                vaddr=sgpr(1),
+                vdata0=vgpr(2),
+            )
+        with self.assertRaises(ValueError):
+            DSMinRtnU32Instruction(
+                opcode=DSOpcode.DS_MIN_RTN_U32,
+                vdst=vgpr(0),
+                vaddr=vgpr(1),
+                vdata0=sgpr(2),
+            )
+
+    def test_ast_program_container(self) -> None:
+        prog = Program()
+        inst1 = DSMinRtnU32Instruction(opcode=DSOpcode.DS_MIN_RTN_U32, vdst=vgpr(0), vaddr=vgpr(1), vdata0=vgpr(2))
+        inst2 = DSMinRtnU32Instruction(opcode=DSOpcode.DS_MIN_RTN_U32, vdst=vgpr(3), vaddr=vgpr(4), vdata0=vgpr(5))
+        prog.add(inst1)
+        prog.add(inst2)
+        self.assertEqual(len(prog), 2)
+        instructions = list(prog)
+        self.assertEqual(instructions[0], inst1)
+        self.assertEqual(instructions[1], inst2)
 
 
 if __name__ == "__main__":
