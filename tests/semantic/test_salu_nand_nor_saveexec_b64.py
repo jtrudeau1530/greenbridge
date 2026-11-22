@@ -747,5 +747,160 @@ class TestSIMDDivergenceAndMasking(unittest.TestCase):
                 self.assertEqual(state.get_vgpr(lane, 7), 0xBBBB)
 
 
+# ==============================================================================
+# Phase 5 Unit Tests: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Verify atomic operand sampling and correctness under all register aliasing permutations."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_alias_dst_equals_src_nand(self) -> None:
+        """When sdst == ssrc0, source must be read BEFORE sdst is written with old EXEC."""
+        state = ScalarMachineState()
+        # s[4:5] = 0x1111_1111_1111_1111, EXEC = 0x3333_3333_3333_3333
+        state.set_sgpr64(4, 0x1111_1111_1111_1111)
+        state.exec_mask = 0x3333_3333_3333_3333
+
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 4),
+            ssrc0=Reg64(RegType.SGPR, 4),
+        )
+
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        # Saved destination s[4:5] must receive old EXEC (0x3333_3333_3333_3333)
+        self.assertEqual(saved, 0x3333_3333_3333_3333)
+        self.assertEqual(state.get_sgpr64(4), 0x3333_3333_3333_3333)
+
+        # New EXEC must be ~(0x1111_1111_1111_1111 & 0x3333_3333_3333_3333) = ~(0x1111...) = 0xEEEE...
+        # If buggy and read after write, it would be ~(0x3333... & 0x3333...) = 0xCCCC...
+        self.assertEqual(new_exec, 0xEEEE_EEEE_EEEE_EEEE)
+        self.assertEqual(state.exec_mask, 0xEEEE_EEEE_EEEE_EEEE)
+        self.assertEqual(scc, 1)
+
+    def test_alias_dst_equals_src_nor(self) -> None:
+        """When sdst == ssrc0, s_nor_saveexec_b64 must atomically read source first."""
+        state = ScalarMachineState()
+        # s[6:7] = 0x0F0F_0F0F_0F0F_0F0F, EXEC = 0x00FF_00FF_00FF_00FF
+        state.set_sgpr64(6, 0x0F0F_0F0F_0F0F_0F0F)
+        state.exec_mask = 0x00FF_00FF_00FF_00FF
+
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 6),
+            ssrc0=Reg64(RegType.SGPR, 6),
+        )
+
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        self.assertEqual(saved, 0x00FF_00FF_00FF_00FF)
+        self.assertEqual(state.get_sgpr64(6), 0x00FF_00FF_00FF_00FF)
+
+        # 0x0F0F | 0x00FF = 0x0FFF
+        # ~(0x0FFF_0FFF_0FFF_0FFF) = 0xF000_F000_F000_F000
+        expected_new_exec = 0xF000_F000_F000_F000
+        self.assertEqual(new_exec, expected_new_exec)
+        self.assertEqual(state.exec_mask, expected_new_exec)
+        self.assertEqual(scc, 1)
+
+    def test_alias_src_equals_exec(self) -> None:
+        """When ssrc0 is the EXEC register, NAND and NOR compute complement of EXEC."""
+        state = ScalarMachineState()
+        state.exec_mask = 0x0123_4567_89AB_CDEF
+
+        # s_nand_saveexec_b64 s[0:1], exec
+        # new_exec = ~(exec & exec) = ~exec
+        instr_nand = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 0),
+            ssrc0=Reg64(RegType.EXEC),
+        )
+        saved, new_exec, scc = self.interp.step(instr_nand, state)
+        self.assertEqual(saved, 0x0123_4567_89AB_CDEF)
+        self.assertEqual(state.get_sgpr64(0), 0x0123_4567_89AB_CDEF)
+        self.assertEqual(new_exec, (~0x0123_4567_89AB_CDEF) & MASK64)
+        self.assertEqual(state.exec_mask, (~0x0123_4567_89AB_CDEF) & MASK64)
+
+        # s_nor_saveexec_b64 s[2:3], exec
+        # new_exec = ~(exec | exec) = ~exec
+        state.exec_mask = 0xAAAA_5555_AAAA_5555
+        instr_nor = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 2),
+            ssrc0=Reg64(RegType.EXEC),
+        )
+        saved2, new_exec2, scc2 = self.interp.step(instr_nor, state)
+        self.assertEqual(saved2, 0xAAAA_5555_AAAA_5555)
+        self.assertEqual(state.get_sgpr64(2), 0xAAAA_5555_AAAA_5555)
+        self.assertEqual(new_exec2, 0x5555_AAAA_5555_AAAA)
+        self.assertEqual(state.exec_mask, 0x5555_AAAA_5555_AAAA)
+
+    def test_alias_dst_and_src_both_exec(self) -> None:
+        """When both sdst and ssrc0 are EXEC, EXEC is replaced with ~EXEC."""
+        state = ScalarMachineState()
+        state.exec_mask = 0x1234_0000_5678_0000
+
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.EXEC),
+            ssrc0=Reg64(RegType.EXEC),
+        )
+        saved, new_exec, scc = self.interp.step(instr, state)
+        self.assertEqual(saved, 0x1234_0000_5678_0000)
+        self.assertEqual(new_exec, (~0x1234_0000_5678_0000) & MASK64)
+        self.assertEqual(state.exec_mask, new_exec)
+
+    def test_overlapping_misaligned_sgprs(self) -> None:
+        """Partial overlap where destination is s[4:5] and source is s[5:6]."""
+        state = ScalarMachineState()
+        # s[4]=0x11111111, s[5]=0x22222222, s[6]=0x33333333
+        state.sgprs[4] = 0x1111_1111
+        state.sgprs[5] = 0x2222_2222
+        state.sgprs[6] = 0x3333_3333
+        state.exec_mask = ALL64
+
+        # ssrc0 = s[5:6] -> bits: lo=s[5]=0x22222222, hi=s[6]=0x33333333
+        # sdst = s[4:5] -> lo=s[4], hi=s[5]
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 4),
+            ssrc0=Reg64(RegType.SGPR, 5),
+        )
+
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        # Saved destination s[4:5] gets old EXEC (ALL64)
+        self.assertEqual(saved, ALL64)
+        self.assertEqual(state.get_sgpr64(4), ALL64)
+
+        # Source was read before s[5] was clobbered by ALL64's high word!
+        # ssrc0 was ((0x33333333 << 32) | 0x22222222)
+        expected_src = ((0x3333_3333) << 32) | 0x2222_2222
+        # new_exec = ~(expected_src | ALL64) = 0
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(state.exec_mask, 0)
+        self.assertEqual(scc, 0)
+
+    def test_in_place_recycling_loop(self) -> None:
+        """Ping-pong loop recycling registers in-place across multiple iterations."""
+        state = ScalarMachineState()
+        state.exec_mask = 0x00FF_00FF_00FF_00FF
+        state.set_sgpr64(0, 0xFF00_FF00_FF00_FF00)
+
+        for i in range(4):
+            instr = SaveExecInstruction(
+                opcode=Opcode.S_NOR_SAVEEXEC_B64,
+                sdst=Reg64(RegType.SGPR, 0),
+                ssrc0=Reg64(RegType.SGPR, 0),
+            )
+            saved, new_exec, scc = self.interp.step(instr, state)
+            self.assertEqual(state.exec_mask, new_exec)
+            self.assertEqual(state.get_sgpr64(0), saved)
+
+
 if __name__ == "__main__":
     unittest.main()
