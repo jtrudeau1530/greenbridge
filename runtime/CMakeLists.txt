@@ -1370,6 +1370,24 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_predicated_copy_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_predicated_copy COMMAND d3d12_predicated_copy_test)
     set_tests_properties(d3d12_predicated_copy PROPERTIES SKIP_RETURN_CODE 77)
+    # A DISPATCH-only ExecuteIndirect signature with a GPU count buffer: native Windows WARP versus Vulkan GPU,
+    # including a GPU-written count that changes between two calls in the same command list.
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(_indirect_count_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_indirect_dispatch_count.spv)
+      add_custom_command(OUTPUT ${_indirect_count_spv}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2
+          -o ${_indirect_count_spv} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
+        COMMENT "Compiling the counted indirect dispatch test shader" VERBATIM)
+      add_executable(d3d12_indirect_dispatch_count_test test/d3d12_indirect_dispatch_count_test.cpp
+        ${_indirect_count_spv})
+      target_link_libraries(d3d12_indirect_dispatch_count_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_indirect_dispatch_count_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        LEONIDA_TEST_INDIRECT_COUNT_SPV="${_indirect_count_spv}")
+      target_compile_options(d3d12_indirect_dispatch_count_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_indirect_dispatch_count COMMAND d3d12_indirect_dispatch_count_test)
+      set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)

@@ -37,6 +37,7 @@
 #include <vulkan/vulkan.h>
 #include "vulkan_predicate.h"
 #include "vulkan_predicated_copy.h"
+#include "vulkan_indirect_dispatch_count.h"
 
 #include <algorithm>
 #include <array>
@@ -847,6 +848,11 @@ struct ReplayFunctions {
     PFN_vkCmdDrawIndirectCount draw_indirect_count = nullptr;
     PFN_vkCmdDrawIndexedIndirectCount draw_indexed_indirect_count = nullptr;
     PFN_vkCmdDispatchIndirect dispatch_indirect = nullptr;
+    // A DISPATCH-only ExecuteIndirect signature with a GPU count buffer needs a compute prepass to clamp
+    // the number of commands. The resulting scratch buffer is owned by the queue's timeline-retained batch.
+    std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
+                       CountedDispatch&)> prepare_counted_dispatch;
+    std::function<void(VkCommandBuffer, const CountedDispatch&)> emit_counted_dispatch;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
@@ -928,6 +934,7 @@ struct Prepared {
     std::uint32_t statistics_begin = PreparedQuery::no_segment;
     PredicateCapture predicate;
     std::vector<PredicatedCopyDispatch> predicated_copy;
+    CountedDispatch counted_dispatch;
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
@@ -2176,7 +2183,8 @@ inline void plan_statistics_segments(PreparedList& out) {
     std::size_t next_query = 0;
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
-        if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24))
+        if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
+                      p.counted_dispatch.indirect))
             inner.push_back({&p.statistics_end, &p.statistics_begin});
         if (next_query == out.queries.size() || out.queries[next_query].command != i) continue;
         auto& query = out.queries[next_query++];
@@ -2226,7 +2234,8 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
         if (!query) {
             // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
             // segment before it and open a new one after, the way resolves do.
-            if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24)) {
+            if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
+                                    p.counted_dispatch.indirect)) {
                 p.statistics_end = current;
                 current = out.statistics_segment_count++;
                 p.statistics_begin = current;
@@ -2758,10 +2767,19 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!detail::indirect_range(*cnt, ind->count_offset, sizeof(std::uint32_t)))
                     return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
-                if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
-                    (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count) ||
-                    ind->kind == IndirectKind::dispatch)
+                if (ind->kind == IndirectKind::dispatch) {
+                    // Vulkan lacks vkCmdDispatchIndirectCount. Copy the GPU-visible commands to private scratch
+                    // and replace commands past min(count, max_count) with zero-group dispatches.
+                    if (!ind->pipeline || !vk.dispatch_indirect || !vk.prepare_counted_dispatch ||
+                        !vk.emit_counted_dispatch || (statistics_active && !statistics_helpers) ||
+                        !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
+                                                     p.source.buffer, p.source.buffer_offset + ind->count_offset,
+                                                     ind->stride, ind->max_count, p.counted_dispatch))
+                        return ReplayResult::unsupported;
+                } else if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
+                           (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count)) {
                     return ReplayResult::unsupported;
+                }
             } else {
                 if ((ind->kind == IndirectKind::draw && !vk.draw_indirect) ||
                     (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect) ||
@@ -3585,7 +3603,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
-            if (ind->count_buffer) {
+            if (ind->count_buffer && ind->kind != IndirectKind::dispatch) {
                 const VkDeviceSize count = p.source.buffer_offset + ind->count_offset;
                 if (ind->kind == IndirectKind::draw) {
                     vk.draw_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer,
@@ -3600,6 +3618,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 } else if (ind->kind == IndirectKind::draw_indexed) {
                     vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
                 } else if (ind->kind == IndirectKind::dispatch) {
+                    if (ind->count_buffer) {
+                        // No D3D12 query must count this internal compute pass as an application dispatch.
+                        end_statistics();
+                        vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
+                        begin_statistics();
+                    }
                     if (ind->pipeline) {
                         ShaderUserData data{};
                         std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
@@ -3613,8 +3637,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                           &data);
                     }
                     for (std::uint32_t k = 0; k < ind->max_count; ++k) {
-                        vk.dispatch_indirect(command_buffer, p.binding.buffer,
-                                             arguments + VkDeviceSize(k) * ind->stride);
+                        vk.dispatch_indirect(command_buffer,
+                            ind->count_buffer ? p.counted_dispatch.indirect : p.binding.buffer,
+                            (ind->count_buffer ? p.counted_dispatch.offset + VkDeviceSize(k) * 12
+                                               : arguments + VkDeviceSize(k) * ind->stride));
                     }
                 }
             }
