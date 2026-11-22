@@ -69,15 +69,18 @@ class Kernel:
     s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64. mode: the float MODE the kernel
     starts with (raw kernels only), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults.
     lds: bytes of LDS the kernel allocates (.amdhsa_group_segment_fixed_size and the metadata's
-    .group_segment_fixed_size; without it the hardware gives the group no LDS); vgprs: registers the kernel uses."""
+    .group_segment_fixed_size; without it the hardware gives the group no LDS); vgprs, sgprs: registers the kernel uses
+    (default 32 and 40)."""
 
-    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None, lds=0, vgprs=32):
+    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None, lds=0, vgprs=32, sgprs=40):
         self.lines, self.wave, self.threads, self.words, self.raw = list(lines), wave, threads, words, raw
-        self.lds, self.vgprs = lds, vgprs
+        self.lds, self.vgprs, self.sgprs = lds, vgprs, sgprs
         if not 0 <= lds <= 65536 or lds % 4:
             raise ValueError(f"LDS size {lds} is not a multiple of 4 in 0..65536")
         if not 1 <= vgprs <= 256:
             raise ValueError(f"vgprs {vgprs} is not in 1..256")
+        if not 1 <= sgprs <= 104:
+            raise ValueError(f"sgprs {sgprs} is not in 1..104")
         self.mode = dict(mode or {})
         unknown = set(self.mode) - set(MODE_FIELDS)
         if unknown:
@@ -109,7 +112,7 @@ def gfx10_spelling(line):
     return _GFX10_NAMES.get(op, op) + sep + rest
 
 
-def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32):
+def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
     modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
@@ -129,7 +132,7 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32):
 .amdhsa_kernel {name}
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_next_free_vgpr {vgprs}
-  .amdhsa_next_free_sgpr 40
+  .amdhsa_next_free_sgpr {sgprs}
   .amdhsa_group_segment_fixed_size {lds}
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
   .amdhsa_system_vgpr_workitem_id 0{modes}
@@ -168,16 +171,16 @@ def kernel_text(name, lines, arch):
 """
 
 
-def metadata(names, wave=32, lds=None, vgprs=None):
+def metadata(names, wave=32, lds=None, vgprs=None, sgprs=None):
     """The HSA metadata block. Without it the HIP runtime fails the load with hipErrorNoBinaryForGpu (209).
-    lds / vgprs: per kernel (lists as long as names); default 0 bytes of LDS and 32 registers."""
+    lds / vgprs / sgprs: per kernel (lists as long as names); default 0 bytes of LDS, 32 VGPRs and 40 SGPRs."""
     out = [".amdgpu_metadata", "---", "amdhsa.version: [1, 2]", "amdhsa.kernels:"]
     for i, n in enumerate(names):
         out += [f"  - .name: {n}", f"    .symbol: {n}.kd", "    .args:",
                 "      - {.offset: 0, .size: 8, .value_kind: global_buffer, .address_space: global}",
                 f"    .group_segment_fixed_size: {lds[i] if lds else 0}", "    .private_segment_fixed_size: 0",
                 "    .kernarg_segment_align: 8", "    .kernarg_segment_size: 8", "    .max_flat_workgroup_size: 1024",
-                f"    .sgpr_count: 40", f"    .vgpr_count: {vgprs[i] if vgprs else 32}", f"    .wavefront_size: {wave}"]
+                f"    .sgpr_count: {sgprs[i] if sgprs else 40}", f"    .vgpr_count: {vgprs[i] if vgprs else 32}", f"    .wavefront_size: {wave}"]
     out.append(".end_amdgpu_metadata")
     return "\n".join(out) + "\n"
 
@@ -186,13 +189,14 @@ def module_text(programs, arch, prefix="k", wave=32):
     """(assembly text, kernel names, first source line of each kernel) for a list of programs. A program is a list
     of lines (wrapped as a scalar test) or a Kernel."""
     parts = [f'.amdgcn_target "amdgcn-amd-amdhsa--{arch}"', ".text"]
-    names, starts, line_no, lds, vgprs = [], [], 2, [], []
+    names, starts, line_no, lds, vgprs, sgprs = [], [], 2, [], [], []
     for i, prog in enumerate(programs):
         name = f"{prefix}{i}"
         lds.append(prog.lds if isinstance(prog, Kernel) else 0)
         vgprs.append(prog.vgprs if isinstance(prog, Kernel) else 32)
+        sgprs.append(prog.sgprs if isinstance(prog, Kernel) else 40)
         if isinstance(prog, Kernel):
-            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, prog.vgprs) if prog.raw
+            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, prog.vgprs, prog.sgprs) if prog.raw
                     else kernel_text(name, prog.lines, arch))
         else:
             text = kernel_text(name, prog, arch)
@@ -200,7 +204,7 @@ def module_text(programs, arch, prefix="k", wave=32):
         starts.append(line_no + 1)
         parts.append(text.rstrip("\n"))
         line_no += text.count("\n") + 0
-    parts.append(metadata(names, wave, lds, vgprs).rstrip("\n"))
+    parts.append(metadata(names, wave, lds, vgprs, sgprs).rstrip("\n"))
     return "\n".join(parts) + "\n", names, starts
 
 

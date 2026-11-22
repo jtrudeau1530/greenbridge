@@ -348,5 +348,22 @@ class OnHardware(unittest.TestCase):
         self.assertIn("rejected", rejected)
 
 
+class KernelResources(unittest.TestCase):
+    """Kernel(vgprs=, sgprs=): the register counts reach the descriptor and the metadata; no hardware needed."""
+
+    def test_requested_registers_are_in_the_text(self):
+        k = asm.Kernel(["s_endpgm"], wave=32, threads=64, words=8, raw=True, vgprs=40, sgprs=72)
+        text, names, _ = asm.module_text([k, asm.Kernel(["s_endpgm"], raw=True)], "gfx1150")
+        self.assertIn(".amdhsa_next_free_vgpr 40", text)
+        self.assertIn(".amdhsa_next_free_sgpr 72", text)
+        self.assertIn(".sgpr_count: 72", text)
+        self.assertIn(".vgpr_count: 40", text)
+        self.assertEqual(text.count(".amdhsa_next_free_vgpr"), 2)
+        self.assertIn(".amdhsa_next_free_vgpr 32", text)      # the second kernel keeps the defaults
+        self.assertIn(".amdhsa_next_free_sgpr 40", text)
+        self.assertEqual(names, ["k0", "k1"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
