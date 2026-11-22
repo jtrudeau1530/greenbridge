@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -45,12 +46,12 @@ struct Module {
 
     // Static TLS (IMAGE_DIRECTORY_ENTRY_TLS). load() installs tls_block in the calling thread and writes tls_index to
     // the image's _tls_index. tls_index names TEB->ThreadLocalStoragePointer[tls_index], the array
-    // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves the index by loading
-    // gta6rt_tls_host.dll, so only one manually mapped TLS module can be live at a time; a second one is rejected
-    // rather than sharing (and corrupting) the slot. Every thread started after load() gets its own copy through the
-    // helper's DLL_THREAD_ATTACH, and gives it back at DLL_THREAD_DETACH; install_tls_for_thread() is for threads
-    // that already existed.
+    // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves distinct indices by loading
+    // gta6rt_tls_host.dll (and cloning it on demand for additional simultaneous TLS modules, up to 16 at a time).
+    // Every thread started after load() gets its own copy through the helper's DLL_THREAD_ATTACH, and gives it back
+    // at DLL_THREAD_DETACH; install_tls_for_thread() is for threads that already existed.
     uint32_t tls_index = kNoTlsIndex;
+    uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool
     void* tls_block = nullptr;         // calling thread's copy of the image's template
     void* tls_saved_block = nullptr;   // helper DLL block replaced in that thread, restored by ~Loader
     uint32_t tls_block_size = 0;       // raw template + zero fill
@@ -103,6 +104,12 @@ public:
     void install_tls_for_thread(Module& m);
     void uninstall_tls_for_thread(Module& m);
 
+    // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
+    void* find_loaded_module(const std::string& dll_lower) const;
+    void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
+    void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
+    bool owns_module_handle(void* module_handle) const;
+
 private:
     void initialise(Module& m);
     static void set_initialised(Module& m, bool value);
@@ -115,6 +122,7 @@ private:
     void protect_sections(Module& m);
     void register_unwind(Module& m);
 
+    mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
     std::map<std::string, Module*> by_name_;  // lower-case file name
     std::vector<Module*> order_;       // mapping order; owns the modules

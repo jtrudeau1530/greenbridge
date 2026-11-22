@@ -49,7 +49,7 @@ leonida::ResourceBinding resource() {
     r.image = reinterpret_cast<VkImage>(std::uintptr_t{1});
     r.format = VK_FORMAT_R8G8B8A8_UNORM;
     r.width = 5; r.height = 3;
-    r.rgba8_typeless = true;
+    r.typeless = true;
     return r;
 }
 void reset_counters() {
@@ -173,6 +173,8 @@ int main() {
             const auto resolve = [&](ResourceId id) { return id == 2 ? &predicate : &binding; };
             EXPECT(prepare(list, resolve, queries, prepared) ==
                    (inside ? ReplayResult::unsupported : ReplayResult::success));
+            EXPECT(prepare(list, resolve, queries, prepared, true) == ReplayResult::success);
+            EXPECT(prepared.statistics_segment_count == (inside ? 2u : 0u));
             ++checks;
         }
     }
@@ -252,7 +254,7 @@ int main() {
         EXPECT(requested_range.layerCount == view.layer_count && rendering_layers == view.layer_count);
         ++checks;
     }
-    auto wrong = binding; wrong.rgba8_typeless = false;
+    auto wrong = binding; wrong.typeless = false;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
     wrong = binding; wrong.format = VK_FORMAT_R32_SFLOAT;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_uint}));
@@ -292,7 +294,7 @@ int main() {
     EXPECT(run(same_format, binding, unavailable) == ReplayResult::success && image_clears == 1 && !attachment_clears);
     ++checks;
     auto legacy = binding;
-    legacy.rgba8_typeless = false;
+    legacy.typeless = false;
     legacy.format = VK_FORMAT_UNDEFINED; // Existing ownerless float-only replay clients omit this metadata.
     CommandList legacy_list;
     EXPECT(legacy_list.clear_render_target({1, 0, 0, 1}, color) && legacy_list.close());

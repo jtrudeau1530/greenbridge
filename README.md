@@ -55,6 +55,7 @@ work on booting can start as soon as one is available to a developer.
 | Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
 | PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Controllers through a GameInput shim on SDL3 (any controller SDL supports, rumble, DualSense trigger effects and lightbar; built when SDL3 is installed or with `-DLEONIDA_SDL3_FETCH=ON`, [notes](docs/gameinput.md)). `--trace-d3d12` logs every D3D12 call and its outcome for the first boot. Untested against the real executable |
 | Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed and reserved resources, render-target and depth views (3D targets included), texture views and samplers (2D, cube and 3D views, the depth and stencil planes of depth-stencil textures, packed formats such as B5G6R5, B4G4R4A4 and R9G9B9E5; they go into the bindless set), and query heaps. Barriers, clears, uploads, copies (BC included), colour resolves, predication, CPU-side texture reads and writes, and occlusion, timestamp and pipeline-statistics queries run on Vulkan, checked on one GPU. No buffer views, root signatures, pipelines, draws, placed resources, 1D textures or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
+| Ray tracing (BVH) | ⚠️ In progress. `BuildRaytracingAccelerationStructure` builds BLASes and TLASes on the GPU in the console's XDXR BVH4 layout, which the translated shaders walk themselves (`image_bvh_intersect_ray`, TRI0/TRI1 leaves); `LEONIDA_RT_AS=khr` uses Vulkan's own acceleration structures instead. The build descriptions are recovered from the package's `XboxBvhBuilder.dll` ([notes](docs/xdxr.md)). The game's `*_bvh4.rpf` packs are measured: offline-built, dehydrated BLASes that rehydrate through that DLL with their geometry from the drawables in `levels.rpf` ([notes](docs/bvh.md)). Not done in the builder: TRI1 pairing, BOX16 nodes, serialization. Open: whether the game rehydrates the packs or rebuilds them, and the XDXR-vs-KHR default ([#313](https://github.com/ItsNotRexed/Leonida/issues/313)) |
 
 
 ## How to build
@@ -93,6 +94,12 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
+
+**Low disk space:** the ~350 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
+needs about 30 GB; the `assets` stage (~300 GB) is only for the asset tools, and `--wav` adds several times the
+Ogg Opus size. `--work` and `--out` can sit on another drive; a read-only package drive needs `--overlay` on a
+writable one. Leave the `.s` files in `work/shaders/dxbc/disasm` in place: deleting them while keeping the folder
+makes the stage look finished with zero shaders, and a symlinked `disasm` is refused.
 
 **From a terminal**, with the same behaviour and more control:
 

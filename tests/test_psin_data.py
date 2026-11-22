@@ -257,6 +257,33 @@ class TestCli(unittest.TestCase):
             self.assertEqual(r.returncode, 2)
             self.assertIn("incomplete", r.stderr)
 
+    def test_dump_missing_file_returns_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.bin")
+            r = self.run_tool(missing, "--dump")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("ERROR:", r.stderr)
+            self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+
+    def test_dump_oserror_returns_2_without_traceback(self):
+        import io
+        import unittest.mock
+        from contextlib import redirect_stderr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "locked.bin")
+            with open(path, "wb") as f:
+                f.write(sample())
+            err = io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", ["psin_data.py", path, "--dump"]), \
+                 unittest.mock.patch("builtins.open", side_effect=OSError("I/O error")), \
+                 redirect_stderr(err):
+                rc = D.main()
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertIn("I/O error", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

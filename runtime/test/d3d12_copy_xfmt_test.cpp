@@ -194,6 +194,8 @@ int main() {
         {"CopyTextureRegion D32_FLOAT -> R32_UINT", tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), tex(DXGI_FORMAT_R32_UINT, 16, 16), false, true},
         // A depth-stencil side is copied whole (no box, offset 0), as D3D12 requires of CopyTextureRegion.
         {"CopyTextureRegion R16_UNORM -> D16_UNORM", tex(DXGI_FORMAT_R16_UNORM, 16, 16), tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), false, true},
+        {"CopyResource D16_UNORM -> R16_UINT", tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), tex(DXGI_FORMAT_R16_UINT, 16, 16), true, true},
+        {"CopyTextureRegion R16_SNORM -> D16_UNORM", tex(DXGI_FORMAT_R16_SNORM, 16, 16), tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), false, true},
         {"CopyResource D32_FLOAT -> R32_FLOAT, 3 mips", mips(tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), 3), mips(tex(DXGI_FORMAT_R32_FLOAT, 16, 16), 3), true, true},
         {"negative control: CopyResource D32_FLOAT -> R16_UNORM", tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), tex(DXGI_FORMAT_R16_UNORM, 16, 16), true, true},
         {"CopyTextureRegion R32G32_UINT 4x4 -> BC1 16x16", tex(DXGI_FORMAT_R32G32_UINT, 4, 4), tex(DXGI_FORMAT_BC1_UNORM, 16, 16), false, false},

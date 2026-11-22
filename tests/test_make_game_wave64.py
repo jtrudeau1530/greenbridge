@@ -5,6 +5,7 @@ vulkaninfo text below is a hand-written excerpt of its format.
 
     python -I tests/test_make_game_wave64.py
 """
+import json
 import os
 import subprocess
 import sys
@@ -60,7 +61,8 @@ class Wave64EmulateTest(unittest.TestCase):
                 mock.patch.object(make_game.subprocess, "run", side_effect=fake_run) as run, \
                 mock.patch.object(make_game, "log", lambda *a: None):
             result = make_game.wave64_emulate(mode)
-        return result, run.called
+        asked_vulkaninfo = any(call.args[0] == [which] for call in run.call_args_list)
+        return result, asked_vulkaninfo
 
     def test_on_and_off_never_ask_vulkaninfo(self):
         self.assertEqual(self.decide("on", stdout=vulkaninfo_text(64)), (True, False))
@@ -213,6 +215,16 @@ class Rdna2AmdWindowsTest(unittest.TestCase):
     def test_rdna2_only_pc_is_unchanged(self):
         self.assertFalse(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700)[0])
 
+    def test_rdna2_guard_when_vulkaninfo_is_missing_or_unreadable(self):
+        for exe in (None, "vulkaninfo"):
+            with self.subTest(vulkaninfo=exe), \
+                    mock.patch.object(make_game.shutil, "which", return_value=exe), \
+                    mock.patch.object(make_game, "runtime_gpu_info", return_value=json.loads(self.RX6700)), \
+                    mock.patch.object(make_game.subprocess, "run", side_effect=OSError("cannot start")), \
+                    mock.patch.object(make_game, "log") as log:
+                self.assertEqual(make_game.wave64_settings("auto"), (False, False))
+                self.assertIn("#857", log.call_args.args[0])
+
     def test_explicit_on_is_taken_as_given(self):
         self.assertTrue(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700, mode="on")[0])
 
@@ -220,7 +232,14 @@ class Rdna2AmdWindowsTest(unittest.TestCase):
 class KeepEmulatedFlagTest(unittest.TestCase):
     """Only the default auto may keep emulated shaders; an explicit on or off is taken as given."""
 
-    def kept(self, mode):
+    def kept(self, mode, gpu=None, max_sizes=(64,)):
+        def fake_run(args, **kwargs):
+            if os.path.basename(str(args[-1])) == "vk_subgroup_info.py":
+                stdout = json.dumps(gpu or {})
+            else:
+                stdout = vulkaninfo_text(*max_sizes)
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
         with tempfile.TemporaryDirectory() as tmp:
             game = os.path.join(tmp, "game")
             os.makedirs(game)
@@ -229,16 +248,26 @@ class KeepEmulatedFlagTest(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
                     mock.patch.object(make_game, "log", lambda *a: None), \
                     mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
-                    mock.patch.object(make_game, "preflight"), \
-                    mock.patch.object(make_game, "wave64_emulate", return_value=False), \
+                    mock.patch.object(make_game, "preflight") as preflight, \
+                    mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                    mock.patch.object(make_game.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(make_game, "runtime_gpu_per_vertex", return_value=True), \
                     mock.patch.object(make_game, "shaders") as sh:
                 make_game.main()
+            self.assertEqual(preflight.call_args.kwargs["keep_emulated"], sh.call_args.kwargs["keep_emulated"])
             return sh.call_args.kwargs["keep_emulated"]
 
     def test_only_auto_keeps(self):
         self.assertTrue(self.kept("auto"))
         self.assertFalse(self.kept("off"))
         self.assertFalse(self.kept("on"))
+
+    def test_auto_does_not_keep_emulated_outputs_on_native_rdna2_on_amd_windows(self):
+        gpu = {"device": "AMD Radeon RX 6700", "native64": True, "rdna2_amd_windows": True}
+        for max_sizes in ((64,), (64, 32)):
+            with self.subTest(max_sizes=max_sizes):
+                self.assertFalse(self.kept("auto", gpu, max_sizes))
+        self.assertTrue(self.kept("auto", dict(gpu, rdna2_amd_windows=False)))
 
 
 class SubgroupInfoToolTest(unittest.TestCase):

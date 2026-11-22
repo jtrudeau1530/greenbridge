@@ -121,16 +121,26 @@ class Med3NaN(unittest.TestCase):
             ((NAN_A, P70, P50), P50),
             ((NAN_A, P35, M25), M25),
             ((M25, NAN_B, P35), M25),
+            ((P70, P50, NAN_A), P50),          # NaN in S2 (z): previously hit undefined FClamp
+            ((P50, P70, NAN_B), P50),
+            ((NAN_A, NAN_B, P50), P50),        # two NaNs in S0, S1: previously hit undefined FClamp
+            ((NAN_A, P50, NAN_B), P50),
+            ((P50, NAN_A, NAN_B), P50),
             ((NZ, PZ, NZ), NZ),
             ((ONE, P35, M25), ONE),            # no NaN: the median, unchanged
         ]
         for ins, want in rows:
             with self.subTest(ins=[hex(w) for w in ins]):
                 self.assertEqual(run_op("v_med3_f32 v0, v1, v2, v3", ins), want)
+        # All three NaN: must return a NaN without triggering undefined FClamp.
+        self.assertTrue(is_nan32(run_op("v_med3_f32 v0, v1, v2, v3", (NAN_A, NAN_B, NAN_A))))
+        spv = translate_text(LOAD + "v_med3_f32 v0, v1, v2, v3\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+        self.assertNotIn("FClamp", spv)
 
     def test_v_med3_f32_with_inline_constants(self):
         # med3(0, NaN, 1.0) = 0 on hardware. Only the register operand can be a NaN, so only it is tested.
         self.assertEqual(run_op("v_med3_f32 v0, 0, v1, 1.0", (NAN_A,)), PZ)
+        self.assertEqual(run_op("v_med3_f32 v0, 0, 1.0, v1", (NAN_A,)), PZ)
         spv = translate_text(LOAD + "v_med3_f32 v0, 0, v1, 1.0\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
         self.assertEqual(spv.count("OpIsNan"), 1)
 
@@ -147,8 +157,19 @@ class Med3NaN(unittest.TestCase):
         self.assertEqual(support.mrt0_words(spv, push_constants=PUSH, memory={0x1000: P70, 0x1004: P50})[0], P50)
 
     def test_v_med3_f16_follows_the_same_rule(self):
-        # The f16 form of the first f32 row (rule stated for v_med3_f32/_f16): med3(NaN, 7.0, 5.0) = 5.0.
-        self.assertEqual(run_op("v_med3_f16 v0, v1, v2, v3", (0x7E11, 0x4700, 0x4500)), 0x4500)
+        # All 1-, 2-, and 3-NaN operand positions for v_med3_f16 (measured on gfx1035 wave32 & wave64).
+        nan16, h5, h7 = 0x7E11, 0x4500, 0x4700
+        for ins, want in (
+            ((nan16, h7, h5), h5),
+            ((h7, nan16, h5), h5),
+            ((h7, h5, nan16), h5),
+            ((nan16, nan16, h5), h5),
+            ((nan16, h5, nan16), h5),
+            ((h5, nan16, nan16), h5),
+        ):
+            with self.subTest(ins=[hex(w) for w in ins]):
+                self.assertEqual(run_op("v_med3_f16 v0, v1, v2, v3", ins), want)
+        self.assertTrue(is_nan16(run_op("v_med3_f16 v0, v1, v2, v3", (nan16, nan16, nan16)) & 0xFFFF))
 
 
 class FractNearOne(unittest.TestCase):

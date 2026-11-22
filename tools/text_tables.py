@@ -111,7 +111,7 @@ def string_tables(buf: bytes):
                 continue
             start = blob + (struct.unpack_from("<Q", buf, at)[0] >> 20)
             end = buf.find(b"\0", start, blob + blob_bytes)
-            if blob <= start and end > start:
+            if blob <= start <= end:
                 out[h] = buf[start:end].decode("utf-8", "replace")
         if out:
             yield out
@@ -170,11 +170,14 @@ def _is_resource(data: bytes) -> bool:
 
 
 def _chains(rows, read):
-    """(offset, bytes) per logical blob: a stream plus the streams that continue a full 64 KiB one."""
+    """(offset, bytes) per logical blob: a stream plus the streams that continue a full one.
+
+    A stream is full when its size is a whole number of 64 KiB blocks: a resource's first stream is often 128 or
+    192 KiB (docs/page_directory.md), not only 64 KiB, and its descriptors then end in the stream that follows."""
     cur_off, parts, last = None, [], 0
     for row in rows:
         data = read(row)
-        continues = (cur_off is not None and last == BLOCK and not _is_resource(data)
+        continues = (cur_off is not None and last > 0 and last % BLOCK == 0 and not _is_resource(data)
                      and data[:4] != b"PSIN" and data[:4] != b"RBF0")
         if continues and sum(map(len, parts)) + len(data) <= MAX_RESOURCE_BYTES:
             parts.append(data)
@@ -281,6 +284,15 @@ def _write_csv(path, fields, rows):
     return n
 
 
+def _same_output_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("sources", nargs="+", help="rpf9_carve.py directory, .rpf archive, or resource files/dirs")
@@ -289,13 +301,17 @@ def main(argv=None) -> int:
     ap.add_argument("--tables", help="CSV: one row per string table (source, offset, lang, group, counts)")
     ap.add_argument("--strings", help="CSV: every string (source, offset, lang, hash, label, text)")
     a = ap.parse_args(argv)
-    outs = [p for p in (a.dialogue, a.tables, a.strings) if p]
-    seen = set()
-    for p in outs:
-        key = os.path.normcase(os.path.realpath(p))
-        if key in seen:
+    out_flags = [(flag, path) for flag, path in (("--dialogue", a.dialogue), ("--tables", a.tables),
+                                                 ("--strings", a.strings)) if path]
+    outs = [path for _, path in out_flags]
+    seen = []
+    for flag, p in out_flags:
+        if any(_same_output_path(p, prev) for prev in seen):
             ap.error("outputs must be distinct files")
-        seen.add(key)
+        seen.append(p)
+        parent = os.path.dirname(os.path.abspath(p))
+        if not os.path.isdir(parent):
+            ap.error(f"{flag} parent directory does not exist: {parent}")
     for path in a.sources + a.labels:
         if not os.path.exists(path):
             print(f"text_tables: error: {path}: no such file or directory", file=sys.stderr)
@@ -304,12 +320,16 @@ def main(argv=None) -> int:
             ap.error("an output must not overwrite an input")
 
     scan = Scan()
-    for source in a.sources:
-        for label, offset, data in blobs(source):
-            scan.add(label, offset, data)
-    names = {}
-    for path in a.labels:
-        names.update(read_labels(path))
+    try:
+        for source in a.sources:
+            for label, offset, data in blobs(source):
+                scan.add(label, offset, data)
+        names = {}
+        for path in a.labels:
+            names.update(read_labels(path))
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"text_tables: error: cannot read input: {error}", file=sys.stderr)
+        return 2
     for labels in scan.pairs.values():               # dialogue labels name themselves
         for label in labels:
             names[joaat(label)] = label
