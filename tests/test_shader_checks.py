@@ -355,6 +355,37 @@ class PixelDeviceLimits(unittest.TestCase):
                 self.assertNotIsInstance(problem, check.Skip)
                 self.assertIn("wrong", problem)
 
+    @staticmethod
+    def vcmpx_pixels(words=(0xf05b2a48, 0xf05e8a12, 0xb174be18, 0x15550000)):
+        return b"".join(struct.pack("<4I", *words) for _ in range(64 * 64))
+
+    def test_vcmpx_forms_skips_on_variable_fragment_subgroup(self):
+        # TEST-205: no lane IDs in mrt0, so the skip is from the reported range (same class as #1318).
+        out = "device: Intel UHD 770 (subgroup 8..32)\nok 64x64\n"
+        problem = self.run_pixel("ps_vcmpx_forms", 0, out, data=self.vcmpx_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("8..32", problem)
+        self.assertIn("needs 32", problem)
+
+    def test_vcmpx_forms_skips_below_32_lanes(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_vcmpx_forms", 0, out, data=self.vcmpx_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("narrower than 32 lanes", problem)
+
+    def test_vcmpx_forms_is_judged_at_32_lanes(self):
+        out = "device: NVIDIA (subgroup 32..32)\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_vcmpx_forms", 0, out, data=self.vcmpx_pixels()), "")
+        bad = self.vcmpx_pixels((0, 0, 0, 0xffff))  # lane-mask-looking word3, as on UHD 770
+        problem = self.run_pixel("ps_vcmpx_forms", 0, out, data=bad)
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("differ", problem)
+
+    def test_vcmpx_forms_skips_without_a_subgroup_width(self):
+        problem = self.run_pixel("ps_vcmpx_forms", 0, "ok 64x64\n", data=self.vcmpx_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("no subgroup width", problem)
+
 
 class SeededPixelTests(unittest.TestCase):
     """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""

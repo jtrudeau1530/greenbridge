@@ -549,6 +549,24 @@ def bitmask_perm_narrow_skip(out, px):
     return None
 
 
+def vcmpx_forms_narrow_skip(out):
+    """A Skip when ps_vcmpx_forms cannot be judged at 32-lane EXEC (TEST-205 / #618).
+
+    The shader packs v_cmpx EXEC results into constant mrt0 words and does not write lane IDs, so unlike
+    bitmask_perm_narrow_skip the width cannot be read back from the frame. On devices with minSubgroupSize < 32,
+    requiredSubgroupSizeStages typically omits FRAGMENT (#1318), so vk_harness cannot pin the stage and the
+    driver runs it narrower (Intel UHD 770: 4096/4096 mismatches, last word looking like a lane mask)."""
+    m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
+    if not m:
+        return Skip("SKIP (vk_harness reported no subgroup width)")
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if hi < 32:
+        return Skip(f"SKIP (subgroup {hi} is narrower than 32 lanes)")
+    if lo < 32:
+        return Skip(f"SKIP (fragment subgroup may run narrower than 32 on {lo}..{hi} device; needs 32)")
+    return None
+
+
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
                  env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
@@ -1033,6 +1051,9 @@ def pixel_test(tools, spirv, name):
             return Skip("SKIP (vk_harness reported no subgroup width)")
         if int(m.group(1)) < 32:
             return Skip(f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)")
+    if name == "ps_vcmpx_forms":
+        if skip := vcmpx_forms_narrow_skip(out):
+            return skip
     if not px:
         return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
     n = len(px)
