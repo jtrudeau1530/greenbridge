@@ -265,7 +265,20 @@ public:
         return swapchain_.acquire_next_image(next) ? S_OK : E_FAIL;
     }
 
-    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* mode) override {
+        if (!mode) return DXGI_ERROR_INVALID_CALL;  // host-measured, not E_INVALIDARG
+        // Windowed: the target output's client area takes the mode's size, and the back buffers keep theirs until
+        // ResizeBuffers (where 0 means the client area). The window's own style gives the frame around it. A zero
+        // size is accepted, as on the host, and the window's minimum tracking size decides what is left of it.
+        RECT frame{0, 0, static_cast<LONG>(mode->Width), static_cast<LONG>(mode->Height)};
+        const auto style = static_cast<DWORD>(GetWindowLongW(hwnd_, GWL_STYLE));
+        const auto ex_style = static_cast<DWORD>(GetWindowLongW(hwnd_, GWL_EXSTYLE));
+        if (!AdjustWindowRectEx(&frame, style, FALSE, ex_style)) return E_INVALIDARG;
+        if (!SetWindowPos(hwnd_, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
+                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
+            return DXGI_ERROR_INVALID_CALL;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; }
     HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) override {
         if (!stats) return DXGI_ERROR_INVALID_CALL;
