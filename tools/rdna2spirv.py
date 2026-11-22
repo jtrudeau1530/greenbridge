@@ -3531,7 +3531,9 @@ class Gen:
         """A bitfield-extract width cut to 32 - off (off in 0-31): SPIR-V leaves offset + count > 32 undefined. The
         field then runs to bit 31: gfx1150 hardware does this for s_bfe (4000 random control words, salu_diff
         --oracle hw), and LLVM's v_bfe fold (constantFoldBFE in AMDGPUISelLowering.cpp, 5-bit width) is analogous:
-        Src0 >> Offset, logical for the unsigned and arithmetic for the signed extract. RDNA2 is unmeasured."""
+        Src0 >> Offset, logical for the unsigned and arithmetic for the signed extract. On RDNA2 v_bfe_u32/v_bfe_i32
+        do the same (gfx1036, wave32 and wave64, tools/int_hw_probe.py group valu_bfe_past31), and s_bfe too (gfx1035,
+        SHADER-137)."""
         room, fits, w = self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{room} = OpISub %uint {self.cu(32)} {off}")
         self.emit(f"{fits} = OpULessThan %bool {wid} {room}")
