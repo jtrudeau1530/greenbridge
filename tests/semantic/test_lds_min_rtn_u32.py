@@ -1254,5 +1254,264 @@ class TestDSMinRtnU32IEEE754AndBoundaries(unittest.TestCase):
         self.assertEqual(eff2, 16)
 
 
+class SignedComparisonMutant(ScalarDSInterpreter):
+    """Mutant 1: Uses signed comparison instead of unsigned comparison."""
+
+    def execute_instruction(self, inst: DSMinRtnU32Instruction) -> int:
+        vaddr_val = self.state.get_vgpr(inst.vaddr.index)
+        vdata0_val = self.state.get_vgpr(inst.vdata0.index)
+        eff_addr = calc_lds_effective_address(vaddr_val, inst.offset.value)
+        idx = self.state.lds.get_dword_index(eff_addr)
+        old_val = self.state.lds.dwords[idx]
+        # Mutation: signed comparison
+        signed_old = s32(old_val)
+        signed_cand = s32(vdata0_val)
+        new_val = u32(signed_old if signed_old < signed_cand else signed_cand)
+        self.state.lds.dwords[idx] = new_val
+        if inst.opcode.is_return and inst.vdst is not None:
+            self.state.set_vgpr(inst.vdst.index, old_val)
+        return old_val
+
+
+class MaxInsteadOfMinMutant(ScalarDSInterpreter):
+    """Mutant 2: Performs unsigned maximum instead of minimum."""
+
+    def execute_instruction(self, inst: DSMinRtnU32Instruction) -> int:
+        vaddr_val = self.state.get_vgpr(inst.vaddr.index)
+        vdata0_val = self.state.get_vgpr(inst.vdata0.index)
+        eff_addr = calc_lds_effective_address(vaddr_val, inst.offset.value)
+        idx = self.state.lds.get_dword_index(eff_addr)
+        old_val = self.state.lds.dwords[idx]
+        # Mutation: max instead of min
+        new_val = old_val if old_val > vdata0_val else vdata0_val
+        self.state.lds.dwords[idx] = new_val
+        if inst.opcode.is_return and inst.vdst is not None:
+            self.state.set_vgpr(inst.vdst.index, old_val)
+        return old_val
+
+
+class NewValReturnMutant(ScalarDSInterpreter):
+    """Mutant 3: Returns post-operation new value instead of pre-operation old value."""
+
+    def execute_instruction(self, inst: DSMinRtnU32Instruction) -> int:
+        vaddr_val = self.state.get_vgpr(inst.vaddr.index)
+        vdata0_val = self.state.get_vgpr(inst.vdata0.index)
+        eff_addr = calc_lds_effective_address(vaddr_val, inst.offset.value)
+        old_val = self.state.lds.atomic_min_rtn_u32(eff_addr, vdata0_val)
+        # Mutation: return new_val instead of old_val
+        new_val = self.state.lds.read_by_byte_addr(eff_addr)
+        if inst.opcode.is_return and inst.vdst is not None:
+            self.state.set_vgpr(inst.vdst.index, new_val)
+        return new_val
+
+
+class DroppedOffsetMutant(ScalarDSInterpreter):
+    """Mutant 4: Ignores the immediate byte offset."""
+
+    def execute_instruction(self, inst: DSMinRtnU32Instruction) -> int:
+        vaddr_val = self.state.get_vgpr(inst.vaddr.index)
+        vdata0_val = self.state.get_vgpr(inst.vdata0.index)
+        # Mutation: drop offset
+        eff_addr = calc_lds_effective_address(vaddr_val, 0)
+        old_val = self.state.lds.atomic_min_rtn_u32(eff_addr, vdata0_val)
+        if inst.opcode.is_return and inst.vdst is not None:
+            self.state.set_vgpr(inst.vdst.index, old_val)
+        return old_val
+
+
+class InactiveLaneLeakMutant(SIMDDSInterpreter):
+    """Mutant 5: Inactive SIMD lanes leak and overwrite their destination VGPRs."""
+
+    def execute_instruction(self, inst: DSMinRtnU32Instruction) -> Dict[int, int]:
+        results = super().execute_instruction(inst)
+        # Mutation: overwrite inactive lane destination registers
+        if inst.opcode.is_return and inst.vdst is not None:
+            for lane in range(self.state.wave_size):
+                if not self.state.is_lane_active(lane):
+                    self.state.set_vgpr(lane, inst.vdst.index, 0xBADF00D)
+        return results
+
+
+class NoWritebackToMemoryMutant(ScalarDSInterpreter):
+    """Mutant 6: Returns old value but fails to write updated minimum back to memory."""
+
+    def execute_instruction(self, inst: DSMinRtnU32Instruction) -> int:
+        vaddr_val = self.state.get_vgpr(inst.vaddr.index)
+        eff_addr = calc_lds_effective_address(vaddr_val, inst.offset.value)
+        idx = self.state.lds.get_dword_index(eff_addr)
+        old_val = self.state.lds.dwords[idx]
+        # Mutation: memory write omitted
+        if inst.opcode.is_return and inst.vdst is not None:
+            self.state.set_vgpr(inst.vdst.index, old_val)
+        return old_val
+
+
+class TestDSMinRtnU32NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+
+    def test_syntax_rejection_negative_controls(self) -> None:
+        # Invalid register indices
+        with self.assertRaises(ValueError):
+            vgpr(-5)
+        with self.assertRaises(ValueError):
+            vgpr(300)
+        with self.assertRaises(ValueError):
+            sgpr(120)
+
+        # Invalid offset
+        with self.assertRaises(ValueError):
+            OffsetImmediate(-1)
+        with self.assertRaises(ValueError):
+            OffsetImmediate(70000)
+
+        # Invalid memory size
+        with self.assertRaises(ValueError):
+            LDSMemory(0)
+        with self.assertRaises(ValueError):
+            LDSMemory(12345)
+
+        # Invalid wave size
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+        # Missing destination on returning opcode
+        with self.assertRaises(ValueError):
+            DSMinRtnU32Instruction(
+                opcode=DSOpcode.DS_MIN_RTN_U32,
+                vdst=None,
+                vaddr=vgpr(0),
+                vdata0=vgpr(1),
+            )
+
+    def test_mutation_1_signed_comparison_detected(self) -> None:
+        state = ScalarThreadState(lds=self.lds)
+        mutant = SignedComparisonMutant(state=state)
+        # In unsigned: 0 < 0xFFFFFFFF
+        # In signed: 0xFFFFFFFF (-1) < 0
+        state.set_vgpr(1, 0x10)
+        state.set_vgpr(2, 0xFFFFFFFF)
+        self.lds.write_by_byte_addr(0x10, 0)
+
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+        )
+        mutant.execute_instruction(inst)
+
+        # The mutant erroneously stores 0xFFFFFFFF because signed -1 < 0
+        mutant_stored = self.lds.read_by_byte_addr(0x10)
+        # Expected correct unsigned minimum is 0
+        expected = 0
+        self.assertNotEqual(mutant_stored, expected, "Signed comparison mutant must be caught")
+
+    def test_mutation_2_max_instead_of_min_detected(self) -> None:
+        state = ScalarThreadState(lds=self.lds)
+        mutant = MaxInsteadOfMinMutant(state=state)
+        state.set_vgpr(1, 0x20)
+        state.set_vgpr(2, 50)
+        self.lds.write_by_byte_addr(0x20, 100)
+
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+        )
+        mutant.execute_instruction(inst)
+
+        # Mutant computed max(100, 50) = 100 instead of min = 50
+        mutant_stored = self.lds.read_by_byte_addr(0x20)
+        expected = 50
+        self.assertNotEqual(mutant_stored, expected, "Max-instead-of-min mutant must be caught")
+
+    def test_mutation_3_new_val_return_detected(self) -> None:
+        state = ScalarThreadState(lds=self.lds)
+        mutant = NewValReturnMutant(state=state)
+        state.set_vgpr(1, 0x30)
+        state.set_vgpr(2, 25)
+        self.lds.write_by_byte_addr(0x30, 90)
+
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+        )
+        mutant.execute_instruction(inst)
+
+        # Mutant returned 25 instead of old value 90
+        mutant_returned = state.get_vgpr(0)
+        expected_returned = 90
+        self.assertNotEqual(mutant_returned, expected_returned, "New-val-return mutant must be caught")
+
+    def test_mutation_4_dropped_offset_detected(self) -> None:
+        state = ScalarThreadState(lds=self.lds)
+        mutant = DroppedOffsetMutant(state=state)
+        state.set_vgpr(1, 0x40)
+        state.set_vgpr(2, 10)
+        self.lds.write_by_byte_addr(0x40, 500)
+        self.lds.write_by_byte_addr(0x48, 800)  # offset 8
+
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+            offset=OffsetImmediate(8),
+        )
+        mutant.execute_instruction(inst)
+
+        # Correct behavior updates byte 0x48. Mutant updates byte 0x40.
+        mutant_at_target = self.lds.read_by_byte_addr(0x48)
+        expected_at_target = 10
+        self.assertNotEqual(mutant_at_target, expected_at_target, "Dropped offset mutant must be caught")
+
+    def test_mutation_5_inactive_lane_leak_detected(self) -> None:
+        state = SIMDWaveState(wave_size=32, lds=self.lds)
+        state.exec_mask = 0x00000001  # Only lane 0 active
+        state.set_vgpr(1, 0, 0xCAFE)  # Canary in inactive lane 1
+        mutant = InactiveLaneLeakMutant(state=state)
+
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+        )
+        mutant.execute_instruction(inst)
+
+        # Mutant corrupted inactive lane's register
+        canary = state.get_vgpr(1, 0)
+        expected_canary = 0xCAFE
+        self.assertNotEqual(canary, expected_canary, "Inactive lane leak mutant must be caught")
+
+    def test_mutation_6_no_writeback_detected(self) -> None:
+        state = ScalarThreadState(lds=self.lds)
+        mutant = NoWritebackToMemoryMutant(state=state)
+        state.set_vgpr(1, 0x60)
+        state.set_vgpr(2, 30)
+        self.lds.write_by_byte_addr(0x60, 100)
+
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+        )
+        mutant.execute_instruction(inst)
+
+        # Mutant left memory at 100 instead of updating to 30
+        stored = self.lds.read_by_byte_addr(0x60)
+        expected = 30
+        self.assertNotEqual(stored, expected, "No writeback mutant must be caught")
+
+
 if __name__ == "__main__":
     unittest.main()
