@@ -157,13 +157,16 @@ def read(p):
         return f.read()
 
 
+INPUT_EXTENSIONS = (".jsav", ".asav", ".json", ".bin")
+
+
 def iter_inputs(paths):
-    """Yield the bytes of every save file or .json found under the given paths."""
+    """Yield the bytes of every save file (.jsav, .asav, .bin or no extension) or .json found under the given paths."""
     for p in paths:
         if os.path.isdir(p):
             for dp, _, fs in os.walk(p):
                 for f in sorted(fs):
-                    if f.endswith(".json") or f.endswith(".bin") or "." not in f:
+                    if f.lower().endswith(INPUT_EXTENSIONS) or "." not in f:
                         yield read(os.path.join(dp, f))
         else:
             yield read(p)
