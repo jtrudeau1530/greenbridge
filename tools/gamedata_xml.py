@@ -25,7 +25,6 @@ import os
 import re
 import statistics
 import sys
-import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 
@@ -33,6 +32,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import gamedata_index as gi  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
 MACRO_REF = re.compile(r"\$\(([A-Za-z_][\w.-]*)\)")
@@ -191,10 +191,22 @@ def scan_xml(data: bytes) -> dict:
     except (ET.ParseError, LookupError, ValueError) as exc:
         # The parser also raises LookupError or ValueError for unsupported encoding declarations.
         report["error"] = str(exc)
+        # The parser stops at the error, so the comments after it would go uncounted (a truncated or tail-only
+        # document): count them in the bytes instead, still skipping comment-like text inside CDATA.
+        report["comments"] = raw_comment_count(data)
     if ended is not None:
         scan_refs(ended.tail, report)
     report["attributes"] = sorted(report["attrs"])
     return report
+
+
+CDATA = re.compile(rb"<!\[CDATA\[.*?(?:\]\]>|\Z)", re.S)
+
+
+def raw_comment_count(data: bytes) -> int:
+    """Comment starts in a document the parser could not finish, outside CDATA sections (an unclosed one runs to
+    the end of the data)."""
+    return CDATA.sub(b"", data).count(b"<!--")
 
 
 def looks_truncated(data: bytes, root: str) -> bool:
@@ -472,42 +484,6 @@ def _make_parent(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-
-
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
-def same_report_path(first: str, second: str) -> bool:
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def write_csv(path: str, rows: list) -> None:

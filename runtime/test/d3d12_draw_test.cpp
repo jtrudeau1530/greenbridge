@@ -202,6 +202,40 @@ int main() {
         instance_desc.InputLayout = {instance_elements, 2};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&instance_desc, IID_PPV_ARGS(&instanced.p))));
 
+        // CachedPSO on a graphics description: what the PC runtime matches, measured on an RTX 3060
+        // (src/cached_pso.h). Flags is not part of it; every state below is.
+        {
+            Ref<ID3DBlob> blob;
+            EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p && blob->GetBufferSize());
+            auto with_blob = [&](D3D12_GRAPHICS_PIPELINE_STATE_DESC d) {
+                d.CachedPSO = {blob->GetBufferPointer(), blob->GetBufferSize()};
+                Ref<ID3D12PipelineState> made;
+                const HRESULT hr = device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&made.p));
+                return SUCCEEDED(hr) == (made.p != nullptr) ? hr : E_UNEXPECTED;
+            };
+            EXPECT(with_blob(pso_desc) == S_OK);
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC changed = pso_desc;
+            changed.Flags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG;
+            EXPECT(with_blob(changed) == S_OK);
+            EXPECT(with_blob(mrt_desc) == E_INVALIDARG);
+            EXPECT(with_blob(instance_desc) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.SampleMask = 1;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+            changed = pso_desc;
+            changed.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            EXPECT(with_blob(changed) == E_INVALIDARG);
+        }
+
         // State that needs a Vulkan feature this test device does not enable is refused, not passed to the driver.
         D3D12_GRAPHICS_PIPELINE_STATE_DESC needs_feature = pso_desc;
         needs_feature.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;  // fillModeNonSolid
