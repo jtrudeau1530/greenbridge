@@ -6,6 +6,9 @@ target:
 
     set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
 
+On Windows, arguments follow the MSVC C runtime's quoting rules. Double a trailing backslash in a quoted
+argument before the closing quote.
+
 run() starts such a command and turns a missing llvm-mc into one line instead of a FileNotFoundError traceback.
 """
 from __future__ import annotations
