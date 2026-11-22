@@ -850,9 +850,40 @@ and any validation error fails them.
   from `decode(T#)`. `check.py`'s `SAMPLER_CASES` cover a point mip filter, MAX_LOD 0, MIN_LOD 1, LOD_BIAS ±1,
   MIP_FILTER_NONE with and without MIN_LOD, and a T# whose BASE_LEVEL is 1. Each pixel is judged against levels
   worked out from the S# and T# bits in Python, independently of the header. On Vulkan, the sampler's minLod and
-  mipLodBias apply to an explicit LOD as well. That this matches the console for `image_sample_lz` and
-  `image_sample_l` is taken from radv, which writes these Vulkan fields straight into the S#; it was not measured
-  on RDNA2 here. The T#'s MIN_LOD (D3D12's ResourceMinLODClamp) is not covered by this test.
+  mipLodBias apply to an explicit LOD as well. The T#'s MIN_LOD (D3D12's ResourceMinLODClamp) is not covered by
+  this test.
+- **Measured on RDNA2** (SHADER-539): `tools/sampler_lod_probe.py --oracle hw` samples a linear 64x64 R32_SFLOAT
+  texture with seven levels at its top-left texel. The texture memory is a dword ramp, so each result names the
+  level it was read from, and a calibration row per level finds the level starts. It runs 43 rows of
+  `image_sample_l` and `image_sample_lz` on a gfx1036 (Radeon iGPU, Windows 11, AMD 26.10.1, `tools/hw_oracle`
+  HIP launcher, rocm-sdk-core 10.0.0 clang). wave32 and wave64 gave the same level in every row, and three runs
+  were identical.
+  - **The S# fields apply to explicit LODs.** LOD_BIAS (±), MIN_LOD and MAX_LOD apply to `image_sample_l`'s
+    explicit LOD and to `image_sample_lz`'s LOD 0, bias before the clamp, as radv assumes. MIP_FILTER none ignores
+    them and reads the view's base level.
+  - **The T#'s MIN_LOD applies too.** It counts from the resource's level 0, not the view's BASE_LEVEL: BASE_LEVEL
+    1 with MIN_LOD 2 reads level 2.
+  - **Where the hardware is not Vulkan:**
+    - **Rounding.** The point mip filter's level is floor(lambda + 0.5), so an exact .5 rounds up: LOD 0.5, 1.5 and
+      2.5 read levels 1, 2 and 3, and so do S# MIN_LOD 1.5 or MAX_LOD 1.5 and LOD 1 with bias +0.5. Vulkan's
+      nearest is ceil(lambda + 0.5) - 1, which reads 0, 1 and 2.
+    - **The T#'s MIN_LOD clamps the still fractional LOD before that rounding.** MIN_LOD 2.25, 2.5 and 2.75 at
+      LOD 0 read levels 2, 3 and 3. `VK_EXT_image_view_min_lod` raises the integer level to floor(minLod), which
+      gives 2, 2 and 2.
+    - **MIP_FILTER none with the T#'s MIN_LOD.** The level is the base raised to floor(MIN_LOD): 2.5 reads level 2,
+      the same as Vulkan.
+
+    So a host whose Vulkan driver follows the spec's nearest rule reads one level lower than the console on 8 of
+    the 43 rows: an exact half-level LOD, or a fractional ResourceMinLODClamp. LOD 1.49 reads level 1 on both. The
+    AMD driver does not follow it. Through the runtime's own path (`vk_sampler_test`, `vulkan_sampler(decode(S#))`),
+    an S# LOD_BIAS of +0.5 on `image_sample_lz` reads level 1, like the console, on the same gfx1036 and on an RX 7800
+    XT (both AMD 26.10.1). So on AMD hosts the S# case matches. Other hosts (NVIDIA, Intel, Mesa) are not measured
+    here.
+  - **Layout.** gfx1036 lays a linear mip chain out smallest level first, each row padded to 256 bytes. Levels 6..0
+    of the 64-wide R32 chain start at dwords 0, 64, 192, 448, 960, 1984 and 4032.
+
+  `tests/test_sampler_lod_probe.py` checks the descriptor fields against `check.py` and `gfx10_descriptors.h`, and
+  the model against these levels, without a GPU.
 - `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
   the CPU has not signalled holds the GPU back.
 - `dxgi_swapchain_test`: creates a Win32 HWND and exercises `rt::d3d12::create_dxgi_factory`,
