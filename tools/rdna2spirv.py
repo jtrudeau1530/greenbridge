@@ -3984,7 +3984,8 @@ class Gen:
                     "buffer_load_format_d16_xyz", "buffer_load_format_d16_xyzw"):
             self.buffer_load_format(op, a, mods)
         elif op in ("tbuffer_load_format_x", "tbuffer_load_format_xy", "tbuffer_load_format_xyz",
-                    "tbuffer_load_format_xyzw"):
+                    "tbuffer_load_format_xyzw", "tbuffer_load_format_d16_x", "tbuffer_load_format_d16_xy",
+                    "tbuffer_load_format_d16_xyz", "tbuffer_load_format_d16_xyzw"):
             # MTBUF encodes its own format. LLVM omits the modifier for GFX10's default, BUF_FMT_8_UNORM.
             fm = next((m for m in mods if m.startswith("format:")), "format:[BUF_FMT_8_UNORM]")
             name = "GFX10_FORMAT_" + fm.split("BUF_FMT_")[-1].rstrip("]")
