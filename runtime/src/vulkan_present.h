@@ -236,7 +236,7 @@ public:
     // destination rectangle of the window, plane 1 blended over plane 0, composed by a compute pass into an RGBA16F image
     // that is then copied to the swapchain image. Colour spaces are converted to the swapchain's: when a plane is HDR10 and
     // the surface lists an HDR10 (ST.2084) format the swapchain uses it (hdr_active()), else the HDR10 planes are
-    // tone mapped to SDR (extended Reinhard, then clipped). Planes are filtered and blended in linear light. The swapchain
+    // tone mapped to SDR (shoulder above 0.8 of SDR white, then clipped). Planes are filtered and blended in linear light. The swapchain
     // is always UNORM here; sRGB-format sources are
     // encoded again by the pass. Sources must be single-sample, sampled (no DENY_SHADER_RESOURCE) float/UNORM/sRGB
     // colour textures; others are refused (VK_ERROR_FORMAT_NOT_SUPPORTED). Rectangles outside their range give

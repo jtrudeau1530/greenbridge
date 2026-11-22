@@ -2,6 +2,7 @@
 
 #include "../src/vulkan_present.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -31,25 +32,56 @@ XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, l
       pacer_(clock ? *clock : *own_clock_) {
     // A present waiting for a swapchain image gives up once SuspendX has been called.
     presenter_->set_abort([this] { return pacer_.suspended(); });
-    // LEONIDA_SDR_EOTF=gamma22 (or 2.2) decodes SDR with a pure power of 2.2 instead of piecewise sRGB.
-    char eotf[16] = {};
+    // LEONIDA_SDR_EOTF=gamma22 (or 2.2, any case) decodes SDR with a pure power of 2.2 instead of piecewise sRGB; "srgb" or
+    // unset keeps the default; anything else (also a value too long for the buffer, ERANGE) is logged once and ignored.
+    char eotf[32] = {};
     std::size_t eotf_length = 0;
-    if (getenv_s(&eotf_length, eotf, "LEONIDA_SDR_EOTF") == 0 && eotf_length > 1 &&
-        (!std::strcmp(eotf, "gamma22") || !std::strcmp(eotf, "2.2")))
-        sdr_eotf_ = leonida::PresentPlanes::SdrEotf::gamma22;
+    const errno_t env = getenv_s(&eotf_length, eotf, "LEONIDA_SDR_EOTF");
+    if (env == 0 && eotf_length > 1) {
+        if (!_stricmp(eotf, "gamma22") || !_stricmp(eotf, "2.2")) sdr_eotf_ = leonida::PresentPlanes::SdrEotf::gamma22;
+        else if (_stricmp(eotf, "srgb") != 0)
+            std::fprintf(stderr, "[rt] present: LEONIDA_SDR_EOTF=%s is not srgb, gamma22 or 2.2: piecewise sRGB used\n", eotf);
+    } else if (env == ERANGE) {
+        std::fprintf(stderr, "[rt] present: LEONIDA_SDR_EOTF is too long to be srgb, gamma22 or 2.2: piecewise sRGB used\n");
+    }
+    display_white_thread_ = std::thread([this] { display_white_worker(); });
 }
 
-XboxPresentation::~XboxPresentation() { presenter_->set_abort(nullptr); }
+XboxPresentation::~XboxPresentation() {
+    {
+        std::lock_guard lock(worker_mutex_);
+        worker_stop_ = true;
+    }
+    worker_wake_.notify_all();
+    display_white_thread_.join();
+    presenter_->set_abort(nullptr);
+}
+
+// Windows' SDR white level costs a QueryDisplayConfig and two DisplayConfigGetDeviceInfo calls (measured in
+// xbox_present_test, docs section 4.5): too much for the present path, which would hitch once a second and feed the pacer.
+// So it is read here, about once a second while an HDR10 swapchain is in use, and PresentX reads the cached value.
+void XboxPresentation::display_white_worker() {
+    std::unique_lock lock(worker_mutex_);
+    while (!worker_stop_) {
+        if (white_wanted_.load()) {
+            lock.unlock();
+            const float nits = presenter_->display_sdr_white_nits();
+            if (nits > 0.0f) display_white_ = nits;  // a failed query keeps the last good value
+            lock.lock();
+        }
+        worker_wake_.wait_for(lock, std::chrono::seconds(1), [this] { return worker_stop_; });
+    }
+}
 
 float XboxPresentation::effective_sdr_white_nits() {
     if (sdr_white_override_ > 0.0f) return sdr_white_override_;
     if (!presenter_->hdr_active()) return 203.0f;  // the Windows setting belongs to HDR mode
-    const auto now = std::chrono::steady_clock::now();
-    if (display_white_time_ == std::chrono::steady_clock::time_point{} || now - display_white_time_ > std::chrono::seconds(1)) {
-        display_white_ = presenter_->display_sdr_white_nits();
-        display_white_time_ = now;
+    if (!white_wanted_.exchange(true)) {  // first HDR10 present: have it read now
+        std::lock_guard lock(worker_mutex_);
+        worker_wake_.notify_all();
     }
-    return display_white_ > 0.0f ? display_white_ : 203.0f;
+    const float cached = display_white_;
+    return cached > 0.0f ? cached : 203.0f;
 }
 
 HRESULT XboxPresentation::SetFrameIntervalX(IUnknown*, UINT interval_period_us, UINT latency, UINT flags) {

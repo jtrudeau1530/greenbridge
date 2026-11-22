@@ -12,8 +12,8 @@
 // it is weighted (SDR: the EOTF, 1.0 = SDR white, Rec.709; HDR10: PQ to nits, Rec.2020). The filtered plane is converted to
 // the working space of the output (HDR10 output: linear Rec.2020 nits, SDR white = sdr_white nits; SDR output: linear
 // Rec.709, 1.0 = SDR white), plane 1 is blended over plane 0 there, and the sum is encoded once (PQ, or the inverse of
-// the SDR EOTF). HDR10 plane -> SDR output: extended Reinhard on luminance with the white point at hdr_peak nits, then
-// clipped per channel (no gamut mapping).
+// the SDR EOTF). HDR10 plane -> SDR output: a luminance shoulder (identity below 0.8 of SDR white, extended Reinhard above, peak at
+// hdr_peak nits mapped to 1.0), then clipped per channel (no gamut mapping).
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
 
@@ -106,12 +106,18 @@ vec3 bt2020_to_bt709(vec3 v) {
                 dot(vec3(-0.018151, -0.100579, 1.118730), v));
 }
 
-// Extended Reinhard on luminance (Reinhard et al. 2002, eq. 4): Ld = L (1 + L / Lw^2) / (1 + L), colour scaled by Ld / L.
-// `v`: linear Rec.709, 1.0 = SDR white; Lw = hdr_peak / sdr_white maps to 1.0.
+// Tone map: a shoulder on luminance. Identity up to the knee (0.8 of SDR white), then extended Reinhard (Reinhard et al.
+// 2002, eq. 4) on the excess, scaled to be continuous in value and slope at the knee and to map the content peak to 1.0:
+// with t = 1 - knee, u = (Y - knee) / t, w = (Lw - knee) / t: Yd = knee + t u (1 + u / w^2) / (1 + u). The colour is scaled
+// by Yd / Y. `v`: linear Rec.709, 1.0 = SDR white; Lw = hdr_peak / sdr_white (at least 1).
 vec3 tone_map(vec3 v) {
-    float lw = max(pc.hdr_peak / pc.sdr_white, 1.0);
+    const float knee = 0.8;
     float y = dot(v, vec3(0.2126, 0.7152, 0.0722));
-    return v * ((1.0 + y / (lw * lw)) / (1.0 + y));
+    if (y <= knee) return v;
+    float t = 1.0 - knee;
+    float w = (max(pc.hdr_peak / pc.sdr_white, 1.0) - knee) / t;
+    float u = (y - knee) / t;
+    return v * ((knee + t * u * (1.0 + u / (w * w)) / (1.0 + u)) / y);
 }
 
 // A linear premultiplied colour of alpha `a` from the plane's space to the output's working space. Both conversions are

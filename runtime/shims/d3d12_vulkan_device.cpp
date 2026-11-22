@@ -42,6 +42,7 @@
 #include <set>
 #include <string>
 #include <type_traits>
+#include <cwchar>
 #include <vector>
 
 namespace rt::d3d12 {
@@ -6292,12 +6293,19 @@ float WindowPresenter::display_sdr_white_nits() const {
     MONITORINFOEXW monitor{};
     monitor.cbSize = sizeof(monitor);
     if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor)) return 0.0f;
+    // The active configuration can change between the size query and the read (a hot-plug): ERROR_INSUFFICIENT_BUFFER asks
+    // for the sizes again (the pattern Microsoft documents for QueryDisplayConfig).
     UINT32 path_count = 0, mode_count = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) return 0.0f;
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
-    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr) != ERROR_SUCCESS)
-        return 0.0f;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    LONG status = ERROR_INSUFFICIENT_BUFFER;
+    for (int attempt = 0; attempt < 8 && status == ERROR_INSUFFICIENT_BUFFER; ++attempt) {
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) return 0.0f;
+        paths.assign(path_count, {});
+        modes.assign(mode_count, {});
+        status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr);
+    }
+    if (status != ERROR_SUCCESS) return 0.0f;  // the caller keeps the last good value
     for (UINT32 i = 0; i < path_count; ++i) {
         DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
         source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), paths[i].sourceInfo.adapterId,
