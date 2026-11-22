@@ -218,5 +218,67 @@ class GpuEnv(unittest.TestCase):
                          str(max(len(X.OUT_REGS), 64)))
 
 
+class HardwareOracle(unittest.TestCase):
+    """--oracle hw: the native kernel text (no GPU needed) and the exit-77 contract."""
+
+    def test_hw_lines_resolve_branches_and_store_through_the_output_pointer(self):
+        for seed in range(40):
+            prog = X.make_program(seed, 64 if seed % 2 else 32, 24)
+            lines = prog.hw_lines(guard=False)
+            text = "\n".join(lines)
+            self.assertNotIn("@", text)
+            self.assertNotIn("buffer_store", text)
+            self.assertEqual(sum(ln.startswith("global_store_b32 v22, v20, s[2:3] offset:") for ln in lines),
+                             len(X.OUT_REGS))
+            self.assertEqual(lines[-1], "s_endpgm")
+            targets = re.findall(r"s_cbranch_\w+ (\.L\S+)", text)
+            for t in targets:
+                self.assertIn(t + ":", lines)
+            self.assertEqual(len(targets), len(set(targets)))
+
+    def test_guard_follows_every_instruction_but_the_end(self):
+        prog = X.make_program(3, 32, 10)
+        plain, guarded = prog.hw_lines(guard=False), prog.hw_lines(guard=True)
+        labels = [ln for ln in plain if ln.endswith(":")]
+        self.assertEqual(len(guarded), 2 * (len(plain) - len(labels)) - 1 + len(labels))
+        self.assertEqual([ln for ln in guarded if ln != "s_nop 7"], plain)
+
+    def test_native_kernel_geometry(self):
+        from hw_oracle import asm
+        prog = X.make_program(5, 64, 8)
+        k = asm.Kernel(prog.hw_lines(), prog.wave, prog.group, prog.group * len(X.OUT_REGS), raw=True)
+        text, names, _ = asm.module_text([k], "gfx1150", wave=64)
+        self.assertIn(".amdhsa_wavefront_size32 0", text)
+        self.assertIn(".wavefront_size: 64", text)
+        text32, _, _ = asm.module_text([asm.Kernel(["s_endpgm"], 32, 32, 1, raw=True)], "gfx1150")
+        self.assertIn(".amdhsa_wavefront_size32 1", text32)
+
+    def test_tool_exits_77_without_the_oracle_tools(self):
+        env = dict(os.environ, LEONIDA_AMD_CLANG=os.path.join(TOOLS, "no-such-clang.exe"))
+        r = subprocess.run([sys.executable, "-I", TOOL, "--oracle", "hw", "--programs", "2"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
+        self.assertIn("unavailable", r.stdout)
+
+    def test_unknown_oracle_is_a_usage_error(self):
+        r = subprocess.run([sys.executable, "-I", TOOL, "--oracle", "gpu"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
+    def test_on_hardware(self):
+        from hw_oracle import runner
+        try:
+            oracle = runner.open_oracle()
+        except runner.Unavailable as e:
+            self.skipTest(f"hardware oracle unavailable: {e}")
+        try:
+            stats, fails = {}, []
+            progs = [X.make_program(900 + i, (32, 64)[i % 2], 16, dpp=True) for i in range(12)]
+            X.run_hw(oracle, progs, stats, fails)
+        finally:
+            oracle.close()
+        self.assertEqual([(p.name, w) for p, _, w, _ in fails if w.startswith("mismatch")], [])
+        self.assertEqual(sum(st["programs"] for st in stats.values()), 12)
+
+
 if __name__ == "__main__":
     unittest.main()

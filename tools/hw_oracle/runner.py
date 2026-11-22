@@ -160,13 +160,13 @@ class Oracle:
             raise Unavailable(f"device reports {head!r} but assembling for {self.arch} (set LEONIDA_HW_ARCH)")
         return head.lstrip("# ")
 
-    def _assemble(self, text):
+    def _assemble(self, text, wave=32):
         s = os.path.join(self.workdir, "k.s")
         o = os.path.join(self.workdir, "k.o")
         co = os.path.join(self.workdir, "k.co")
         with open(s, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        r = subprocess.run([self.clang, f"--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", "-c", s, "-o", o],
+        r = subprocess.run([self.clang, f"--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", *(["-mwavefrontsize64"] if wave == 64 else []), "-c", s, "-o", o],
                            capture_output=True, text=True)
         if r.returncode:
             return None, r.stderr
@@ -183,16 +183,17 @@ class Oracle:
         """Run each program (a list of lines). Returns one entry per program: a list of `words` ints, or a str
         explaining why it could not run (assembler rejection)."""
         results = [None] * len(programs)
-        for lo in range(0, len(programs), self.chunk):
-            idx = list(range(lo, min(lo + self.chunk, len(programs))))
-            self._run_chunk(programs, idx, results, words)
+        for wave in (32, 64):
+            todo = [i for i, p in enumerate(programs) if (p.wave if isinstance(p, asm.Kernel) else 32) == wave]
+            for lo in range(0, len(todo), self.chunk):
+                self._run_chunk(programs, todo[lo:lo + self.chunk], results, words, wave)
         return results
 
-    def _run_chunk(self, programs, idx, results, words):
+    def _run_chunk(self, programs, idx, results, words, wave=32):
         live = list(idx)
         while live:
-            text, names, starts = asm.module_text([programs[i] for i in live], self.arch)
-            co, err = self._assemble(text)
+            text, names, starts = asm.module_text([programs[i] for i in live], self.arch, wave=wave)
+            co, err = self._assemble(text, wave)
             if co is not None:
                 break
             bad = asm.failing_kernels(err, starts)
@@ -207,7 +208,12 @@ class Oracle:
             # architecture), not a thousand skips
             raise RuntimeError("the assembler rejected every program in a chunk: " +
                                (str(results[idx[0]]) if idx else "empty chunk"))
-        rc, out, err = self._launch(co, names, words)
+        tokens = []
+        for n, i in zip(names, live):
+            p = programs[i]
+            tokens.append(f"{n}:{p.threads}:{p.words}" if isinstance(p, asm.Kernel) else n)
+        top = max([4] + [programs[i].words for i in live if isinstance(programs[i], asm.Kernel)])
+        rc, out, err = self._launch(co, tokens, top if top > 4 else words)
         if rc:
             raise RuntimeError(f"hw_oracle exited {rc}: {err.strip()[:300]}")
         got = {}

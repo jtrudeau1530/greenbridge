@@ -56,6 +56,40 @@ def skip_reason(lines, arch):
     return None
 
 
+class Kernel:
+    """One program to run. lines: the instructions. raw=False wraps them (output pointer load, v[8:11] store);
+    raw=True means the lines already end with their own stores and s_endpgm and only get the output pointer in
+    s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64."""
+
+    def __init__(self, lines, wave=32, threads=1, words=4, raw=False):
+        self.lines, self.wave, self.threads, self.words, self.raw = list(lines), wave, threads, words, raw
+
+
+def raw_kernel_text(name, lines, arch, wave=32):
+    """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
+    fam = family(arch)
+    load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
+    body = "\n".join("  " + ln for ln in lines)
+    return f""".globl {name}
+.p2align 8
+.type {name},@function
+{name}:
+  {load} s[2:3], s[0:1], 0x0
+  s_waitcnt lgkmcnt(0)
+{body}
+.rodata
+.p2align 6
+.amdhsa_kernel {name}
+  .amdhsa_user_sgpr_kernarg_segment_ptr 1
+  .amdhsa_next_free_vgpr 32
+  .amdhsa_next_free_sgpr 40
+  .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
+  .amdhsa_system_vgpr_workitem_id 0
+.end_amdhsa_kernel
+.text
+"""
+
+
 def kernel_text(name, lines, arch):
     """Assembly for one kernel."""
     fam = family(arch)
@@ -86,31 +120,35 @@ def kernel_text(name, lines, arch):
 """
 
 
-def metadata(names):
+def metadata(names, wave=32):
     """The HSA metadata block. Without it the HIP runtime fails the load with hipErrorNoBinaryForGpu (209)."""
     out = [".amdgpu_metadata", "---", "amdhsa.version: [1, 2]", "amdhsa.kernels:"]
     for n in names:
         out += [f"  - .name: {n}", f"    .symbol: {n}.kd", "    .args:",
                 "      - {.offset: 0, .size: 8, .value_kind: global_buffer, .address_space: global}",
                 "    .group_segment_fixed_size: 0", "    .private_segment_fixed_size: 0",
-                "    .kernarg_segment_align: 8", "    .kernarg_segment_size: 8", "    .max_flat_workgroup_size: 32",
-                "    .sgpr_count: 32", "    .vgpr_count: 16", "    .wavefront_size: 32"]
+                "    .kernarg_segment_align: 8", "    .kernarg_segment_size: 8", "    .max_flat_workgroup_size: 256",
+                "    .sgpr_count: 40", "    .vgpr_count: 32", f"    .wavefront_size: {wave}"]
     out.append(".end_amdgpu_metadata")
     return "\n".join(out) + "\n"
 
 
-def module_text(programs, arch, prefix="k"):
-    """(assembly text, kernel names, first source line of each kernel) for a list of programs."""
+def module_text(programs, arch, prefix="k", wave=32):
+    """(assembly text, kernel names, first source line of each kernel) for a list of programs. A program is a list
+    of lines (wrapped as a scalar test) or a Kernel."""
     parts = [f'.amdgcn_target "amdgcn-amd-amdhsa--{arch}"', ".text"]
     names, starts, line_no = [], [], 2
-    for i, lines in enumerate(programs):
+    for i, prog in enumerate(programs):
         name = f"{prefix}{i}"
-        text = kernel_text(name, lines, arch)
+        if isinstance(prog, Kernel):
+            text = raw_kernel_text(name, prog.lines, arch, prog.wave) if prog.raw else kernel_text(name, prog.lines, arch)
+        else:
+            text = kernel_text(name, prog, arch)
         names.append(name)
         starts.append(line_no + 1)
         parts.append(text.rstrip("\n"))
         line_no += text.count("\n") + 0
-    parts.append(metadata(names).rstrip("\n"))
+    parts.append(metadata(names, wave).rstrip("\n"))
     return "\n".join(parts) + "\n", names, starts
 
 
