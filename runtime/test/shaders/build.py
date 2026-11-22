@@ -108,7 +108,7 @@ def translate_tests(work, names):
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
         # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
+        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8", newline="\n")
         program = None if n.startswith("cs_") else asm_fssm(asm_path)
         if program:   # where the translator looks for a program to hash, as in the game's work folder
             (fssm / (n + ".fssm")).write_bytes(program)
@@ -168,7 +168,7 @@ def main():
         published_index = spirv / index.name
         combined = json.loads(published_index.read_text(encoding="utf-8")) if published_index.exists() else {}
         combined.update(validated)
-        index.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8")
+        index.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8", newline="\n")
         for n in validated:
             for suffix in (".spv", ".spvasm"):
                 artifact = built / (n + suffix)

@@ -299,7 +299,7 @@ def name_streams(names, streams, pins=None, max_skip=MAX_SKIP):
 
 def write(out, rows, unmatched, summary):
     if out.lower().endswith(".json"):
-        with open(out, "w", encoding="utf-8") as fh:
+        with open(out, "w", encoding="utf-8", newline="\n") as fh:
             json.dump({"summary": summary, "streams": rows, "unmatched_list_entries": unmatched}, fh, indent=1)
     else:
         with open(out, "w", encoding="utf-8", newline="") as fh:

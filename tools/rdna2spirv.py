@@ -11260,7 +11260,7 @@ def write_index(path, index):
     """Write an index under another name and rename it into place, so a run stopped part-way never leaves half of
     one: make_game.py takes these files as proof that a shard, or the whole translation, finished."""
     tmp = path + ".tmp"     # must not end in .json: --merge globs index.part*.json
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         _json.dump(index, f, indent=0, sort_keys=True)
         f.flush()
         os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
@@ -11403,7 +11403,7 @@ def main():
         ok += 1
         sa = os.path.join(a.out, name + ".spvasm")
         sv = os.path.join(a.out, name + ".spv")
-        with open(sa, "w") as f:
+        with open(sa, "w", newline="\n") as f:
             f.write(asm)
         r = assemble_spirv(sa, sv)
         if r.returncode == 0:

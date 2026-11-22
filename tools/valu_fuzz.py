@@ -845,7 +845,7 @@ def translate(progs, work, emulate):
     for p in progs:
         text = p.asm()
         asm_path = work / (p.name + ".asm")
-        asm_path.write_text(text, encoding="utf-8")
+        asm_path.write_text(text, encoding="utf-8", newline="\n")
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
@@ -853,7 +853,7 @@ def translate(progs, work, emulate):
         if r.returncode or "error:" in r.stderr:
             raise RuntimeError(f"{p.name} did not assemble:\n{r.stderr}")
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-        (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8")
+        (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8", newline="\n")
         (fssm / (p.name + ".fssm")).write_bytes(compute_header(asm_path))
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:

@@ -195,7 +195,7 @@ def main():
     try:
         names = load_names(a.names)
         if a.refs:
-            with open(a.refs, "w", encoding="utf-8") as refs:
+            with open(a.refs, "w", encoding="utf-8", newline="\n") as refs:
                 refs.write("file\tstruct\tfield\ttype\tvalue\tname\n")
                 summary, table = scan(a.src, names, a.limit, refs)
         else:

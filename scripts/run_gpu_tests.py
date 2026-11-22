@@ -115,7 +115,7 @@ def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
             continue
         if ln.startswith("\t"):
             lines.append(ln)
-    with open(s_path, "w", encoding="utf-8") as f:
+    with open(s_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
 
 

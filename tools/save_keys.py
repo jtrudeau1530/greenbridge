@@ -317,7 +317,7 @@ def cmd_resolve(a):
     print(f"  total (joaat)    {len(resolved):6} of {len(keys)} keys ({100 * len(resolved) / max(1, len(keys)):.1f}%)")
     if a.out:
         try:
-            with open(a.out, "w", encoding="utf-8") as f:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},
                           f, indent=1)
         except OSError as e:
