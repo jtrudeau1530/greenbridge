@@ -802,6 +802,11 @@ public:
         const HRESULT hr = CreateSwapChainForHwnd(device, desc->OutputWindow, &desc1, &fs_desc, nullptr, &sc1);
         if (SUCCEEDED(hr) && sc1) {
             *out = static_cast<IDXGISwapChain*>(sc1);
+            if (!desc->Windowed) {
+                // When exclusive fullscreen is unavailable, native DXGI creates the
+                // windowed chain and returns DXGI_STATUS_OCCLUDED.
+                return DXGI_STATUS_OCCLUDED;
+            }
         }
         return hr;
     }

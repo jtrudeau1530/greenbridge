@@ -1146,6 +1146,30 @@ int main() {
             return fail("GetDesc on legacy swapchain mismatch");
         }
 
+        // Fullscreen request fallback: when exclusive fullscreen is unavailable,
+        // CreateSwapChain falls back to windowed chain and returns DXGI_STATUS_OCCLUDED.
+        HWND hwnd_fs = create_test_window(160, 120);
+        if (!hwnd_fs) return fail("CreateWindowExW (fullscreen fallback)");
+        DXGI_SWAP_CHAIN_DESC fs_req_desc = leg_desc;
+        fs_req_desc.OutputWindow = hwnd_fs;
+        fs_req_desc.Windowed = FALSE;
+        IDXGISwapChain* fs_sc = nullptr;
+        const HRESULT fs_hr = factory->CreateSwapChain(queue, &fs_req_desc, &fs_sc);
+        if (fs_hr != DXGI_STATUS_OCCLUDED || !fs_sc) {
+            if (fs_sc) fs_sc->Release();
+            DestroyWindow(hwnd_fs);
+            return fail("CreateSwapChain(Windowed == FALSE) should return DXGI_STATUS_OCCLUDED fallback");
+        }
+        BOOL is_fs = TRUE;
+        fs_sc->GetFullscreenState(&is_fs, nullptr);
+        if (is_fs != FALSE) {
+            fs_sc->Release();
+            DestroyWindow(hwnd_fs);
+            return fail("GetFullscreenState should remain FALSE on fallback windowed swapchain");
+        }
+        fs_sc->Release();
+        DestroyWindow(hwnd_fs);
+
         if (FAILED(legacy_sc->Present(0, 0))) {
             legacy_sc->Release();
             DestroyWindow(hwnd_legacy);
