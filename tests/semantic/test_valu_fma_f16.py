@@ -1182,5 +1182,153 @@ class TestFmaF16SIMDMultiLane(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr_half_u16(lane, 0, HalfSel.LO), self.CANARY_OLD)
 
 
+class TestFmaF16RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = FmaF16ScalarInterpreter(self.rf)
+
+    def test_dst_alias_src0(self) -> None:
+        self.rf.write_vgpr_half_f16(0, HalfSel.LO, 3.0)
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, 4.0)
+        self.rf.write_vgpr_half_f16(2, HalfSel.LO, 5.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(0, HalfSel.LO),
+            src1=ASTOperand.vgpr(1, HalfSel.LO),
+            src2=ASTOperand.vgpr(2, HalfSel.LO),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 17.0)
+        # Verify unaliased sources remain untouched
+        self.assertEqual(self.rf.read_vgpr_half_f16(1, HalfSel.LO), 4.0)
+        self.assertEqual(self.rf.read_vgpr_half_f16(2, HalfSel.LO), 5.0)
+
+    def test_dst_alias_src1(self) -> None:
+        self.rf.write_vgpr_half_f16(0, HalfSel.LO, 4.0)
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, 3.0)
+        self.rf.write_vgpr_half_f16(2, HalfSel.LO, 5.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(0, HalfSel.LO),
+            src2=ASTOperand.vgpr(2, HalfSel.LO),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 17.0)
+        self.assertEqual(self.rf.read_vgpr_half_f16(1, HalfSel.LO), 3.0)
+        self.assertEqual(self.rf.read_vgpr_half_f16(2, HalfSel.LO), 5.0)
+
+    def test_dst_alias_src2_accumulator(self) -> None:
+        # In-place accumulation MAC: v0 = (v1 * v2) + v0
+        self.rf.write_vgpr_half_f16(0, HalfSel.LO, 10.0)
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, 2.5)
+        self.rf.write_vgpr_half_f16(2, HalfSel.LO, 4.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.LO),
+            src2=ASTOperand.vgpr(0, HalfSel.LO),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 20.0)
+        self.assertEqual(self.rf.read_vgpr_half_f16(1, HalfSel.LO), 2.5)
+        self.assertEqual(self.rf.read_vgpr_half_f16(2, HalfSel.LO), 4.0)
+
+    def test_dst_alias_all_sources(self) -> None:
+        # v0 = (v0 * v0) + v0
+        self.rf.write_vgpr_half_f16(0, HalfSel.LO, 2.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(0, HalfSel.LO),
+            src1=ASTOperand.vgpr(0, HalfSel.LO),
+            src2=ASTOperand.vgpr(0, HalfSel.LO),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 6.0)
+
+    def test_inplace_iterative_accumulation(self) -> None:
+        # 50 iterations: v0 = (v0 * 1.0) + 0.25
+        self.rf.write_vgpr_half_f16(0, HalfSel.LO, 0.0)
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, 1.0)
+        self.rf.write_vgpr_half_f16(2, HalfSel.LO, 0.25)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(0, HalfSel.LO),
+            src1=ASTOperand.vgpr(1, HalfSel.LO),
+            src2=ASTOperand.vgpr(2, HalfSel.LO),
+        )
+        for _ in range(50):
+            self.interp.execute(inst)
+
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 12.5)
+
+    def test_sibling_halfword_preservation_under_aliasing(self) -> None:
+        # Reading high half as source, writing low half as destination
+        # v0.l = (v0.h * 2.0) + 1.0
+        self.rf.write_vgpr_half_f16(0, HalfSel.HI, 5.0)
+        self.rf.write_vgpr_half_f16(0, HalfSel.LO, 0.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(0, HalfSel.HI),
+            src1=ASTOperand.inline_const(2.0),
+            src2=ASTOperand.inline_const(1.0),
+        )
+        self.interp.execute(inst)
+        # v0.l updated to 11.0
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 11.0)
+        # v0.h must remain untouched 5.0
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.HI), 5.0)
+
+    def test_high_half_destination_sibling_preservation(self) -> None:
+        # Reading low half as source, writing high half as destination
+        # v0.h = (v0.l * 3.0) + 2.0
+        self.rf.write_vgpr_half_f16(0, HalfSel.LO, 4.0)
+        self.rf.write_vgpr_half_f16(0, HalfSel.HI, 0.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.HI),
+            src0=ASTOperand.vgpr(0, HalfSel.LO),
+            src1=ASTOperand.inline_const(3.0),
+            src2=ASTOperand.inline_const(2.0),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.HI), 14.0)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 4.0)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        wave.exec_mask = 0xFFFFFFFF
+        for lane in range(32):
+            wave.set_lane_vgpr_half_f16(lane, 0, HalfSel.LO, float(lane))
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(0, HalfSel.LO),
+            src1=ASTOperand.inline_const(2.0),
+            src2=ASTOperand.inline_const(1.0),
+        )
+        wave.execute(inst)
+
+        for lane in range(32):
+            expected = float(lane) * 2.0 + 1.0
+            self.assertEqual(wave.get_lane_vgpr_half_f16(lane, 0, HalfSel.LO), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
