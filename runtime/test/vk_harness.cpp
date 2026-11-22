@@ -464,6 +464,13 @@ int main(int argc, char** argv) {
         if (!f2q.features.shaderInt64) { std::fprintf(stderr, "unsupported: 64-bit addresses need shaderInt64\n"); return 77; }
         feats.shaderInt64 = VK_TRUE;   // heap and --mesh-compute output addresses are 64-bit
     }
+    if (tex_rgba_path) {
+        if (!f2q.features.shaderSampledImageArrayDynamicIndexing) {
+            std::fprintf(stderr, "unsupported: VKH_TEX_RGBA needs shaderSampledImageArrayDynamicIndexing\n");
+            return 77;
+        }
+        feats.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    }
     dci.pEnabledFeatures = &feats;
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
