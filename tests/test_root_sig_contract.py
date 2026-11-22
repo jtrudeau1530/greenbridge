@@ -189,3 +189,49 @@ def test_cli_hard_fail_on_negative_sgpr(tmp_path):
     assert result.returncode == 1
     assert "CONTRADICTION bad" in result.stdout
     assert "s-1 read but layout has 8 dwords" in result.stdout
+
+
+@pytest.mark.parametrize("sgpr", [True, False, 1.0, "1", None, [], {}])
+def test_reconcile_rejects_noninteger_sgpr(sgpr):
+    dwords, _ = rsc.pack_layout(ROOT_SIG)
+    # Including a real index catches bool/int and float/int key collisions.
+    reads = [{"sgpr": 1, "kind": "const32"},
+             {"sgpr": sgpr, "kind": "const32"}]
+    assert rsc.reconcile(reads, dwords) == [
+        f"invalid SGPR index {sgpr!r}: expected an integer"]
+
+
+def test_cluster_preserves_invalid_index_distinctions():
+    index = {
+        "valid": {"user_sgpr_reads": [{"sgpr": 1, "kind": "const32"}]},
+        "invalid": {"user_sgpr_reads": [
+            {"sgpr": 1, "kind": "const32"},
+            {"sgpr": True, "kind": "const32"},
+            {"sgpr": "1", "kind": "const32"},
+            {"sgpr": [], "kind": "const32"}]},
+    }
+    ranked = rsc.cluster(index)
+    assert len(ranked) == 2
+    assert sum(count for _, count, _ in ranked) == 2
+
+
+def test_cli_rejects_noninteger_sgprs_with_cluster(tmp_path):
+    index = {"bad": {"user_sgpr_reads": [
+        {"sgpr": 1, "kind": "const32"},
+        {"sgpr": True, "kind": "const32"},
+        {"sgpr": "1", "kind": "const32"},
+        {"sgpr": 1.0, "kind": "const32"},
+        {"sgpr": [], "kind": "const32"}]}}
+    index_path = tmp_path / "index.json"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps(ROOT_SIG), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-I", TOOL, str(index_path),
+         "--rootsig", str(sig_path), "--cluster"],
+        capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "CONTRADICTION bad" in result.stdout
+    assert "invalid SGPR index" in result.stdout
+    assert "read-set shapes" in result.stdout
+    assert "Traceback" not in result.stderr
