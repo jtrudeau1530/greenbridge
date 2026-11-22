@@ -58,15 +58,51 @@ work on booting can start as soon as one is available to a developer.
 | Ray tracing (BVH) | ⚠️ In progress. `BuildRaytracingAccelerationStructure` builds BLASes and TLASes on the GPU in the console's XDXR BVH4 layout, which the translated shaders walk themselves (`image_bvh_intersect_ray`, TRI0/TRI1 leaves); `LEONIDA_RT_AS=khr` uses Vulkan's own acceleration structures instead. The build descriptions are recovered from the package's `XboxBvhBuilder.dll` ([notes](docs/xdxr.md)). The game's `*_bvh4.rpf` packs are measured: offline-built, dehydrated BLASes that rehydrate through that DLL with their geometry from the drawables in `levels.rpf` ([notes](docs/bvh.md)). Not done in the builder: TRI1 pairing, BOX16 nodes, serialization. Open: whether the game rehydrates the packs or rebuilds them, and the XDXR-vs-KHR default ([#313](https://github.com/ItsNotRexed/Leonida/issues/313)) |
 
 
-## PS5 input check
+## Experimental PS5 support
 
-The experimental PS5 mode inspects an explicitly supplied, readable `app0` directory. It checks the x86-64 ELF program headers in `eboot.bin` and the PlayStation 5 title ID in `sce_sys/param.json`.
+Use an already-readable PS5 application directory (app0) with a raw x86-64 ELF at
+`eboot.bin` and a PS5 title ID in `sce_sys/param.json`.
 
 ```powershell
-python -I make_game.py --platform ps5 --game "D:\path\to\app0" --check
+python -I make_game.py --platform ps5 --game D:/app0 --check
+python -I tools/ps5_port.py check D:/app0 --reference-sce-sys D:/reference/sce_sys
+python -I tools/ps5_port.py assets D:/app0
+python -I tools/ps5_port.py audio D:/app0 --out D:/ps5-audio
+python -I tools/ps5_port.py shaders D:/captures --out D:/ps5-spirv --anyps5-build D:/AnyPS5/build
+python -I tools/ps5_port.py pipelines D:/compute-captures --out D:/ps5-pipelines --anyps5-build D:/AnyPS5/build-vulkan --gpu "RTX 5070"
+python -I tools/ps5_port.py runtime D:/app0 --out D:/ps5-windows --anyps5-build D:/AnyPS5/build
 ```
 
-The check requires an ELF executable and reports SELF containers as unsupported input. It reads the input in place. PS5 module loading, asset and shader conversion, and runtime setup remain separate work.
+- **Check** validates the ELF headers and title metadata. The optional comparison reads
+  `param.json`, `playgo-chunk.dat`, `playgo-hash-table.dat`, and `playgo-ficm.dat`. It reports
+  identity and filename-hash coverage. With `--path-catalog`, the JSON catalog maps content
+  versions under `versions` to objects containing `matching_paths` arrays of
+  `{"candidate":"path/to/file","hash":"16-digit hex","chunk":0}` records.
+- **Assets** identifies known media and shader headers and checks RPF9 record bounds,
+  AWC streams and tags, and RDS5/ETPF texture database geometry. This is a header
+  inventory. Archive contents and textures still require their own readers.
+- **Audio** exports ATRAC9 and supported AWC streams to PCM WAV and checks sample counts,
+  rates, and channels. Install FFmpeg for ATRAC9 and the recognized Opus SFX profile.
+  For other readable AWC streams install vgmstream-cli or pass `--awc-decoder`.
+  The Opus profile uses Leonida's `awc_opus.py` and preserves the Ogg Opus files.
+- **Shaders** uses a compatible AnyPS5 build with `agc_shader_replay` for `.req` inputs.
+  It can also read SPIR-V and GPU metadata from `.aps5cp` captures without that build.
+  Both paths need Khronos `spirv-val` on PATH.
+- **Pipelines** uses `agc_compute_pipeline_replay` from an AnyPS5 build configured with
+  `-DANYPS5_ENABLE_SPIRV_TOOLS=ON`. It checks compute pipeline creation on the matching
+  GPU with a fresh cache and zero dispatches. Set `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`
+  in the environment to require evidence that the installed Vulkan validation layer loaded.
+- **Runtime** stages raw ELF executables and shared modules with the AnyPS5 Windows relinker,
+  a matching MinGW runtime and AnyPS5 system libraries. It collects modules from
+  `sce_module`, `sce_modules`, or `prx`, with additional locations passed as
+  `--module-dir` paths relative to app0. Pass `--anyps5-source` if the compatible source
+  checkout is outside the build directory's parent. A successful stage includes `app.exe`,
+  app0 files, libraries, and a strict import-audit report. The command stages without launching.
+
+The commands emit JSON and read the inputs in place. Commands that write results require a
+new output directory outside the input. Failures after staging begins preserve an incomplete
+directory with diagnostic output. Windows staging and shader verification have been exercised
+with generated fixtures. Booting GTA VI on this route still requires testing a readable title.
 
 ## How to build
 
