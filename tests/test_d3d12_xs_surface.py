@@ -101,14 +101,11 @@ if __name__ == "__main__":
     test_iid_block_is_alphabetical()
     test_sdk_include_override_accepts_a_trailing_separator()
     test_sdk_discovery_sorts_versions_numerically()
-    um, _shared = S.find_sdk_include()
-    if um:
-        errors, checked, _um = S.check_sdk()
-        assert errors == [], errors
-        assert checked == 83
-    if os.environ.get("SCARAB_REF"):
-        errors, _notes = S.check_scarab(os.environ["SCARAB_REF"])
-        assert errors == [], errors
-    else:
-        print("SCARAB cross-check skipped: SCARAB_REF is not set")
+    # Call the two optional checks through their real definitions so this runner cannot drift from them; both
+    # raise unittest.SkipTest when their inputs (SDK headers, SCARAB_REF) are absent.
+    for optional in (test_standard_iids_match_sdk, test_scarab_cross_check):
+        try:
+            optional()
+        except unittest.SkipTest as skip:
+            print(f"skipped: {skip}")
     print("ok")
