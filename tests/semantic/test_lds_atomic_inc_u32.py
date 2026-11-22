@@ -378,10 +378,6 @@ class TestReferenceAtomicIncOracle(unittest.TestCase):
         self.assertEqual(interp.get_vgpr(0, lane=3), 0xCAFEBABE)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestModuloWrapBoundaryAndBankConflicts(unittest.TestCase):
     """Tests modulo wrap boundaries and SIMD multi-lane bank conflict scenarios."""
 
@@ -497,3 +493,7 @@ class TestReturnValuePreservationAlignmentAndNegativeControls(unittest.TestCase)
             LdsSemanticInterpreter(lds_dwords=0)  # non-positive lds dwords
         with self.assertRaises(ValueError):
             LdsSemanticInterpreter(lds_dwords=100)  # non power-of-two lds dwords
+
+
+if __name__ == "__main__":
+    unittest.main()
