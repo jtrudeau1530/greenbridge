@@ -5236,16 +5236,24 @@ public:
             // format without a tile shape (96-bit) has none at any count. That is GetResourceAllocationInfo's rule
             // here (tiled MSAA is 4x only). 128-bit formats at 4x: the AMD drivers answer 0, WARP and the RTX 5070 Ti
             // allocate them; this follows the latter, as the allocation path does.
-            const bool tiled = levels->Flags == D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE;
-            if ((levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE && !tiled) ||
-                levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
-                (levels->SampleCount & (levels->SampleCount - 1)) != 0)
-                return d3d12_trace::result(method, E_INVALIDARG);
+            // RTX 5070 / 621.14: undefined flag bits are ignored; bad counts/formats fail, known formats have 1x.
+            const bool tiled = (levels->Flags & D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE) != 0;
+            if (levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
+                !(UINT(levels->Format) <= DXGI_FORMAT_B4G4R4A4_UNORM ||
+                  (UINT(levels->Format) >= DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE &&
+                   UINT(levels->Format) <= DXGI_FORMAT_A4B4G4R4_UNORM)))
+                return d3d12_trace::result(method, E_FAIL);
+            Format format = texture_storage_format(levels->Format, false);
+            if (levels->SampleCount == 1) {
+                levels->NumQualityLevels = tiled && format.rgb96 ? 0 : 1;
+                return d3d12_trace::result(method, S_OK);
+            }
+            if ((levels->SampleCount & (levels->SampleCount - 1)) != 0)
+                return d3d12_trace::result(method, S_OK);
             const bool alpha_only = levels->Format == DXGI_FORMAT_A8_UNORM;
             if (alpha_only && levels->SampleCount != 1) return d3d12_trace::result(method, S_OK);
             if (levels->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && levels->SampleCount != 1)
                 return d3d12_trace::result(method, S_OK);  // single-sample 2D only; no quality levels
-            Format format = texture_storage_format(levels->Format, false);
             // A typeless format that is only a texture as depth (R24G8_TYPELESS, R32G8X24_TYPELESS) has no colour
             // format; creation makes it a depth image, so ask the same.
             const bool depth_only_typeless = format.format == VK_FORMAT_UNDEFINED &&
@@ -5257,11 +5265,8 @@ public:
                 format = state_.texture_format(depth_desc);  // includes the D24-to-D32 fallback used by creation
             }
             if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
-                return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
-            if (format.rgb96) {  // no 96-bit render targets yet, so no multisampled ones; no tile shape either
-                levels->NumQualityLevels = levels->SampleCount == 1 && !tiled ? 1 : 0;
                 return d3d12_trace::result(method, S_OK);
-            }
+            if (format.rgb96) return d3d12_trace::result(method, S_OK);  // no 96-bit render targets yet
 
             // Vulkan exposes one standard sample pattern per supported count, so each supported count maps to
             // one D3D12 quality level (quality index 0). Query the matching colour or depth/stencil attachment

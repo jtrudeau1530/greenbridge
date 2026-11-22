@@ -3345,15 +3345,55 @@ int main() {
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
 
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_sample_count{};
-        invalid_sample_count.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        invalid_sample_count.SampleCount = D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT * 2;
-        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
-                                           sizeof(invalid_sample_count)) == E_INVALIDARG);
-        EXPECT(invalid_sample_count.NumQualityLevels == 0);
-        invalid_sample_count.SampleCount = 0;
-        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_sample_count,
-                                           sizeof(invalid_sample_count)) == E_INVALIDARG);
+        // RTX 5070 / 621.14 host answers, without requiring a host device for this regression.
+        for (const UINT samples : {0u, 33u, 64u, UINT_MAX}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{DXGI_FORMAT_R8G8B8A8_UNORM, samples,
+                                                               D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                                               sizeof(levels)) == E_FAIL);
+            EXPECT(levels.NumQualityLevels == 0);
+        }
+        for (UINT format = 0; format <= 192; ++format) {
+            const bool known = format <= 115 || (format >= 189 && format <= 191);
+            for (const UINT samples : {1u, 3u, 31u}) {
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{DXGI_FORMAT(format), samples,
+                                                                   D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+                EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                                                   sizeof(levels)) == (known ? S_OK : E_FAIL));
+                EXPECT(levels.NumQualityLevels == UINT(known && samples == 1));
+            }
+        }
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_format_levels{DXGI_FORMAT_FORCE_UINT, 1,
+                                                                          D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &invalid_format_levels,
+                                           sizeof(invalid_format_levels)) == E_FAIL);
+        EXPECT(invalid_format_levels.NumQualityLevels == 0);
+        for (const auto format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_R32G32B32_FLOAT}) {
+            for (const UINT samples : {1u, 3u, 4u, 32u}) {
+                for (const UINT flags : {0u, 1u}) {
+                    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS plain{format, samples,
+                        D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAGS(flags)};
+                    EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &plain,
+                                                       sizeof(plain)) == S_OK);
+                    if (flags && format == DXGI_FORMAT_R32G32B32_FLOAT) EXPECT(plain.NumQualityLevels == 0);
+                    for (const UINT extra : {2u, 0xfeu}) {
+                        auto undefined_flags = plain;
+                        undefined_flags.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAGS(flags | extra);
+                        undefined_flags.NumQualityLevels = 99;
+                        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &undefined_flags,
+                                                           sizeof(undefined_flags)) == S_OK);
+                        EXPECT(undefined_flags.NumQualityLevels == plain.NumQualityLevels);
+                    }
+                }
+            }
+        }
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS wrong_size[2]{{DXGI_FORMAT_R8G8B8A8_UNORM, 1,
+            D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 99}};
+        for (const UINT bytes : {UINT(sizeof(wrong_size[0]) - 1), UINT(sizeof(wrong_size))}) {
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, wrong_size,
+                                               bytes) == E_INVALIDARG);
+            EXPECT(wrong_size[0].NumQualityLevels == 99);
+        }
 
         D3D12_RESOURCE_DESC unsupported_quality =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
