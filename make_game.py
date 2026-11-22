@@ -881,7 +881,7 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -984,6 +984,12 @@ def runtime_gpu_per_vertex():
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
+
+
+def runtime_gpu_max_push_constants():
+    """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
+    v = runtime_gpu_info().get("max_push_constants_size")
+    return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
 
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
@@ -1532,6 +1538,10 @@ def main() -> int:
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
+                         "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
+                         "the shaders need (144, or 152 with --mesh-compute)")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -1598,6 +1608,13 @@ def main() -> int:
         log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
             "fragmentShaderBarycentric): translating with --f16-interp-fallback")
         a.f16_interp_fallback = True
+    if "shaders" in stages and not a.pc_tail_ubo:
+        need_pc = 152 if a.mesh_compute else 144
+        max_pc = runtime_gpu_max_push_constants()
+        if max_pc is not None and max_pc < need_pc:
+            log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
+                "translating with --pc-tail-ubo")
+            a.pc_tail_ubo = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)

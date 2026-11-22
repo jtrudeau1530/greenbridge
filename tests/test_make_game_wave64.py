@@ -260,6 +260,7 @@ class KeepEmulatedFlagTest(unittest.TestCase):
                     mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
                     mock.patch.object(make_game.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(make_game, "runtime_gpu_per_vertex", return_value=True), \
+                    mock.patch.object(make_game, "runtime_gpu_max_push_constants", return_value=256), \
                     mock.patch.object(make_game, "shaders") as sh:
                 make_game.main()
             keys = ("emulate", "keep_emulated", "fallbacks")

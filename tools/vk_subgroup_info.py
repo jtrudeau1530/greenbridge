@@ -29,6 +29,10 @@ per_vertex_inputs says whether the device can run a pixel shader with PerVertexK
 docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
+
+max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
+contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
+RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
 """
 import ctypes
 import json
@@ -81,6 +85,7 @@ PROPS_VENDOR_ID = 8
 PROPS_DEVICE_ID = 12
 PROPS_DEVICE_NAME = 20      # char[256]
 PROPS_API_VERSION = 0
+PROPS_MAX_PUSH_CONSTANTS_SIZE = 296 + 32  # limits (296) + maxPushConstantsSize (32) on 64-bit
 QUEUE_FAMILY_SIZE = 24      # sizeof(VkQueueFamilyProperties)
 
 
@@ -246,6 +251,7 @@ def query() -> dict:
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
+                          int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
         if chosen is None:
@@ -255,7 +261,8 @@ def query() -> dict:
                     "the runtime needs matches"
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
-        name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex, vendor, device, driver = chosen
+        (name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex,
+         max_push_constants_size, vendor, device, driver) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -277,6 +284,7 @@ def query() -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
+            "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,
             "driver_id": driver,
