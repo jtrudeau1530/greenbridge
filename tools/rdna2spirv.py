@@ -2414,19 +2414,40 @@ class Gen:
                 out += 1
 
     def decode_any_format(self, fmt, words):
-        """Decode every supported format from 4 packed dwords, then pick by FORMAT (0 for one outside FORMATS)."""
-        comps = [self.cu(0)] * 4
-        for code in self.FORMATS:
-            dec = self.decode_format(words, code)
-            e = self.tmp()
-            self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
-            nxt = []
-            for c in range(4):
-                s = self.tmp()
-                self.emit(f"{s} = OpSelect %uint {e} {dec[c]} {comps[c]}")
-                nxt.append(s)
-            comps = nxt
-        return comps
+        """Decode 4 packed dwords by the run-time FORMAT (0 for one outside FORMATS), executing only that format's
+        decode: a binary search over the codes, marked DontFlatten (decoding every format to select one was about
+        770 VALU instructions on every lane). Plain conditional branches, which the test interpreters run too."""
+        return self.decode_format_search(fmt, words, sorted(self.FORMATS))[0]
+
+    def decode_format_search(self, fmt, words, codes):
+        """decode_any_format over the sorted ``codes`` -> (4 ids, the label of the block that defines them, or None
+        for the block the search started in)."""
+        cond, yes, no, end = self.tmp(), self.tmp() + "_fy", self.tmp() + "_fn", self.tmp() + "_fe"
+        leaf = len(codes) == 1
+        if leaf:
+            self.emit(f"{cond} = OpIEqual %bool {fmt} {self.cu(codes[0])}")
+        else:
+            mid = len(codes) // 2
+            self.emit(f"{cond} = OpULessThan %bool {fmt} {self.cu(codes[mid])}")
+        self.emit(f"OpSelectionMerge {end} DontFlatten")
+        self.emit(f"OpBranchConditional {cond} {yes} {no}")
+        self.emit(f"{yes} = OpLabel")
+        if leaf:
+            a, a_end = self.decode_format(words, codes[0]), None
+        else:
+            a, a_end = self.decode_format_search(fmt, words, codes[:mid])
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{no} = OpLabel")
+        if leaf:
+            b, b_end = [self.cu(0)] * 4, None
+        else:
+            b, b_end = self.decode_format_search(fmt, words, codes[mid:])
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
+        out = [self.tmp() for _ in range(4)]
+        for o, x, y in zip(out, a, b):
+            self.emit(f"{o} = OpPhi %uint {x} {a_end or yes} {y} {b_end or no}")
+        return out, end
 
     def format_decode_call(self, fmt, words):
         """4 uint ids: the element decoded per the run-time FORMAT, through one function in the module.
@@ -2491,15 +2512,18 @@ class Gen:
         # need = ceil((byte_shift + size) / 4) = (b3 + size + 3) >> 2. A 16-byte
         # element that starts at byte 3 spans 5 dwords. Extra unused loads re-read
         # dword 0 so a load never walks an out-of-range index.
-        need = self.cu(1)
+        # Pick size + 3 from the format alone (uniform when the V# is), then add the per-lane byte offset once.
+        size3, known = self.cu(0), self.tmp()
         for code, (size, _, _) in self.FORMATS.items():
-            e, sum_, n2 = (self.tmp() for _ in range(3))
+            e, sel = self.tmp(), self.tmp()
             self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
-            self.emit(f"{sum_} = OpIAdd %uint {b3} {self.cu(size + 3)}")
-            self.emit(f"{n2} = OpShiftRightLogical %uint {sum_} {self.cu(2)}")
-            sel = self.tmp()
-            self.emit(f"{sel} = OpSelect %uint {e} {n2} {need}")
-            need = sel
+            self.emit(f"{sel} = OpSelect %uint {e} {self.cu(size + 3)} {size3}")
+            size3 = sel
+        sum_, n2, need = (self.tmp() for _ in range(3))
+        self.emit(f"{known} = OpINotEqual %bool {size3} {self.cu(0)}")
+        self.emit(f"{sum_} = OpIAdd %uint {b3} {size3}")
+        self.emit(f"{n2} = OpShiftRightLogical %uint {sum_} {self.cu(2)}")
+        self.emit(f"{need} = OpSelect %uint {known} {n2} {self.cu(1)}")     # outside FORMATS: 1 dword
         cond = self.tmp()
         self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
