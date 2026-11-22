@@ -598,6 +598,7 @@ if(BUILD_TESTING)
       target_compile_options(fsr_dispatch_test PRIVATE /W4 /permissive- /EHsc /utf-8)
       target_link_options(fsr_dispatch_test PRIVATE /OPT:NOREF)
       target_link_libraries(fsr_dispatch_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY} psapi)
+      add_dependencies(fsr_dispatch_test gta6rt_tls_host)
       add_test(NAME fsr_dispatch COMMAND fsr_dispatch_test)
       set_tests_properties(fsr_dispatch PROPERTIES SKIP_RETURN_CODE 77)
 
