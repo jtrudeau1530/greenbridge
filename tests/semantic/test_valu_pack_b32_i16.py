@@ -830,8 +830,152 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class PackI16StatusFlags:
+    """Architectural condition codes and status flags for packed 16-bit integer channels."""
+    ch0_zero: bool
+    ch1_zero: bool
+    both_zero: bool
+    ch0_negative: bool
+    ch1_negative: bool
+    both_negative: bool
+    ch0_min_int16: bool
+    ch1_min_int16: bool
+    ch0_max_int16: bool
+    ch1_max_int16: bool
+    ch0_odd: bool
+    ch1_odd: bool
+    sign_equal: bool
+
+
+def evaluate_pack_i16_flags(res32: int) -> PackI16StatusFlags:
+    """Evaluate packed signed integer status flags on 32-bit packed result."""
+    h0 = res32 & MASK16
+    h1 = (res32 >> 16) & MASK16
+
+    s0 = s16(h0)
+    s1 = s16(h1)
+
+    ch0_z = (s0 == 0)
+    ch1_z = (s1 == 0)
+    ch0_neg = (s0 < 0)
+    ch1_neg = (s1 < 0)
+
+    return PackI16StatusFlags(
+        ch0_zero=ch0_z,
+        ch1_zero=ch1_z,
+        both_zero=ch0_z and ch1_z,
+        ch0_negative=ch0_neg,
+        ch1_negative=ch1_neg,
+        both_negative=ch0_neg and ch1_neg,
+        ch0_min_int16=(s0 == INT16_MIN),
+        ch1_min_int16=(s1 == INT16_MIN),
+        ch0_max_int16=(s0 == INT16_MAX),
+        ch1_max_int16=(s1 == INT16_MAX),
+        ch0_odd=bool(h0 & 1),
+        ch1_odd=bool(h1 & 1),
+        sign_equal=(ch0_neg == ch1_neg),
+    )
+
+
+def compute_half_pack_signed_carry_borrow(val0: int, val1: int) -> Tuple[int, int, int, int]:
+    """Compute 16-bit unsigned carry out and borrow out between packed half words.
+
+    Returns: (sum16, carry_out, diff16, borrow_out)
+    """
+    u0 = val0 & MASK16
+    u1 = val1 & MASK16
+
+    total = u0 + u1
+    sum16 = total & MASK16
+    carry_out = 1 if total > 0xFFFF else 0
+
+    diff = u0 - u1
+    diff16 = diff & MASK16
+    borrow_out = 1 if u0 < u1 else 0
+
+    return sum16, carry_out, diff16, borrow_out
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_exact_zero_flags(self) -> None:
+        # Both channels zero
+        res_both_zero = 0x00000000
+        flags_both = evaluate_pack_i16_flags(res_both_zero)
+        self.assertTrue(flags_both.ch0_zero)
+        self.assertTrue(flags_both.ch1_zero)
+        self.assertTrue(flags_both.both_zero)
+        self.assertFalse(flags_both.ch0_negative)
+        self.assertFalse(flags_both.ch1_negative)
+
+        # ch0 non-zero, ch1 zero
+        res_mixed = (0x0000 << 16) | 0x0005
+        flags_mixed = evaluate_pack_i16_flags(res_mixed)
+        self.assertFalse(flags_mixed.ch0_zero)
+        self.assertTrue(flags_mixed.ch1_zero)
+        self.assertFalse(flags_mixed.both_zero)
+
+    def test_negative_sign_flags(self) -> None:
+        # Both negative: -10 (0xFFF6) and -20 (0xFFEC)
+        res_both_neg = (0xFFEC << 16) | 0xFFF6
+        flags_both = evaluate_pack_i16_flags(res_both_neg)
+        self.assertTrue(flags_both.ch0_negative)
+        self.assertTrue(flags_both.ch1_negative)
+        self.assertTrue(flags_both.both_negative)
+        self.assertTrue(flags_both.sign_equal)
+
+        # Mixed signs: ch0 positive (10), ch1 negative (-10)
+        res_mixed = (0xFFF6 << 16) | 0x000A
+        flags_mixed = evaluate_pack_i16_flags(res_mixed)
+        self.assertFalse(flags_mixed.ch0_negative)
+        self.assertTrue(flags_mixed.ch1_negative)
+        self.assertFalse(flags_mixed.both_negative)
+        self.assertFalse(flags_mixed.sign_equal)
+
+    def test_int16_min_max_extremes_flags(self) -> None:
+        # INT16_MIN (0x8000 = -32768) and INT16_MAX (0x7FFF = 32767)
+        res_extremes = (0x7FFF << 16) | 0x8000
+        flags = evaluate_pack_i16_flags(res_extremes)
+        self.assertTrue(flags.ch0_min_int16)
+        self.assertFalse(flags.ch0_max_int16)
+        self.assertTrue(flags.ch0_negative)
+
+        self.assertFalse(flags.ch1_min_int16)
+        self.assertTrue(flags.ch1_max_int16)
+        self.assertFalse(flags.ch1_negative)
+
+    def test_parity_flags(self) -> None:
+        # ch0 even (4), ch1 odd (7)
+        res = (7 << 16) | 4
+        flags = evaluate_pack_i16_flags(res)
+        self.assertFalse(flags.ch0_odd)
+        self.assertTrue(flags.ch1_odd)
+
+    def test_carry_borrow_generation(self) -> None:
+        # Carry generation: 0x8000 + 0x8000 = 0x10000 -> carry_out = 1
+        sum16, carry, diff16, borrow = compute_half_pack_signed_carry_borrow(0x8000, 0x8000)
+        self.assertEqual(sum16, 0x0000)
+        self.assertEqual(carry, 1)
+        self.assertEqual(diff16, 0x0000)
+        self.assertEqual(borrow, 0)
+
+        # Borrow generation: 0x0005 - 0x000A -> borrow_out = 1, diff16 = 0xFFFB (-5)
+        sum16_b, carry_b, diff16_b, borrow_b = compute_half_pack_signed_carry_borrow(0x0005, 0x000A)
+        self.assertEqual(carry_b, 0)
+        self.assertEqual(borrow_b, 1)
+        self.assertEqual(s16(diff16_b), -5)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
