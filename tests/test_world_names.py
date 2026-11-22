@@ -337,7 +337,7 @@ class CliTest(unittest.TestCase):
                     err = io.StringIO()
                     with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                         self.assertNotEqual(WN.main(["resolve", *prefix, "--out", source]), 0)
-                    self.assertIn(repr(source), err.getvalue())
+                    self.assertIn(f"would overwrite input {source}", err.getvalue())
                     with open(source, "rb") as handle:
                         self.assertEqual(handle.read(), original)
 

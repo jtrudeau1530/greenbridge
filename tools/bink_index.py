@@ -285,7 +285,7 @@ def write_csv(path, rows, probe):
 def write_json(path, target, rows, summary, probe):
     fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
     streams = [_flat(row, fields) for row in rows]
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump({"target": target, "summary": summary, "streams": streams},
                   fh, indent=1)
 

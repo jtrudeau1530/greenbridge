@@ -496,7 +496,7 @@ def translated(lines, name="ps_salu"):
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
         path = os.path.join(dis, name + ".s")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             if has_branches(lines):
                 # The translator places branch targets from the encoding sizes; it does not read the bytes.
                 body = listing(lines + ["exp mrt0 v8, v9, v10, v11 done vm", "s_endpgm"])

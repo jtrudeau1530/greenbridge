@@ -325,7 +325,7 @@ def main(argv):
     target = f"spv{ver.group(1)}.{ver.group(2)}" if ver else "vulkan1.2"
     subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
     if lay_path:
-        with open(lay_path, "w") as f:
+        with open(lay_path, "w", newline="\n") as f:
             json.dump(lay, f, indent=1)
     print(json.dumps(lay))
     return 0

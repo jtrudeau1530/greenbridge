@@ -624,7 +624,7 @@ def main() -> int:
     print_summary(graph)
     if args.json:
         try:
-            with open(args.json, "w", encoding="utf-8") as f:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(graph, f, indent=1)
         except OSError as exc:
             print(f"cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)

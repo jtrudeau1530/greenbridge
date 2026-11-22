@@ -81,11 +81,18 @@ class IntHwProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             jpath = os.path.join(tmp, "out.json")
             out = io.StringIO()
+            # The table is empty since #1831/#1856 fixed the measured divergences, so give the reporting path one: the
+            # "hardware" returns other words for v_cvt_flr_edges, and the table lists them as a known divergence.
+            fake_hw[1][32]["v_cvt_flr_edges"] = fake_hw[1][64]["v_cvt_flr_edges"] = [1, 2, 3, 4]
+            known = {"v_cvt_flr_edges": ("synthetic", [1, 2, 3, 4], "test-only divergence")}
+            patch_known = unittest.mock.patch.dict(probe.KNOWN_DIVERGENCES, known)
+            patch_known.start()
+            self.addCleanup(patch_known.stop)
             with unittest.mock.patch.object(probe, "run_hw", return_value=fake_hw):
                 with redirect_stdout(out):
                     rc = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi", "--json", jpath])
             self.assertEqual(rc, 0)
-            self.assertIn("2 match, 2 known divergence, 0 unexpected mismatch, 0 wave32/64 diff", out.getvalue())
+            self.assertIn("3 match, 1 known divergence, 0 unexpected mismatch, 0 wave32/64 diff", out.getvalue())
             data = json.loads(Path(jpath).read_text(encoding="utf-8"))
             self.assertEqual(data["device"], "device=mock arch=gfx1035")
             self.assertEqual(len(data["cases"]), 4)

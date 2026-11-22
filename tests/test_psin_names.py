@@ -137,6 +137,24 @@ class TestCli(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(json.loads(r.stdout)["summary"]["u64 resolved"], 1)
 
+    def test_rejects_refs_aliasing_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "one.bin")
+            names = os.path.join(tmp, "names.txt")
+            for path, data in ((source, sample()), (names, b"prop_crate_01\n")):
+                with open(path, "wb") as f:
+                    f.write(data)
+            for destination in (source, names):
+                with self.subTest(destination=destination):
+                    with open(destination, "rb") as f:
+                        original = f.read()
+                    alias = os.path.join(tmp, ".", os.path.basename(destination))
+                    result = self.run_tool(source, "--names", names, "--refs", alias)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--refs must not overwrite an input", result.stderr)
+                    with open(destination, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
     def test_missing_names_file_is_one_line(self):
         with tempfile.TemporaryDirectory() as d:
             r = self.run_tool(d, "--names", os.path.join(d, "none.txt"))

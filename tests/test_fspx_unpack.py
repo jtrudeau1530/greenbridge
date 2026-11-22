@@ -200,6 +200,26 @@ class Cli(unittest.TestCase):
             with open(os.path.join(out, "lib_01.dxbc"), "rb") as f:
                 self.assertEqual(f.read(), c)
 
+    def test_retains_programs_with_matching_input_stems(self):
+        container = Containers().container()
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a", "sample.dxbc")
+            b = os.path.join(tmp, "b", "sample.dll")
+            for path, data in ((a, container), (b, b"MZ" + bytes(62) + container)):
+                os.makedirs(os.path.dirname(path))
+                with open(path, "wb") as f:
+                    f.write(data)
+            out = os.path.join(tmp, "out")
+            code, _, err = self.run_tool(a, b, "--out", out)
+            self.assertEqual(code, 0, err)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual([entry["file"] for entry in index], ["sample.dxbc", "sample_2.dxbc"])
+            for name, offset in (("sample", 0), ("sample_2", 64)):
+                with open(os.path.join(out, "fspx", name + ".json"), encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["source"]["offset"], offset)
+                self.assertTrue(os.path.isfile(os.path.join(out, name + ".dxbc")))
+
     def test_bare_payload_and_a_file_without_fspx(self):
         with tempfile.TemporaryDirectory() as t:
             bare = os.path.join(t, "one.fspx")

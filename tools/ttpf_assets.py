@@ -4,8 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import zlib
+
+# `python -I` implies `-P`, so the script's directory is not on sys.path; the sibling modules are next to it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bcpack
 from file_mode import published_mode
