@@ -1048,8 +1048,146 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(neg_sat, 0x7FFF)
 
 
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_register_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(300, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VPackB32I16Instruction(dst=dst_sgpr, src0=src, src1=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_syntax_rejection_invalid_op_sel(self) -> None:
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(ValueError):
+            VPackB32I16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(2, 0))
+        with self.assertRaises(ValueError):
+            VPackB32I16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(0, -1))
+
+    def test_negative_control_operand_order_reversal(self) -> None:
+        s0, s1 = 100, 200
+        correct = oracle_v_pack_b32_i16(s0, s1)
+        reversed_order = oracle_v_pack_b32_i16(s1, s0)
+        self.assertNotEqual(correct, reversed_order)
+
+    def test_negative_control_inverted_op_sel(self) -> None:
+        s0 = (20 << 16) | 10
+        s1 = (40 << 16) | 30
+        correct = oracle_v_pack_b32_i16(s0, s1, op_sel=(0, 0))
+        inverted = oracle_v_pack_b32_i16(s0, s1, op_sel=(1, 1))
+        self.assertNotEqual(correct, inverted)
+
+    def test_negative_control_missing_high_half_shift(self) -> None:
+        s0, s1 = 100, 200
+        correct = oracle_v_pack_b32_i16(s0, s1)
+        # Bug: unshifted high half
+        buggy = (s0 & MASK16) | (s1 & MASK16)
+        self.assertNotEqual(correct, buggy)
+
+    def test_negative_control_off_by_one_shift(self) -> None:
+        s0, s1 = 100, 200
+        correct = oracle_v_pack_b32_i16(s0, s1)
+        shift_15 = (s0 & MASK16) | ((s1 & MASK16) << 15)
+        shift_17 = (s0 & MASK16) | (((s1 & MASK16) << 17) & MASK32)
+        self.assertNotEqual(correct, shift_15)
+        self.assertNotEqual(correct, shift_17)
+
+    def test_negative_control_missing_mask_truncation(self) -> None:
+        s0 = 0xDEAD1234
+        s1 = 0xBEEF5678
+        correct = oracle_v_pack_b32_i16(s0, s1)
+        # Bug: unmasked 32-bit values leaking into destination
+        unmasked = (s0 | (s1 << 16)) & MASK32
+        self.assertNotEqual(correct, unmasked)
+
+    def test_mutation_pack_addition_instead_of_or(self) -> None:
+        """Mutant: Replace bitwise OR with addition, which overflows on dirty bits."""
+        def mutant_pack(lo: int, hi: int) -> int:
+            return ((hi << 16) + lo) & MASK32
+
+        s0 = 0x8000
+        s1 = 0x8000
+        expected = pack_b32_i16(s0, s1)
+        mutant = mutant_pack(s0, s1)
+        self.assertEqual(expected, mutant)  # matches when inputs are clean 16-bit
+
+        # When dirty high bits leak:
+        dirty_lo = 0x18000
+        dirty_hi = 0x8000
+        self.assertNotEqual(pack_b32_i16(dirty_lo, dirty_hi), mutant_pack(dirty_lo, dirty_hi))
+
+    def test_mutation_ignore_abs_modifier(self) -> None:
+        """Mutant: Ignore abs modifier on negative 16-bit integer."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool, clamp: bool) -> int:
+            val = s16(bits)
+            if neg_mod:
+                val = -val
+            if clamp:
+                val = max(INT16_MIN, min(INT16_MAX, val))
+            return val & MASK16
+
+        val = (-123) & MASK16
+        correct = apply_i16_modifiers(val, abs_mod=True, neg_mod=False)
+        mutant = mutant_apply_mod(val, abs_mod=True, neg_mod=False, clamp=False)
+        self.assertEqual(correct, 123)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_neg_modifier(self) -> None:
+        """Mutant: Ignore neg modifier on positive 16-bit integer."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool, clamp: bool) -> int:
+            val = s16(bits)
+            if abs_mod:
+                val = abs(val)
+            if clamp:
+                val = max(INT16_MIN, min(INT16_MAX, val))
+            return val & MASK16
+
+        val = 123
+        correct = apply_i16_modifiers(val, abs_mod=False, neg_mod=True)
+        mutant = mutant_apply_mod(val, abs_mod=False, neg_mod=True, clamp=False)
+        self.assertEqual(s16(correct), -123)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_wrong_clamp_saturation(self) -> None:
+        """Mutant: Clamps to unsigned 0xFFFF instead of INT16_MAX (0x7FFF)."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool, clamp: bool) -> int:
+            val = s16(bits)
+            if abs_mod:
+                val = abs(val)
+            if clamp:
+                val = min(0xFFFF, val)
+            return val & MASK16
+
+        val = 0x8000  # -32768
+        correct = apply_i16_modifiers(val, abs_mod=True, clamp=True)
+        mutant = mutant_apply_mod(val, abs_mod=True, neg_mod=False, clamp=True)
+        self.assertEqual(correct, 0x7FFF)
+        self.assertEqual(mutant, 0x8000)
+        self.assertNotEqual(correct, mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
