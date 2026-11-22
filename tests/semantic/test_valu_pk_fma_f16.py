@@ -1118,5 +1118,139 @@ class TestPkFmaF16SIMDMultiLane(unittest.TestCase):
             self.assertEqual(hi, f16_to_bits(20.0 + float(lane)))
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestPkFmaF16RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        # v0 = (2.0, 3.0), v1 = (4.0, 5.0), v2 = (1.0, 2.0)
+        state.set_vgpr(0, pack_pk_f16(POS_TWO, f16_to_bits(3.0)))
+        state.set_vgpr(1, pack_pk_f16(f16_to_bits(4.0), f16_to_bits(5.0)))
+        state.set_vgpr(2, pack_pk_f16(POS_ONE, POS_TWO))
+
+        # v0 = v0 * v1 + v2 -> lo: 2*4 + 1 = 9.0, hi: 3*5 + 2 = 17.0
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(2, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, f16_to_bits(9.0))
+        self.assertEqual(hi, f16_to_bits(17.0))
+        self.assertEqual(state.get_vgpr(0), res)
+        # Verify src1 and src2 were not mutated
+        self.assertEqual(state.get_vgpr(1), pack_pk_f16(f16_to_bits(4.0), f16_to_bits(5.0)))
+        self.assertEqual(state.get_vgpr(2), pack_pk_f16(POS_ONE, POS_TWO))
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_pk_f16(POS_TWO, POS_TWO))
+        state.set_vgpr(1, pack_pk_f16(f16_to_bits(3.0), f16_to_bits(4.0)))
+        state.set_vgpr(2, pack_pk_f16(POS_HALF, POS_HALF))
+
+        # v1 = v0 * v1 + v2 -> lo: 2*3 + 0.5 = 6.5, hi: 2*4 + 0.5 = 8.5
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(1, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(2, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, f16_to_bits(6.5))
+        self.assertEqual(hi, f16_to_bits(8.5))
+        self.assertEqual(state.get_vgpr(1), res)
+        self.assertEqual(state.get_vgpr(0), pack_pk_f16(POS_TWO, POS_TWO))
+
+    def test_dst_alias_src2(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, pack_pk_f16(POS_TWO, POS_TWO))
+        state.set_vgpr(1, pack_pk_f16(POS_TWO, POS_TWO))
+        state.set_vgpr(2, pack_pk_f16(POS_ONE, POS_ONE))
+
+        # v2 = v0 * v1 + v2 -> lo: 2*2 + 1 = 5.0, hi: 2*2 + 1 = 5.0
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(2, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(2, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, f16_to_bits(5.0))
+        self.assertEqual(hi, f16_to_bits(5.0))
+        self.assertEqual(state.get_vgpr(2), res)
+
+    def test_dst_alias_all_three_operands(self) -> None:
+        state = ScalarMachineState()
+        # v0 = (2.0, 3.0)
+        # v0 = v0 * v0 + v0 -> lo: 2*2 + 2 = 6.0, hi: 3*3 + 3 = 12.0
+        state.set_vgpr(0, pack_pk_f16(POS_TWO, f16_to_bits(3.0)))
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(0, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        lo, hi = unpack_pk_f16(res)
+        self.assertEqual(lo, f16_to_bits(6.0))
+        self.assertEqual(hi, f16_to_bits(12.0))
+        self.assertEqual(state.get_vgpr(0), res)
+
+    def test_inplace_iterative_mac_accumulation(self) -> None:
+        state = ScalarMachineState()
+        # v0 accumulator starts at (0.0, 0.0)
+        state.set_vgpr(0, pack_pk_f16(POS_ZERO, POS_ZERO))
+        state.set_vgpr(1, pack_pk_f16(POS_ONE, POS_ONE))
+        state.set_vgpr(2, pack_pk_f16(POS_HALF, POS_ONE))
+
+        # 10 iterations: v0 = v1 * v2 + v0
+        # each iteration adds 0.5 to lo and 1.0 to hi
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(2, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(0, RegType.VGPR)),
+        )
+        for _ in range(10):
+            self.scalar_interp.step(instr, state)
+
+        lo, hi = unpack_pk_f16(state.get_vgpr(0))
+        self.assertEqual(lo, f16_to_bits(5.0))
+        self.assertEqual(hi, f16_to_bits(10.0))
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, pack_pk_f16(f16_to_bits(float(lane)), f16_to_bits(float(lane))))
+            state.set_vgpr(lane, 1, pack_pk_f16(POS_TWO, POS_TWO))
+            state.set_vgpr(lane, 2, pack_pk_f16(POS_ONE, POS_ONE))
+
+        # Each lane computes in place: v0 = v0 * v1 + v2 -> lane * 2.0 + 1.0
+        instr = VPkFmaF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src2=VOP3POperand(Reg32(2, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            lo, hi = unpack_pk_f16(state.get_vgpr(lane, 0))
+            expected = f16_to_bits(float(lane) * 2.0 + 1.0)
+            self.assertEqual(lo, expected)
+            self.assertEqual(hi, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
