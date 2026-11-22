@@ -11267,6 +11267,88 @@ def write_index(path, index):
     os.replace(tmp, path)   # ponytail: no retry; add one if a scanner on Windows ever holds the new file open
 
 
+class ShardSetError(Exception):
+    """The index parts on disk are not one complete shard set: merging them would publish a partial index."""
+
+
+SHARD_MARKER = "shard{index}.json"
+
+
+def _read_shard_markers(out):
+    """{index: count} from the shard<i>.json markers a --shard run writes beside its index.part<i>.json."""
+    import glob as _gl, json as _js
+    markers = {}
+    for path in sorted(_gl.glob(os.path.join(out, "shard*.json"))):
+        m = re.fullmatch(r"shard(\d+)\.json", os.path.basename(path))
+        if not m:            # make_game.py's shards.json plan is not a marker
+            continue
+        with open(path, encoding="utf-8") as f:
+            doc = _js.load(f)
+        try:
+            index, count = int(doc["index"]), int(doc["count"])
+        except (KeyError, TypeError, ValueError):
+            raise ShardSetError(f"{path} is not a shard marker (expected an object with \"index\" and \"count\")") from None
+        if index != int(m.group(1)):
+            raise ShardSetError(f"{path} is a marker for shard {index}, but its name says shard {m.group(1)}")
+        if index in markers and markers[index] != count:
+            raise ShardSetError(f"shard markers disagree on the shard count: {path}")
+        markers[index] = count
+    return markers
+
+
+def merge_shard_parts(out):
+    """{shader: meta} from index.part*.json, after checking the set is complete.
+
+    A --shard i/n run writes index.part<i>.json and shard<i>.json ({"index": i, "count": n}); the markers say how
+    many parts the set has. Parts from before the markers existed fall back to make_game.py's shards.json plan.
+    With neither there is no way to know the count, so the old merge-everything behaviour is kept."""
+    import glob as _gl, json as _js
+    parts = sorted(_gl.glob(os.path.join(out, "index.part*.json")))
+    indices = []
+    for part in parts:
+        m = re.search(r"index\.part(\d+)\.json$", part)
+        if not m:
+            raise ShardSetError(f"{part} is not an index.part<i>.json file")
+        indices.append(int(m.group(1)))
+    if len(set(indices)) != len(indices):
+        raise ShardSetError(f"index.part*.json has two parts with the same index: {sorted(indices)}")
+    markers = _read_shard_markers(out)
+    expected = None
+    if markers:
+        counts = set(markers.values())
+        if len(counts) != 1:
+            raise ShardSetError(f"shard markers disagree on the shard count: {sorted(counts)}")
+        expected = counts.pop()
+    else:
+        plan = os.path.join(out, "shards.json")
+        if os.path.isfile(plan):
+            try:
+                with open(plan, encoding="utf-8") as f:
+                    expected = int(_js.load(f).get("jobs") or 0) or None
+            except (OSError, ValueError, TypeError, AttributeError):
+                expected = None
+    if expected is not None:
+        missing = [i for i in range(expected) if i not in set(indices)]
+        extra = [i for i in indices if i >= expected]
+        if missing or extra:
+            raise ShardSetError(
+                f"incomplete shard set: {len(indices)} of {expected} parts (0..{expected - 1})"
+                + (f", missing {missing}" if missing else "")
+                + (f", unexpected {extra}" if extra else "")
+                + "; let every --shard run finish before --merge")
+    if markers and set(markers) != set(indices):
+        raise ShardSetError(f"index parts and shard markers disagree: parts {sorted(set(indices))}, "
+                            f"markers {sorted(markers)}")
+    merged = {}
+    for part in parts:
+        with open(part, encoding="utf-8") as f:
+            doc = _js.load(f)
+        if not isinstance(doc, dict):
+            raise ShardSetError(f"{part} does not contain a shader index object")
+        merged.update(doc)
+    return merged
+
+
 def assemble_spirv(sa, sv):
     """Keep the assembled module out of the final path until validation succeeds."""
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
@@ -11362,11 +11444,11 @@ def main():
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
     if a.merge:
-        import glob as _gl, json as _js
-        merged = {}
-        for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
-            with open(part, encoding="utf-8") as f:
-                merged.update(_js.load(f))
+        try:
+            merged = merge_shard_parts(a.out)
+        except ShardSetError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         # The stubs go first: index.json is what tells make_game.py the translation finished.
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
@@ -11427,6 +11509,8 @@ def main():
         for name in invalid:
             old.pop(name, None)
     old.update(meta)
+    if shard is not None:   # a marker beside the part, so --merge can tell a complete set from a partial one
+        write_index(os.path.join(a.out, SHARD_MARKER.format(index=shard)), {"index": shard, "count": sn})
     write_index(idx_path, old)
     if shard is None:
         import spirv_stubs
