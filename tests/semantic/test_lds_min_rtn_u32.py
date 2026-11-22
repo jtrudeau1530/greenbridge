@@ -464,5 +464,159 @@ class TestDSMinRtnU32AST(unittest.TestCase):
         self.assertEqual(instructions[1], inst2)
 
 
+class ScalarThreadState:
+    """Architectural register and execution state for a single scalar GPU thread."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+        self.pc: int = 0
+        self.instruction_count: int = 0
+        self.cycle_count: int = 0
+
+    def get_vgpr(self, idx: int) -> int:
+        """Read 32-bit dword from VGPR file."""
+        return self.vgprs[idx] & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        """Write 32-bit dword to VGPR file."""
+        self.vgprs[idx] = val & MASK32
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar instruction interpreter for LDS instructions."""
+
+    def __init__(self, state: Optional[ScalarThreadState] = None, lds: Optional[LDSMemory] = None) -> None:
+        if state is not None:
+            self.state = state
+        else:
+            self.state = ScalarThreadState(lds=lds)
+
+    def execute_instruction(self, inst: DSMinRtnU32Instruction) -> int:
+        """Execute a single ds_min_rtn_u32 instruction deterministically."""
+        if inst.opcode not in (DSOpcode.DS_MIN_RTN_U32, DSOpcode.DS_MIN_U32):
+            raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+        # In RDNA2, register reads occur before any register write
+        vaddr_val = self.state.get_vgpr(inst.vaddr.index)
+        vdata0_val = self.state.get_vgpr(inst.vdata0.index)
+
+        eff_addr = calc_lds_effective_address(vaddr_val, inst.offset.value)
+        old_val = self.state.lds.atomic_min_rtn_u32(eff_addr, vdata0_val)
+
+        if inst.opcode.is_return and inst.vdst is not None:
+            self.state.set_vgpr(inst.vdst.index, old_val)
+
+        self.state.instruction_count += 1
+        self.state.cycle_count += 4
+        return old_val
+
+    def run_program(self, prog: Program) -> int:
+        """Execute all instructions in the given program sequentially."""
+        count = 0
+        for inst in prog:
+            self.execute_instruction(inst)
+            count += 1
+        return count
+
+
+class TestDSMinRtnU32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter(state=self.state)
+
+    def test_scalar_single_execution(self) -> None:
+        # v1 (addr) = 0x40, v2 (data) = 0x200, LDS[0x40] = 0x500
+        self.state.set_vgpr(1, 0x40)
+        self.state.set_vgpr(2, 0x200)
+        self.lds.write_by_byte_addr(0x40, 0x500)
+
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+        )
+        returned = self.interp.execute_instruction(inst)
+
+        # Destination VGPR v0 and returned value should be old LDS value
+        self.assertEqual(returned, 0x500)
+        self.assertEqual(self.state.get_vgpr(0), 0x500)
+        # LDS memory should now be the minimum
+        self.assertEqual(self.lds.read_by_byte_addr(0x40), 0x200)
+        self.assertEqual(self.state.instruction_count, 1)
+
+    def test_scalar_sequential_reduction(self) -> None:
+        # Address at v1 = 0x80; initial memory = 1000
+        self.state.set_vgpr(1, 0x80)
+        self.lds.write_by_byte_addr(0x80, 1000)
+
+        steps = [
+            (800, 1000, 800),   # (candidate, expected_ret, expected_mem)
+            (950, 800, 800),    # candidate is larger, mem unchanged
+            (300, 800, 300),    # candidate is smaller, mem updated
+            (300, 300, 300),    # candidate equal, mem unchanged
+            (50, 300, 50),      # candidate is smaller, mem updated
+        ]
+
+        for cand, exp_ret, exp_mem in steps:
+            self.state.set_vgpr(2, cand)
+            inst = DSMinRtnU32Instruction(
+                opcode=DSOpcode.DS_MIN_RTN_U32,
+                vdst=vgpr(0),
+                vaddr=vgpr(1),
+                vdata0=vgpr(2),
+            )
+            ret = self.interp.execute_instruction(inst)
+            self.assertEqual(ret, exp_ret)
+            self.assertEqual(self.state.get_vgpr(0), exp_ret)
+            self.assertEqual(self.lds.read_by_byte_addr(0x80), exp_mem)
+
+    def test_scalar_with_offset(self) -> None:
+        # v1 (addr) = 0x20, offset = 12 -> byte 0x2C
+        self.state.set_vgpr(1, 0x20)
+        self.state.set_vgpr(2, 0x1111)
+        self.lds.write_by_byte_addr(0x2C, 0x9999)
+
+        inst = DSMinRtnU32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_U32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(2),
+            offset=OffsetImmediate(12),
+        )
+        ret = self.interp.execute_instruction(inst)
+        self.assertEqual(ret, 0x9999)
+        self.assertEqual(self.state.get_vgpr(0), 0x9999)
+        self.assertEqual(self.lds.read_by_byte_addr(0x2C), 0x1111)
+
+    def test_scalar_program_execution(self) -> None:
+        prog = Program()
+        # Initialize 3 memory locations
+        for i in range(3):
+            addr = i * 4
+            self.lds.write_by_byte_addr(addr, 100 * (i + 1))
+            self.state.set_vgpr(10 + i, addr)
+            self.state.set_vgpr(20 + i, 50 * (i + 1))
+            prog.add(DSMinRtnU32Instruction(
+                opcode=DSOpcode.DS_MIN_RTN_U32,
+                vdst=vgpr(i),
+                vaddr=vgpr(10 + i),
+                vdata0=vgpr(20 + i),
+            ))
+
+        executed = self.interp.run_program(prog)
+        self.assertEqual(executed, 3)
+        self.assertEqual(self.state.get_vgpr(0), 100)
+        self.assertEqual(self.lds.read_by_byte_addr(0), 50)
+        self.assertEqual(self.state.get_vgpr(1), 200)
+        self.assertEqual(self.lds.read_by_byte_addr(4), 100)
+        self.assertEqual(self.state.get_vgpr(2), 300)
+        self.assertEqual(self.lds.read_by_byte_addr(8), 150)
+
+
 if __name__ == "__main__":
     unittest.main()
