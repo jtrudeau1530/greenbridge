@@ -52,6 +52,11 @@ def truthy(value) -> bool:
     return str(value).strip().lower() in ("1", "on", "true", "yes")
 
 
+def regex_list(value: str | list[str]) -> list[str]:
+    """Treat a single string as one output expression, like a one-element CTest list."""
+    return [value] if isinstance(value, str) else value
+
+
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
     command = test.get("command")
@@ -92,8 +97,8 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
     detail = f"exit {code} in {elapsed:.1f} s\n{out}"
-    required = props.get("PASS_REGULAR_EXPRESSION", [])
-    forbidden = props.get("FAIL_REGULAR_EXPRESSION", [])
+    required = regex_list(props.get("PASS_REGULAR_EXPRESSION", []))
+    forbidden = regex_list(props.get("FAIL_REGULAR_EXPRESSION", []))
     # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
     try:
         passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0

@@ -153,6 +153,20 @@ class RunTestTest(unittest.TestCase):
                 status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
                 self.assertEqual(status, expected, detail)
 
+    def test_a_scalar_output_expression_is_matched_as_one_pattern(self):
+        required = {"PASS_REGULAR_EXPRESSION": "usage: gta6rt"}
+        forbidden = {"FAIL_REGULAR_EXPRESSION": r"module\(s\) mapped"}
+        for code, output, props, expected in (
+            (3, "unexpected output", required, "fail"),
+            (2, "usage: gta6rt", required, "pass"),
+            (0, "unexpected output", forbidden, "pass"),
+            (0, "1 module(s) mapped", forbidden, "fail"),
+        ):
+            with self.subTest(output=output, props=props):
+                exe = self.program("regex.py", f"import sys\nprint({output!r})\nsys.exit({code})\n")
+                status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
+                self.assertEqual(status, expected, detail)
+
     def test_a_signal_termination_fails_even_with_success_overrides(self):
         # The mocked negative returncode keeps the test portable across Windows and POSIX.
         exe = self.exiting(0)
