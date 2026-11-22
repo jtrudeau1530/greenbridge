@@ -125,6 +125,13 @@ def is_nan_f64(bits: int) -> bool:
     return ((bits & EXP_MASK_F64) == EXP_MASK_F64) and ((bits & MANT_MASK_F64) != 0)
 
 
+def is_snan_f64(bits: int) -> bool:
+    """Check if binary64 bits represent a signaling NaN (quiet bit 51 is zero)."""
+    if not is_nan_f64(bits):
+        return False
+    return ((bits >> 51) & 1) == 0
+
+
 def is_inf_f64(bits: int) -> bool:
     """Check if binary64 bit pattern represents +/- infinity."""
     return ((bits & EXP_MASK_F64) == EXP_MASK_F64) and ((bits & MANT_MASK_F64) == 0)
@@ -144,6 +151,32 @@ def is_normal_f64(bits: int) -> bool:
     """Check if binary64 bit pattern represents a normalized finite float."""
     exp = (bits & EXP_MASK_F64) >> EXP_SHIFT_F64
     return 1 <= exp <= 2046
+
+
+@dataclass
+class FPStatusFlags:
+    """IEEE 754 floating-point status exception flags."""
+    invalid: bool = False
+    div_by_zero: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+
+    def merge(self, other: FPStatusFlags) -> None:
+        self.invalid |= other.invalid
+        self.div_by_zero |= other.div_by_zero
+        self.overflow |= other.overflow
+        self.underflow |= other.underflow
+        self.inexact |= other.inexact
+
+
+def calc_frexp_f64_status_flags(src0_bits: int, opcode: str) -> FPStatusFlags:
+    """Determine IEEE 754 exception flags for v_frexp_mant_f64 / v_frexp_exp_i32_f64."""
+    flags = FPStatusFlags()
+    # Signaling NaN generates invalid operation exception
+    if is_snan_f64(src0_bits):
+        flags.invalid = True
+    return flags
 
 
 def ref_frexp_mant_f64(
@@ -488,12 +521,14 @@ class ScalarVALUInterpreter:
         self.sgpr = [0] * self.num_sgprs
         self.vcc = 0
         self.exec = MASK64
+        self.status_flags = FPStatusFlags()
 
     def reset(self) -> None:
         self.vgpr = [0] * self.num_vgprs
         self.sgpr = [0] * self.num_sgprs
         self.vcc = 0
         self.exec = MASK64
+        self.status_flags = FPStatusFlags()
 
     def get_vgpr_u32(self, idx: int) -> int:
         if not (0 <= idx < self.num_vgprs):
@@ -565,6 +600,9 @@ class ScalarVALUInterpreter:
         ast.validate()
         s0_val = self.eval_operand_f64(ast.src0)
 
+        flags = calc_frexp_f64_status_flags(s0_val, ast.opcode)
+        self.status_flags.merge(flags)
+
         if ast.opcode == "v_frexp_mant_f64":
             res = ref_frexp_mant_f64(
                 s0_val,
@@ -598,12 +636,14 @@ class SIMDVALUInterpreter:
         self.sgpr = [0] * self.num_sgprs
         self.vcc = 0
         self.exec = (1 << self.wave_size) - 1
+        self.status_flags = FPStatusFlags()
 
     def reset(self) -> None:
         self.vgpr = [[0] * self.wave_size for _ in range(self.num_vgprs)]
         self.sgpr = [0] * self.num_sgprs
         self.vcc = 0
         self.exec = (1 << self.wave_size) - 1
+        self.status_flags = FPStatusFlags()
 
     def get_vgpr_u32(self, reg: int, lane: int) -> int:
         if not (0 <= reg < self.num_vgprs):
@@ -693,6 +733,9 @@ class SIMDVALUInterpreter:
                 continue
 
             s0_val = src0_latched[lane]
+            flags = calc_frexp_f64_status_flags(s0_val, ast.opcode)
+            self.status_flags.merge(flags)
+
             if ast.opcode == "v_frexp_mant_f64":
                 res = ref_frexp_mant_f64(
                     s0_val,
@@ -713,6 +756,85 @@ class SIMDVALUInterpreter:
     def execute_asm(self, asm_line: str) -> list[int]:
         ast = parse_valu_frexp_f64(asm_line)
         return self.execute(ast)
+
+
+class TestValuFrexpF64StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_strictly_preserved_scalar(self):
+        interp = ScalarVALUInterpreter()
+        initial_vcc = 0x123456789ABCDEF0
+        interp.vcc = initial_vcc
+        interp.set_vgpr_u64(2, f64_to_bits(1.0))
+
+        interp.execute_asm("v_frexp_mant_f64 v[0:1], v[2:3]")
+        self.assertEqual(interp.vcc, initial_vcc, "VCC must remain unmodified by v_frexp_mant_f64")
+
+        interp.execute_asm("v_frexp_exp_i32_f64 v4, v[2:3]")
+        self.assertEqual(interp.vcc, initial_vcc, "VCC must remain unmodified by v_frexp_exp_i32_f64")
+
+    def test_vcc_strictly_preserved_simd_wave64(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        initial_vcc = 0xCAFEBABE0000FFFF
+        sim.vcc = initial_vcc
+        for lane in range(64):
+            sim.set_vgpr_u64(2, lane, f64_to_bits(2.0))
+
+        sim.execute_asm("v_frexp_mant_f64 v[0:1], v[2:3]")
+        self.assertEqual(sim.vcc, initial_vcc, "Wave64 VCC must remain untouched by mantissa")
+
+        sim.execute_asm("v_frexp_exp_i32_f64 v4, v[2:3]")
+        self.assertEqual(sim.vcc, initial_vcc, "Wave64 VCC must remain untouched by exponent")
+
+    def test_fp_flags_exact_normal_no_exceptions(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u64(2, f64_to_bits(3.5))
+        interp.execute_asm("v_frexp_mant_f64 v[0:1], v[2:3]")
+        interp.execute_asm("v_frexp_exp_i32_f64 v4, v[2:3]")
+        self.assertFalse(interp.status_flags.invalid)
+        self.assertFalse(interp.status_flags.overflow)
+        self.assertFalse(interp.status_flags.underflow)
+        self.assertFalse(interp.status_flags.inexact)
+
+    def test_fp_flags_invalid_snan_mant(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u64(2, SNAN_F64)
+        interp.execute_asm("v_frexp_mant_f64 v[0:1], v[2:3]")
+        self.assertTrue(interp.status_flags.invalid)
+
+    def test_fp_flags_invalid_snan_exp(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u64(2, SNAN_F64)
+        interp.execute_asm("v_frexp_exp_i32_f64 v0, v[2:3]")
+        self.assertTrue(interp.status_flags.invalid)
+
+    def test_fp_flags_no_invalid_on_qnan(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u64(2, QNAN_F64)
+        interp.execute_asm("v_frexp_mant_f64 v[0:1], v[2:3]")
+        interp.execute_asm("v_frexp_exp_i32_f64 v4, v[2:3]")
+        self.assertFalse(interp.status_flags.invalid)
+
+    def test_fp_flags_subnormals_exact(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u64(2, MIN_SUBNORMAL_F64)
+        interp.execute_asm("v_frexp_mant_f64 v[0:1], v[2:3]")
+        interp.execute_asm("v_frexp_exp_i32_f64 v4, v[2:3]")
+        # Frexp decomposition is exact; no underflow or overflow flags are raised
+        self.assertFalse(interp.status_flags.underflow)
+        self.assertFalse(interp.status_flags.overflow)
+        self.assertFalse(interp.status_flags.invalid)
+
+    def test_fp_flags_infinities_and_zeros(self):
+        interp = ScalarVALUInterpreter()
+        for val in (POS_ZERO_F64, NEG_ZERO_F64, POS_INF_F64, NEG_INF_F64):
+            interp.reset()
+            interp.set_vgpr_u64(2, val)
+            interp.execute_asm("v_frexp_mant_f64 v[0:1], v[2:3]")
+            interp.execute_asm("v_frexp_exp_i32_f64 v4, v[2:3]")
+            self.assertFalse(interp.status_flags.invalid)
+            self.assertFalse(interp.status_flags.overflow)
+            self.assertFalse(interp.status_flags.underflow)
 
 
 class TestValuFrexpF64RegisterAliasing(unittest.TestCase):
