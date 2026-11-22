@@ -1257,30 +1257,26 @@ def read_glb_summary(data: bytes) -> dict:
     if not isinstance(gltf, dict):
         raise GlbError("GLB JSON root must be a JSON object")
 
-    offset = 20 + json_len
+    after_json = 20 + json_len
+    offset = after_json
     bin_bytes = 0
-    if offset < total_length:
+    while offset < total_length:
         if offset + 8 > total_length:
-            raise GlbError("truncated BIN chunk header")
-        bin_len, bin_type = struct.unpack_from("<II", buf, offset)
-        if bin_type != CHUNK_TYPE_BIN:
-            raise GlbError(f"second GLB chunk must be BIN (0x{CHUNK_TYPE_BIN:08X}), got 0x{bin_type:08X}")
-        if bin_len % 4 != 0:
-            raise GlbError(f"BIN chunk length not 4-byte aligned: {bin_len}")
-        if offset + 8 + bin_len > total_length:
-            raise GlbError(f"BIN chunk length {bin_len} exceeds total length {total_length}")
-        bin_bytes = bin_len
-        offset += 8 + bin_len
-
-        while offset < total_length:
-            if offset + 8 > total_length:
-                raise GlbError("truncated trailing GLB chunk header")
-            chunk_len, _chunk_type = struct.unpack_from("<II", buf, offset)
-            if chunk_len % 4 != 0:
-                raise GlbError(f"trailing chunk length not 4-byte aligned: {chunk_len}")
-            if offset + 8 + chunk_len > total_length:
-                raise GlbError("trailing chunk exceeds GLB total length")
-            offset += 8 + chunk_len
+            raise GlbError("truncated GLB chunk header")
+        chunk_len, chunk_type = struct.unpack_from("<II", buf, offset)
+        if chunk_len % 4 != 0:
+            raise GlbError(f"GLB chunk length not 4-byte aligned: {chunk_len}")
+        chunk_end = offset + 8 + chunk_len
+        if chunk_end > total_length:
+            raise GlbError(f"GLB chunk length {chunk_len} exceeds GLB total length {total_length}")
+        if chunk_type == CHUNK_TYPE_JSON:
+            raise GlbError("duplicate GLB JSON chunk")
+        if chunk_type == CHUNK_TYPE_BIN:
+            if offset != after_json:
+                raise GlbError("GLB BIN chunk must be second")
+            bin_bytes = chunk_len
+        # Extension chunks are ignored after checking their framing.
+        offset = chunk_end
 
     buf0_limit = bin_bytes
     buffers = gltf.get("buffers")
