@@ -83,9 +83,25 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
     const BOOL ok = get_stats(kMeasuredKind, stats);
     check(ok != FALSE, "XMemGetWorkingSetStatistics(kind, 64-byte out) returns TRUE");
 
+    uint64_t total_memory = 0;
+    std::memcpy(&total_memory, stats + 0, sizeof(total_memory));
+    check(ok != FALSE && total_memory != 0, "XMemGetWorkingSetStatistics writes a non-zero total memory at +0");
+
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
+        check(ok != FALSE && total_memory == ms.ullTotalPhys,
+              "XMemGetWorkingSetStatistics total memory (+0) matches GlobalMemoryStatusEx ullTotalPhys");
+    } else {
+        check(ok != FALSE && total_memory == 12ULL * 1024 * 1024 * 1024,
+              "XMemGetWorkingSetStatistics total memory (+0) falls back to 12 GiB title limit");
+    }
+
     uint64_t working_set = 0;
     std::memcpy(&working_set, stats + 8, sizeof(working_set));
     check(ok != FALSE && working_set != 0, "XMemGetWorkingSetStatistics writes a non-zero size at +8");
+
+    check(ok != FALSE && total_memory >= working_set,
+          "XMemGetWorkingSetStatistics total memory (+0) >= working set (+8)");
 
     bool tail_untouched = true;
     for (size_t i = 16; i < sizeof(stats); ++i) {
