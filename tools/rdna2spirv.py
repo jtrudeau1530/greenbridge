@@ -622,8 +622,8 @@ class Gen:
                 x, y = vals
             ops = {"lt": "OpFOrdLessThan", "le": "OpFOrdLessThanEqual", "gt": "OpFOrdGreaterThan",
                    "ge": "OpFOrdGreaterThanEqual", "eq": "OpFOrdEqual", "neq": "OpFUnordNotEqual",
-                   "lg": "OpFOrdNotEqual", "nlt": "OpFUnordGreaterThanEqual", "ngt": "OpFUnordLessThanEqual",
-                   "nle": "OpFUnordGreaterThan", "nge": "OpFUnordLessThan"}
+                   "lg": "OpFOrdNotEqual", "nlg": "OpFUnordEqual", "nlt": "OpFUnordGreaterThanEqual",
+                   "ngt": "OpFUnordLessThanEqual", "nle": "OpFUnordGreaterThan", "nge": "OpFUnordLessThan"}
         elif ty in ("u16", "i16"):
             x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
             xs, ys = self.tmp(), self.tmp()

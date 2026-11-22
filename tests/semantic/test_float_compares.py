@@ -1,6 +1,6 @@
-"""Semantic interpreter tests for RDNA2 float compares: v_cmp_{lt,le,gt,ge,eq,lg,neq,nlt,ngt,nle,nge}_{f32,f16}.
+"""Semantic interpreter tests for RDNA2 float compares: v_cmp_{lt,le,gt,ge,eq,lg,neq,nlg,nlt,ngt,nle,nge}_{f32,f16}.
 
-lt/le/gt/ge/eq/lg are ordered (false when either source is NaN); neq/nlt/ngt/nle/nge are their unordered negations
+lt/le/gt/ge/eq/lg are ordered (false when either source is NaN); neq/nlg/nlt/ngt/nle/nge are their unordered negations
 (true when either source is NaN). +0 and -0 compare equal. Each case translates a synthetic pixel shader with
 tools/rdna2spirv.py, runs it in tests/semantic/spirv_mini_interp.py, reads the compare back with v_cndmask_b32 and
 compares it with Python's own comparison of the operands. f16 sources take the low half of the 32-bit register; the
@@ -31,7 +31,7 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 ORDERED = {"lt": lambda x, y: x < y, "le": lambda x, y: x <= y, "gt": lambda x, y: x > y,
            "ge": lambda x, y: x >= y, "eq": lambda x, y: x == y,
            "lg": lambda x, y: x != y and not (math.isnan(x) or math.isnan(y))}
-UNORDERED = {"neq": "eq", "nlt": "lt", "ngt": "gt", "nle": "le", "nge": "ge"}   # n<c> = not <c>
+UNORDERED = {"neq": "eq", "nlg": "lg", "nlt": "lt", "ngt": "gt", "nle": "le", "nge": "ge"}   # n<c> = not <c>
 
 
 def relation(cond: str, x: float, y: float) -> bool:
@@ -129,6 +129,32 @@ class F16Compares(unittest.TestCase):
                 with self.subTest(op=op, x=xn, y=yn):
                     want = int(relation(cond, f16_value(xb), f16_value(yb)))
                     self.assertEqual(run_cmp(op, 0xABCD0000 | xb, 0x12340000 | yb), want)
+
+
+class CmpxNlgTests(unittest.TestCase):
+    def run_cmpx(self, op: str, x_bits: int, y_bits: int):
+        if _TMP_DIR is None:
+            setUpModule()
+        lines = [
+            f"v_mov_b32 v2, {x_bits:#x}",
+            f"v_mov_b32 v3, {y_bits:#x}",
+            "v_mov_b32 v0, 0x3f800000",
+            f"{op}_e32 v2, v3",
+        ]
+        asm = "; test_cmpx_nlg\n" + "".join(f"\t{ln}\n" for ln in lines) + "\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
+        with open(_SRC_PATH, "w", encoding="utf-8") as f:
+            f.write(asm)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            spv = rdna2spirv.translate(_SRC_PATH)
+        return "%out_mrt0" in si.run_fragment(spv)
+
+    def test_v_cmpx_nlg_f32_and_f16(self):
+        # nlg = unordered equal: active iff x == y or either operand is NaN.
+        for op, tbl in (("v_cmpx_nlg_f32", F32), ("v_cmpx_nlg_f16", F16)):
+            for xn, yn, want in (("1", "1", True), ("0", "-0", True), ("nan", "1", True), ("1", "2.5", False)):
+                with self.subTest(op=op, x=xn, y=yn):
+                    self.assertEqual(self.run_cmpx(op, tbl[xn], tbl[yn]), want)
 
 
 if __name__ == "__main__":
