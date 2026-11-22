@@ -11,7 +11,7 @@ Checks that always run:
   * every standard GUID in the table is byte-identical to the Windows SDK, when the SDK is found;
   * GUIDs are valid RFC 4122 version 4, unique, and the 10 console GUIDs are not in the SDK set;
   * the 88 IID ordinals 28..115 are alphabetical, except IID_ID3D12ConsDmaCommandList pinned at 100;
-  * the four non-exported console command-list IIDs are not given values or ordinals.
+  * the four unresolved console command-list IIDs are not assigned values or ordinals in the local tables.
 
 Optional checks:
   * ``--scarab PATH`` cross-checks the table against a SCARAB checkout (values, ordinals, catalogue).
@@ -263,9 +263,9 @@ CONSOLE_IIDS = {
     "IID_IGraphicsUnknown": (0xACEEEA63, 0xE0A9, 0x4A1C, 0xBB, 0xEC, 0x71, 0xB2, 0xF4, 0x85, 0xF7, 0x58),
 }
 
-# The four console command-list interfaces whose IIDs the runtime does not export (doc section 4).
-# SCARAB's provenance file says they are NOT exported and NOT recovered; only a QueryInterface
-# from the running title can supply a value. They must stay out of DATA_EXPORTS and CONSOLE_IIDS.
+# The four console command-list interfaces whose IIDs SCARAB reports as not exported and not
+# recovered (doc section 4). The local tables must not assign a value; a title trace is one
+# possible future source. They must stay out of DATA_EXPORTS and CONSOLE_IIDS.
 UNRECOVERED_CONSOLE_IIDS = (
     "ID3D12ConsComputeCommandList",
     "ID3D12ConsComputeCommandList6",
@@ -377,15 +377,16 @@ def check_guid_values():
 
 
 def check_unrecovered_console_iids():
-    """The four non-exported command-list IIDs have no export name, ordinal or GUID value."""
+    """The four unresolved command-list IIDs are absent from the local export table and CONSOLE_IIDS; the
+    vendor-runtime observation is SCARAB's."""
     errors = []
     export_names = {name for _n, name, _kind, _ev in DATA_EXPORTS}
     for interface in UNRECOVERED_CONSOLE_IIDS:
         for name in (interface, "IID_" + interface):
             if name in export_names:
-                errors.append("%s must not be in the 93-GUID export table" % name)
+                errors.append("%s must not be assigned to the 93-GUID export table" % name)
             if name in CONSOLE_IIDS:
-                errors.append("%s must not have a published GUID value" % name)
+                errors.append("%s must not be assigned a local GUID value" % name)
     return errors
 
 

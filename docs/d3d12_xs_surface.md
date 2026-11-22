@@ -101,7 +101,7 @@ for.
 
 The 93 are the documented GUID data exports. They do **not** include the four console
 command-list IIDs in §4: SCARAB's provenance note says the runtime does not export them, so they
-have no ordinal here and cannot be added to this table from any export dump.
+have no ordinal here and are absent from this export dump.
 
 | # | GUID export | Std | Evidence |
 |---:|---|---|---|
@@ -349,20 +349,21 @@ SCARAB from the vendor runtime's export table; the ordinal is from `iid_console.
 | 39 | `IID_ID3D11CounterSetX` | `f9f6a732-c5f8-4a57-ba36-eae7c27ba74a` | D3D11 counters | Out of scope |
 | 38 | `IID_ID3D11CounterSampleX` | `806ceee4-280b-43d9-9008-b4fdf7febee2` | D3D11 counters | Out of scope |
 
-The four command-list IIDs are **not exports**, so they have no row above and no ordinal:
+The four command-list IIDs are **not runtime exports** according to SCARAB's provenance, so they
+have no row above and no ordinal:
 `ID3D12ConsComputeCommandList`, `...6`, `...8`, and `ID3D12ConsCopyCommandList6`. SCARAB's
 provenance note says they are "NOT exported by the runtime and are NOT recovered" and that a
 `QueryInterface` for one is logged by the wrapper's audit hook
 ([`iid_provenance.json:13`](https://github.com/p-portela/SCARAB/blob/d304fa2/components/extension-wrapper/iid_provenance.json)).
-That is also why this 1.0.2.1 package cannot supply them: its root has the 16 middleware/CRT
-DLLs and no D3D12 runtime DLL, its layout XML lists no `d3d12_xs.dll`, the executable that would
-call `QueryInterface` with them is absent, and `gameos.xvd` is an encrypted XVD with a
-high-entropy payload and no plaintext `d3d12_xs.dll` name in ASCII or UTF-16 (measured in
-[d3d12_command_objects.md](d3d12_command_objects.md) §1 and
+This 1.0.2.1 package's own DLL export tables do not contain them either: its root has the 16
+middleware/CRT DLLs and no D3D12 runtime DLL, its layout XML lists no `d3d12_xs.dll`, the
+executable that would call `QueryInterface` with them is absent, and `gameos.xvd` is an encrypted
+XVD with a high-entropy payload and no plaintext `d3d12_xs.dll` name in ASCII or UTF-16 (measured
+in [d3d12_command_objects.md](d3d12_command_objects.md) §1 and
 [d3d12_vulkan.md](d3d12_vulkan.md) Appendix A.1). SCARAB also holds seven candidate v4 UUIDs
 found 16-byte-aligned after `IID_ID3D12Device4` in the UMD's `.rdata` and marks them `CANDIDATE`,
 not used. Do not use them or assign them by position. A QI for one of those interfaces must be
-logged and refused until the title itself supplies the GUID.
+logged and refused until a title trace or another artifact supplies the GUID.
 
 The DMA IID is the load-bearing one. SCARAB's end-to-end test created a console DMA command list
 through a PC D3D12 device and got an object that served both `IID_ID3D12ConsDmaCommandList` and
@@ -462,15 +463,15 @@ For Leonida, the transferable facts are the rule and the IID, not the wrapper:
   not a standard GCL IID, treat it as a console list.
 - If `type == 6` **and** `riid == 30bc77b9-8379-4b25-95de-b8588c42275d`, implement it as a copy
   list (Vulkan transfer queue / transfer-only command buffer). If the IID is anything else, log
-  the GUID and refuse; the compute/copy console IIDs are not exported by the runtime and are not
-  known.
+  the GUID and refuse; SCARAB reports that the compute/copy console IIDs are not runtime exports
+  and they are not known.
 - `D3D12CONS_COMMAND_LIST_FLAG_ENABLE_IB_CHAINING` is a recovered name (value unknown). A console
   list flag must not be passed to `vkCmd...` as if it were a D3D12 flag.
 - The console also has `ID3D12ConsComputeCommandList` (and 6/8 variants) and
   `ID3D12ConsCopyCommandList6`, plus `D3D12ConsRehydrateRaytracingAccelerationStructure`
   ([`docs/d3d12-xs-bridge.md:239-245`](https://github.com/p-portela/SCARAB/blob/d304fa2/docs/d3d12-xs-bridge.md)).
-  Their IIDs are not exported by the runtime, so no export table can supply them; the values and
-  the layouts are **Open**.
+  Their IIDs are not runtime exports according to SCARAB, so this package's export tables cannot
+  supply them; the values and the layouts are **Open**.
 
 What this does not tell us: the slot of `CreateCommandList` in the console device vtable (Leonida
 already measures device slot 14/62/76 independently), the real numeric value of the DMA type, or
@@ -591,7 +592,7 @@ evidence.
 | #11 `CheckFeatureSupport` answers | **still unknown** | — |
 | #12 async compute / copy queues | **described** | `CreateCommandQueueX` creates a shader-based queue, which the UMD says only supports `D3D12_COMMAND_LIST_TYPE_COMPUTE`; `SuspendX`/`ResumeX` exist. No params. |
 | #18 heap aliasing / reserved | **still unknown** | — |
-| console IIDs | **10 exported; 4 not exported** | The DMA list IID is proven and the other nine console GUIDs are reported. The four command-list IIDs are not exported by the runtime (SCARAB provenance), so they have no ordinal; this package has no D3D12 DLL to read. They stay unknown until the title's QI log supplies them. |
+| console IIDs | **10 exported; 4 not exported** | The DMA list IID is proven and the other nine console GUIDs are reported. SCARAB's provenance reports that the four command-list IIDs are not runtime exports, so they have no ordinal; this package has no D3D12 DLL to read. They stay unresolved until a title trace or another artifact supplies them. |
 | standard IIDs | **answered** | 83/83 standard GUIDs match the SDK; the 28 D3D12 ones are exact. |
 | export contract | **answered** | 116 = 23 functions + 93 GUIDs; 23 function ordinals and 59 IID ordinals are documented, 34 are derived. The four command-list IIDs are outside the 93 and have no ordinal. |
 | free-function dispositions | **answered as a list** | 7 standard + 16 console-only; Leonida serves 4 today. |
@@ -639,11 +640,12 @@ These are stated plainly because a future reader will otherwise trust the wrong 
    `d3d12_xs.dll` and did not run Wine. Nothing in this doc depends on them.
 10. **`docs/dll-surface.md` is stale.** It says the console `d3d12_xs.dll` is "not obtainable"
     (line 83), while `d3d12_xs-findings.md` documents the acquired binary. Use the findings doc.
-11. **"Recover the four command-list IIDs from the package's D3D12 DLL exports" cannot be done
-    with 1.0.2.1.** The package has 16 DLLs and no D3D12 runtime DLL, and `gameos.xvd` is
-    encrypted; SCARAB's provenance says the runtime does not export these four IIDs at all. There
-    is no export ordinal to read, in this package or in the vendor DLL. The only source is a
-    `QueryInterface` from the running title.
+11. **The package's D3D12 DLL exports do not contain the four command-list IIDs with 1.0.2.1.**
+    The package has 16 DLLs and no D3D12 runtime DLL, and `gameos.xvd` is encrypted; SCARAB's
+    provenance says the runtime does not export these four IIDs. There is no export ordinal to
+    read in this package or in the vendor DLL. A `QueryInterface` trace from the running title is
+    one possible way to establish the mapping; the package evidence does not exclude other
+    sources.
 
 The central claim does hold, with one link stated: **SCARAB's table reproduces 28/28 D3D12 IIDs,
 and in fact 83/83 standard GUIDs, byte-identically**, checked against the Windows SDK here. That
