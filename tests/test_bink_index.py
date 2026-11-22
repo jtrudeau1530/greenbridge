@@ -209,6 +209,16 @@ class TestCommandLine(unittest.TestCase):
             self.assertEqual(bink.main([missing]), 2)
         self.assertIn("no such file or directory", err.getvalue())
 
+    def test_output_write_failure_is_an_error(self):
+        for extension in ("csv", "json"):
+            with self.subTest(extension=extension):
+                path = os.path.join(self.tmp.name, "missing", f"index.{extension}")
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(bink.main([self.path, "--out", path]), 2)
+                self.assertEqual(out.getvalue(), "")
+                self.assertIn(f"cannot write {path}", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
