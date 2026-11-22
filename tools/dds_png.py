@@ -943,18 +943,25 @@ def _resample_box(width: int, height: int, rgba: bytes, nw: int, nh: int) -> byt
     out = bytearray(nw * nh * 4)
     for y, rows in enumerate(y_spans):
         for x, cols in enumerate(x_spans):
-            samples = [(4 * (sy * width + sx), wx * wy) for sy, wy in rows for sx, wx in cols]
+            samples = []
+            for sy, wy in rows:
+                for sx, wx in cols:
+                    offset = 4 * (sy * width + sx)
+                    samples.append((offset, rgba[offset + 3] * wx * wy))
+            coverage = sum(weight for _, weight in samples)
             dst = 4 * (y * nw + x)
-            for channel in range(4):
-                total = sum(rgba[offset + channel] * weight for offset, weight in samples)
-                out[dst + channel] = (total + area // 2) // area
+            out[dst + 3] = (coverage + area // 2) // area
+            if coverage:
+                for channel in range(3):
+                    total = sum(rgba[offset + channel] * weight for offset, weight in samples)
+                    out[dst + channel] = (total + coverage // 2) // coverage
     return bytes(out)
 
 
 def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
     nw = max(1, width // 2)
     nh = max(1, height // 2)
-    if (width > 1 and width % 2) or (height > 1 and height % 2):
+    if (width > 1 and width % 2) or (height > 1 and height % 2) or rgba[3::4].count(255) != width * height:
         return nw, nh, _resample_box(width, height, rgba, nw, nh)
     row_bytes = width * 4
     out_row_bytes = nw * 4
@@ -993,7 +1000,7 @@ def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
 
 
 def downscale_rgba(width: int, height: int, rgba: bytes, max_size: int) -> tuple[int, int, bytes]:
-    """Repeatedly halve RGBA8 via a full-image box filter until max(w, h) <= max_size."""
+    """Halve straight-alpha RGBA8 with an alpha-weighted box filter until max(w, h) <= max_size."""
     if width <= 0 or height <= 0:
         raise DdsError(f"Invalid image dimensions: {width}x{height}")
     expected = width * height * 4
