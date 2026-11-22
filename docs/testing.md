@@ -90,7 +90,8 @@ WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/wind
 ```
 
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
-`make_game.py --runtime-build runtime/build/windows` takes this folder like a Windows build. CMake packages are
+`make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
+runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are
 looked up only inside the SDK folder, so a Windows SDL3 for the GameInput shim is passed as `-DSDL3_DIR=<its
 cmake folder>` (`CMAKE_PREFIX_PATH` is not searched here).
 

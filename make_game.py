@@ -18,14 +18,15 @@ Stages, in order (each skips work that is already done, so a stopped build conti
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
-    runtime   build the loader (needs the game's executable to run, not to build). Off Windows, or to skip the
-              build, --runtime-build DIR takes a Windows build of runtime/ instead (the runtime-windows artifact of
-              the Runtime workflow, or your own) and, off Windows, writes gta6rt.sh to start it with Wine
+    runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
+              clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh starts it with Wine; --runtime-build DIR
+              takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
     pipelines create every translated shader on your GPU's driver (and every compute pipeline), report anything
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
 """
 import argparse
 import functools
+import glob
 import hashlib
 import json
 import os
@@ -43,7 +44,9 @@ from mc_command import mc_command  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
-WINDOWS_ONLY = ("runtime",)   # off Windows only with --runtime-build
+WINDOWS_ONLY = ("runtime",)   # off Windows: the clang-cl + xwin cross-build, or --runtime-build
+CROSS_TOOLS = ("clang-cl", "lld-link", "llvm-lib", "llvm-rc", "llvm-mt")
+XWIN_DEFAULT = os.path.join("~", ".local", "share", "xwin-sdk")
 RUNTIME_FILES = ("gta6rt.exe", "gta6rt_tls_host.dll")
 # Archives scanned for models and texture dictionaries, small to large.
 MODEL_ARCHIVES = [
@@ -77,11 +80,11 @@ def below_normal() -> None:
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)
 
 
-def run(args: list, **kw) -> None:
+def run(args: list, hint: str = "", **kw) -> None:
     log("  " + " ".join(os.path.basename(str(a)) if i == 0 else str(a) for i, a in enumerate(args)))
     r = subprocess.run([str(a) for a in args], **kw)
     if r.returncode != 0:
-        fail(f"{os.path.basename(str(args[0]))} exited with {r.returncode}")
+        fail(f"{os.path.basename(str(args[0]))} exited with {r.returncode}" + (f". {hint}" if hint else ""))
 
 
 def py(tool: str, *args) -> None:
@@ -277,14 +280,8 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
-              emulate: bool = False, keep_emulated: bool = False) -> None:
+              emulate: bool = False, keep_emulated: bool = False, jobs: int = 1) -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
-    if os.name != "nt" and not runtime_build:
-        asked = [s for s in stages if s in WINDOWS_ONLY]
-        if asked:
-            fail(f"The {', '.join(asked)} stage builds on Windows only for now. Pass --runtime-build with a Windows "
-                 "build of runtime/ (README.md, \"Running the loader on Linux\"), or leave it out of --stages; "
-                 "without --stages it is left out on this system.")
     if "runtime" in stages and runtime_build:
         absent = [n for n in RUNTIME_FILES if not os.path.isfile(os.path.join(runtime_build, n))]
         if absent:
@@ -309,14 +306,21 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
                            "https://dotnet.microsoft.com/download/dotnet/8.0")
         ensure_submodule()
-    if "runtime" in stages and not runtime_build and not visual_cpp_tools_ok():
+    if os.name == "nt" and "runtime" in stages and not runtime_build and not visual_cpp_tools_ok():
         missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+    if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
+        missing.extend(f"{s} (for the runtime stage, or pass --runtime-build)" for s in cross_build_missing())
     # The pipelines stage needs a checker the runtime stage builds (on Windows only with VULKAN_SDK set).
     # Without this check a build with shaders and pipelines spends hours before failing at the very end.
     if "pipelines" in stages and not pipeline_check_exe():
-        runtime_building = "runtime" in stages and os.name == "nt" and not runtime_build
-        if not runtime_building or not os.environ.get("VULKAN_SDK"):
-            missing.append(pipeline_check_prerequisite(runtime_building))
+        if os.name != "nt":
+            if not shutil.which("cmake"):
+                missing.append("CMake 3.24 or newer, a C++20 compiler and the Vulkan headers, to build "
+                               "vk_pipeline_check for the pipelines stage")
+        else:
+            runtime_building = "runtime" in stages and not runtime_build
+            if not runtime_building or not os.environ.get("VULKAN_SDK"):
+                missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
@@ -334,6 +338,14 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if free_gb < need_gb:
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work.")
+    if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
+        cross_configure()
+    if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
+        build_pipeline_check(jobs)
+        if not pipeline_check_exe():
+            fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
+                 "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
+                 "runtime/build/linux and run the build again.")
 
 
 def visual_cpp_tools_ok() -> bool:
@@ -349,6 +361,41 @@ def visual_cpp_tools_ok() -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def xwin_dir() -> "str | None":
+    """The xwin /winsysroot splat for the cross-build: XWIN_DIR, else the folder docs/testing.md uses."""
+    d = os.path.expanduser(os.environ.get("XWIN_DIR") or XWIN_DEFAULT)
+    sdk = glob.glob(os.path.join(glob.escape(d), "Windows Kits", "10", "Lib", "*", "um", "x64"))
+    return d if os.path.isdir(os.path.join(d, "VC", "Tools", "MSVC")) and sdk else None
+
+
+def clang_cl_major() -> "int | None":
+    try:
+        r = subprocess.run(["clang-cl", "--version"], capture_output=True, text=True, errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"clang version (\d+)", r.stdout)
+    return int(m.group(1)) if m else None
+
+
+def cross_build_missing() -> list:
+    """What the clang-cl + xwin cross-build of runtime/ (runtime/cmake/clang-cl-xwin.cmake) lacks here."""
+    missing = []
+    if not shutil.which("cmake"):
+        missing.append("CMake 3.24 or newer")
+    absent = [t for t in CROSS_TOOLS if not shutil.which(t)]
+    if absent:
+        missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm)")
+    else:
+        major = clang_cl_major()
+        if major is not None and major < 19:
+            missing.append(f"clang-cl 19 or newer (this one is {major}; the MSVC STL from xwin rejects older Clang)")
+    if not xwin_dir():
+        missing.append("an xwin splat made with `xwin splat --use-winsysroot-style --preserve-ms-arch-notation` "
+                       "(VC/Tools/MSVC and Windows Kits/10/Lib/<version>/um/x64) in XWIN_DIR or "
+                       "~/.local/share/xwin-sdk, see docs/testing.md, \"The Windows runtime on Linux\"")
+    return missing
 
 
 def dotnet_sdk_ok() -> bool:
@@ -838,12 +885,53 @@ exec "${WINE:-wine}" "$here/gta6rt.exe" "$@"
 """
 
 
-def runtime(game: str, out: str, v: dict, runtime_build: str | None = None) -> None:
+def cmake_configure(build: str, *config: str, hint: str = "") -> None:
+    """Configure runtime/ in build; the generator and build type are chosen only for a new build folder."""
+    fresh = [] if os.path.isfile(os.path.join(build, "CMakeCache.txt")) else [
+        *(["-G", "Ninja"] if shutil.which("ninja") else []), "-DCMAKE_BUILD_TYPE=RelWithDebInfo"]
+    run(["cmake", "-S", os.path.join(ROOT, "runtime"), "-B", build, *fresh, *config], hint=hint)
+
+
+def cmake_build(build: str, targets: list, jobs: int, hint: str) -> None:
+    run(["cmake", "--build", build, "--parallel", str(jobs), "--target", *targets], hint=hint)
+
+
+def cross_configure() -> str:
+    xwin = xwin_dir()
+    if not xwin:
+        fail("runtime: no xwin SDK in XWIN_DIR or ~/.local/share/xwin-sdk (docs/testing.md, "
+             "\"The Windows runtime on Linux\"), and no --runtime-build.")
+    build = os.path.join(ROOT, "runtime", "build", "windows")
+    cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
+                    f"-DXWIN_DIR={xwin}", hint="CMake's error above says what the cross-build lacks "
+                    "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
+                    "runtime from --stages (the default without it: check,shaders,assets,pipelines).")
+    return build
+
+
+def cross_build_runtime(jobs: int) -> str:
+    log("runtime: cross-building with clang-cl and xwin")
+    build = cross_configure()
+    cmake_build(build, ["gta6rt", "gta6rt_tls_host"], jobs,
+                "See the compiler output above; docs/testing.md has the cross-build's requirements.")
+    return build
+
+
+def build_pipeline_check(jobs: int) -> None:
+    build = os.path.join(ROOT, "runtime", "build", "linux")
+    log("pipelines: building vk_pipeline_check")
+    cmake_configure(build)
+    cmake_build(build, ["vk_pipeline_check"], jobs,
+                "It needs a C++20 compiler and the Vulkan headers (your distribution's Vulkan headers package, "
+                "or VULKAN_SDK); the CMake output above says which is missing.")
+
+
+def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1) -> None:
     if runtime_build:
         log(f"runtime: using the build in {runtime_build}")
         build = runtime_build
     elif os.name != "nt":
-        fail("The runtime builds on Windows only for now: pass --runtime-build with a Windows build of runtime/.")
+        build = cross_build_runtime(jobs)
     else:
         log("runtime: building")
         run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
@@ -924,7 +1012,7 @@ def main() -> int:
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     ap.add_argument("--runtime-build", metavar="DIR",
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
-                         "instead of building it; off Windows the stage needs it and adds gta6rt.sh for Wine")
+                         "instead of building it (off Windows: instead of the clang-cl + xwin cross-build)")
     ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) turns it on unless vulkaninfo shows that "
@@ -982,11 +1070,14 @@ def main() -> int:
             fail("--out and --work must be outside the game folder.")
     runtime_build = os.path.abspath(a.runtime_build) if a.runtime_build else None
     if a.stages is None and os.name != "nt" and not runtime_build:
-        stages = [s for s in stages if s not in WINDOWS_ONLY]
-        log(f"{', '.join(WINDOWS_ONLY)}: left out, it builds on Windows only for now (or pass --runtime-build)")
+        lacking = cross_build_missing()
+        if lacking:
+            stages = [s for s in stages if s not in WINDOWS_ONLY]
+            log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
+                "(or pass --runtime-build)")
     emulate = "shaders" in stages and wave64_emulate(a.wave64_emulate)
     keep_emulated = a.wave64_emulate == "auto"
-    preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated)
+    preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated, jobs=a.jobs)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
@@ -994,7 +1085,7 @@ def main() -> int:
     if "assets" in stages:
         assets(game, work, a.wav, a.jobs)
     if "runtime" in stages:
-        runtime(game, out, v, runtime_build)
+        runtime(game, out, v, runtime_build, a.jobs)
     if "pipelines" in stages:
         pipelines(work, out, a.jobs)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
