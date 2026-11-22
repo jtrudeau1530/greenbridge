@@ -147,14 +147,21 @@ def step(state, ins):
     if "_saveexec_b" in op or "_wrexec_b" in op or op == "s_bfm_b64":
         put(state, a[0], MASK)
     elif op.startswith(COPIES) and len(a) > 1:
-        put(state, a[0], kind(state, a[1]))
+        k = kind(state, a[1])
+        if k is None and op.endswith("b64") and a[0]["k"] == "special" and a[0].get("t") in ("vcc", "vcc_lo") and \
+                a[1]["k"] == "imm":
+            k = MASK
+        put(state, a[0], k)
     elif op.startswith(BITWISE):
         kinds = [kind(state, x) for x in a[1:]]
-        if None in kinds:
-            put(state, a[0], None)
-        else:
-            ms = {k for k in kinds if k in MASK_KINDS}
+        ms = {k for k in kinds if k in MASK_KINDS}
+        if None not in kinds:
             put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else EITHER)
+        elif op.endswith("b64") and (ms or (a[0]["k"] == "special" and a[0].get("t") in ("vcc", "vcc_lo"))) and \
+                all(k is not None or x["k"] == "imm" for k, x in zip(kinds, a[1:])):
+            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK)
+        else:
+            put(state, a[0], None)
     else:
         put(state, a[0], None)
         if ((op.startswith("v_") and "_co_" in op) or op in ("v_mad_u64_u32", "v_mad_i64_i32")) and len(a) > 1:
@@ -174,7 +181,7 @@ def parked(blocks, masks):
     return sorted(found)
 
 
-def analyse(blocks, succ):
+def analyse(blocks, succ, *, include_either=False):
     entry = [None] * len(blocks)                        # None: not reached yet
     if blocks:
         entry[0] = {}
@@ -202,11 +209,13 @@ def analyse(blocks, succ):
             if merged != entry[s]:
                 entry[s] = merged
                 work.append(s)
-    out, writes = {}, set()
+    out, writes, either = {}, set(), {}
     for n, blk in enumerate(blocks):
         state = dict(entry[n] or {})
         for ins in blk:
             out[id(ins)] = {r: k for r, k in state.items() if k in MASK_KINDS}
+            if include_either:
+                either[id(ins)] = {r for r, k in state.items() if k == EITHER}
             if step(state, ins):
                 writes.add(id(ins))
-    return out, writes
+    return (out, writes, either) if include_either else (out, writes)
