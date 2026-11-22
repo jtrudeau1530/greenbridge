@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -250,6 +251,26 @@ int fspx_checks() {
 
 int main() {
     using namespace leonida;
+
+    // Test the shared file reader without passing malformed bytes to a driver.
+    const std::vector<std::uint32_t> header = {0x07230203, 0x00010300, 0, 1, 0};
+    const std::string header_bytes(reinterpret_cast<const char*>(header.data()), header.size() * sizeof(header.front()));
+    {
+        std::istringstream input(header_bytes);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()) == header);
+    }
+    for (const auto& bad : {std::string{}, header_bytes.substr(0, 16), header_bytes + 'x',
+                            std::string("bad!") + header_bytes.substr(4)}) {
+        std::istringstream input(bad);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, input.tellg()).empty());
+    }
+    {
+        std::istringstream input(header_bytes);
+        input.seekg(0, std::ios::end);
+        CHECK(read_spirv_words(input, static_cast<std::streamoff>(header_bytes.size() + 4)).empty());
+    }
 
     CHECK(sha256_hex({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     CHECK(sha256_hex(bytes("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");

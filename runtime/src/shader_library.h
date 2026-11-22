@@ -8,6 +8,8 @@
 // writes into `spirv/index.json`, next to `<name>.spv`. This header needs no Windows, Vulkan or third-party code:
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
+#include "spirv_words.h"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -717,13 +719,8 @@ public:
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
-        std::ifstream file(dir_ + "/" + entry.name + ".spv", std::ios::binary);
-        if (!file) return {};
-        const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        if (bytes.size() < 20 || bytes.size() % 4) return {};
-        std::vector<std::uint32_t> words(bytes.size() / 4);
-        std::memcpy(words.data(), bytes.data(), bytes.size());
-        return words[0] == 0x07230203 ? words : std::vector<std::uint32_t>{};
+        std::ifstream file(dir_ + "/" + entry.name + ".spv", std::ios::binary | std::ios::ate);
+        return read_spirv_words(file, file.tellg());
     }
 
 private:
