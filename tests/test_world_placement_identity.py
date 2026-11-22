@@ -111,10 +111,13 @@ class PlacementIdentityTest(unittest.TestCase):
             self.assertNotIn("parent_map_name", row)
 
     def test_duplicate_pointer_and_unreferenced_row_have_no_authored_index(self):
-        rows = self.export(make_map([(0, 0, -1)] * 2, [entity_ref(0), entity_ref(0)]))
-        self.assertEqual([r["position"][0] for r in rows], [10, 11])
-        for row in rows:
+        pointers = [entity_ref(0), entity_ref(0), entity_ref(2)]
+        rows = self.export(make_map([(0, 0, -1)] * 3, pointers))
+        self.assertEqual([r["position"][0] for r in rows], [10, 11, 12])
+        for row in rows[:2]:
             self.assertNotIn("entity_index", row)
+            self.assertNotIn("parent_map_name", row)
+        self.assertEqual(rows[2]["entity_index"], 2)
 
     def test_cross_map_join_selects_the_authored_parent_from_combined_export(self):
         child = make_map([(1, 2, -1)], [entity_ref(0)])
@@ -142,7 +145,8 @@ class PlacementIdentityTest(unittest.TestCase):
                 rows = self.export(blob)
                 self.assertEqual([r["position"][0] for r in rows], [10, 11])
                 field = "entity_index" if damaged == "pointer block" else "parent_map_name"
-                self.assertNotIn(field, rows[1])
+                for row in rows:
+                    self.assertNotIn(field, row)
 
 
 if __name__ == "__main__":
