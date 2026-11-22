@@ -470,8 +470,10 @@ class TestBuildForIndex(unittest.TestCase):
             self.assertEqual(len(commands), 4)
             for asm, spv, assemble, validate in zip((asm_a, asm_b), built, commands[::2], commands[1::2], strict=True):
                 staged = Path(assemble[-1])
-                self.assertEqual(assemble, ["spirv-as", "--target-env", "vulkan1.2", asm, "-o", str(staged)])
+                staged_asm = staged.with_suffix(".spvasm")
+                self.assertEqual(assemble, ["spirv-as", "--target-env", "vulkan1.2", str(staged_asm), "-o", str(staged)])
                 self.assertEqual(validate, ["spirv-val", "--target-env", "vulkan1.2", str(staged)])
+                self.assertTrue(Path(asm).is_file())
                 self.assertEqual(staged.name, Path(spv).name)
                 self.assertEqual(staged.parent.parent, Path(tmp))
                 self.assertFalse(staged.parent.exists())
@@ -496,8 +498,10 @@ class TestBuildForIndex(unittest.TestCase):
             self.assertEqual(built, [spv])
             assemble, validate = [call.args[0] for call in run_mock.call_args_list]
             staged = Path(assemble[-1])
-            self.assertEqual(assemble, ["spirv-as", "--target-env", "vulkan1.2", asm, "-o", str(staged)])
+            staged_asm = staged.with_suffix(".spvasm")
+            self.assertEqual(assemble, ["spirv-as", "--target-env", "vulkan1.2", str(staged_asm), "-o", str(staged)])
             self.assertEqual(validate, ["spirv-val", "--target-env", "vulkan1.2", str(staged)])
+            self.assertTrue(Path(asm).is_file())
             self.assertEqual(staged.name, Path(spv).name)
             self.assertEqual(staged.parent.parent, Path(tmp))
             self.assertEqual(Path(spv).read_bytes(), b"synthetic binary")
@@ -541,13 +545,15 @@ class TestBuildForIndex(unittest.TestCase):
             self.assertEqual(run_mock.call_count, 2)
 
     @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs SPIRV-Tools")
-    def test_invalid_rebuild_preserves_the_validated_binary(self) -> None:
+    def test_invalid_rebuild_preserves_the_validated_pair(self) -> None:
         index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
         with tempfile.TemporaryDirectory() as tmp:
             self._write_index(tmp, index)
             built, = bary_fallback_gs.build_for_index(tmp)
             published = Path(built)
+            published_asm = published.with_suffix(".spvasm")
             original = published.read_bytes()
+            original_asm = published_asm.read_bytes()
             valid = bary_fallback_gs.gs_spvasm([0], 1)
             invalid = valid.replace("OpStore %out_bary %bary0", "OpStore %out_bary %f1")
             self.assertNotEqual(invalid, valid)
@@ -555,7 +561,12 @@ class TestBuildForIndex(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "spirv-val failed"):
                     bary_fallback_gs.build_for_index(tmp)
             self.assertEqual(published.read_bytes(), original)
+            self.assertEqual(published_asm.read_bytes(), original_asm)
             subprocess.run(["spirv-val", "--target-env", "vulkan1.2", published], check=True)
+            with tempfile.TemporaryDirectory() as verification:
+                reassembled = Path(verification) / published.name
+                subprocess.run(["spirv-as", "--target-env", "vulkan1.2", published_asm, "-o", reassembled], check=True)
+                self.assertEqual(reassembled.read_bytes(), original)
             self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ps_a.bary_gs.spv", "ps_a.bary_gs.spvasm"])
 
     def test_missing_spirv_binaries_raise_file_not_found(self):
