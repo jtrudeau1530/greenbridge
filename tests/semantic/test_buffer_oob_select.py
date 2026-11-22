@@ -1253,5 +1253,182 @@ class TestBufferOobSimdMultiLane(unittest.TestCase):
                 self.assertEqual(got, want, f"Offset {off} yielded {got} instead of {want}")
 
 
+class TestBufferOobStrideNegativeAndControls(unittest.TestCase):
+    """Tests for stride wrapping, negative offsets, and negative controls."""
+
+    def translate_helper(self, lines):
+        return support.translate_lines(
+            "cs_oob_stride_neg_t",
+            ["v_cmpx_eq_u32_e32 0, v0", *lines, "s_endpgm"],
+            fssm=tv.CS_BOUNDS_FSSM,
+        )
+
+    def run_spv_helper(self, spv):
+        memory = tv.ReadLog({BASE + k: tv._pattern_word(k) for k in range(-4, 0x80)})
+        support.run_fragment(
+            spv,
+            inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x100, OUT_V] + [0] * 28,
+            memory=memory,
+        )
+        return memory
+
+    def test_stride_zero_behavior_across_all_modes(self):
+        # Mode 0 with stride 0: any dword access is out of bounds (off + 4 <= 0 is impossible)
+        desc_m0 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=0, num_records=16, oob_select=0)
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m0, k=0, idx=0, off=0))
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m0, k=0, idx=None, off=0))
+
+        # Mode 1 with stride 0: checks idx < num_records, ignoring stride
+        desc_m1 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=0, num_records=16, oob_select=1)
+        self.assertTrue(BufferOobOracle.check_dword_bounds(desc_m1, k=0, idx=5, off=64))
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m1, k=0, idx=16, off=0))
+
+        # Mode 2 with stride 0: checks num_records != 0 only
+        desc_m2 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=0, num_records=16, oob_select=2)
+        self.assertTrue(BufferOobOracle.check_dword_bounds(desc_m2, k=0, idx=100, off=1024))
+
+        # Mode 3 with stride 0: raw byte addressing bounded by num_records
+        desc_m3 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=0, num_records=16, oob_select=3)
+        self.assertTrue(BufferOobOracle.check_dword_bounds(desc_m3, k=0, off=12))
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m3, k=0, off=13))
+
+    def test_stride_14bit_mask_and_boundary(self):
+        # Stride is 14 bits (0..16383)
+        max_stride = 0x3FFF  # 16383
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=BASE,
+            stride=max_stride,
+            num_records=4,
+            oob_select=0,
+        )
+        self.assertEqual(desc.stride, 16383)
+        # Exactly fits: 16379 + 4 = 16383 <= 16383
+        self.assertTrue(BufferOobOracle.check_dword_bounds(desc, k=0, idx=0, off=16379))
+        # 1-byte overflow: 16380 + 4 = 16384 > 16383
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc, k=0, idx=0, off=16380))
+
+    def test_stride_wrapping_partial_vector_loads(self):
+        # Stride 16, num_records 4. Multi-dword loads wrapping past stride
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=BASE,
+            stride=16,
+            num_records=4,
+            oob_select=0,
+        )
+        mem = {BASE + 4 * k: 0x1000 + k for k in range(16)}
+
+        # off 8: dword 0 (8..12), dword 1 (12..16) fit; dwords 2, 3 wrap past stride
+        loaded_8 = BufferOobOracle.load_dwords(desc, num_dwords=4, idx=0, off=8, memory=mem)
+        self.assertEqual(loaded_8, [0x1002, 0x1003, 0, 0])
+
+        # off 12: dword 0 (12..16) fits; dwords 1..3 wrap past stride
+        loaded_12 = BufferOobOracle.load_dwords(desc, num_dwords=4, idx=0, off=12, memory=mem)
+        self.assertEqual(loaded_12, [0x1003, 0, 0, 0])
+
+        # off 14: unaligned start straddling stride edge: 14 + 4 = 18 > 16 -> OOB
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc, k=0, idx=0, off=14))
+
+    def test_negative_voffset_32bit_wrap(self):
+        # A negative 32-bit voffset (e.g. -4 = 0xFFFFFFFC) wraps to high 32-bit address space
+        # In Mode 0: off = 0xFFFFFFFC; 0xFFFFFFFC + 4 = 0x100000000 (overflow) > stride -> OOB
+        desc_m0 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=16, num_records=4, oob_select=0)
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m0, k=0, idx=0, off=0xFFFFFFFC))
+
+        # In Mode 3: offs = 0xFFFFFFFC > num_records -> OOB
+        desc_m3 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=0, num_records=32, oob_select=3)
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m3, k=0, off=0xFFFFFFFC))
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m3, k=0, off=0xFFFFFFF0))
+
+        # Verify in translated SPIR-V for Mode 3 RAW with negative voffset
+        lines = [
+            f"s_mov_b32 s4, {BASE:#x}",
+            "s_mov_b32 s5, 0",
+            "s_mov_b32 s6, 32",
+            "s_mov_b32 s7, 0x31016FAC",  # Mode 3 RAW
+            "v_mov_b32 v1, -4",          # negative voffset (0xFFFFFFFC)
+            "buffer_load_dword v2, v1, s[4:7], 0 offen",
+            "s_waitcnt vmcnt(0)",
+            "buffer_store_dword v2, off, s[0:3], 0",
+        ]
+        spv = self.translate_helper(lines)
+        memory = self.run_spv_helper(spv)
+        self.assertEqual(dict.get(memory, 0, 0), 0)
+
+    def test_negative_soffset_participation_by_mode(self):
+        # Mode 0: soffset does not participate in the bounds check off = voff + inst_offset
+        # A negative soffset (e.g. -4) does not invalidate an in-bounds off=0
+        desc_m0 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=16, num_records=4, oob_select=0)
+        self.assertTrue(BufferOobOracle.check_dword_bounds(desc_m0, k=0, idx=0, off=0, soffset=0xFFFFFFFC))
+
+        # Mode 3: soffset participates in offs = voff + inst_offset + soffset
+        # A negative soffset that wraps into high 32 bits exceeds num_records and is rejected
+        desc_m3 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=0, num_records=32, oob_select=3)
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m3, k=0, off=0, soffset=0xFFFFFFFC))
+
+    def test_negative_controls_zero_num_records(self):
+        # When num_records == 0, ALL modes must reject loads and stores
+        for mode in range(4):
+            with self.subTest(mode=mode):
+                desc = BufferResourceDescriptor.from_fields(base_address=BASE, stride=16, num_records=0, oob_select=mode)
+                self.assertFalse(BufferOobOracle.check_dword_bounds(desc, k=0, idx=0, off=0))
+                # Load returns 0
+                loaded = BufferOobOracle.load_dwords(desc, num_dwords=1, idx=0, off=0)
+                self.assertEqual(loaded, [0])
+                # Store writes nothing
+                mem = {}
+                written = BufferOobOracle.store_dwords(desc, [0x12345678], idx=0, off=0, memory=mem)
+                self.assertEqual(written, [])
+                self.assertEqual(mem, {})
+
+    def test_negative_controls_mesa_gfx10_vs_rdna2_hardware(self):
+        # Discriminative tests documented in docs/buffer_bounds.md where Mesa GFX10 rule fails on RDNA2:
+        # Case 1: Raw buffer with N = 3, read at offset 0
+        # Mesa GFX10 column (offset >= N): 0 >= 3 is False -> would allow load (WRONG)
+        # RDNA2 GFX11 column (offset + 4 > N): 0 + 4 = 4 > 3 is True -> OUT OF BOUNDS (CORRECT)
+        desc_raw_3 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=0, num_records=3, oob_select=3)
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_raw_3, k=0, off=0))
+
+        # Case 2: Structured buffer with stride 10, inst_offset 8
+        # Mesa GFX10 column (offset >= stride): 8 >= 10 is False -> would allow load (WRONG)
+        # RDNA2 GFX11 column (off + 4 > stride): 8 + 4 = 12 > 10 is True -> OUT OF BOUNDS (CORRECT)
+        desc_str_10 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=10, num_records=4, oob_select=0)
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_str_10, k=0, idx=0, off=0, inst_offset=8))
+
+        # Case 3: Raw read with soffset 8, offset 8, N = 18
+        # Mesa GFX11 without soffset (offset + 4 > N): 8 + 4 = 12 <= 18 -> would allow load (WRONG)
+        # RDNA2 measured hardware rule (offset + soffset + 4 > N): 8 + 8 + 4 = 20 > 18 -> OUT OF BOUNDS (CORRECT)
+        desc_raw_18 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=0, num_records=18, oob_select=3)
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_raw_18, k=0, off=8, soffset=8))
+
+        # End-to-end translation verification for Case 1 (num_records = 3, offset 0 -> must return 0)
+        lines = [
+            f"s_mov_b32 s4, {BASE:#x}",
+            "s_mov_b32 s5, 0",
+            "s_mov_b32 s6, 3",           # num_records = 3
+            "s_mov_b32 s7, 0x31016FAC",  # Mode 3 RAW
+            "buffer_load_dword v2, off, s[4:7], 0",
+            "s_waitcnt vmcnt(0)",
+            "buffer_store_dword v2, off, s[0:3], 0",
+        ]
+        spv = self.translate_helper(lines)
+        memory = self.run_spv_helper(spv)
+        self.assertEqual(dict.get(memory, 0, 0), 0)
+
+    def test_negative_controls_out_of_range_indices(self):
+        # In Mode 0 and Mode 1: idx == num_records must be rejected
+        desc_m0 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=16, num_records=4, oob_select=0)
+        desc_m1 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=16, num_records=4, oob_select=1)
+
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m0, k=0, idx=4, off=0))
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m0, k=0, idx=5, off=0))
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m1, k=0, idx=4, off=0))
+        self.assertFalse(BufferOobOracle.check_dword_bounds(desc_m1, k=0, idx=10, off=0))
+
+        # Mode 3 RAW: index is NOT part of bounds check (it is part of address only)
+        desc_m3 = BufferResourceDescriptor.from_fields(base_address=BASE, stride=16, num_records=32, oob_select=3)
+        self.assertTrue(BufferOobOracle.check_dword_bounds(desc_m3, k=0, idx=100, off=0))
+
+
 if __name__ == "__main__":
     unittest.main()
