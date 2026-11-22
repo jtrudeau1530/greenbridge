@@ -346,6 +346,36 @@ class RttiScanCoreTest(unittest.TestCase):
             data = json.load(f)
         self.assertEqual(data["type_descriptors"], 1)
 
+    def test_report_must_not_overwrite_the_input_image(self):
+        image = os.path.join(self.tmp.name, "source.exe")
+        original = make_synthetic_pe(text_bytes=b"\xc3", rdata_bytes=b".?AVSample@@\x00")
+        hardlink = os.path.join(self.tmp.name, "source-link.exe")
+
+        for label, output in [
+            ("identical", image),
+            ("alternate spelling", os.path.join(self.tmp.name, ".", "source.exe")),
+            ("hard link", hardlink),
+        ]:
+            with self.subTest(label):
+                with open(image, "wb") as f:
+                    f.write(original)
+                if os.path.exists(hardlink):
+                    os.remove(hardlink)
+                os.link(image, hardlink)
+                p = self.run_tool(image, "--out", output)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("output must not overwrite the source image", p.stderr)
+                with open(image, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+        distinct = os.path.join(self.tmp.name, "report.json")
+        p = self.run_tool(image, "--out", distinct)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(image, "rb") as f:
+            self.assertEqual(f.read(), original)
+        with open(distinct, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["image"], image)
+
     def test_output_it_cannot_write_is_one_line(self):
         img_path = os.path.join(self.tmp.name, "unwritable.exe")
         with open(img_path, "wb") as f:
