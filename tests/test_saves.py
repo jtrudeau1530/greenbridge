@@ -248,6 +248,21 @@ class ImportTest(unittest.TestCase):
                 quiet(saves.import_saves, [story, prof, "--out", out, "--force",
                                            "--map", "SLOT3=Same/blob", "--map", "Player=same/BLOB"])
 
+    def test_folder_with_two_payloads_is_refused(self):
+        # A folder holding a save and an older backup with the same signature must not import either silently.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "ambiguous")
+            jsav, _, _ = make_jsav()
+            write(os.path.join(folder, "slot1"), jsav)
+            write(os.path.join(folder, "slot1.bak"), jsav)
+            out = os.path.join(tmp, "o")
+            with self.assertRaises(SystemExit) as cm:
+                quiet(saves.import_saves, [folder, "--out", out, "--dry-run"])
+            msg = str(cm.exception)
+            self.assertIn("slot1", msg)
+            self.assertIn("slot1.bak", msg)
+            self.assertFalse(os.path.exists(out))
+
     def test_folder_without_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty")

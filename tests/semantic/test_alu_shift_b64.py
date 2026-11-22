@@ -65,18 +65,28 @@ def tearDownModule():
         _TMP_DIR = None
 
 
+# exp writes float channels, and a word that is a signalling-NaN pattern can come back quieted (bit 22 set): some
+# platforms do that in the float round trip, and GPUs may too. So v[0:1] leaves as four 16-bit halves, each ORed
+# into 0x40000000 (a normal float, never a NaN or a denormal), and is put back together here.
+EXPORT_HALVES = ["v_and_b32 v5, 0xffff, v0", "v_lshrrev_b32 v6, 16, v0", "v_and_b32 v7, 0xffff, v1",
+                 "v_lshrrev_b32 v8, 16, v1", "v_or_b32 v5, 0x40000000, v5", "v_or_b32 v6, 0x40000000, v6",
+                 "v_or_b32 v7, 0x40000000, v7", "v_or_b32 v8, 0x40000000, v8"]
+
+
 def run_lines(lines) -> int:
-    """Run the lines, export v[0:1], return the pair as one 64-bit value."""
+    """Run the lines, export v[0:1] in 16-bit halves, return the pair as one 64-bit value."""
     if _TMP_DIR is None:
         setUpModule()
-    asm = "; test_shift_b64\n" + "".join(f"\t{ln}\n" for ln in lines) + "\texp mrt0 v0, v1, v0, v0 done vm\n\ts_endpgm\n"
+    body = list(lines) + EXPORT_HALVES
+    asm = "; test_shift_b64\n" + "".join(f"\t{ln}\n" for ln in body) + "\texp mrt0 v5, v6, v7, v8 done vm\n\ts_endpgm\n"
     with open(_SRC_PATH, "w", encoding="utf-8") as f:
         f.write(asm)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
         spv = rdna2spirv.translate(_SRC_PATH)
     w = si.run_fragment(spv)["%out_mrt0"]
-    return w[0] | w[1] << 32
+    assert all(x >> 16 == 0x4000 for x in w), [hex(x) for x in w]
+    return sum((x & 0xFFFF) << (16 * i) for i, x in enumerate(w))
 
 
 def run_op(op: str, n: int, x: int) -> int:
@@ -85,6 +95,11 @@ def run_op(op: str, n: int, x: int) -> int:
 
 
 class ShiftB64Tests(unittest.TestCase):
+    def test_signalling_nan_word_survives_the_export(self):
+        # 0xffffffffffa3a095: the low word is a signalling-NaN pattern (review on #454).
+        x = 0xFFFFFFFFFFA3A095
+        self.assertEqual(run_lines([f"v_mov_b32 v0, {x & 0xFFFFFFFF:#x}", f"v_mov_b32 v1, {x >> 32:#x}"]), x)
+
     def test_reference(self):
         self.assertEqual(OPS["v_lshrrev_b64"](32, 1 << 63), 0x80000000)
         self.assertEqual(OPS["v_ashrrev_i64"](32, 1 << 63), 0xFFFFFFFF80000000)

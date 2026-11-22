@@ -14,6 +14,9 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_pk_ashrrev_i16
   v_add_nc_u16          D.lo = (S0.lo + S1.lo) & 0xffff; the VOP3 form keeps D's high half (carry is dropped).
   v_sin_f16/v_cos_f16   input is a number of turns: sin/cos(S * 2*pi), rounded to binary16; high half kept.
+  v_add/sub/mul_f16,    low halves in, D.lo out, D's high half kept; neg/abs in the VOP3 form apply to the low
+  v_fmac_f16              half that is read. v_fmac_f16: D.lo = S0.lo * S1.lo + D.lo. The ps_f16_vop2 words were
+                          measured on an RX 6800 (gfx1030), wave32 and wave64 (see its .asm header).
   s_buffer_load_dwordx2 with destination vcc: dword 0 -> vcc_lo, dword 1 -> vcc_hi.
   v_interp_mov_f32      reads the flat (provoking-vertex) input attribute; the translator must declare it Flat.
   v_perm_b32            byte i = BYTE_PERMUTE({S0, S1}, S2 byte i) over 8 bytes, S1 = bytes 0-3: selector 0-7 picks
@@ -49,6 +52,7 @@ EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
 EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
 EXPECTED_OPS8 = [0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
+EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
 EXPECTED_SCC_MINMAX = [0x00030205, 0x00030207, 0x00030209, 0x00030203]
 EXPECTED_FMA_LITERAL = [0x41B80000, 0x41800000, 0x40E00000, 0x41A40000]
@@ -192,6 +196,12 @@ def reference_fma_literal():
             _f32_bits(4.0 * k2 + 5.0), _f32_bits(4.0 * 5.0 + k2)]     # madmk, madak
 
 
+def reference_f16_vop2():
+    a, b, acc = _unhalf(0x3E00), _unhalf(0x3800), _unhalf(0x3C00)       # low halves: 1.5, 0.5, accumulator 1.0
+    return [0xAAAA0000 | _half(a + b), 0xAAAA0000 | _half(-a - abs(b)), 0xAAAA0000 | _half(a * b),
+            0x42000000 | _half(a * b + acc)]
+
+
 def reference_vcc_x2():
     return [0x11223344, 0x55667788, 0, 0]
 
@@ -275,6 +285,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_ops7(), EXPECTED_OPS7)
         self.assertEqual(reference_ops8(), EXPECTED_OPS8)
         self.assertEqual(reference_vcc_x2(), EXPECTED_VCC_X2)
+        self.assertEqual(reference_f16_vop2(), EXPECTED_F16_VOP2)
         self.assertEqual(reference_flat(), EXPECTED_FLAT)
         self.assertEqual(reference_scc_minmax(), EXPECTED_SCC_MINMAX)
         self.assertEqual(reference_fma_literal(), EXPECTED_FMA_LITERAL)
@@ -326,6 +337,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # fmamk/madmk multiply S0 by the literal and add vsrc1; fmaak/madak multiply S0 by vsrc1 and add the
         # literal. Swapping K and vsrc1 changes every word (16 and 20.5 instead of 23 and 7, and back).
         self.check("ps_fma_literal", EXPECTED_FMA_LITERAL)
+
+    def test_f16_vop2_partial_writes(self):
+        # Low halves in (the high halves hold other values), low half out, the destination's high half kept;
+        # v_fmac_f16 accumulates into the low half of its destination.
+        self.check("ps_f16_vop2", EXPECTED_F16_VOP2)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.

@@ -156,13 +156,18 @@ private:
     // Called with mutex_ held (from prepare). Views live until their image is removed.
     VkImageView view(const ResourceBinding& r, const VkImageSubresourceRange& range) {
         const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer,
-                                         range.layerCount);
+                                         range.layerCount, r.format);
         if (const auto it = views_.find(key); it != views_.end()) return it->second;
         VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         info.image = r.image;
         info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         info.format = r.format;
         info.subresourceRange = range;
+        // Reinterpreted RTVs need only color-attachment usage. Inheriting STORAGE usage from the resource
+        // would incorrectly require it from an sRGB view, even though this view is never used as storage.
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (r.rgba8_typeless) info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
         views_[key] = view;
@@ -175,7 +180,7 @@ private:
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     LayoutTracker tracker_;
-    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
+    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     ReplayFunctions replay_;
 };
