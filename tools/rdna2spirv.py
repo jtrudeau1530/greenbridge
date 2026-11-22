@@ -1234,13 +1234,12 @@ class Gen:
     # GFX10 buffer formats (from Mesa src/amd/registers/gfx10-rsrc.json, GFX10_FORMAT):
     #   code: (bytes, kind, component bit widths from bit 0)
     # The names list the widths from the top bit down, so 2_10_10_10 (50) is R10G10B10A2.
-    # A 32-bit SINT component holds the same bits as UINT (no conversion, nothing to clamp at full width), so the
-    # *_SINT codes 21/63/73/76 share the raw-dword "u32" path with their UINT twins 20/62/72/75.
+    # Full-width SINT and UINT preserve the same raw dwords. Keep separate kinds for signed D16 conversion.
     FORMATS = {22: (4, "f32", (32,)), 64: (8, "f32", (32, 32)), 74: (12, "f32", (32, 32, 32)),
                77: (16, "f32", (32, 32, 32, 32)), 20: (4, "u32", (32,)), 62: (8, "u32", (32, 32)),
                72: (12, "u32", (32, 32, 32)), 75: (16, "u32", (32, 32, 32, 32)),
-               21: (4, "u32", (32,)), 63: (8, "u32", (32, 32)), 73: (12, "u32", (32, 32, 32)),
-               76: (16, "u32", (32, 32, 32, 32)), 13: (2, "f16", (16,)), 29: (4, "f16", (16, 16)),
+               21: (4, "i32", (32,)), 63: (8, "i32", (32, 32)), 73: (12, "i32", (32, 32, 32)),
+               76: (16, "i32", (32, 32, 32, 32)), 13: (2, "f16", (16,)), 29: (4, "f16", (16, 16)),
                71: (8, "f16", (16, 16, 16, 16)), 1: (1, "unorm", (8,)), 14: (2, "unorm", (8, 8)),
                56: (4, "unorm", (8, 8, 8, 8)), 57: (4, "snorm", (8, 8, 8, 8)), 60: (4, "uint", (8, 8, 8, 8)),
                7: (2, "unorm", (16,)), 23: (4, "unorm", (16, 16)), 24: (4, "snorm", (16, 16)),
@@ -1251,14 +1250,14 @@ class Gen:
 
     def encode_format(self, fcomps, icomps, code):
         """Encode one element of format `code` -> list of uint ids (whole dwords; elements under 4 bytes return one
-        value in the low bits). fcomps are f32 bit patterns (float/normalized kinds), icomps integers (u32/uint)."""
+        value in the low bits). fcomps are f32 bit patterns (float/normalized kinds), icomps integer bit patterns (u32/i32/uint)."""
         try:
             size, kind, widths = self.FORMATS[code]
         except KeyError:
             raise Unsupported(f"format {code} (not in FORMATS)")
         if kind == "f32":
             return list(fcomps[:len(widths)])
-        if kind == "u32":
+        if kind in ("u32", "i32"):
             return list(icomps[:len(widths)])
         words = [self.cu(0)] * max(1, (size + 3) // 4)
         bit = 0
@@ -1347,7 +1346,7 @@ class Gen:
         return result
 
     def decode_format(self, words, code, *, fixed: bool = False):
-        """Decode one element of format `code` from raw dwords -> 4 uint ids holding f32 bits (or uint for *_UINT/uint).
+        """Decode one element of format `code` from raw dwords -> 4 uint ids holding f32 or integer bits.
 
         Missing channels repeat the format's own (component c = c mod n): measured on RX 6700 for SHADER-86.
         UNORM/SNORM give the correctly rounded quotient, as the RX 6700 does, built with integer ops (norm_bits):
@@ -1356,7 +1355,7 @@ class Gen:
             size, kind, widths = self.FORMATS[code]
         except KeyError:
             raise Unsupported(f"format {code} (not in FORMATS)")
-        if kind in ("f32", "u32"):
+        if kind in ("f32", "u32", "i32"):
             n = len(widths)
             vals = list(words[:n])
             while len(vals) < 4:
@@ -1612,13 +1611,17 @@ class Gen:
         else:
             comps = self.format_decode_call(fmt, words)
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
-        is_int_fmt = "%false"
+        is_int_fmt, is_signed = "%false", "%false"
         for code_v, (_, kind, _) in self.FORMATS.items():
-            if kind in ("u32", "uint"):
+            if kind in ("u32", "i32", "uint"):
                 e, o = self.tmp(), self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
                 self.emit(f"{o} = OpLogicalOr %bool {is_int_fmt} {e}")
                 is_int_fmt = o
+                if d16 and kind == "i32":
+                    signed = self.tmp()
+                    self.emit(f"{signed} = OpLogicalOr %bool {is_signed} {e}")
+                    is_signed = signed
         dst1 = self.tmp()
         self.emit(f"{dst1} = OpSelect %uint {is_int_fmt} {self.cu(1)} {self.cu(0x3F800000)}")
         outs = []
@@ -1638,33 +1641,32 @@ class Gen:
             else:
                 self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, rb)
         if d16:
-            # d16: two 16-bit results per register (x | y << 16, z | w << 16): f16 for float/normalized formats,
-            # saturating unsigned conversion for integer formats (FORMATS kinds u32/uint).
-            is_int = "%false"
-            for code_v, (_, kind, _) in self.FORMATS.items():
-                if kind in ("u32", "uint"):
-                    e, o = self.tmp(), self.tmp()
-                    self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
-                    self.emit(f"{o} = OpLogicalOr %bool {is_int} {e}")
-                    is_int = o
+            # D16 packs two results per register, saturating integer formats according to signedness.
+            def int_half(word):
+                unsigned = self.saturate_int16(word, signed=False)
+                signed = self.saturate_int16(word, signed=True)
+                half = self.tmp()
+                self.emit(f"{half} = OpSelect %uint {is_signed} {signed} {unsigned}")
+                return half
+
             for i in range(0, len(outs), 2):
                 dest = {"k": "vgpr", "r": vd["r"] + i // 2, "n": 1}
                 lo = outs[i]
-                il = self.saturate_int16(lo, signed=False)
+                il = int_half(lo)
                 r = self.tmp()
                 if i + 1 == len(outs):
                     # For d16_x and d16_xyz the unaddressed high half keeps its previous bits.
                     fl = self.f16_bits(self.tof(lo))
-                    self.emit(f"{r} = OpSelect %uint {is_int} {il} {fl}")
+                    self.emit(f"{r} = OpSelect %uint {is_int_fmt} {il} {fl}")
                     self.write_lo16(dest, r)
                     continue
                 hi = outs[i + 1]
                 ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))
                 ih, pi = self.tmp(), self.tmp()
-                high_half = self.saturate_int16(hi, signed=False)
+                high_half = int_half(hi)
                 self.emit(f"{ih} = OpShiftLeftLogical %uint {high_half} {self.cu(16)}")
                 self.emit(f"{pi} = OpBitwiseOr %uint {il} {ih}")
-                self.emit(f"{r} = OpSelect %uint {is_int} {pi} {ph}")
+                self.emit(f"{r} = OpSelect %uint {is_int_fmt} {pi} {ph}")
                 self.dst(dest, r)
 
     def global_mem(self, op, a, mods):
@@ -2129,6 +2131,13 @@ class Gen:
             self.emit(f"{red} = OpSelect %uint {bgra} {unorm_rgba[2]} {unorm_rgba[0]}")
             self.emit(f"{blue} = OpSelect %uint {bgra} {unorm_rgba[0]} {unorm_rgba[2]}")
             unorm_view = [red, unorm_rgba[1], blue, unorm_rgba[3]]
+            signed_ic = ic
+            if d16:
+                signed_ic = []
+                for component in ic[:n]:
+                    extended = self.tmp()
+                    self.emit(f"{extended} = OpBitFieldSExtract %int {self.as_int(component)} {self.cu(0)} {self.cu(16)}")
+                    signed_ic.append(self.tou(extended))
             for code, (size, kind, widths) in self.FORMATS.items():
                 e = self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
@@ -2141,7 +2150,8 @@ class Gen:
                 fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 if code in (50, 56):
                     fcs = unorm_view
-                ics = ic[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
+                integer_source = signed_ic if kind == "i32" else ic
+                ics = integer_source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
                 if size >= 4:
                     for k, w in enumerate(words[:size // 4]):

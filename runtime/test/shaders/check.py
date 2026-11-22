@@ -156,6 +156,22 @@ CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
+# cs_fmt_sint32.asm: hand-derived full-width and D16 load results, inputs, stores, and untouched words.
+FMT_SINT32_WORDS = [
+    0x80000000, 0x7FFFFFFF, 0x80000000, 1,
+    0x80000000, 0x7FFFFFFF, 0xFFFFFFFD, 0x80000000,
+    0x80000000, 0x7FFFFFFF, 0xFFFFFFFD, 17,
+    0x80000000, 0x7FFFFFFF, 0, 0,
+    0x80000000, 0x7FFFFFFF, 0xFFFFFFFD, 0,
+    0x80000000, 0x7FFFFFFF, 0xFFFFFFFD, 17,
+    0x7FFF8000, 0x0011FFFD, 0x7FFF8000, 0x0011FFFD,
+    0xFFFFFFFD, 0xFFFFFFFD, 0xEEEEEEEE, 0xEEEEEEEE,
+    0x80000000, 0x7FFFFFFF, 0xFFFFFFFD, 17,
+    0x80000000, 0x7FFFFFFF, 0xEEEEEEEE, 0xEEEEEEEE,
+    0x80000000, 0x7FFFFFFF, 0xFFFFFFFD, 0xEEEEEEEE,
+    0x80000000, 0x7FFFFFFF, 0xFFFFFFFD, 17,
+    0xFFFFFFFD, 0xFFFF8000, 0xFFFFFFFD, *[0xEEEEEEEE] * 13,
+]
 # cs_fmt_xy_xyz.asm (TEST-185): 12 xy/xyz loads, then the 9 store regions read back, as a Radeon 680M (gfx1035) gives
 # them natively, with the updated UINT saturation case checked on gfx1036. Layout and rules in the .asm header.
 FMT_XY_XYZ_WORDS = [
@@ -417,6 +433,10 @@ def dump_test(tools, spirv, name, want, words, env=None):
 def fmt_1010102_test(tools, spirv, env=None):
     """Check both packed stores and the untouched tail of a single group's 64 words."""
     return dump_test(tools, spirv, "cs_fmt_1010102", FMT_1010102_WORDS + [0xEEEEEEEE] * 48, 64, env)
+
+
+def fmt_sint32_test(tools, spirv, env=None):
+    return dump_test(tools, spirv, "cs_fmt_sint32", FMT_SINT32_WORDS, len(FMT_SINT32_WORDS), env)
 
 
 def fmt_xy_xyz_test(tools, spirv, env=None):
@@ -1157,6 +1177,7 @@ def main():
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
+    results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
