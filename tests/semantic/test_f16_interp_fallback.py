@@ -183,18 +183,25 @@ class FallbackStagePair(unittest.TestCase):
               "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"]
         pixel, pixel_meta = translate("ps_budget", ps)
         self.assertEqual(pixel_meta["f16_halves"], {"0": [28, 29]})
-        for fits, exports, expected in (
-                (True, ["exp param27 v2, v2, v2, v2"], (2.0, 3.0)),
-                (False, ["exp param28 v2, v2, v2, v2", "exp param29 v3, v3, v3, v3"], (5.0, 7.0))):
-            with self.subTest(halves_fit=fits):
+        for exports, expected in (
+                (["exp param27 v2, v2, v2, v2"], (2.0, 3.0)),
+                (["exp param28 v2, v2, v2, v2"], (5.0, None)),
+                (["exp param28 v2, v2, v2, v2", "exp param29 v3, v3, v3, v3"], (5.0, 7.0))):
+            with self.subTest(exports=exports):
                 vertex, vertex_meta = translate("vs_budget", vs + exports + ["s_endpgm"])
+                fits = expected == (2.0, 3.0)
                 self.assertEqual(vertex_meta.get("f16_halves", {}), pixel_meta["f16_halves"] if fits else {})
                 outputs = run_fragment(vertex)
                 # Link the two translated modules by their emitted SPIR-V Location decorations.
                 locations = {loc: tuple(f32(w) for w in outputs[var]) for var, loc in
                              re.findall(r"OpDecorate (%out_\w+) Location (\d+)", vertex)}
-                inputs = {var: locations[loc] for var, loc in
-                          re.findall(r"OpDecorate (%in_\w+) Location (\d+)", pixel)}
+                pixel_inputs = dict(re.findall(r"OpDecorate (%in_\w+) Location (\d+)", pixel))
+                if expected[1] is None:
+                    # The high-half input is unbound. Check the interface without inventing its value.
+                    self.assertEqual(set(pixel_inputs.values()) - locations.keys(), {"29"})
+                    self.assertEqual(locations[pixel_inputs["%in_f16h0_0"]][0], expected[0])
+                    continue
+                inputs = {var: locations[loc] for var, loc in pixel_inputs.items()}
                 words = support.mrt0_words(pixel, inputs=inputs)
                 actual = tuple(struct.unpack("<e", struct.pack("<H", w & 0xffff))[0] for w in words[:2])
                 self.assertEqual(actual, expected)
