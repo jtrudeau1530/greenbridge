@@ -140,8 +140,10 @@ carved samples:
 - a plain NUL-terminated bone list (896-byte stream), and
 - a front-coded table (2,064 bytes) whose entries are length-prefixed name fragments plus parent indices.
 
-The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. The model manifest available here does
-not expose bone names, so that match is not measured; the animation pages carry no model name next to the bones.
+The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. The animation pages carry no model name next
+to the bones, but a skeleton carries its own names (`joaat32` at bone record `+0x1C`, name at `+0x30`,
+[character_skeleton.md](character_skeleton.md)), so the match is measured: see
+[Bone tables and motion matchers](#bone-tables-and-motion-matchers).
 
 ### Type-hash containers
 
@@ -319,6 +321,21 @@ from 0x0100, the full name list at 0x0750, and a `pack:/...motionmatcher` path a
 All 8 of its +0x10 hashes match joaat32 of full names in its own 0x0750 list. The 2,848-byte stream has a
 14-entry pointer table at 0x0000 (targets in the `0x5005xxxx` range), records at 0x02d0, and two motionmatcher
 paths at 0x0210 and 0x0290; 19 of its 30 names hash-confirm. The 4,272-byte stream has 28 names and 14 hashes.
+
+**Which skeleton (ASSET-231).** `tools/anim_skel_match.py` reads every skeleton `anim_glb.read_skeleton` reads in
+`packs.rpf` (14,212, 199 distinct joint-hash lists) and looks each name up by `joaat32` of its lowercased spelling:
+
+| Stream | Names | Joints of some skeleton | Same spelling as the joint | Skeletons holding all of them |
+|---|---:|---:|---:|---|
+| `0x101a32160` | 28 | 28 | 28 | 2 (the 596- and 560-bone humanoids) |
+| `0x101c379a0` | 28 | 28 | 28 | 2 (596, 560) |
+| `0x101c41d50` | 15 | 15 | 15 | 69 distinct, 124 copies (78 to 596 joints) |
+| `0x101ea66c0` | 30 | 30 | 30 | 2 (596, 560) |
+| union | 30 | 30 | 30 | 2 (596, 560) |
+
+So every bone name in these pages is a joint of the female (596) and male (560) humanoid skeletons that the clip
+dictionaries already bind to ([character_skeleton.md](character_skeleton.md)), under the same name; no other
+skeleton holds the 30. The 15-name table is a subset many smaller rigs share too.
 
 This is a measured **clip → bone-table binding for the four motionmatcher paths**: the path and the bone table
 are in the same stream. It is not a rig → skeleton link for RBF0:
