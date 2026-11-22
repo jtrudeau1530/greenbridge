@@ -18,8 +18,9 @@ checked against the local disassembly. Offsets are bytes into the constant buffe
 - Check the RGB tint at `+0x00`, `+0x04` and `+0x08` first. The shader multiplies the filtered colour by these
   values before export. An all-zero tint makes bloom black even with a valid source. The fourth value at `+0x0C`
   feeds the exported alpha.
-- The sample loop has a limit of 13. The scale at `+0x1C` feeds the luminance-dependent reciprocal weights.
-  Setting it to zero removes that dependence for finite inputs. The spatial filter and output tint still apply.
+- The sample loop has a limit of 13. Its luminance-dependent weight has the form `1 / (1 + k × luminance)`,
+  with scale `k` at `+0x1C`. Setting it to zero removes that dependence for finite inputs. The spatial filter
+  and output tint still apply.
 
 ### Flat, wrong or slowly changing exposure (`PS_CalculateExposure`)
 
@@ -27,13 +28,16 @@ checked against the local disassembly. Offsets are bytes into the constant buffe
   logarithmic exposure from the measured luminance. Check this before diagnosing the automatic exposure path.
 - On the compensation path, a nonzero dword at `+0x40C` selects the fixed value at `+0x408`. Zero selects a
   sample from a 1D compensation curve. Check that the curve is bound when using the texture path.
-- The report also describes adaptation from the previous frame's exposure. For a single-frame comparison, account
-  for the initial exposure and adaptation threshold. This first-frame guidance comes from the issue report.
+- Check the previous-exposure texture when the pass changes slowly. The adaptation code subtracts its sample
+  from the target exposure and can blend back toward the target. It tests `+0x3B0` against zero and compares
+  a value derived from the exposure delta against the threshold at `+0x3B4`. For a single-frame comparison,
+  the issue report suggests seeding the previous exposure with the target.
 
 ### Luminance downsample and bloom upsample
 
-`PS_LuminanceSourceDownsample` has five sampling sites and `PS_UpSampleBloomFilterBlend` has nine. Check the
-source resolution, sampling and reduction before comparing the luminance pyramid with a whole-frame average.
+All five sampling sites in `PS_LuminanceSourceDownsample` contribute to the export. All nine in
+`PS_UpSampleBloomFilterBlend` do too. Check the source resolution, sampling and reduction before comparing
+the luminance pyramid with a whole-frame average.
 When inspecting the upsample in isolation, check in the pipeline state how its output blends with the previous level.
 
 ## Studio-shot lighting (`PS_STUDIOSHOT_PBR_MATERIAL_STANDARD_LIGHTING`)
