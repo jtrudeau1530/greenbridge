@@ -6,9 +6,13 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1 -Dest D:\tools\llvm-mc -NoEnv
+#
+# The default -Dest is outside AppData on purpose: `python` from the Python install manager (the app execution alias
+# in WindowsApps) doesn't see folders that other programs create under %LOCALAPPDATA% or %APPDATA%, so an llvm-mc.exe
+# there looks missing to make_game.py and the tools, although LLVM_MC names it.
 param(
     [string]$Version = "21.1.8",
-    [string]$Dest = (Join-Path $env:LOCALAPPDATA "Leonida\llvm-mc"),
+    [string]$Dest = (Join-Path $env:USERPROFILE ".leonida\llvm-mc"),
     [string]$Temp = (Join-Path $env:TEMP "leonida-llvm-mc"),
     [switch]$NoEnv,   # don't set LLVM_MC for the current user
     [switch]$Keep     # keep the sources and build folder (faster rebuilds)

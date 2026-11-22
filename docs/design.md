@@ -354,9 +354,12 @@ installs it at `/usr/lib/llvm-21/bin/llvm-mc`). The official Windows LLVM build 
 Native: `scripts\build_llvm_mc.ps1` fetches the LLVM sources the tool needs (sparse, shallow), builds `llvm-mc` alone
 with `LLVM_TARGETS_TO_BUILD=AMDGPU`, static CRT and the DIA SDK off (its headers need ATL, which the C++ build tools
 don't always include), checks it disassembles an `s_endpgm` for `gfx1013`, keeps only `llvm-mc.exe` (by default in
-`%LOCALAPPDATA%\Leonida\llvm-mc`) and sets `LLVM_MC` for the user. It needs git, Python and Visual Studio with the C++
+`%USERPROFILE%\.leonida\llvm-mc`) and sets `LLVM_MC` for the user. It needs git, Python and Visual Studio with the C++
 x64 tools, about 2 GB of temporary space and 20-40 minutes. `-Dest`, `-NoEnv`, `-Keep` and `-Version` change the
-defaults.
+defaults. Keep `-Dest` out of AppData: `python` from the Python install manager (the `WindowsApps` alias) doesn't see
+folders that other programs create under `%LOCALAPPDATA%` or `%APPDATA%`, so `make_game.py` reports `llvm-mc` missing
+and the fuzzers stop with `WinError 2`, although `LLVM_MC` names the file; `py`, or the same `python.exe` started by
+its full path, sees it (measured with Python 3.14.7 on Windows 11).
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1

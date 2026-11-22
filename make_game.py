@@ -29,6 +29,7 @@ import functools
 import glob
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -98,6 +99,25 @@ def tool_available(cmd: str) -> bool:
         return True
     head = cmd.split()[0].strip('"') if cmd.split() else ""
     return bool(head and (shutil.which(head) or os.path.isfile(head)))
+
+
+def appdata_hint(cmd: str) -> str:
+    """Why a tool under AppData may look missing on Windows, or "".
+
+    `python` from the Python install manager (the app execution alias in WindowsApps) doesn't see folders that other
+    programs create under %LOCALAPPDATA% or %APPDATA%; `py`, or the same python.exe started by its full path, does.
+    scripts\\build_llvm_mc.ps1 used to install llvm-mc.exe to %LOCALAPPDATA%\\Leonida\\llvm-mc."""
+    if os.name != "nt":
+        return ""
+    path = ntpath.normcase(cmd.strip().strip('"'))
+    for var in ("LOCALAPPDATA", "APPDATA"):
+        base = os.environ.get(var, "").strip()
+        if base and path.startswith(ntpath.normcase(ntpath.join(base, ""))):
+            return (f" LLVM_MC points into %{var}%, which `python` from the Python install manager can't see: copy "
+                    "llvm-mc.exe out of AppData (scripts\\build_llvm_mc.ps1 now installs it to "
+                    "%USERPROFILE%\\.leonida\\llvm-mc), set LLVM_MC to the new path and reopen the terminal, or start "
+                    "make_game.py with `py`.")
+    return ""
 
 
 def need(exe: str, hint: str) -> str:
@@ -292,12 +312,13 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if sys.version_info < (3, 12):
         missing.append("Python 3.12 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
-        if not tool_available(mc_command()[0]):
+        mc = mc_command()[0]
+        if not tool_available(mc):
             missing.append(
                 "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
                 "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
                 "LLVM_MC to the whole command, e.g. "
-                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)")
+                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
