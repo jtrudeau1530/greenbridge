@@ -390,7 +390,7 @@ renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
   camera.getWorldDirection(fwd); right.crossVectors(fwd, up).normalize();
-  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") ? 0.2 : 1);
+  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") || keys.has("ControlRight") ? 0.2 : 1);
   if (keys.has("KeyW")) v.add(fwd); if (keys.has("KeyS")) v.sub(fwd);
   if (keys.has("KeyD")) v.add(right); if (keys.has("KeyA")) v.sub(right);
   if (keys.has("KeyE")) v.y += 1; if (keys.has("KeyQ")) v.y -= 1;

@@ -269,6 +269,62 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
     helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
 });
 
+test('Shift speeds the camera up and Ctrl slows it down, on either side of the keyboard', async () => {
+    class Vector3 {
+        constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
+        set(x, y, z) { return Object.assign(this, { x, y, z }); }
+        fromArray([x, y, z]) { return this.set(x, y, z); }
+        add(v) { return this.set(this.x + v.x, this.y + v.y, this.z + v.z); }
+        sub(v) { return this.set(this.x - v.x, this.y - v.y, this.z - v.z); }
+        addScaledVector(v, s) { return this.set(this.x + v.x * s, this.y + v.y * s, this.z + v.z * s); }
+        crossVectors(a, b) { return this.set(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+        lengthSq() { return this.x * this.x + this.y * this.y + this.z * this.z; }
+        normalize() { const n = Math.sqrt(this.lengthSq()) || 1; return this.set(this.x / n, this.y / n, this.z / n); }
+    }
+    const handlers = new Map();
+    let frame;
+    const camera = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn camera; })()`, {
+        THREE: {
+            WebGLRenderer: class {
+                domElement = { addEventListener() {} };
+                info = { render: { calls: 0, triangles: 0 } };
+                setPixelRatio() {} setSize() {} render() {}
+                setAnimationLoop(callback) { frame = callback; }
+            },
+            Scene: class { add() {} },
+            PerspectiveCamera: class {
+                position = new Vector3();
+                quaternion = { setFromEuler() {} };
+                getWorldDirection(v) { return v.set(0, 0, -1); }
+            },
+            DirectionalLight: class { position = { set() {} }; },
+            Clock: class { getDelta() { return 0.1; } },
+            Color: class {}, Fog: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {}, Euler: class {},
+            Group: class { add() {} },
+            Vector3,
+        },
+        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        addEventListener: (type, handler) => handlers.set(type, handler),
+        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
+        performance: { now: () => 0 },
+        fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
+    });
+    // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.
+    const climb = (...modifiers) => {
+        for (const code of ['KeyE', ...modifiers]) handlers.get('keydown')({ code });
+        const before = camera.position.y;
+        frame();
+        for (const code of ['KeyE', ...modifiers]) handlers.get('keyup')({ code });
+        return camera.position.y - before;
+    };
+    const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} is not ${expected}`);
+    close(climb(), 4);
+    close(climb('ShiftLeft'), 20);
+    close(climb('ShiftRight'), 20);
+    close(climb('ControlLeft'), 0.8);
+    close(climb('ControlRight'), 0.8);
+});
+
 const begin = html.indexOf('// ---------- chunk streaming ----------');
 const end = html.indexOf('// ---------- main loop ----------', begin);
 assert(begin >= 0 && end > begin, 'viewer streaming section must exist');
