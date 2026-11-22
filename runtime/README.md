@@ -135,6 +135,13 @@ Current limits, by design:
   depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
   section 3.2 for what is missing.
 
+- `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
+  (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, and on a
+  DualSense adaptive-trigger effects and the lightbar. Optional and CMake-only: built when an installed SDL3 is found,
+  or with `-DLEONIDA_SDL3_FETCH=ON` to download the pinned release; nothing is downloaded otherwise, and the
+  `scripts/build_runtime.ps1` cl.exe fallback never builds it. See [docs/gameinput.md](../docs/gameinput.md) for the mapping, the `LEONIDA_DS_*` settings and what is
+  unverified.
+
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
 imports are unknown until it is available.
@@ -162,6 +169,11 @@ when the Vulkan SDK is found:
   names and skips modules larger than the limit, which is how the corpus run works around the
   driver's compile time on multi-megabyte ray-tracing shaders. The measured partial pass is in
   [docs/pipeline_check.md](../docs/pipeline_check.md).
+
+`gameinput_test` (only with SDL3; otherwise CTest lists `gameinput` as not run) drives the GameInput shim on SDL virtual joysticks (no controller needed): enumeration, readings
+and the button/axis mapping, rumble and trigger rumble, DualSense effect bytes, a dispatcher, and hot-plug.
+`gameinput_probe [--seconds N] [--rumble]` is the manual check on a real pad: it prints live readings and plays each
+motor and trigger.
 
 `unimplemented_policy_test` builds a small image whose two imports bind to nothing and checks `log`, `fail` and
 `stop` on it: return values, untouched out parameter, xmm0 = 0, environment parsing, and (in a child process) the
