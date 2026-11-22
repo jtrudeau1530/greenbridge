@@ -211,6 +211,15 @@ struct DeviceState {
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
     bool upload_in_vram = false;
+
+    // What D3D12_OPTIONS1 answers with: the physical device's own subgroup facts, read on first use.
+    struct SubgroupFacts {
+        UINT lane_min = 0;
+        UINT lane_max = 0;
+        bool wave_ops = false;
+    };
+    SubgroupFacts subgroups;
+    bool subgroups_read = false;
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
@@ -254,6 +263,33 @@ struct DeviceState {
             create.arrayLayers > limits.maxArrayLayers || !(limits.sampleCounts & create.samples))
             return E_INVALIDARG;
         return S_OK;
+    }
+
+    // D3D12_OPTIONS1's wave facts, from the physical device: which subgroup operations exist and what wave sizes it
+    // can run. Zeros and false when the device cannot be asked, which the query then reports as unsupported.
+    const SubgroupFacts& subgroup_facts() {
+        if (subgroups_read) return subgroups;
+        subgroups_read = true;
+        const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            info.get_instance_proc
+                ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2")
+                : nullptr);
+        if (!properties2 || !info.physical) return subgroups;
+        VkPhysicalDeviceSubgroupSizeControlProperties size_control{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+                                                   &size_control};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
+        properties2(info.physical, &properties);
+        // Every group the wave intrinsics map to, because D3D12 promises them all behind the one bool.
+        constexpr VkSubgroupFeatureFlags kD3D12WaveOps =
+            VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
+            VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+        subgroups.wave_ops = (subgroup.supportedOperations & kD3D12WaveOps) == kD3D12WaveOps;
+        subgroups.lane_min = size_control.minSubgroupSize ? size_control.minSubgroupSize : subgroup.subgroupSize;
+        subgroups.lane_max = size_control.maxSubgroupSize ? size_control.maxSubgroupSize : subgroups.lane_min;
+        if (subgroups.lane_max < subgroups.lane_min) subgroups.lane_max = subgroups.lane_min;
+        return subgroups;
     }
 
     // The format a texture description is created with, D24S8's fallback included.
@@ -2248,6 +2284,20 @@ public:
             *opts = {};
             opts->DynamicDepthBiasSupported = FALSE;
             opts->GPUUploadHeapSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS1: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1*>(data);
+            const DeviceState::SubgroupFacts& facts = state_.subgroup_facts();
+            *opts = {};
+            opts->WaveOps = facts.wave_ops;
+            opts->WaveLaneCountMin = facts.lane_min;
+            opts->WaveLaneCountMax = facts.lane_max;
+            // D3D12 counts every lane of the device here, and Vulkan has no such number. This is one full wave
+            // (section 4.1): a game that sizes work from it plans for less parallelism than the GPU has, not more.
+            opts->TotalLaneCount = facts.lane_max;
+            opts->ExpandedComputeResourceStates = TRUE;  // Vulkan has no resource states to expand
             return S_OK;
         }
         case D3D12_FEATURE_D3D12_OPTIONS17: {

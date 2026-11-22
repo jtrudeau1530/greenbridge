@@ -891,6 +891,15 @@ The trace will enumerate them.
   there, so 1.1 is what the game can rely on everywhere. A higher request is clamped down like the shader model, and
   an undefined value is refused. Measured against the host PC runtime (616.86): 1.0-1.2 echo the request, and a
   wrong `DataSize` is `E_INVALIDARG`; the host crashed on a null buffer, so the test never gives it one.
+- `D3D12_FEATURE_D3D12_OPTIONS1`: answer from the Vulkan device's subgroups. `WaveOps` is true only when every
+  operation group the wave intrinsics map to is present (`BASIC`, `VOTE`, `BALLOT`, `SHUFFLE`, `ARITHMETIC`),
+  because D3D12 promises them all behind that one bool. `WaveLaneCountMin`/`Max` are the subgroup size range
+  (`VkPhysicalDeviceSubgroupSizeControlProperties`, or the single `subgroupSize` without those 1.3 properties).
+  `TotalLaneCount` has no Vulkan equivalent: D3D12 counts every lane of the device, and the layer answers one full
+  wave, so a game that sizes work from it plans for less parallelism than the GPU has, never more. Measured
+  against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
+  and `E_INVALIDARG` for a `DataSize` one field too short or too long. The host crashed the process on a null
+  buffer, so the layer refuses one without asking the host (as with root signatures).
 - `D3D12_OPTIONS` families: report the tier the Vulkan feature set can honour (resource binding tier 3 when
   descriptor indexing and update-after-bind are available), plus wave ops, 16-bit, barycentrics, render passes,
   VRS, mesh shader tier, and RT tier 1.1 only if the layer can honour them. The game may branch on these; a false
