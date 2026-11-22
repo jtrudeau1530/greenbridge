@@ -79,6 +79,9 @@ struct ResourceBinding {
     // (depth24.h) and clears quantise to 24 bits.
     bool depth24_as_float = false;
     bool depth24 = false;  // a D24 family format, native or not: depth clears are quantised to 24 bits first
+    // A D3D12 R32G32B32 texture (12 bytes a texel) held in an R32G32B32A32 image (16): footprints keep D3D12's 12
+    // bytes, and copies between it and a buffer are repacked by the depth24 pass (Depth24Job::rgb96).
+    bool rgb96 = false;
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
 };
@@ -458,6 +461,14 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     }
 }
 
+// The same for a resource as D3D12 lays it out, which for an rgb96 texture is not its image's layout.
+inline constexpr std::uint32_t rgb96_bytes = 12;
+inline BlockFormat copy_block_format(const ResourceBinding& resource, VkImageAspectFlags aspect) {
+    BlockFormat format = block_format(resource.format, aspect);
+    if (resource.rgb96 && format.bytes) format.bytes = rgb96_bytes;
+    return format;
+}
+
 inline bool two_planes(const ResourceBinding& resource) {
     return (resource.aspects & depth_stencil_aspects) == depth_stencil_aspects;
 }
@@ -748,6 +759,9 @@ struct Prepared {
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
     VkImageView resolve_view = VK_NULL_HANDLE;
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
+                               // (or a copy of an rgb96 texture: repacked by the same pass)
+    std::uint32_t rgb96_row_words = 0;    // an rgb96 footprint: words between its rows and between its slices
+    std::uint32_t rgb96_slice_words = 0;
     Depth24Job depth24;                    // the whole copy: where its scratch floats are
     std::vector<Depth24Job> depth24_parts;  // the dispatches that convert it
     std::vector<VkImageSubresourceRange> discards;  // DiscardResource: the subresources to discard
@@ -1041,7 +1055,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
             !copy_subresource(p.source, copy.src.subresource, src))
             return ReplayResult::invalid_subresource;
         if (dst.aspectMask != src.aspectMask || p.binding.volume != p.source.volume ||
-            p.binding.samples != p.source.samples)
+            p.binding.samples != p.source.samples || p.binding.rgb96 != p.source.rgb96)
             return ReplayResult::invalid_copy;
         const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
         const auto from_depth = std::max(1u, p.source.depth >> src.baseMipLevel);
@@ -1122,8 +1136,10 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     VkImageSubresourceRange range{};
     if (!copy_subresource(image, texture.subresource, range)) return ReplayResult::invalid_subresource;
     if (image.samples != 1) return ReplayResult::invalid_copy;  // multisampled textures have no footprint
-    const BlockFormat format = block_format(image.format, range.aspectMask);
-    if (!format.bytes || placed.row_pitch % format.bytes) return ReplayResult::unsupported;
+    const BlockFormat format = copy_block_format(image, range.aspectMask);
+    // A 12-byte texel does not divide D3D12's 256-byte pitches; an rgb96 copy hands Vulkan the scratch buffer of
+    // the repack, never this pitch, and the pass reads the footprint in words.
+    if (!format.bytes || placed.row_pitch % (image.rgb96 ? 4 : format.bytes)) return ReplayResult::unsupported;
     const VkExtent2D mip = mip_extent(image, range.baseMipLevel);
     const auto mip_depth = std::max(1u, image.depth >> range.baseMipLevel);
     // The box is in the source's coordinates: the footprint for an upload, the texture for a readback.
@@ -1153,7 +1169,9 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
                           std::uint64_t(placed_x / format.block) * format.bytes;
     if (!within(slice_start, in_slice, buffer.size)) return ReplayResult::invalid_copy;
     const auto offset = slice_start + in_slice;
-    const std::uint32_t alignment = (range.aspectMask & depth_stencil_aspects) ? 4 : format.bytes;
+    // Vulkan wants a buffer offset that is a multiple of the texel size (VUID-vkCmdCopyBufferToImage-dstImage-07975),
+    // which D3D12's 512-byte placement does not give a 12-byte texel: one more reason an rgb96 copy is repacked.
+    const std::uint32_t alignment = (range.aspectMask & depth_stencil_aspects) || image.rgb96 ? 4 : format.bytes;
     if (offset % alignment) return ReplayResult::unsupported;
     const std::uint64_t rows = (std::uint64_t(h) + format.block - 1) / format.block;
     const std::uint64_t row_bytes = (std::uint64_t(w) + format.block - 1) / format.block * format.bytes;
@@ -1168,6 +1186,13 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
     region.imageOffset = {std::int32_t(texture_x), std::int32_t(texture_y), std::int32_t(texture_z)};
     region.imageExtent = {w, h, depth};
+    if (image.rgb96) {  // the repack's scratch replaces this buffer in the copy; these are for the pass
+        if (placed.row_pitch / 4 > UINT32_MAX || slice_pitch / 4 > UINT32_MAX) return ReplayResult::unsupported;
+        p.rgb96_row_words = std::uint32_t(placed.row_pitch / 4);
+        p.rgb96_slice_words = std::uint32_t(slice_pitch / 4);
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+    }
     p.buffer_image_copies.push_back(region);
     (upload ? p.range : p.source_range) = range;
     return ReplayResult::success;
@@ -1192,6 +1217,7 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     if (!dst.image || !src.image || !same_shape ||
         dst.depth != src.depth || dst.volume != src.volume || dst.mip_levels != src.mip_levels ||
         dst.array_layers != src.array_layers || dst.aspects != src.aspects || dst.samples != src.samples ||
+        dst.rgb96 != src.rgb96 ||
         block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
         return ReplayResult::invalid_copy;
     for (const VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
@@ -1632,6 +1658,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.slices = region.imageExtent.depth;
                     job.app_row_words = region.bufferRowLength ? region.bufferRowLength : job.width;
                     job.app_slice_words = job.app_row_words * (region.bufferImageHeight ? region.bufferImageHeight : job.height);
+                    if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
+                    p.has_depth24 = true;
+                } else if (result == ReplayResult::success && image.rgb96 && !p.buffer_image_copies.empty()) {
+                    // A footprint of a 96-bit texture: 12-byte texels, 16 in the image. The same pass and scratch.
+                    const VkBufferImageCopy& region = p.buffer_image_copies[0];
+                    const ResourceBinding& buffer = upload ? p.source : p.binding;
+                    Depth24Job& job = p.depth24;
+                    job.rgb96 = true;
+                    job.to_float = upload;
+                    job.app = buffer.buffer;
+                    job.app_offset = region.bufferOffset;
+                    job.app_size = buffer.size;
+                    job.width = region.imageExtent.width;
+                    job.height = region.imageExtent.height;
+                    job.slices = region.imageExtent.depth;
+                    job.app_row_words = p.rgb96_row_words;
+                    job.app_slice_words = p.rgb96_slice_words;
                     if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
                 }

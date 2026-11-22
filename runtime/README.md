@@ -252,6 +252,19 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 .\runtime\build\RelWithDebInfo\d3d12_typeless_rtv_test.exe
 ```
 
+### 96-bit R32G32B32 textures (D3D-62)
+
+`d3d12_rgb96_test` compares footprints, uploads, readbacks, boxes, texture-to-texture copies and CPU copies of
+`R32G32B32_FLOAT/UINT/SINT/TYPELESS` textures (2D arrays with mips, and volumes) with Windows WARP, bit for bit,
+and prints how long an upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
+is registered in CTest (`d3d12_rgb96`).
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_rgb96_test.exe
+```
+
 RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.
 
 ### Resource descriptions

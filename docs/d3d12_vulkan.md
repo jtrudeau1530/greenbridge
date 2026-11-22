@@ -1210,6 +1210,29 @@ The trace will enumerate them.
   texture a barrier has moved, a default-heap texture, which D3D12 does not allow but the layer copies and logs) is
   a `CopyTextureRegion` from or to a host-visible staging buffer, replayed on the device's queue and waited for, so
   the layout tracker and a first use's zero fill behave exactly as for the application's own copies.
+- 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
+  (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
+  no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places
+  subresources at multiples of 512 bytes and Vulkan requires a copy's buffer offset to be a multiple of the
+  12-byte texel (VUID-vkCmdCopyBufferToImage-dstImage-07975). What the application sees stays D3D12's:
+  `GetCopyableFootprints` gives 12-byte texels (compared with WARP in `d3d12_rgb96_test`), and a view's T# names
+  `GFX10_FORMAT_32_32_32_*`, whose swizzle reads alpha as one, so the image's fourth channel is never read.
+  - `CopyTextureRegion` between a texture and a buffer is repacked by the D24 compute pass
+    (`src/depth24_convert.comp` modes 2 and 3, `Depth24Job::rgb96`): the same scratch buffers, parts and lifetime,
+    with texels of three words in the footprint and four in the scratch, copied as they are (an upload writes the
+    fourth word as 0). The words are not interpreted, so NaN payloads, denormals and integers pass unchanged. On
+    an RX 9070 XT (AMD 26.11.2) an upload and a readback take 4.4 and 0.7 ms at 1024x1024 and 18 and 35 ms at
+    4096x4096 (`d3d12_rgb96_test`; single runs, each the first submission of a new queue).
+  - Texture-to-texture copies and `CopyResource` are plain image copies, and only between two 96-bit textures.
+  - `WriteToSubresource`/`ReadFromSubresource` always take the staged copy, as a D24 texture stored as D32 does:
+    a host image copy would not repack.
+  - Not done: render targets. WARP creates 96-bit render targets; this layer refuses `ALLOW_RENDER_TARGET` and
+    leaves `RENDER_TARGET` out of `FORMAT_SUPPORT`, since a writable fourth channel changes destination-alpha
+    blending. `ALLOW_UNORDERED_ACCESS` and `ALLOW_DEPTH_STENCIL` are refused, as on WARP (measured in the test).
+    `GetResourceAllocationInfo` gives no size for a description creation refuses. A typed 96-bit texture has
+    views of its own format only; the `TYPELESS` one has `FLOAT`, `UINT` and `SINT` views (sampled in
+    `d3d12_descriptor_test`). `GetResourceTiling` reports nothing for a 96-bit texture: the tile shape of a
+    12-byte texel is not measured.
 - Resource flags map to Vulkan usage: `ALLOW_RENDER_TARGET` → `COLOR_ATTACHMENT`, `ALLOW_DEPTH_STENCIL` →
   `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
   sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;
