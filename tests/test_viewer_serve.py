@@ -374,6 +374,33 @@ class PortArgumentTest(unittest.TestCase):
         self.assertIn("viewer: stopped", out)
         self.assertNotIn("Traceback", err)
 
+    def test_ctrl_c_right_after_the_serving_line_still_stops_the_viewer(self):
+        """The test above sends SIGINT as soon as it reads the serving line. When the signal was handled before main()
+        was inside its try, the KeyboardInterrupt escaped (exit -2, a traceback): 24 of 300 runs with 12 at once
+        under load. Here the interrupt comes from printing that line, every time."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        def print_then_ctrl_c(*args, **kwargs):
+            print(*args, **kwargs)
+            if args and str(args[0]).startswith("viewer: http://127.0.0.1:"):
+                raise KeyboardInterrupt
+
+        out = io.StringIO()
+        world = serve.Handler.world
+        try:
+            with mock.patch.object(sys, "argv", ["serve.py", "--port", "0"]), \
+                    mock.patch.object(serve, "print", print_then_ctrl_c, create=True), \
+                    contextlib.redirect_stdout(out):
+                serve.main()
+        except KeyboardInterrupt:
+            self.fail("a Ctrl+C right after the serving line escaped main()")
+        finally:
+            serve.Handler.world = world
+        self.assertIn("viewer: http://127.0.0.1:", out.getvalue())
+        self.assertIn("viewer: stopped", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
