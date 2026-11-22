@@ -597,5 +597,171 @@ class TestValuDot4IntScalarInterpreter(unittest.TestCase):
         self.assertEqual(interp.rf.vgprs[0], INT32_MAX & MASK32)
 
 
+# ---------------------------------------------------------------------------
+# SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking Model
+# ---------------------------------------------------------------------------
+
+class SIMDWaveState:
+    """Wavefront SIMD execution state supporting Wave32 and Wave64 execution modes."""
+
+    def __init__(self, wave_size: int = 32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave_size {wave_size}; RDNA2 supports only Wave32 and Wave64")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * 106
+
+    def read_operand_for_lane(self, op: ASTOperand, lane: int) -> int:
+        if op.kind == OperandKind.VGPR:
+            if not (0 <= op.reg_num < 256):
+                raise IndexError(f"VGPR index out of bounds: v{op.reg_num}")
+            return self.vgprs[lane][op.reg_num] & MASK32
+        elif op.kind == OperandKind.SGPR:
+            if not (0 <= op.reg_num < 106):
+                raise IndexError(f"SGPR index out of bounds: s{op.reg_num}")
+            return self.sgprs[op.reg_num] & MASK32
+        elif op.kind in (OperandKind.LITERAL, OperandKind.INLINE_INT):
+            return op.literal_value & MASK32
+        raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def write_vgpr_lane(self, lane: int, reg_num: int, val: int) -> None:
+        if not (0 <= reg_num < 256):
+            raise IndexError(f"VGPR index out of bounds: v{reg_num}")
+        self.vgprs[lane][reg_num] = val & MASK32
+
+    def step(self, instr: ASTInstruction) -> None:
+        if instr.dst.kind != OperandKind.VGPR:
+            raise ValueError(f"VALU instruction destination must be a VGPR, got {instr.dst.kind}")
+
+        dst_reg = instr.dst.reg_num
+        for lane in range(self.wave_size):
+            # Check if current lane is active in EXEC mask
+            if not (self.exec_mask & (1 << lane)):
+                continue
+
+            if instr.opcode == Opcode.V_MOV_B32:
+                src_val = self.read_operand_for_lane(instr.src0, lane)
+                self.write_vgpr_lane(lane, dst_reg, src_val)
+                continue
+
+            s0 = self.read_operand_for_lane(instr.src0, lane)
+            s1 = self.read_operand_for_lane(instr.src1, lane)
+            s2 = self.read_operand_for_lane(instr.src2, lane) if instr.src2 is not None else 0
+
+            if instr.opcode == Opcode.V_DOT4_I32_I8:
+                res = ref_dot4_i32_i8(s0, s1, s2, clamp=instr.clamp)
+            elif instr.opcode in (Opcode.V_DOT4_U32_U8, Opcode.V_DOT4ACC_U32_U8):
+                res = ref_dot4_u32_u8(s0, s1, s2, clamp=instr.clamp)
+            else:
+                raise NotImplementedError(f"Unsupported opcode execution: {instr.opcode}")
+
+            self.write_vgpr_lane(lane, dst_reg, res)
+
+    def execute_asm(self, asm_lines: list[str]) -> None:
+        for line in asm_lines:
+            line = line.strip()
+            if not line or line.startswith("//") or line.startswith(";"):
+                continue
+            instr = parse_instruction(line)
+            self.step(instr)
+
+
+class TestValuDot4IntSIMDMultiLane(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking unit tests for v_dot4_int."""
+
+    def test_wave32_uniform_execution(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        s0 = pack_u8(1, 2, 3, 4)
+        s1 = pack_u8(5, 6, 7, 8)
+        # Uniform vector setup across all 32 lanes
+        for lane in range(32):
+            wave.write_vgpr_lane(lane, 1, s0)
+            wave.write_vgpr_lane(lane, 2, s1)
+            wave.write_vgpr_lane(lane, 3, 100)
+
+        wave.execute_asm(["v_dot4_u32_u8 v0, v1, v2, v3"])
+        # All active lanes should have computed 70 + 100 = 170
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], 170)
+
+    def test_wave64_uniform_execution(self) -> None:
+        wave = SIMDWaveState(wave_size=64)
+        s0 = pack_i8(2, 2, 2, 2)
+        s1 = pack_i8(3, 3, 3, 3)
+        for lane in range(64):
+            wave.write_vgpr_lane(lane, 1, s0)
+            wave.write_vgpr_lane(lane, 2, s1)
+            wave.write_vgpr_lane(lane, 3, 0)
+
+        wave.execute_asm(["v_dot4_i32_i8 v0, v1, v2, v3"])
+        for lane in range(64):
+            self.assertEqual(wave.vgprs[lane][0], 24)
+
+    def test_wave32_divergent_alternating_exec_mask(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        # EXEC mask with alternating active lanes (even lanes active, odd inactive)
+        wave.exec_mask = 0x5555_5555
+        s0 = pack_u8(1, 1, 1, 1)
+        s1 = pack_u8(2, 2, 2, 2)
+
+        # Pre-fill destination v0 with sentinel value 0xDEADBEEF
+        for lane in range(32):
+            wave.write_vgpr_lane(lane, 0, 0xDEAD_BEEF)
+            wave.write_vgpr_lane(lane, 1, s0)
+            wave.write_vgpr_lane(lane, 2, s1)
+
+        wave.execute_asm(["v_dot4_u32_u8 v0, v1, v2, 0"])
+        # Active even lanes: 4 * (1 * 2) = 8
+        # Inactive odd lanes: preserved sentinel 0xDEAD_BEEF
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][0], 8, f"Lane {lane} active failed")
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 0xDEAD_BEEF, f"Lane {lane} inactive modified")
+
+    def test_wave64_divergent_high_half_exec_mask(self) -> None:
+        wave = SIMDWaveState(wave_size=64)
+        # Enable only upper 32 lanes: lanes [32..63]
+        wave.exec_mask = 0xFFFF_FFFF_0000_0000
+        for lane in range(64):
+            wave.write_vgpr_lane(lane, 0, 0x1111_1111)
+            wave.write_vgpr_lane(lane, 1, pack_u8(4, 3, 2, 1))
+            wave.write_vgpr_lane(lane, 2, pack_u8(1, 2, 3, 4))
+
+        wave.execute_asm(["v_dot4_u32_u8 v0, v1, v2, 5"])
+        # 4*1 + 3*2 + 2*3 + 1*4 = 4 + 6 + 6 + 4 = 20; 20 + 5 = 25
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], 0x1111_1111)
+        for lane in range(32, 64):
+            self.assertEqual(wave.vgprs[lane][0], 25)
+
+    def test_wave_exec_mask_zero_preservation(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        wave.exec_mask = 0x0000_0000
+        for lane in range(32):
+            wave.write_vgpr_lane(lane, 0, 0x9999_9999)
+            wave.write_vgpr_lane(lane, 1, 0xFFFF_FFFF)
+            wave.write_vgpr_lane(lane, 2, 0xFFFF_FFFF)
+
+        wave.execute_asm(["v_dot4_u32_u8 v0, v1, v2, 0"])
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], 0x9999_9999)
+
+    def test_divergent_per_lane_vector_data(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        # Give each lane distinct inputs based on its lane ID
+        for lane in range(32):
+            wave.write_vgpr_lane(lane, 1, pack_u8(lane, 1, 1, 1))
+            wave.write_vgpr_lane(lane, 2, pack_u8(2, 2, 2, 2))
+            wave.write_vgpr_lane(lane, 3, 10)
+
+        wave.execute_asm(["v_dot4_u32_u8 v0, v1, v2, v3"])
+        for lane in range(32):
+            # (lane * 2) + (1 * 2) + (1 * 2) + (1 * 2) + 10 = 2*lane + 6 + 10 = 2*lane + 16
+            expected = (2 * lane) + 16
+            self.assertEqual(wave.vgprs[lane][0], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
