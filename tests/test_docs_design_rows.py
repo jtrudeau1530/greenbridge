@@ -1,17 +1,19 @@
-"""Each table in docs/design.md names a topic once.
+"""Each table in docs/design.md, docs/README.md and docs/testing.md names a topic once.
 
     python -I tests/test_docs_design_rows.py
 
 The translator contract table is where every new rule is recorded (CONTRIBUTING.md, AGENTS.md). When two branches
 edit the same row and a merge keeps both sides, the table ends up with two rows for one topic, each holding facts the
 other lacks, and a reader who stops at the first one misses the rest. On 2026-11-22 twenty topics appeared two to six
-times. This test fails on a repeated first cell within one table. No game files or build tools.
+times; the docs index and the testing guide's "Known problems" had the same pattern. This test fails on a repeated
+first cell within one table of those pages, where the first cell is the topic (other pages repeat it on purpose, e.g.
+one row per benchmark size). No game files or build tools.
 """
 import os
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DESIGN = os.path.join(ROOT, "docs", "design.md")
+PAGES = ("design.md", "README.md", "testing.md")
 
 
 def repeated_topics(lines):
@@ -48,12 +50,14 @@ class DesignTableRows(unittest.TestCase):
                  "| EXEC | in a code block |", "```"]
         self.assertEqual(repeated_topics(lines), [("EXEC", [3, 5])])
 
-    def test_design_md_names_each_topic_once_per_table(self):
-        with open(DESIGN, encoding="utf-8") as f:
-            lines = f.read().split("\n")
-        repeated = repeated_topics(lines)
-        self.assertEqual(repeated, [], "rows to merge into one (topic, lines): " +
-                         "; ".join(f"{k[:60]!r} at {v}" for k, v in repeated))
+    def test_each_page_names_each_topic_once_per_table(self):
+        for page in PAGES:
+            with self.subTest(page=page):
+                with open(os.path.join(ROOT, "docs", page), encoding="utf-8") as f:
+                    lines = f.read().split("\n")
+                repeated = repeated_topics(lines)
+                self.assertEqual(repeated, [], f"rows to merge into one in docs/{page} (topic, lines): " +
+                                 "; ".join(f"{k[:60]!r} at {v}" for k, v in repeated))
 
 
 if __name__ == "__main__":
