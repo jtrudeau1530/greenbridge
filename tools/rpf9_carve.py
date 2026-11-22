@@ -4,6 +4,11 @@ The data area is mostly zlib streams laid end to end, separated by zero padding.
 every stream that decodes cleanly to the end, and writes each one as <offset>.bin. It also records which byte
 ranges it couldn't read, so coverage is measurable.
 
+index.json holds the summary (totals), `files` (one row per carved stream) and `unread`: one row per gap between
+streams (or after the last one) that is not all zero bytes, with its offset, size and the Shannon entropy in
+bits/byte of its first ENTROPY_SAMPLE bytes (`sampled`). An all-zero gap is padding and only counts toward
+`zero_padding`. The bytes are counted, never decoded.
+
 Usage:
     python -I rpf9_carve.py <archive.rpf> <out_dir> [--start N] [--limit BYTES] [--until-adat] [--index-only]
 
@@ -13,7 +18,9 @@ touching the banks and without a build-specific --limit (docs/audio_config.md). 
 enough: they also occur inside `METADATA` and in compressed data. index.json's summary records the boundary.
 """
 import argparse
+import collections
 import json
+import math
 import mmap
 import os
 import re
@@ -29,6 +36,28 @@ from rsc8_audio import parse_adat_header_bytes  # noqa: E402
 # RPF9 magic as it sits on disk: the tag "RPF9" stored little-endian (docs/rpf.md, docs/bvh.md).
 MAGIC = b"9FPR"
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
+ENTROPY_SAMPLE = 1 << 20   # bytes of an unread range used for its entropy
+GAP_CHUNK = 1 << 20        # a gap is checked this many bytes at a time: one can be gigabytes long
+
+
+def all_zero(buf, a, b, chunk=GAP_CHUNK):
+    """Whether buf[a:b] is all zero bytes, reading at most `chunk` bytes at a time.
+
+    Slicing a whole gap of a multi-gigabyte archive at once ran out of memory (a 20 GB archive in this package).
+    """
+    for p in range(a, b, chunk):
+        piece = buf[p:min(p + chunk, b)]
+        if piece.count(0) != len(piece):
+            return False
+    return True
+
+
+def entropy(sample):
+    """Shannon entropy of a byte string in bits per byte (0.0 for an empty one)."""
+    if not sample:
+        return 0.0
+    n = len(sample)
+    return -sum(c / n * math.log2(c / n) for c in collections.Counter(sample).values())
 
 
 def below_normal():
@@ -123,6 +152,19 @@ def main() -> int:
                 end = boundary
                 print(f"--until-adat: first AWC bank at {boundary:#x}; scanning {pos:#x}..{boundary:#x}", flush=True)
         rows, last, unread, zero = [], pos, 0, 0
+        unread_ranges = []
+
+        def account(a, b):
+            """Count the gap m[a:b] as zero padding, or as an unread range that is also listed."""
+            nonlocal zero, unread
+            if all_zero(m, a, b):
+                zero += b - a
+                return
+            unread += b - a
+            sample = m[a:min(b, a + ENTROPY_SAMPLE)]
+            unread_ranges.append({"off": a, "size": b - a, "entropy": round(entropy(sample), 3),
+                                  "sampled": len(sample)})
+
         t0 = time.time()
         while pos < end:
             mt = ZHDR.search(m, pos, end)
@@ -138,11 +180,7 @@ def main() -> int:
                 if not (64 <= blen <= end - s and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                account(last, s)
                 rows.append({"off": s, "stored": blen, "size": blen, "type": "bink2", "w": w, "h": h,
                              "frames": struct.unpack_from("<I", m, s + 8)[0], "pre": "", "head": m[s:s + 16].hex()})
                 if not a.index_only:
@@ -171,11 +209,7 @@ def main() -> int:
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            gap = m[last:s]
-            if gap.count(0) == len(gap):
-                zero += len(gap)
-            else:
-                unread += len(gap)
+            account(last, s)
             rows.append({"off": s, "stored": used, "size": len(out), "pre": m[max(0, s - 16):s].hex(),
                          "head": out[:16].hex()})
             if not a.index_only:
@@ -185,26 +219,25 @@ def main() -> int:
             if len(rows) % 2000 == 0:
                 done = (pos - (a.start or 0)) / max(1, end - (a.start or 0))
                 print(f"[{done:6.1%}] {len(rows)} files, {time.time() - t0:.0f}s", flush=True)
-        tail = m[last:end]
-        if tail.count(0) == len(tail):
-            zero += len(tail)
-        else:
-            unread += len(tail)
+        account(last, end)
     total = sum(r["stored"] for r in rows)
     bink = sum(r["stored"] for r in rows if r.get("type") == "bink2")
     span = end - base
     summary = {"archive": a.archive, "files": len(rows), "compressed_bytes": total,
                "inflated_bytes": sum(r["size"] for r in rows), "bink2_bytes": bink,
                "bink2_files": sum(1 for r in rows if r.get("type") == "bink2"),
-               "zero_padding": zero, "unread_bytes": unread,
+               "zero_padding": zero, "unread_bytes": unread, "unread_ranges": len(unread_ranges),
                "span": span}
     if a.until_adat:
         summary["first_adat_bank"] = boundary   # None: no bank in the window, the whole window was scanned
     with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "files": rows}, f)
+        json.dump({"summary": summary, "files": rows, "unread": unread_ranges}, f)
     print(json.dumps(summary, indent=1))
     span = max(1, span)   # an empty data area (or --start at the end) has nothing to divide by
     print(f"readable: {total / span:.1%}, zero padding {zero / span:.1%}, unread {unread / span:.1%}")
+    if unread_ranges:
+        print(f"unread: {len(unread_ranges)} range(s), largest {max(r['size'] for r in unread_ranges)} bytes "
+              f"(listed in index.json)")
     return 0
 
 

@@ -179,6 +179,94 @@ class LimitWindowTest(unittest.TestCase):
         self.assertEqual(summary["compressed_bytes"] + summary["zero_padding"] + summary["unread_bytes"],
                          summary["span"])
 
+
+def no_zlib_header(b):
+    """Noise without 0x78, so no byte of it can start a zlib stream the walker would try."""
+    return b.replace(b"\x78", b"\x79")
+
+
+class UnreadRangesTest(unittest.TestCase):
+    """index.json lists every non-zero gap with its offset, size and sampled entropy; zero padding is not listed."""
+
+    def test_ranges_match_the_totals(self):
+        def stream(c):
+            return zlib.compress(c * 3000), "stream"
+        noise = no_zlib_header(noisy(4096, 7))
+        flat = b"\x11" * 300                              # non-zero but uniform: entropy 0
+        mixed = bytes(40) + b"\x22\x33" + bytes(40)       # mostly zero: the whole gap is still unread
+        data = bytearray(b"9FPR" + struct.pack("<I", 0x40) + bytes(0x38))
+        layout = []
+        # A gap is everything between two streams, so each one sits between streams here.
+        for chunk, kind in (stream(b"A"), (bytes(64), "zero"), stream(b"B"), (noise, "unread"), stream(b"C"),
+                            (flat, "unread"), stream(b"D"), (mixed, "unread"), stream(b"E")):
+            layout.append((len(data), len(chunk), kind))
+            data += chunk
+        data += no_zlib_header(noisy(500, 9))             # the tail after the last stream
+        layout.append((len(data) - 500, 500, "unread"))
+        doc = carve(self, bytes(data))
+        expected = [(off, size) for off, size, kind in layout if kind == "unread"]
+        self.assertEqual([(r["off"], r["size"]) for r in doc["unread"]], expected)
+        s = doc["summary"]
+        self.assertEqual(s["unread_ranges"], len(expected))
+        self.assertEqual(sum(r["size"] for r in doc["unread"]), s["unread_bytes"])
+        self.assertEqual(s["zero_padding"], 64)
+        self.assertEqual(s["compressed_bytes"] + s["zero_padding"] + s["unread_bytes"], s["span"])
+        by_off = {r["off"]: r for r in doc["unread"]}
+        self.assertGreater(by_off[expected[0][0]]["entropy"], 7.5)   # 4 KiB of hash output
+        self.assertEqual(by_off[expected[1][0]]["entropy"], 0.0)     # one repeated byte
+        self.assertTrue(all(r["sampled"] == r["size"] for r in doc["unread"]))
+
+    def test_all_zero_gaps_list_nothing(self):
+        a = zlib.compress(b"A" * 3000)
+        data = b"9FPR" + struct.pack("<I", 0x40) + bytes(0x38) + bytes(32) + a + bytes(100)
+        doc = carve(self, data)
+        self.assertEqual(doc["unread"], [])
+        self.assertEqual(doc["summary"]["unread_ranges"], 0)
+        self.assertEqual(doc["summary"]["zero_padding"], 132)
+
+    def test_a_large_range_samples_its_first_mebibyte(self):
+        big = no_zlib_header(noisy((1 << 20) + 4096, 3))
+        data = b"9FPR" + struct.pack("<I", 0x40) + bytes(0x38) + big + zlib.compress(b"D" * 3000)
+        doc = carve(self, data)
+        self.assertEqual(len(doc["unread"]), 1)
+        self.assertEqual(doc["unread"][0]["size"], len(big))
+        self.assertEqual(doc["unread"][0]["sampled"], 1 << 20)
+
+
+def load_carve():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rpf9_carve_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class AllZeroTest(unittest.TestCase):
+    """A gap is checked in chunks, never sliced whole: a whole multi-gigabyte gap ran out of memory."""
+
+    def test_chunked_check_matches_the_whole_slice(self):
+        carve_tool = load_carve()
+        buf = bytes(100) + b"\x01" + bytes(99)
+        for a, b in ((0, 100), (0, 101), (101, 200), (50, 150), (100, 101), (7, 7)):
+            for chunk in (1, 3, 16, 64, 1 << 20):
+                with self.subTest(a=a, b=b, chunk=chunk):
+                    self.assertEqual(carve_tool.all_zero(buf, a, b, chunk), buf[a:b].count(0) == b - a)
+
+    def test_reads_at_most_one_chunk_at_a_time(self):
+        carve_tool = load_carve()
+
+        class Probe(bytes):
+            largest = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    Probe.largest = max(Probe.largest, len(range(*key.indices(len(self)))))
+                return bytes.__getitem__(self, key)
+
+        self.assertTrue(carve_tool.all_zero(Probe(bytes(1000)), 0, 1000, 64))
+        self.assertEqual(Probe.largest, 64)
+
+
 if __name__ == "__main__":
     unittest.main()
 
