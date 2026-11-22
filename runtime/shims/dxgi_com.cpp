@@ -119,6 +119,7 @@ public:
 
     ~SwapChain() {
         unregister_buffers();
+        if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
         if (device_) device_->Release();
         if (parent_) parent_->Release();
@@ -178,7 +179,15 @@ public:
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        return device_ ? device_->QueryInterface(riid, out) : E_NOINTERFACE;
+        if (!device_) return E_NOINTERFACE;
+
+        ID3D12DeviceChild* device_child = nullptr;
+        if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&device_child)))) {
+            const HRESULT hr = device_child->GetDevice(riid, out);
+            device_child->Release();
+            return hr;
+        }
+        return device_->QueryInterface(riid, out);
     }
 
     // IDXGISwapChain
@@ -300,12 +309,30 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override { if (!out) return E_INVALIDARG; *out = hwnd_; return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void** out) override {
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        *out = nullptr;
+        return DXGI_ERROR_INVALID_CALL;
+    }
     HRESULT STDMETHODCALLTYPE Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS*) override {
         return Present(sync, flags);
     }
     BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
-    HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput** out) override {
+        if (!out) return E_INVALIDARG;
+        if (restrict_to_output_) {
+            *out = restrict_to_output_;
+            restrict_to_output_->AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
+    }
+    void set_restrict_to_output(IDXGIOutput* out) {
+        if (restrict_to_output_) restrict_to_output_->Release();
+        restrict_to_output_ = out;
+        if (restrict_to_output_) restrict_to_output_->AddRef();
+    }
     HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA* color) override {
         if (!color) return E_INVALIDARG;
         background_color_ = *color;
@@ -424,6 +451,7 @@ private:
     leonida::VulkanContext& context_;
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
+    IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
@@ -739,7 +767,11 @@ public:
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
-    HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
 
     // IDXGIFactory
     HRESULT STDMETHODCALLTYPE EnumAdapters(UINT index, IDXGIAdapter** out) override {
@@ -756,9 +788,35 @@ public:
         *hwnd = assoc_hwnd_;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE CreateSwapChain(IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**) override {
-        stub("IDXGIFactory::CreateSwapChain");
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE CreateSwapChain(IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) override {
+        if (!out || !device || !desc) return DXGI_ERROR_INVALID_CALL;
+        *out = nullptr;
+        DXGI_SWAP_CHAIN_DESC1 desc1{};
+        desc1.Width = desc->BufferDesc.Width;
+        desc1.Height = desc->BufferDesc.Height;
+        desc1.Format = desc->BufferDesc.Format;
+        desc1.SampleDesc = desc->SampleDesc;
+        desc1.BufferUsage = desc->BufferUsage;
+        desc1.BufferCount = desc->BufferCount;
+        desc1.Scaling = DXGI_SCALING_STRETCH;
+        desc1.SwapEffect = desc->SwapEffect;
+        desc1.Flags = desc->Flags;
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc{};
+        fs_desc.Windowed = desc->Windowed;
+        fs_desc.RefreshRate = desc->BufferDesc.RefreshRate;
+        fs_desc.Scaling = desc->BufferDesc.Scaling;
+        fs_desc.ScanlineOrdering = desc->BufferDesc.ScanlineOrdering;
+        IDXGISwapChain1* sc1 = nullptr;
+        const HRESULT hr = CreateSwapChainForHwnd(device, desc->OutputWindow, &desc1, &fs_desc, nullptr, &sc1);
+        if (SUCCEEDED(hr) && sc1) {
+            *out = static_cast<IDXGISwapChain*>(sc1);
+            if (!desc->Windowed) {
+                // When exclusive fullscreen is unavailable, native DXGI creates the
+                // windowed chain and returns DXGI_STATUS_OCCLUDED.
+                return DXGI_STATUS_OCCLUDED;
+            }
+        }
+        return hr;
     }
     HRESULT STDMETHODCALLTYPE CreateSoftwareAdapter(HMODULE, IDXGIAdapter**) override { return E_NOTIMPL; }
 
@@ -776,7 +834,7 @@ public:
     // IDXGIFactory2
     BOOL STDMETHODCALLTYPE IsWindowedStereoEnabled() override { return FALSE; }
     HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
-                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*,
+                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput* restrict_to_output,
                                                      IDXGISwapChain1** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -786,6 +844,7 @@ public:
         const VkFormat vk_fmt = dxgi_to_vk_format(desc->Format);
         if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
+        if (restrict_to_output) sc->set_restrict_to_output(restrict_to_output);
         if (!sc->init(hwnd, *desc, vk_fmt)) {
             sc->Release();
             return E_FAIL;

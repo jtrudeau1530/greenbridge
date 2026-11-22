@@ -198,6 +198,12 @@ def validate_cases():
             out[name] = {"assemble": True,
                          "valid": bool(rv and rv.returncode == 0),
                          "stderr": ((rv.stderr if rv else "") or "")[:300]}
+    # A broken toolchain can reject everything and still reject the malformed control.
+    compute = out["compute32"]
+    compute["control_ok"] = compute.get("valid") is True
+    if not compute["control_ok"]:
+        compute["error"] = ("compute32 did not assemble and validate: the spirv-as/spirv-val gate did not accept "
+                            "the known-good module, so the other case results are not trustworthy")
     # The control must be rejected: if spirv-as or spirv-val accepts a malformed module, none of the
     # other results say anything about the toolchain gate and the atlas must not be read as a pass.
     control = out.get("broken_negative")
@@ -239,10 +245,11 @@ def main():
         print(f"atlas -> {a.out}")
     else:
         print(text)
-    control = cases.get("broken_negative") if isinstance(cases, dict) else None
-    if isinstance(control, dict) and control.get("error"):
-        print(f"turing_atlas: error: {control['error']}", file=sys.stderr)
-        return 2
+    for name in ("compute32", "broken_negative"):
+        error = cases.get(name, {}).get("error")
+        if error:
+            print(f"turing_atlas: error: {error}", file=sys.stderr)
+            return 2
     return 0
 
 

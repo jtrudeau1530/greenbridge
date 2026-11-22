@@ -147,6 +147,17 @@ function buildTestChunk([cx, cz, size]) {
   }
   geo.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
   geo.computeVertexNormals();
+  // Sample the shared height field on both sides of each border for matching edge normals.
+  const normal = geo.attributes.normal, stride = seg + 1, step = size / seg;
+  for (let i = 0; i < pos.count; i++) {
+    const row = Math.floor(i / stride), column = i % stride;
+    if (row > 0 && row < seg && column > 0 && column < seg) continue;
+    const x = pos.getX(i), z = pos.getZ(i);
+    const nx = height(x - step, z) - height(x + step, z);
+    const nz = height(x, z - step) - height(x, z + step);
+    const length = Math.hypot(nx, 2 * step, nz);
+    normal.setXYZ(i, nx / length, 2 * step / length, nz / length);
+  }
   g.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95 })));
   const box = new THREE.BoxGeometry(1, 1, 1); box.translate(0, 0.5, 0);
   const count = 18, inst = new THREE.InstancedMesh(box, new THREE.MeshStandardMaterial({ color: 0x9aa4b1, roughness: 0.7 }), count);
