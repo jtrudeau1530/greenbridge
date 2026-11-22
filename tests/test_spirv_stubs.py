@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -82,6 +84,39 @@ class SpirvStubsTests(unittest.TestCase):
             flat_decs = [d for d in decs if len(d) == 2 and d[1] == spirv_stubs.DEC_FLAT]
             self.assertEqual(len(flat_decs), len(flat))
             self._maybe_spirv_val(data)
+
+    def test_failed_rebuild_keeps_existing_stub(self):
+        index = {"ps": {"stage": "ps", "inputs": [0, 2]}}
+
+        def interrupted_open(path, mode):
+            with open(path, mode) as partial:
+                partial.write(b"partial")
+            raise OSError("injected write failure")
+
+        failures = (
+            ("write", patch.object(spirv_stubs, "open", interrupted_open, create=True)),
+            ("replace", patch.object(spirv_stubs.os, "replace", side_effect=PermissionError("injected replace failure"))),
+        )
+        for step, failure in failures:
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as tmp:
+                written = spirv_stubs.generate_for_index(tmp, index)
+                target = Path(tmp) / "stubs" / written[0]
+                original = target.read_bytes()
+                self._maybe_spirv_val(original)
+                with failure, self.assertRaisesRegex(OSError, f"injected {step} failure"):
+                    spirv_stubs.generate_for_index(tmp, index)
+                self.assertEqual(target.read_bytes(), original)
+                self.assertEqual(list(target.parent.iterdir()), [target])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file mode")
+    def test_rebuild_preserves_existing_mode(self):
+        index = {"ps": {"stage": "ps", "inputs": [0]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            written = spirv_stubs.generate_for_index(tmp, index)
+            target = Path(tmp) / "stubs" / written[0]
+            target.chmod(0o640)
+            self.assertEqual(spirv_stubs.generate_for_index(tmp, index), written)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
 
     def test_required_stubs_and_deduplication(self):
         index = {

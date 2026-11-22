@@ -13,8 +13,10 @@ unique location set matches every shader with that interface.
 """
 import json
 import os
+import shutil
 import struct
 import sys
+import tempfile
 
 SPIRV_MAGIC = 0x07230203
 SPIRV_VERSION_1_0 = 0x00010000
@@ -237,12 +239,21 @@ def generate_for_index(spirv_dir, index):
     stubs_dir = os.path.join(spirv_dir, "stubs")
     os.makedirs(stubs_dir, exist_ok=True)
     written = []
-    for kind, locs in sorted(needed):
-        fname = stub_name(kind, locs)
-        data = build_vs_stub(locs) if kind == "vs" else build_ps_stub(locs)
-        with open(os.path.join(stubs_dir, fname), "wb") as f:
-            f.write(data)
-        written.append(fname)
+    with tempfile.TemporaryDirectory(prefix=".stubs-", dir=stubs_dir) as staging:
+        for kind, locs in sorted(needed):
+            fname = stub_name(kind, locs)
+            data = build_vs_stub(locs) if kind == "vs" else build_ps_stub(locs)
+            staged = os.path.join(staging, fname)
+            target = os.path.join(stubs_dir, fname)
+            with open(staged, "wb") as f:
+                f.write(data)
+            if os.name == "posix":
+                try:
+                    shutil.copymode(target, staged)
+                except FileNotFoundError:
+                    pass
+            os.replace(staged, target)
+            written.append(fname)
     return written
 
 
