@@ -1,4 +1,4 @@
-"""make_game.py: --jobs reaches vk_pipeline_check in the pipelines stage.
+"""make_game.py: vk_pipeline_check selection and arguments in the pipelines stage.
 
 Standard library only; no GPU, no Vulkan SDK, no game data: the checker is mocked.
 """
@@ -56,6 +56,24 @@ class PipelinesJobsTest(unittest.TestCase):
 
     def test_jobs_on_the_command_line_reach_the_checker(self):
         self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5"))), "5")
+
+    def test_windows_reuses_the_checker_from_the_supplied_runtime_build(self):
+        supplied = os.path.join(self.root, "unpacked runtime")
+        os.makedirs(supplied)
+        checker = os.path.join(supplied, "vk_pipeline_check.exe")
+        for name in (*make_game.RUNTIME_FILES, "vk_pipeline_check.exe"):
+            with open(os.path.join(supplied, name), "wb"):
+                pass
+        argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
+                "--stages", "runtime,pipelines", "--runtime-build", supplied, "--jobs", "3"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch("os.name", "nt"), mock.patch.object(make_game, "below_normal"), \
+                mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
+                mock.patch.object(make_game, "log"), mock.patch.object(make_game, "run") as run:
+            self.assertEqual(make_game.main(), 0)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0][0], checker)
+        self.assertEqual(self.jobs_of(run.call_args.args[0]), "3")
 
     def test_the_default_matches_the_checker_default(self):
         # vk_pipeline_check's own default is half the hardware threads, as is make_game.py's --jobs.

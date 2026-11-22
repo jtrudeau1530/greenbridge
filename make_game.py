@@ -431,7 +431,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         missing.extend(f"{s} (for the runtime stage, or pass --runtime-build)" for s in cross_build_missing())
     # The pipelines stage needs a checker the runtime stage builds (on Windows only with VULKAN_SDK set).
     # Without this check a build with shaders and pipelines spends hours before failing at the very end.
-    if "pipelines" in stages and not pipeline_check_exe():
+    if "pipelines" in stages and not pipeline_check_exe(runtime_build):
         if os.name != "nt":
             if not shutil.which("cmake"):
                 missing.append("CMake 3.24 or newer, a C++20 compiler and the Vulkan headers, to build "
@@ -1441,12 +1441,12 @@ def positive_int(text: str) -> int:
     return value
 
 
-def pipeline_check_exe():
-    """vk_pipeline_check where the build puts it: runtime/build on Windows (scripts/build_runtime.ps1), the CMake
-    build folders of the README and CONTRIBUTING.md elsewhere."""
+def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
+    """Find the checker for this host, using a supplied Windows build before the local Windows build."""
     build = os.path.join(ROOT, "runtime", "build")
     if os.name == "nt":
-        found = [os.path.join(build, "vk_pipeline_check.exe")]
+        windows_builds = (runtime_build, build) if runtime_build else (build,)
+        found = [os.path.join(d, "vk_pipeline_check.exe") for d in windows_builds]
     else:
         found = [os.path.join(build, "linux", "vk_pipeline_check"), os.path.join(build, "vk_pipeline_check")]
     return next((p for p in found if os.path.isfile(p)), None)
@@ -1459,8 +1459,8 @@ def require_translated_shaders(work: str) -> str:
     return spirv
 
 
-def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
-    exe = pipeline_check_exe()
+def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: str | None = None) -> None:
+    exe = pipeline_check_exe(runtime_build)
     if not exe and os.name == "nt":
         fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
     if not exe:
@@ -1580,7 +1580,8 @@ def main() -> int:
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     ap.add_argument("--runtime-build", metavar="DIR",
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
-                         "instead of building it (off Windows: instead of the clang-cl + xwin cross-build)")
+                         "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
+                         "on Windows, also use vk_pipeline_check.exe from DIR if present")
     ap.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto",
                     help="translate wave64 compute and mesh shaders to be exact on any subgroup size (needed on "
                          "32-wide GPUs: NVIDIA, Intel). auto (default) checks GPU subgroup support and prefers "
@@ -1693,7 +1694,7 @@ def main() -> int:
     if "runtime" in stages:
         runtime(game, out, v, runtime_build, a.jobs)
     if "pipelines" in stages:
-        pipelines(work, out, a.jobs)
+        pipelines(work, out, a.jobs, runtime_build=runtime_build)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

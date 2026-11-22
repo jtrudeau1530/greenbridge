@@ -385,9 +385,9 @@ class PipelineCheckExeTest(unittest.TestCase):
         open(p, "w").close()
         return p
 
-    def exe(self, os_name):
+    def exe(self, os_name, runtime_build=None):
         with mock.patch.object(make_game.os, "name", os_name):
-            return make_game.pipeline_check_exe()
+            return make_game.pipeline_check_exe(runtime_build)
 
     def test_linux_prefers_the_readme_build_folder(self):
         self.assertIsNone(self.exe("posix"))
@@ -402,8 +402,18 @@ class PipelineCheckExeTest(unittest.TestCase):
         exe = self.touch("vk_pipeline_check.exe")
         self.assertEqual(self.exe("nt"), exe)
 
+    def test_windows_prefers_supplied_checker_and_falls_back_to_local_build(self):
+        local = self.touch("vk_pipeline_check.exe")
+        with tempfile.TemporaryDirectory() as supplied:
+            self.assertEqual(self.exe("nt", supplied), local)
+            bundled = os.path.join(supplied, "vk_pipeline_check.exe")
+            with open(bundled, "wb"):
+                pass
+            self.assertEqual(self.exe("nt", supplied), bundled)
+
     def test_pipelines_off_windows_runs_the_linux_build(self):
         exe = self.touch("linux", "vk_pipeline_check")
+        self.touch("vk_pipeline_check.exe")
         work = os.path.join(self.tmp.name, "work")
         os.makedirs(os.path.join(work, "shaders", "spirv"))
         open(os.path.join(work, "shaders", "spirv", "index.json"), "w").close()
@@ -411,7 +421,7 @@ class PipelineCheckExeTest(unittest.TestCase):
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch.object(make_game, "log"), \
                 mock.patch.object(make_game, "run", return_value=0) as run:
-            make_game.pipelines(work, out)
+            make_game.pipelines(work, out, runtime_build=self.build)
         self.assertEqual(run.call_args.args[0][0], exe)
 
     def test_pipelines_off_windows_without_the_build_says_how_to_build_it(self):
