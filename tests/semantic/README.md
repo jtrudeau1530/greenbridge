@@ -35,6 +35,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_global_mem_offset.py` runs the address arithmetic `global_load*`/`global_store*` emit (its own small
   evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
   accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.
+- `test_float_nan_fract.py` runs float min/max/min3/max3/med3 with a quiet NaN and `v_fract` next to 1.0 (f32 and
+  f16) with inputs from memory, and the GPU fixtures `ps_fnan_med3` and `ps_fnan_fract`; the expected words were
+  measured on an AMD Radeon RX 6800 (gfx1030). A NaN result is asserted as "a NaN", not by its bits.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
@@ -75,7 +78,9 @@ through a float op lose NaN payloads (Python floats), so expected output words a
 signalling NaN read back through `OpBitcast` comes out quieted. `Fma` is exact: the product and sum are rationals,
 rounded once to binary32. `Exp2`/`Log2`/`Sqrt`/`InverseSqrt` are correctly rounded (Vulkan allows a few ULP), and
 inputs GLSL.std.450 or SPIR-V leave undefined (`Log2` of x <= 0, `OpFDiv` by zero, `FMax` of NaN...) raise
-`UnsupportedConstruct`. The `.asm`
+`UnsupportedConstruct`. `Fract` is
+computed exactly and rounded once to binary32. `NMin`/`NMax` give the other operand for a NaN, and they and
+`FMin`/`FMax`/`FClamp` order -0 below +0 (the order RDNA2 hardware uses). The `.asm`
 sources are written for `llvm-mc -mcpu=gfx1013`; these tests do not assemble them, so assembler syntax is not
 checked here.
 To add a shader: put the `.asm` in `runtime/test/shaders/`, add it to `SHADERS` in `regen_fixtures.py`, regenerate,

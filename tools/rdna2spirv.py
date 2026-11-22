@@ -458,10 +458,17 @@ class Gen:
         self.emit(f"{r} = OpBitwiseOr %uint {a} {sh}")
         return r
 
-    def f16_out(self, d, r, hi=0):
+    def f16_out(self, d, r, hi=0, fract=False):
         """Narrow f32 ``r`` to f16 (round to nearest even, f16_bits) and write it to the low half of ``d``, or to the high half when
-        ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16)."""
+        ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16).
+        ``fract`` (v_fract_f16): a result that rounded up to 1.0 (0x3c00) becomes 0x3bff, the largest f16 below 1,
+        as on hardware (docs/design.md, float min/max/med3 with NaN and v_fract)."""
         lo = self.f16_bits(r)
+        if fract:
+            one, below = self.tmp(), self.tmp()
+            self.emit(f"{one} = OpIEqual %bool {lo} {self.cu(0x3C00)}")
+            self.emit(f"{below} = OpSelect %uint {one} {self.cu(0x3BFF)} {lo}")
+            lo = below
         if not hi:
             self.write_lo16(d, lo)
             return
@@ -2384,6 +2391,54 @@ class Gen:
         self.emit(f"{d} = OpBitcast %double {v2}")
         return d
 
+    def fract_below_one(self, r):
+        """v_fract: a Fract(x) that rounded up to 1.0 (x a tiny negative number) becomes 0x3f7fffff, the largest
+        float below 1, as on hardware. A compare and select, not FMin, so the NaN of fract(+-inf) is kept."""
+        one, below = self.tmp(), self.tmp()
+        self.emit(f"{one} = OpFOrdEqual %bool {r} %f1")
+        self.emit(f"{below} = OpSelect %float {one} {self.tof(self.cu(0x3F7FFFFF))} {r}")
+        return below
+
+    def med3_f(self, vals, srcs, sel=None):
+        """v_med3_f32 / v_med3_f16 on the f32 values ``vals`` of operands ``srcs`` (``sel``: the f16 half each one
+        reads). Without NaN: the median, FClamp(z, NMin(x, y), NMax(x, y)). With a NaN operand the hardware returns
+        min3(x, y, z) with the NaN-ignoring min (docs/design.md). An inline or literal constant that is not a NaN
+        gets no OpIsNan; with no operand left to check there is no select."""
+        x, y, z = vals
+        lo, hi, m = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lo} = OpExtInst %float %glsl NMin {x} {y}")
+        self.emit(f"{hi} = OpExtInst %float %glsl NMax {x} {y}")
+        self.emit(f"{m} = OpExtInst %float %glsl FClamp {z} {lo} {hi}")
+        checks = []
+        for i, (v, s) in enumerate(zip(vals, srcs)):
+            bits = None
+            if s["k"] == "imm":
+                bits = s["v"] & 0xFFFFFFFF
+            elif s["k"] == "fimm":
+                bits = struct.unpack("<I", struct.pack("<f", s["v"]))[0]
+            if bits is not None:
+                if sel is None:
+                    is_nan = (bits & 0x7F800000) == 0x7F800000 and bits & 0x7FFFFF
+                else:
+                    h = (bits >> 16 if sel[i] else bits) & 0xFFFF
+                    is_nan = (h & 0x7C00) == 0x7C00 and h & 0x3FF
+                if not is_nan:
+                    continue
+            c = self.tmp()
+            self.emit(f"{c} = OpIsNan %bool {v}")
+            checks.append(c)
+        if not checks:
+            return m
+        nan = checks[0]
+        for c in checks[1:]:
+            o = self.tmp()
+            self.emit(f"{o} = OpLogicalOr %bool {nan} {c}")
+            nan = o
+        mn, r = self.tmp(), self.tmp()
+        self.emit(f"{mn} = OpExtInst %float %glsl NMin {lo} {z}")
+        self.emit(f"{r} = OpSelect %float {nan} {mn} {m}")
+        return r
+
     # ---- instructions ----
     SDWA_SEL = {"BYTE_0": (0, 8), "BYTE_1": (8, 8), "BYTE_2": (16, 8), "BYTE_3": (24, 8),
                 "WORD_0": (0, 16), "WORD_1": (16, 16), "DWORD": (0, 32)}
@@ -2479,7 +2534,7 @@ class Gen:
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
             x, y, z = (self.src_f(t) for t in a[1:4])
-            f = "FMax" if "max" in op else "FMin"
+            f = "NMax" if "max" in op else "NMin"      # a NaN operand gives the other one (docs/design.md)
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpExtInst %float %glsl {f} {x} {y}")
             self.emit(f"{r} = OpExtInst %float %glsl {f} {m} {z}")
@@ -3543,7 +3598,7 @@ class Gen:
             elif op in ("v_pk_add_f16", "v_pk_mul_f16"):
                 self.emit(f"{r} = {'OpFAdd' if 'add' in op else 'OpFMul'} %v2float {vx} {vy}")
             else:
-                self.emit(f"{r} = OpExtInst %v2float %glsl {'FMax' if 'max' in op else 'FMin'} {vx} {vy}")
+                self.emit(f"{r} = OpExtInst %v2float %glsl {'NMax' if 'max' in op else 'NMin'} {vx} {vy}")
             if "clamp" in mods:
                 c = self.tmp()
                 z2, o2 = self.tmp(), self.tmp()
@@ -3592,10 +3647,7 @@ class Gen:
         elif op == "v_med3_f16":
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
             vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
-            lo_, hi_, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{lo_} = OpExtInst %float %glsl FMin {vals[0]} {vals[1]}")
-            self.emit(f"{hi_} = OpExtInst %float %glsl FMax {vals[0]} {vals[1]}")
-            self.emit(f"{r} = OpExtInst %float %glsl FClamp {vals[2]} {lo_} {hi_}")
+            r = self.med3_f(vals, a[1:4], sel)
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
@@ -3759,8 +3811,12 @@ class Gen:
                 self.emit(f"{r} = OpExtInst %float %glsl {fn} {f}")
             else:
                 self.emit(f"{r} = OpFDiv %float %f1 {f}")
+            if fn == "Fract":
+                r = self.fract_below_one(r)
             r = self.clamp_mods(r, mods)
-            self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
+            # 0x3c00 -> 0x3bff only when 0x3c00 is Fract's own rounding: after mul:2 fract(0.5) is a true 1.0.
+            omod = any(m in ("mul:2", "mul:4", "div:2") for m in mods)
+            self.f16_out(a[0], r, dhi, fract=fn == "Fract" and not omod)  # GFX10: f16 ops keep the other half
         elif op == "v_not_b32":
             x = self.src_u(a[1])
             r = self.tmp()
@@ -3786,7 +3842,7 @@ class Gen:
             if k:
                 self.emit(f"{r} = {k} %float {vals[0]} {vals[1]}")
             else:
-                self.emit(f"{r} = OpExtInst %float %glsl {'FMax' if 'max' in op else 'FMin'} {vals[0]} {vals[1]}")
+                self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if 'max' in op else 'NMin'} {vals[0]} {vals[1]}")
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op.startswith(("v_cmp_", "v_cmpx_")) and op.endswith(("_u64", "_i64")) and op.split("_")[2] in ("eq", "ne", "lg"):
@@ -4481,7 +4537,7 @@ class Gen:
             x, y = self.src_f(a[1]), self.src_f(a[2])
             r = self.tmp()
             if F2[op] in ("max", "min"):
-                self.emit(f"{r} = OpExtInst %float %glsl {'FMax' if F2[op] == 'max' else 'FMin'} {x} {y}")
+                self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if F2[op] == 'max' else 'NMin'} {x} {y}")
             else:
                 self.emit(f"{r} = {F2[op]} %float {x} {y}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
@@ -4499,11 +4555,7 @@ class Gen:
             elif op == "v_fmac_f32":
                 x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
             else:
-                x, y, z = (self.src_f(t) for t in a[1:4])
-                lo, hi, r = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{lo} = OpExtInst %float %glsl FMin {x} {y}")
-                self.emit(f"{hi} = OpExtInst %float %glsl FMax {x} {y}")
-                self.emit(f"{r} = OpExtInst %float %glsl FClamp {z} {lo} {hi}")
+                r = self.med3_f([self.src_f(t) for t in a[1:4]], a[1:4])
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
             r = self.tmp()
@@ -4516,6 +4568,8 @@ class Gen:
                 self.emit(f"{r} = OpFDiv %float %f1 {x}")
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {F1[op]} {x}")
+                if F1[op] == "Fract":
+                    r = self.fract_below_one(r)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_cvt_f32_u32", "v_cvt_f32_i32"):
             x = self.src_u(a[1])
