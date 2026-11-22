@@ -650,6 +650,55 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
 
 
+# SHADER-91: a native wave32 compute shader whose s_barrier isn't in a top-level block runs in barrier rounds.
+BARRIER_SAMPLES = ("cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop")
+
+
+@pytest.mark.parametrize("stem", BARRIER_SAMPLES)
+def test_nested_barrier_runs_in_barrier_rounds(stem, make_shader):
+    """No OpControlBarrier is left among the blocks (the cases of the switch over %pc): s_barrier ends a segment
+    there. The only two are before the round loop and at its end, where the whole workgroup is."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", stem + ".asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), stem)
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.control_flow == "barrier rounds"
+    blocks = asm[asm.index("OpSwitch %pcv"):asm.index("%sw_default = OpLabel")]
+    assert "OpControlBarrier" not in blocks and "OpStore %x_bar %true" in blocks
+    assert asm.count("OpControlBarrier") == 2
+    head, tail = asm.index("OpLoopMerge %loop_exit %loop_cont"), asm.index("%loop_cont = OpLabel")
+    assert asm.index("OpControlBarrier") < head and asm.rindex("OpControlBarrier") > tail
+    assert "OpAtomicIAdd" in asm[tail - 2000:tail] and "%x_buf = OpVariable" in asm
+
+
+def test_top_level_barrier_keeps_the_plain_translation(make_shader):
+    """A barrier in a block every invocation runs (the top level of the structured tree) stays one OpControlBarrier
+    in place: no rounds for a shader that doesn't need them."""
+    shader = make_shader("v_lshlrev_b32_e32 v2, 2, v0\nds_write_b32 v2, v0\ns_waitcnt lgkmcnt(0)\ns_barrier\n"
+                         "v_readfirstlane_b32 s5, v0\ns_cmp_lg_u32 s5, 0\ns_cbranch_scc1 2\n"   # skips the 2-dword read
+                         "ds_read_b32 v4, v2\ns_endpgm\n", "cs_barrier_top")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.control_flow == "structured"
+    assert asm.count("OpControlBarrier") == 1 and "%x_bar" not in asm and "%x_buf" not in asm
+
+
+def test_barrier_rounds_are_wave32_compute_only(make_shader, monkeypatch):
+    """Native wave64 (AMD's 64-wide subgroups) keeps the barrier where s_barrier is; under --wave64-emulate the
+    emulated round loop already holds the only barrier."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_barrier_divergent.asm"), encoding="utf-8") as f:
+        src = f.read()
+    shader = make_shader("s_mov_b64 exec, -1\n" + src, "cs_barrier_divergent_w64")   # a 64-bit EXEC write: wave64
+    asm = shader.translate()
+    gen = rdna2spirv.translate.last_gen
+    assert gen.wave64 and not gen.bar_rounds and gen.control_flow == "structured"
+    assert asm.count("OpControlBarrier") == 2 and "%x_bar" not in asm
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    shader.translate()
+    gen = rdna2spirv.translate.last_gen
+    assert gen.emulate and not gen.bar_rounds and gen.control_flow == "emulated wave64 rounds"
+
+
 # SHADER-36: image_gather4_l(_o) runs every texel of its 2x2 footprint through the S#'s CLAMP_X/CLAMP_Y.
 def _gather_l(s_word0, dynamic=False, s_word1=0):
     return program(

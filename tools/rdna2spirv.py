@@ -153,6 +153,7 @@ class Gen:
         self.x_gen = 0             # emulate: bumped at every label (control flow inside a block): forgets x_tok
         self.x_mcache = {}         # emulate: wave_mask key -> (lo, hi) already exchanged in this block
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
+        self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
         self.uses_heap = False
         self.uses_codebase = False
@@ -3190,7 +3191,7 @@ class Gen:
             # Workgroup execution barrier; AMD orders LDS through s_waitcnt before it, so include workgroup memory.
             if self.stage not in ("cs", "ms"):
                 raise Unsupported("s_barrier outside compute")
-            if self.emulate:
+            if self.emulate or self.bar_rounds:
                 # The wave waits in the scheduler until every wave not done waits too (assemble).
                 self.emit("OpStore %x_bar %true")
                 self.x_split()
@@ -6454,12 +6455,16 @@ def assemble(gen):
         if x_missing:
             for v in (x_missing - 1, gen.x_lanes + x_threads):
                 gen.cu(v)
+    if gen.bar_rounds:
+        sx, sy, _ = gen.cs["size"]
+        for v in (0, 1, 2, 3, 0x108, sx, sx * sy):
+            gen.cu(v)
     model = "Vertex" if vs else "GLCompute" if cs else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
     ms_blk = ms and (gen.uses_clip or gen.uses_cull)
     iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts", ("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)]) if ms else []) + (
-        ["%x_buf"] if gen.emulate else []) + (
+        ["%x_buf"] if gen.emulate or gen.bar_rounds else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         ((["%fmt_uint_mask", "%fmt_sint_mask"] +
           [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)]) if gen.uses_store_views else [])
@@ -6808,6 +6813,11 @@ def assemble(gen):
         types += [f"%x_arr = OpTypeArray %uint {gen.cu(x_sink + 1)}",
                   "%_ptr_WG_x_arr = OpTypePointer Workgroup %x_arr", "%_ptr_WG_uint_x = OpTypePointer Workgroup %uint"]
         gvars += ["%x_buf = OpVariable %_ptr_WG_x_arr Workgroup"]
+    elif gen.bar_rounds:
+        # Barrier rounds: one count of the invocations not done per round, 3 slots by round mod 3 (bar_scheduler).
+        types += [f"%x_arr = OpTypeArray %uint {gen.cu(3)}",
+                  "%_ptr_WG_x_arr = OpTypePointer Workgroup %x_arr", "%_ptr_WG_uint_x = OpTypePointer Workgroup %uint"]
+        gvars += ["%x_buf = OpVariable %_ptr_WG_x_arr Workgroup"]
     if cs:
         types += ["%v3uint = OpTypeVector %uint 3", "%_ptr_Input_v3u = OpTypePointer Input %v3uint"]
         gvars += ["%wg_id = OpVariable %_ptr_Input_v3u Input", "%local_id = OpVariable %_ptr_Input_v3u Input"]
@@ -6894,6 +6904,10 @@ def assemble(gen):
         fn += [f"{var} = OpVariable {ptr} Function" for var, ptr in gen.x_spills]
         if gen.uses_perm:
             fn.append("%x_perm = OpVariable %_ptr_Function_uint Function %c0")
+    elif gen.bar_rounds:
+        fn += ["%x_it = OpVariable %_ptr_Function_uint Function %c0",
+               "%x_bar = OpVariable %_ptr_Function_bool Function %false"]
+        fn += [f"{var} = OpVariable {ptr} Function" for var, ptr in gen.x_spills]
     # User data: s0..s31 are loaded at entry from a push-constant block (the driver's user-SGPR setup).
     if gen.uses_heap:
         gen.consts.setdefault(1, "%c1")
@@ -6986,10 +7000,13 @@ def assemble(gen):
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     out = hdr + dec + types + gvars + (gen.desc_fn or []) + (gen.fmt_fn or []) + fn
-    tree = cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate else None
+    tree = (cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate and not gen.bar_rounds
+            else None)
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
     if gen.emulate:
         gen.control_flow = "emulated wave64 rounds"
+    elif gen.bar_rounds:
+        gen.control_flow = "barrier rounds"
     if tree is not None:
         # Real loops and conditionals (cfg_structure): the blocks nested by dominance, each behind a test of %pc,
         # and every natural loop as a loop that repeats while %pc names its header.
@@ -7032,6 +7049,14 @@ def assemble(gen):
             body += blines
             body.append("OpBranch %sw_merge")
         body += x_scheduler_tail(gen)
+    elif gen.bar_rounds:
+        lines = bar_scheduler(gen)
+        body = []
+        for i, blines in sorted(list(enumerate(gen.blocks)) + list(gen.x_segs.items())):
+            body.append(f"%blk{i} = OpLabel")
+            body += blines
+            body.append("OpBranch %sw_merge")
+        body += bar_scheduler_tail(gen)
     elif gen.blocks:
         # Dispatch loop: any CFG (forward/backward branches) in structured SPIR-V form. Used for the irreducible
         # graphs cfg_structure refuses (a loop with two entries), and with --dispatch-loop.
@@ -7761,6 +7786,7 @@ def translate(path):
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
+    g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
     g.x_seg = len(blocks) + 1           # emulate: continuation segments are numbered after "done" (len(blocks))
     for n, blk in enumerate(blocks):
         g.body = []
@@ -7831,10 +7857,35 @@ def translate(path):
 _DEF = re.compile(r"(%\w+) = (Op\w+)(?: (%\w+))?")
 
 
+def needs_barrier_rounds(g, blocks, succ):
+    """SHADER-91: whether a native wave32 compute shader has to run in barrier rounds (bar_scheduler). On RDNA every
+    s_barrier counts against the same workgroup barrier, so waves on different paths meet at different s_barrier
+    sites. SPIR-V requires an OpControlBarrier to be reached by the whole workgroup in uniform control flow, and an
+    Intel GPU hangs (device lost) when it isn't (cs_barrier_divergent.asm). A barrier is only certain to be
+    uniform in a block at the top level of the structured tree, which every invocation runs; one under a guard
+    or in a loop, or anywhere in the dispatch loop, may be reached by some waves and not others."""
+    if g.stage != "cs" or g.emulate or g.wave64:
+        return False                    # emulated: already rounds; native wave64 cs and ms run on AMD only
+    with_barrier = set()
+    for n, blk in enumerate(blocks):
+        for ins in blk:
+            op = base_op(ins["op"])
+            if op == "s_endpgm" or op in BRANCHES:
+                break
+            if op == "s_barrier":
+                with_barrier.add(n)
+                break
+    if not with_barrier:
+        return False
+    tree = cfg_structure.structure(succ) if STRUCTURED else None
+    top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
+    return not with_barrier <= top
+
+
 def x_spill(g, parts):
-    """Emulated wave64: the segments of one block run in different rounds, i.e. in different cases of the
-    scheduler's switch and different loop iterations, so an SSA value defined in one and used in a later one
-    can't be referenced directly. It goes through a Function variable: stored at the end of the segment that
+    """Emulated wave64 and barrier rounds: the segments of one block run in different rounds, i.e. in different
+    cases of the scheduler's switch and different loop iterations, so an SSA value defined in one and used in a
+    later one can't be referenced directly. It goes through a Function variable: stored at the end of the segment that
     defines it and loaded, under a new id, at the top of each later segment that uses it."""
     defs, out = {}, []
     for k, part in enumerate(parts):
@@ -7848,7 +7899,8 @@ def x_spill(g, parts):
             seg, typ, var = defs[ref]
             if var is None:
                 if typ is None or typ.startswith("%_ptr"):
-                    raise Unsupported("wave64 emulation: a pointer lives across a round")
+                    mode = "barrier rounds" if g.bar_rounds else "wave64 emulation"
+                    raise Unsupported(f"{mode}: a pointer lives across a round")
                 ptr = {"%uint": "%_ptr_Function_uint", "%bool": "%_ptr_Function_bool"}.get(typ)
                 if ptr is None:
                     ptr = g.x_ptr_types.setdefault(typ, f"%_ptr_Function_x_{typ[1:]}")
@@ -7967,6 +8019,76 @@ def x_scheduler_tail(gen):
             "%x_nrel = OpLogicalNot %bool %x_rel", "%x_b4 = OpLogicalAnd %bool %x_b3 %x_nrel",
             "OpStore %x_bar %x_b4", f"%x_it1 = OpIAdd %uint %x_itv {c(1)}", "OpStore %x_it %x_it1",
             f"%x_fin = OpIEqual %bool %x_r0 {c(0)}", "OpBranchConditional %x_fin %loop_exit %loop_head",
+            "%loop_exit = OpLabel"]
+
+
+def bar_scheduler(gen):
+    """Barrier rounds (SHADER-91): a native wave32 compute shader whose s_barrier isn't in uniform control flow
+    (needs_barrier_rounds). The emulated wave64 loop without its cross-lane part: s_barrier ends a segment, and
+    the code after it is a continuation segment (x_split). In a round each invocation that isn't done runs its
+    blocks, through the switch over %pc, until it reaches an s_barrier or the end; then the whole workgroup meets
+    at one OpControlBarrier, at the end of the round loop, in uniform control flow. After the inner loop every
+    invocation is done or waits, so the barrier always releases the waiting ones, and a wave that has ended
+    doesn't hold the others back (RDNA's rule). Cross-lane operations stay subgroup operations: a wave runs one
+    segment at a time, as in the dispatch loop. The round's count of invocations not done ends the loop at 0.
+
+    %x_buf holds 3 counts, by round mod 3: round r adds to its own slot before the barrier and reads it after,
+    and invocation 0 clears the slot of round r + 1, last read in round r - 2 (before the barrier of r - 1).
+    The first two lines are the Function variables %pc and %done, as for the dispatch loop."""
+    c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
+    sx, sy, _ = gen.cs["size"]
+    return ["%pc = OpVariable %_ptr_Function_uint Function %c0",
+            "%done = OpVariable %_ptr_Function_bool Function %false",
+            "%xb_lid = OpLoad %v3uint %local_id", "%xb_lx = OpCompositeExtract %uint %xb_lid 0",
+            "%xb_ly = OpCompositeExtract %uint %xb_lid 1", "%xb_lz = OpCompositeExtract %uint %xb_lid 2",
+            f"%xb_ly2 = OpIMul %uint %xb_ly {c(sx)}", f"%xb_lz2 = OpIMul %uint %xb_lz {c(sx * sy)}",
+            "%xb_lxy = OpIAdd %uint %xb_lx %xb_ly2", "%xb_li = OpIAdd %uint %xb_lxy %xb_lz2",
+            f"%xb_first = OpIEqual %bool %xb_li {c(0)}",
+            # Workgroup memory starts undefined: invocation 0 clears round 0's count before the first round.
+            "OpSelectionMerge %xb_z_end None", "OpBranchConditional %xb_first %xb_z %xb_z_end", "%xb_z = OpLabel",
+            f"%xb_zp = OpAccessChain %_ptr_WG_uint_x %x_buf {c(0)}", f"OpStore %xb_zp {c(0)}",
+            "OpBranch %xb_z_end", "%xb_z_end = OpLabel",
+            f"OpControlBarrier {c(2)} {c(2)} {c(0x108)}",
+            "OpBranch %loop_head", "%loop_head = OpLabel", "OpLoopMerge %loop_exit %loop_cont None",
+            "OpBranch %xb_round", "%xb_round = OpLabel",
+            "%xb_itv = OpLoad %uint %x_it", f"%xb_s = OpUMod %uint %xb_itv {c(3)}",
+            f"%xb_n1 = OpIAdd %uint %xb_itv {c(1)}", f"%xb_sn = OpUMod %uint %xb_n1 {c(3)}",
+            "OpSelectionMerge %xb_r_end None", "OpBranchConditional %xb_first %xb_r %xb_r_end", "%xb_r = OpLabel",
+            "%xb_rp = OpAccessChain %_ptr_WG_uint_x %x_buf %xb_sn", f"OpStore %xb_rp {c(0)}",
+            "OpBranch %xb_r_end", "%xb_r_end = OpLabel",
+            "%xb_d = OpLoad %bool %done",
+            "OpSelectionMerge %xb_ran None", "OpBranchConditional %xb_d %xb_ran %xb_run", "%xb_run = OpLabel",
+            # The invocation's blocks, until an s_barrier (%x_bar) or the end (%done).
+            "OpBranch %xb_in_head", "%xb_in_head = OpLabel", "OpLoopMerge %xb_in_merge %xb_in_cont None",
+            "OpBranch %dispatch", "%dispatch = OpLabel",
+            "%pcv = OpLoad %uint %pc", "OpSelectionMerge %sw_merge None",
+            "OpSwitch %pcv %sw_default " + " ".join(f"{i} %blk{i}" for i in
+                                                    sorted(list(range(len(gen.blocks))) + list(gen.x_segs)))]
+
+
+def bar_scheduler_tail(gen):
+    """Barrier rounds: the end of a round, after the switch (see bar_scheduler)."""
+    c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
+    return ["%sw_default = OpLabel", "OpStore %done %true", "OpBranch %sw_merge",
+            "%sw_merge = OpLabel", "OpBranch %xb_in_cont", "%xb_in_cont = OpLabel",
+            "%xb_d1 = OpLoad %bool %done", "%xb_b1 = OpLoad %bool %x_bar",
+            "%xb_stop = OpLogicalOr %bool %xb_d1 %xb_b1",
+            "OpBranchConditional %xb_stop %xb_in_merge %xb_in_head", "%xb_in_merge = OpLabel",
+            # Not done: count this invocation in the round's slot.
+            "%xb_d2 = OpLoad %bool %done",
+            "OpSelectionMerge %xb_c_end None", "OpBranchConditional %xb_d2 %xb_c_end %xb_c", "%xb_c = OpLabel",
+            "%xb_cp = OpAccessChain %_ptr_WG_uint_x %x_buf %xb_s",
+            f"%xb_ca = OpAtomicIAdd %uint %xb_cp {c(2)} {c(0)} {c(1)}",
+            "OpBranch %xb_c_end", "%xb_c_end = OpLabel",
+            "OpBranch %xb_ran", "%xb_ran = OpLabel",
+            "OpBranch %loop_cont", "%loop_cont = OpLabel",
+            # s_barrier's own barrier (workgroup, acquire-release, workgroup memory), now in uniform control flow;
+            # it also orders the count, read below.
+            f"OpControlBarrier {c(2)} {c(2)} {c(0x108)}",
+            "%xb_lp = OpAccessChain %_ptr_WG_uint_x %x_buf %xb_s", "%xb_left = OpLoad %uint %xb_lp",
+            "OpStore %x_bar %false",
+            f"%xb_it1 = OpIAdd %uint %xb_itv {c(1)}", "OpStore %x_it %xb_it1",
+            f"%xb_fin = OpIEqual %bool %xb_left {c(0)}", "OpBranchConditional %xb_fin %loop_exit %loop_head",
             "%loop_exit = OpLabel"]
 
 
