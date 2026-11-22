@@ -323,6 +323,11 @@ What is implemented (all of it testable without the game):
     `d3d12_uav_clear_test`);
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
+  - `B8G8R8X8_UNORM`, `_UNORM_SRGB` and `_TYPELESS` (D3D-87) are `B8G8R8A8` images: clears, copies and footprints
+    keep all four bytes (WARP writes the clear's alpha into the X byte too), and shader views read alpha as 1. Its
+    typeless family is its own, so views to or from `B8G8R8A8` are refused (a castable-format list that names the
+    other family is not consulted yet). As on the host runtime, the family has no typed UAV, and a typed
+    `B8G8R8X8` texture cannot allow unordered access;
   - `R10G10B10_XR_BIAS_A2_UNORM` maps to `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, the same packed 10:10:10:2
     layout; the bias and scale are the application's shader work. Like the PC runtime, it accepts only a
     single-mip, single-sample 2D texture: extra mips, multisampling and 3D are refused in creation, allocation

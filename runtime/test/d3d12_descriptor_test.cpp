@@ -13,6 +13,9 @@
 //     CreateSampler2 samplers that clamp to a UINT (0,0,0,0) and (1,1,1,1) border, and a float white border on
 //     the UNORM texture. Every texel is the border: 0, 1 and 255 in each channel. Both white borders are built in
 //     at the same S# type, so this also checks that they are two samplers, not one.
+//   - B8G8R8X8 (D3D-87): a B8G8R8X8_UNORM and a B8G8R8A8_UNORM texture uploaded with the same bytes, the fourth
+//     never 255. Their default views read the same red, green and blue; B8G8R8X8 reads alpha 1, B8G8R8A8 the
+//     stored byte. Views between the two typeless families give a null descriptor.
 // Multisample SRVs: four masked triangles seed different values per sample and array layer. A compute shader reads
 // them back using the T#s for the 2D, full-array and sliced-array views. The test builds its pipelines in Vulkan
 // and binds the device's set (rt::d3d12::bindless_set). Without glslangValidator the GPU readbacks are skipped.
@@ -79,6 +82,13 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 // The uploaded texture: a gradient no two texels of which are equal.
 std::array<std::uint8_t, 4> texel(UINT x, UINT y) {
     return {std::uint8_t(x * 32), std::uint8_t(y * 32), std::uint8_t(128 + x + 8 * y), 255};
+}
+
+// The same texel in B, G, R memory order, with a fourth byte that is never 255: what a B8G8R8X8 texture and a
+// B8G8R8A8 one with the same bytes are uploaded with. Through a view the first reads alpha 1, the second this byte.
+std::array<std::uint8_t, 4> bgrx_texel(UINT x, UINT y) {
+    const auto t = texel(x, y);
+    return {t[2], t[1], t[0], std::uint8_t(3 * (y * 8 + x))};
 }
 
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
@@ -292,7 +302,7 @@ int main() {
     if (device_status != vktest::DeviceStatus::ready) return 1;
 
     constexpr UINT size = 8, texels = size * size, bytes = texels * 4;
-    std::vector<std::uint8_t> results(4 * bytes), after_destruction(bytes), borders(3 * bytes);
+    std::vector<std::uint8_t> results(4 * bytes), after_destruction(bytes), borders(3 * bytes), bgr_results(2 * bytes);
     bool sampled_through_set = false;
     UINT lod_mismatches = 0;
     {
@@ -532,6 +542,32 @@ int main() {
                 for (UINT x = 0; x < fp.Width; ++x) std::memcpy(row + 4 * x, color.data(), 4);
             }
         }
+        // A B8G8R8X8_UNORM texture and a B8G8R8A8_UNORM one, uploaded with the same bgrx_texel bytes past the cube
+        // array's footprints.
+        constexpr DXGI_FORMAT bgr_formats[2] = {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM};
+        Ref<ID3D12Resource> bgr_textures[2];
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT bgr_placed[2]{};
+        const auto& last_array = array_levels[std::size(array_levels) - 1];
+        constexpr UINT64 placement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        const UINT64 bgr_start =
+            (last_array.Offset + UINT64(last_array.Footprint.RowPitch) * last_array.Footprint.Height + placement - 1) &
+            ~(placement - 1);
+        for (UINT f = 0; f < 2; ++f) {
+            D3D12_RESOURCE_DESC desc = texture_desc;
+            desc.Format = bgr_formats[f];
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&bgr_textures[f].p))));
+            device->GetCopyableFootprints(&desc, 0, 1, bgr_start + 8192 * f, &bgr_placed[f], nullptr, nullptr, nullptr);
+            EXPECT(bgr_placed[f].Footprint.Format == bgr_formats[f]);
+            EXPECT(bgr_placed[f].Offset + UINT64(bgr_placed[f].Footprint.RowPitch) * size <= upload_desc.Width);
+            for (UINT y = 0; y < size; ++y)
+                for (UINT x = 0; x < size; ++x)
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + bgr_placed[f].Offset +
+                                    y * bgr_placed[f].Footprint.RowPitch + x * 4,
+                                bgrx_texel(x, y).data(), 4);
+        }
+        EXPECT(bgr_placed[0].Footprint.RowPitch == bgr_placed[1].Footprint.RowPitch);
 
         // Shader-visible heaps, start handles in the Xbox shape.
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -562,7 +598,7 @@ int main() {
             volume_lod_slot = cube_lod_slot + cube_lod_count,
             ms_slot = volume_lod_slot + volume_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot,
-            line_default, line_mip, line_clamped, view_slot_count
+            line_default, line_mip, line_clamped, bgrx_slot, bgra_slot, typed_bgrx_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -1099,6 +1135,51 @@ int main() {
         std::memset(view_bytes(null_slot), 0x77, step);
         device->CreateShaderResourceView(texture.p, &colour_plane, view_slot(null_slot));
         EXPECT(null_at(null_slot));
+
+        // B8G8R8X8 is a BGRA8 image whose views read alpha as 1, so its T# selects one where B8G8R8A8's selects W.
+        // B8G8R8X8 and B8G8R8A8 are different typeless families: a view never crosses from one to the other.
+        device->CreateShaderResourceView(bgr_textures[0].p, nullptr, view_slot(bgrx_slot));
+        device->CreateShaderResourceView(bgr_textures[1].p, nullptr, view_slot(bgra_slot));
+        g::Image bgrx_image{}, bgra_image{};
+        EXPECT(image_at(bgrx_slot, bgrx_image) && image_at(bgra_slot, bgra_image));
+        EXPECT(bgrx_image.format == g::format_from_vulkan(VK_FORMAT_B8G8R8A8_UNORM) &&
+               bgra_image.format == bgrx_image.format);
+        EXPECT((bgrx_image.swizzle == g::Swizzle{g::select_z, g::select_y, g::select_x, g::select_one}));
+        EXPECT((bgra_image.swizzle == g::Swizzle{g::select_z, g::select_y, g::select_x, g::select_w}));
+        Ref<ID3D12Resource> bgrx_typeless;
+        D3D12_RESOURCE_DESC bgrx_typeless_desc = texture_desc;
+        bgrx_typeless_desc.Format = DXGI_FORMAT_B8G8R8X8_TYPELESS;
+        bgrx_typeless_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;  // allowed, but no format gives a UAV
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &bgrx_typeless_desc,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         IID_PPV_ARGS(&bgrx_typeless.p))));
+        D3D12_SHADER_RESOURCE_VIEW_DESC bgr_view = flat_view;
+        bgr_view.Format = DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+        device->CreateShaderResourceView(bgrx_typeless.p, &bgr_view, view_slot(typed_bgrx_slot));
+        g::Image typed_bgrx_image{};
+        EXPECT(image_at(typed_bgrx_slot, typed_bgrx_image));
+        EXPECT(typed_bgrx_image.format == g::format_from_vulkan(VK_FORMAT_B8G8R8A8_SRGB));
+        EXPECT(typed_bgrx_image.swizzle == bgrx_image.swizzle && typed_bgrx_image.address != bgrx_image.address);
+        bgr_view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        for (ID3D12Resource* x8 : {bgr_textures[0].p, bgrx_typeless.p}) {
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(x8, &bgr_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+        }
+        bgr_view.Format = DXGI_FORMAT_B8G8R8X8_UNORM;
+        std::memset(view_bytes(null_slot), 0x77, step);
+        device->CreateShaderResourceView(bgr_textures[1].p, &bgr_view, view_slot(null_slot));
+        EXPECT(null_at(null_slot));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC bgrx_write{};
+        bgrx_write.Format = DXGI_FORMAT_B8G8R8X8_UNORM;
+        bgrx_write.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        const D3D12_UNORDERED_ACCESS_VIEW_DESC* const bgrx_uavs[2] = {nullptr, &bgrx_write};
+        for (const D3D12_UNORDERED_ACCESS_VIEW_DESC* uav : bgrx_uavs) {
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateUnorderedAccessView(bgrx_typeless.p, nullptr, uav, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
+        }
+        bgrx_typeless.reset();
         cube.reset();
         writable.reset();
 
@@ -1205,6 +1286,11 @@ int main() {
                 transition(bc.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &barrier);
         }
+        for (UINT f = 0; f < 2; ++f) {
+            to_texture.pResource = bgr_textures[f].p;
+            from_upload.PlacedFootprint = bgr_placed[f];
+            list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        }
         to_texture.pResource = volume.p;
         for (UINT mip = 0; mip < 2; ++mip) {
             to_texture.SubresourceIndex = mip;
@@ -1221,7 +1307,11 @@ int main() {
             transition(line.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            transition(volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+            transition(volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(bgr_textures[0].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(bgr_textures[1].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
         list->ResourceBarrier(UINT(std::size(sampled)), sampled);
         to_texture.pResource = array_texture.p;
         for (UINT sub = 0; sub < std::size(array_levels); ++sub) {
@@ -1854,6 +1944,15 @@ int main() {
                 }
             EXPECT(rgb96_differ == 0);
         }
+        // The B8G8R8X8 and B8G8R8A8 textures through their default views.
+        SampleKeys bgr_keys[2] = {};
+        const UINT bgr_slots[2] = {bgrx_slot, bgra_slot};
+        for (UINT k = 0; k < 2; ++k) {
+            std::memcpy(bgr_keys[k].tsharp, view_bytes(bgr_slots[k]), sizeof(bgr_keys[k].tsharp));
+            std::memcpy(bgr_keys[k].ssharp, sampler_bytes, sizeof(bgr_keys[k].ssharp));
+            bgr_keys[k].first = k * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, bgr_keys, bgr_results.data()));
 #endif
 
         // A destroyed texture takes its views out of the set: the next ExecuteCommandLists writes that, and nothing
@@ -2078,6 +2177,7 @@ int main() {
         byte_heap.reset();
         ms_texture.reset();
         ms_array.reset();
+        for (auto& resource : bgr_textures) resource.reset();
         view_heap.reset();
         sampler_heap.reset();
         list.reset();
@@ -2141,6 +2241,19 @@ int main() {
         }
     EXPECT(!mismatches);
     EXPECT(lod_mismatches == 0);
+    // Both read red, green and blue from the same bytes; B8G8R8X8 reads alpha 1, B8G8R8A8 the stored byte.
+    const char* bgr_names[2] = {"B8G8R8X8_UNORM", "B8G8R8A8_UNORM"};
+    for (UINT k = 0; k < 2; ++k)
+        for (UINT i = 0; i < texels; ++i) {
+            auto want = texel(i % size, i / size);
+            if (k == 1) want[3] = bgrx_texel(i % size, i / size)[3];
+            const std::uint8_t* got = bgr_results.data() + k * bytes + i * 4;
+            if (std::memcmp(got, want.data(), 4) != 0 && mismatches++ < 4)
+                std::fprintf(stderr, "%s texel %u: got %u,%u,%u,%u, want %u,%u,%u,%u\n", bgr_names[k], i,
+                             unsigned(got[0]), unsigned(got[1]), unsigned(got[2]), unsigned(got[3]),
+                             unsigned(want[0]), unsigned(want[1]), unsigned(want[2]), unsigned(want[3]));
+        }
+    EXPECT(!mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
@@ -2148,6 +2261,7 @@ int main() {
     std::printf("descriptors: copies matched; a T# and an S# from CreateShaderResourceView and CreateSampler were "
                 "found in the device's bindless set by a shader, %u RGBA8 and RGB9E5 texels matched, and an unknown descriptor "
                 "and a destroyed texture's gave the fallback; UINT black, UINT white and float white borders read "
-                "0, 1 and 255\n", texels);
+                "0, 1 and 255; B8G8R8X8 read alpha 1 where B8G8R8A8 read the same bytes' alpha (%u texels each)\n",
+                texels, texels);
     return 0;
 }

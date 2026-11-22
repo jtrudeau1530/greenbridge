@@ -506,6 +506,9 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(13, 7, DXGI_FORMAT_B5G5R5A1_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, 4), 4},
+        {texture_desc(13, 7, DXGI_FORMAT_B8G8R8X8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
+        {texture_desc(13, 7, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, D3D12_RESOURCE_FLAG_NONE, 4), 4},
+        {texture_desc(16, 16, DXGI_FORMAT_B8G8R8X8_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(10, 6, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE, 4), 4},
         {texture_desc(4, 4, DXGI_FORMAT_BC7_UNORM_SRGB, D3D12_RESOURCE_FLAG_NONE, 1, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_BC5_UNORM, D3D12_RESOURCE_FLAG_NONE, 5), 5},
@@ -3142,7 +3145,8 @@ int main() {
                      DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R16G16B16A16_SINT,
                      DXGI_FORMAT_R10G10B10A2_UINT, DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_UINT,
                      DXGI_FORMAT_R16G16_SINT, DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UINT,
-                     DXGI_FORMAT_R8G8_SINT}) {
+                     DXGI_FORMAT_R8G8_SINT, DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM,
+                     DXGI_FORMAT_B8G8R8X8_UNORM_SRGB}) {
                 D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{f};
                 EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))));
                 EXPECT(fs.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
@@ -3152,6 +3156,42 @@ int main() {
                     &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                     IID_PPV_ARGS(&tex.p))));
                 EXPECT(tex.p != nullptr);
+            }
+        }
+        // D3D-87, B8G8R8X8: no typed UAV and no typed texture that allows unordered access (the typeless family may),
+        // as the host runtime answers; render targets as for B8G8R8A8.
+        {
+            Ref<ID3D12Device> host;
+            if (create_host_device(host)) {
+                const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+                for (DXGI_FORMAT f : {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB,
+                                      DXGI_FORMAT_B8G8R8X8_TYPELESS}) {
+                    D3D12_FEATURE_DATA_FORMAT_SUPPORT a{f}, b{f};
+                    EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &a, sizeof(a))));
+                    EXPECT(SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &b, sizeof(b))));
+                    constexpr UINT typed_uav = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+                    constexpr UINT typed_uav2 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+                    EXPECT((UINT(a.Support1) & typed_uav) == (UINT(b.Support1) & typed_uav));
+                    EXPECT((UINT(a.Support2) & typed_uav2) == (UINT(b.Support2) & typed_uav2));
+                    for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET}) {
+                        const D3D12_RESOURCE_DESC desc = texture_desc(16, 16, f, flag, 1);
+                        Ref<ID3D12Resource> ours_resource, host_resource;
+                        const HRESULT ours_hr = device->CreateCommittedResource(
+                            &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                            IID_PPV_ARGS(&ours_resource.p));
+                        const HRESULT host_hr = host->CreateCommittedResource(
+                            &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                            IID_PPV_ARGS(&host_resource.p));
+                        if (SUCCEEDED(ours_hr) != SUCCEEDED(host_hr))
+                            std::fprintf(stderr, "B8G8R8X8 format %d flags %d: ours %08lx, host %08lx\n", int(f),
+                                         int(flag), static_cast<unsigned long>(ours_hr),
+                                         static_cast<unsigned long>(host_hr));
+                        EXPECT(SUCCEEDED(ours_hr) == SUCCEEDED(host_hr));
+                    }
+                }
+                std::printf("B8G8R8X8: typed UAV support and UAV/RTV resource creation match the host runtime\n");
+            } else {
+                std::printf("B8G8R8X8: no host D3D12 device to compare with, skipped\n");
             }
         }
 
