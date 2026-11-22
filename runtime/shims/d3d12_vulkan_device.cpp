@@ -3963,7 +3963,7 @@ public:
         }
         const UINT64 unit = structured ? view.StructureByteStride : 4;
         if (!unit || unit > 0x3fff || view.CounterOffsetInBytes ||
-            (UINT64(view.FirstElement) + view.NumElements) * unit > rd.Width ||
+            view.FirstElement > rd.Width / unit || (UINT64(view.FirstElement) + view.NumElements) > rd.Width / unit ||
             UINT64(view.NumElements) * (structured ? 1 : 4) > ~0u) {
             log_once("unordered-access view of a buffer outside the resource or with a bad stride; elements",
                      int(view.NumElements));
