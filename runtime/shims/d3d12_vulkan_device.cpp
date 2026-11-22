@@ -389,6 +389,15 @@ struct TextureCreateInfo {
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
     VulkanDeviceInfo info;
+    std::vector<std::uint32_t> families;
+
+    template<typename CreateInfo>
+    void share(CreateInfo& create) const {
+        if (families.size() < 2) return;
+        create.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        create.queueFamilyIndexCount = std::uint32_t(families.size());
+        create.pQueueFamilyIndices = families.data();
+    }
     std::unique_ptr<leonida::VulkanContext> context;
     VkPhysicalDeviceMemoryProperties memory{};
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
@@ -715,7 +724,9 @@ struct DeviceState {
         }
         auto& vk = context->vk;  // without the query, a throwaway image
         VkImage image = VK_NULL_HANDLE;
-        if (vk.vkCreateImage(info.device, &create, nullptr, &image) != VK_SUCCESS) return false;
+        VkImageCreateInfo shared = create;
+        share(shared);
+        if (vk.vkCreateImage(info.device, &shared, nullptr, &image) != VK_SUCCESS) return false;
         vk.vkGetImageMemoryRequirements(info.device, image, &out);
         vk.vkDestroyImage(info.device, image, nullptr);
         return true;
@@ -1415,6 +1426,7 @@ public:
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         }
+        device_.share(info);
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
@@ -1563,6 +1575,7 @@ public:
             support = device_.check_image_support(info);
         }
         if (FAILED(support)) return support;
+        device_.share(info);
         const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
         if (created != VK_SUCCESS) {
             if (created == VK_ERROR_OUT_OF_HOST_MEMORY || created == VK_ERROR_OUT_OF_DEVICE_MEMORY)
@@ -1848,6 +1861,7 @@ private:
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = staging.size;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;  // storage: D24 depth conversion
+        device_.share(info);
         if (vk.vkCreateBuffer(dev, &info, nullptr, &staging.buffer) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void* mapped = nullptr;
@@ -3694,6 +3708,11 @@ public:
     explicit Device(const VulkanDeviceInfo& info) {
         state_.info = info;
         queue_busy_.resize(info.command_queues.size(), false);
+        compute_busy_.resize(info.compute_queues.size(), false);
+        copy_busy_.resize(info.copy_queues.size(), false);
+        for (std::uint32_t f : {info.queue_family, info.compute_family, info.copy_family})
+            if (f != UINT32_MAX && std::find(state_.families.begin(), state_.families.end(), f) == state_.families.end())
+                state_.families.push_back(f);
         const auto get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
             info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
         state_.format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
@@ -3794,6 +3813,8 @@ public:
                 families(info.physical, &count, nullptr);
                 std::vector<VkQueueFamilyProperties> queues(count);
                 families(info.physical, &count, queues.data());
+                if (info.copy_family < count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                    state_.context->set_transfer_only_family(info.copy_family);
                 if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                     state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
                     if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);
@@ -3987,6 +4008,7 @@ public:
         if (state_.info.ray_tracing)
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        state_.share(info);
         if (vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer) != VK_SUCCESS) {
             arena.buffer = VK_NULL_HANDLE;
             return false;
@@ -4223,8 +4245,32 @@ public:
             return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
                                                                      state_.info.queue_family, *desc, riid, out,
                                                                      identity(), state_.clock));
-        // Vulkan only guarantees ordering within a VkQueue. Assign a distinct handle to each live D3D12 queue;
-        // otherwise a Wait submitted before another queue's Signal can deadlock the shared handle.
+        if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+            const bool compute = desc->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            auto& busy = compute ? compute_busy_ : copy_busy_;
+            const auto& queues = compute ? state_.info.compute_queues : state_.info.copy_queues;
+            const std::uint32_t family = compute ? state_.info.compute_family : state_.info.copy_family;
+            std::size_t dedicated = busy.size();
+            {
+                std::lock_guard lock(queue_mutex_);
+                for (std::size_t i = 0; i < busy.size(); ++i) {
+                    if (!busy[i]) {
+                        busy[i] = true;
+                        dedicated = i;
+                        break;
+                    }
+                }
+            }
+            if (dedicated < busy.size()) {
+                std::shared_ptr<void> lease(nullptr, [this, compute, dedicated](void*) {
+                    std::lock_guard lock(queue_mutex_);
+                    (compute ? compute_busy_ : copy_busy_)[dedicated] = false;
+                });
+                return d3d12_trace::result(method, create_command_queue(*state_.context, queues[dedicated], family,
+                                                                         *desc, riid, out, identity(), state_.clock,
+                                                                         std::move(lease)));
+            }
+        }
         std::size_t slot = queue_busy_.size();
         {
             std::lock_guard lock(queue_mutex_);
@@ -6628,6 +6674,8 @@ private:
 
     std::mutex queue_mutex_;
     std::vector<bool> queue_busy_;
+    std::vector<bool> compute_busy_;
+    std::vector<bool> copy_busy_;
     DeviceState state_;
     std::atomic<bool> removed_{false};
     OwnedRuntime owned_;
@@ -7234,11 +7282,37 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     std::vector<VkQueueFamilyProperties> families(family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, families.data());
     const std::uint32_t command_queue_count = std::min(16u, families[info.queue_family].queueCount);
-    std::vector<float> priorities(command_queue_count, 1.0f);
-    VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    queue_info.queueFamilyIndex = info.queue_family;
-    queue_info.queueCount = command_queue_count;
-    queue_info.pQueuePriorities = priorities.data();
+    std::vector<float> priorities(16, 1.0f);
+    std::vector<VkDeviceQueueCreateInfo> queue_infos;
+    {
+        VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        q.queueFamilyIndex = info.queue_family;
+        q.queueCount = command_queue_count;
+        q.pQueuePriorities = priorities.data();
+        queue_infos.push_back(q);
+    }
+    const auto picked = leonida::pick_queue_families(families, info.queue_family);
+    std::uint32_t compute_count = 0, copy_count = 0;
+    if (picked.compute != info.queue_family) {
+        info.compute_family = picked.compute;
+        compute_count = std::min(16u, families[picked.compute].queueCount);
+        VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        q.queueFamilyIndex = picked.compute;
+        q.queueCount = compute_count;
+        q.pQueuePriorities = priorities.data();
+        queue_infos.push_back(q);
+    }
+    if (picked.copy != info.queue_family) {
+        info.copy_family = picked.copy;
+        if (picked.copy != picked.compute) {
+            copy_count = std::min(16u, families[picked.copy].queueCount);
+            VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            q.queueFamilyIndex = picked.copy;
+            q.queueCount = copy_count;
+            q.pQueuePriorities = priorities.data();
+            queue_infos.push_back(q);
+        }
+    }
     VkPhysicalDeviceFeatures enable{};
     enable.sparseBinding = chosen_features.sparseBinding;
     enable.sparseResidencyBuffer = chosen_features.sparseResidencyBuffer;
@@ -7437,8 +7511,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     }
 
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
-    device_info.queueCreateInfoCount = 1;
-    device_info.pQueueCreateInfos = &queue_info;
+    device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
+    device_info.pQueueCreateInfos = queue_infos.data();
     device_info.pEnabledFeatures = &enable;
     std::vector<const char*> device_extensions;
     v13.add_extensions(device_extensions);
@@ -7475,6 +7549,22 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"));
     for (std::uint32_t i = 0; i < command_queue_count; ++i)
         get_queue(owned.device, info.queue_family, i, &info.command_queues[i]);
+    if (compute_count) {
+        // Copies on the async-compute family split its queues with the compute queues: one VkQueue per live queue.
+        const bool split = info.copy_family == info.compute_family && compute_count > 1;
+        const std::uint32_t for_compute = split ? compute_count / 2 : compute_count;
+        for (std::uint32_t i = 0; i < compute_count; ++i) {
+            VkQueue q = VK_NULL_HANDLE;
+            get_queue(owned.device, info.compute_family, i, &q);
+            (i < for_compute ? info.compute_queues : info.copy_queues).push_back(q);
+        }
+        if (info.copy_family == info.compute_family && !split) info.copy_family = UINT32_MAX;
+    }
+    for (std::uint32_t i = 0; i < copy_count; ++i) {
+        VkQueue q = VK_NULL_HANDLE;
+        get_queue(owned.device, info.copy_family, i, &q);
+        info.copy_queues.push_back(q);
+    }
     info.queue = info.command_queues[0];
     info.max_push_constants_size = chosen.limits.maxPushConstantsSize;
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);

@@ -17,6 +17,7 @@
 #include "vulkan_depth24.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
+#include "queue_families.h"
 #include "resource_tiling.h"
 #include "xdxr_build.h"
 
@@ -1115,6 +1116,8 @@ public:
     // `prepare` is called at the start of the command buffer of every ExecuteCommandLists, before the lists are
     // written: the device brings the bindless set 0 of the translated shaders up to date there (vulkan_bindless.h)
     // and records what the set needs first. When it fails, nothing of that call is executed.
+    void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
+
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::unique_lock lock(resource_mutex_);
         bindless_prepare_ = std::move(prepare);
@@ -1294,6 +1297,7 @@ private:
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
     std::uint32_t predicate_family_ = UINT32_MAX;
+    std::uint32_t transfer_only_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
 #ifdef _MSC_VER
@@ -1474,6 +1478,12 @@ public:
     // the layout tracker as it was. Pending Wait()s are attached to this submission.
     ReplayResult execute(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost()) return ReplayResult::unsupported;
+        if (kind_ != QueueKind::direct)
+            for (const auto* list : lists)
+                for (const auto& command : list->commands())
+                    if (std::holds_alternative<ClearRenderTarget>(command) ||
+                        std::holds_alternative<ClearDepthStencil>(command))
+                        return ReplayResult::unsupported;
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
@@ -1500,12 +1510,16 @@ public:
                 if (active && scratch) scratch->retire(progress, 0);
             }
         } scratch_guard{context_.scratch_.get(), progress_, false};
-        bindless_commit = context_.bindless_commit_;
+        const bool transfer_only = family_ == context_.transfer_only_family_;
+        if (!transfer_only) bindless_commit = context_.bindless_commit_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
         auto& prepared = prepared_;
         prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
+        replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
+                              : kind_ == QueueKind::compute ? detail::queue_stages_compute
+                                                            : 0;
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -1549,7 +1563,7 @@ public:
                 return context_.scratch_->get(bytes, buffer, offset);
             };
         }
-        if (context_.depth24_) {
+        if (context_.depth24_ && !transfer_only) {
             replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
                                                                            std::vector<Depth24Job>& parts) {
                 if (!tracker_lock.owns_lock()) tracker_lock.lock();
@@ -1644,7 +1658,7 @@ public:
             return ReplayResult::unsupported;
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
-        if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
+        if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);

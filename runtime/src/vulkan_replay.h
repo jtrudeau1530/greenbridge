@@ -773,6 +773,7 @@ struct ReplayFunctions {
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
+    VkPipelineStageFlags2 queue_stages = 0;
     PFN_vkCmdBeginRendering begin_rendering = nullptr;      // rectangle clears
     PFN_vkCmdEndRendering end_rendering = nullptr;
     PFN_vkCmdClearAttachments clear_attachments = nullptr;
@@ -1101,6 +1102,36 @@ inline void clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t l
     }
 }
 
+inline constexpr VkPipelineStageFlags2 queue_stages_copy =
+    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
+    VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+inline constexpr VkPipelineStageFlags2 queue_stages_compute =
+    queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+    VK_PIPELINE_STAGE_2_CLEAR_BIT;
+
+inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& stages, VkAccessFlags2& access) {
+    if (!vk.queue_stages) return;
+    VkAccessFlags2 allowed = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                             VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_READ_BIT |
+                             VK_ACCESS_2_HOST_WRITE_BIT;
+    if (vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+        allowed |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
+                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    stages &= vk.queue_stages;
+    if (!stages) stages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    access &= allowed;
+}
+
+inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags& stages, VkAccessFlags& access) {
+    if (!vk.queue_stages) return;
+    VkPipelineStageFlags2 s2 = stages;
+    VkAccessFlags2 a2 = access;
+    restrict_to_queue(vk, s2, a2);
+    stages = static_cast<VkPipelineStageFlags>(s2 & 0xFFFFFFFFull);
+    access = static_cast<VkAccessFlags>(a2 & 0xFFFFFFFFull);
+}
+
 // A D3D12 barrier on a volume mip covers every W slice, including on devices with maintenance9.
 inline VkImageSubresourceRange layout_range(const ResourceBinding& resource, VkImageSubresourceRange range) {
     if (resource.volume) range.layerCount = VK_REMAINING_ARRAY_LAYERS;
@@ -1111,6 +1142,8 @@ inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buf
                           const VkImageSubresourceRange& range, VkImageLayout old_layout, VkImageLayout new_layout,
                           VkAccessFlags src_access, VkPipelineStageFlags src_stages, VkAccessFlags dst_access,
                           VkPipelineStageFlags dst_stages) {
+    restrict_to_queue(vk, src_stages, src_access);
+    restrict_to_queue(vk, dst_stages, dst_access);
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.srcAccessMask = src_access;
@@ -1126,6 +1159,8 @@ inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buf
 
 inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkAccessFlags src_access,
                            VkPipelineStageFlags src_stages, VkAccessFlags dst_access, VkPipelineStageFlags dst_stages) {
+    restrict_to_queue(vk, src_stages, src_access);
+    restrict_to_queue(vk, dst_stages, dst_access);
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = src_access;
@@ -1152,7 +1187,7 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
                                   const ResourceBinding& resource, const VkImageSubresourceRange& range,
                                   VkImageLayout dst_layout) {
     const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
-    if (fmt.block <= 1 || !fmt.bytes || !vk.copy_buffer_to_image) return false;
+    if (fmt.block < 1 || !fmt.bytes || !vk.copy_buffer_to_image) return false;
     const std::uint32_t mip_begin = range.baseMipLevel;
     const std::uint32_t mip_end =
         range.levelCount == VK_REMAINING_MIP_LEVELS ? resource.mip_levels
@@ -1296,8 +1331,10 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
-        const bool compressed = fmt.block > 1;
-        if (resource.not_zeroed) {
+        const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
+        const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
+        const bool compressed = fmt.block > 1 || (!can_clear && color);
+        if (resource.not_zeroed || (!can_clear && !color)) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         } else if (compressed) {
@@ -2925,6 +2962,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             barrier.dstStageMask = dst.stages;
             barrier.srcAccessMask = src.access;
             barrier.dstAccessMask = dst.access;
+            if (barrier.srcStageMask) detail::restrict_to_queue(vk, barrier.srcStageMask, barrier.srcAccessMask);
+            if (barrier.dstStageMask) detail::restrict_to_queue(vk, barrier.dstStageMask, barrier.dstAccessMask);
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
             dependency.memoryBarrierCount = 1;
             dependency.pMemoryBarriers = &barrier;
@@ -2959,6 +2998,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.image = p.binding.image;
                 b.subresourceRange = detail::layout_range(p.binding, piece.range);
+                if (b.srcStageMask) detail::restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
+                if (b.dstStageMask) detail::restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
                 barriers.push_back(b);
             }
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
