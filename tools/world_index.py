@@ -12,10 +12,14 @@ It does not decrypt the archive table and does not extract models or textures.
 Usage:
     python -I world_index.py <archive.rpf|folder> [--out FILE] [--csv FILE]
                              [--start N] [--limit BYTES] [--max-inflate BYTES]
-                             [--archetypes-out FILE]
+                             [--archetypes-out FILE] [--entities-out FILE]
 
 ``--archetypes-out`` also writes the aggregate archetype file that ``world_names.py resolve --archetypes``
 reads: entity count per ``archetypeName`` hash and the entity's 64-bit archetype key. Counts and hashes only.
+
+``--entities-out`` writes one JSON line per complete ``CEntityDef`` (archetype hash and 64-bit key, position,
+stored rotation, scales and LOD fields), the placement input of ``world_build.py --placements``. The rows are
+derived from your own copy of the game: keep the file in your local work folder.
 
 For a 76 GB archive, bound the run with --start/--limit. Coverage and the scanned window are written to the
 JSON summary.
@@ -460,6 +464,41 @@ class ArchetypeCounts:
                             "incomplete_entities": self.incomplete}}
 
 
+class EntityRows:
+    """A ``parse_resource`` collector that writes one JSON line per complete entity (``--entities-out``)."""
+
+    FIELDS = ("position", "rotation", "scale_xy", "scale_z", "lod_level", "parent_index", "num_children",
+              "lod_dist", "child_lod_dist")
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.written = 0
+        self.incomplete = 0
+
+    def append(self, entity):
+        if not entity.get("complete", True) or entity.get("archetype") is None:
+            self.incomplete += 1
+            return
+        row = {"archetype": f"{entity['archetype']:08x}"}
+        if entity.get("archetype_key"):
+            row["key"] = f"{entity['archetype_key']:016x}"
+        for k in self.FIELDS:
+            row[k] = entity.get(k)
+        self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        self.written += 1
+
+
+class _Both:
+    """Feed one entity stream to two collectors."""
+
+    def __init__(self, *sinks):
+        self.sinks = [x for x in sinks if x is not None]
+
+    def append(self, entity):
+        for x in self.sinks:
+            x.append(entity)
+
+
 def _count(minimum):
     """An argparse type for a whole number (decimal or 0x hex) of at least `minimum`."""
     def parse(text):
@@ -485,13 +524,27 @@ def main(argv=None):
                     help="stop keeping bytes above this per resource, default 64 MiB")
     ap.add_argument("--archetypes-out",
                     help="also write entity counts and 64-bit keys per archetype hash (world_names resolve input)")
+    ap.add_argument("--entities-out",
+                    help="also write one JSON line per complete entity (world_build --placements input; local only)")
     a = ap.parse_args(argv)
     agg = ArchetypeCounts() if a.archetypes_out else None
+    ent_handle = ent = None
+    if a.entities_out:
+        os.makedirs(os.path.dirname(os.path.abspath(a.entities_out)), exist_ok=True)
+        ent_handle = open(a.entities_out, "w", encoding="utf-8", newline="\n")
+        ent = EntityRows(ent_handle)
     try:
-        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, agg)
+        sink = _Both(agg, ent) if agg is not None and ent is not None else (agg if agg is not None else ent)
+        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink)
     except (OSError, ValueError) as e:      # a missing path or --start outside an archive's data area
         print(f"ERROR: {e}", file=sys.stderr)
+        if ent_handle is not None:
+            ent_handle.close()
+            os.remove(a.entities_out)       # no partial placement file
         return 2
+    finally:
+        if ent_handle is not None:
+            ent_handle.close()
     summary = dict(stats)
     summary["resources"] = len(rows)
     summary["maps"] = sum(1 for r in rows if r["kind"] == "map")
@@ -524,6 +577,8 @@ def main(argv=None):
         with open(a.archetypes_out, "w", encoding="utf-8") as f:
             json.dump(agg.to_json(), f, indent=1, sort_keys=True)
         summary["archetype_file"] = agg.to_json()["summary"]
+    if ent is not None:
+        summary["entity_rows"] = {"written": ent.written, "incomplete": ent.incomplete}
     print(json.dumps(summary, indent=1))
     return 0
 
