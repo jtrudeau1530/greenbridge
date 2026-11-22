@@ -15,11 +15,6 @@ field.
 | exported at least one mip | 308,895 |
 | skipped | 48,220 |
 
-**Bottom line:** the gap is measurable and the codec mapping is certain, but BCPack itself is
-not byte-exactly decodable from public facts. A public candidate BC1 decoder is mip-consistent
-on a subset, but it depends on an unpublished predictor window and has no plaintext check; no
-decoder is added. The compact mip chain, which the first measurement called the next tractable
-work, is now decoded and validated below; the remaining gap is BCPack.
 **Bottom line:** the compact mip chain is decoded and validated below, and a clean-room
 stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`) now decodes the
 rANS entropy layer for all six active modes (BC1, BC3, BC4, BC5, BC6H, BC7) and rebuilds
