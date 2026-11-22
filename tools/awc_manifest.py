@@ -149,9 +149,9 @@ def _bank_rows(path: str, bank: str) -> list:
 def collect(src: str, *, out: str | None = None):
     """(parsed bank count, rows, streamed-music row count); one warning per skipped bank.
 
-    Invalid banks are reported on stderr and excluded from the bank count, so the summary cannot claim
-    that a directory was inventoried when none of its files could be read. If out is given, refuse a report
-    that would replace any input bank before reading even the first bank (including invalid ones).
+    Malformed banks are reported on stderr and excluded from the bank count. I/O errors propagate so an
+    incomplete scan cannot replace a previous manifest. If out is given, refuse a report that would replace
+    any input bank before reading even the first bank (including malformed ones).
     """
     recursive = os.path.isdir(src)
     if recursive:
@@ -173,7 +173,7 @@ def collect(src: str, *, out: str | None = None):
             bank = os.path.relpath(path, src).replace(os.sep, "/") if recursive else os.path.basename(path)
             rows += _bank_rows(path, bank)
             parsed += 1
-        except (ValueError, struct.error, IndexError, OSError) as e:
+        except (ValueError, struct.error, IndexError) as e:
             print(f"awc_manifest: warning: skipping {path}: {e}", file=sys.stderr)
     rows.sort(key=lambda r: (r["bank"].lower(), int(r["stream"], 16)))
     return parsed, rows, sum(1 for r in rows if r["streamed_music"])
@@ -236,6 +236,9 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(f"awc_manifest: error: {e}", file=sys.stderr)
         return 2
+    except OSError as e:
+        print(f"awc_manifest: error: cannot read {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
+        return 1
     try:
         write_manifest(rows, banks, streamed, fmt, a.out)
     except OSError as e:
