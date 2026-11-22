@@ -32,7 +32,7 @@ typedef int (*hipModuleLaunchKernel_t)(void *, unsigned, unsigned, unsigned, uns
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: hw_oracle code.co words < kernel-names\n"); return 2; }
     unsigned words = (unsigned)strtoul(argv[2], NULL, 0);
-    if (words < 1 || words > 4096) { fprintf(stderr, "words must be 1..4096\n"); return 2; }
+    if (words < 1 || words > 16384) { fprintf(stderr, "words must be 1..16384\n"); return 2; }
     HMODULE h = NULL;
     if (argc > 3) {
         h = LoadLibraryA(argv[3]);

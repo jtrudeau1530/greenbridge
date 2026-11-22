@@ -169,7 +169,14 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
 - `vk_command_replay_test`, `d3d12_com_test`, `d3d12_vulkan_device_test` — the D3D12 command path on
-  Vulkan: replay, the COM command objects, and the Vulkan device behind the Xbox-ABI proxy. Set
+  Vulkan: replay, the COM command objects, and the Vulkan device behind the Xbox-ABI proxy.
+- GPU tests count only validation-type errors. Loader and layer messages, such as a third-party implicit layer
+  that fails to load, are printed but don't fail the run; to silence one, set
+  `VK_LOADER_LAYERS_DISABLE=<layer name pattern>`.
+- `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
+  Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
+  out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit
+  submission, which the presenter must survive. Set
   `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
 - `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--max-bytes N]` -
   creates a shader module and, for compute shaders, a pipeline for every entry in the translator's
@@ -250,6 +257,19 @@ ctest --test-dir runtime/build -C RelWithDebInfo -R '^typeless_rtv$' --output-on
 $env:LEONIDA_VK_VALIDATION = '1'
 $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 .\runtime\build\RelWithDebInfo\d3d12_typeless_rtv_test.exe
+```
+
+### 96-bit R32G32B32 textures (D3D-62)
+
+`d3d12_rgb96_test` compares footprints, uploads, readbacks, boxes, texture-to-texture copies and CPU copies of
+`R32G32B32_FLOAT/UINT/SINT/TYPELESS` textures (2D arrays with mips, and volumes) with Windows WARP, bit for bit,
+and prints how long an upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
+is registered in CTest (`d3d12_rgb96`).
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_rgb96_test.exe
 ```
 
 RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.

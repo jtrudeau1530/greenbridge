@@ -144,6 +144,43 @@ def build_music_bank(block_tocs, samples, rate=48000):
     return bytes(out + desc + data)
 
 
+def build_music_pcm_bank(blocks=1, count=1, pcm=None):
+    """One streamed-music descriptor (one mono Opus group) plus one PCM16 stream.
+
+    The music data tag holds exactly one real chunk: a 2048-byte header subblock and one
+    2048-byte data subblock with a single CELT 20 ms mono packet. The PCM payload follows the
+    music data directly. `blocks` and `count` are what the descriptor and the chunk record
+    declare, so a test can declare more than the data tag holds.
+    """
+    chunk = 4096
+    desc = bytearray(12 + 16)
+    struct.pack_into("<III", desc, 0, blocks, chunk, 1)
+    struct.pack_into("<II", desc, 12, 0x100, 960)
+    struct.pack_into("<H", desc, 22, 48000)
+    desc[24] = 0x0B
+    music_data = bytearray(chunk)
+    struct.pack_into("<I", music_data, 4, count)
+    struct.pack_into("<HB", music_data, 2048, 1, 0x78)
+    if pcm is None:
+        pcm = struct.pack("<4h", 11, 22, 33, 44)
+    fmt = format_block(len(pcm) // 2, 48000, 0, 1)
+    header_size = 16 + 2 * 4 + 4 * 8
+    desc_at = header_size
+    mdata_at = desc_at + len(desc)
+    pcm_at = mdata_at + len(music_data)
+    fmt_at = pcm_at + len(pcm)
+    out = bytearray(b"ADAT" + struct.pack("<III", 0, 2, header_size))
+    out += struct.pack("<I", 0x20 | (2 << 29))         # music stream: tags 0x48 + 0x55
+    out += struct.pack("<I", 0x21 | (2 << 29))         # PCM stream: tags 0x76 + 0x55
+    out += struct.pack("<Q", tag(0x48, desc_at, len(desc)))
+    out += struct.pack("<Q", tag(0x55, mdata_at, len(music_data)))
+    out += struct.pack("<Q", tag(0x76, fmt_at, len(fmt)))
+    out += struct.pack("<Q", tag(0x55, pcm_at, len(pcm)))
+    if len(out) != header_size:
+        raise AssertionError("stream table/tag layout does not match header_size")
+    return bytes(out + desc + music_data + pcm + fmt)
+
+
 class WriteWavTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -433,6 +470,82 @@ class StreamedMusicTest(unittest.TestCase):
         _, music = awc.parse_awc(d)
         info = awc.music_channels(d, music[0][0], music[0][1], collect_packets=False)
         self.assertEqual((info[0][1], info[0][4], info[0][5]), (960, [], 2))
+
+
+class MalformedMusicGeometryTest(unittest.TestCase):
+    """A music descriptor that declares more blocks or subblocks than its data tag holds is
+    rejected, instead of reading past the tag into a sibling stream or past the end of the bank."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "out")
+
+    def write_bank(self, **kw):
+        path = os.path.join(self.tmp.name, "streamed.awc")
+        with open(path, "wb") as f:
+            f.write(build_music_pcm_bank(**kw))
+        return path
+
+    def test_blocks_beyond_data_tag_keep_sibling_streams(self):
+        # Before the fix: struct.error out of music_channels, so main() skipped the whole
+        # bank and the valid PCM16 stream was never exported.
+        path = self.write_bank(blocks=3)
+        with open(path, "rb") as f:
+            d = f.read()
+        _, music = awc.parse_awc(d)
+        self.assertEqual(awc.music_channels(d, *music[0]), [])
+        self.assertEqual(awc.music_channels(d, *music[0], collect_packets=False), [])
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 0, "music": 0})
+        od = os.path.join(self.out, "streamed")
+        self.assertTrue(os.path.isfile(os.path.join(od, "00000021.wav")))
+        self.assertFalse(os.path.exists(os.path.join(od, "00000100.ogg")))
+
+    def test_overread_into_sibling_payload_exports_no_music(self):
+        # The bytes right after the one real chunk are the PCM stream's payload, crafted to
+        # look like a second chunk. Before the fix its 'packet' was exported as music audio.
+        pcm = bytearray(4096)
+        struct.pack_into("<hh", pcm, 0, 11, 22)
+        struct.pack_into("<I", pcm, 4, 1)
+        struct.pack_into("<HB", pcm, 2048, 1, 0x78)
+        path = self.write_bank(blocks=2, pcm=bytes(pcm))
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 0, "music": 0})
+        od = os.path.join(self.out, "streamed")
+        self.assertFalse(os.path.exists(os.path.join(od, "00000100.ogg")))
+        self.assertEqual(read_wav(os.path.join(od, "00000021.wav"))["pcm"], bytes(pcm))
+
+    def test_subblock_run_beyond_chunk_rejected(self):
+        # count=2 needs a 2048-byte header plus 2 data subblocks, but the data tag holds
+        # only 4096 bytes. Before the fix the second subblock was read from the PCM payload.
+        path = self.write_bank(count=2)
+        with open(path, "rb") as f:
+            d = f.read()
+        _, music = awc.parse_awc(d)
+        self.assertEqual(awc.music_channels(d, *music[0]), [])
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 0, "music": 0})
+
+    def test_cli_exports_the_sibling_stream_without_skipping_the_bank(self):
+        path = self.write_bank(blocks=3)
+        result = subprocess.run([sys.executable, "-I", awc.__file__, path, self.out, "--jobs", "1"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("1 WAV", result.stdout)
+        self.assertNotIn("skip", result.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "streamed", "00000021.wav")))
+
+    def test_valid_combined_bank_still_exports_music(self):
+        path = self.write_bank()
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 0, "music": 1})
+        od = os.path.join(self.out, "streamed")
+        with open(os.path.join(od, "00000100.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(pages[-1]["granule"], 960)
+        self.assertEqual(pages[-1]["body"], bytes([0x78]))
+        self.assertTrue(os.path.isfile(os.path.join(od, "00000021.wav")))
 
 
 class MalformedBankTest(unittest.TestCase):

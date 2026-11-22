@@ -48,7 +48,12 @@ def entropy(data: bytes) -> float:
     return -sum(c / n * math.log2(c / n) for c in Counter(data).values())
 
 
-def _cstring(data: bytes, offset: int, limit: int = 512) -> str | None:
+# An MSVC decorated name can be 4,096 characters (the documented limit of a decorated name); with the 512 this
+# was, a long template import became "?" and a DLL with a long name lost its whole entry.
+NAME_LIMIT = 4097
+
+
+def _cstring(data: bytes, offset: int, limit: int = NAME_LIMIT) -> str | None:
     end = data.find(b"\0", offset, min(len(data), offset + limit))
     if end < 0:
         return None
@@ -83,12 +88,16 @@ class PeImage:
         self.subsystem = struct.unpack_from("<H", data, opt + 68)[0]
         self.dll_characteristics = struct.unpack_from("<H", data, opt + 70)[0]
 
+        # NumberOfRvaAndSizes counts the data directories: a slot past it is not a directory, whatever bytes it
+        # holds (runtime/src/pe_loader.cpp reads them the same way). The count is the dword before the table.
         opt_end = min(len(data), opt + opt_size)
         dirs = opt + (112 if self.is64 else 96)
+        count = struct.unpack_from("<I", data, dirs - 4)[0] if dirs <= opt_end else 0
         self.directories = []
         for i in range(16):
             at = dirs + i * 8
-            self.directories.append(struct.unpack_from("<II", data, at) if at + 8 <= opt_end else (0, 0))
+            present = i < count and at + 8 <= opt_end
+            self.directories.append(struct.unpack_from("<II", data, at) if present else (0, 0))
 
         # A section's data can be virtual only, so lookups past SizeOfRawData have no file bytes to read.
         self.sections = []
@@ -113,10 +122,13 @@ class PeImage:
         if rva < self.size_of_headers:
             return rva if rva < len(self.data) else None
         for s in self.sections:
-            span = max(s["vsize"], s["rawsize"])
+            # A section is VirtualSize bytes in memory (SizeOfRawData when that is 0). File bytes past it are not
+            # mapped, as in runtime/src/pe_loader.cpp: with SizeOfRawData larger than the span to the next
+            # section, max(vsize, rawsize) answered the next section's RVAs from this one's raw tail.
+            span = s["vsize"] or s["rawsize"]
             if s["rva"] <= rva < s["rva"] + span:
                 delta = rva - s["rva"]
-                if delta >= s["rawsize"]:
+                if delta >= min(s["rawsize"], span):
                     return None
                 at = s["rawptr"] + delta
                 return at if at < len(self.data) else None

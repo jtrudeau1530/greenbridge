@@ -40,6 +40,104 @@ class ArgumentTypes(unittest.TestCase):
                 rdna2spirv._shard_arg(text)
 
 
+class SourceDiscovery(unittest.TestCase):
+    """The src argument is a .s file or a folder of .s files; other names are not inputs."""
+
+    def run_main(self, src, out):
+        def spirv_tool(cmd, **kwargs):
+            tool = cmd[0]
+            if tool == "spirv-as":
+                Path(cmd[3]).write_bytes(b"new module")
+            elif tool == "spirv-val":
+                self.assertEqual(Path(cmd[-1]).read_bytes(), b"new module")
+            else:
+                self.fail(f"unexpected tool: {tool}")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(src), "--out", str(out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(output):
+            rdna2spirv.main()
+        return output.getvalue()
+
+    def test_missing_src_is_refused_with_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "spirv")
+            # The .s suffix matters: without isfile() a missing shader path would be trusted as a file.
+            p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "absent.s"), "--out", out],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("not a .s file or a folder of .s files", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_directory_ending_in_s_as_src_is_a_directory(self):
+        # A .s suffix alone is not a shader: an existing directory is still scanned as a folder.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "shader.s")
+            os.mkdir(src)
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "spirv")],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertIn("0 shaders:", p.stdout)
+
+    def test_non_file_non_dir_entry_is_skipped(self):
+        # Covers entries that are neither files nor directories (broken symlinks, FIFOs, devices).
+        # is_file() rejects them; `not is_dir()` would feed one to translate() and crash.
+        class OddEntry:
+            name = "foo.s"
+            path = os.path.join("not-a-file", "foo.s")
+
+            def is_file(self):
+                return False
+
+            def is_dir(self):
+                return False
+
+        class FakeScandir:
+            def __enter__(self):
+                return iter([OddEntry()])
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "disasm")
+            os.mkdir(src)
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", [TOOL, src, "--out", os.path.join(tmp, "spirv")]), \
+                    mock.patch.object(rdna2spirv.os, "scandir", lambda path: FakeScandir()), \
+                    redirect_stdout(output):
+                rdna2spirv.main()
+            self.assertIn("0 shaders:", output.getvalue())
+
+    def test_directory_ending_in_s_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "disasm"
+            src.mkdir()
+            (src / "ps_ok.s").write_text("\ts_endpgm\n", encoding="utf-8")
+            (root / "ps_ok.dxbc").write_bytes(b"DXBC" + bytes(28))
+            (src / "nested.s").mkdir()  # a directory that looks like a shader
+            out = root / "spirv"
+            out.mkdir()
+            stdout = self.run_main(src, out)
+            self.assertIn("1 pass spirv-val", stdout)
+            self.assertTrue((out / "ps_ok.spv").is_file())
+            self.assertFalse((out / "nested.spv").exists())
+
+    def test_non_s_file_as_src_is_refused_with_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "notes.txt")
+            Path(src).write_text("not a shader", encoding="utf-8")
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "spirv")],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+
+
 class CommandLine(unittest.TestCase):
     def test_bad_limit_or_shard_is_refused_before_out_is_made(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,6 +191,9 @@ class ValidatedOutput(unittest.TestCase):
                 mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output):
             rdna2spirv.main()
         return output.getvalue()
+
+    def test_existing_single_s_file_still_translates(self):
+        self.assertIn("1 pass spirv-val", self.translate())
 
     def test_validator_rejection_does_not_publish_binary(self):
         self.assertIn("INVALID: synthetic rejection", self.translate(reject_at="spirv-val"))

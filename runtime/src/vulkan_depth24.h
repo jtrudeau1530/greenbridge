@@ -1,3 +1,6 @@
+// Also the repack of 96-bit R32G32B32 texels, held in R32G32B32A32 images (Depth24Job::rgb96, D3D-62): the same
+// scratch, parts and lifetime, with texels of three words in the footprint and four in the scratch.
+//
 // The compute pass behind D24_UNORM_S8_UINT on a GPU without D24 (depth24.h, depth24_convert.comp). A copy between a
 // footprint and the depth aspect of such a texture goes through a scratch buffer of floats: an upload converts the
 // footprint's words into the scratch and a copy command moves the scratch into the image; a readback copies the image
@@ -54,22 +57,26 @@ public:
     // larger, so no copy is too big for the device. `whole.scratch` and `whole.scratch_offset` tell the copy where
     // the floats are.
     bool prepare(Depth24Job& whole, std::vector<Depth24Job>& parts) {
+        // A row of the footprint is `aw` words wide and a row of the scratch `sw` (a texel is one word of each for
+        // D24, three and four for 96-bit texels).
+        const std::uint64_t aw = std::uint64_t(whole.width) * whole.app_texel_words();
+        const std::uint64_t sw = std::uint64_t(whole.width) * whole.scratch_texel_words();
         if (!loaded_ || !make_pipeline() || !whole.app || !whole.width || !whole.height || !whole.slices ||
-            whole.app_offset % 4 || whole.app_row_words < whole.width ||
-            whole.app_slice_words < std::uint64_t(whole.app_row_words) * (whole.height - 1) + whole.width)
+            whole.app_offset % 4 || whole.app_row_words < aw ||
+            whole.app_slice_words < std::uint64_t(whole.app_row_words) * (whole.height - 1) + aw)
             return false;
-        const std::uint64_t w = whole.width, h = whole.height, s = whole.slices;
-        const std::uint64_t span_words = (s - 1) * whole.app_slice_words + (h - 1) * whole.app_row_words + w;
+        const std::uint64_t h = whole.height, s = whole.slices;
+        const std::uint64_t span_words = (s - 1) * whole.app_slice_words + (h - 1) * whole.app_row_words + aw;
         if (whole.app_offset + span_words * 4 > whole.app_size) return false;
-        if (!whole.scratch && !scratch(w * h * s * 4, whole.scratch, whole.scratch_offset)) return false;
+        if (!whole.scratch && !scratch(sw * h * s * 4, whole.scratch, whole.scratch_offset)) return false;
 
         // A window starts at a multiple of 256 (the largest minStorageBufferOffsetAlignment), which costs up to 252 bytes.
         constexpr std::uint64_t slack = 256;
         const std::uint64_t limit = max_range_;
         const auto app_bytes = [&](std::uint64_t slices, std::uint64_t rows) {
-            return ((slices - 1) * whole.app_slice_words + (rows - 1) * whole.app_row_words + w) * 4 + slack;
+            return ((slices - 1) * whole.app_slice_words + (rows - 1) * whole.app_row_words + aw) * 4 + slack;
         };
-        const auto scratch_bytes = [&](std::uint64_t slices, std::uint64_t rows) { return slices * rows * w * 4 + slack; };
+        const auto scratch_bytes = [&](std::uint64_t slices, std::uint64_t rows) { return slices * rows * sw * 4 + slack; };
         std::uint64_t slices_per_part = 0;  // 0: a slice alone is too big
         while (slices_per_part < s && app_bytes(slices_per_part + 1, h) <= limit && scratch_bytes(slices_per_part + 1, h) <= limit)
             ++slices_per_part;
@@ -89,7 +96,7 @@ public:
                 part.slices = std::uint32_t(n);
                 part.height = std::uint32_t(rows);
                 part.app_offset = whole.app_offset + (z * whole.app_slice_words + y * whole.app_row_words) * 4;
-                part.scratch_offset = whole.scratch_offset + ((z * h + y) * w) * 4;
+                part.scratch_offset = whole.scratch_offset + ((z * h + y) * sw) * 4;
                 if (!make_part(part, whole.app_size)) return false;
                 parts.push_back(part);
             }
@@ -103,8 +110,8 @@ public:
     void run(VkCommandBuffer command_buffer, const Depth24Job& job) const {
         struct Push {
             std::uint32_t width, height, slices, to_float, app_base, app_row, app_slice, scratch_base;
-        } push{job.width, job.height, job.slices, job.to_float ? 1u : 0u, job.app_base_words, job.app_row_words,
-               job.app_slice_words, job.scratch_base_words};
+        } push{job.width, job.height, job.slices, (job.to_float ? 1u : 0u) | (job.rgb96 ? 2u : 0u), job.app_base_words,
+               job.app_row_words, job.app_slice_words, job.scratch_base_words};
         vk_.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vk_.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &job.set, 0,
                                     nullptr);
@@ -238,10 +245,11 @@ private:
     bool make_part(Depth24Job& part, std::uint64_t app_size) {
         constexpr std::uint64_t alignment = 256;
         const std::uint64_t span = ((std::uint64_t(part.slices) - 1) * part.app_slice_words +
-                                    (std::uint64_t(part.height) - 1) * part.app_row_words + part.width) * 4;
+                                    (std::uint64_t(part.height) - 1) * part.app_row_words +
+                                    std::uint64_t(part.width) * part.app_texel_words()) * 4;
         const std::uint64_t window = part.app_offset / alignment * alignment;
         const std::uint64_t range = part.app_offset - window + span;
-        const std::uint64_t tight = std::uint64_t(part.width) * part.height * part.slices * 4;
+        const std::uint64_t tight = std::uint64_t(part.width) * part.scratch_texel_words() * part.height * part.slices * 4;
         const std::uint64_t scratch_window = part.scratch_offset / alignment * alignment;
         const std::uint64_t scratch_range = part.scratch_offset - scratch_window + tight;
         if (window + range > app_size) return false;

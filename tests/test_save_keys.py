@@ -216,5 +216,44 @@ class DirectoryScanTest(unittest.TestCase):
             self.assertEqual(sk.collect_keys([path]), sk.collect_keys([tmp]))
 
 
+
+class LongIdentifiers(unittest.TestCase):
+    """harvest() takes a run of identifier characters whole: it used to cut after 81 and go on in the rest."""
+
+    def harvest(self, *chunks):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "strings.bin")
+            with open(path, "wb") as f:
+                for chunk in chunks:
+                    f.write(b"\0" + chunk + b"\0")
+            return sk.harvest([path])
+
+    def test_a_name_longer_than_81_characters_is_one_name(self):
+        name = b"A" * 81 + b"TailPart"
+        got = self.harvest(name, b"Short")
+        self.assertIn(name, got)
+        self.assertIn(b"Short", got)
+        self.assertNotIn(b"A" * 81, got)       # the old cut
+        self.assertNotIn(b"TailPart", got)     # and the name it invented from the rest
+
+    def test_the_same_inside_a_zlib_stream(self):
+        name = b"Group_" + b"x" * 120
+        got = self.harvest(zlib.compress(b"<Item>" + name + b"</Item>"))
+        self.assertIn(name, got)
+        self.assertNotIn(name[81:], got)
+
+    def test_a_run_past_the_limit_is_left_out_whole(self):
+        blob = b"Q" * (sk.IDENT_MAX + 1)
+        got = self.harvest(blob, b"Q" * sk.IDENT_MAX)
+        self.assertIn(b"Q" * sk.IDENT_MAX, got)
+        self.assertFalse([name for name in got if len(name) > sk.IDENT_MAX])
+        self.assertNotIn(b"Q", got)
+        self.assertEqual({name for name in got if set(name) == {ord("Q")}}, {b"Q" * sk.IDENT_MAX})
+
+    def test_a_127_character_name_is_harvested(self):
+        name = b"Vehicle" + b"Part" * 30
+        self.assertEqual(self.harvest(name), {name})
+
+
 if __name__ == "__main__":
     unittest.main()

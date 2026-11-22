@@ -61,6 +61,25 @@ failures on both an RTX 5070 Ti Laptop and a Radeon 610M with the `426023a` scri
 either matching pair is clean. If you cannot build locally, the `runtime-windows` artifact of the Runtime workflow
 belongs to the commit that built it; check that commit out as well.
 
+### Without a compiler: a CI-built runtime
+
+If you cannot build the test programs locally, the Runtime workflow publishes them as the `runtime-windows`
+artifact of its own commit. Open the run for that commit under Actions -> Runtime, download and unzip
+`runtime-windows`, and pass the unzipped folder to `--build`:
+
+```sh
+python -I scripts/run_gpu_tests.py --build ~/Downloads/runtime-windows
+```
+
+`build.py` and `check.py` take the same folder as their second argument:
+
+```sh
+python -I runtime/test/shaders/build.py <out dir>
+python -I runtime/test/shaders/check.py <out dir> ~/Downloads/runtime-windows
+```
+
+The artifact belongs to the commit that built it, so run the scripts from that commit as well (see the note above).
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
@@ -81,7 +100,7 @@ python -I runtime/test/shaders/check.py <out dir> <folder with the test programs
 ## The Windows runtime on Linux, under Wine or Proton
 
 The Linux build above makes only the Vulkan programs. The loader (`gta6rt`), its shims and their tests are Windows
-programs; `runtime/cmake/clang-cl-xwin.cmake` cross-compiles them on Linux with clang-cl and lld-link (LLVM 19+: the
+programs; `runtime/cmake/clang-cl-xwin.cmake` cross-compiles them on Linux with clang-cl and lld-link (LLVM 19+, but not 22.1.7 or 22.1.8 (see Known problems): the
 MSVC STL that xwin lays out rejects older Clang; versioned names go in with `-DCMAKE_CXX_COMPILER=clang-cl-19` etc.)
 against an MSVC CRT and Windows SDK that [xwin](https://github.com/Jake-Shadle/xwin) downloads from Microsoft
 (running it means accepting Microsoft's licence), and `ctest` runs them through Wine:
@@ -195,6 +214,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | `ps_bary` and `ps_uniform_branch` fail by about 0.9 | The GPU runs pixel shaders wave64 without fragment barycentrics (GCN3 and RDNA1 on RADV), or an old AMD Windows driver (22.40) | Current `main` skips them on such devices; on Windows, update the driver |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
+| `ctest` lists `fsr_dispatch` and `bvh_builder` as failed (`Not Run`) after clang-cl hits an internal compiler error in `fsr_dispatch_test.cpp` and `bvh_builder_test.cpp` | clang-cl 22.1.8 on Fedora (Linux cross-build) and Windows, plus 22.1.7 on Windows | Use clang-cl 23.1.6 (both files compile on Windows) |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
 | `vulkaninfo` lists `Microsoft Direct3D12 (<gpu>)` next to the real GPU and the tests run on it | The Windows "OpenCL™, OpenGL® and Vulkan® Compatibility Pack" installs Mesa's Dozen, a Vulkan-on-D3D12 layer that reports `DISCRETE_GPU` like the native card | Current `main` prefers a native ICD over Microsoft's vendor (`0x1414`) in every harness; set `LEONIDA_VK_DEVICE=<part of the real GPU name>` to select explicitly. See #915. |
 | A GPU test that uses `image_load` (or lighting built from real shaders) reads zeros from its image; @Silliana saw every texel except pixel (0,0) come back zero in their own layer (#603, not reproduced here) | In this runtime the shader turns the T# words into an index through the descriptor hash table (`runtime/src/descriptor_table.h`: a miss gives index 0), and index 0 is a 1×1 image of zeros (`runtime/src/vulkan_bindless.h`), so a hand-built or zeroed T# that was never registered reads zeros even at (0,0). The translator does not compare coordinates with the T# size, and `cs_imgload.asm` only uses its T# words as a hash key | Register the descriptor through the runtime (for D3D12, create it with `CreateShaderResourceView`) so its T# hits the table, with the image's real width and height (stored as size − 1, see `runtime/src/gfx10_descriptors.h`) |
