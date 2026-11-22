@@ -530,6 +530,41 @@ def _file_identity(path):
     return stat.st_dev, stat.st_ino
 
 
+def _resolve_report_path(path):
+    if os.name != "nt":
+        return os.path.realpath(path)
+    if not path.startswith("\\\\?\\"):
+        # GetFullPathName normalizes ordinary Windows paths the same way opening them does.
+        return os.path.realpath(os.path.abspath(path))
+
+    # realpath can trim literal trailing dots and spaces from missing verbatim components.
+    # Resolve the existing ancestor and append the missing components as written.
+    missing = []
+    while not os.path.lexists(path):
+        parent, name = os.path.split(path)
+        if not name:
+            break
+        missing.append(name)
+        path = parent
+    return os.path.join(os.path.realpath(path), *reversed(missing))
+
+
+def _pending_path_key(path):
+    path = os.path.normcase(_resolve_report_path(path))
+    if os.name != "nt":
+        return path
+
+    # Drive and UNC paths can also be spelled using the extended-length prefix.
+    extended_prefix = "\\\\?\\"
+    unc_prefix = extended_prefix + "unc\\"
+    if path.startswith(unc_prefix):
+        return "\\\\" + path[len(unc_prefix):]
+    drive, _ = os.path.splitdrive(path)
+    if drive.startswith(extended_prefix) and len(drive) == len(extended_prefix) + 2 and drive.endswith(":"):
+        return path[len(extended_prefix):]
+    return path
+
+
 def _check_report_paths(parser, reports, source, directory_files):
     existing, pending = {}, {}
     for flag, path in reports:
@@ -537,7 +572,7 @@ def _check_report_paths(parser, reports, source, directory_files):
             continue
         key = _file_identity(path)
         if key is None:
-            key = os.path.normcase(os.path.realpath(path))
+            key = _pending_path_key(path)
             destinations = pending
         else:
             destinations = existing
@@ -547,7 +582,7 @@ def _check_report_paths(parser, reports, source, directory_files):
 
     source_id = _file_identity(source)
     if source_id is None:
-        flag = pending.get(os.path.normcase(os.path.realpath(source)))
+        flag = pending.get(_pending_path_key(source))
     else:
         flag = existing.get(source_id)
     if flag:
