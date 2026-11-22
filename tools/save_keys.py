@@ -163,7 +163,9 @@ def iter_inputs(paths):
         if os.path.isdir(p):
             for dp, _, fs in os.walk(p):
                 for f in sorted(fs):
-                    if f.endswith(".json") or f.endswith(".bin") or "." not in f:
+                    # .jsav is the tool's primary input; skipping it here made a directory scan
+                    # silently miss the very saves this command is for.
+                    if f.lower().endswith((".json", ".bin", ".jsav")) or "." not in f:
                         yield read(os.path.join(dp, f))
         else:
             yield read(p)
