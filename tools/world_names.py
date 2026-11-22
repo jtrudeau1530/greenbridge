@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import collections
-import html
 import json
 import os
 import re
@@ -182,6 +181,20 @@ def _collisions(table: dict[int, set[str]]) -> int:
     return sum(1 for names in table.values() if len(names) > 1)
 
 
+_XML_ENTITY = re.compile(r"&(?:(amp|lt|gt|quot|apos)|#([0-9]+)|#x([0-9A-Fa-f]+));")
+_XML_NAMED = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+
+
+def _xml_unescape(text: str) -> str:
+    """Decode XML's five named entities and numeric character references; leave anything else as written."""
+    def one(m: re.Match) -> str:
+        if m[1]:
+            return _XML_NAMED[m[1]]
+        code = int(m[2]) if m[2] else int(m[3], 16)
+        return chr(code) if 0 < code <= 0x10FFFF else m[0]
+    return _XML_ENTITY.sub(one, text)
+
+
 class NameDictionary:
     """Hash -> names, with exact and derived (LOD spelling) tables kept apart."""
 
@@ -270,13 +283,14 @@ class NameDictionary:
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             text = handle.read()
 
-        # Comments are dropped (an unterminated one runs to the end), CDATA and processing instructions are kept.
-        text = re.sub(r"(<!\[CDATA\[.*?\]\]>|<\?.*?\?>)|<!--.*?(?:-->|\Z)",
+        # Comments are dropped, CDATA and processing instructions are kept. The input may be many files joined
+        # together, so an unterminated comment ends at the next XML declaration, not at the end of the input.
+        text = re.sub(r"(<!\[CDATA\[.*?\]\]>|<\?.*?\?>)|<!--.*?(?:-->|(?=<\?xml)|\Z)",
                       lambda m: m[1] or "", text, flags=re.S)
 
         added = 0
         for match in re.finditer(r"<filename>(.*?)</filename>", text, re.S):
-            raw = html.unescape(match.group(1)).strip().replace("\\", "/")
+            raw = _xml_unescape(match.group(1)).strip().replace("\\", "/")
             base = raw.rsplit("/", 1)[-1]
             added += int(self.add(base, source=source + "_filename"))
             if "." in base:
@@ -285,7 +299,7 @@ class NameDictionary:
             raw = match.group(1)
             if "<" in raw:
                 continue
-            value = html.unescape(raw).strip()
+            value = _xml_unescape(raw).strip()
             if value and len(value) <= 120:
                 added += int(self.add(value, source=source + "_name"))
         return added
