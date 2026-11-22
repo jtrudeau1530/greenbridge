@@ -180,6 +180,18 @@ class FspxStage(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
         self.assertEqual(self.run_step(), [])
 
+    def test_missing_cached_module_is_rebuilt(self) -> None:
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(), [])
+        module = os.path.join(self.spirv, "upscaler_00.spv")
+        os.remove(module)
+
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        with open(module, "rb") as f:
+            self.assertEqual(f.read(), b"synthetic module")
+        self.assertEqual(self.run_step(), [])
+
     def test_no_dll_no_step(self):
         os.remove(self.dll)
         self.assertEqual(self.run_step(), [])
