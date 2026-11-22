@@ -28,7 +28,7 @@ struct Ref {
     T* operator->() const { return p; }
 };
 
-int exercise_shader_cache(ID3D12Device9* dev, const char* label) {
+int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool test_null_in_params) {
     // {7c83f2a1-4b5e-4d19-9a32-1f2e3d4c5b6a}
     const GUID id1 = {0x7c83f2a1, 0x4b5e, 0x4d19, {0x9a, 0x32, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a}};
     const GUID id2 = {0x1b74e9d0, 0x2c3a, 0x4f81, {0x8e, 0x11, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f}};
@@ -41,7 +41,12 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label) {
     desc.Version = 1;
 
     // 1. CreateShaderCacheSession argument validation & capability check (null output -> S_FALSE).
-    EXPECT(dev->CreateShaderCacheSession(nullptr, __uuidof(ID3D12ShaderCacheSession), nullptr) == E_INVALIDARG);
+    // Passing nullptr for SAL _In_/_Inout_ parameters (pDesc, pKey, pValue, pValueSize) is undefined
+    // behaviour on older in-box Windows D3D12 runtimes (e.g. Win11 23H2 22621.5415 AVs), so those
+    // null-pointer guards are exercised only on the Vulkan layer.
+    if (test_null_in_params) {
+        EXPECT(dev->CreateShaderCacheSession(nullptr, __uuidof(ID3D12ShaderCacheSession), nullptr) == E_INVALIDARG);
+    }
     EXPECT(dev->CreateShaderCacheSession(&desc, __uuidof(ID3D12ShaderCacheSession), nullptr) == S_FALSE);
 
     D3D12_SHADER_CACHE_SESSION_DESC bad = desc;
@@ -76,13 +81,18 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label) {
     UINT sz = sizeof(out_v);
     EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_NOT_FOUND);
     EXPECT(sz == sizeof(out_v));
-    EXPECT(s1->FindValue(nullptr, sizeof(k1), &out_v, &sz) == E_INVALIDARG);
+    if (test_null_in_params) {
+        EXPECT(s1->FindValue(nullptr, sizeof(k1), &out_v, &sz) == E_INVALIDARG);
+    }
     EXPECT(s1->FindValue(&k1, 0, &out_v, &sz) == E_INVALIDARG);
-    EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, nullptr) == E_INVALIDARG);
-
-    EXPECT(s1->StoreValue(nullptr, sizeof(k1), &v1, sizeof(v1)) == E_INVALIDARG);
+    if (test_null_in_params) {
+        EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, nullptr) == E_INVALIDARG);
+        EXPECT(s1->StoreValue(nullptr, sizeof(k1), &v1, sizeof(v1)) == E_INVALIDARG);
+    }
     EXPECT(s1->StoreValue(&k1, 0, &v1, sizeof(v1)) == E_INVALIDARG);
-    EXPECT(s1->StoreValue(&k1, sizeof(k1), nullptr, sizeof(v1)) == E_INVALIDARG);
+    if (test_null_in_params) {
+        EXPECT(s1->StoreValue(&k1, sizeof(k1), nullptr, sizeof(v1)) == E_INVALIDARG);
+    }
     EXPECT(s1->StoreValue(&k1, sizeof(k1), &v1, 0) == E_INVALIDARG);
     EXPECT(s1->StoreValue(&k1, sizeof(k1), &v1, sizeof(v1)) == S_OK);
     EXPECT(s1->StoreValue(&k1, sizeof(k1), &v1, sizeof(v1)) == DXGI_ERROR_ALREADY_EXISTS);
@@ -151,6 +161,7 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label) {
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     vktest::Device d;
     const auto status = d.initialize();
     if (status == vktest::DeviceStatus::unavailable) {
@@ -170,7 +181,7 @@ int main() {
 
     Ref<ID3D12Device9> device;
     EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
-    EXPECT(exercise_shader_cache(device.p, "Vulkan layer") == 0);
+    EXPECT(exercise_shader_cache(device.p, "Vulkan layer", true) == 0);
 
     // Layer-specific ShaderCacheControl CLEAR / DISABLE / ENABLE, default limits, DXGI_ERROR_CACHE_FULL,
     // version-mismatch handling, MEMORY teardown discard, and malformed-disk-file bounds checks.
@@ -398,7 +409,7 @@ int main() {
         if (copycmp::create_host(host, adapter_name)) {
             Ref<ID3D12Device9> host9;
             if (SUCCEEDED(host.p->QueryInterface(IID_PPV_ARGS(&host9.p))) && host9.p) {
-                EXPECT(exercise_shader_cache(host9.p, adapter_name.c_str()) == 0);
+                EXPECT(exercise_shader_cache(host9.p, adapter_name.c_str(), false) == 0);
             }
         }
     }
