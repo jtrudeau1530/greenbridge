@@ -159,9 +159,7 @@ The most frequent type ids are `0x88560988` (721 streams), `0x51e5606c` (220), `
 separate 18-stream group (`PSIN` at offset 0, 0.21 MB stored / 0.65 MB inflated); `docs/design.md` already
 describes `PSIN` as PSO metadata, and these bytes do not show that it is animation data.
 
-<a id="packed-clip-streams"></a>
-
-### Auxiliary tables on the second system page
+### Packed clip streams
 
 1,781 streams start with:
 
@@ -191,6 +189,12 @@ In every pair the declared payload lengths fit within page two. The instance blo
 and none overlaps the auxiliary table or its payloads. The same framing is measured independently for
 [navigation resources](navmesh.md#schema-tables-q28-q30-q38-q40). The meaning of the individual payloads
 in the animation archive remains open.
+The leading u32 is 2 or 3; the next four bytes are constant. Stored 18,168,950 bytes, inflated 32,691,776 bytes.
+1,767 distinct payloads (duplicates up to 10 copies). Entropy 4.03–7.79 bits/byte, so these are packed/quantized
+bitstreams rather than zlib streams. The 24-byte header has five small fields after the type; the measured
+version split and the track side are below. No keyframe values are claimed. Each of these streams is the second
+system page of a `0DRP` resource, the one right after its `0DRP` stream (see [Keyframe
+decoding](#keyframe-decoding)).
 
 ### Partial clip decode
 
@@ -218,9 +222,19 @@ Bone masks:
 The 2,064-byte motionmatcher table also re-parses cleanly: 15 names, parent entries, and all 8 record hashes
 resolve.
 
-An earlier search of the 1,781 auxiliary-table pages found none of the 30 known bone hashes or nine tested
-clip-name hashes as 32-bit or 64-bit values. No keyframe values have been recovered from their tagged payloads.
-The clip dictionaries' keyframes are decoded in [Keyframe decoding](#keyframe-decoding).
+Header fields measured over the 1,781 streams:
+
+- `+0x04` is always `0x00000101`.
+- Version 3 (1,253 streams): `+0x0C = 0x0113` on 1,235, `+0x14 = 0x0207` on all 1,253.
+- Version 2 (528 streams): `+0x0C = 0x0207` on all 528; `+0x14` is a 32-bit hash.
+- `+0x08` is the leading packed-region length; the first 16-byte `(hash, 0, index, 0)` table follows a short
+  sub-header (for example at `0x2C8`, `0x4C8`, `0x6C8` in one page).
+
+**Still missing:** the page → packed-stream join. None of the 1,781 streams contains any of the 30 known bone
+hashes or the nine tested clip-name hashes, as 32-bit or 64-bit values; only the shared track-type hash
+`0x9A7B6E6D` crosses over. The track records and quantization-like blocks are visible, but the exact component
+count/order/delta coding did not survive a unit-quaternion norm test. No keyframe value is claimed for these
+`0DRP` pages. The clip dictionaries' keyframes are decoded in [Keyframe decoding](#keyframe-decoding).
 
 ### Tail `RBF0` rig-set manager
 
@@ -402,7 +416,7 @@ The other classes fit the same framing:
   273 sit inside dictionaries.
 - **The `0DRP` (version 122) streams** are a different resource kind with the same page map. Their system pages are
   one stream in 2,892 resources and two in 19,931. In 19,909 of the two-page ones the second page is the next stream;
-  in the other 22 it is not. Their second pages include all 1,781 pages classified as `clip-stream` and all 1,371 type-hash
+  in the other 22 it is not. Their second pages include all 1,781 "2/3 packed clip streams" and all 1,371 type-hash
   streams. So those classes are not stand-alone clip payloads: each one is the page right after a `0DRP` stream in
   the same resource. The `0DRP` root objects are not decoded here. Neither are the 324 `MoVE` streams, which are not
   pages of either kind.
@@ -730,11 +744,13 @@ the archetypes reference; the per-bone mapping onto each model's skeleton still 
    55 are referenced by one distinct asset name each. The remaining 104 are shared. Across their local
    animation packs, 63 dictionaries have nonzero rotation or translation bone hashes and 96 have none.
    All 63 fall below the 90% reference-skeleton threshold used above.
+measured. Still open in ASSET-20: the `0DRP` "2/3 packed clip streams" ([above](#packed-clip-streams)) and which
+model or skeleton each non-humanoid clip dictionary drives.
 
 ## Readable, compressed and still opaque
 
 - **Readable:** all 273 name tables (2,298 paths), the `0DRP` version/page count, 1,371 type-hash headers,
-  1,781 auxiliary tables with two or three tagged payloads, two named clip records (durations and 0x48-byte track
+  1,781 clip-stream headers with their version split, two named clip records (durations and 0x48-byte track
   arrays), the 63/38 and 12/38 bone masks (all 38 finger hashes resolve), the RBF0 mapping (1,126 rig sets /
   6,677 entries / 3,669 rigs), one standalone bone-name list, and three motion matcher streams with embedded
   bone tables (30-name union; 19 bone hashes present). Some `MoVE` and zero-prefixed pages expose counts and
@@ -748,7 +764,7 @@ the archetypes reference; the per-bone mapping onto each model's skeleton still 
   sampled positions.
   No Oodle signature is known from these bytes; none is guessed.
 - **Still opaque:** high-entropy blocks inside `other` and zero-prefixed pages (4 KiB blocks up to 7.96
-  bits/byte), the `0DRP` root objects and the meaning of their auxiliary payloads, the
+  bits/byte), the `0DRP` root objects and the packed component coding of their 1,781 clip-stream pages, the
   fields of `MoVE` beyond the version/hash/size words, the 56 empty rig sets, the RBF0 numeric fields, and
   the rig→skeleton link (0 measured matches). Of the 30 bone names, 19 have a confirmed stored hash and 11 do
   not; the four motionmatcher paths bind to embedded tables, but not to an RBF0 rig.
@@ -781,10 +797,11 @@ The bytes support **new RAGE resource pages**, not the GTA V `YCD`/`RSC7` family
 - `SKEL_*` bone tables in plain and front-coded forms.
 - `RBF0` rig-set metadata (`rage__crRigSetManager`): 1,126 rig sets, 6,677 source→rig entries and 3,669 distinct
   rigs, with source tags and group strings. The rig→skeleton key is not in RBF0 or the skeleton streams.
-- `MoVE` (version 19) streams and second pages containing two or three tagged auxiliary payloads.
+- `MoVE` (version 19) and the 2/3 clip streams as the animation payloads; neither is zlib inside the page.
 - No `YCD`, `YDD`, `YLD`, `YFD`, `RSC7` or `RSC8` at any stream start.
 
-The interpretation of `MoVE` as motion-matching data remains a hypothesis.
+`MoVE` is probably motion/motion-matching data and the 2/3 streams are probably packed clips, but only the bytes
+above are measured. Treat those two labels as hypotheses until a decoder reads a known clip.
 
 ### What the bytes do not prove
 
@@ -792,8 +809,9 @@ The interpretation of `MoVE` as motion-matching data remains a hypothesis.
   decoded, and the marker is not proven to be animation-specific.
 - `MoVE` is named like motion data; the version, 32-bit hash and payload-size words are mapped, the remaining
   fields are not.
-- The two- and three-entry auxiliary tables bound their tagged payloads. Their contents have yet to be linked
-  to a clip. The clip dictionaries' keyframes are decoded in [Keyframe decoding](#keyframe-decoding).
+- The 2/3 streams expose header variants, track arrays and bone masks. They are the second system pages of `0DRP`
+  resources, whose root objects and packed coding are not decoded. The keyframes of the clip dictionaries are
+  decoded; see [Keyframe decoding](#keyframe-decoding).
 - The `RBF0` rig-set/rig/group entries are parsed. The numeric fields, the schema type table and the
   rig→skeleton reference are not; the measured skeleton match is 0.
 - The three motion matcher streams embed bone tables, but whether those define a full skeleton or only the
@@ -818,10 +836,12 @@ The interpretation of `MoVE` as motion-matching data remains a hypothesis.
    the stem (path without `pack:/` and without the final extension). The record stride varies (16 or 32 bytes in
    sampled tables), so do not assume one layout. The recurring `0x98e1750c` is `joaat32("bonerotation")`, a
    track type.
-5. **Trace the auxiliary payloads to their consumers.** Use the parent's `+0x40` table to bound each payload
-   before checking its fields against the root object's schema. The table framing alone establishes no
-   association with the two named page-0 clips. `MoVE` (version 19, header 46 bytes, hash at `+0x14`, payload
-   size at `+0x18`) is a separate format.
+5. **Join rigs to clips, then decode a known clip.** Two named clips are already followed to page-0 payloads
+   (durations and track arrays above). The missing link is the **page → packed stream**: none of the 1,781
+   packed streams contains the 30 known bone hashes or the nine tested clip hashes. Map the track records and
+   the 16-byte `(hash, 0, index, 0)` tables first, then test a component count/order/delta coding against a
+   unit-quaternion norm. `MoVE` (version 19, header 46 bytes, hash at `+0x14`, payload size at `+0x18`) is a
+   second, separate format; map its fields only after a known payload decodes.
 6. **Keep the compression boundary explicit.** Outer RPF9 zlib is understood. Do not add a zlib pass inside a
    page without evidence; the sampled pages had no valid nested stream.
 7. **Re-run the model cross-check with the full export.** The current 1,350-model data.rpf manifest has bone
@@ -843,8 +863,7 @@ python -I tools/anim_index.py <work>\anim-carve <work>\anim-index.json
 python -I tools/anim_clips.py <package>\anim.rpf <work>\anim-clips.json --jobs 8
 ```
 
-`tools/anim_index.py` reports `MoVE`, `0DRP`, `pack:/`, `SKEL_`, `RBF0`, `PSIN`, type-hash and the two- or
-three-entry auxiliary table signature (historically labelled `clip-stream`),
+`tools/anim_index.py` reports `MoVE`, `0DRP`, `pack:/`, `SKEL_`, `RBF0`, `PSIN`, type-hash and 2/3 clip headers,
 plus `raw:<hex>` for anything it does not recognise. It writes no payloads. `--start` must be 0 or more and
 `--limit` at least 1 (decimal or `0x` hex); an out-of-range value stops with a one-line error and exit code 2
 before an index is written.
