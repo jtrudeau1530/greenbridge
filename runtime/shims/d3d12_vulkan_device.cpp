@@ -472,6 +472,10 @@ struct DeviceState {
                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (info.conditional_rendering) result.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        // D3D12 reserved buffers are visible to DIRECT, COPY and COMPUTE queues without exposing Vulkan
+        // queue-family ownership. Their tile bindings and accesses may use distinct families, so match the
+        // CONCURRENT sharing policy used for ordinary buffers and the GPU address arena.
+        share(result);
         return result;
     }
 
@@ -7518,7 +7522,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         q.pQueuePriorities = priorities.data();
         queue_infos.push_back(q);
     }
-    const auto picked = leonida::pick_queue_families(families, info.queue_family);
+    const auto preferred = leonida::pick_queue_families(families, info.queue_family);
+    // D3D12 permits UpdateTileMappings on DIRECT, COMPUTE and COPY queues. Vulkan requires
+    // VK_QUEUE_SPARSE_BINDING_BIT on the VkQueue passed to vkQueueBindSparse. A dedicated
+    // async family without that capability cannot implement all D3D12 queue operations;
+    // fall back to the graphics family when sparse buffers are supported. QueueKind still
+    // enforces the D3D12 COPY/COMPUTE stage restrictions on the more capable family.
+    const bool sparse_buffers = chosen_features.sparseBinding && chosen_features.sparseResidencyBuffer &&
+                                chosen_features.sparseResidencyAliased;
+    const auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
     std::uint32_t compute_count = 0, copy_count = 0;
     if (picked.compute != info.queue_family) {
         info.compute_family = picked.compute;
