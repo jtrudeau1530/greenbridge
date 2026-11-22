@@ -153,7 +153,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     VkPhysicalDeviceMemoryProperties memory{};
     d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical,
                                                                                                 &memory);
-    context.set_binary_occlusion_memory(memory);
+    context.set_occlusion_resolve_memory(memory);
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok());
     constexpr QueryHeapId query_id = 1, stats_id = 2;

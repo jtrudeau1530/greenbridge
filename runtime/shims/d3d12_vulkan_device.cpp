@@ -1493,7 +1493,7 @@ public:
             if (family.timestampValidBits)
                 state_.context->set_timestamp_period(properties.limits.timestampPeriod);
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
-                state_.context->set_binary_occlusion_memory(state_.memory);
+                state_.context->set_occlusion_resolve_memory(state_.memory);
         }
 
         if (info.debug_utils) {
