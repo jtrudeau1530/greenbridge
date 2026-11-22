@@ -1044,5 +1044,68 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(carry1, 1)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 edge cases, subnormals, signed zero, and NaN behavior."""
+
+    def test_subnormal_multiplication_gradual_underflow(self) -> None:
+        # Smallest subnormal * 2.0 = 2 * 2^-24
+        res = ref_mul_f16(MIN_SUBNORMAL_F16, POS_TWO_F16)
+        self.assertEqual(res, 0x0002)
+
+        # Max subnormal (1023 * 2^-24) * 0.5 = 511.5 * 2^-24 -> rounds to nearest even (512, 0x0200)
+        res_half = ref_mul_f16(MAX_SUBNORMAL_F16, POS_HALF_F16)
+        self.assertEqual(res_half, 0x0200)
+
+        # Complete underflow to zero
+        res_zero = ref_mul_f16(MIN_SUBNORMAL_F16, MIN_SUBNORMAL_F16)
+        self.assertEqual(res_zero, POS_ZERO_F16)
+
+    def test_max_finite_overflow_boundaries(self) -> None:
+        # Max finite * 1.0 == max finite
+        self.assertEqual(ref_mul_f16(MAX_FINITE_F16, POS_ONE_F16), MAX_FINITE_F16)
+        # Max finite * -1.0 == -max finite
+        self.assertEqual(ref_mul_f16(MAX_FINITE_F16, NEG_ONE_F16), MAX_FINITE_F16 | SIGN_MASK_F16)
+
+        # Max finite * 2.0 overflows to +inf
+        self.assertEqual(ref_mul_f16(MAX_FINITE_F16, POS_TWO_F16), POS_INF_F16)
+        # -Max finite * 2.0 overflows to -inf
+        self.assertEqual(ref_mul_f16(MAX_FINITE_F16 | SIGN_MASK_F16, POS_TWO_F16), NEG_INF_F16)
+
+    def test_signed_zero_combinations(self) -> None:
+        # +0 * +0 = +0
+        self.assertEqual(ref_mul_f16(POS_ZERO_F16, POS_ZERO_F16), POS_ZERO_F16)
+        # +0 * -0 = -0
+        self.assertEqual(ref_mul_f16(POS_ZERO_F16, NEG_ZERO_F16), NEG_ZERO_F16)
+        # -0 * -0 = +0
+        self.assertEqual(ref_mul_f16(NEG_ZERO_F16, NEG_ZERO_F16), POS_ZERO_F16)
+        # -0 * 5.0 = -0
+        self.assertEqual(ref_mul_f16(NEG_ZERO_F16, f16_to_bits(5.0)), NEG_ZERO_F16)
+        # -0 * -5.0 = +0
+        self.assertEqual(ref_mul_f16(NEG_ZERO_F16, f16_to_bits(-5.0)), POS_ZERO_F16)
+
+    def test_infinity_arithmetic(self) -> None:
+        # +inf * +inf = +inf
+        self.assertEqual(ref_mul_f16(POS_INF_F16, POS_INF_F16), POS_INF_F16)
+        # +inf * -inf = -inf
+        self.assertEqual(ref_mul_f16(POS_INF_F16, NEG_INF_F16), NEG_INF_F16)
+        # -inf * -inf = +inf
+        self.assertEqual(ref_mul_f16(NEG_INF_F16, NEG_INF_F16), POS_INF_F16)
+
+        # inf * -0.5 = -inf
+        self.assertEqual(ref_mul_f16(POS_INF_F16, NEG_HALF_F16), NEG_INF_F16)
+
+    def test_nan_quietening_and_clamp_rule(self) -> None:
+        # SNaN quietening: bit 9 (0x0200) becomes 1
+        snan = 0x7D55
+        res = ref_mul_f16(snan, POS_ONE_F16)
+        self.assertTrue(is_qnan_f16(res))
+        self.assertEqual(res, snan | QNAN_BIT_F16)
+
+        # NaN with clamp modifier produces +0.0 under RDNA2 rules
+        qnan = CANONICAL_QNAN_F16
+        self.assertEqual(ref_mul_f16(qnan, POS_ONE_F16, clamp=True), POS_ZERO_F16)
+        self.assertEqual(ref_mul_f16(snan, POS_TWO_F16, clamp=True), POS_ZERO_F16)
+
+
 if __name__ == "__main__":
     unittest.main()
