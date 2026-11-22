@@ -363,6 +363,17 @@ class LodSetsTest(unittest.TestCase):
         with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["lod_bands"]["lod"], [130.0, 450.0])
 
+    def test_export_uses_finer_lod_distance_when_child_distance_is_missing(self) -> None:
+        rows = [self.lod_row((10, 10, 0), 0, own=120.0),
+                self.lod_row((10, 10, 0), 1, own=450.0)]
+        _, out = self.build(rows, lod_sets=True, lod_levels=(0, 1))
+        with open(os.path.join(out, "world.json"), encoding="utf-8") as handle:
+            world = json.load(handle)
+        self.assertEqual(sorted(chunk["lod"] for chunk in world["chunks"]), ["hd", "lod"])
+        for chunk in world["chunks"]:
+            self.assertTrue(os.path.isfile(os.path.join(out, "chunks", f'{chunk["id"]}.glb')))
+        self.assertEqual(world["lod_bands"], {"hd": [0.0, 120.0], "lod": [120.0, 450.0]})
+
     def test_option_rules(self):
         with self.assertRaisesRegex(ValueError, "lod-sets needs --instancing"):
             self.build([self.lod_row((0, 0, 0), 0)], lod_sets=True, instancing="bake")

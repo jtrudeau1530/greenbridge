@@ -286,8 +286,9 @@ def lod_bands(child_lod: dict, lod_dist: dict, present) -> tuple[dict, dict]:
     """Camera distance band [start, end) per tier, from the selected entities' medians.
 
     A parent's childLodDist is the distance inside which its children are drawn instead of it, so a tier starts
-    at its own median childLodDist (HD at 0) and ends where the next coarser tier present starts; the coarsest
-    tier ends at its median lodDist. ORPHAN_HD has no parent and is drawn from 0 to its median lodDist. Returns
+    at its own median childLodDist (the finest starts at 0) and ends where the next coarser tier starts.
+    A missing childLodDist uses the previous finer tier's median lodDist. The coarsest tier ends at its
+    median lodDist. ORPHAN_HD has no parent and is drawn from 0 to its median lodDist. Returns
     (bands by tier name, the measured medians by tier name)."""
     measured = {}
     for lvl in present:
@@ -297,8 +298,14 @@ def lod_bands(child_lod: dict, lod_dist: dict, present) -> tuple[dict, dict]:
     chain = [lvl for lvl in LOD_CHAIN if lvl in present]
     starts = []
     for i, lvl in enumerate(chain):
-        start = 0.0 if i == 0 else (measured[LOD_TIER_NAMES[lvl]]["child_lod_dist_median"] or 0.0)
-        starts.append(max(start, starts[-1] if starts else 0.0))
+        if i == 0:
+            starts.append(0.0)
+            continue
+        start = measured[LOD_TIER_NAMES[lvl]]["child_lod_dist_median"]
+        if start is None:
+            previous_tier = LOD_TIER_NAMES[chain[i - 1]]
+            start = measured[previous_tier]["lod_dist_median"]
+        starts.append(max(start or 0.0, starts[-1]))
     for i, lvl in enumerate(chain):
         if i + 1 < len(chain):
             end = starts[i + 1]
