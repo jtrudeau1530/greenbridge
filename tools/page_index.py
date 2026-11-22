@@ -406,10 +406,14 @@ def main():
         return 2
     summary = summarise(pages, mode, a.source)
     summary["streams"] = streams_seen
-    if ext == ".json":
-        write_json(a.out, pages, summary)
-    else:
-        write_csv(a.out, pages)
+    try:
+        if ext == ".json":
+            write_json(a.out, pages, summary)
+        else:
+            write_csv(a.out, pages)
+    except OSError as e:
+        print(f"{a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if not a.quiet:
         print(json.dumps(summary, indent=1))
     return 0
