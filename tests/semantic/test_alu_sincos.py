@@ -17,6 +17,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -612,6 +613,150 @@ class SinCosSIMDAndPackedHalfwordTests(unittest.TestCase):
             else:
                 want.append(0x33330000 | oracle_sincos_f16("v_cos_f16", H_QUARTER))
         self.assertEqual(got, want)
+
+
+class SinCosSpecialFloatBoundariesAndNegativeControlsTests(unittest.TestCase):
+    """Semantic tests for special float boundaries (signed zeros, inf, nan) and negative controls."""
+
+    def test_signed_zeros(self):
+        # sin(+0.0) == +0.0 (0x0000), sin(-0.0) == -0.0 (0x8000)
+        # cos(+0.0) == 1.0 (0x3C00), cos(-0.0) == 1.0 (0x3C00)
+        # Upper 16 bits of destination register must be preserved.
+        got_sin_pos = run("v_sin_f16 v0, v1", H_POS_ZERO, old=OLD)
+        self.assertEqual(got_sin_pos & 0xFFFF, H_POS_ZERO)
+        self.assertEqual(got_sin_pos & 0xFFFF0000, OLD & 0xFFFF0000)
+
+        got_sin_neg = run("v_sin_f16 v0, v1", H_NEG_ZERO, old=OLD)
+        self.assertEqual(got_sin_neg & 0xFFFF, H_NEG_ZERO)
+        self.assertEqual(got_sin_neg & 0xFFFF0000, OLD & 0xFFFF0000)
+
+        got_cos_pos = run("v_cos_f16 v0, v1", H_POS_ZERO, old=OLD)
+        self.assertEqual(got_cos_pos & 0xFFFF, H_ONE)
+        self.assertEqual(got_cos_pos & 0xFFFF0000, OLD & 0xFFFF0000)
+
+        got_cos_neg = run("v_cos_f16 v0, v1", H_NEG_ZERO, old=OLD)
+        self.assertEqual(got_cos_neg & 0xFFFF, H_ONE)
+        self.assertEqual(got_cos_neg & 0xFFFF0000, OLD & 0xFFFF0000)
+
+    def test_infinities_produce_nan(self):
+        # cos(+-inf) == NaN, sin(+-inf) == NaN
+        for op in ("v_sin_f16", "v_cos_f16"):
+            for inf_val in (H_POS_INF, H_NEG_INF):
+                with self.subTest(op=op, inf=hex(inf_val)):
+                    got = run(f"{op} v0, v1", inf_val, old=OLD)
+                    self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
+                    self.assertTrue(f16_is_nan(got & 0xFFFF))
+                    self.assertTrue(math.isnan(h2f(got & 0xFFFF)))
+
+    def test_nan_propagation(self):
+        # Quiet and signaling NaNs propagate as NaN
+        nan_inputs = [H_QNAN, H_SNAN, H_NEG_QNAN, H_NEG_SNAN, 0x7E55, 0xFEAA]
+        for op in ("v_sin_f16", "v_cos_f16"):
+            for nan_val in nan_inputs:
+                with self.subTest(op=op, nan=hex(nan_val)):
+                    got = run(f"{op} v0, v1", nan_val, old=OLD)
+                    self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
+                    self.assertTrue(f16_is_nan(got & 0xFFFF))
+
+    def test_subnormal_angles_preserve_sign(self):
+        # Smallest subnormal +2^-24 (0x0001) and -2^-24 (0x8001)
+        # sin(+2^-24) produces positive subnormal 0x0006, cos(+2^-24) produces 1.0 (0x3C00)
+        got_sin_sub = run("v_sin_f16 v0, v1", 0x0001, old=OLD)
+        self.assertEqual(got_sin_sub & 0xFFFF, 0x0006)
+        self.assertEqual(got_sin_sub & 0xFFFF0000, OLD & 0xFFFF0000)
+
+        got_sin_sub_neg = run("v_sin_f16 v0, v1", 0x8001, old=OLD)
+        self.assertEqual(got_sin_sub_neg & 0xFFFF, 0x8006)
+        self.assertEqual(got_sin_sub_neg & 0xFFFF0000, OLD & 0xFFFF0000)
+
+        got_cos_sub = run("v_cos_f16 v0, v1", 0x0001, old=OLD)
+        self.assertEqual(got_cos_sub & 0xFFFF, H_ONE)
+
+        got_cos_sub_neg = run("v_cos_f16 v0, v1", 0x8001, old=OLD)
+        self.assertEqual(got_cos_sub_neg & 0xFFFF, H_ONE)
+
+    def test_whole_integer_turns(self):
+        # Non-zero integer turns N in [-100, 100] produce +0.0 (0x0000) for sin, 1.0 (0x3C00) for cos
+        whole_turns = [-100.0, -10.0, -2.0, -1.0, 1.0, 2.0, 10.0, 100.0]
+        for n in whole_turns:
+            h_in = f2h(n)
+            with self.subTest(n=n, h_in=hex(h_in)):
+                got_sin = run("v_sin_f16 v0, v1", h_in, old=OLD)
+                self.assertEqual(got_sin & 0xFFFF, H_POS_ZERO)
+                self.assertEqual(got_sin & 0xFFFF0000, OLD & 0xFFFF0000)
+
+                got_cos = run("v_cos_f16 v0, v1", h_in, old=OLD)
+                self.assertEqual(got_cos & 0xFFFF, H_ONE)
+                self.assertEqual(got_cos & 0xFFFF0000, OLD & 0xFFFF0000)
+
+    def test_negative_control_spirv_opcode_sabotage(self):
+        # Sabotaging OpExtInst %glsl Sin with Cos or vice-versa causes detectable divergence
+        spv_sin = translate_ps([
+            f"v_mov_b32 v1, {H_QUARTER:#x}",
+            "v_sin_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        expected_sin = H_ONE
+        self.assertEqual(si.run_fragment(spv_sin)["%out_mrt0"][0] & 0xFFFF, expected_sin)
+
+        sabotaged_sin, n = re.subn(r"\bSin\b", "Cos", spv_sin, count=1)
+        self.assertEqual(n, 1)
+        sabotaged_out = si.run_fragment(sabotaged_sin)["%out_mrt0"][0] & 0xFFFF
+        self.assertNotEqual(sabotaged_out, expected_sin)
+
+        spv_cos = translate_ps([
+            f"v_mov_b32 v1, {H_POS_ZERO:#x}",
+            "v_cos_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        expected_cos = H_ONE
+        self.assertEqual(si.run_fragment(spv_cos)["%out_mrt0"][0] & 0xFFFF, expected_cos)
+
+        sabotaged_cos, n = re.subn(r"\bCos\b", "Sin", spv_cos, count=1)
+        self.assertEqual(n, 1)
+        sabotaged_cos_out = si.run_fragment(sabotaged_cos)["%out_mrt0"][0] & 0xFFFF
+        self.assertNotEqual(sabotaged_cos_out, expected_cos)
+
+    def test_negative_control_turn_scaling_sabotage(self):
+        # Sabotaging the 2*pi scaling factor (1086918619 -> 1.0 = 1065353216) fails the check
+        spv = translate_ps([
+            f"v_mov_b32 v1, {H_QUARTER:#x}",
+            "v_sin_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("1086918619", spv)
+        expected = H_ONE
+        self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0] & 0xFFFF, expected)
+
+        sabotaged = spv.replace("1086918619", "1065353216")
+        sabotaged_out = si.run_fragment(sabotaged)["%out_mrt0"][0] & 0xFFFF
+        self.assertNotEqual(sabotaged_out, expected)
+
+    def test_negative_control_high_half_preservation_failure(self):
+        # A hypothetical buggy translator that clobbers the upper half would be detected
+        spv = translate_ps([
+            f"v_mov_b32 v1, {H_QUARTER:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "v_sin_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        actual_out = si.run_fragment(spv)["%out_mrt0"][0]
+        self.assertEqual(actual_out & 0xFFFF0000, OLD & 0xFFFF0000)
+
+        corrupted_out = actual_out & 0x0000FFFF
+        self.assertNotEqual(corrupted_out & 0xFFFF0000, OLD & 0xFFFF0000)
+
+    def test_negative_control_nan_assertion(self):
+        # Ensure our NaN detection logic correctly distinguishes non-NaN values
+        self.assertTrue(f16_is_nan(H_QNAN))
+        self.assertTrue(f16_is_nan(H_SNAN))
+        self.assertFalse(f16_is_nan(H_ONE))
+        self.assertFalse(f16_is_nan(H_POS_ZERO))
+        self.assertFalse(f16_is_nan(H_POS_INF))
 
 
 if __name__ == "__main__":
