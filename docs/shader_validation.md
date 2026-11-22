@@ -665,6 +665,13 @@ T# in `s[8:15]`), runs it through `runtime/test/vk_image_fuzz.cpp` against a syn
 format, and compares every RGBA32F pixel with an oracle that models the RDNA2 texel fetch for that format: a
 fetch is a memory read, so there is no filter, border or LOD to model.
 
+The comparison is bit exact (any NaN matches any NaN) with one exception. The translated shader fetches a UNORM
+texel through a float view, so the 8-bit to float conversion is the driver's. RDNA2 returns the correctly rounded
+c / 255. llvmpipe multiplies by an f32 1/255, which is one ulp above that for 126 of the 256 byte values (27 gives
+0x3dd8d8da, not 0x3dd8d8d9), and a run stops at its first mismatch, so on llvmpipe no case after the first
+`R8G8B8A8_UNORM` one ran. The translator oracle therefore accepts one ulp on a UNORM8 texel component, never on
+another format or on a sentinel, and the summary says how many components needed it. `--oracle hw` stays bit exact.
+
 ```sh
 cmake --build runtime/build --target vk_image_fuzz
 python -I tools/image_fuzz.py --programs 8 --seed 1 [--show]

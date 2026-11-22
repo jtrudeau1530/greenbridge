@@ -154,6 +154,67 @@ def test_compare_distinguishes_signed_zero():
     assert [(p[0], p[1]) for p in problems] == [(5, 7)]
 
 
+def f32_add_ulps(value, n):
+    return struct.unpack("<f", struct.pack("<I", struct.unpack("<I", struct.pack("<f", value))[0] + n))[0]
+
+
+def drawn(texel_values, width, height, dmask=0xf):
+    """The 64x64 RGBA32F readback for per-texel component lists, packed by dmask over the sentinels."""
+    got = []
+    for y in range(imf.DRAW):
+        for x in range(imf.DRAW):
+            tx, ty = imf.texel_of_pixel(x, y, width, height)
+            got.extend(imf.masked_components(texel_values[ty * width + tx], dmask))
+    return got
+
+
+def every_unorm8_byte():
+    """An 8x8 R8G8B8A8_UNORM texture holding each of the 256 byte values once."""
+    return bytes(range(256)), 8, 8
+
+
+def test_compare_accepts_the_drivers_one_ulp_unorm8_conversion(monkeypatch):
+    """llvmpipe converts UNORM8 as c * f32(1/255): one ulp above the exact c / 255 for 126 of the 256 values (27 gives
+    0x3dd8d8da, not 0x3dd8d8d9). The conversion is the driver's, so it matches, and the summary counts it."""
+    monkeypatch.setattr(imf, "unorm8_near", 0, raising=False)
+    texels, width, height = every_unorm8_byte()
+    recip = imf.f32(1 / 255.0)
+    product = [[imf.f32(texels[i * 4 + c] * recip) for c in range(4)] for i in range(width * height)]
+    exact = imf.oracle("R8G8B8A8_UNORM", texels, width, height)
+    off = sum(p != e for pv, ev in zip(product, exact) for p, e in zip(pv, ev))
+    assert off == 126
+    assert struct.pack("<f", product[27 // 4][27 % 4]) == struct.pack("<I", 0x3DD8D8DA)
+    assert imf.compare("R8G8B8A8_UNORM", texels, width, height, drawn(product, width, height)) == []
+    assert imf.unorm8_near == 126 * (imf.DRAW // width) * (imf.DRAW // height)   # every texel is drawn 64 times
+
+
+@pytest.mark.parametrize("wrong", ["two_ulps", "divide_by_256", "negative_zero"])
+def test_compare_still_rejects_unorm8_values_that_are_not_the_quotient(wrong):
+    texels, width, height = every_unorm8_byte()
+    values = imf.oracle("R8G8B8A8_UNORM", texels, width, height)
+    if wrong == "two_ulps":
+        values = [[f32_add_ulps(v, 2) for v in texel] for texel in values]
+    elif wrong == "divide_by_256":
+        values = [[imf.f32(texels[i * 4 + c] / 256.0) for c in range(4)] for i in range(width * height)]
+    else:   # byte 0 comes back as -0.0
+        values[0] = [-0.0] + values[0][1:]
+    assert imf.compare("R8G8B8A8_UNORM", texels, width, height, drawn(values, width, height))
+
+
+def test_the_one_ulp_allowance_is_only_for_unorm8_texel_components():
+    """Float formats stay bit exact, and so do the sentinels in the registers a UNORM8 dmask leaves unwritten."""
+    width = height = 8
+    texels = b"".join(struct.pack("<4f", 0.1, 0.25, 0.5, 1.0) for _ in range(width * height))
+    values = [[f32_add_ulps(v, 1) for v in texel] for texel in imf.oracle("R32G32B32A32_SFLOAT", texels, width, height)]
+    assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, drawn(values, width, height))
+
+    texels, width, height = every_unorm8_byte()
+    got = drawn(imf.oracle("R8G8B8A8_UNORM", texels, width, height), width, height, dmask=0x1)
+    assert imf.compare("R8G8B8A8_UNORM", texels, width, height, got, 0x1) == []
+    got[1] = f32_add_ulps(got[1], 1)   # pixel (0, 0): the sentinel 2.0 in the second register, one ulp off
+    assert [(p[0], p[1]) for p in imf.compare("R8G8B8A8_UNORM", texels, width, height, got, 0x1)] == [(0, 0)]
+
+
 def test_compare_treats_any_nan_as_equal():
     """The bit comparison keeps the old policy: NaN payloads are not modelled."""
     width = height = 8
