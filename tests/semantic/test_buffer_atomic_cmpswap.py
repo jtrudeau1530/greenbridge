@@ -1071,5 +1071,175 @@ class TestBufferAtomicCmpswapSIMD(unittest.TestCase):
         self.assertEqual(simd.mem.read_u32(0), 42)
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestBufferAtomicCmpswapAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_aliasing_vdata0_equals_vaddr_with_glc(self) -> None:
+        # v0 is vdata[0] (src) and vaddr
+        # Memory at address 64 contains 1000
+        self.interp.mem.write_u32(64, 1000)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 64)    # src = 64, vaddr = 64
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 1000)  # cmp = 1000
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertTrue(swapped)
+        # Memory at 64 was swapped to src (64)
+        self.assertEqual(self.interp.mem.read_u32(64), 64)
+        # v0 received pre-op value (1000)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 1000)
+        # v1 (cmp) is preserved intact (1000)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 1000)
+
+    def test_aliasing_vdata1_equals_vaddr_with_glc(self) -> None:
+        # v1 is vdata[1] (cmp) and vaddr
+        # Address is 32; memory has 500
+        self.interp.mem.write_u32(32, 500)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 999)   # src = 999
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 32)    # cmp = 32, vaddr = 32
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        # 500 != 32, so swap fails
+        self.assertFalse(swapped)
+        self.assertEqual(self.interp.mem.read_u32(32), 500)
+        # v0 receives pre-op value (500)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 500)
+        # v1 is preserved intact (32)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 32)
+
+    def test_vdata1_preserved_under_glc_writeback(self) -> None:
+        self.interp.mem.write_u32(100, 0xAAAA5555)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x11112222)  # src
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0xAAAA5555)  # cmp
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 100)         # vaddr
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+
+        # v0 receives pre-op value
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0xAAAA5555)
+        # v1 remains unchanged
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 0xAAAA5555)
+
+    def test_unrelated_vgprs_preserved(self) -> None:
+        for idx in range(10, 20):
+            self.interp.write_reg_u32(RegKind.VGPR, idx, 0x77000000 + idx)
+
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 10)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+
+        for idx in range(10, 20):
+            self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, idx), 0x77000000 + idx)
+
+    def test_sgpr_descriptor_and_offset_preserved(self) -> None:
+        d0, d1, d2, d3 = self.desc.to_dwords()
+        self.interp.write_reg_u32(RegKind.SGPR, 8, 16)  # soffset
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=Register(RegKind.SGPR, 8, count=1),
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 4), d0)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 5), d1)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 6), d2)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 7), d3)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 8), 16)
+
+    def test_simd_aliasing_with_divergent_exec_mask(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        exec_mask = 0x0000000F  # Lanes 0..3 active
+        simd.set_exec_mask(exec_mask)
+
+        # Pre-seed memory: each lane has initial value 1000 + lane
+        for lane in range(32):
+            addr = lane * 4
+            simd.mem.write_u32(addr, 1000 + lane)
+            # Aliasing: vaddr = v0 = addr
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, addr)
+            # cmp matches initial value
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 1000 + lane)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        simd.step(inst)
+
+        # Active lanes:
+        # Memory updated to src (addr); v0 receives pre-op value (1000 + lane); v1 preserved
+        for lane in range(4):
+            addr = lane * 4
+            self.assertEqual(simd.mem.read_u32(addr), addr)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 1000 + lane)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), 1000 + lane)
+
+        # Inactive lanes:
+        # Memory untouched (1000 + lane); v0 untouched (addr); v1 untouched
+        for lane in range(4, 32):
+            addr = lane * 4
+            self.assertEqual(simd.mem.read_u32(addr), 1000 + lane)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), addr)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), 1000 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
