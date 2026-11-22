@@ -1239,5 +1239,100 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(mask_u, 0b1000)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Test suite for IEEE-754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_nan_snan_quieting(self) -> None:
+        # Positive signaling NaN
+        snan_pos = 0x7FF0000000000001
+        self.assertTrue(is_f64_snan(snan_pos))
+        res_pos = ref_mul_f64(snan_pos, F64_ONE)
+        self.assertTrue(is_f64_qnan(res_pos))
+        self.assertEqual(res_pos, 0x7FF8000000000001)
+
+        # Negative signaling NaN
+        snan_neg = 0xFFF0000012345678
+        self.assertTrue(is_f64_snan(snan_neg))
+        res_neg = ref_mul_f64(F64_TWO, snan_neg)
+        self.assertTrue(is_f64_qnan(res_neg))
+        self.assertEqual(res_neg, 0xFFF8000012345678)
+
+    def test_nan_payload_propagation(self) -> None:
+        # Quiet NaN payload from src0
+        qnan_a = 0x7FF8AABBCCDDEEFF
+        res_a = ref_mul_f64(qnan_a, f64_to_u64(5.0))
+        self.assertEqual(res_a, qnan_a)
+
+        # Quiet NaN payload from src1
+        qnan_b = 0xFFF8112233445566
+        res_b = ref_mul_f64(f64_to_u64(-3.0), qnan_b)
+        self.assertEqual(res_b, qnan_b)
+
+    def test_nan_dual_precedence(self) -> None:
+        # When both are NaN, src0 takes precedence
+        qnan0 = 0x7FF8AAAA00000000
+        qnan1 = 0x7FF8BBBB00000000
+        res = ref_mul_f64(qnan0, qnan1)
+        self.assertEqual(res, qnan0)
+
+    def test_signed_zero_combinations(self) -> None:
+        self.assertEqual(ref_mul_f64(F64_POS_ZERO, F64_POS_ZERO), F64_POS_ZERO)
+        self.assertEqual(ref_mul_f64(F64_POS_ZERO, F64_NEG_ZERO), F64_NEG_ZERO)
+        self.assertEqual(ref_mul_f64(F64_NEG_ZERO, F64_POS_ZERO), F64_NEG_ZERO)
+        self.assertEqual(ref_mul_f64(F64_NEG_ZERO, F64_NEG_ZERO), F64_POS_ZERO)
+
+        # With finite numbers
+        self.assertEqual(ref_mul_f64(F64_POS_ZERO, f64_to_u64(10.0)), F64_POS_ZERO)
+        self.assertEqual(ref_mul_f64(F64_POS_ZERO, f64_to_u64(-10.0)), F64_NEG_ZERO)
+        self.assertEqual(ref_mul_f64(F64_NEG_ZERO, f64_to_u64(10.0)), F64_NEG_ZERO)
+        self.assertEqual(ref_mul_f64(F64_NEG_ZERO, f64_to_u64(-10.0)), F64_POS_ZERO)
+
+    def test_signed_infinity_combinations(self) -> None:
+        self.assertEqual(ref_mul_f64(F64_POS_INF, F64_POS_INF), F64_POS_INF)
+        self.assertEqual(ref_mul_f64(F64_POS_INF, F64_NEG_INF), F64_NEG_INF)
+        self.assertEqual(ref_mul_f64(F64_NEG_INF, F64_POS_INF), F64_NEG_INF)
+        self.assertEqual(ref_mul_f64(F64_NEG_INF, F64_NEG_INF), F64_POS_INF)
+
+        # With finite numbers
+        self.assertEqual(ref_mul_f64(F64_POS_INF, f64_to_u64(2.0)), F64_POS_INF)
+        self.assertEqual(ref_mul_f64(F64_POS_INF, f64_to_u64(-2.0)), F64_NEG_INF)
+        self.assertEqual(ref_mul_f64(F64_NEG_INF, f64_to_u64(2.0)), F64_NEG_INF)
+        self.assertEqual(ref_mul_f64(F64_NEG_INF, f64_to_u64(-2.0)), F64_POS_INF)
+
+    def test_max_normal_overflow(self) -> None:
+        # DBL_MAX * 1.0 = DBL_MAX
+        self.assertEqual(ref_mul_f64(F64_MAX_NORMAL, F64_ONE), F64_MAX_NORMAL)
+        # DBL_MAX * -1.0 = -DBL_MAX
+        self.assertEqual(ref_mul_f64(F64_MAX_NORMAL, F64_NEG_ONE), F64_MAX_NORMAL | F64_SIGN_MASK)
+        # DBL_MAX * 2.0 = +inf (overflow)
+        self.assertEqual(ref_mul_f64(F64_MAX_NORMAL, F64_TWO), F64_POS_INF)
+        # DBL_MAX * -2.0 = -inf (overflow)
+        self.assertEqual(ref_mul_f64(F64_MAX_NORMAL, f64_to_u64(-2.0)), F64_NEG_INF)
+
+    def test_min_normal_underflow_to_subnormal(self) -> None:
+        # DBL_MIN * 1.0 = DBL_MIN
+        self.assertEqual(ref_mul_f64(F64_MIN_NORMAL, F64_ONE), F64_MIN_NORMAL)
+        # DBL_MIN * 0.5 = subnormal 2^-1023
+        res = ref_mul_f64(F64_MIN_NORMAL, F64_HALF)
+        self.assertTrue(is_f64_subnormal(res))
+        self.assertEqual(res, 0x0008000000000000)
+
+    def test_subnormal_boundaries(self) -> None:
+        # Min subnormal (2^-1074) * 1.0 = min subnormal
+        self.assertEqual(ref_mul_f64(F64_MIN_SUBNORMAL, F64_ONE), F64_MIN_SUBNORMAL)
+        # Min subnormal * 2.0 = 2^-1073 (0x2)
+        self.assertEqual(ref_mul_f64(F64_MIN_SUBNORMAL, F64_TWO), 0x0000000000000002)
+        # Min subnormal * 0.5 = underflow to +0.0
+        self.assertEqual(ref_mul_f64(F64_MIN_SUBNORMAL, F64_HALF), F64_POS_ZERO)
+        # -Min subnormal * 0.5 = underflow to -0.0
+        self.assertEqual(ref_mul_f64(F64_MIN_SUBNORMAL | F64_SIGN_MASK, F64_HALF), F64_NEG_ZERO)
+
+    def test_round_to_nearest_even(self) -> None:
+        v_base = 1.0 + 2.0**(-52)
+        bits_base = f64_to_u64(v_base)
+        res = ref_mul_f64(bits_base, F64_ONE)
+        self.assertEqual(res, bits_base)
+
+
 if __name__ == "__main__":
     unittest.main()
