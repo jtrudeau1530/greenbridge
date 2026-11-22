@@ -937,6 +937,7 @@ struct Prepared {
     std::vector<VkBufferCopy> buffer_copies;
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
+    bool same_copy_subresource = false;
     VkImageResolve resolve{};  // resolves
     // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
@@ -1501,6 +1502,8 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
             p.binding.volume != p.source.volume || p.binding.samples != p.source.samples ||
             p.binding.rgb96 != p.source.rgb96)
             return ReplayResult::invalid_copy;
+        p.same_copy_subresource = p.source.image == p.binding.image && src.aspectMask == dst.aspectMask &&
+                                  src.baseMipLevel == dst.baseMipLevel && src.baseArrayLayer == dst.baseArrayLayer;
         const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
         const auto from_depth = std::max(1u, p.source.depth >> src.baseMipLevel);
         const auto to_depth = std::max(1u, p.binding.depth >> dst.baseMipLevel);
@@ -1540,6 +1543,14 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         }
         std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
         const std::uint32_t d = box.back - box.front;
+        if (p.same_copy_subresource) {
+            const auto intersects = [](std::uint32_t a, std::uint32_t b, std::uint32_t size) {
+                return (a < b ? b - a : a - b) < size;
+            };
+            if (intersects(box.left, copy.x, padded(w)) && intersects(box.top, copy.y, padded(h)) &&
+                intersects(box.front, copy.z, d))
+                return ReplayResult::invalid_copy;
+        }
         if (block > 1) {
             // D3D12 copies whole blocks: the box is rounded up to blocks and must fit the destination's padded mip.
             // Vulkan takes an extent that is a block multiple or reaches the edge of each image separately, so the
@@ -3284,10 +3295,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_layout,
                                         std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
             } else if (!p.image_copies.empty()) {
+                // A subresource can be both the source and destination only in a shared layout.
+                const bool self = p.same_copy_subresource;
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
-                const VkImageLayout dst_layout = detail::copy_layout(
+                    self ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    self ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT,
+                    tracker);
+                const VkImageLayout dst_layout = self ? src_layout : detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
                 const auto count = std::uint32_t(p.image_copies.size());
