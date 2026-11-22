@@ -47,10 +47,12 @@ std::uint32_t as_bits(float f) {
 
 int main() {
     vktest::Device gpu;
-    if (!gpu.create()) {
+    const auto status = gpu.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
         std::printf("depth24_convert_test: no Vulkan device, skipped\n");
-        return 0;
+        return 77;
     }
+    if (status != vktest::DeviceStatus::ready) return 1;
 
     // The converter allocates nothing here (every job brings its scratch buffer), but the callback must exist.
     Depth24Converter converter(gpu.device_proc, gpu.device, [](const VkMemoryRequirements&) { return VK_NULL_HANDLE; });
