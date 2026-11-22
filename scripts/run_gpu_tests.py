@@ -38,7 +38,7 @@ from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: tex
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
-                   vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
+                   unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
@@ -294,6 +294,11 @@ def w64_emulated() -> bool:
     # subgroup, matching check.py (W64_EMULATED). Accepts "1"/"true"/"yes"/"on" and tolerates
     # the trailing space cmd.exe's `set VAR=1 &` leaves in the value.
     return (os.environ.get("LEONIDA_W64_EMULATE") or "").strip().lower() in ("1", "true", "yes", "on")
+def pc_tail_ubo() -> bool:
+    # LEONIDA_PC_TAIL_UBO=1: translate with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the tail in a uniform
+    # block at set 1), for devices whose maxPushConstantsSize is 128. The test programs read the same variable
+    # (runtime/test/vk_pc_tail.h) and bind the block; same accepted values as LEONIDA_W64_EMULATE.
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
 def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) -> tuple[bool | None, str]:
     """cs_wavemask, as in check.py: (passed, detail), passed None for a skip. The native build needs a 64-wide
     subgroup and skips where the device has none; with LEONIDA_W64_EMULATE=1 it was translated with
@@ -310,6 +315,22 @@ def dump_words(msg: str) -> list[int] | None:
     check.py): trailing text, a missing word or a non-number is a malformed dump, not a result."""
     m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)
     return [int(x) for x in m.group(1).split()] if m else None
+
+
+def subgroup_pin_skip(msg: str, cs_env: dict | None) -> Skip | None:
+    """A Skip when the runner asked for a subgroup size (VKC_SUBGROUP_SIZE) and vk_compute_test says this device
+    cannot pin it, so the dispatched words are not the ones the fixture was written for. Only for the dumps in
+    WAVE32_PIN_DUMPS: everything else the runner judges at the device's own width, which is how cs_store and the
+    cs_w32_* fixtures keep being tested on a 64-only device (check.py is conservative and skips all of them)."""
+    if cs_env and "VKC_SUBGROUP_SIZE" in cs_env:
+        return unpinned_subgroup_skip(msg)
+    return None
+
+
+# Dumps whose expected words depend on the wave width but are not lane-mask dumps (those are WAVE32_LANE_DUMPS):
+# cs_barrier_loop's trip count is 4 waves of 32, so at 64 lanes it writes a different pattern and the words would
+# report a failure that is really an unpinnable wave size (GCN3/GCN4 expose 64..64 only).
+WAVE32_PIN_DUMPS = ("cs_barrier_loop",)
 
 
 def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
@@ -557,7 +578,8 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
-              SIGNED_MIP_TEST: "vs_ids.asm"}
+              SIGNED_MIP_TEST: "vs_ids.asm",
+              "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
 
@@ -721,6 +743,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
+        if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
+            cmd.append("--pc-tail-ubo")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add: GLSL Fma or OpFmaKHR (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
         rc, out = run_cmd(cmd, gpu=False)
@@ -809,7 +833,7 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
-                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8"):
+                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_buf_load_sub", "cs_buf_fmt8"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
             # cs_cmpx_class_f32 and cs_cvt_pk_u8 are per-lane and need no particular subgroup width either.
@@ -831,6 +855,9 @@ def run_suite(a, work: str) -> int:
                                    0xBEEF0001],
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
                 "cs_cvt_pk_u8": CVT_PK_U8_WORDS,
+                # TEST-510: sub-dword MUBUF loads (RAW end check by element size) and GFX10_FORMAT_8_UINT
+                "cs_buf_load_sub": [0x80, 0xFFFFFF80, 0x1FF, 0xFFFF807F, 0xAB01, 0xCD, 0, 0],
+                "cs_buf_fmt8": [0x7F, 0x80, 0xFF, 0x01, 0, 0, 0xFF, 1],
             }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
@@ -867,6 +894,14 @@ def run_suite(a, work: str) -> int:
             vals = words[:len(USER_SGPRS_WORDS)] if words else []
             results.append((name, rc == 0 and vals == USER_SGPRS_WORDS,
                             " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_f64_add":
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            if rc == 77:
+                results.append((name, None, "SKIP (no shaderFloat64 on this device)"))
+            else:
+                ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
+                                           hexwords=True)
+                results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
             wrong = []
@@ -1003,6 +1038,10 @@ def run_suite(a, work: str) -> int:
                 cs_env = dict(os.environ, **WAVE32_LANE_ENV)
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
             skip = wave32_lane_skip(msg) if name in WAVE32_LANE_DUMPS else None
+            if skip is None and name in WAVE32_PIN_DUMPS:
+                # the device may not be able to run the wave size this fixture was written for (a 64-only device
+                # can't pin 32, so cs_barrier_loop's words mean nothing); check.py skips it too
+                skip = subgroup_pin_skip(msg, cs_env)
             if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
                 ok, detail = None, str(skip)
             else:
@@ -1080,7 +1119,7 @@ def run_suite(a, work: str) -> int:
             problem = sampler_test(a.build, spirv_dir)
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or f"{len(SAMPLER_CASES)} S#/T# cases, 4096 pixels each exact"))
-        elif name in ("ps_texoff", "ps_texoff_implicit"):
+        elif name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
             # Texel offsets: needs vk_texture_test's texture, sampler and descriptor table (vk_harness binds none),
             # and VK_KHR_maintenance8 for the non-constant Offset; the tool exits 77 without it.
             raw = os.path.join(raw_dir, f"{name}.raw")
@@ -1092,7 +1131,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, msg))
             else:
                 with open(raw, "rb") as f:
-                    problem, covered = texoff_problem(f.read(), msg)
+                    problem, covered = texoff_problem(f.read(), msg, name=name)
                 results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
         elif name in OTHER_HARNESS:
             results.append((name, None, f"SKIP (run by {OTHER_HARNESS[name]})"))
@@ -1125,6 +1164,7 @@ def run_suite(a, work: str) -> int:
                 "ps_ops4": (0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00),
                 "ps_scc": (1, 1, 3, 0x80000000),
                 "ps_sdwa": (0x000000F1, 0xBFFEFFF2, 0x3C003344, 0xBFF70000),
+                "ps_sdwa_dword_hi": (0x00004000, 0x00000003, 0x00004700, 0x0000C000),   # 16-bit SDWA, dst_sel:DWORD
                 "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
                 "ps_ops5": (0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00),   # from the .asm headers
                 "ps_ops6": (0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0),
@@ -1157,6 +1197,10 @@ def run_suite(a, work: str) -> int:
                 "ps_fnan_fract": (0x3F7FFFFF, 0x00003BFF, 0xC0200000, 0xC0200000),
                 # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
                 "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3F800000),
+                "ps_vcmp_f16": (0x48A12080, 0x4CE9B1A2, 0x4BA72C98, 0x4FEFBDBA),   # 16-bit float v_cmp e32 (.asm header)
+                "ps_vcmp_f16_e64": (0x44C11100, 0x4CF171C1, 0x47C71D18, 0x4FF77DD9),   # same, e64 with swapped operands
+                "ps_vcmpx_f16": (0x68A12080, 0x6CE9B1A2, 0x6BA72C98, 0x6FEFBDBA),   # 16-bit float v_cmpx e32 (.asm header)
+                "ps_vcmpx_f16_e64": (0x64C11100, 0x6CF171C1, 0x67C71D18, 0x6FF77DD9),   # same, e64 with swapped operands
                 "ps_cvt_off": (0xBF000000, 0x3EE00000, 0xBE800000, 0x3F800000),
                 "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3E00, 0xAAAA0000, 0xAAAA4000),
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
@@ -1268,6 +1312,19 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
+        elif name == "vs_base_ids":
+            # Zero-based v0 / v3 (the hardware's VS input VGPRs): drawn with firstVertex 16 and firstInstance 7,
+            # ps_flat must still see vertex 0 of instance 0 (0x101), as check.py checks.
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            env = dict(gfx_env or os.environ, VKH_DRAW="16,7")
+            rc, msg = run_cmd([vk_harness, spv, os.path.join(spirv_dir, "ps_flat.spv"), raw], env=env)
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                ok, detail = check_flat(raw)
+                results.append((name, ok, detail))
 
     if a.filter and not results:   # the filter matched only inputs/partners: say so rather than "0/0 passed"
         names = [os.path.splitext(f)[0] for f in asm_files]
@@ -1297,4 +1354,8 @@ def run_suite(a, work: str) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

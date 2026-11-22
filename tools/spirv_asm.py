@@ -18,6 +18,7 @@ As a CLI:
 import argparse
 import array
 import os
+import re
 import struct
 import sys
 
@@ -116,13 +117,13 @@ def _unquote_string(tok: str, lineno: int) -> str:
     raw = tok[1:-1]
     if "\\" not in raw:
         return raw
+    # SPIRV-Tools decodes \<ch> as the literal character <ch> (e.g. \n -> 'n', \" -> '"', \\ -> '\').
     out = []
     i = 0
     n = len(raw)
     while i < n:
         if raw[i] == "\\" and i + 1 < n:
-            nxt = raw[i + 1]
-            out.append({"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}.get(nxt, nxt))
+            out.append(raw[i + 1])
             i += 2
         else:
             out.append(raw[i])
@@ -145,14 +146,64 @@ def _parse_int(tok: str, lineno: int) -> int:
         raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}") from exc
 
 
-def _parse_float(tok: str, lineno: int) -> float:
-    low = tok.lower()
+_HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
+_FLOAT_SPEC = {
+    16: (5, 10, 15, "<e", "<H"),
+    32: (8, 23, 127, "<f", "<I"),
+    64: (11, 52, 1023, "<d", "<Q"),
+}
+
+
+def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
+    """Encode a SPIR-V float literal (decimal or width-aware hex-float incl. Inf/NaN) as IEEE-754 bits."""
+    spec = _FLOAT_SPEC.get(width)
+    if spec is None:
+        raise SpirvAsmError(f"line {lineno}: unsupported float constant width {width}")
+    exp_bits, mant_bits, bias, pack_fmt, unpack_fmt = spec
+    exp_max = (1 << exp_bits) - 1
+    m = _HEX_FLOAT_RE.match(tok)
+    if m:
+        sign_s, ipart, fpart, exp_s = m.groups()
+        fpart = fpart or ""
+        if not ipart and not fpart:
+            raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}")
+        sign = 1 if sign_s == "-" else 0
+        sig = int(ipart + fpart, 16)
+        if sig == 0:
+            return sign << (exp_bits + mant_bits)
+        exp = int(exp_s) - 4 * len(fpart)
+        top = sig.bit_length() - 1
+        e_biased = exp + top + bias
+        if e_biased == exp_max:
+            # SPIRV-Tools hex-float spelling for Inf (0x1p+128) and NaN payloads (0x1.8p+128).
+            frac = sig & ((1 << top) - 1)
+            if top <= mant_bits:
+                mant = frac << (mant_bits - top)
+            else:
+                mant = frac >> (top - mant_bits)
+            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits) | mant
+        if e_biased > exp_max:
+            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
+        if 0 < e_biased < exp_max and top <= mant_bits:
+            frac = sig & ((1 << top) - 1)
+            mant = frac << (mant_bits - top)
+            return (sign << (exp_bits + mant_bits)) | (e_biased << mant_bits) | mant
+        try:
+            fv = float.fromhex(tok)
+            return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
+        except OverflowError:
+            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
+        except ValueError as exc:
+            raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
     try:
-        if ("0x" in low or "0X" in tok) and ("p" in low):
-            return float.fromhex(tok)
-        return float(tok)
+        fv = float(tok)
     except ValueError as exc:
         raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
+    try:
+        return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
+    except OverflowError:
+        sign = 1 if tok.startswith("-") else 0
+        return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
 
 
 def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
@@ -168,13 +219,11 @@ def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
             return [u64 & 0xFFFFFFFF, (u64 >> 32) & 0xFFFFFFFF]
         raise SpirvAsmError(f"line {lineno}: unsupported integer constant width {width}")
     if kind == "float":
-        fv = _parse_float(tok, lineno)
-        if width == 32:
-            return [struct.unpack("<I", struct.pack("<f", fv))[0]]
+        bits = _parse_float_bits(tok, width, lineno)
+        if width <= 32:
+            return [bits & 0xFFFFFFFF]
         if width == 64:
-            return list(struct.unpack("<II", struct.pack("<d", fv)))
-        if width == 16:
-            return [struct.unpack("<H", struct.pack("<e", fv))[0]]
+            return [bits & 0xFFFFFFFF, (bits >> 32) & 0xFFFFFFFF]
         raise SpirvAsmError(f"line {lineno}: unsupported float constant width {width}")
     raise SpirvAsmError(f"line {lineno}: unsupported constant type {type_info!r}")
 
@@ -214,8 +263,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             out.append(_parse_int(toks[idx], lineno) & 0xFFFFFFFF)
             return idx + 1
         if kind == "LiteralFloat":
-            fv = _parse_float(toks[idx], lineno)
-            out.append(struct.unpack("<I", struct.pack("<f", fv))[0])
+            out.append(_parse_float_bits(toks[idx], 32, lineno))
             return idx + 1
         if kind == "LiteralString":
             out.extend(_encode_string_words(_unquote_string(toks[idx], lineno)))

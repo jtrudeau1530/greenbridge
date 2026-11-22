@@ -13,6 +13,7 @@ pure-Python parts run without them.
 """
 import json
 import os
+import struct
 import subprocess
 import sys
 
@@ -63,6 +64,24 @@ def test_every_fixture_has_a_tier_and_a_gpu_check():
     assert asm == set(EXPECT) == set(w64_graphics.FIXTURES)
     for name, (tier, _, _) in EXPECT.items():
         assert w64_graphics.FIXTURES[name][0] == tier
+
+
+def test_tier_c_reference_rejects_changes_to_invariant_words(tmp_path, monkeypatch):
+    name = "ps_w64_c_lane_id"
+    (tmp_path / (name + ".spv")).touch()
+    expected = w64_graphics.FIXTURES[name][1](0)
+    reference = tuple(0 if value is None else value for value in expected)
+    (tmp_path / (name + ".ref64.raw")).write_bytes(struct.pack("<4I", *reference))
+    monkeypatch.setenv("W64G_REF", str(tmp_path))
+    monkeypatch.delenv("W64G_SAVE_REF", raising=False)
+
+    words = [tuple(value + (expected[i] is None) for i, value in enumerate(reference))]
+    monkeypatch.setattr(w64_graphics, "draw", lambda _tools, _spirv, _name, size, _tmp: (words, None, size == 32))
+    assert w64_graphics.check(None, tmp_path, name) == ""
+
+    stable = next(i for i, value in enumerate(expected) if value is not None)
+    words[0] = tuple(value + (i == stable) for i, value in enumerate(words[0]))
+    assert "must not depend on the partition" in w64_graphics.check(None, tmp_path, name)
 
 
 @requires_tools

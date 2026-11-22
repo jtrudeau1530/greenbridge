@@ -184,6 +184,28 @@ void expect_rejects(const char* what, const std::vector<uint8_t>& bytes) {
 
 void test_valid_image() { expect_loads("a valid image maps with its section intact", make_image()); }
 
+void test_entry_bounds() {
+    for (bool is_dll : {false, true}) {
+        for (uint32_t entry : {0u, 0x1000u, 0x1FFFu, 0x2000u, 0x2001u}) {
+            auto img = make_image();
+            if (is_dll) nt_of(img)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+            nt_of(img)->OptionalHeader.AddressOfEntryPoint = entry;
+            const std::string what = std::string(is_dll ? "DLL" : "EXE") + " entry RVA " + std::to_string(entry);
+            if (entry < nt_of(img)->OptionalHeader.SizeOfImage) {
+                expect_loads(what.c_str(), img);
+            } else {
+                std::string error;
+                if (load(write_image(img), error) == 0)
+                    failed(what.c_str(), "the image loaded");
+                else if (error.find("the entry point is outside the image") == std::string::npos)
+                    failed(what.c_str(), "unexpected error: " + error);
+                else
+                    pass(what.c_str());
+            }
+        }
+    }
+}
+
 void test_header_bounds() {
     {
         auto img = make_image();
@@ -941,6 +963,19 @@ std::vector<uint8_t> make_unwind_image(const std::vector<RUNTIME_FUNCTION>& entr
     return img;
 }
 
+// PE/COFF: NumberOfRvaAndSizes counts the data directories; the slots past it are not directories whatever they hold.
+// With 9 directories the TLS slot (index 9) is not one, so bytes left in it must not make the image fail to load.
+void test_tls_directory_count() {
+    auto img = make_image();
+    auto& tls = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    tls.VirtualAddress = 0xFFFF0000;  // would run past the image if it were read as a TLS directory
+    tls.Size = sizeof(IMAGE_TLS_DIRECTORY64);
+    nt_of(img)->OptionalHeader.NumberOfRvaAndSizes = IMAGE_DIRECTORY_ENTRY_TLS;
+    expect_loads("a TLS slot past NumberOfRvaAndSizes is not read as a TLS directory", img);
+    nt_of(img)->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    expect_rejects("the same TLS slot within NumberOfRvaAndSizes is checked and refused", img);
+}
+
 void test_unwind_registration() {
     const std::vector<RUNTIME_FUNCTION> entries = {{0x1000, 0x1010, kUnwindRva}, {0x1010, 0x1020, kUnwindRva}};
     uintptr_t pc = 0;
@@ -1093,6 +1128,7 @@ int main() {
             return 1;
         }
         test_valid_image();
+        test_entry_bounds();
         test_header_bounds();
         test_section_bounds();
         test_truncation();
@@ -1109,6 +1145,7 @@ int main() {
         test_delay_descriptor_fields();
         test_forwarded_exports();
         test_export_bounds();
+        test_tls_directory_count();
         test_unwind_registration();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
