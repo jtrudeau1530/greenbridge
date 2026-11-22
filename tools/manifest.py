@@ -211,6 +211,9 @@ def load_manifest(manifest: str) -> dict:
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     want = load_manifest(manifest)
     have = dict(walk(game_dir, exclude=manifest))
+    if not want and have:
+        # A create that was cut short, or a mistyped --manifest, would otherwise print OK without checking a file.
+        raise ManifestError(f"{manifest} lists no files, but {game_dir} holds {len(have)}; create it again")
     problems = {}
     pending = []
     for rel, info in want.items():
