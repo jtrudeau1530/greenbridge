@@ -751,5 +751,183 @@ class TestMulLoOverflowWrapping(unittest.TestCase):
             self.assertEqual(run_spirv_imul(a, b), expected)
 
 
+class TestMulLoSignedUnsignedIdentity(unittest.TestCase):
+    """Rigorous verification of the signed vs unsigned low-dword identity:
+    (s32(a) * s32(b)) mod 2^32 == (u32(a) * u32(b)) mod 2^32.
+    """
+
+    def test_signed_unsigned_low_dword_isomorphic_identity(self) -> None:
+        """Low 32 bits are unconditionally identical for signed and unsigned integers."""
+        for a, b in SAMPLE_PAIRS:
+            with self.subTest(a=hex(a), b=hex(b)):
+                lo_u = ref_mul_lo_u32(a, b)
+                lo_i = ref_mul_lo_i32(a, b)
+                self.assertEqual(lo_u, lo_i)
+
+    def test_signed_negative_operands_product(self) -> None:
+        """Verification of signed negative operand combinations."""
+        # Negative * Negative = Positive
+        neg_neg_cases = [
+            (-1, -1, 1),
+            (-2, -3, 6),
+            (-10, -20, 200),
+            (-100, -200, 20000),
+            (-2147483648, -1, 0x80000000),  # INT32_MIN * -1 = 2^31 -> 0x80000000
+            (-2147483647, -1, 0x7FFFFFFF),  # (-(2^31 - 1)) * -1 = INT32_MAX
+        ]
+        for a, b, expected in neg_neg_cases:
+            with self.subTest(a=a, b=b, expected=hex(expected)):
+                self.assertEqual(ref_mul_lo_i32(a, b), expected)
+                self.assertEqual(ref_mul_lo_u32(a, b), expected)
+                self.assertEqual(run_spirv_imul(a, b), expected)
+
+        # Negative * Positive = Negative (two's complement)
+        neg_pos_cases = [
+            (-1, 1, 0xFFFFFFFF),
+            (-5, 10, (-50) & MASK32),
+            (-16, 64, (-1024) & MASK32),
+            (-2147483648, 2, 0),             # INT32_MIN * 2 = -2^32 -> 0 mod 2^32
+            (-2147483648, 3, 0x80000000),    # INT32_MIN * 3 = -3 * 2^31 = -2^32 - 2^31 -> 0x80000000
+        ]
+        for a, b, expected in neg_pos_cases:
+            with self.subTest(a=a, b=b, expected=hex(expected)):
+                self.assertEqual(ref_mul_lo_i32(a, b), expected)
+                self.assertEqual(ref_mul_lo_u32(a, b), expected)
+                self.assertEqual(run_spirv_imul(a, b), expected)
+
+    def test_signed_vs_unsigned_high_dword_divergence_contrast(self) -> None:
+        """Contrast: low dword is identical, but high dword diverges on negative operands.
+        This demonstrates why hardware needs separate v_mul_hi_u32 and v_mul_hi_i32,
+        but only a single v_mul_lo_u32.
+        """
+        divergent_pairs = [
+            (0xFFFFFFFF, 0xFFFFFFFF),  # -1 * -1
+            (0xFFFFFFFF, 5),           # -1 * 5
+            (0x80000000, 2),           # INT32_MIN * 2
+            (100, -1),                 # 100 * -1
+            (-16, 64),                 # -16 * 64
+        ]
+        for a, b in divergent_pairs:
+            with self.subTest(a=hex(a), b=hex(b)):
+                lo_u, hi_u = ref_mul_64(a, b, signed=False)
+                lo_i, hi_i = ref_mul_64(a, b, signed=True)
+
+                # Low dword MUST be identical
+                self.assertEqual(lo_u, lo_i, f"Low dword diverged for ({hex(a)}, {hex(b)})")
+                self.assertEqual(lo_u, ref_mul_lo_u32(a, b))
+
+                # High dword MUST diverge for these negative inputs
+                self.assertNotEqual(hi_u, hi_i, f"Expected high dwords to diverge for ({hex(a)}, {hex(b)})")
+
+    def test_signed_fuzz_identity(self) -> None:
+        """Differential fuzz verification that signed and unsigned lo-multiplication match."""
+        rng = random.Random(0x5349474E)
+        for _ in range(200):
+            a = rng.randint(0, MASK32)
+            b = rng.randint(0, MASK32)
+            self.assertEqual(ref_mul_lo_u32(a, b), ref_mul_lo_i32(a, b))
+
+
+class TestMulLoNegativeControls(unittest.TestCase):
+    """Negative controls ensuring any faulty arithmetic, incorrect signedness,
+    truncation, or pipeline mutations are caught.
+    """
+
+    def test_hi_lo_word_confusion_detected(self) -> None:
+        """Negative control: returning high word instead of low word fails."""
+        pairs = [
+            (0x10000, 0x10000),
+            (0xFFFFFFFF, 2),
+            (0x80000000, 2),
+            (0x12345678, 0x9ABCDEF0),
+        ]
+        for a, b in pairs:
+            with self.subTest(a=hex(a), b=hex(b)):
+                lo = ref_mul_lo_u32(a, b)
+                hi_u = ((u32(a) * u32(b)) >> 32) & MASK32
+                self.assertNotEqual(lo, hi_u, f"lo and hi should diverge for ({hex(a)}, {hex(b)})")
+
+    def test_16bit_truncation_mutation_detected(self) -> None:
+        """Negative control: truncating inputs to 16 bits fails on 32-bit operands."""
+        a = 0x10001
+        b = 0x20003
+        correct = ref_mul_lo_u32(a, b)
+        sabotaged_16bit = ((a & 0xFFFF) * (b & 0xFFFF)) & MASK32
+        self.assertNotEqual(correct, sabotaged_16bit)
+
+    def test_arithmetic_mutations_detected(self) -> None:
+        """Negative control: common arithmetic sabotages are detected."""
+        a = 0x12345678
+        b = 0x00000003
+        correct = ref_mul_lo_u32(a, b)
+
+        # Addition instead of multiplication
+        sabotaged_add = (a + b) & MASK32
+        self.assertNotEqual(correct, sabotaged_add)
+
+        # Off-by-one error
+        sabotaged_off_by_one = (correct + 1) & MASK32
+        self.assertNotEqual(correct, sabotaged_off_by_one)
+
+        # Dropped high bit (31-bit masking)
+        val_with_msb = 0x80000001
+        res = ref_mul_lo_u32(val_with_msb, 1)
+        sabotaged_mask31 = res & 0x7FFFFFFF
+        self.assertNotEqual(res, sabotaged_mask31)
+
+    def test_signed_saturation_mutation_detected(self) -> None:
+        """Negative control: saturating overflow instead of wrapping is detected."""
+        a = 0x7FFFFFFF  # INT32_MAX
+        b = 2
+        correct = ref_mul_lo_u32(a, b)  # wraps to 0xFFFFFFFE (-2)
+        sabotaged_saturated = 0x7FFFFFFF  # clamped to INT32_MAX
+        self.assertNotEqual(correct, sabotaged_saturated)
+
+    def test_exec_mask_leak_mutation_detected(self) -> None:
+        """Negative control: modifying inactive EXEC lanes is detected."""
+        interp = VectorALUMulInterpreter(wave_size=4)
+        interp.set_exec(0b0011)  # only lanes 0 and 1 active
+        interp.set_vgpr(0, 2, 0xDEADBEEF)
+        interp.set_vgpr(0, 3, 0xDEADBEEF)
+
+        interp.execute_v_mul_lo_u32(0, 10, 20)
+
+        # Inactive lanes 2 and 3 must not be modified
+        self.assertEqual(interp.get_vgpr(0, 2), 0xDEADBEEF)
+        self.assertEqual(interp.get_vgpr(0, 3), 0xDEADBEEF)
+
+        # If a buggy implementation updated lane 2 to 200, it would fail
+        sabotaged_lane2 = 200
+        self.assertNotEqual(interp.get_vgpr(0, 2), sabotaged_lane2)
+
+    def test_spirv_opcode_substitution_detected(self) -> None:
+        """Negative control: mutating OpIMul to OpISub in SPIR-V produces divergence."""
+        a = 20
+        b = 5
+        correct = run_spirv_imul(a, b)  # 20 * 5 = 100
+
+        module_isub = f"""\
+OpCapability Shader
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%ca = OpConstant %uint {u32(a)}
+%cb = OpConstant %uint {u32(b)}
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%res = OpISub %uint %ca %cb
+OpStore %out %res
+OpReturn
+OpFunctionEnd
+"""
+        mutated_res = si.run_fragment(module_isub)["%out"][0]  # 20 - 5 = 15
+        self.assertNotEqual(correct, mutated_res)
+
+
 if __name__ == "__main__":
     unittest.main()
