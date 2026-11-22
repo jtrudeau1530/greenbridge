@@ -428,6 +428,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_grad_a16": "vs_ids.asm",
+              "ps_texture_sample_d16": "vs_ids.asm",
               "vs_clip": "ps_ops.asm"}
 
 
@@ -740,19 +741,31 @@ def run_suite(a, work: str) -> int:
         elif name == "ps_texture_grad_a16":
             problem = texture_gradient_a16_test(a.build, spirv_dir)
             results.append((name, not problem, problem or "4096 RGBA pixels matched"))
-        elif name in ("ps_texture_sample", "ps_cube_sample"):
+        elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
-            mode = ["cube"] if name == "ps_cube_sample" else []
+            if name == "ps_texture_sample_d16":
+                cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
+            else:
+                mode = ["cube"] if name == "ps_cube_sample" else []
+                cmd = [tool, *mode, raw]
             try:
-                p = subprocess.run([tool, *mode, raw], capture_output=True, text=True, cwd=spirv_dir)
+                p = subprocess.run(cmd, capture_output=True, text=True, cwd=spirv_dir)
                 rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
             except FileNotFoundError:
                 rc, msg = 1, f"missing {tool}"
             except OSError as e:
                 rc, msg = 1, start_failure(tool, e)
-            results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
+            if name == "ps_texture_sample_d16" and rc == 0 and os.path.isfile(raw):
+                with open(raw, "rb") as f:
+                    f.seek((32 * 64 + 32) * 16)
+                    r, g, b, alpha = struct.unpack("<4f", f.read(16))
+                exp_b = struct.unpack("<e", struct.pack("<e", 128.0 / 255.0))[0]
+                ok = abs(r - exp_b) <= 0.05 and abs(g - exp_b) <= 0.05 and abs(b - exp_b) == 0.0 and alpha == 1.0
+                results.append((name, ok, f"center(32,32)=({r:.6f}, {g:.6f}, {b:.6f}, {alpha:.1f})"))
+            else:
+                results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
         elif name == "ps_tex":
             # A texture through the descriptor hash table and the bindless set. vk_bindless_test compares the
             # pixels itself, and exits 77 where the device lacks a feature the set or the shader needs.

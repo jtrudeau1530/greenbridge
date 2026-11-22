@@ -4463,9 +4463,7 @@ class Gen:
                     comps.append(comp)
                 if d16:
                     for i in range(0, 4, 2):
-                        v, p = self.tmp(), self.tmp()
-                        self.emit(f"{v} = OpCompositeConstruct %v2float {comps[i]} {comps[i + 1]}")
-                        self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v}")
+                        p = self.pack_f16_pair_int(comps[i], comps[i + 1])
                         self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, p)
                 else:
                     for i, comp in enumerate(comps):
@@ -4584,9 +4582,7 @@ class Gen:
             # d16: components are packed two per register as f16 (x|y<<16, z|w<<16).
             for i in range(0, len(comps), 2):
                 second = comps[i + 1] if i + 1 < len(comps) else "%f0"
-                v, p = self.tmp(), self.tmp()
-                self.emit(f"{v} = OpCompositeConstruct %v2float {comps[i]} {second}")
-                self.emit(f"{p} = OpExtInst %uint %glsl PackHalf2x16 {v}")
+                p = self.pack_f16_pair_int(comps[i], second)
                 self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, p)
         else:
             for i, comp in enumerate(comps):
