@@ -207,6 +207,52 @@ def gfx10_tile_bytes(mode):
     return COMPACT_TILE_64K if gfx10_tile_mode(mode) == 0 else COMPACT_TILE_4K
 
 
+def parse_texture_dict_page(data: bytes):
+    """Parse a small RAGE texture dictionary system page (e.g. the 400-byte stream in textures.rpf).
+
+    Layout:
+      +0x140..+0x170: null-separated lower-case ASCII texture names
+      +0x170: array of 64-bit pointers to grcTexture descriptors (tagged 0x5... system page)
+      +0x180: array of 32-bit joaat32 name hashes
+      Within each grcTexture descriptor:
+        +0x10: dtype (0x980)
+        +0x18: data pointer (0x60000000 + GPU data offset)
+        +0x38: u16 width, u16 height, u16 depth, u8 mips, u8 DXGI format
+    """
+    if len(data) < 400:
+        raise ValueError(f"texture dictionary page truncated: expected >= 400 bytes, got {len(data)}")
+
+    p0 = struct.unpack_from("<Q", data, 0x170)[0] & 0x0FFFFFFF
+    p1 = struct.unpack_from("<Q", data, 0x178)[0] & 0x0FFFFFFF
+    h0 = struct.unpack_from("<I", data, 0x180)[0]
+    h1 = struct.unpack_from("<I", data, 0x184)[0]
+
+    names_raw = data[0x140:0x170]
+    names = [s.decode("latin1") for s in names_raw.split(b"\x00") if s]
+
+    textures = []
+    for idx, (ptr, thash) in enumerate([(p0, h0), (p1, h1)]):
+        if ptr + 0x40 > len(data):
+            continue
+        dtype = struct.unpack_from("<Q", data, ptr + 0x10)[0]
+        data_off = struct.unpack_from("<Q", data, ptr + 0x18)[0] & 0x0FFFFFFF
+        w, height, depth, mips, fmt = struct.unpack_from("<HHHBB", data, ptr + 0x38)
+        name = names[idx] if idx < len(names) else f"tex_{thash:08x}"
+        textures.append({
+            "name": name,
+            "hash": thash,
+            "width": w,
+            "height": height,
+            "depth": depth,
+            "mips": mips,
+            "format": fmt,
+            "format_name": DXGI.get(fmt, f"dxgi{fmt}"),
+            "data_offset": data_off,
+            "dtype": dtype,
+        })
+    return textures
+
+
 def parse_etpf_texture_record(record):
     """Parse one 16-byte ETPF texture record (the RDS5 embedded descriptor).
 

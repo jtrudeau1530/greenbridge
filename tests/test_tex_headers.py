@@ -958,5 +958,68 @@ class CliInputTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
 
 
+class TestTextureDictionaryParsing(unittest.TestCase):
+    def _create_synthetic_page(self, name0=b"waterfog2", name1=b"waterfog", fmt=95, w=128, h=128):
+        buf = bytearray(400)
+        names_chunk = name0 + b"\x00" + name1 + b"\x00"
+        buf[0x140:0x140 + len(names_chunk)] = names_chunk
+        struct.pack_into("<QQ", buf, 0x170, 0x50000040, 0x50000090)
+        struct.pack_into("<II", buf, 0x180, 0x9b9b31df, 0xf1389e16)
+
+        # desc 0
+        struct.pack_into("<Q", buf, 0x40 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x40 + 0x18, 0x60000000)
+        struct.pack_into("<HHHBB", buf, 0x40 + 0x38, w, h, 1, 1, fmt)
+
+        # desc 1
+        struct.pack_into("<Q", buf, 0x90 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x90 + 0x18, 0x60004000)
+        struct.pack_into("<HHHBB", buf, 0x90 + 0x38, w, h, 1, 1, fmt)
+        return bytes(buf)
+
+    def test_parse_valid_texture_dict_page(self):
+        data = self._create_synthetic_page()
+        res = tex_headers.parse_texture_dict_page(data)
+        self.assertEqual(len(res), 2)
+
+        t0 = res[0]
+        self.assertEqual(t0["name"], "waterfog2")
+        self.assertEqual(t0["hash"], 0x9b9b31df)
+        self.assertEqual(t0["width"], 128)
+        self.assertEqual(t0["height"], 128)
+        self.assertEqual(t0["format"], 95)
+        self.assertEqual(t0["format_name"], "BC6H_UF16")
+        self.assertEqual(t0["data_offset"], 0)
+        self.assertEqual(t0["dtype"], 0x980)
+
+        t1 = res[1]
+        self.assertEqual(t1["name"], "waterfog")
+        self.assertEqual(t1["hash"], 0xf1389e16)
+        self.assertEqual(t1["width"], 128)
+        self.assertEqual(t1["height"], 128)
+        self.assertEqual(t1["format"], 95)
+        self.assertEqual(t1["format_name"], "BC6H_UF16")
+        self.assertEqual(t1["data_offset"], 0x4000)
+
+    def test_truncated_buffer_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            tex_headers.parse_texture_dict_page(b"\x00" * 399)
+
+    def test_missing_names_fallback_to_hash(self):
+        buf = bytearray(self._create_synthetic_page())
+        buf[0x140:0x170] = b"\x00" * 0x30
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["name"], f"tex_{0x9b9b31df:08x}")
+        self.assertEqual(res[1]["name"], f"tex_{0xf1389e16:08x}")
+
+    def test_out_of_bounds_pointer_skipped(self):
+        buf = bytearray(self._create_synthetic_page())
+        struct.pack_into("<Q", buf, 0x178, 0x50000300)
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["name"], "waterfog2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
