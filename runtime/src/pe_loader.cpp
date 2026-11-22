@@ -64,7 +64,8 @@ uint64_t rva_in(const Module& m, uint64_t va, const char* what) {
 
 IMAGE_TLS_DIRECTORY64* tls_directory(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    // Through directory(), as every other directory: an entry past NumberOfRvaAndSizes is not a TLS directory.
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
     if (!dir.Size || !dir.VirtualAddress) return nullptr;
     require_range(m.name, dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64), m.size, "the TLS directory");
     return at<IMAGE_TLS_DIRECTORY64>(m.base, dir.VirtualAddress);
