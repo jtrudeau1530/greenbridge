@@ -988,7 +988,8 @@ public:
 
     ~Resource() override {
         if (accel_) {
-            device_.context->unregister_acceleration_structure(va_);
+            device_.context->unregister_acceleration_structure(gpu_va_);
+            if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::acceleration_structure, accel_);
         }
         if (image_address_) device_.forget_image(image_address_);
@@ -1024,11 +1025,9 @@ public:
         // A buffer has at least one byte, and its size must survive alignment to 64 KiB without wrapping.
         if (!desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return E_INVALIDARG;
         const bool host = cpu_visible();
-        const bool acceleration_structure =
-            device_.info.ray_tracing && initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
-        if (!host && !acceleration_structure && device_.arena.mapped) {
+        if (!host && device_.arena.mapped) {
             if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
                          int(desc_.Width / 1024));
@@ -1089,7 +1088,7 @@ public:
                                           addressable || need_bda);
         if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
-        if (addressable && vk.vkGetBufferDeviceAddress) {
+        if (addressable) {
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = buffer_;
             va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
@@ -1119,12 +1118,14 @@ public:
                     VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
                 dai.accelerationStructure = accel_;
                 const std::uint64_t as_va = vk.vkGetAccelerationStructureDeviceAddressKHR(device_.info.device, &dai);
-                if (as_va) va_ = as_va;
-                device_.context->register_acceleration_structure(va_, accel_);
+                if (as_va) gpu_va_ = as_va;
+                device_.context->register_acceleration_structure(gpu_va_, accel_);
+                if (buffer_va_ && buffer_va_ != gpu_va_)
+                    device_.context->register_acceleration_structure(buffer_va_, accel_);
             }
         }
         binding.buffer = buffer_;
-        binding.va = va_;
+        binding.size = desc_.Width;
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
@@ -5530,14 +5531,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #endif
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
-    // It serves both the DXGI swapchain and create_window_presenter.
-    info.presentation = has_swapchain && instance_has_surface;
-    if (info.presentation) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
+    info.presentation = has_swapchain && instance_has_surface;
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

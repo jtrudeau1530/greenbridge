@@ -2292,8 +2292,6 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
             predicate.buffer = predication->buffer ? p.predicate.scratch : VK_NULL_HANDLE;
             if (predicate.buffer) {
-                // The word was captured from the resource at prepare's offset (buffer_offset + the command's, so a
-                // default-heap buffer inside the GPU address arena reads its own range); the test reads the capture.
                 vk.capture_predicate(command_buffer, p.predicate);
                 predicate.offset = p.predicate.offset + 8;
                 // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
