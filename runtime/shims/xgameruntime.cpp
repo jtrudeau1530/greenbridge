@@ -339,12 +339,13 @@ RuntimeObject g_threading{kThreadingVtable, &kThreadingClass, nullptr};
 RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
 RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
 
-RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
+RuntimeObject& system_object();   // XSystemImpl, defined after the XSystem functions it serves
+RuntimeObject& package_object();  // XPackageImpl, after the XPackage functions
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object()})
+        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object(), &package_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
     }
     char cls[40], iid[40];
@@ -694,6 +695,86 @@ bool __stdcall XPackageIsPackagedProcess() {
         if (std::atoi(s) == 0) return false;
     }
     return true;
+}
+
+// ---- XPackageImpl (asked for as IXPackageImpl3), offline ----
+//
+// libHttpClient.GDK.dll asks QueryApiImpl for XPackageImpl with IXPackageImpl3's id through 30 thunks (slots 3-19,
+// 22, 24-27, 30, 32-34, 37-40), each in the argument shape of the method at that position of xgameruntime-docs'
+// IXPackageImpl (slots 3-34), IXPackageImpl2 (35-38) and IXPackageImpl3 (39-40) lists (docs/runtime_imports.md).
+// The slots with an offline answer forward to the XPackage functions above (the package identifier, whether the
+// process is packaged, the mount path and its size, the user's locale); every other slot logs its number once and
+// returns E_NOTIMPL, so the first boot shows which ones the title needs.
+
+constexpr GUID kPackageClass = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
+constexpr GUID kPackage3 = {0xe2a4734b, 0x2f4a, 0x456d, {0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09}};
+
+template <int Slot> HRESULT STDMETHODCALLTYPE package_not_implemented(void*) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackageImpl slot %d not implemented offline (E_NOTIMPL)\n", Slot);
+    return E_NOTIMPL;
+}
+HRESULT STDMETHODCALLTYPE pkg_identifier(void*, size_t size, char* buffer) {
+    return XPackageGetCurrentProcessPackageIdentifier(size, buffer);
+}
+bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess(); }
+// XPackageGetUserLocale(size_t localeSize, char* locale): the host user's locale name ("en-US").
+HRESULT STDMETHODCALLTYPE pkg_user_locale(void*, size_t size, char* locale) {
+    if (!locale || !size) return E_INVALIDARG;
+    wchar_t wide[LOCALE_NAME_MAX_LENGTH] = {};
+    char name[LOCALE_NAME_MAX_LENGTH * 4] = "en-US";
+    if (GetUserDefaultLocaleName(wide, LOCALE_NAME_MAX_LENGTH) > 0)
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, name, static_cast<int>(sizeof(name)), nullptr, nullptr);
+    const size_t len = std::strlen(name);
+    if (size < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(locale, name, len + 1);
+    return S_OK;
+}
+// XPackageGetMountPathSize(mount, size_t* pathSize): the size XPackageGetMountPath needs, terminator included.
+HRESULT STDMETHODCALLTYPE pkg_mount_path_size(void*, void* mount, size_t* size) {
+    if (!size) return E_INVALIDARG;
+    char path[MAX_PATH] = {};
+    const HRESULT hr = XPackageGetMountPath(mount, sizeof(path), path);
+    if (FAILED(hr)) return hr;
+    *size = std::strlen(path) + 1;
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE pkg_mount_path(void*, void* mount, size_t size, char* path) {
+    return XPackageGetMountPath(mount, size, path);
+}
+void STDMETHODCALLTYPE pkg_close_mount(void*, void*) {}  // offline mounts own nothing
+
+#define PN(n) reinterpret_cast<const void*>(&package_not_implemented<n>)
+const void* const kPackageVtable[] = {
+    reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
+    reinterpret_cast<const void*>(&object_release),
+    reinterpret_cast<const void*>(&pkg_identifier),   // 3  XPackageGetCurrentProcessPackageIdentifier
+    reinterpret_cast<const void*>(&pkg_is_packaged),  // 4  XPackageIsPackagedProcess
+    PN(5), PN(6), PN(7), PN(8), PN(9), PN(10),        // 5-10 installation monitor: create, close, progress, update,
+                                                      //      register / unregister progress changed
+    reinterpret_cast<const void*>(&pkg_user_locale),  // 11 XPackageGetUserLocale
+    PN(12), PN(13), PN(14), PN(15), PN(16), PN(17),   // 12-19 chunks: find / enumerate availability, change order,
+    PN(18), PN(19),                                   //       install (+ async, result), estimate size, uninstall
+    PN(20), PN(21),                                   // 20-21 _unknown_ (older enumerate / register installed)
+    PN(22),                                           // 22 XPackageUnregisterPackageInstalled
+    PN(23),                                           // 23 XPackageMount
+    reinterpret_cast<const void*>(&pkg_mount_path_size),  // 24 XPackageGetMountPathSize
+    reinterpret_cast<const void*>(&pkg_mount_path),       // 25 XPackageGetMountPath
+    reinterpret_cast<const void*>(&pkg_close_mount),      // 26 XPackageCloseMountHandle
+    PN(27), PN(28), PN(29), PN(30), PN(31),           // 27 _unknown_, 28 EnumeratePackages, 29 RegisterPackageInstalled,
+                                                      // 30 GetWriteStats, 31 _unknown_
+    PN(32), PN(33), PN(34),                           // 32 UninstallUWPInstance, 33 EnumerateFeatures, 34 UninstallPackage
+    PN(35), PN(36), PN(37), PN(38),                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
+                                                      //   MountWithUiAsync, MountWithUiResult
+    PN(39), PN(40),                                   // IXPackageImpl3: EnumeratePackages, RegisterPackageInstalled
+};
+#undef PN
+static_assert(std::size(kPackageVtable) == 41, "IUnknown + IXPackageImpl's 32 + IXPackageImpl2's 4 + IXPackageImpl3's 2");
+
+RuntimeObject& package_object() {
+    static RuntimeObject object{kPackageVtable, &kPackageClass, &kPackage3};
+    return object;
 }
 
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}

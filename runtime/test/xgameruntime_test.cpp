@@ -420,6 +420,49 @@ void check_run_time_load() {
               "slots 6-8 (handle tracking, handle check, download bandwidth) answer offline");
         release(sy);
     }
+
+    // XPackageImpl, asked for as libHttpClient.GDK.dll does: the class id with IXPackageImpl3's interface id. The
+    // slots with an offline answer agree with the named exports; the others are E_NOTIMPL.
+    const GUID package_cls = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
+    const GUID package3 = {0xe2a4734b, 0x2f4a, 0x456d, {0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09}};
+    void* pk = nullptr;
+    check(query(&package_cls, package3, &pk) == S_OK && pk, "QueryApiImpl hands out XPackageImpl for IXPackageImpl3");
+    if (pk) {
+        using Ident = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
+        using IdentExport = HRESULT(__stdcall*)(size_t, char*);
+        char a[64] = {}, b[64] = {};
+        const auto ident_export = reinterpret_cast<IdentExport>(
+            rt::shims::find("xgameruntime.dll", "XPackageGetCurrentProcessPackageIdentifier"));
+        check(reinterpret_cast<Ident>(slot(pk, 3))(pk, sizeof(a), a) == S_OK && ident_export &&
+                  ident_export(sizeof(b), b) == S_OK && std::strcmp(a, b) == 0,
+              "slot 3 is XPackageGetCurrentProcessPackageIdentifier, the same answer as the export");
+        using IsPackaged = bool(STDMETHODCALLTYPE*)(void*);
+        using IsPackagedExport = bool(__stdcall*)();
+        const auto packaged_export =
+            reinterpret_cast<IsPackagedExport>(rt::shims::find("xgameruntime.dll", "XPackageIsPackagedProcess"));
+        check(packaged_export && reinterpret_cast<IsPackaged>(slot(pk, 4))(pk) == packaged_export(),
+              "slot 4 is XPackageIsPackagedProcess");
+        using Locale = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
+        char locale[128] = {};
+        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK && std::strlen(locale) >= 2 &&
+                  reinterpret_cast<Locale>(slot(pk, 11))(pk, 1, locale) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+              "slot 11 (XPackageGetUserLocale) gives the host locale; a 1-byte buffer is too short");
+        using PathSize = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t*);
+        using Path = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t, char*);
+        using CloseMount = void(STDMETHODCALLTYPE*)(void*, void*);
+        size_t need = 0;
+        char path[MAX_PATH] = {};
+        check(reinterpret_cast<PathSize>(slot(pk, 24))(pk, nullptr, &need) == S_OK && need > 1 &&
+                  reinterpret_cast<Path>(slot(pk, 25))(pk, nullptr, need, path) == S_OK && std::strlen(path) + 1 == need &&
+                  reinterpret_cast<Path>(slot(pk, 25))(pk, nullptr, need - 1, path) ==
+                      HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+              "slots 24/25: the mount path size is exactly what XPackageGetMountPath needs");
+        reinterpret_cast<CloseMount>(slot(pk, 26))(pk, nullptr);
+        using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
+        check(reinterpret_cast<Stub>(slot(pk, 5))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL,
+              "the slots without an offline answer (5, 40) are E_NOTIMPL");
+        release(pk);
+    }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
     HMODULE k32 = load_w(L"kernel32.dll");
