@@ -1197,6 +1197,15 @@ python -I tools/fmisc_diff.py --programs 3000 --seed 11 --max-ops 8
 python -I tools/fmisc_diff.py --oracle hw --programs 500 --seed 1
 python -I tests/test_fmisc_diff.py
 ```
+**Default-mode DX9 multiply regression.** `v_mul_legacy_f32` now explicitly flushes each f32 operand before the
+DX9 `0 * anything => +0` override, and flushes the nonzero product before its VOP3 output modifier. The output is
+flushed again before the active omod's `-0 => +0` rule. Previously it emitted an unguarded `OpFMul`, so on a Vulkan
+driver that keeps f32 denormals, a subnormal input times a large number or an underflowing normal product yielded
+nonzero results even though the inferred RDNA2 `MODE.denorm_mode_32 = 0` requires zero. The standalone semantic
+test `test_valu_mul_legacy_denorm.py` checks the exact bit patterns and the two GPU fixtures
+`ps_mul_legacy_denorm` / `ps_mul_legacy_denorm_mods` exercise signed input/output FTZ, legacy zero override, and
+output scaling. This is a translation for the **inferred game MODE**, not a claim of correctly handling dynamic
+denormal-preserving or IEEE modes; native gfx1013 measurements of these new fixtures were not available.
 
 
 ### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
