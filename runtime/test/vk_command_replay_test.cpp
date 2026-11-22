@@ -5,7 +5,8 @@
 // resolves a multisampled target. Part D records every D3D12 sync/access pair as enhanced barriers, which the
 // validation layer must accept. Part E (where VK_EXT_conditional_rendering is available) checks SetPredication.
 // Part F (D3D-26) runs immediate buffer writes, atomic copies and discards. Part G copies one subresource twice in one
-// list, which D3D12 orders on the queue and needs an explicit dependency for on Vulkan.
+// list, which D3D12 orders on the queue and needs an explicit dependency for on Vulkan. Part H copies depth to colour
+// and back (D32_FLOAT <-> R32_FLOAT), which the replay stages through a scratch buffer.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -968,13 +969,123 @@ int part_g(vktest::Device& d) {
     return 0;
 }
 
+// Part H: depth <-> colour copies. A D32 depth image is uploaded from floats, copied whole into an R32_SFLOAT colour
+// image (CopyResource), and that into a second depth image (CopyTextureRegion); both are read back bit for bit.
+// vkCmdCopyImage cannot mix a depth and a colour aspect, so the replay stages each copy through `copy_scratch`; with
+// no scratch the list is refused as unsupported, before anything is written.
+int part_h(vktest::Device& d) {
+    if (!d.depth_format_usable(VK_FORMAT_D32_SFLOAT)) {
+        std::printf("H: skipped, no D32_SFLOAT\n");
+        return 0;
+    }
+    constexpr std::uint32_t size = 4, texels = size * size, pitch = texture_data_pitch_alignment;
+    constexpr VkDeviceSize bytes = VkDeviceSize(texels) * 4, scratch_bytes = 65536;
+    const VkImage depth = d.image(VK_FORMAT_D32_SFLOAT, size, size, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    const VkImage colour = d.image(VK_FORMAT_R32_SFLOAT, size, size, 1, VK_IMAGE_USAGE_SAMPLED_BIT);
+    const VkImage back = d.image(VK_FORMAT_D32_SFLOAT, size, size, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    void *up_mapped = nullptr, *down_mapped = nullptr, *scratch_mapped = nullptr;
+    const VkBuffer up = d.buffer(VkDeviceSize(size) * pitch, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up_mapped);
+    const VkBuffer down = d.buffer(bytes * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &down_mapped);
+    const VkBuffer scratch = d.buffer(scratch_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                      &scratch_mapped);
+    EXPECT(depth && colour && back && up && down && scratch);
+    const auto value = [](std::uint32_t i) { return float(i * 7 % texels) / float(texels); };  // in [0, 1)
+    for (std::uint32_t i = 0; i < texels; ++i) {
+        const float v = value(i);
+        std::memcpy(static_cast<std::uint8_t*>(up_mapped) + (i / size) * pitch + (i % size) * 4, &v, 4);
+    }
+
+    const auto image_binding = [&](VkImage image, VkFormat format, VkImageAspectFlags aspects) {
+        ResourceBinding b{};
+        b.image = image;
+        b.format = format;
+        b.aspects = aspects;
+        b.width = b.height = size;
+        return b;
+    };
+    ResourceBinding up_binding{};
+    up_binding.buffer = up;
+    up_binding.size = VkDeviceSize(size) * pitch;
+    constexpr ResourceId depth_id = 40, colour_id = 41, back_id = 42, up_id = 43;
+    const std::map<ResourceId, ResourceBinding> bindings{
+        {depth_id, image_binding(depth, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT)},
+        {colour_id, image_binding(colour, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT)},
+        {back_id, image_binding(back, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT)},
+        {up_id, up_binding},
+    };
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        const auto it = bindings.find(id);
+        return it == bindings.end() ? nullptr : &it->second;
+    };
+    LayoutTracker tracker(true);
+    for (const ResourceId id : {depth_id, colour_id, back_id})
+        tracker.track(id, bindings.at(id), VK_IMAGE_LAYOUT_UNDEFINED);
+
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    vk.clear_depth_stencil_image = d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
+    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    vk.separate_depth_stencil_layouts = true;  // matches LayoutTracker
+    const ReplayFunctions without_scratch = vk;
+    VkDeviceSize scratch_used = 0;
+    vk.copy_scratch = [&](VkDeviceSize n, VkBuffer& buffer, VkDeviceSize& offset) {
+        if (n > scratch_bytes - scratch_used) return false;
+        buffer = scratch;
+        offset = scratch_used;
+        scratch_used += (n + 255) / 256 * 256;
+        return true;
+    };
+
+    const CopyLocation footprint{up_id, true, 0, 0, size, size, 1, pitch};
+    const auto sub = [](ResourceId id) { return CopyLocation{id, false, 0, 0, 0, 0, 0, 0}; };
+    CommandList list;
+    EXPECT(list.copy_texture({sub(depth_id), 0, 0, 0, footprint, false, {}}));
+    EXPECT(list.transition({depth_id, 0, s::copy_dest, s::copy_source}));
+    EXPECT(list.copy_resource({colour_id, depth_id}));                           // depth -> colour
+    EXPECT(list.transition({colour_id, 0, s::copy_dest, s::copy_source}));
+    EXPECT(list.copy_texture({sub(back_id), 0, 0, 0, sub(colour_id), false, {}}));  // colour -> depth
+    EXPECT(list.transition({back_id, 0, s::copy_dest, s::copy_source}));
+    EXPECT(list.close());
+
+    const unsigned errors_before = d.validation_errors();
+    const bool ok = d.run([&](VkCommandBuffer cb) {
+        if (replay(list, cb, resolve, without_scratch, &tracker) != ReplayResult::unsupported) return false;
+        if (tracker.layout(depth_id, 0) != VK_IMAGE_LAYOUT_UNDEFINED) return false;  // refused before writing
+        if (replay(list, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
+        d.read_back(cb, colour, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, 1, down, 0);
+        d.read_back(cb, back, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, size, size, 1, down,
+                    bytes);
+        return true;
+    });
+    EXPECT(ok);
+    EXPECT(scratch_used > 0);
+    const auto* read = static_cast<const std::uint8_t*>(down_mapped);
+    for (std::uint32_t i = 0; i < texels; ++i) {
+        float c = 0, b = 0;
+        std::memcpy(&c, read + i * 4, 4);
+        std::memcpy(&b, read + bytes + i * 4, 4);
+        if (c != value(i) || b != value(i)) {
+            std::fprintf(stderr, "H texel %u: colour %g, depth %g, expected %g\n", i, c, b, value(i));
+            ++g_mismatches;
+        }
+    }
+    const unsigned errors = d.validation_errors() - errors_before;
+    std::printf("H: D32_FLOAT -> R32_FLOAT -> D32_FLOAT through scratch, %u texels%s\n", texels,
+                d.validation ? (errors ? ": validation errors" : ", no validation errors") : " (validation off)");
+    return 0;
+}
+
 } // namespace
 
 int main() {
     vktest::Device device;
     EXPECT(device.create());
     if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
-        part_g(device))
+        part_g(device) || part_h(device))
         return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {

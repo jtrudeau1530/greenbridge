@@ -64,6 +64,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   the pixel must survive exactly when Python's comparison of the operands holds, and on a 16-lane wave with
   one lane switched off beforehand, where the lanes left running and an untouched VCC are checked. It also
   runs the GPU test `ps_vcmpx_forms` and re-derives its four words.
+- `test_image_bvh_tri.py` runs `image_bvh64_intersect_ray` on hand-built triangle nodes. It checks the vertex
+  slots of each node type (TRI0–TRI3) and every selector of the barycentric remap byte at +60, against weights
+  written by hand and a plain-Python solve (docs/design.md, Ray tracing row).
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.

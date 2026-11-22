@@ -633,6 +633,17 @@ class ArchiveTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no clip dictionary"):
             anim_clips.decode_one(self.rpf, self.offsets[3], 2)
 
+    def test_budget_rejects_nan_and_negative(self):
+        for value in ("nan", "-1"):
+            r = subprocess.run(
+                [sys.executable, "-I", TOOL, self.rpf, os.path.join(self.tmp.name, "o.json"),
+                 "--budget", value],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 2, value)
+            self.assertIn("--budget", r.stderr)
+            self.assertEqual(r.stdout, "")
+
     def test_bad_arguments(self):
         for args in (["--jobs", "0", "x.json"], [], ["x.json", "--start", "-1"]):
             r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, *args], capture_output=True, text=True)

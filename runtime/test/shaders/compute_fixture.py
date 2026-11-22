@@ -24,6 +24,17 @@ def compute_header(asm_path):
     return header
 
 
+def unpinned_subgroup(out):
+    """The lane count vk_compute_test was asked for with VKC_SUBGROUP_SIZE and could not pin on this device, or None.
+
+    vk_compute_test then prints "compute subgroup size: N not available" and runs at whatever size the driver picks
+    (#774); Mesa llvmpipe's only size is 8. A wave32 program's words from such a run say nothing about the translator,
+    so the fuzzers skip it, as check.py's unpinned_subgroup_skip does for its lane-mask dumps. Output without the line
+    (the size was pinned, none was asked for, or an older vk_compute_test) gives None."""
+    m = re.search(r"^compute subgroup size: (\d+) not available$", out, re.MULTILINE)
+    return int(m.group(1)) if m else None
+
+
 def find_test_program(build, name):
     """The folder holding test program `name`: `build` itself (Ninja, Makefiles) or the RelWithDebInfo/Release
     subfolder a Visual Studio build puts it in, as run_gpu_tests.py's find_test_programs looks. None if not built.

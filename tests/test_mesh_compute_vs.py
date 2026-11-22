@@ -112,6 +112,26 @@ class Cli(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("Vertex shaders that draw", stderr)
 
+    def test_help_prints_usage(self):
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                rc, stdout, stderr = self.run_main(["mesh_compute_vs.py", flag])
+                self.assertEqual(rc, 0)
+                self.assertIn("mesh_compute_vs.py <spirv dir>", stdout)
+                self.assertEqual(stderr, "")
+
+    def test_a_missing_directory_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing")
+            with mock.patch.object(vs, "build_for_index") as build:
+                rc, stdout, stderr = self.run_main(["mesh_compute_vs.py", missing])
+            build.assert_not_called()
+            self.assertEqual(os.listdir(tmp), [])
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(stderr.splitlines()), 1)
+        self.assertIn("not a directory", stderr)
+
     def test_an_unreadable_index_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_index(tmp, {})

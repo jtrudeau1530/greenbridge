@@ -48,7 +48,7 @@ struct Case {
     const char* name;
     D3D12_RESOURCE_DESC src, dst;
     bool whole;  // CopyResource, else CopyTextureRegion of subresource 0 with no box
-    bool depth_values;  // also marks the depth <-> colour cases, reported apart from the BC ones
+    bool depth_values;  // also marks the depth <-> colour cases, counted apart from the BC ones (both fail the test)
     UINT x = 0, y = 0;  // CopyTextureRegion destination offset
     bool has_box = false;
     D3D12_BOX box{};
@@ -190,6 +190,12 @@ int main() {
         {"CopyTextureRegion D32_FLOAT -> R32_FLOAT", tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), tex(DXGI_FORMAT_R32_FLOAT, 16, 16), false, true},
         {"CopyResource R32_FLOAT -> D32_FLOAT", tex(DXGI_FORMAT_R32_FLOAT, 16, 16), tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), true, true},
         {"CopyResource D16_UNORM -> R16_UNORM", tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), tex(DXGI_FORMAT_R16_UNORM, 16, 16), true, true},
+        {"CopyResource R16_UNORM -> D16_UNORM", tex(DXGI_FORMAT_R16_UNORM, 16, 16), tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), true, true},
+        {"CopyTextureRegion D32_FLOAT -> R32_UINT", tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), tex(DXGI_FORMAT_R32_UINT, 16, 16), false, true},
+        // A depth-stencil side is copied whole (no box, offset 0), as D3D12 requires of CopyTextureRegion.
+        {"CopyTextureRegion R16_UNORM -> D16_UNORM", tex(DXGI_FORMAT_R16_UNORM, 16, 16), tex(DXGI_FORMAT_D16_UNORM, 16, 16, ds), false, true},
+        {"CopyResource D32_FLOAT -> R32_FLOAT, 3 mips", mips(tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), 3), mips(tex(DXGI_FORMAT_R32_FLOAT, 16, 16), 3), true, true},
+        {"negative control: CopyResource D32_FLOAT -> R16_UNORM", tex(DXGI_FORMAT_D32_FLOAT, 16, 16, ds), tex(DXGI_FORMAT_R16_UNORM, 16, 16), true, true},
         {"CopyTextureRegion R32G32_UINT 4x4 -> BC1 16x16", tex(DXGI_FORMAT_R32G32_UINT, 4, 4), tex(DXGI_FORMAT_BC1_UNORM, 16, 16), false, false},
         {"CopyTextureRegion BC1 16x16 -> R32G32_UINT 4x4", tex(DXGI_FORMAT_BC1_UNORM, 16, 16), tex(DXGI_FORMAT_R32G32_UINT, 4, 4), false, false},
         {"negative control: CopyResource R32_FLOAT -> R16_FLOAT", tex(DXGI_FORMAT_R32_FLOAT, 16, 16), tex(DXGI_FORMAT_R16_FLOAT, 16, 16), true, false},
@@ -259,5 +265,5 @@ int main() {
         std::printf("%u Vulkan validation errors\n", vk.validation_errors());
         return 1;
     }
-    return differ ? 1 : 0;
+    return differ || differ_depth ? 1 : 0;
 }

@@ -119,6 +119,8 @@ def load_manifest(path: str) -> dict[str, dict]:
         if not nested and raw_rel in ("created", "title", "version", "note"):
             continue
         rel = str(raw_rel).replace("\\", "/")
+        if rel in entries:
+            raise ManifestError(f"{path}: duplicate normalized path {rel!r}")
         if isinstance(info, dict):
             size = info.get("size")
             digest = info.get("sha256")

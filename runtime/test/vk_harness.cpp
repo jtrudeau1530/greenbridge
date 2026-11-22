@@ -9,6 +9,11 @@
 //   VKH_SGPRS=w0,w1,...          sets s0, s1, ... (decimal or 0x hex)
 //   VKH_HEAP=addr=word,...       allocates a zeroed 64 KiB heap (Xbox VA 0 = its device address), writes each word at
 //                                its address and passes the heap base, so a V# in VKH_SGPRS can point into it.
+//   VKH_HEAP_DUMP=<file>         after the draw, writes the 64 KiB heap (needs VKH_HEAP, which may be empty-valued as
+//                                "0=0"), so a test can read what the pixel shader stored or atomically added.
+//   VKH_SUBGROUP_SIZE=32|64      requires that subgroup size of the fragment shader (or of the compute or geometry
+//                                stage under test); stderr says "fragment subgroup size: N" when it took effect and
+//                                "... not available" when the device cannot require it (exit code stays 0).
 //
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
@@ -432,6 +437,9 @@ int main(int argc, char** argv) {
             stages[2].pNext = &reqSg;
         else if (!mesh && !gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
             stages[1].pNext = &reqSg;
+        if (stages[1].pNext == &reqSg) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
+    } else if (req_sg > 0) {
+        std::fprintf(stderr, "fragment subgroup size: %u not available\n", req_sg);
     }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -494,6 +502,7 @@ int main(int argc, char** argv) {
     bai.memoryTypeIndex = memtype(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory bmem; CHECK(vkAllocateMemory(dev, &bai, nullptr, &bmem));
     CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
+    void* heap_map = nullptr;
     if (heap_env) {
         LOADD(vkGetBufferDeviceAddress);
         VkBufferCreateInfo hbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -509,6 +518,7 @@ int main(int argc, char** argv) {
         VkDeviceMemory hmem; CHECK(vkAllocateMemory(dev, &hai, nullptr, &hmem));
         CHECK(vkBindBufferMemory(dev, heap, hmem, 0));
         void* hp; CHECK(vkMapMemory(dev, hmem, 0, heap_bytes, 0, &hp));
+        heap_map = hp;
         std::memset(hp, 0, heap_bytes);
         for (auto [addr, word] : heap_words) std::memcpy(static_cast<char*>(hp) + addr, &word, 4);
         VkBufferDeviceAddressInfo hda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -599,6 +609,12 @@ int main(int argc, char** argv) {
     output.write(static_cast<const char*>(p), std::streamsize(bi.size));
     output.close();
     if (!output) { std::fprintf(stderr, "failed to write %s\n", argv[3]); return 1; }
+    if (const char* dump = std::getenv("VKH_HEAP_DUMP"); dump && *dump && heap_map) {
+        std::ofstream hf(dump, std::ios::binary);
+        hf.write(static_cast<const char*>(heap_map), heap_bytes);
+        hf.close();
+        if (!hf) { std::fprintf(stderr, "failed to write %s\n", dump); return 1; }
+    }
     std::fprintf(stderr, "ok %ux%u -> %s\n", W, H, argv[3]);
     return 0;
 }

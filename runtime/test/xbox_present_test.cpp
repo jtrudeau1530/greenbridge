@@ -5,7 +5,8 @@
 // Cases: 0 planes (blank), 1 plane (solid colour, two colours side by side, a source rectangle, an RGBA and a BGRA
 // source, an sRGB source), 2 planes (plane 0 shown), token errors (null, unknown, stale, repeated), suspend/resume
 // with re-registration, statistics, and a real-time loop at 60 Hz. Needs a window and a Vulkan GPU with presentation.
-// Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test.
+// Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
+// the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -86,6 +87,18 @@ bool region_is(const Frame& frame, UINT x0, UINT y0, UINT x1, UINT y1, Px want, 
 }  // namespace
 
 int main() {
+    {
+        // The callback's narrow exception must match the sRGB swapchain VUID, including its follow-ons, and nothing else.
+        VkDebugUtilsMessengerCallbackDataEXT data{};
+        data.messageIdNumber = 0xc036022f;
+        data.pMessage = "vkCreateSwapchainKHR(): VK_IMAGE_USAGE_STORAGE_BIT is not supported";
+        EXPECT(vktest::known_srgb_swapchain_storage_error(&data));
+        data.pMessage = "vkCreateSwapchainKHR(): imageArrayLayers 1, but the maximum is 0";
+        EXPECT(vktest::known_srgb_swapchain_storage_error(&data));
+        data.messageIdNumber = 0x12345678;
+        data.pMessage = "vkCreateSwapchainKHR(): another validation error";
+        EXPECT(!vktest::known_srgb_swapchain_storage_error(&data));
+    }
     vktest::Device d;
     if (!d.create(true)) {  // no Vulkan loader, device or presentation extensions: nothing to test (ctest: skipped)
         std::printf("no Vulkan device with presentation: skipped\n");
@@ -484,9 +497,16 @@ int main() {
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
 
-    if (d.validation_errors()) {
-        std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+    const unsigned validation_errors = d.validation_errors();
+    const unsigned known_errors = d.known_validation_errors();
+    if (validation_errors != known_errors) {
+        std::fprintf(stderr, "%u validation errors (%u known sRGB swapchain checks)\n", validation_errors,
+                     known_errors);
         return 1;
+    }
+    if (known_errors) {
+        std::fprintf(stderr, "%u known sRGB swapchain STORAGE validation errors; skipped\n", known_errors);
+        return 77;
     }
     std::printf("xbox_present_test: all cases pass\n");
     return 0;

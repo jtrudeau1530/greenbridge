@@ -348,7 +348,7 @@ def run_three_input(op: str, a_bits: int, b_bits: int, c_bits: int, mods: str = 
     """Translate and run a single 3-operand instruction (`v_min3_f32`, `v_max3_f32`, `v_mad_f32`,
     `v_mad_legacy_f32`, or `v_fmac_f32` where `c_bits` initializes the `v0` accumulator)."""
     mod_s = f" {mods}" if mods else ""
-    if op.startswith(("v_fmac_f32", "v_mac_f32")):
+    if op.startswith(("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32")):
         lines = [
             f"v_mov_b32 v1, {a_bits & MASK32:#x}",
             f"v_mov_b32 v2, {b_bits & MASK32:#x}",
@@ -965,6 +965,43 @@ class NegativeControlsTests(unittest.TestCase):
         )
         self.assertEqual(clamp_cnt, 1)
         self.assertNotEqual(si.run_fragment(bad_clamp)["%out_mrt0"][0], ONE)
+
+
+class MacLegacyF32Tests(unittest.TestCase):
+    """v_mac_legacy_f32 (GFX10.1 VOP2): v_mad_legacy_f32 with D as the addend, D = legacy(S0 * S1) + D, with the same
+    denormal flush. Until 2026-11-22 the translator rejected it."""
+
+    VALUES = [POS_ZERO, NEG_ZERO, SUBNORM_MIN, NEG_SUBNORM_MIN, FLT_MIN, HALF, ONE, NEG_ONE, TWO, NEG_TWO, THREE,
+              FLT_MAX, POS_INF, NEG_INF, QNAN]
+
+    def test_matches_mad_legacy_reference(self):
+        for a in self.VALUES:
+            for b in self.VALUES[::2]:
+                for c in (POS_ZERO, NEG_ZERO, NEG_ONE, TWO_HALF, POS_INF, SUBNORM_MIN):
+                    with self.subTest(a=hex(a), b=hex(b), c=hex(c)):
+                        want = ref_mad_legacy_f32_ftz(a, b, c)
+                        got = run_three_input("v_mac_legacy_f32", a, b, c)
+                        if is_nan_bits(want):
+                            self.assertTrue(is_nan_bits(got), hex(got))
+                        else:
+                            self.assertEqual(got, want)
+
+    def test_zero_times_inf_is_zero_and_d_is_the_addend(self):
+        self.assertEqual(run_three_input("v_mac_legacy_f32", POS_ZERO, POS_INF, NEG_TWO), NEG_TWO)
+        self.assertEqual(run_three_input("v_mac_legacy_f32", QNAN, NEG_ZERO, THREE), THREE)
+        self.assertEqual(run_three_input("v_mac_legacy_f32", TWO, THREE, FOUR), f32_to_bits(10.0))
+        self.assertEqual(run_three_input("v_mac_legacy_f32", NEG_ZERO, TWO, NEG_ZERO), POS_ZERO)
+
+    def test_e64_modifiers_and_accumulator_aliasing(self):
+        # VOP3 form: neg on a source, clamp on the result.
+        self.assertEqual(run_three_input("v_mac_legacy_f32_e64", TWO, THREE, FOUR, "clamp"), ONE)
+        lines = [f"v_mov_b32 v1, {TWO:#x}", f"v_mov_b32 v2, {THREE:#x}", f"v_mov_b32 v0, {FOUR:#x}",
+                 "v_mac_legacy_f32_e64 v0, -v1, v2"]
+        self.assertEqual(run_ps_mrt0(lines)[0], NEG_TWO)                        # -2*3 + 4
+        # D read as src0 and as the addend: 3*3 + 3 = 12; chained: 12*2 + 12 = 36.
+        lines = [f"v_mov_b32 v0, {THREE:#x}", f"v_mov_b32 v2, {TWO:#x}",
+                 "v_mac_legacy_f32 v0, v0, v0", "v_mac_legacy_f32 v0, v0, v2"]
+        self.assertEqual(run_ps_mrt0(lines)[0], f32_to_bits(36.0))
 
 
 if __name__ == "__main__":
