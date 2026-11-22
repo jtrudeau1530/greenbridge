@@ -59,6 +59,7 @@ NEG_ONE_F64: int = 0xBFF0000000000000       # -1.0 -> exp = 1
 HALF_F64: int = 0x3FE0000000000000          # 0.5 -> exp = 0
 NEG_HALF_F64: int = 0xBFE0000000000000      # -0.5 -> exp = 0
 POS_TWO_F64: int = 0x4000000000000000       # 2.0 -> exp = 2
+NEG_TWO_F64: int = 0xC000000000000000       # -2.0 -> exp = 2
 POS_FOUR_F64: int = 0x4010000000000000      # 4.0 -> exp = 3
 QUARTER_F64: int = 0x3FD0000000000000       # 0.25 -> exp = -1
 
@@ -316,6 +317,71 @@ class Program:
         return "\n".join(inst.to_assembly() for inst in self.instructions)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar interpreter for GFX10/RDNA2 v_frexp_exp_i32_f64."""
+
+    def __init__(self, mode_ftz: bool = False) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.mode_ftz: bool = mode_ftz
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        return (self.vgprs[idx] if kind == RegKind.VGPR else self.sgprs[idx]) & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def read_reg_u64(self, kind: RegKind, idx: int) -> int:
+        lo = self.read_reg_u32(kind, idx)
+        hi = self.read_reg_u32(kind, idx + 1)
+        return join_dwords(lo, hi)
+
+    def write_reg_u64(self, kind: RegKind, idx: int, val: int) -> None:
+        lo, hi = split_dwords(val)
+        self.write_reg_u32(kind, idx, lo)
+        self.write_reg_u32(kind, idx + 1, hi)
+
+    def read_operand(self, op: Register | Immediate, mods: OperandModifiers) -> int:
+        if isinstance(op, Immediate):
+            raw = op.bits
+        elif isinstance(op, Register):
+            raw = self.read_reg_u64(op.kind, op.index)
+        else:
+            raise TypeError(f"Unsupported operand type: {type(op)}")
+        return mods.apply(raw)
+
+    def step(self, inst: Instruction) -> int:
+        """Executes a single v_frexp_exp_i32_f64 instruction deterministically."""
+        # Read 64-bit float source before writing 32-bit integer destination
+        s0_val = self.read_operand(inst.src0, inst.src0_mods)
+
+        if inst.opcode == Opcode.V_FREXP_EXP_I32_F64:
+            res = ref_frexp_exp_i32_f64(s0_val, ftz=self.mode_ftz)
+        else:
+            raise NotImplementedError(f"Unsupported opcode in scalar interpreter: {inst.opcode}")
+
+        self.write_reg_u32(inst.dst.kind, inst.dst.index, res)
+        self.trace.append(f"{inst.to_assembly()} => {res:#010x} ({s32(res)})")
+        return res
+
+    def run_program(self, prog: Program) -> list[int]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
 class TestValuFrexpExpI32F64Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -459,6 +525,97 @@ class TestValuFrexpExpI32F64AST(unittest.TestCase):
             f"v_frexp_exp_i32_f64 v1, {POS_TWO_F64:#018x}"
         )
         self.assertEqual(prog.to_assembly(), expected)
+
+
+class TestValuFrexpExpI32F64ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar VALU instruction interpreter."""
+
+    def test_scalar_register_read_write(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, 0x12345678)
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_TWO_F64)
+        interp.write_reg_u64(RegKind.SGPR, 4, NEG_HALF_F64)
+
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0x12345678)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 2), POS_TWO_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.SGPR, 4), NEG_HALF_F64)
+
+    def test_scalar_execution_from_vgpr_pair(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # Set v[2:3] = 4.0 -> exp = 3
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_FOUR_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 2, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(s32(res), 3)
+        self.assertEqual(s32(interp.read_reg_u32(RegKind.VGPR, 0)), 3)
+
+    def test_scalar_execution_from_sgpr_pair(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # Set s[0:1] = 0.5 -> exp = 0
+        interp.write_reg_u64(RegKind.SGPR, 0, HALF_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 5, count=1),
+            src0=Register(RegKind.SGPR, 0, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(s32(res), 0)
+        self.assertEqual(s32(interp.read_reg_u32(RegKind.VGPR, 5)), 0)
+
+    def test_scalar_execution_from_immediate(self) -> None:
+        interp = ScalarVALUInterpreter()
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(1.0),
+        )
+        res = interp.step(inst)
+        self.assertEqual(s32(res), 1)
+        self.assertEqual(s32(interp.read_reg_u32(RegKind.VGPR, 0)), 1)
+
+    def test_scalar_modifiers_abs_neg(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u64(RegKind.VGPR, 2, NEG_TWO_F64)
+
+        # v0 = frexp_exp(-|-2.0|) -> exp(-2.0) = 2
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src0_mods=OperandModifiers(neg=True, abs_val=True),
+        )
+        res = interp.step(inst)
+        self.assertEqual(s32(res), 2)
+        self.assertEqual(s32(interp.read_reg_u32(RegKind.VGPR, 0)), 2)
+
+    def test_scalar_program_execution_chain(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_FOUR_F64)   # 4.0 -> exp = 3
+        interp.write_reg_u64(RegKind.VGPR, 4, QUARTER_F64)    # 0.25 -> exp = -1
+
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 2, count=2),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 1, count=1),
+            src0=Register(RegKind.VGPR, 4, count=2),
+        ))
+
+        results = interp.run_program(prog)
+        self.assertEqual([s32(r) for r in results], [3, -1])
+        self.assertEqual(s32(interp.read_reg_u32(RegKind.VGPR, 0)), 3)
+        self.assertEqual(s32(interp.read_reg_u32(RegKind.VGPR, 1)), -1)
+        self.assertEqual(len(interp.trace), 2)
 
 
 if __name__ == "__main__":
