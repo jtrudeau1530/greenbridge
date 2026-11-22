@@ -321,21 +321,15 @@ def resolve(record, elements, pool_base, blocks=None, stride=None):
     if count == 0:
         return [], "empty", 0
     default_step = stride or ELEMENT_SIZE
-    candidates = []
-    if record["poolOffset"] in elements:
-        candidates.append((record["poolOffset"], "absolute", ELEMENT_SIZE))
+    candidates = [(record["poolOffset"], "absolute", ELEMENT_SIZE)]
     if pool_base is not None:
         address = pool_base + (record["poolOffset"] >> POOL_SHIFT)
-        if address in elements:
-            candidates.append((address, "pool", ELEMENT_SIZE))
+        candidates.append((address, "pool", ELEMENT_SIZE))
     base, size = block_at(blocks, record)
     if base is not None:
         offset = pool_byte_offset(record)
-        address = base + offset
-        if offset + count * default_step <= size and address in elements:
-            candidates.append((address, "block", default_step))
-    if not candidates:
-        return [], "unresolved", count
+        if offset + count * default_step <= size:
+            candidates.append((base + offset, "block", default_step))
     best = None
     for base_at, mode, slot_step in candidates:
         entities = []
