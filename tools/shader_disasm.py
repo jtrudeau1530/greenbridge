@@ -74,6 +74,8 @@ def disasm(code: bytes, mcpu: str):
     except OSError as e:
         return "", 0, str(e)
     bad = p.stderr.count("invalid instruction encoding")
+    if p.returncode != 0:
+        return "", bad, p.stderr.strip() or f"llvm-mc exited with code {p.returncode}"
     return p.stdout, bad, p.stderr
 
 
@@ -148,9 +150,9 @@ def main():
     print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
     if FAILED:
         path, reason = FAILED[0]
-        print(f"ERROR: {len(FAILED)} shader(s) produced no disassembly, first {os.path.basename(path)}: {reason}",
-              file=sys.stderr)
-        return 1
+        fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
+    if not (res["clean"] or res["invalid words"]):
+        fail(f"no disassembly produced for {a.src}")
     return 0
 
 

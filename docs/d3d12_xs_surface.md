@@ -570,7 +570,7 @@ evidence.
 | #5 VA range / arena capacity | **still unknown** | — |
 | #6 DXGI vs `PresentX` | **described** | `PresentX` is a queue method; ≤2 planes, ≤8 views, four flag names. Public samples give the call sequence and argument counts (no DXGI swapchain; frame events + `PresentX`), see §7. No slot or layout; game itself not observed. |
 | #7 standard AS vs BVH builder | **still unknown** | New names: `D3D12ConsRehydrateRaytracingAccelerationStructure`, `D3D12CONS_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_DEHYDRATE`, `DispatchRaysX`, `DispatchRaysDimensionsX`. No layouts. |
-| #8 XDXR struct layouts | **still unknown** | — |
+| #8 XDXR struct layouts | **still unknown** | Nothing from SCARAB. Measured since from `XboxBvhBuilder.dll` itself, see [xdxr.md](xdxr.md). |
 | #9 tiled data layout / DCC | **described** | Flag, copy and state names; no values, no swizzle. |
 | #10 binning/DCC/VRS/WMMA usage | **described** | `D3D12CONS_PIPELINE_STATE_FLAG_DISABLE_AUTO_DPBB`, `_DISABLE_RB_PLUS`, `RSSetShadingRateX`; usage still unknown. |
 | #11 `CheckFeatureSupport` answers | **still unknown** | — |

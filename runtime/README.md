@@ -188,6 +188,21 @@ work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
 
+### First-boot D3D12 trace
+
+On a Vulkan-enabled build, select the Vulkan backend to trace device, command-list and queue calls handled
+by Leonida. Put `--trace-d3d12` before the separator for game arguments.
+
+```powershell
+$env:LEONIDA_D3D12 = 'vulkan'
+.\runtime\build\gta6rt.exe --run $gameExe --trace-d3d12 2>&1 |
+    Select-String '^\[d3d12-trace\]'
+```
+
+Each trace line contains a sequence number, a fixed API name and an outcome. `called` marks a void API call
+whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
+Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
+
 ### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
