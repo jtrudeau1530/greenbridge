@@ -247,6 +247,88 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(rows[-1]["offset"], (end + 15) & ~15)
         self.assertEqual(rows[-1]["size"], len(blob))
 
+    def assert_report_collision(self, args, message):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            WI.main(args)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn(message, err.getvalue())
+
+    def test_reports_cannot_overwrite_a_single_input(self):
+        resource = make_resource()
+        for name, content in (("resource.bin", resource), ("archive.rpf", make_rpf_streams([resource]))):
+            path = os.path.join(self.dir, name)
+            for flag in ("--out", "--csv", "--archetypes-out", "--entities-out"):
+                with self.subTest(name=name, flag=flag):
+                    with open(path, "wb") as f:
+                        f.write(content)
+                    out = os.path.join(self.dir, "summary.json")
+                    args = [path, flag, path]
+                    if flag != "--out":
+                        args.extend(["--out", out])
+                    self.assert_report_collision(args, f"{flag} would overwrite the input")
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), content)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_entities_report_cannot_create_the_missing_input(self):
+        path = os.path.join(self.dir, "missing.bin")
+        out = os.path.join(self.dir, "summary.json")
+        self.assert_report_collision(
+            [path, "--out", out, "--entities-out", path], "--entities-out would overwrite the input")
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(out))
+
+    def test_report_cannot_overwrite_a_nested_input_through_a_hard_link(self):
+        carve = os.path.join(self.dir, "carve")
+        nested = os.path.join(carve, "nested")
+        os.makedirs(nested)
+        resource = make_resource()
+        path = os.path.join(nested, "resource.bin")
+        with open(path, "wb") as f:
+            f.write(resource)
+        report = os.path.join(self.dir, "entities.jsonl")
+        try:
+            os.link(path, report)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        out = os.path.join(self.dir, "summary.json")
+        self.assert_report_collision(
+            [carve, "--out", out, "--entities-out", report], "--entities-out would overwrite the input")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), resource)
+        self.assertFalse(os.path.exists(out))
+
+    def test_report_alias_is_rejected_before_opening_any_output(self):
+        path = os.path.join(self.dir, "resource.bin")
+        with open(path, "wb") as f:
+            f.write(make_resource())
+        out = os.path.join(self.dir, "report")
+        alias = os.path.join(self.dir, ".", "report")
+        entities = os.path.join(self.dir, "new", "entities.jsonl")
+        self.assert_report_collision(
+            [path, "--out", out, "--csv", alias, "--entities-out", entities],
+            "--out and --csv must use different paths")
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(os.path.dirname(entities)))
+
+    def test_reports_cannot_alias_through_hard_links(self):
+        path = os.path.join(self.dir, "resource.bin")
+        with open(path, "wb") as f:
+            f.write(make_resource())
+        out = os.path.join(self.dir, "summary.json")
+        entities = os.path.join(self.dir, "entities.jsonl")
+        with open(out, "wb") as f:
+            f.write(b"previous report")
+        try:
+            os.link(out, entities)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        self.assert_report_collision(
+            [path, "--out", out, "--entities-out", entities], "--out and --entities-out must use different paths")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
     def test_directory_scan_and_outputs(self):
         with open(os.path.join(self.dir, "map.bin"), "wb") as f:
             f.write(make_resource())
@@ -260,10 +342,14 @@ class WorldIndexTest(unittest.TestCase):
 
         out = os.path.join(self.dir, "out.json")
         csv_out = os.path.join(self.dir, "out.csv")
-        self.assertEqual(WI.main([self.dir, "--out", out, "--csv", csv_out]), 0)
+        entities = os.path.join(self.dir, "entities.jsonl")
+        self.assertEqual(WI.main([self.dir, "--out", out, "--csv", csv_out, "--entities-out", entities]), 0)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
+        self.assertEqual(doc["summary"]["files"], 2)
         self.assertEqual(doc["summary"]["resources"], 2)
+        with open(entities, encoding="utf-8") as f:
+            self.assertEqual(len([json.loads(line) for line in f]), 1)
         self.assertEqual(doc["summary"]["maps"], 1)
         self.assertEqual(doc["summary"]["entities"], 1)
         with open(csv_out, newline="", encoding="utf-8") as f:
