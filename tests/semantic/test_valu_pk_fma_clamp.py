@@ -347,6 +347,72 @@ class VPkFmaClampF16Instruction:
 
 
 # -----------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ScalarState:
+    """Architectural state of a single execution lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    m0: int = 0
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, value: int) -> None:
+        self.vgprs[index] = value & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, value: int) -> None:
+        self.sgprs[index] = value & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU instructions."""
+
+    @staticmethod
+    def resolve_operand(operand: VOP3POperand, state: ScalarState) -> int:
+        """Resolve operand to a 32-bit dword value."""
+        if operand.is_vgpr:
+            assert operand.reg is not None
+            return state.get_vgpr(operand.reg.index)
+        if operand.is_sgpr:
+            assert operand.reg is not None
+            return state.get_sgpr(operand.reg.index)
+        if operand.is_literal:
+            assert operand.literal_val is not None
+            return operand.literal_val & MASK32
+        if operand.is_inline_const:
+            assert operand.inline_val is not None
+            # Replicate 16-bit constant to both halves
+            f16_val = f16_to_u16(operand.inline_val)
+            return pack_f16x2(f16_val, f16_val)
+        raise ValueError(f"Unsupported operand: {operand}")
+
+    def step(self, instr: VPkFmaClampF16Instruction, state: ScalarState) -> int:
+        """Execute a single v_pk_fma_clamp_f16 instruction deterministically."""
+        s0_val = self.resolve_operand(instr.src0, state)
+        s1_val = self.resolve_operand(instr.src1, state)
+        s2_val = self.resolve_operand(instr.src2, state)
+
+        res = ref_v_pk_fma_clamp_f16(
+            s0_val,
+            s1_val,
+            s2_val,
+            op_sel=instr.op_sel,
+            op_sel_hi=instr.op_sel_hi,
+            neg_lo=instr.neg_lo,
+            neg_hi=instr.neg_hi,
+        )
+
+        state.set_vgpr(instr.dst.index, res)
+        return res
+
+
+# -----------------------------------------------------------------------------
 # Unit Tests
 # -----------------------------------------------------------------------------
 
@@ -458,6 +524,82 @@ class TestSymbolicASTDefinitions(unittest.TestCase):
                 src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
                 op_sel=(0, 0),  # wrong length (needs 3)
             )
+
+
+class TestScalarInstructionInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_vgpr_fma_clamped(self) -> None:
+        # v1 = [0.5, 0.25], v2 = [0.5, 2.0], v3 = [0.25, 0.125]
+        # v0 = clamp(v1 * v2 + v3) -> [0.50, 0.625]
+        self.state.set_vgpr(1, pack_f16x2(f16_to_u16(0.5), f16_to_u16(0.25)))
+        self.state.set_vgpr(2, pack_f16x2(f16_to_u16(0.5), f16_to_u16(2.0)))
+        self.state.set_vgpr(3, pack_f16x2(f16_to_u16(0.25), f16_to_u16(0.125)))
+
+        instr = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+            src2=VOP3POperand(reg=Reg(3, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        res_lo, res_hi = unpack_f16x2(res)
+        self.assertAlmostEqual(u16_to_f16(res_lo), 0.50)
+        self.assertAlmostEqual(u16_to_f16(res_hi), 0.625)
+        self.assertEqual(self.state.get_vgpr(0), res)
+
+    def test_sgpr_scalar_broadcast(self) -> None:
+        # s4 = [0.25, 0.25], v1 = [2.0, 1.0], v2 = [0.25, 0.5]
+        # v0 = clamp(v1 * s4 + v2) -> [0.75, 0.75]
+        self.state.set_vgpr(1, pack_f16x2(f16_to_u16(2.0), f16_to_u16(1.0)))
+        self.state.set_sgpr(4, pack_f16x2(f16_to_u16(0.25), f16_to_u16(0.25)))
+        self.state.set_vgpr(2, pack_f16x2(f16_to_u16(0.25), f16_to_u16(0.5)))
+
+        instr = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(4, RegType.SGPR)),
+            src2=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        res_lo, res_hi = unpack_f16x2(res)
+        self.assertAlmostEqual(u16_to_f16(res_lo), 0.75)
+        self.assertAlmostEqual(u16_to_f16(res_hi), 0.75)
+
+    def test_inline_constant_operand(self) -> None:
+        # v1 = [0.5, 0.5], v2 = [0.5, 0.5], src2 = inline const 0.5
+        # v0 = clamp(0.5 * 0.5 + 0.5) = 0.75
+        self.state.set_vgpr(1, pack_f16x2(f16_to_u16(0.5), f16_to_u16(0.5)))
+        self.state.set_vgpr(2, pack_f16x2(f16_to_u16(0.5), f16_to_u16(0.5)))
+
+        instr = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+            src2=VOP3POperand(inline_val=0.5),
+        )
+        res = self.interp.step(instr, self.state)
+        res_lo, res_hi = unpack_f16x2(res)
+        self.assertAlmostEqual(u16_to_f16(res_lo), 0.75)
+        self.assertAlmostEqual(u16_to_f16(res_hi), 0.75)
+
+    def test_state_isolation(self) -> None:
+        self.state.set_vgpr(10, 0x12345678)
+        self.state.set_sgpr(5, 0x87654321)
+
+        instr = VPkFmaClampF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(inline_val=0.0),
+            src1=VOP3POperand(inline_val=0.0),
+            src2=VOP3POperand(inline_val=0.0),
+        )
+        self.interp.step(instr, self.state)
+        self.assertEqual(self.state.get_vgpr(10), 0x12345678)
+        self.assertEqual(self.state.get_sgpr(5), 0x87654321)
 
 
 if __name__ == "__main__":
