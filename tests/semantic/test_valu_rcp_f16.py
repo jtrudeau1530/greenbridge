@@ -1172,8 +1172,80 @@ class TestValuRcpF16StatusFlags(unittest.TestCase):
         self.assertTrue(cc_nan["nan"])
 
 
+
+class TestValuRcpF16IEEE754Boundaries(unittest.TestCase):
+    def test_signed_zeros_and_infinities(self):
+        # 1.0 / +0.0 = +inf
+        self.assertEqual(ref_rcp_f16(POS_ZERO_F16), POS_INF_F16)
+        # 1.0 / -0.0 = -inf
+        self.assertEqual(ref_rcp_f16(NEG_ZERO_F16), NEG_INF_F16)
+        # 1.0 / +inf = +0.0
+        self.assertEqual(ref_rcp_f16(POS_INF_F16), POS_ZERO_F16)
+        # 1.0 / -inf = -0.0
+        self.assertEqual(ref_rcp_f16(NEG_INF_F16), NEG_ZERO_F16)
+
+    def test_nan_quieting_and_payloads(self):
+        # Signaling NaNs must have quiet bit (bit 9, 0x0200) set
+        snans = [0x7C01, 0x7C10, 0x7D55, 0x7CFF]
+        for snan in snans:
+            res = ref_rcp_f16(snan)
+            self.assertTrue(is_nan_f16(res))
+            self.assertTrue(is_qnan_f16(res), f"Expected quiet NaN for input {snan:#06x}, got {res:#06x}")
+            # Verify payload bit preservation
+            self.assertTrue((res & 0x01FF) == (snan & 0x01FF))
+
+        # Quiet NaNs retain payload
+        qnans = [0x7E00, 0x7E01, 0x7FFF, 0xFE00, 0xFFFF]
+        for qnan in qnans:
+            res = ref_rcp_f16(qnan)
+            self.assertTrue(is_nan_f16(res))
+            self.assertTrue(is_qnan_f16(res))
+
+    def test_subnormal_boundaries(self):
+        # Smallest subnormal 0x0001 (2^-24) overflows to infinity
+        self.assertEqual(ref_rcp_f16(MIN_SUBNORMAL_F16), POS_INF_F16)
+        self.assertEqual(ref_rcp_f16(0x8001), NEG_INF_F16)
+
+        # 2^-15 = 0x0200 -> 32768.0 = 0x7800
+        self.assertEqual(ref_rcp_f16(0x0200), 0x7800)
+        self.assertEqual(ref_rcp_f16(0x8200), 0xF800)
+
+        # Min normal 2^-14 = 0x0400 -> 16384.0 = 0x7400
+        self.assertEqual(ref_rcp_f16(MIN_NORMAL_F16), 0x7400)
+        self.assertEqual(ref_rcp_f16(0x8400), 0xF400)
+
+    def test_max_finite_and_underflow_to_subnormal(self):
+        # 1.0 / 65504.0 (0x7BFF) -> rounds to subnormal 0x0100
+        res = ref_rcp_f16(MAX_FINITE_F16)
+        self.assertTrue(is_subnormal_f16(res))
+        self.assertEqual(res, 0x0100)
+
+        # Negative max finite: -65504.0 (0xFBFF) -> 0x8100
+        res_neg = ref_rcp_f16(0xFBFF)
+        self.assertTrue(is_subnormal_f16(res_neg))
+        self.assertEqual(res_neg, 0x8100)
+
+    def test_boundary_clamping_extremes(self):
+        # clamp(+0.0 input) -> 1.0 / +0.0 = +inf -> clamped to 1.0
+        self.assertEqual(ref_rcp_f16(POS_ZERO_F16, clamp=True), ONE_F16)
+        # clamp(-0.0 input) -> 1.0 / -0.0 = -inf -> clamped to +0.0
+        self.assertEqual(ref_rcp_f16(NEG_ZERO_F16, clamp=True), POS_ZERO_F16)
+        # clamp(+inf input) -> 1.0 / +inf = +0.0 -> clamped to +0.0
+        self.assertEqual(ref_rcp_f16(POS_INF_F16, clamp=True), POS_ZERO_F16)
+        # clamp(-inf input) -> 1.0 / -inf = -0.0 -> clamped to +0.0
+        self.assertEqual(ref_rcp_f16(NEG_INF_F16, clamp=True), POS_ZERO_F16)
+        # clamp(NaN) -> 0.0
+        self.assertEqual(ref_rcp_f16(QNAN_F16, clamp=True), POS_ZERO_F16)
+        self.assertEqual(ref_rcp_f16(SNAN_F16, clamp=True), POS_ZERO_F16)
+        # clamp(subnormal overflow to +inf) -> clamped to 1.0
+        self.assertEqual(ref_rcp_f16(MIN_SUBNORMAL_F16, clamp=True), ONE_F16)
+        # clamp(subnormal negative overflow to -inf) -> clamped to 0.0
+        self.assertEqual(ref_rcp_f16(0x8001, clamp=True), POS_ZERO_F16)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
