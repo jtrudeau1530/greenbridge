@@ -2056,7 +2056,13 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     `ALLOW_UNORDERED_ACCESS`, which the NVIDIA driver refuses (`E_INVALIDARG`); WARP creates it. The console build
     creates it, so the console takes that format as a UAV. On the same GPU Vulkan has no `STORAGE_IMAGE` support for
     `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` either (vulkaninfo, driver 597.06), so the layer needs an emulation (32-bit
-    storage plus a pack/unpack) where a GPU lacks it.
+    storage plus a pack/unpack) where a GPU lacks it. @Vonsek measured the same texture on more devices (#864):
+    refused on an RTX 5080 (616.92), created on an AMD Radeon and on WARP, where typed UAV writes round-trip; and on
+    both GPUs one allocation can serve both uses, a mutable `R32_UINT` Vulkan image with `E5B9G9R9_UFLOAT_PACK32` in
+    its format list, written through an `R32_UINT` storage view and sampled through an `E5B9G9R9` view.
+    Open: a float store to that format rounds differently on PC devices (@Vonsek, #864: AMD Radeon truncates the
+    mantissas, WARP rounds to nearest even; 609 of 794 test triples differ). Which rule the console FSR needs, and
+    whether its shaders store floats to that texture at all, waits on decoding its `FSPX` shaders.
   - With that one texture created as `R32_UINT` instead (the test's PC stand-in, `standin_slot76`), or as is on
     WARP, `ffxCreateContext` and `ffxDestroyContext` both return OK. Device slots called: 14 (5), 15 (26), 18 (10),
     19 (16), **27
