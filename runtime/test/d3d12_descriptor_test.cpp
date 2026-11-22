@@ -1985,13 +1985,16 @@ int main() {
         };
         UINT64 packed_signal = 2;
         for (const auto& format : packed_formats) {
-            // Vulkan requires sampling A4R4G4B4 (1.3) and A1R5G5B5 but not R4G4B4A4: skip it where it isn't sampled.
-            D3D12_FEATURE_DATA_FORMAT_SUPPORT packed_support{format.dxgi};
-            if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &packed_support,
-                                                   sizeof(packed_support))) ||
-                !(packed_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)) {
-                std::printf("%s: not sampled on this device, skipped\n", format.name);
-                continue;
+            // Vulkan requires sampling A4R4G4B4 (1.3) and A1R5G5B5 but not R4G4B4A4: skip A4B4G4R4 where the Vulkan
+            // driver can't sample it (the driver's answer, not the layer's, so a dropped mapping still fails).
+            if (format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM) {
+                VkFormatProperties props{};
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                    d.physical, format.vk, &props);
+                if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+                    std::printf("%s: the Vulkan driver can't sample it, skipped\n", format.name);
+                    continue;
+                }
             }
             D3D12_RESOURCE_DESC format_desc = texture_desc;
             format_desc.Format = format.dxgi;

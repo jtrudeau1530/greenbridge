@@ -70,6 +70,10 @@ int conversion_checks() {
     EXPECT((element(VK_FORMAT_B8G8R8A8_UNORM, true, floats(1.0f, 0.0f, 0.0f, 1.0f)) == V{0, 0, 0xff, 0xff}));
     EXPECT(word(element(VK_FORMAT_A2B10G10R10_UNORM_PACK32, true, floats(1.0f, 0.0f, 0.5f, 1.0f))) ==
            (1023u | 512u << 20 | 3u << 30));
+    // A4B4G4R4 (R4G4B4A4_PACK16): red in bits 12-15, alpha in 0-3, as the host's render-target clears give.
+    EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0xf0}));
+    EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 0, 0, 1.0f)) == V{0x0f, 0x00}));
+    EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 1.0f, 0.2f, 0)) == V{0x30, 0x0f}));
     // Half floats round to nearest even; too large is infinity; tiny values become subnormals.
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0x3c}));
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-2.0f, 0, 0, 0)) == V{0x00, 0xc0}));
@@ -616,6 +620,21 @@ int main() {
                                                       {0x12345678u, 0x9abcdef0u, 0u, 0u}, 0, 0, 1, {{2, 3, 4, 5}}));
                 }
                 all_textures.push_back(std::move(e5));
+            }
+        }
+        {
+            // A4B4G4R4's typed UAV is the driver's call (WARP has it, AMD's D3D12 driver doesn't); where the layer
+            // reports one, its clears must work. The element layout itself is checked in conversion_checks.
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT a4_support{DXGI_FORMAT_A4B4G4R4_UNORM};
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &a4_support, sizeof(a4_support))) &&
+                (a4_support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) {
+                all_textures.push_back(
+                    {"A4B4G4R4_UNORM, Float and Uint", DXGI_FORMAT_A4B4G4R4_UNORM, VK_FORMAT_R4G4B4A4_UNORM_PACK16, 8, 8,
+                     1, 1, false,
+                     {texture_clear(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(1.0f, 0.0f, 0.2f, 0.0f), 0, 0, 1),
+                      texture_clear(VK_FORMAT_R4G4B4A4_UNORM_PACK16, false, {1, 2, 3, 4}, 0, 0, 1)}});
+            } else {
+                std::printf("A4B4G4R4_UNORM: no typed UAV on this device, its clears skipped\n");
             }
         }
         for (const auto& test : all_textures)

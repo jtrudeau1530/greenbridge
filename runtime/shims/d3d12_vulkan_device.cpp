@@ -4820,7 +4820,12 @@ public:
             }
 
             if (buffer != 0) s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
-            if (buffer & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) s1 |= D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
+            // Only what CreateGraphicsPipelineState's input layouts accept (vertex_format): R8/R16 SNORM and SINT
+            // have Vulkan vertex support but no input-layout mapping yet.
+            VkFormat vertex_vk = VK_FORMAT_UNDEFINED;
+            UINT vertex_bytes = 0;
+            if ((buffer & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) && vertex_format(fs->Format, vertex_vk, vertex_bytes))
+                s1 |= D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
             if (fs->Format == DXGI_FORMAT_R16_UINT || fs->Format == DXGI_FORMAT_R32_UINT)
                 s1 |= D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER;
 
