@@ -284,6 +284,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
+  add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
+
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
 
