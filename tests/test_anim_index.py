@@ -379,6 +379,20 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("output must end in .json or .csv", p.stderr)
 
+    def test_cli_cannot_create_a_report_in_place_of_the_carve_manifest(self):
+        # <source>/index.json is the carve manifest's name even before a carve has written it.
+        carve = os.path.join(self.root, "carved_no_manifest")
+        os.makedirs(carve)
+        manifest = os.path.join(carve, "index.json")
+        out_csv = os.path.join(self.root, "no_manifest.csv")
+        for args, flag in (([manifest], "output"), ([out_csv, "--rigs", manifest], "--rigs")):
+            with self.subTest(flag=flag):
+                p = subprocess.run([sys.executable, "-I", TOOL, carve, *args, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn(f"{flag} would overwrite the carve manifest", p.stderr)
+                self.assertFalse(os.path.exists(manifest))
+
     def test_cli_carve_dir_protects_manifest_and_input_files(self):
         carve = os.path.join(self.root, "carved_manifest_test")
         os.makedirs(carve)
