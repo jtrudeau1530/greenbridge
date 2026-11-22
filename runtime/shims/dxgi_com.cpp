@@ -4,9 +4,12 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace rt::dxgi {
@@ -346,6 +349,26 @@ private:
     std::atomic<UINT> max_frame_latency_{2};
 };
 
+struct ReservationState {
+    std::atomic<UINT64> local{0};
+    std::atomic<UINT64> non_local{0};
+};
+
+// Video-memory reservations are scoped per physical adapter in the process (matching native DXGI,
+// where separate IDXGIAdapter3 handles opened for the same LUID observe each other's reservations).
+std::shared_ptr<ReservationState> adapter_reservation_state(LUID luid, VkPhysicalDevice physical) {
+    static std::mutex mutex;
+    static std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>> table;
+    const bool has_luid = (luid.LowPart != 0 || luid.HighPart != 0);
+    const auto key =
+        has_luid ? std::make_tuple(std::uint32_t(luid.LowPart), std::int32_t(luid.HighPart), std::uintptr_t(0))
+                 : std::make_tuple(std::uint32_t(0), std::int32_t(0), reinterpret_cast<std::uintptr_t>(physical));
+    std::lock_guard lock(mutex);
+    auto& entry = table[key];
+    if (!entry) entry = std::make_shared<ReservationState>();
+    return entry;
+}
+
 // Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
 class Adapter final : public IDXGIAdapter3 {
@@ -354,6 +377,7 @@ public:
         : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical) {
         if (parent_) parent_->AddRef();
         populate_desc();
+        reservations_ = adapter_reservation_state(desc_.AdapterLuid, physical_);
     }
 
     ~Adapter() {
@@ -475,19 +499,19 @@ public:
             info->Budget = want_local ? desc_.DedicatedVideoMemory : desc_.SharedSystemMemory;
         }
         info->AvailableForReservation = info->Budget / 2;
-        info->CurrentReservation = want_local ? local_reservation_.load(std::memory_order_relaxed)
-                                              : non_local_reservation_.load(std::memory_order_relaxed);
+        info->CurrentReservation = want_local ? reservations_->local.load(std::memory_order_relaxed)
+                                              : reservations_->non_local.load(std::memory_order_relaxed);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetVideoMemoryReservation(UINT node_index, DXGI_MEMORY_SEGMENT_GROUP group,
                                                         UINT64 reservation) override {
         if (node_index != 0) return E_INVALIDARG;
         if (group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL) {
-            local_reservation_.store(reservation, std::memory_order_relaxed);
+            reservations_->local.store(reservation, std::memory_order_relaxed);
             return S_OK;
         }
         if (group == DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) {
-            non_local_reservation_.store(reservation, std::memory_order_relaxed);
+            reservations_->non_local.store(reservation, std::memory_order_relaxed);
             return S_OK;
         }
         return E_INVALIDARG;
@@ -571,8 +595,7 @@ private:
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     DXGI_ADAPTER_DESC2 desc_{};
     bool has_memory_budget_ = false;
-    std::atomic<UINT64> local_reservation_{0};
-    std::atomic<UINT64> non_local_reservation_{0};
+    std::shared_ptr<ReservationState> reservations_;
 };
 
 class Factory final : public IDXGIFactory4 {

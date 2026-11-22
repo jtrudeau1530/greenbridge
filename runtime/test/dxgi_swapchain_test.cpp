@@ -605,7 +605,10 @@ int main() {
         if (factory->EnumAdapterByLuid(bogus, IID_PPV_ARGS(&by_luid)) != DXGI_ERROR_NOT_FOUND || by_luid != nullptr)
             return fail("EnumAdapterByLuid(bogus) should return DXGI_ERROR_NOT_FOUND");
 
-        // QueryVideoMemoryInfo + SetVideoMemoryReservation.
+        // QueryVideoMemoryInfo + SetVideoMemoryReservation (shared across distinct handles for the same LUID).
+        IDXGIAdapter3* by_luid_b = nullptr;
+        if (FAILED(factory->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&by_luid_b))) || !by_luid_b)
+            return fail("EnumAdapterByLuid(second handle) failed");
         DXGI_QUERY_VIDEO_MEMORY_INFO local_info{};
         if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info)) ||
             local_info.Budget == 0)
@@ -614,10 +617,25 @@ int main() {
             return fail("SetVideoMemoryReservation(LOCAL) failed");
         if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info)) ||
             local_info.CurrentReservation != 64u * 1024u * 1024u)
-            return fail("SetVideoMemoryReservation did not reflect in QueryVideoMemoryInfo");
+            return fail("SetVideoMemoryReservation did not reflect on handle A");
+        DXGI_QUERY_VIDEO_MEMORY_INFO local_info_b{};
+        if (FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info_b)) ||
+            local_info_b.CurrentReservation != 64u * 1024u * 1024u)
+            return fail("SetVideoMemoryReservation(LOCAL) did not reflect across second IDXGIAdapter3 handle");
+
         DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info{};
-        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info)))
-            return fail("QueryVideoMemoryInfo(NON_LOCAL) failed");
+        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, 32u * 1024u * 1024u)) ||
+            FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info)) ||
+            nonlocal_info.CurrentReservation != 32u * 1024u * 1024u)
+            return fail("SetVideoMemoryReservation(NON_LOCAL) did not reflect across second IDXGIAdapter3 handle");
+        // Restore reservations to 0 and verify both handles see 0.
+        if (FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, 0)) ||
+            FAILED(adapter3->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, 0)) ||
+            FAILED(by_luid_b->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info_b)) ||
+            local_info_b.CurrentReservation != 0)
+            return fail("Restoring SetVideoMemoryReservation to 0 failed");
+        by_luid_b->Release();
+
         if (adapter3->QueryVideoMemoryInfo(1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info) != E_INVALIDARG ||
             adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, nullptr) != E_INVALIDARG)
             return fail("QueryVideoMemoryInfo invalid args should return E_INVALIDARG");
