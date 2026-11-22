@@ -661,5 +661,49 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(bits_to_f32(state.get_vgpr(lane, 2)), 100.0)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src_inplace(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, f32_to_bits(16.0))
+        state.set_vgpr(1, f32_to_bits(999.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(bits_to_f32(state.get_vgpr(0)), 4.0)
+        self.assertEqual(bits_to_f32(state.get_vgpr(1)), 999.0)
+
+    def test_inplace_iterative_convergence(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, f32_to_bits(65536.0))
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        for expected in [256.0, 16.0, 4.0, 2.0]:
+            self.scalar_interp.step(instr, state)
+            self.assertEqual(bits_to_f32(state.get_vgpr(0)), expected)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, f32_to_bits(float(lane * lane)))
+
+        instr = VSqrtF32Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src=VOP3Operand(Reg32(0, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertAlmostEqual(bits_to_f32(state.get_vgpr(lane, 0)), float(lane), places=5)
+
+
 if __name__ == "__main__":
     unittest.main()
