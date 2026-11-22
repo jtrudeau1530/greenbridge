@@ -669,7 +669,10 @@ Blob format: `rt::rootsig::parse_rts0` reads the `RTS0` chunk of a serialized ro
 and 1.2. `root_signature_oracle_test` checks it on Windows against blobs the PC `d3d12.dll` serializes. These
 layouts are measured, not assumed:
 - a descriptor table's payload is `{num_ranges, ranges_offset}`, with the ranges at that offset;
-- ranges are 20 bytes, or 24 with the 1.1/1.2 flags dword;
+- ranges are 20 bytes, or 24 with the 1.1/1.2 flags dword, in `D3D12_DESCRIPTOR_RANGE(1)` order:
+  `{type, count, base register, space, offset}` in 1.0 and `{type, count, base register, space, flags, offset}` in
+  1.1/1.2, so the flags come *before* `OffsetInDescriptorsFromTableStart` (a range with `DATA_STATIC` and offset 7
+  serializes as `… 8 7`). The parser keeps all six fields;
 - root descriptors carry a flags dword from 1.1 on;
 - static samplers are 13 dwords (`D3D12_STATIC_SAMPLER_DESC` order). In 1.2 they are 14: `D3D12_STATIC_SAMPLER_DESC1`
   appends `Flags`, i.e. UINT border colours and non-normalized coordinates.
