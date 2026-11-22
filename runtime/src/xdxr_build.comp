@@ -1,0 +1,496 @@
+// Builds an XDXR BVH4 runtime acceleration structure on the GPU (docs/bvh.md 3.1 and 7a): the records the game's
+// translated traversal shaders read with image_bvh_intersect_ray, written straight into the destination resource.
+// tools/xdxr_bvh.py is the CPU reference; runtime/test/vk_xdxr_build_test.cpp checks this pass against it.
+// xdxr_build_spv.h is this file compiled with `glslc --target-env=vulkan1.2 -O -mfmt=c` (see the header); keep them
+// together.
+//
+// One pipeline, one dispatch per step, selected by pc.mode (xdxr_build.h records them in this order, with a compute
+// barrier between each):
+//   MODE_INIT      parent table to 0xffffffff, centroid bounds to empty
+//   MODE_TRIANGLES one thread per triangle of one geometry: the leaf (TRI0, remap 0x09), its box, the centroid bounds
+//   MODE_INSTANCES one thread per D3D12_RAYTRACING_INSTANCE_DESC: the 128-byte INSTANCE record and its world box
+//   MODE_MORTON    one thread per element: 30-bit Morton key of its box centre (empty boxes sort last)
+//   MODE_RADIX_*   a stable LSD radix sort of the keys with their element indices: 8 passes of 4-bit digits, each
+//                  a count per tile of RADIX_TILE elements, one exclusive scan, and a scatter (24 dispatches in all,
+//                  whatever the count; shared memory only, no subgroup operations)
+//   MODE_SMALL_SORT up to SMALL_SORT_MAX keys: one workgroup sorts them in shared memory (bitonic, ties by element
+//                  index, so the order is the stable one), in one dispatch instead of the radix sort's 24, whose
+//                  fixed latency dominated small builds
+//   MODE_LEVEL     one thread per BOX32 node of one level: four consecutive entries of the level below
+//   MODE_HEADER    one thread: the 64-byte header
+// An update (D3D12 PERFORM_UPDATE: same topology, new positions or transforms) refits instead: MODE_COPY copies the
+// source structure to the destination when they differ, MODE_TRIANGLES / MODE_INSTANCES rewrite the elements at their
+// slots, MODE_LEVEL with arg2 = 1 recomputes each node's boxes from the children it already points to (the tree's
+// grouping is kept, so there is no Morton pass and no sort), and MODE_HEADER rewrites the bounds.
+//   MODE_COPY      one thread per word: count words from src0 to dst
+//   MODE_COPY_AS   CopyRaytracingAccelerationStructure CLONE / COMPACT: the source structure's size comes from its
+//                  header (totalSizeIn64BNodes, which does not count the 64-byte header: the size is 64 * (field +
+//                  1) bytes), so the copy can follow a build in the same list; at most count
+//                  words. The records are position-independent (node pointers count from the structure's start, and
+//                  a TLAS names its BLASes by address), so the bytes are the copy.
+//   MODE_POSTBUILD one thread: the 8-byte COMPACTED_SIZE or CURRENT_SIZE of the structure at src0, at dst. A build
+//                  is already exactly its layout's size, so both are (totalSizeIn64BNodes + 1) * 64.
+// The tree groups four consecutive children per node in Morton order, level by level, so its shape depends only on
+// the element count and the layout (xdxr_build.h XdxrLayout) is known when the command is recorded.
+//
+// Addresses are 64-bit buffer device addresses passed as uvec2 (GL_EXT_buffer_reference_uvec2): only the
+// bufferDeviceAddress feature is needed, no shaderInt64. An address read from memory (an instance's BLAS) is a
+// D3D12 GPU virtual address and gets pc.bias added, the distance between the application's address space and the
+// device's (0 where they are the same).
+//
+// No invocation stores to a word and then uses a value it loaded from that word earlier in the same dispatch. The
+// SPIRV-Cross in MoltenVK 1.4.2 (6c09849f, and aa217aeb, which MoltenVK main pins) moves a load through a pointer
+// made by OpBitcast from a uvec2 to where its value is used, after a store to the same address, so the load reads
+// the new value. SPIRV-Cross 38abe362 fixes it. The radix scan used to rewrite the counts in place this way and lost
+// elements on MoltenVK (docs/bvh.md, GPU builder).
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+const uint MODE_INIT = 0u, MODE_TRIANGLES = 1u, MODE_INSTANCES = 2u, MODE_MORTON = 3u, MODE_LEVEL = 5u,
+           MODE_HEADER = 6u, MODE_RADIX_COUNT = 7u, MODE_RADIX_SCAN = 8u, MODE_RADIX_SCATTER = 9u,
+           MODE_SMALL_SORT = 10u, MODE_COPY = 11u, MODE_COPY_AS = 12u, MODE_POSTBUILD = 13u;
+const uint SMALL_SORT_MAX = 1024u;          // xdxr_build.h XdxrLayout::small_sort_max
+const uint RADIX_BITS = 4u, RADIX_BINS = 16u, RADIX_PASSES = 8u;
+const uint RADIX_TILE = 256u;              // elements per workgroup in count and scatter: 4 chunks of 64
+const uint INVALID = 0xffffffffu;
+const uint TRI0 = 0u, BOX32 = 5u, INSTANCE = 6u;
+const uint REMAP_IDENTITY = 0x09u;
+const uint FLAG_BOTTOM_LEVEL = 0x80000000u, VERSION_2403 = 6u, INST_IDENTITY_ROTATION = 0x80000000u,
+           INST_FLAGS_MASK = 0xc0000000u;
+
+layout(push_constant) uniform Push {
+    uvec2 dst;            // the acceleration structure (header at byte 0)
+    uvec2 scratch;        // xdxr_build.h XdxrLayout scratch words
+    uvec2 src0;           // triangles: vertices; instances: the instance descs
+    uvec2 src1;           // triangles: indices (0 = none)
+    uvec2 src2;           // triangles: 3x4 transform (0 = none)
+    uvec2 bias;           // added to addresses read from memory
+    uint mode;
+    uint count;           // threads of this dispatch
+    uint first;           // triangles: first element; level: first node of this level; radix: the pass (0..7)
+    uint arg0;            // triangles: vertex stride; level: entries in the level below
+    uint arg1;            // triangles: 0 = R32G32B32_FLOAT, 1 = R32G32_FLOAT; level: first node of the level below,
+                          //   or INVALID when the level below is the elements
+    uint arg2;            // triangles: index type (0 none, 1 u16, 2 u32); level: 1 = refit the existing node
+    uint geometry;        // triangles: geometry index << 8 | D3D12_RAYTRACING_GEOMETRY_FLAGS
+    uint elements;        // element count N
+    uint sort_size;       // N: the keys sorted (one per element)
+    uint elements_off;    // byte offsets in dst (XdxrLayout)
+    uint nodes_off;
+    uint parents_off;
+    uint total_size;
+    uint tlas;            // 1: elements are 128-byte instances
+} pc;
+
+// ---- 64-bit addresses as uvec2 ----
+uvec2 add(uvec2 a, uint b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b, carry);
+    return uvec2(lo, a.y + carry);
+}
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    return uvec2(lo, a.y + b.y + carry);
+}
+Words at(uvec2 base, uint byte_offset) { return Words(add(base, byte_offset)); }
+uint load(uvec2 base, uint byte_offset) { return at(base, byte_offset).w[0]; }
+void store(uvec2 base, uint byte_offset, uint v) { at(base, byte_offset).w[0] = v; }
+void storef(uvec2 base, uint byte_offset, float v) { store(base, byte_offset, floatBitsToUint(v)); }
+bool is_null(uvec2 a) { return a.x == 0u && a.y == 0u; }
+
+// ---- scratch: centroid bounds (6 ordered words at 0), keys and element indices twice (the radix sort's two
+// sides; the sorted result is back in the first after an even number of passes), digit counts, their exclusive
+// prefix sums, boxes ----
+const uint SCRATCH_KEYS = 64u;
+uint radix_tiles() { return (pc.sort_size + RADIX_TILE - 1u) / RADIX_TILE; }
+uint keys_off() { return SCRATCH_KEYS; }
+uint vals_off() { return SCRATCH_KEYS + 4u * pc.sort_size; }
+uint keys2_off() { return SCRATCH_KEYS + 8u * pc.sort_size; }
+uint vals2_off() { return SCRATCH_KEYS + 12u * pc.sort_size; }
+uint counts_off() { return SCRATCH_KEYS + 16u * pc.sort_size; }  // RADIX_BINS x tiles, digit-major
+uint offsets_off() { return counts_off() + 4u * RADIX_BINS * radix_tiles(); }  // the same shape: the scan of counts
+uint boxes_off() { return offsets_off() + 4u * RADIX_BINS * radix_tiles(); }  // 6 floats per element, then per node
+
+// A float as a uint that orders the same way, for atomicMin/atomicMax.
+uint ordered(float f) {
+    uint b = floatBitsToUint(f);
+    return (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
+}
+float unordered(uint u) {
+    return uintBitsToFloat((u & 0x80000000u) != 0u ? (u & 0x7fffffffu) : ~u);
+}
+
+void store_box(uint index, vec3 lo, vec3 hi) {
+    uint o = boxes_off() + 24u * index;
+    storef(pc.scratch, o, lo.x); storef(pc.scratch, o + 4u, lo.y); storef(pc.scratch, o + 8u, lo.z);
+    storef(pc.scratch, o + 12u, hi.x); storef(pc.scratch, o + 16u, hi.y); storef(pc.scratch, o + 20u, hi.z);
+}
+void load_box(uint index, out vec3 lo, out vec3 hi) {
+    uint o = boxes_off() + 24u * index;
+    lo = vec3(uintBitsToFloat(load(pc.scratch, o)), uintBitsToFloat(load(pc.scratch, o + 4u)),
+              uintBitsToFloat(load(pc.scratch, o + 8u)));
+    hi = vec3(uintBitsToFloat(load(pc.scratch, o + 12u)), uintBitsToFloat(load(pc.scratch, o + 16u)),
+              uintBitsToFloat(load(pc.scratch, o + 20u)));
+}
+bool box_empty(vec3 lo, vec3 hi) { return !(lo.x <= hi.x && lo.y <= hi.y && lo.z <= hi.z); }
+
+void grow_centroid_bounds(vec3 lo, vec3 hi) {
+    if (box_empty(lo, hi)) return;
+    vec3 c = (lo + hi) * 0.5;
+    Words s = at(pc.scratch, 0u);
+    atomicMin(s.w[0], ordered(c.x)); atomicMin(s.w[1], ordered(c.y)); atomicMin(s.w[2], ordered(c.z));
+    atomicMax(s.w[3], ordered(c.x)); atomicMax(s.w[4], ordered(c.y)); atomicMax(s.w[5], ordered(c.z));
+}
+
+uint element_size() { return pc.tlas != 0u ? 128u : 64u; }
+uint element_ptr(uint e) { return ((pc.elements_off + e * element_size()) >> 6) << 3 | (pc.tlas != 0u ? INSTANCE : TRI0); }
+uint node_ptr(uint n) { return ((pc.nodes_off + n * 128u) >> 6) << 3 | BOX32; }
+uint ptr_unit(uint p) { return p >> 3; }
+
+// ---- MODE_TRIANGLES ----
+vec3 vertex(uint v) {
+    uvec2 a = add(pc.src0, v * pc.arg0);
+    float x = uintBitsToFloat(load(a, 0u)), y = uintBitsToFloat(load(a, 4u));
+    float z = pc.arg1 == 1u ? 0.0 : uintBitsToFloat(load(a, 8u));
+    return vec3(x, y, z);
+}
+uint index_of(uint i) {
+    if (pc.arg2 == 0u) return i;
+    if (pc.arg2 == 2u) return load(pc.src1, 4u * i);
+    uint word = load(pc.src1, 4u * (i >> 1));      // u16 indices: D3D12 requires 2-byte alignment; the word is aligned
+    return (i & 1u) != 0u ? word >> 16 : word & 0xffffu;
+}
+vec3 transformed(vec3 p) {
+    if (is_null(pc.src2)) return p;
+    vec3 r;
+    for (uint row = 0u; row < 3u; ++row) {
+        uint o = 16u * row;
+        vec4 m = vec4(uintBitsToFloat(load(pc.src2, o)), uintBitsToFloat(load(pc.src2, o + 4u)),
+                      uintBitsToFloat(load(pc.src2, o + 8u)), uintBitsToFloat(load(pc.src2, o + 12u)));
+        r[row] = dot(m.xyz, p) + m.w;
+    }
+    return r;
+}
+
+void build_triangle(uint t) {
+    vec3 v[3];
+    for (uint k = 0u; k < 3u; ++k) v[k] = transformed(vertex(index_of(3u * t + k)));
+    uint e = pc.first + t;
+    uint o = pc.elements_off + 64u * e;
+    for (uint k = 0u; k < 3u; ++k) {
+        storef(pc.dst, o + 12u * k, v[k].x); storef(pc.dst, o + 12u * k + 4u, v[k].y);
+        storef(pc.dst, o + 12u * k + 8u, v[k].z);
+    }
+    storef(pc.dst, o + 36u, v[2].x); storef(pc.dst, o + 40u, v[2].y); storef(pc.dst, o + 44u, v[2].z);  // slot 3 unused
+    store(pc.dst, o + 48u, pc.geometry);
+    store(pc.dst, o + 52u, t);                 // primitive index within its geometry
+    store(pc.dst, o + 56u, INVALID);           // no TRI1 in this leaf
+    store(pc.dst, o + 60u, REMAP_IDENTITY);
+    // D3D12: a triangle whose first vertex has a NaN x is inactive, and so is one with a NaN anywhere it cannot
+    // be hit; an empty box keeps it out of every traversal and of the centroid bounds.
+    bool nan_any = any(isnan(v[0])) || any(isnan(v[1])) || any(isnan(v[2]));
+    vec3 lo = min(min(v[0], v[1]), v[2]), hi = max(max(v[0], v[1]), v[2]);
+    if (nan_any) { lo = vec3(uintBitsToFloat(0x7f800000u)); hi = -lo; }
+    store_box(e, lo, hi);
+    grow_centroid_bounds(lo, hi);
+}
+
+// ---- MODE_INSTANCES ----
+void build_instance(uint i) {
+    uint d = 64u * i;
+    float m[12];
+    for (uint k = 0u; k < 12u; ++k) m[k] = uintBitsToFloat(load(pc.src0, d + 4u * k));
+    uint id_mask = load(pc.src0, d + 48u), contrib = load(pc.src0, d + 52u);
+    uvec2 blas_va = uvec2(load(pc.src0, d + 56u), load(pc.src0, d + 60u));
+    uint o = pc.elements_off + 128u * i;
+    for (uint k = 0u; k < 12u; ++k) storef(pc.dst, o + 4u * k, m[k]);
+    store(pc.dst, o + 48u, id_mask);
+    store(pc.dst, o + 52u, contrib);
+    vec3 lo = vec3(uintBitsToFloat(0x7f800000u)), hi = -lo;
+    uint root = INVALID;
+    if (!is_null(blas_va)) {
+        uvec2 blas = add64(blas_va, pc.bias);
+        root = load(blas, 48u);
+        vec3 blo = vec3(uintBitsToFloat(load(blas, 16u)), uintBitsToFloat(load(blas, 20u)), uintBitsToFloat(load(blas, 24u)));
+        vec3 bhi = vec3(uintBitsToFloat(load(blas, 28u)), uintBitsToFloat(load(blas, 32u)), uintBitsToFloat(load(blas, 36u)));
+        if (!box_empty(blo, bhi) && (id_mask >> 24) != 0u) {     // mask 0: never hit, no box
+            for (uint c = 0u; c < 8u; ++c) {
+                vec3 p = vec3((c & 1u) != 0u ? bhi.x : blo.x, (c & 2u) != 0u ? bhi.y : blo.y, (c & 4u) != 0u ? bhi.z : blo.z);
+                vec3 w = vec3(m[0] * p.x + m[1] * p.y + m[2] * p.z + m[3],
+                              m[4] * p.x + m[5] * p.y + m[6] * p.z + m[7],
+                              m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11]);
+                lo = min(lo, w); hi = max(hi, w);
+            }
+        }
+    }
+    bool identity = m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[4] == 0.0 && m[5] == 1.0 && m[6] == 0.0 &&
+                    m[8] == 0.0 && m[9] == 0.0 && m[10] == 1.0;
+    store(pc.dst, o + 56u, (root & ~INST_FLAGS_MASK) | (identity ? INST_IDENTITY_ROTATION : 0u));
+    // The record holds the BLAS address in 256-byte units: the application's address, as the game wrote it.
+    store(pc.dst, o + 60u, (blas_va.x >> 8) | (blas_va.y << 24));
+    // world-to-object: the inverse of the affine transform
+    mat3 a = mat3(m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10]);   // columns
+    float det = determinant(a);
+    mat3 inv = det != 0.0 ? inverse(a) : mat3(0.0);
+    vec3 t = vec3(m[3], m[7], m[11]);
+    vec3 it = -(inv * t);
+    for (uint row = 0u; row < 3u; ++row) {
+        storef(pc.dst, o + 64u + 16u * row, inv[0][row]);
+        storef(pc.dst, o + 68u + 16u * row, inv[1][row]);
+        storef(pc.dst, o + 72u + 16u * row, inv[2][row]);
+        storef(pc.dst, o + 76u + 16u * row, it[row]);
+    }
+    store(pc.dst, o + 112u, i);
+    store(pc.dst, o + 116u, INVALID);          // parent node: MODE_LEVEL fills it
+    store(pc.dst, o + 120u, 0u);
+    store(pc.dst, o + 124u, 0u);
+    if (det == 0.0) { lo = vec3(uintBitsToFloat(0x7f800000u)); hi = -lo; }
+    store_box(i, lo, hi);
+    grow_centroid_bounds(lo, hi);
+}
+
+// ---- MODE_MORTON ----
+uint spread10(uint x) {
+    x &= 0x3ffu;
+    x = (x | (x << 16)) & 0x030000ffu;
+    x = (x | (x << 8)) & 0x0300f00fu;
+    x = (x | (x << 4)) & 0x030c30c3u;
+    x = (x | (x << 2)) & 0x09249249u;
+    return x;
+}
+void morton(uint i) {
+    uint key = 0x3fffffffu;                              // empty boxes keep the largest key and sort last
+    vec3 lo, hi;
+    load_box(i, lo, hi);
+    if (!box_empty(lo, hi)) {
+        Words s = at(pc.scratch, 0u);
+        vec3 cmin = vec3(unordered(s.w[0]), unordered(s.w[1]), unordered(s.w[2]));
+        vec3 cmax = vec3(unordered(s.w[3]), unordered(s.w[4]), unordered(s.w[5]));
+        vec3 extent = max(cmax - cmin, vec3(1e-30));
+        uvec3 q = uvec3(clamp((((lo + hi) * 0.5) - cmin) / extent, 0.0, 1.0) * 1023.0);
+        key = spread10(q.x) << 2 | spread10(q.y) << 1 | spread10(q.z);
+    }
+    store(pc.scratch, keys_off() + 4u * i, key);
+    store(pc.scratch, vals_off() + 4u * i, i);
+}
+// ---- MODE_SMALL_SORT ----
+// 8 KiB, with the radix arrays below about 12.5 KiB: under the 16 KiB every Vulkan device must allow.
+shared uint small_keys[SMALL_SORT_MAX];
+shared uint small_vals[SMALL_SORT_MAX];
+
+void small_sort(uint t) {
+    uint n = pc.sort_size, p = 1u;
+    while (p < n) p <<= 1;
+    for (uint i = t; i < p; i += 64u) {
+        small_keys[i] = i < n ? load(pc.scratch, keys_off() + 4u * i) : INVALID;
+        small_vals[i] = i < n ? load(pc.scratch, vals_off() + 4u * i) : INVALID;
+    }
+    barrier();
+    for (uint k = 2u; k <= p; k <<= 1) {
+        for (uint j = k >> 1; j > 0u; j >>= 1) {
+            for (uint i = t; i < p; i += 64u) {
+                uint l = i ^ j;
+                if (l > i) {
+                    uint ki = small_keys[i], kl = small_keys[l], vi = small_vals[i], vl = small_vals[l];
+                    bool greater = ki > kl || (ki == kl && vi > vl);
+                    if (greater == ((i & k) == 0u)) {
+                        small_keys[i] = kl; small_keys[l] = ki;
+                        small_vals[i] = vl; small_vals[l] = vi;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+    for (uint i = t; i < n; i += 64u) {
+        store(pc.scratch, keys_off() + 4u * i, small_keys[i]);
+        store(pc.scratch, vals_off() + 4u * i, small_vals[i]);
+    }
+}
+
+// ---- MODE_RADIX_* ----
+shared uint radix_hist[RADIX_BINS];
+shared uint radix_rank[RADIX_BINS][64];
+shared uint radix_base[RADIX_BINS];
+shared uint radix_part[64];
+
+uint src_keys() { return (pc.first & 1u) == 0u ? keys_off() : keys2_off(); }
+uint src_vals() { return (pc.first & 1u) == 0u ? vals_off() : vals2_off(); }
+uint dst_keys() { return (pc.first & 1u) == 0u ? keys2_off() : keys_off(); }
+uint dst_vals() { return (pc.first & 1u) == 0u ? vals2_off() : vals_off(); }
+uint digit(uint key) { return (key >> (RADIX_BITS * pc.first)) & (RADIX_BINS - 1u); }
+
+// Workgroup w counts the digits of its tile; counts[d * tiles + w].
+void radix_count(uint w, uint t) {
+    if (t < RADIX_BINS) radix_hist[t] = 0u;
+    barrier();
+    uint begin = w * RADIX_TILE, end = min(begin + RADIX_TILE, pc.sort_size);
+    for (uint i = begin + t; i < end; i += 64u) atomicAdd(radix_hist[digit(load(pc.scratch, src_keys() + 4u * i))], 1u);
+    barrier();
+    if (t < RADIX_BINS) store(pc.scratch, counts_off() + 4u * (t * radix_tiles() + w), radix_hist[t]);
+}
+
+// One workgroup: the exclusive prefix sum of all counts in digit-major order, into offsets (not in place: see the
+// SPIRV-Cross note at the top). Each thread sums a contiguous segment, the 64 segment sums are scanned in shared
+// memory, then each thread writes its segment.
+void radix_scan(uint t) {
+    uint n = RADIX_BINS * radix_tiles();
+    uint per = (n + 63u) / 64u;
+    uint begin = min(t * per, n), end = min(begin + per, n);
+    uint sum = 0u;
+    for (uint i = begin; i < end; ++i) sum += load(pc.scratch, counts_off() + 4u * i);
+    radix_part[t] = sum;
+    barrier();
+    if (t == 0u) {
+        uint running = 0u;
+        for (uint k = 0u; k < 64u; ++k) { uint v = radix_part[k]; radix_part[k] = running; running += v; }
+    }
+    barrier();
+    uint running = radix_part[t];
+    for (uint i = begin; i < end; ++i) {
+        uint v = load(pc.scratch, counts_off() + 4u * i);
+        store(pc.scratch, offsets_off() + 4u * i, running);
+        running += v;
+    }
+}
+
+// Workgroup w moves its tile's keys to their places, in order: the tile is read in chunks of 64, and an element's
+// place is its digit's base for this tile plus the number of earlier elements of the tile with the same digit.
+void radix_scatter(uint w, uint t) {
+    if (t < RADIX_BINS) radix_base[t] = load(pc.scratch, offsets_off() + 4u * (t * radix_tiles() + w));
+    uint begin = w * RADIX_TILE, end = min(begin + RADIX_TILE, pc.sort_size);
+    for (uint chunk = begin; chunk < end; chunk += 64u) {
+        uint i = chunk + t;
+        bool live = i < end;
+        uint key = live ? load(pc.scratch, src_keys() + 4u * i) : 0u;
+        uint val = live ? load(pc.scratch, src_vals() + 4u * i) : 0u;
+        uint d = digit(key);
+        for (uint b = 0u; b < RADIX_BINS; ++b) radix_rank[b][t] = (live && b == d) ? 1u : 0u;
+        barrier();
+        // inclusive scan of each digit's flags across the chunk (Hillis-Steele)
+        for (uint step = 1u; step < 64u; step <<= 1) {
+            uint add[RADIX_BINS];
+            for (uint b = 0u; b < RADIX_BINS; ++b) add[b] = t >= step ? radix_rank[b][t - step] : 0u;
+            barrier();
+            for (uint b = 0u; b < RADIX_BINS; ++b) radix_rank[b][t] += add[b];
+            barrier();
+        }
+        if (live) {
+            uint place = radix_base[d] + radix_rank[d][t] - 1u;
+            store(pc.scratch, dst_keys() + 4u * place, key);
+            store(pc.scratch, dst_vals() + 4u * place, val);
+        }
+        barrier();
+        if (t < RADIX_BINS) radix_base[t] += radix_rank[t][63];
+        barrier();
+    }
+}
+
+// ---- MODE_LEVEL ----
+void build_node(uint n) {
+    uint node = pc.first + n;
+    uint me = node_ptr(node);
+    uint o = pc.nodes_off + 128u * node;
+    vec3 ulo = vec3(uintBitsToFloat(0x7f800000u)), uhi = -ulo;
+    for (uint c = 0u; c < 4u; ++c) {
+        uint entry = 4u * n + c;
+        uint child = INVALID;
+        vec3 lo = vec3(uintBitsToFloat(0x7f800000u)), hi = -lo;     // min > max: the box test misses it
+        if (pc.arg2 == 1u) {
+            // refit: the child this node already has; its new box is in scratch (an element's from MODE_TRIANGLES /
+            // MODE_INSTANCES, a node's from the level below)
+            child = load(pc.dst, o + 4u * c);
+            if (child != INVALID) {
+                uint at = ptr_unit(child) * 64u;
+                if ((child & 7u) == BOX32) {
+                    load_box(pc.elements + (at - pc.nodes_off) / 128u, lo, hi);
+                } else {
+                    uint e = (at - pc.elements_off) / element_size();
+                    load_box(e, lo, hi);
+                    if (pc.tlas != 0u) store(pc.dst, pc.elements_off + 128u * e + 116u, me);
+                }
+                if (!box_empty(lo, hi)) { ulo = min(ulo, lo); uhi = max(uhi, hi); }
+            }
+        } else if (entry < pc.arg0) {
+            if (pc.arg1 == INVALID) {
+                uint e = load(pc.scratch, vals_off() + 4u * entry);
+                child = element_ptr(e);
+                load_box(e, lo, hi);
+                if (pc.tlas != 0u) store(pc.dst, pc.elements_off + 128u * e + 116u, me);
+            } else {
+                uint below = pc.arg1 + entry;
+                child = node_ptr(below);
+                load_box(pc.elements + below, lo, hi);
+            }
+            store(pc.dst, pc.parents_off + 4u * (ptr_unit(child) - pc.elements_off / 64u), me);
+            if (!box_empty(lo, hi)) { ulo = min(ulo, lo); uhi = max(uhi, hi); }
+        }
+        store(pc.dst, o + 4u * c, child);
+        uint b = o + 16u + 24u * c;
+        storef(pc.dst, b, lo.x); storef(pc.dst, b + 4u, lo.y); storef(pc.dst, b + 8u, lo.z);
+        storef(pc.dst, b + 12u, hi.x); storef(pc.dst, b + 16u, hi.y); storef(pc.dst, b + 20u, hi.z);
+    }
+    for (uint k = 0u; k < 4u; ++k) store(pc.dst, o + 112u + 4u * k, 0u);
+    store_box(pc.elements + node, ulo, uhi);
+}
+
+// ---- MODE_HEADER ----
+void build_header() {
+    uint root = pc.first;                                // the root node's index
+    vec3 lo, hi;
+    load_box(pc.elements + root, lo, hi);
+    store(pc.dst, 0u, (pc.tlas != 0u ? 0u : FLAG_BOTTOM_LEVEL) | VERSION_2403);
+    store(pc.dst, 4u, pc.total_size / 64u - 1u);          // totalSizeIn64BNodes does not count the header: 64 * (field + 1) bytes
+    store(pc.dst, 8u, 0u);                               // crc32: not computed for runtime builds
+    store(pc.dst, 12u, pc.elements);
+    storef(pc.dst, 16u, lo.x); storef(pc.dst, 20u, lo.y); storef(pc.dst, 24u, lo.z);
+    storef(pc.dst, 28u, hi.x); storef(pc.dst, 32u, hi.y); storef(pc.dst, 36u, hi.z);
+    store(pc.dst, 40u, pc.nodes_off);
+    store(pc.dst, 44u, 0u);                              // offsetToPrimRemap
+    store(pc.dst, 48u, node_ptr(root));
+    store(pc.dst, 52u, pc.elements_off);
+    store(pc.dst, 56u, pc.parents_off);
+    store(pc.dst, 60u, 0u);                              // compressionParams: uncompressed
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    // the radix modes use shared memory and barriers: every invocation of a workgroup takes part
+    if (pc.mode == MODE_RADIX_COUNT) { radix_count(gl_WorkGroupID.x, gl_LocalInvocationID.x); return; }
+    if (pc.mode == MODE_RADIX_SCAN) { radix_scan(gl_LocalInvocationID.x); return; }
+    if (pc.mode == MODE_RADIX_SCATTER) { radix_scatter(gl_WorkGroupID.x, gl_LocalInvocationID.x); return; }
+    if (pc.mode == MODE_SMALL_SORT) { small_sort(gl_LocalInvocationID.x); return; }
+    if (pc.mode == MODE_HEADER) {
+        if (i == 0u) build_header();
+        return;
+    }
+    if (i >= pc.count) return;
+    if (pc.mode == MODE_POSTBUILD) {
+        if (i == 0u) { store(pc.dst, 0u, (load(pc.src0, 4u) + 1u) * 64u); store(pc.dst, 4u, 0u); }
+        return;
+    }
+    if (pc.mode == MODE_COPY_AS) {
+        if (4u * i < (load(pc.src0, 4u) + 1u) * 64u) store(pc.dst, 4u * i, load(pc.src0, 4u * i));
+        return;
+    }
+    if (pc.mode == MODE_COPY) {
+        store(pc.dst, 4u * i, load(pc.src0, 4u * i));
+    } else if (pc.mode == MODE_INIT) {
+        store(pc.dst, pc.parents_off + 4u * i, INVALID);
+        if (i < 3u) { store(pc.scratch, 4u * i, INVALID); store(pc.scratch, 12u + 4u * i, 0u); }
+    } else if (pc.mode == MODE_TRIANGLES) {
+        build_triangle(i);
+    } else if (pc.mode == MODE_INSTANCES) {
+        build_instance(i);
+    } else if (pc.mode == MODE_MORTON) {
+        morton(i);
+    } else if (pc.mode == MODE_LEVEL) {
+        build_node(i);
+    }
+}
