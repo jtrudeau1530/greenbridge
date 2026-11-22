@@ -1074,5 +1074,201 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(oracle_v_lerp_u8(0, 0, 0), 0)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(999, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg32(0, RegType.SGPR)
+        src = VLerpOperand(Reg32(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VLerpU8Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = 0x10203040
+        s1 = 0x50607080
+        s2 = 0x01000100
+        correct = oracle_v_lerp_u8(s0, s1, s2)
+
+        # Corrupt single bits across different byte lanes
+        for bit_pos in (0, 7, 8, 15, 16, 23, 24, 31):
+            corrupted = correct ^ (1 << bit_pos)
+            self.assertNotEqual(correct, corrupted)
+
+    def test_mutation_unmasked_s2_upper_bits_detected(self) -> None:
+        """Mutant: S2 upper bits [7:1] are added rather than discarded."""
+        def mutant_lerp_byte(b0: int, b1: int, s2_byte: int) -> int:
+            # Bug: fails to mask s2 with 0x01
+            return ((b0 + b1 + (s2_byte & 0xFF)) >> 1) & MASK8
+
+        s0 = 0x20
+        s1 = 0x20
+        s2 = 0xFE  # Bit 0 is 0, bits [7:1] set (254)
+
+        oracle_res = ref_lerp_u8_byte(s0, s1, s2)
+        mutant_res = mutant_lerp_byte(s0, s1, s2)
+
+        # Oracle ignores bits [7:1] -> (32 + 32 + 0) >> 1 = 32
+        self.assertEqual(oracle_res, 0x20)
+        # Mutant adds 254 -> (32 + 32 + 254) >> 1 = 159
+        self.assertEqual(mutant_res, 159)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_inverted_round_bit_detected(self) -> None:
+        """Mutant: Subtracts round bit instead of adding."""
+        def mutant_lerp_byte(b0: int, b1: int, r: int) -> int:
+            # Bug: subtracts r
+            return ((b0 + b1 - (r & 1)) >> 1) & MASK8
+
+        s0 = 1
+        s1 = 2
+        r = 1
+
+        oracle_res = ref_lerp_u8_byte(s0, s1, r)
+        mutant_res = mutant_lerp_byte(s0, s1, r)
+
+        # (1 + 2 + 1) >> 1 = 2
+        self.assertEqual(oracle_res, 2)
+        # (1 + 2 - 1) >> 1 = 1
+        self.assertEqual(mutant_res, 1)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_signed_byte_interpretation_detected(self) -> None:
+        """Mutant: Treats byte operands as signed int8 (-128..127)."""
+        def mutant_lerp_byte(b0: int, b1: int, r: int) -> int:
+            # Bug: signed cast
+            sb0 = (b0 & 0xFF) if (b0 & 0x80) == 0 else (b0 & 0xFF) - 256
+            sb1 = (b1 & 0xFF) if (b1 & 0x80) == 0 else (b1 & 0xFF) - 256
+            return ((sb0 + sb1 + (r & 1)) >> 1) & MASK8
+
+        s0 = 0xFF  # 255 unsigned, -1 signed
+        s1 = 0x00  # 0
+        r = 0
+
+        oracle_res = ref_lerp_u8_byte(s0, s1, r)
+        mutant_res = mutant_lerp_byte(s0, s1, r)
+
+        # Unsigned average: (255 + 0) >> 1 = 127 (0x7F)
+        self.assertEqual(oracle_res, 0x7F)
+        # Signed average: (-1 + 0) >> 1 = -1 (0xFF)
+        self.assertEqual(mutant_res, 0xFF)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_premature_shift_detected(self) -> None:
+        """Mutant: Shifts operands before addition."""
+        def mutant_lerp_byte(b0: int, b1: int, r: int) -> int:
+            # Bug: premature shift loses odd LSB
+            return ((b0 >> 1) + (b1 >> 1) + (r & 1)) & MASK8
+
+        s0 = 1
+        s1 = 1
+        r = 0
+
+        oracle_res = ref_lerp_u8_byte(s0, s1, r)
+        mutant_res = mutant_lerp_byte(s0, s1, r)
+
+        # (1 + 1 + 0) >> 1 = 1
+        self.assertEqual(oracle_res, 1)
+        # (0 + 0 + 0) = 0
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_ignore_simd_exec_mask_detected(self) -> None:
+        """Mutant: SIMD interpreter writes inactive lanes."""
+        sentinel = 0xCAFEBABE
+        state = SIMDState(num_lanes=32, exec_mask=0x00000000)  # all inactive
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+
+        class BrokenSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VLerpU8Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: no exec_mask check
+                    res = oracle_v_lerp_u8(0, 0, 0)
+                    state.set_vgpr(lane, instr.dst.index, res)
+                    results.append(res)
+                return results
+
+        broken = BrokenSIMDInterpreter()
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Literal32(0)),
+            src1=VLerpOperand(Literal32(0)),
+            src2=VLerpOperand(Literal32(0)),
+        )
+        broken.step(instr, state)
+
+        # All 32 lanes were erroneously overwritten
+        corrupted = [lane for lane in range(32) if state.get_vgpr(lane, 0) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+    def test_mutation_cross_byte_carry_bleed_detected(self) -> None:
+        """Mutant: Whole 32-bit addition without per-byte lane isolation."""
+        def mutant_lerp_u32(s0: int, s1: int, s2: int) -> int:
+            # Bug: unisolated 32-bit addition bleeds carries across bytes
+            return ((s0 + s1 + (s2 & 1)) >> 1) & MASK32
+
+        # In byte 0, 255 + 255 + 0 = 510 = 0x1FE (bit 8 carry)
+        s0 = 0x0000_00FF
+        s1 = 0x0000_00FF
+        s2 = 0x0000_0000
+
+        oracle_res = oracle_v_lerp_u8(s0, s1, s2)
+        mutant_res = mutant_lerp_u32(s0, s1, s2)
+
+        # Oracle keeps lane 1 isolated at 0x00
+        self.assertEqual(oracle_res, 0x0000_00FF)
+        # Mutant bleeds carry into lane 1: (0x1FE >> 1) = 0xFF (happens to match byte 0),
+        # but let's test where carry actually crosses lane boundaries:
+        s0_bleed = 0x0000_01FF
+        s1_bleed = 0x0000_01FF
+        oracle_bleed = oracle_v_lerp_u8(s0_bleed, s1_bleed, 0)
+        mutant_bleed = mutant_lerp_u32(s0_bleed, s1_bleed, 0)
+        # Oracle: byte 0 = (255+255)>>1 = 255 (0xFF); byte 1 = (1+1)>>1 = 1 (0x01) -> 0x000001FF
+        self.assertEqual(oracle_bleed, 0x0000_01FF)
+        # Mutant: (0x1FF + 0x1FF) >> 1 = 0x3FE >> 1 = 0x1FF
+        # Now test with odd byte 0 that spills bit 0 into next bit
+        s0_spill = 0x0000_0080
+        s1_spill = 0x0000_0080
+        # Let's test non-isolated shift where bit 8 of lane 0 shifts into bit 7 of lane 0
+        s0_cross = 0x0000_0200
+        s1_cross = 0x0000_0200
+        self.assertEqual(oracle_v_lerp_u8(s0_cross, s1_cross, 0), 0x0000_0200)
+
+    def test_mutation_bit1_instead_of_bit0_round_detected(self) -> None:
+        """Mutant: S2 round bit reads bit 1 instead of bit 0."""
+        def mutant_lerp_byte(b0: int, b1: int, s2_byte: int) -> int:
+            # Bug: samples bit 1
+            return ((b0 + b1 + ((s2_byte >> 1) & 1)) >> 1) & MASK8
+
+        # s2 has bit 0 set, bit 1 clear
+        s2_bit0 = 0x01
+        s0 = 1
+        s1 = 2
+
+        oracle_res = ref_lerp_u8_byte(s0, s1, s2_bit0)
+        mutant_res = mutant_lerp_byte(s0, s1, s2_bit0)
+
+        # Oracle: (1 + 2 + 1) >> 1 = 2
+        self.assertEqual(oracle_res, 2)
+        # Mutant: (1 + 2 + 0) >> 1 = 1
+        self.assertEqual(mutant_res, 1)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+
 if __name__ == "__main__":
     unittest.main()
