@@ -118,6 +118,12 @@ class TestAlign(unittest.TestCase):
         self.assertEqual(unmatched, ["f/b_1080.bk2"])
         self.assertEqual(conf, ["anchored", "anchored"])
 
+    def test_trailing_skip_limit_selects_best_permitted_match(self):
+        names = ["f/a_720.bk2", "f/b_1080.bk2", "f/c_720.bk2"]
+        rows, unmatched = names_mod.name_streams(names, [stream(0)], max_skip=1)
+        self.assertEqual([row["path"] for row in rows], [names[1]])
+        self.assertEqual(unmatched, [names[0], names[2]])
+
     def test_family_siblings_share_shape(self):
         # x_01/x_02 share a shape, y does not exist in the archive
         names = ["f/x_01.bk2", "f/x_02.bk2", "f/y.bk2", "f/z.bk2"]
@@ -155,7 +161,7 @@ class TestAlign(unittest.TestCase):
             names_mod.name_streams(["f/a.bk2"], [stream(0), stream(1)])
 
     def test_no_streams(self):
-        self.assertEqual(names_mod.name_streams(["f/a.bk2"], []), ([], ["f/a.bk2"]))
+        self.assertEqual(names_mod.name_streams(["f/a.bk2"], [], max_skip=0), ([], ["f/a.bk2"]))
 
 
 class TestLoadPins(unittest.TestCase):
@@ -205,6 +211,22 @@ class TestCli(unittest.TestCase):
                     names_mod.main([tmp, "--mount", xml, "--max-skip", "-1"])
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("--max-skip must be 0 or more", err.getvalue())
+
+    def test_zero_max_skip_disallows_a_trailing_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(make_stream(1280, 720, 5))
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(mount_xml(["f/a.bk2", "f/b.bk2"]))
+            report = os.path.join(tmp, "names.json")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = names_mod.main([archive, "--mount", xml, "--max-skip", "0", "--out", report])
+            self.assertEqual(code, 1)
+            self.assertIn("no alignment within --max-skip", err.getvalue())
+            self.assertFalse(os.path.exists(report))
 
     def test_archive_end_to_end(self):
         shapes = [(1280, 720, 40), (1920, 1080, 50), (512, 512, 15)]
