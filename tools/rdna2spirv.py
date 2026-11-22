@@ -44,6 +44,7 @@ WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact o
 # (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
+FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
 # --texel-offset-fallback: image_sample*_o without VK_KHR_maintenance8. The run-time texel offset is folded into the
 # coordinate (coordinate + offset / size of the sampled mip level) instead of the SPIR-V Offset operand, which needs
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
@@ -148,6 +149,7 @@ class Gen:
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
+        self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_bvh = False
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
@@ -586,6 +588,18 @@ class Gen:
         self.emit(f"{r} = OpINotEqual %bool {v} {self.cu(0)}")
         return r
 
+    def emit_fma(self, r, x, y, z):
+        """r = x * y + z as an f32 multiply-add with ONE rounding, which is what RDNA2's v_fma_* do.
+
+        GLSL.std.450 Fma is specified in the Vulkan environment as "inherited from OpFMul followed by OpFAdd", so a
+        driver may round twice. With --fma khr it is OpFmaKHR instead: "correctly rounded" (SPV_KHR_fma), which needs
+        VK_KHR_shader_fma + shaderFmaFloat32 and is recorded in the index as capability FMAKHR."""
+        if FMA_KHR:
+            self.uses_fma_khr = True
+            self.emit(f"{r} = OpFmaKHR %float {x} {y} {z}")
+        else:
+            self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
+
     def fma_f16_odd(self, x, y, z):
         """fma(x, y, z) for f16 inputs (widened to f32), rounded to f32 with round-to-odd (SHADER-55).
 
@@ -636,10 +650,10 @@ class Gen:
         s - r, which needs an f32-ulp-level cancellation, or where x*y overflows while z cancels it."""
         t = self.tmp
         r, p, np_, pe, s_, bb, sb, da, db, se = (t() for _ in range(10))
-        self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
+        self.emit_fma(r, x, y, z)
         self.emit(f"{p} = OpFMul %float {x} {y}")
         self.emit(f"{np_} = OpFNegate %float {p}")
-        self.emit(f"{pe} = OpExtInst %float %glsl Fma {x} {y} {np_}")
+        self.emit_fma(pe, x, y, np_)
         self.emit(f"{s_} = OpFAdd %float {p} {z}")
         self.emit(f"{bb} = OpFSub %float {s_} {p}")
         self.emit(f"{sb} = OpFSub %float {s_} {bb}")
@@ -4991,7 +5005,7 @@ class Gen:
             # Each source is f32, or (op_sel_hi bit set) an f16 from the low/high half chosen by op_sel.
             vals = self.fma_mix_srcs(a, mods)
             r = self.tmp()
-            self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
+            self.emit_fma(r, vals[0], vals[1], vals[2])
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_mad_f32", "v_mac_f32"):
             # Unfused: the product is rounded before the add. v_mac_f32 is the VOP2 form with D as the addend
@@ -5317,7 +5331,7 @@ class Gen:
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
             vals = self.fma_mix_srcs(a, mods)
             r = self.tmp()
-            self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
+            self.emit_fma(r, vals[0], vals[1], vals[2])
             if self.round_mode:
                 # Toward zero the hardware rounds the exact fma once, to f16; round-to-odd at f32 narrows exactly.
                 # Nearest even keeps the f32 Fma then narrow (unchanged).
@@ -5412,7 +5426,7 @@ class Gen:
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
             r = self.tmp()
-            self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
+            self.emit_fma(r, x, y, z)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F1:
             x = self.src_f(a[1])
@@ -7663,6 +7677,8 @@ def assemble(gen):
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
     if gen.uses_f64:
         caps.append("Float64")
+    if gen.uses_fma_khr:
+        caps.append("FMAKHR")
     if gen.uses_store_views:
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
         if 3 in gen.uses_store_views:
@@ -7681,6 +7697,8 @@ def assemble(gen):
         caps.append("ShaderViewportIndex")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
+    if gen.uses_fma_khr:
+        exts.append("SPV_KHR_fma")
     if bary_builtin:
         exts.append("SPV_KHR_fragment_shader_barycentric")
     if ms and not msc:
@@ -9412,7 +9430,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "RuntimeDescriptorArray": "runtimeDescriptorArray", "ImageGatherExtended": "shaderImageGatherExtended",
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
-             "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex"}
+             "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
+             "FMAKHR": "shaderFmaFloat32"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),
@@ -9580,8 +9599,14 @@ def main():
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
                          "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
+    ap.add_argument("--fma", choices=("glsl", "khr"), default="glsl",
+                    help="how fused multiply-adds (v_fma_f32, v_fmac_f32, v_fmaak/fmamk_f32, v_fma_mix*) are emitted: "
+                         "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
+                         "(guaranteed single rounding; needs VK_KHR_shader_fma + shaderFmaFloat32, listed in the "
+                         "shader's metadata as capability FMAKHR / feature shaderFmaFloat32)")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE
+    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR
+    FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
     BARY_FALLBACK = a.bary_fallback

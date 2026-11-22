@@ -189,6 +189,16 @@ without it they're skipped, which is expected, not a failure. To test the fallba
 **for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
 (`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
 
+## Fused multiply-add: GLSL Fma or OpFmaKHR
+
+`cs_fma_fused` checks that `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32` (and one `v_fma_f16`) round once, on
+operands taken from user SGPRs so the driver cannot fold them. It passes with the default translation (`--fma glsl`,
+GLSL.std.450 `Fma`) and with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
+That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable it when the device has it and exit
+77 (a SKIP) for a module that needs it on a device without it. The Vulkan specification allows a driver to split GLSL
+`Fma` into two roundings, which is why `khr` exists. Neither the AMD (26.11.2) nor the NVIDIA (617.42) driver we tried
+does, so `cs_fma_fused` passing with `glsl` is not evidence that every driver is safe.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example

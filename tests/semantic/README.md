@@ -95,7 +95,7 @@ dynamic-bounds merge; no backward branches, loops, calls or switches), no textur
 Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
 undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
 through a float op lose NaN payloads (Python floats), so expected output words avoid NaN bit patterns; a
-signalling NaN read back through `OpBitcast` comes out quieted. `Fma` is exact: the product and sum are rationals,
+signalling NaN read back through `OpBitcast` comes out quieted. `Fma` and `OpFmaKHR` (SPV_KHR_fma, `--fma khr`) are exact: the product and sum are rationals,
 rounded once to binary32. `Exp2`/`Log2`/`Sqrt`/`InverseSqrt` are correctly rounded (Vulkan allows a few ULP), and
 inputs GLSL.std.450 or SPIR-V leave undefined (`Log2` of x <= 0, `OpFDiv` by zero, `FMax` of NaN...) raise
 `UnsupportedConstruct`. `Fract` is
