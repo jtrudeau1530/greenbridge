@@ -101,6 +101,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_alu_int_misc.py` translates one-instruction synthetic listings for `v_bfm_b32`, `v_and_or_b32`,
   `v_add_lshl_u32`, `v_lshl_or_b32`, `v_mad_i32_i24` and `v_mul_lo_u32` and checks the mrt0 word against
   hand-computed ISA values (masked shift counts, wrapping adds/products, 24-bit sign extension).
+- `test_lds_subdword_wide.py` translates the GPU tests `cs_w32_lds_subdword` (`ds_write_b8`/`_b16` and their
+  `_d16_hi` forms, `ds_read_u8`/`_i8`/`_u16`/`_i16`) and `cs_w32_lds_wide` (`ds_write`/`ds_read` `_b64`/`_b96`/`_b128`,
+  `ds_read2st64_b32`) and runs 32 lanes in lockstep; the 16 words come from a byte-level LDS model of the ISA rules
+  and match what an RTX 4070 SUPER (driver 610.88) wrote. Three SPIR-V sabotages (zero-extending `_i8`/`_i16`, no
+  high-half shift for `_d16_hi`, `st64` offset in dwords) must change the result.
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,
