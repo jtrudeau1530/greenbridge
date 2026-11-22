@@ -138,6 +138,7 @@ class Gen:
         self.uses_tex_3d = False
         self.uses_v4uint = False
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
+        self.uses_int_gather = False    # 2D typed sampled-image types for image_gather4_lz(_o)
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
         self.writes_depth = False
         self.uses_smul = False
@@ -5524,7 +5525,8 @@ class Gen:
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
             self.emit(f"{smp} = OpLoad %smp {sp}")
-            self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
+            if op not in ("image_gather4_lz", "image_gather4_lz_o"):
+                self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
             f = [self.tof(c) for c in coords]
             goff = None
             if op in ("image_gather4_lz_o", "image_gather4_l_o"):
@@ -5606,13 +5608,29 @@ class Gen:
                     raise Unsupported("image_gather4_lz form")
                 if dim == "dim:SQ_RSRC_IMG_CUBE":
                     f = self.cube_coords(f)
-                uv, res = self.tmp(), self.tmp()
+                uv = self.tmp()
                 if ncoord == 3:          # 2D array (or cube as a 6-layer array): layer is the 3rd coordinate
                     self.emit(f"{uv} = OpCompositeConstruct %v3float {f[0]} {f[1]} {f[2]}")
                 else:
                     self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-                self.emit(f"{res} = OpImageGather %v4float {si} {uv} {self.cu(dmask.bit_length() - 1)}"
-                          + (f" Offset {goff}" if goff is not None else ""))
+                component = self.cu(dmask.bit_length() - 1)
+                offset = f" Offset {goff}" if goff is not None else ""
+
+                def gather(image, cls, ty):
+                    sampled = self.tmp()
+                    sampler_type = f"itxsamp{cls}_0" if cls else stype
+                    self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
+                    res = self.tmp()
+                    self.emit(f"{res} = OpImageGather {ty} {sampled} {uv} {component}{offset}")
+                    return res
+
+                if dim == "dim:SQ_RSRC_IMG_2D":
+                    self.uses_int_gather = True
+                    # dmask selects one texture channel; all four taps are written.
+                    self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
+                                          0xf, vdata, d16, gather)
+                    return
+                res = gather(img, 0, "%v4float")
                 comps = []
                 for c in range(4):
                     comp = self.tmp()
@@ -5797,16 +5815,18 @@ class Gen:
         return flags
 
     def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, d16=False):
-        """image_load with the image's numeric type decided at run time (T# FORMAT). Every format is fetched
-        (OpImageFetch) from the sampled array of the image's dimension, where the runtime binds the T#'s view in the
-        T#'s own format: UINT/SINT formats through a uint/sint alias of that array (same set and binding, an
-        OpTypeImage of %uint/%int), everything else through the float array as before. Vulkan requires the image
-        type's component type to match the view's format, so a float fetch of an integer view would be undefined.
-        No storage view is involved, so no shaderStorageImageReadWithoutFormat (SHADER-151: Intel Xe-LP lacks it),
-        and read-only integer textures, which have no storage view, are read too. A lookup miss (index 0) takes the
-        float path: index 0 holds the RGBA8_UNORM fallback, which an integer alias must not read; it gives zeros.
-        Results are the raw bits of the dmask components; with d16, two per VGPR (see write).
-        t1 is the T#'s second dword (FORMAT), idx the bindless index image_load already looked up."""
+        def fetch(image, _cls, ty):
+            res = self.tmp()
+            self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Lod {self.cu(0)}")
+            return res
+        self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch)
+
+    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read):
+        """Read a sampled image using the component type selected by FORMAT in T# word 1.
+        read(image, cls, ty) emits the fetch or gather and returns its four components. The float view also
+        handles a lookup miss: index zero holds the RGBA8_UNORM fallback. UINT and SINT views share the
+        dimension's sampled binding through typed aliases (SHADER-151), so no storage image feature is needed.
+        dmask selects the output components; d16 packs two per VGPR."""
         di = self.STORE_DIMS[dim][0]
         self.uses_int_fetch.add(di)
         is_u, is_s = self.fmt_int_flags(t1)
@@ -5842,28 +5862,28 @@ class Gen:
                     self.emit(f"{w} = OpBitwiseOr %uint {lo} {hi}")
                 self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, w)
 
-        def fetch(cls, ty):
-            ip, im, r, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        def read_integer(cls, ty):
+            ip, im, b = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_itx{cls}_{di} %itx{cls}_{di} {idx}")
             self.emit(f"{im} = OpLoad %itximg{cls}_{di} {ip}")
-            self.emit(f"{r} = OpImageFetch {ty} {im} {iv} Lod {self.cu(0)}")
+            r = read(im, cls, ty)
             self.emit(f"{b} = OpBitcast %v4uint_st {r}")
             write(b)
 
         self.emit(f"OpSelectionMerge {L['e2']} None")
         self.emit(f"OpBranchConditional {use_s} {L['s']} {L['rest']}")
         self.emit(f"{L['s']} = OpLabel")
-        fetch(2, "%v4int_st")
+        read_integer(2, "%v4int_st")
         self.emit(f"OpBranch {L['e2']}")
         self.emit(f"{L['rest']} = OpLabel")
         self.emit(f"OpSelectionMerge {L['e3']} None")
         self.emit(f"OpBranchConditional {use_u} {L['u']} {L['f']}")
         self.emit(f"{L['u']} = OpLabel")
-        fetch(1, "%v4uint_st")
+        read_integer(1, "%v4uint_st")
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
-        res, b = self.tmp(), self.tmp()
-        self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
+        res = read(img, 0, "%v4float")
+        b = self.tmp()
         self.emit(f"{b} = OpBitcast %v4uint_st {res}")
         write(b, f16=True)
         self.emit(f"OpBranch {L['e3']}")
@@ -7225,6 +7245,8 @@ def assemble(gen):
                           f"%rt_itx{cls}_{di} = OpTypeRuntimeArray %itximg{cls}_{di}",
                           f"%_ptr_UC_rt_itx{cls}_{di} = OpTypePointer UniformConstant %rt_itx{cls}_{di}",
                           f"%_ptr_UC_itx{cls}_{di} = OpTypePointer UniformConstant %itximg{cls}_{di}"]
+                if gen.uses_int_gather and di == 0:
+                    types.append(f"%itxsamp{cls}_{di} = OpTypeSampledImage %itximg{cls}_{di}")
                 dec += [f"OpDecorate %itx{cls}_{di} DescriptorSet 0",
                         f"OpDecorate %itx{cls}_{di} Binding {Gen.SAMPLED_BINDINGS[di]}"]
                 gvars += [f"%itx{cls}_{di} = OpVariable %_ptr_UC_rt_itx{cls}_{di} UniformConstant"]

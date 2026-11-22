@@ -187,6 +187,40 @@ class LoadOnlyShaders(unittest.TestCase):
             self.assertEqual(comps, [0, 3], "dmask 0x9: R into v0, A into v1")
 
 
+class TypedGatherShaders(unittest.TestCase):
+    def test_2d_gather_picks_the_sampled_type_and_selected_component(self):
+        for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
+            with self.subTest(modifier=modifier):
+                m = Module(translate([f"image_gather4_lz {dst}, v[4:5], s[0:7], s[8:11] "
+                                      f"dmask:0x2 dim:SQ_RSRC_IMG_2D{modifier}", "s_waitcnt vmcnt(0)"]))
+                types = set()
+                for rid, op, args in m.order:
+                    if op != "OpImageGather":
+                        continue
+                    types.add(args[0])
+                    self.assertEqual(m.value(args[3], 0, 0), 1)  # green
+                    sampled_op, sampled = m.defs[args[1]]
+                    self.assertEqual(sampled_op, "OpSampledImage")
+                    image_load, image = m.defs[sampled[1]]
+                    self.assertEqual(image_load, "OpLoad")
+                    _, chain = m.defs[image[1]]
+                    self.assertEqual(m.binding[chain[1]], 0)
+                    if modifier and args[0] != "%v4float":
+                        def uses(opcode, operand):
+                            return [(r, a) for r, op, a in m.order if op == opcode and operand in a[1:]]
+                        ((raw, _),) = uses("OpBitcast", rid)
+                        taps = {int(a[2]): r for r, a in uses("OpCompositeExtract", raw)}
+                        self.assertEqual(set(taps), {0, 1, 2, 3})
+                        for tap in (0, 2):
+                            ((lo, mask),) = uses("OpBitwiseAnd", taps[tap])
+                            ((hi, shift),) = uses("OpShiftLeftLogical", taps[tap + 1])
+                            self.assertEqual(m.value(mask[2], 0, 0), 0xffff)
+                            self.assertEqual(m.value(shift[2], 0, 0), 16)
+                            self.assertTrue(any(hi in a for _, a in uses("OpBitwiseOr", lo)))
+
+                self.assertEqual(types, {"%v4uint_st", "%v4int_st", "%v4float"})
+
+
 class StoreAndLoad(unittest.TestCase):
     def test_a_shader_that_also_stores_needs_only_the_write_feature(self):
         m = Module(translate(["v_mov_b32 v4, 1", "v_mov_b32 v5, 2",
