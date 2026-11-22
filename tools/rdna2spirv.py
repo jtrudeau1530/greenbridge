@@ -1573,24 +1573,60 @@ class Gen:
                    "and": ("OpAtomicAnd", 0xFFFFFFFF), "or": ("OpAtomicOr", 0), "xor": ("OpAtomicXor", 0),
                    "swap": ("OpAtomicExchange", None), "cmpswap": ("OpAtomicCompareExchange", None)}
 
+    def atomic_inc_dec_cas(self, p, val, kind, lbl_do):
+        """Structured OpAtomicCompareExchange CAS loop on `%_ptr_PSB_uint` pointer `p` for RDNA2 32-bit unsigned
+        wrapping atomic inc/dec (RDNA2 ISA):
+          inc: M = (M >= DATA) ? 0 : M + 1
+          dec: M = (M == 0 || M > DATA) ? DATA : M - 1
+        Returns `(old_val, exit_label)` where `old_val` is the pre-op word in memory."""
+        lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
+        init = self.tmp()
+        self.emit(f"{init} = OpLoad %uint {p} Aligned 4")
+        self.emit(f"OpBranch {lbl_hdr}")
+        self.emit(f"{lbl_hdr} = OpLabel")
+        cur, got = self.tmp(), self.tmp()
+        self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
+        if kind == "inc":
+            wrap, step, new_u = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{wrap} = OpUGreaterThanEqual %bool {cur} {val}")
+            self.emit(f"{step} = OpIAdd %uint {cur} {self.cu(1)}")
+            self.emit(f"{new_u} = OpSelect %uint {wrap} {self.cu(0)} {step}")
+        else:
+            is_z, gt, wrap, step, new_u = (self.tmp() for _ in range(5))
+            self.emit(f"{is_z} = OpIEqual %bool {cur} {self.cu(0)}")
+            self.emit(f"{gt} = OpUGreaterThan %bool {cur} {val}")
+            self.emit(f"{wrap} = OpLogicalOr %bool {is_z} {gt}")
+            self.emit(f"{step} = OpISub %uint {cur} {self.cu(1)}")
+            self.emit(f"{new_u} = OpSelect %uint {wrap} {val} {step}")
+        done = self.tmp()
+        self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {new_u} {cur}")
+        self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+        self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+        self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+        self.emit(f"{lbl_cont} = OpLabel")
+        self.emit(f"OpBranch {lbl_hdr}")
+        self.emit(f"{lbl_exit} = OpLabel")
+        return cur, lbl_exit
+
     def global_atomic(self, op, a, mods):
         """global_atomic_<op> [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: a 32-bit atomic at the global_* address
         (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst (the first operand); without it there is no
-        vdst. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. Inactive lanes don't touch memory
-        and keep vdst. and/or/xor/swap_x2 work on a 64-bit element (two dwords, low first) as one 32-bit atomic per
-        dword, with no Int64 atomics. That leaves the same memory for a bitwise op, whose bits are independent, but not
-        always for an exchange: two lanes swapping into one element at once can leave one's low dword with the other's
-        high dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two reads, so another lane's 64-bit op on the same
-        element between them could be seen half done. The other
-        _x2 forms (add/sub/min/max carry or compare across the dwords, cmpswap_x2 compares all 64 bits), inc/dec and
-        the float atomics stay Unsupported."""
+        vdst. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. inc/dec wrap unsigned against DATA
+        via a CAS loop. Inactive lanes don't touch memory and keep vdst. and/or/xor/swap_x2 work on a 64-bit element
+        (two dwords, low first) as one 32-bit atomic per dword, with no Int64 atomics. That leaves the same memory for
+        a bitwise op, whose bits are independent, but not always for an exchange: two lanes swapping into one element
+        at once can leave one's low dword with the other's high dword (A.lo, B.lo, B.hi, A.hi). The returned pair is
+        two reads, so another lane's 64-bit op on the same element between them could be seen half done. The other
+        _x2 forms (add/sub/min/max/inc/dec carry or compare across the dwords, cmpswap_x2 compares all 64 bits) and
+        fcmpswap stay Unsupported."""
         kind = op[len("global_atomic_"):]
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.global_atomic_x2(op, kind[:-3], a, mods)
         if kind in ("fmin", "fmax"):
             return self.global_atomic_float(op, kind, a, mods)
-        if kind not in self.BUF_ATOMICS or any(m in mods for m in ("slc", "dlc", "lds")):
-            raise Unsupported(op if kind not in self.BUF_ATOMICS else op + " form")
+        is_inc_dec = kind in ("inc", "dec")
+        if (kind not in self.BUF_ATOMICS and not is_inc_dec) or any(m in mods for m in ("slc", "dlc", "lds")):
+            raise Unsupported(op if (kind not in self.BUF_ATOMICS and not is_inc_dec) else op + " form")
         rtn = "glc" in mods
         if len(a) != (4 if rtn else 3):
             raise Unsupported(op + " operands")
@@ -1602,7 +1638,7 @@ class Gen:
         val = self.load_reg("vgpr", vdata["r"])
         cmp = self.load_reg("vgpr", vdata["r"] + 1) if kind == "cmpswap" else None
         old_d = self.load_reg("vgpr", vdst["r"]) if vdst is not None else self.cu(0)
-        lbl_do, lbl_end, res, old = self.tmp() + "_do", self.tmp() + "_end", self.tmp(), self.tmp()
+        lbl_do, lbl_end, old = self.tmp() + "_do", self.tmp() + "_end", self.tmp()
         pre = self.current_label_placeholder()
         act = self.active_b()      # loaded before the merge: OpSelectionMerge must directly precede the branch
         self.emit(f"OpSelectionMerge {lbl_end} None")
@@ -1611,13 +1647,17 @@ class Gen:
         ptr, p = self.tmp(), self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
-        if kind == "cmpswap":
-            self.emit(f"{res} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmp}")
+        if is_inc_dec:
+            res, done_lbl = self.atomic_inc_dec_cas(p, val, kind, lbl_do)
         else:
-            self.emit(f"{res} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
+            res, done_lbl = self.tmp(), lbl_do
+            if kind == "cmpswap":
+                self.emit(f"{res} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmp}")
+            else:
+                self.emit(f"{res} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
-        self.emit(f"{old} = OpPhi %uint {res} {lbl_do} {old_d} {pre}")
+        self.emit(f"{old} = OpPhi %uint {res} {done_lbl} {old_d} {pre}")
         if vdst is not None:
             self.store_reg("vgpr", vdst["r"], old)
 
@@ -1712,20 +1752,22 @@ class Gen:
 
     def buffer_atomic(self, op, a, mods):
         """buffer_atomic_<op> vdata, vaddr, s[V#], soffset ...: 32-bit atomic at the element address (buffer device
-        address). With 'glc' the pre-op value is returned in vdata. Inactive lanes don't touch memory."""
+        address). With 'glc' the pre-op value is returned in vdata. Inactive or out-of-bounds lanes don't touch memory."""
         kind = op[len("buffer_atomic_"):]
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.buffer_atomic_x2(op, kind[:-3], a, mods)
-        if kind not in self.BUF_ATOMICS or "x2" in kind:
+        is_inc_dec = kind in ("inc", "dec")
+        if (kind not in self.BUF_ATOMICS and not is_inc_dec) or "x2" in kind:
             raise Unsupported(op)
-        spv, neutral = self.BUF_ATOMICS[kind]
-        addr, _, in_b, _ = self.buffer_address(a, mods)
         vd = a[0]
+        if is_inc_dec and (vd["k"] != "vgpr" or vd.get("n", 1) != 1):
+            raise Unsupported(op + " data")
+        addr, _, in_b, _ = self.buffer_address(a, mods)
         val = self.load_reg("vgpr", vd["r"])
         cond = self.tmp()
         self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
         # Guard all atomics with a structured if so inactive or OOB lanes never touch memory.
-        lbl_do, lbl_end, res_do, old = self.tmp() + "_do", self.tmp() + "_end", self.tmp(), self.tmp()
+        lbl_do, lbl_end, old = self.tmp() + "_do", self.tmp() + "_end", self.tmp()
         pre_label = self.current_label_placeholder()
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
@@ -1733,16 +1775,21 @@ class Gen:
         ptr, p = self.tmp(), self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
-        if kind == "cmpswap":
-            cmp = self.load_reg("vgpr", vd["r"] + 1)
-            self.emit(f"{res_do} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmp}")
-        elif kind == "swap":
-            self.emit(f"{res_do} = OpAtomicExchange %uint {p} {self.cu(1)} {self.cu(0)} {val}")
+        if is_inc_dec:
+            res_do, done_lbl = self.atomic_inc_dec_cas(p, val, kind, lbl_do)
         else:
-            self.emit(f"{res_do} = {spv} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
+            spv, _ = self.BUF_ATOMICS[kind]
+            res_do, done_lbl = self.tmp(), lbl_do
+            if kind == "cmpswap":
+                cmp = self.load_reg("vgpr", vd["r"] + 1)
+                self.emit(f"{res_do} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmp}")
+            elif kind == "swap":
+                self.emit(f"{res_do} = OpAtomicExchange %uint {p} {self.cu(1)} {self.cu(0)} {val}")
+            else:
+                self.emit(f"{res_do} = {spv} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
-        self.emit(f"{old} = OpPhi %uint {res_do} {lbl_do} {self.cu(0)} {pre_label}")
+        self.emit(f"{old} = OpPhi %uint {res_do} {done_lbl} {self.cu(0)} {pre_label}")
         if "glc" in mods:
             self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, old)
 
