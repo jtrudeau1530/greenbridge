@@ -58,8 +58,9 @@ The exporters use three tag types:
 The fields the exporters read:
 
 ```
-+0    u32  sample count
++0    u32  sample count (Opus: 48 kHz frames, interleaved across channels)
 +8    u16  sample rate
++12   u32  Opus per-channel frame count (codec 0x0B; +0 for mono, +0/2 for stereo)
 +28   u8   codec
 +29   u8   channel count
 ```
@@ -81,9 +82,10 @@ not store it, so the exporter writes that value as `OpusHead` pre-skip and sets 
 `pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
 frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
 
-The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and a stereo count is
-interleaved across both channels. The exporter therefore does not scale it by the rate field and halves it for
-stereo; scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
+The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and `+0x0C` is the
+per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams). The
+exporter uses `+0x0C` and falls back to `+0 / channels` when a block leaves it zero; it never scales either count
+by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
