@@ -256,6 +256,18 @@ class ImportTest(unittest.TestCase):
         write(os.path.join(prof, "Player"), make_asav(kind=3, title="Player", slot="Player"))
         return story, prof, jsav
 
+    def test_import_rejects_flag_as_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            tool = os.path.join(ROOT, "tools", "saves.py")
+            result = subprocess.run(
+                [sys.executable, "-I", tool, "import", story, "--out", "--dry-run"],
+                cwd=tmp, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("--out needs a value", result.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "--dry-run")))
+
     def test_import_layout_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             story, prof, jsav = self._folders(tmp)
