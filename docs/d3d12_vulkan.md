@@ -1291,7 +1291,19 @@ The trace will enumerate them.
     queries compared with `0` mismatches (`MSAA64KBAlignedTextureSupported = TRUE`,
     `SupportedSampleCountsWithNoOutputs = 0x1d`, `LEONIDA_VK_VALIDATION=1` with `0` validation errors).
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`; multisample render-target
-  and resolve bits also require the format's image-usage/sample-count query to succeed.
+  and resolve bits also require the format's image-usage/sample-count query to succeed. D3D12's per-format
+  rules then apply, as native D3D12 reports them (RX 9070 XT, AMD 26.11.2, and WARP):
+  - `MIP` wherever the image can have more than one level.
+  - `SHADER_GATHER` with `SHADER_SAMPLE`.
+  - `UAV_TYPED_LOAD` with every typed UAV. Typed UAV reads use the sampled binding (`image_read_typed`), not a
+    storage-image read.
+  - The UAV atomic bits other than exchange for `R32_UINT`, the one format with the `r32ui` storage view. There
+    is no `image_atomic_swap`, and the translator's image atomics cover 2D and 3D textures only.
+  - No integer resolve, no 1D block-compressed, no 3D or shader reads of depth formats.
+  - TYPELESS formats report texture dimensions and `MIP` only.
+
+  `d3d12_vulkan_device_test` compares these bits with native D3D12 on the same adapter for every format both
+  support.
 - `D3D12_FEATURE_FORMAT_INFO`: report the DXGI plane count independently of Vulkan texture support. Both
   depth/stencil families (including their view formats), NV12, P010, P016 and NV11 have two planes. The
   device test compares counts and HRESULTs with native D3D12 on the same adapter. If an older host rejects the
