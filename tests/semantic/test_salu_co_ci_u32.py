@@ -484,5 +484,147 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.scc, 1)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDMultiLaneState:
+    """Architectural state for a wavefront (Wave32 or Wave64) with shared SALU."""
+    wave_size: int = 32
+    exec_mask: int = field(init=False)
+    scalar_model: ScalarModel = field(default_factory=ScalarModel)
+    vgprs: List[List[int]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {self.wave_size}")
+        self.exec_mask = (1 << self.wave_size) - 1
+        self.vgprs = [[0] * 256 for _ in range(self.wave_size)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size - 1}]")
+        return bool(self.exec_mask & (1 << lane))
+
+    def read_lane_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx] & MASK_U32
+
+    def write_lane_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.vgprs[lane][reg_idx] = val & MASK_U32
+
+
+class SIMDExecutionEngine:
+    """Execution engine testing interaction between shared SALU and divergent SIMD lanes."""
+
+    def __init__(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+
+    def step_salu(
+        self, instr: SAddSubbCoCiU32Instruction, simd_state: SIMDMultiLaneState
+    ) -> Tuple[int, int]:
+        """SALU execution is uniform and unconditional across the wavefront."""
+        return self.scalar_interp.step(instr, simd_state.scalar_model)
+
+    def vector_add_scalar_broadcast(
+        self, dst_vgpr: int, src_vgpr: int, src_sgpr: int, simd_state: SIMDMultiLaneState
+    ) -> List[Optional[int]]:
+        """Simulate VALU lane operation consuming scalar SGPR result under EXEC mask."""
+        scalar_val = simd_state.scalar_model.read_sgpr(src_sgpr)
+        results: List[Optional[int]] = [None] * simd_state.wave_size
+        for lane in range(simd_state.wave_size):
+            if simd_state.is_lane_active(lane):
+                lane_val = simd_state.read_lane_vgpr(lane, src_vgpr)
+                out_val, _ = oracle_s_addc_u32(lane_val, scalar_val, cin=0)
+                simd_state.write_lane_vgpr(lane, dst_vgpr, out_val)
+                results[lane] = out_val
+        return results
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Verification of SIMD multi-lane divergence and 32/64-bit EXEC masking interaction."""
+
+    def setUp(self) -> None:
+        self.engine = SIMDExecutionEngine()
+
+    def test_salu_unconditional_execution_with_zero_exec_mask(self) -> None:
+        for wave_size in (32, 64):
+            with self.subTest(wave_size=wave_size):
+                state = SIMDMultiLaneState(wave_size=wave_size)
+                state.exec_mask = 0  # Inactive wavefront
+                state.scalar_model.set_scc(1)
+                state.scalar_model.write_sgpr(1, 100)
+                state.scalar_model.write_sgpr(2, 200)
+
+                instr = SAddSubbCoCiU32Instruction(
+                    opcode=SOPOpcode.S_ADDC_U32,
+                    dst=SGPROperand(0),
+                    src0=SGPROperand(1),
+                    src1=SGPROperand(2),
+                )
+                res, cc = self.engine.step_salu(instr, state)
+                self.assertEqual(res, 301)
+                self.assertEqual(cc, 0)
+                # SGPR and SCC must update despite exec_mask == 0
+                self.assertEqual(state.scalar_model.read_sgpr(0), 301)
+                self.assertEqual(state.scalar_model.scc, 0)
+
+    def test_salu_broadcast_to_wave32(self) -> None:
+        state = SIMDMultiLaneState(wave_size=32)
+        state.exec_mask = 0x5555_5555  # Even lanes active
+        for lane in range(32):
+            state.write_lane_vgpr(lane, 0, lane * 20)
+            state.write_lane_vgpr(lane, 1, 0x9999_9999)
+
+        state.scalar_model.set_scc(1)
+        state.scalar_model.write_sgpr(2, 500)
+        salu_instr = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_ADDC_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(2),
+            src1=InlineConstant(9),
+        )
+        self.engine.step_salu(salu_instr, state)
+        # 500 + 9 + 1 = 510
+        self.assertEqual(state.scalar_model.read_sgpr(0), 510)
+
+        results = self.engine.vector_add_scalar_broadcast(dst_vgpr=1, src_vgpr=0, src_sgpr=0, simd_state=state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], (lane * 20) + 510)
+                self.assertEqual(state.read_lane_vgpr(lane, 1), (lane * 20) + 510)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.read_lane_vgpr(lane, 1), 0x9999_9999)
+
+    def test_salu_broadcast_to_wave64(self) -> None:
+        state = SIMDMultiLaneState(wave_size=64)
+        state.exec_mask = 0xFFFF_0000_FFFF_0000
+        for lane in range(64):
+            state.write_lane_vgpr(lane, 3, 100)
+            state.write_lane_vgpr(lane, 4, 0x1111_1111)
+
+        state.scalar_model.set_scc(1)
+        state.scalar_model.write_sgpr(8, 200)
+        salu_subb = SAddSubbCoCiU32Instruction(
+            opcode=SOPOpcode.S_SUBB_U32,
+            dst=SGPROperand(5),
+            src0=SGPROperand(8),
+            src1=InlineConstant(50),
+        )
+        self.engine.step_salu(salu_subb, state)
+        # 200 - 50 - 1 = 149
+        self.assertEqual(state.scalar_model.read_sgpr(5), 149)
+        self.assertEqual(state.scalar_model.scc, 0)
+
+        results = self.engine.vector_add_scalar_broadcast(dst_vgpr=4, src_vgpr=3, src_sgpr=5, simd_state=state)
+        for lane in range(64):
+            if (state.exec_mask & (1 << lane)) != 0:
+                self.assertEqual(results[lane], 249)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.read_lane_vgpr(lane, 4), 0x1111_1111)
+
+
 if __name__ == "__main__":
     unittest.main()
