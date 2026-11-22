@@ -324,10 +324,14 @@ def check_image(data: bytes, manifest: dict) -> dict:
 
 
 def write_ppm(path: str, pixels, width: int, height: int) -> None:
+    """Write RGB bytes, saturating infinities and rendering NaN as zero."""
+    def channel_byte(value: float) -> int:
+        return round(min(1.0, value) * 255) if value > 0.0 else 0
+
     with open(path, "wb") as f:
         f.write(f"P6\n{width} {height}\n255\n".encode())
         f.writelines(
-            bytes(max(0, min(255, round(pixels[i + c] * 255))) for c in range(3))
+            bytes(channel_byte(pixels[i + c]) for c in range(3))
             for i in range(0, len(pixels), 4)
         )
 

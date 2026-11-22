@@ -121,6 +121,19 @@ class FirstLightTests(unittest.TestCase):
             )
 
 
+class PpmTests(unittest.TestCase):
+    def test_nonfinite_readback_channels_write_complete_ppm(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        pixels = (float("nan"), float("inf"), float("-inf"), 1.0,
+                  -0.25, 0.5, 1.25, 1.0)
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "preview.ppm"
+            write_ppm(str(path), pixels, 2, 1)
+            self.assertEqual(path.read_bytes(), b"P6\n2 1\n255\n" + bytes((0, 255, 0, 0, 128, 255)))
+
+
 class OracleTests(unittest.TestCase):
     """The readback oracle on synthetic images: the controls run without a GPU or a game package."""
 
