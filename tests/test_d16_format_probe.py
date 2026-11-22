@@ -5,7 +5,7 @@ library only."""
 import io
 import json
 import os
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import re
 import subprocess
@@ -216,6 +216,36 @@ class OnHardware(unittest.TestCase):
         self.assertEqual(w32["buffer_d16"][255] & 0xFFFF, 0x3C00)
         self.assertEqual(w32["buffer_d16"][0] & 0xFFFF, 0)
         self.assertEqual(w32["buffer_f32"][255], 0x3F800000)
+
+
+class ReportPathTests(unittest.TestCase):
+    """--json names a file; its folder is created and a write failure is one line, not a traceback."""
+
+    def test_json_creates_a_missing_folder(self):
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "reports", "deeper", "r.json")
+            rc, out = run_main(FakeOracle(), "--json", report)
+            self.assertEqual(rc, 0, out)
+            self.assertTrue(os.path.isfile(report))
+
+    def test_json_folder_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit):
+                run_main(FakeOracle(), "--json", d)
+
+    def test_a_failed_write_is_one_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "not_a_folder")
+            with open(blocker, "wb") as f:
+                f.write(b"keep me")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc, _ = run_main(FakeOracle(), "--json", os.path.join(blocker, "r.json"))
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
 
 
 if __name__ == "__main__":
