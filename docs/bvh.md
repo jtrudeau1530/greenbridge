@@ -473,6 +473,19 @@ the destination buffer:
    instance's `ParentNode`;
 4. the header.
 
+The radix sort's scan writes the prefix sums of the digit counts to their own scratch array, not over the counts.
+No invocation of the builder stores to a word and then uses a value it loaded from that word earlier. SPIRV-Cross
+`6c09849f`, in MoltenVK 1.4.2, breaks that pattern for a pointer made by `OpBitcast` from a `uvec2`
+(`GL_EXT_buffer_reference_uvec2`): it moves the load to where the value is used, after the store, and the load
+returns the new value. MoltenVK `main` at `5189f8de` pins SPIRV-Cross `aa217aeb`, which has the same bug.
+SPIRV-Cross [`38abe362`](https://github.com/KhronosGroup/SPIRV-Cross/commit/38abe362c57311a77808b7ec4d1d0d9ceb8d9370)
+fixes it. With the old in-place scan, the radix path (more than 1,024 elements) lost and duplicated elements on
+MoltenVK: `xdxr_build_check` found about 130 of 200 rays wrong in `blas_three_sort_tiles` and 210 of 300 in
+`blas_refit_in_place`, which refits a radix-sorted tree. Measured on an Apple M3 Max, the separate arrays pass
+10 runs out of 10 on Homebrew MoltenVK 1.4.2, on MoltenVK `5189f8de` built with SPIRV-Cross `57e4efcc`, on
+KosmicKrisp and on llvmpipe. A pointer from `OpConvertUToPtr`, which the translator uses, kept its load before the
+store in the same test.
+
 The tree's shape depends only on the element count. `XdxrLayout` therefore computes the result and scratch sizes
 exactly when the build is recorded, and the same numbers can answer `GetRaytracingAccelerationStructurePrebuildInfo`.
 A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with

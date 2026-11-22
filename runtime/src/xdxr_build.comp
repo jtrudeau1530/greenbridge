@@ -37,6 +37,12 @@
 // bufferDeviceAddress feature is needed, no shaderInt64. An address read from memory (an instance's BLAS) is a
 // D3D12 GPU virtual address and gets pc.bias added, the distance between the application's address space and the
 // device's (0 where they are the same).
+//
+// No invocation stores to a word and then uses a value it loaded from that word earlier in the same dispatch. The
+// SPIRV-Cross in MoltenVK 1.4.2 (6c09849f, and aa217aeb, which MoltenVK main pins) moves a load through a pointer
+// made by OpBitcast from a uvec2 to where its value is used, after a store to the same address, so the load reads
+// the new value. SPIRV-Cross 38abe362 fixes it. The radix scan used to rewrite the counts in place this way and lost
+// elements on MoltenVK (docs/bvh.md, GPU builder).
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
@@ -99,7 +105,8 @@ void storef(uvec2 base, uint byte_offset, float v) { store(base, byte_offset, fl
 bool is_null(uvec2 a) { return a.x == 0u && a.y == 0u; }
 
 // ---- scratch: centroid bounds (6 ordered words at 0), keys and element indices twice (the radix sort's two
-// sides; the sorted result is back in the first after an even number of passes), digit counts, boxes ----
+// sides; the sorted result is back in the first after an even number of passes), digit counts, their exclusive
+// prefix sums, boxes ----
 const uint SCRATCH_KEYS = 64u;
 uint radix_tiles() { return (pc.sort_size + RADIX_TILE - 1u) / RADIX_TILE; }
 uint keys_off() { return SCRATCH_KEYS; }
@@ -107,7 +114,8 @@ uint vals_off() { return SCRATCH_KEYS + 4u * pc.sort_size; }
 uint keys2_off() { return SCRATCH_KEYS + 8u * pc.sort_size; }
 uint vals2_off() { return SCRATCH_KEYS + 12u * pc.sort_size; }
 uint counts_off() { return SCRATCH_KEYS + 16u * pc.sort_size; }  // RADIX_BINS x tiles, digit-major
-uint boxes_off() { return counts_off() + 4u * RADIX_BINS * radix_tiles(); }   // 6 floats per element, then per node
+uint offsets_off() { return counts_off() + 4u * RADIX_BINS * radix_tiles(); }  // the same shape: the scan of counts
+uint boxes_off() { return offsets_off() + 4u * RADIX_BINS * radix_tiles(); }  // 6 floats per element, then per node
 
 // A float as a uint that orders the same way, for atomicMin/atomicMax.
 uint ordered(float f) {
@@ -328,8 +336,9 @@ void radix_count(uint w, uint t) {
     if (t < RADIX_BINS) store(pc.scratch, counts_off() + 4u * (t * radix_tiles() + w), radix_hist[t]);
 }
 
-// One workgroup: the exclusive prefix sum of all counts in digit-major order, in place. Each thread sums a
-// contiguous segment, the 64 segment sums are scanned in shared memory, then each thread writes its segment.
+// One workgroup: the exclusive prefix sum of all counts in digit-major order, into offsets (not in place: see the
+// SPIRV-Cross note at the top). Each thread sums a contiguous segment, the 64 segment sums are scanned in shared
+// memory, then each thread writes its segment.
 void radix_scan(uint t) {
     uint n = RADIX_BINS * radix_tiles();
     uint per = (n + 63u) / 64u;
@@ -346,7 +355,7 @@ void radix_scan(uint t) {
     uint running = radix_part[t];
     for (uint i = begin; i < end; ++i) {
         uint v = load(pc.scratch, counts_off() + 4u * i);
-        store(pc.scratch, counts_off() + 4u * i, running);
+        store(pc.scratch, offsets_off() + 4u * i, running);
         running += v;
     }
 }
@@ -354,7 +363,7 @@ void radix_scan(uint t) {
 // Workgroup w moves its tile's keys to their places, in order: the tile is read in chunks of 64, and an element's
 // place is its digit's base for this tile plus the number of earlier elements of the tile with the same digit.
 void radix_scatter(uint w, uint t) {
-    if (t < RADIX_BINS) radix_base[t] = load(pc.scratch, counts_off() + 4u * (t * radix_tiles() + w));
+    if (t < RADIX_BINS) radix_base[t] = load(pc.scratch, offsets_off() + 4u * (t * radix_tiles() + w));
     uint begin = w * RADIX_TILE, end = min(begin + RADIX_TILE, pc.sort_size);
     for (uint chunk = begin; chunk < end; chunk += 64u) {
         uint i = chunk + t;
