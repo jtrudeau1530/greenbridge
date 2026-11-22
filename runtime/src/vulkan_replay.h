@@ -887,7 +887,7 @@ struct PreparedQuery {
     std::uint32_t end_segment = no_segment;
     std::uint32_t first_result = 0;
     std::uint32_t result_count = 0;
-    // A pipeline-statistics query split around the resolves it contains (plan_statistics_segments): the physical
+    // A pipeline-statistics query split around the helpers it contains (plan_statistics_segments): the physical
     // statistics segment this command ends or begins, and for its EndQuery the segments that hold its result.
     std::uint32_t statistics_end = no_segment;
     std::uint32_t statistics_begin = no_segment;
@@ -897,6 +897,9 @@ struct PreparedQuery {
 };
 
 struct Prepared {
+    // Helper commands split the active statistics query just like query resolves.
+    std::uint32_t statistics_end = PreparedQuery::no_segment;
+    std::uint32_t statistics_begin = PreparedQuery::no_segment;
     PredicateCapture predicate;
     std::vector<PredicatedCopyDispatch> predicated_copy;
     ResourceBinding binding;
@@ -1956,20 +1959,25 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
 }
 
-// A resolve inside a pipeline-statistics query can record a helper dispatch (the binary-occlusion normalisation, an
-// occlusion or a statistics sum), and Vulkan would count its invocations in the application's CSInvocations. Such a
-// query is therefore split: its counters go to physical segments that end before each resolve inside it and begin
-// again after it, and its result is the sum of those segments (D3D-162). Whether a resolve dispatches is only known
-// when the list is planned against the heaps' state, so every resolve except a timestamp copy splits the query.
-// A BeginQuery without its EndQuery in the list is left as it was.
+// Helper dispatches must not contribute to the application's CSInvocations (D3D-162). Query resolves and
+// ordinary helper commands share one sequence of physical statistics segments. Resolve dispatch requirements
+// depend on heap state at planning time, so every non-timestamp resolve splits conservatively.
 inline void plan_statistics_segments(PreparedList& out) {
     detail::PreparedQuery* begin = nullptr;
-    std::vector<detail::PreparedQuery*> inner;
-    for (auto& query : out.queries) {
-        const Command& command = out.list->commands()[query.command];
+    struct Split { std::uint32_t* end; std::uint32_t* begin; };
+    std::vector<Split> inner;
+    std::size_t next_query = 0;
+    for (std::size_t i = 0; i < out.commands.size(); ++i) {
+        auto& p = out.commands[i];
+        if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24))
+            inner.push_back({&p.statistics_end, &p.statistics_begin});
+        if (next_query == out.queries.size() || out.queries[next_query].command != i) continue;
+        auto& query = out.queries[next_query++];
+        const Command& command = out.list->commands()[i];
         const auto range = query_range(command);
         if (std::holds_alternative<ResolveQueries>(command)) {
-            if (begin && range.type != d3d12_query::timestamp) inner.push_back(&query);
+            if (begin && range.type != d3d12_query::timestamp)
+                inner.push_back({&query.statistics_end, &query.statistics_begin});
         } else if (range.type == d3d12_query::pipeline_statistics) {
             if (std::holds_alternative<BeginQuery>(command)) {
                 begin = &query;
@@ -1978,9 +1986,9 @@ inline void plan_statistics_segments(PreparedList& out) {
                 if (!inner.empty()) {
                     const std::uint32_t first = out.statistics_segment_count;
                     begin->statistics_begin = out.statistics_segment_count++;
-                    for (auto* resolve : inner) {
-                        resolve->statistics_end = out.statistics_segment_count - 1;
-                        resolve->statistics_begin = out.statistics_segment_count++;
+                    for (auto split : inner) {
+                        *split.end = out.statistics_segment_count - 1;
+                        *split.begin = out.statistics_segment_count++;
                     }
                     query.statistics_end = out.statistics_segment_count - 1;
                     query.statistics_first = first;
@@ -2043,8 +2051,11 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
 
 // Resolves and checks every command. Nothing is written to a command buffer.
 // Resolve maps a ResourceId to a const ResourceBinding* (nullptr: unknown).
+// statistics_helpers promises a statistics segment pool at QueryReplay::plan(). Keep the default for replay()
+// and callers without a summation helper: reject before allocating any helper scratch.
 template<typename Resolve>
-ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out) {
+ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out,
+                     bool statistics_helpers = false) {
     if (!list.closed()) return ReplayResult::list_open;
     if (list.queries_open()) return ReplayResult::invalid_query;  // a Vulkan query must end in its command buffer
     const auto commands = list.commands();
@@ -2217,7 +2228,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (p.source.buffer == p.binding.buffer && src < dst + buffer_copy->size && dst < src + buffer_copy->size)
                     return ReplayResult::invalid_copy;
                 if (predicated) {
-                    if (statistics_active || !vk.prepare_predicated_copy || !vk.emit_predicated_copy ||
+                    if ((statistics_active && !statistics_helpers) || !vk.prepare_predicated_copy || !vk.emit_predicated_copy ||
                         !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, src, dst, buffer_copy->size, p.predicated_copy))
                         return ReplayResult::unsupported;
                 } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
@@ -2231,9 +2242,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     p.buffer_image_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT;
                 const bool rgb96_footprint = result == ReplayResult::success && image.rgb96 &&
                     !p.buffer_image_copies.empty();
-                // These footprint conversions emit compute dispatches in emit(). Refuse them before allocating their
-                // conversion scratch/descriptors because an active statistics query would include their CSInvocations.
-                if (statistics_active && (depth24_footprint || rgb96_footprint)) return ReplayResult::unsupported;
+                // Without a segment pool, refuse before allocating conversion scratch/descriptors.
+                if (statistics_active && !statistics_helpers && (depth24_footprint || rgb96_footprint)) return ReplayResult::unsupported;
                 if (depth24_footprint) {
                     const VkBufferImageCopy& region = p.buffer_image_copies[0];
                     const ResourceBinding& buffer = upload ? p.source : p.binding;
@@ -2374,9 +2384,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             predicated = predication->buffer != 0;
             if (!predicated) continue;
             if (!conditional) return ReplayResult::unsupported;
-            // The internal dispatch must not appear in the application's pipeline-statistics result. Virtualising
-            // that query is separate work; reject the combination before emitting any commands instead of lying.
-            if (statistics_active) return ReplayResult::unsupported;
+            // Without physical segments the capture dispatch would pollute CSInvocations.
+            if (statistics_active && !statistics_helpers) return ReplayResult::unsupported;
             if (!bind(predication->buffer)) return ReplayResult::unresolved_resource;
             if (!p.binding.buffer || !detail::within(predication->offset, 8, p.binding.size) ||
                 predication->offset > UINT64_MAX - p.binding.buffer_offset)
@@ -2520,7 +2529,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
 class QueryReplay {
 public:
     // `statistics_pool` holds the list's pipeline-statistics segments (plan_statistics_segments). Without one, the
-    // list's statistics queries are not split, and a resolve inside one that needs a helper dispatch is refused.
+    // list's statistics queries are not split: ordinary helper commands are refused, as are resolves that dispatch.
     ReplayResult plan(PreparedList& list, const std::shared_ptr<const OcclusionSegmentPool>& pool = {},
                       std::uint32_t base = 0, bool can_sum = false,
                       const std::shared_ptr<const OcclusionSegmentPool>& statistics_pool = {},
@@ -2537,6 +2546,9 @@ public:
                 list.statistics_pool = statistics_pool->pool;
                 list.statistics_base = statistics_base;
             } else {
+                for (const auto& command : list.commands)
+                    if (command.statistics_end != detail::PreparedQuery::no_segment)
+                        return ReplayResult::unsupported;
                 for (auto& query : list.queries) {
                     query.statistics_end = query.statistics_begin = detail::PreparedQuery::no_segment;
                     query.statistics_count = 0;
@@ -2735,12 +2747,25 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;
         }
+        // Helpers run outside the per-command rendering scopes; both segment endpoints stay outside too.
+        const auto end_statistics = [&] {
+            if (p.statistics_end != detail::PreparedQuery::no_segment)
+                vk.end_query(command_buffer, prepared.statistics_pool, prepared.statistics_base + p.statistics_end);
+        };
+        const auto begin_statistics = [&] {
+            if (p.statistics_begin == detail::PreparedQuery::no_segment) return;
+            const auto index = prepared.statistics_base + p.statistics_begin;
+            vk.reset_query_pool(command_buffer, prepared.statistics_pool, index, 1);
+            vk.begin_query(command_buffer, prepared.statistics_pool, index, 0);
+        };
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
             predicate.buffer = predication->buffer ? p.predicate.scratch : VK_NULL_HANDLE;
             if (predicate.buffer) {
+                end_statistics();
                 vk.capture_predicate(command_buffer, p.predicate);
+                begin_statistics();
                 predicate.offset = p.predicate.offset + 8;
                 // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
                 predicate.flags = predication->op == d3d12_predication::not_equal_zero
@@ -2978,7 +3003,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                    std::holds_alternative<CopyResource>(command)) {
             const auto [dst_id, src_id] = copy_ids(command);
             if (!p.predicated_copy.empty()) {
+                end_statistics();
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
+                begin_statistics();
             } else if (!p.buffer_copies.empty()) {
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
@@ -3033,7 +3060,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    end_statistics();
                     for (const auto& part : p.depth24_parts) run_depth24(part);
+                    begin_statistics();
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                     converted = p.buffer_image_copies;
@@ -3065,7 +3094,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    end_statistics();
                     for (const auto& part : p.depth24_parts) run_depth24(part);
+                    begin_statistics();
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
