@@ -159,13 +159,17 @@ def main():
         ap.error(f"{a.out} would overwrite the --rigs input")
     try:
         dicts, summary = scan(a.archive, a.start, a.limit)
-        if a.rigs:
-            with open(a.rigs, encoding="utf-8") as f:
-                summary["rbf0_join"] = join_rbf0(dicts, json.load(f))
     except ValueError as e:
         sys.exit(f"{a.archive}: {e}")
     except OSError as e:
         sys.exit(f"{e.filename or a.archive}: {e.strerror or e}")
+    if a.rigs:
+        try:
+            with open(a.rigs, encoding="utf-8") as f:
+                summary["rbf0_join"] = join_rbf0(dicts, json.load(f))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            print(f"ERROR: {a.rigs}: invalid rig report ({getattr(e, 'strerror', None) or e})", file=sys.stderr)
+            return 2
     rows = [{k: v for k, v in d.items() if k != "entries"} | {"entries": len(d.get("entries", ()))} for d in dicts]
     try:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
