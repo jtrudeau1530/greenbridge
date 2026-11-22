@@ -1044,6 +1044,16 @@ def test_buffer_format_f16_narrowing_avoids_packhalf2x16(make_shader, body):
     assert "PackHalf2x16" not in spv
 
 
+def test_repeated_tbuffer_loads_share_normalization(make_shader):
+    """A packed fixed format with 10- and 2-bit fields needs two exact quotients, regardless of load count."""
+    load = "tbuffer_load_format_xyzw v[4:7], v0, s[0:3], 0 format:[BUF_FMT_2_10_10_10_UNORM] offen"
+    shader = make_shader((load + "\ns_waitcnt vmcnt(0)\n") * 8 + "exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n",
+                         "ps_repeated_tbuffer")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert spv.count("FindUMsb") == 2
+
+
 def test_image_sample_d16_avoids_packhalf2x16(make_shader):
     """d16 image_sample packs f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (
