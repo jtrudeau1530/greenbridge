@@ -1664,7 +1664,8 @@ The trace will enumerate them.
     buffer, 2D, array, block-compressed and volume layouts, and skips a layout the host refuses: which ones a PC
     driver accepts varies (an RTX 3090 on driver 616.56, at tier 3, refuses texture arrays whose mips reach the
     packed tail, measured by @CharlyRien in #295; an RTX 5070 on 621.01 accepts them). How many tiles the packed mips take is the driver's
-    choice: here it is their tight linear size in whole tiles; the PC runtime on an RTX 5070 reported one tile more
+    choice: here it is one tile per tile-depth slice the tail spans, as AMD reports (below), and never fewer than
+    their tight linear size in whole tiles; the PC runtime on an RTX 5070 reported one tile more than the tight size
     for 1000x300 and 100x100 RGBA8 and a 128^3 R8 volume, and the same count for the other layouts probed. Two
     further measured differences: on array slices after the first, the PC runtime
     writes a tile index into packed subresources instead of the documented `D3D12_PACKED_TILE` (ours follows the
@@ -1691,8 +1692,11 @@ The trace will enumerate them.
     tiles), the rule that fits all 47 on both GPUs is: **a mip stays standard while it is wider than half the tile or
     taller than the tile; depth does not count**. An earlier "every axis at most half the tile's largest side" fitted
     the first 17 but missed four tall or deep edge cases. All 47 layouts and AMD's values are in
-    `runtime/test/resource_tiling_test.cpp`; the packed tile count is AMD's in 45 of them, and AMD reserves one more
-    for the two deep volumes that pack from mip 0. The console is RDNA2, so the layer follows this rule (D3D-65;
+    `runtime/test/resource_tiling_test.cpp`. AMD's packed tile count is one tile per tile-depth slice the tail spans,
+    `ceil(depth of the first packed mip / tile depth)`: 1 for every 2D layout, and for 36 further volumes whose tail
+    is deeper than a tile it steps at each tile depth (8x8x32 R8 takes 1 tile, 8x8x33 takes 2, 8x8x256 takes 8), even
+    where the bytes would fit in fewer (16x16x128 RGBA8: 8 tiles for 3 tiles of data). Those 36 are in the test too,
+    83 layouts in all, identical on both GPUs. The console is RDNA2, so the layer follows this rule (D3D-65;
     **Assumption**: that the console's runtime splits like the PC's AMD driver).
   - `UpdateTileMappings` and `CopyTileMappings` bind pages in reserved buffers to default heaps from D3D-16.
     Sequential, NULL, SKIP and single-tile reuse ranges are supported. Queue timeline waits order binding between
