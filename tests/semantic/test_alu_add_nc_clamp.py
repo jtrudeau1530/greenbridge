@@ -430,5 +430,154 @@ class TestAddNcU32SimdDivergence(unittest.TestCase):
                 self.assertNotEqual(clamped_outs[lane], wrapped_outs[lane])
 
 
+class TestAddNcU32EdgeCases(unittest.TestCase):
+    """Overflow wrapping vs clamping edge cases and SPIR-V structure verification."""
+
+    def test_edge_case_matrix(self) -> None:
+        """Exhaustive boundary testing across extreme 32-bit integer patterns."""
+        edge_values = [
+            0,
+            1,
+            2,
+            0x7FFFFFFF,
+            0x80000000,
+            0x80000001,
+            0xFFFFFFFE,
+            0xFFFFFFFF,
+            0x55555555,
+            0xAAAAAAAA,
+        ]
+        for a in edge_values:
+            for b in (0, 1, 0x80000000, 0xFFFFFFFF):
+                for clamp in (False, True):
+                    with self.subTest(a=hex(a), b=hex(b), clamp=clamp):
+                        got = run_op("v_add_nc_u32", a, b, clamp)
+                        want = ref_add_nc_u32(a, b, clamp)
+                        self.assertEqual(got, want)
+
+    def test_vop2_e32_vs_vop3_e64_equivalence_without_clamp(self) -> None:
+        """Without clamp, VOP3 e64 must produce bit-for-bit identical results to VOP2 e32."""
+        pairs = [
+            (0xFFFFFFFF, 1),
+            (0xFFFFFFFF, 0xFFFFFFFF),
+            (0x80000000, 0x80000000),
+            (0x12345678, 0x9ABCDEF0),
+        ]
+        for a, b in pairs:
+            vop2 = run_lines([f"v_mov_b32 v1, {b:#x}", f"v_add_nc_u32_e32 v0, {a:#x}, v1"])
+            vop3 = run_lines([f"v_mov_b32 v1, {a:#x}", f"v_mov_b32 v2, {b:#x}", "v_add_nc_u32_e64 v0, v1, v2"])
+            self.assertEqual(vop2, vop3)
+            self.assertEqual(vop2, ref_add_nc_u32(a, b, clamp=False))
+
+    def test_vcc_isolation(self) -> None:
+        """v_add_nc_u32 must not write or clobber VCC carry condition."""
+        # Set vcc_lo to -1 (all lanes true). Execute v_add_nc_u32 with carry.
+        # Verify vcc_lo is still -1 via v_cndmask_b32.
+        lines = [
+            "s_mov_b32 vcc_lo, -1",
+            "v_mov_b32 v1, 0xffffffff",
+            "v_mov_b32 v2, 1",
+            "v_add_nc_u32_e64 v3, v1, v2 clamp",
+            "v_cndmask_b32_e64 v0, 0, 1, vcc_lo",
+        ]
+        res = run_lines(lines)
+        self.assertEqual(res, 1, "VCC condition was clobbered by v_add_nc_u32")
+
+    def test_spirv_lowering_instruction_pattern(self) -> None:
+        """v_add_nc_u32 with clamp lowers to OpIAddCarry + OpSelect, without clamp to OpIAdd."""
+        if _TMP_DIR is None:
+            setUpModule()
+        # Clamped form:
+        lines_clamped = [
+            "v_mov_b32 v1, 0xffffffff",
+            "v_mov_b32 v2, 1",
+            "v_add_nc_u32_e64 v0, v1, v2 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        asm = "; ps_spirv_check\n" + "".join(f"\t{ln}\n" for ln in lines_clamped)
+        with open(_SRC_PATH, "w", encoding="utf-8") as f:
+            f.write(asm)
+        spv_clamp = rdna2spirv.translate(_SRC_PATH)
+        self.assertIn("OpIAddCarry %umul", spv_clamp)
+        self.assertIn("4294967295", spv_clamp)
+        self.assertIn("OpCompositeExtract %uint", spv_clamp)
+
+        # Unclamped form:
+        lines_wrapped = [
+            "v_mov_b32 v1, 0xffffffff",
+            "v_mov_b32 v2, 1",
+            "v_add_nc_u32_e64 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        asm = "; ps_spirv_check\n" + "".join(f"\t{ln}\n" for ln in lines_wrapped)
+        with open(_SRC_PATH, "w", encoding="utf-8") as f:
+            f.write(asm)
+        spv_wrap = rdna2spirv.translate(_SRC_PATH)
+        self.assertIn("OpIAdd %uint", spv_wrap)
+        self.assertNotIn("OpIAddCarry", spv_wrap)
+
+
+class TestAddNcU32NegativeControls(unittest.TestCase):
+    """Negative controls ensuring mutated arithmetic or incorrect saturation limits fail assertions."""
+
+    def test_overflow_wrapping_vs_clamping_divergence_detected(self) -> None:
+        """Whenever sum > 0xFFFFFFFF, wrapping and clamping must strictly diverge."""
+        overflow_pairs = [
+            (0xFFFFFFFF, 1),
+            (0xFFFFFFFF, 0xFFFFFFFF),
+            (0x80000000, 0x80000000),
+            (0xFFFFFFFE, 2),
+            (0xC0000000, 0x40000001),
+        ]
+        for a, b in overflow_pairs:
+            with self.subTest(a=hex(a), b=hex(b)):
+                wrapped = ref_add_nc_u32(a, b, clamp=False)
+                clamped = ref_add_nc_u32(a, b, clamp=True)
+                self.assertNotEqual(wrapped, clamped)
+                self.assertEqual(clamped, M32)
+                self.assertEqual(wrapped, (a + b) & M32)
+
+    def test_signed_saturation_sabotage_detected(self) -> None:
+        """Unsigned clamp must not be confused with signed clamp (saddsat limit 0x7FFFFFFF)."""
+        a, b = 0xFFFFFFFF, 1
+        correct_uaddsat = ref_add_nc_u32(a, b, clamp=True)
+        sabotaged_saddsat = 0x7FFFFFFF
+        self.assertEqual(correct_uaddsat, M32)
+        self.assertNotEqual(correct_uaddsat, sabotaged_saddsat)
+
+    def test_subtraction_saturation_sabotage_detected(self) -> None:
+        """Addition clamp (saturates to 0xFFFFFFFF) must not be confused with subtraction clamp (saturates to 0)."""
+        a, b = 0xFFFFFFFF, 1
+        correct_add_clamp = ref_add_nc_u32(a, b, clamp=True)
+        sabotaged_sub_clamp = 0
+        self.assertNotEqual(correct_add_clamp, sabotaged_sub_clamp)
+
+    def test_unmasked_64bit_sum_sabotage_detected(self) -> None:
+        """Unmasked 64-bit integer overflow must not pass 32-bit wrapping tests."""
+        a, b = 0xFFFFFFFF, 1
+        correct_wrapped = ref_add_nc_u32(a, b, clamp=False)
+        sabotaged_unmasked = a + b  # 0x100000000
+        self.assertEqual(correct_wrapped, 0)
+        self.assertNotEqual(correct_wrapped, sabotaged_unmasked)
+
+    def test_off_by_one_clamp_limit_detected(self) -> None:
+        """Saturation must be exactly 0xFFFFFFFF, not 0xFFFFFFFE."""
+        a, b = 0xFFFFFFFF, 2
+        correct_clamped = ref_add_nc_u32(a, b, clamp=True)
+        sabotaged_limit = 0xFFFFFFFE
+        self.assertEqual(correct_clamped, M32)
+        self.assertNotEqual(correct_clamped, sabotaged_limit)
+
+    def test_no_carry_addition_does_not_mask_stage_carries(self) -> None:
+        """Oracle analysis accurately reports carry flag and distinct outputs."""
+        analysis = oracle_add_nc_u32_analysis(0x80000000, 0x80000000)
+        self.assertTrue(analysis["carry"])
+        self.assertEqual(analysis["wrapped"], 0)
+        self.assertEqual(analysis["clamped"], M32)
+        self.assertNotEqual(analysis["wrapped"], analysis["clamped"])
+
+
 if __name__ == "__main__":
     unittest.main()
