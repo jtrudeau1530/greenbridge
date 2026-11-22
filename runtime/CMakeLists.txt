@@ -766,7 +766,7 @@ if(BUILD_TESTING)
   endif()
   # Internal XTaskQueue context pinning and rundown regression tests.
   if(WIN32 AND TARGET gta6rt_xtaskqueue)
-    foreach(_context_test context_pinning context_rundown)
+    foreach(_context_test context_pinning context_rundown context_reentrant context_concurrent_detach context_attach_detach_stress)
       add_executable(${_context_test}_test
         test/${_context_test}_test.cpp
       )

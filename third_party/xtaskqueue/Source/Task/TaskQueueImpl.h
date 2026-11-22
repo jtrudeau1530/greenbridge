@@ -5,6 +5,7 @@
 
 #include "ApiRefState.h"
 #include "AtomicVector.h"
+#include <map>
 #include "LocklessQueue.h"
 #include "StaticArray.h"
 #include "ThreadPool.h"
@@ -189,6 +190,8 @@ private:
     DefaultUnnamedMutex m_lock;
 };
 
+class TaskQueuePortContextImpl;
+
 class TaskQueuePortImpl: public Api<ApiId::TaskQueuePort, ITaskQueuePort>
 {
 public:
@@ -292,7 +295,67 @@ private:
 
     XTaskQueuePortObject m_header = { };
     XTaskQueueDispatchMode m_dispatchMode = XTaskQueueDispatchMode::Manual;
-    AtomicVector<ITaskQueuePortContext*> m_attachedContexts;
+    struct AttachedContextRegistration
+    {
+        ITaskQueuePortContext* context;
+        TaskQueuePortContextImpl* pinnable;
+    };
+
+    DefaultUnnamedMutex m_attachedContextsLock;
+    std::map<uint64_t, AttachedContextRegistration> m_attachedContexts;
+
+    uint64_t m_nextAttachedContextId = 1;
+
+    bool TryAcquireNextAttachedContext(
+        uint64_t& cursor,
+        uint64_t upperBound,
+        ITaskQueuePortContext** result);
+
+    template<typename Callback>
+    void VisitAttachedContexts(Callback callback)
+    {
+        // Keep the port alive even if a callback closes its owning queue.
+        if (!TryAddRef())
+        {
+            return;
+        }
+
+        struct PortGuard
+        {
+            TaskQueuePortImpl* port;
+            ~PortGuard() { port->Release(); }
+        } portGuard{ this };
+
+        uint64_t upperBound;
+        {
+            std::lock_guard<std::mutex> lock(m_attachedContextsLock);
+            upperBound = m_nextAttachedContextId - 1;
+        }
+
+        uint64_t cursor = 0;
+
+        for (;;)
+        {
+            ITaskQueuePortContext* context = nullptr;
+
+            if (!TryAcquireNextAttachedContext(
+                    cursor, upperBound, &context))
+            {
+                break;
+            }
+
+            struct ContextGuard
+            {
+                ITaskQueuePortContext* context;
+                ~ContextGuard() { context->Release(); }
+            } contextGuard{ context };
+
+            // Never invoke external code while holding the registry mutex.
+            callback(context);
+        }
+
+        // Only safely pinnable contexts can be visited.
+    }
     std::atomic<uint32_t> m_processingSerializedTbCallback{ 0 };
     std::atomic<uint32_t> m_processingCallback{ 0 };
     DefaultUnnamedConditionVariable m_processingCallbackCv;

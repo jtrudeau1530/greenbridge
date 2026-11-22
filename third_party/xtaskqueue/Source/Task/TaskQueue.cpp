@@ -727,19 +727,94 @@ void __stdcall TaskQueuePortImpl::Terminate(
 }
 
 HRESULT __stdcall TaskQueuePortImpl::Attach(
-    _In_ ITaskQueuePortContext* portContext)
+    _In_ ITaskQueuePortContext* portContext) try
 {
-    return m_attachedContexts.Add(portContext);
-}
+    // Discover the private capability while the caller still owns
+    // the context. QueryApi returns an owned reference on success.
+    void* capability = nullptr;
+    HRESULT queryResult = portContext->QueryApi(
+        TaskQueueInternal::kPinnableContextApiId,
+        &capability);
+
+    if (SUCCEEDED(queryResult) && capability != nullptr)
+    {
+        auto* pinnable =
+            static_cast<TaskQueuePortContextImpl*>(capability);
+
+        struct CapabilityGuard
+        {
+            TaskQueuePortContextImpl* context;
+            ~CapabilityGuard() { context->Release(); }
+        } capabilityGuard{ pinnable };
+
+        std::lock_guard<std::mutex> lock(m_attachedContextsLock);
+
+        if (m_nextAttachedContextId == UINT64_MAX)
+        {
+            return E_OUTOFMEMORY;
+        }
+
+        m_attachedContexts.emplace(
+            m_nextAttachedContextId,
+            AttachedContextRegistration{ portContext, pinnable });
+
+        ++m_nextAttachedContextId;
+        return S_OK;
+    }
+
+    // Without safe pinning, invoking callbacks outside the lock is unsafe.
+    return E_NOINTERFACE;
+} CATCH_RETURN();
 
 void __stdcall TaskQueuePortImpl::Detach(
     _In_ ITaskQueuePortContext* portContext)
 {
-    CancelPendingEntries(portContext, false);
-    m_attachedContexts.Remove([portContext](ITaskQueuePortContext* compare)
     {
-        return portContext == compare;
-    });
+        std::lock_guard<std::mutex> lock(m_attachedContextsLock);
+
+        for (auto it = m_attachedContexts.begin();
+             it != m_attachedContexts.end(); ++it)
+        {
+            if (it->second.context == portContext)
+            {
+                m_attachedContexts.erase(it);
+                break;
+            }
+        }
+    }
+
+    // Cancellation may release references and run reentrant teardown.
+    CancelPendingEntries(portContext, false);
+}
+
+bool TaskQueuePortImpl::TryAcquireNextAttachedContext(
+    uint64_t& cursor,
+    uint64_t upperBound,
+    ITaskQueuePortContext** result)
+{
+    *result = nullptr;
+
+    std::lock_guard<std::mutex> lock(m_attachedContextsLock);
+
+    auto it = m_attachedContexts.upper_bound(cursor);
+
+    while (it != m_attachedContexts.end() &&
+           it->first <= upperBound)
+    {
+        cursor = it->first;
+
+        // A successful pin keeps the containing queue alive until
+        // the caller releases the context outside the registry lock.
+        if (it->second.pinnable->TryPin())
+        {
+            *result = it->second.context;
+            return true;
+        }
+
+        ++it;
+    }
+
+    return false;
 }
 
 bool __stdcall TaskQueuePortImpl::Dispatch(
@@ -1588,7 +1663,7 @@ void TaskQueuePortImpl::PromoteReadyPendingCallbacks(
             {
                 if (nextItem.enqueueTime != dueTime)
                 {
-                    m_attachedContexts.Visit([&](ITaskQueuePortContext* portContext)
+                    VisitAttachedContexts([&](ITaskQueuePortContext* portContext)
                     {
                         auto hooks = portContext->GetQueue()->GetTestHooks();
                         if (hooks != nullptr)
@@ -1643,7 +1718,7 @@ void TaskQueuePortImpl::PromoteReadyPendingCallbacks(
         // No future entries remain in the pending list.
         uint64_t noDueTime = UINT64_MAX;
 
-        m_attachedContexts.Visit([&](ITaskQueuePortContext* portContext)
+        VisitAttachedContexts([&](ITaskQueuePortContext* portContext)
         {
             auto hooks = portContext->GetQueue()->GetTestHooks();
             if (hooks != nullptr)
@@ -1667,7 +1742,7 @@ void TaskQueuePortImpl::PromoteReadyPendingCallbacks(
             // See VerifyDelayedCallbackTimerRaceOnManualQueue for full
             // analysis. The test hook here allows unit tests to verify
             // there is no race.
-            m_attachedContexts.Visit([&](ITaskQueuePortContext* portContext)
+            VisitAttachedContexts([&](ITaskQueuePortContext* portContext)
             {
                 auto hooks = portContext->GetQueue()->GetTestHooks();
                 if (hooks != nullptr)                {
@@ -1808,7 +1883,7 @@ void TaskQueuePortImpl::NotifyItemQueued()
             break;
         }
 
-        m_attachedContexts.Visit([](ITaskQueuePortContext* portContext)
+        VisitAttachedContexts([](ITaskQueuePortContext* portContext)
         {
             portContext->ItemQueued();
         });
