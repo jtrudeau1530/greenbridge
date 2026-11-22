@@ -365,6 +365,18 @@ class TestSwizzleSearchPermutationMatching(unittest.TestCase):
 
 
 class TestSwizzleSearchCliAndRender(unittest.TestCase):
+    @unittest.skipUnless(HAVE_NUMPY, "numpy required")
+    def test_cli_missing_input_is_an_error_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "definitely_missing_path")
+            result = subprocess.run(
+                [sys.executable, "-I", str(TOOL), missing], capture_output=True, text=True
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ERROR: cannot read", result.stderr)
+        self.assertIn("definitely_missing_path", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     @unittest.skipUnless(HAVE_NUMPY, "numpy required")   # the tool imports numpy before it parses arguments
     def test_preview_with_no_fitting_layout_reports_the_problem(self):
         """CLI with tiny blob and --out must exit 1, report 'no layout', and not create file."""
