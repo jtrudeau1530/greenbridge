@@ -7307,8 +7307,7 @@ class Gen:
             # op_sel[0..1], with neg/abs source modifiers) is clamped to [-1, 1] (i16) or [0, 1] (u16), scaled by
             # 32767 or 65535 and rounded once to nearest even (NaN -> 0). For |cl| >= 0.25, cl * (scale + 1) is an
             # exact even integer in f32, so cl * (scale + 1) - RoundEven(cl) gives the exact single-rounded result
-            # without binary32 double-rounding at near-tie f16 inputs (same formula verified on gfx1036 for
-            # v_cvt_norm_{i,u}16_f16). Output modifiers and dst op_sel are rejected.
+            # without binary32 double-rounding at near-tie f16 inputs. Output modifiers and dst op_sel are rejected.
             if any(m == "clamp" or m.startswith(("mul:", "div:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods):
                 raise Unsupported(op + " modifier")
             sel, dhi = self.opsel_bits(mods, 2)
