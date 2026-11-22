@@ -9612,8 +9612,14 @@ def assemble(gen):
             count[0] += 1
             return f"%{prefix}{count[0]}"
 
-        def place(items):
-            for it in items:
+        stack = [("items", tree)]
+        while stack:
+            step = stack.pop()
+            if step[0] == "items":
+                for it in reversed(step[1]):
+                    stack.append(("item", it))
+            elif step[0] == "item":
+                it = step[1]
                 if it[0] == "block":
                     # Under its own label, as in the dispatch form: OpPhi in a body names it as a predecessor.
                     body.extend([f"OpBranch %blk{it[1]}", f"%blk{it[1]} = OpLabel"] + gen.blocks[it[1]])
@@ -9622,19 +9628,22 @@ def assemble(gen):
                     body.extend([f"{v} = OpLoad %uint %pc", f"{c} = OpIEqual %bool {v} {gen.consts[it[1]]}",
                                  f"OpSelectionMerge {end} None", f"OpBranchConditional {c} {do} {end}",
                                  f"{do} = OpLabel"])
-                    place(it[2])
-                    body.extend([f"OpBranch {end}", f"{end} = OpLabel"])
+                    stack.append(("guard_end", end))
+                    stack.append(("items", it[2]))
                 else:
                     head, top, cont, end = label("l_head"), label("l_body"), label("l_cont"), label("l_end")
                     v, again = label("l_pc"), label("l_again")
                     body.extend([f"OpBranch {head}", f"{head} = OpLabel", f"OpLoopMerge {end} {cont} None",
                                  f"OpBranch {top}", f"{top} = OpLabel"])
-                    place(it[2])
-                    body.extend([f"OpBranch {cont}", f"{cont} = OpLabel", f"{v} = OpLoad %uint %pc",
-                                 f"{again} = OpIEqual %bool {v} {gen.consts[it[1]]}",
-                                 f"OpBranchConditional {again} {head} {end}", f"{end} = OpLabel"])
-
-        place(tree)
+                    stack.append(("loop_end", it[1], head, cont, end, v, again))
+                    stack.append(("items", it[2]))
+            elif step[0] == "guard_end":
+                body.extend([f"OpBranch {step[1]}", f"{step[1]} = OpLabel"])
+            else:
+                _, blk_id, head, cont, end, v, again = step
+                body.extend([f"OpBranch {cont}", f"{cont} = OpLabel", f"{v} = OpLoad %uint %pc",
+                             f"{again} = OpIEqual %bool {v} {gen.consts[blk_id]}",
+                             f"OpBranchConditional {again} {head} {end}", f"{end} = OpLabel"])
     elif gen.emulate:
         lines = x_scheduler(gen, x_threads)
         body = []
