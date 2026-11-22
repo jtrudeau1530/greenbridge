@@ -12,8 +12,10 @@ for a single file.
 CSV columns: bank, stream, codec, codec_name, channels, sample_rate, declared_samples, duration_s,
 streamed_music, data_offset, data_size, bank_size, notes. JSON is an object with bank_count,
 stream_count, streamed_music_channel_count and a streams list of the same fields (booleans and
-numbers keep their types). duration_s is the AWC header's declared samples / sample rate; notes
-flags values that look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
+numbers keep their types). duration_s is the decoded duration: a plain Opus stream counts 48 kHz
+frames interleaved across channels, so it is `declared_samples / channels / 48000` regardless of
+the tag's rate field; PCM and XMA use `declared_samples / sample_rate`. notes flags values that
+look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
 A streamed-music descriptor contributes one row per channel group; `channels` is the packet channel count read
 from the Opus TOC stereo bit, and `declared_samples`/`duration_s` are per channel (the descriptor stores the
 interleaved count). `data_offset`/`size` is the shared data tag.
@@ -36,7 +38,21 @@ FIELDS = ("bank", "stream", "codec", "codec_name", "channels", "sample_rate", "d
 CODEC_NAMES = {0x00: "PCM16", 0x02: "PCM float32", 0x05: "XMA2", 0x0B: "Opus"}
 
 
-def _notes(codec: int, channels: int, rate: int, samples: int, data, bank_size: int) -> str:
+def _seconds(codec: int, channels: int, rate: int, samples: int, streamed: bool):
+    """Decoded duration of one stream, or None when the header has no usable timing.
+
+    A plain Opus format tag counts 48 kHz frames interleaved across the packet channels: over
+    1,598,151 measured streams, packet samples - declared is 1920..2879 for every rate, which is
+    only possible if the count is already 48 kHz frames (and halved for stereo). PCM and XMA
+    count per-channel samples at the tag's rate. Streamed-music descriptors are already divided
+    to a per-channel count by awc_opus.music_channels()."""
+    if codec == 0x0B and not streamed:
+        return samples / channels / 48000 if channels > 0 else None
+    return samples / rate if rate > 0 else None
+
+
+def _notes(codec: int, channels: int, rate: int, samples: int, data, bank_size: int,
+           streamed: bool = False) -> str:
     """Human-readable warnings for metadata that does not look self-consistent."""
     offset, size = data
     out = []
@@ -50,8 +66,8 @@ def _notes(codec: int, channels: int, rate: int, samples: int, data, bank_size: 
         out.append("data size is zero")
     if offset < 0 or size < 0 or offset + size > bank_size:
         out.append("data range is outside the bank")
-    if rate > 0:
-        seconds = samples / rate
+    seconds = _seconds(codec, channels, rate, samples, streamed)
+    if seconds is not None:
         if samples and seconds < 0.001:
             out.append(f"duration {seconds:.6f} s is under 1 ms")
         if seconds > 24 * 3600:
@@ -71,7 +87,7 @@ def _notes(codec: int, channels: int, rate: int, samples: int, data, bank_size: 
 
 def _row(bank: str, sid: int, codec: int, channels: int, rate: int, samples: int, data,
          bank_size: int, streamed: bool) -> dict:
-    duration = samples / rate if rate > 0 else None
+    duration = _seconds(codec, channels, rate, samples, streamed)
     return {
         "bank": bank,
         "stream": f"{sid:08X}",
@@ -85,7 +101,7 @@ def _row(bank: str, sid: int, codec: int, channels: int, rate: int, samples: int
         "data_offset": data[0],
         "data_size": data[1],
         "bank_size": bank_size,
-        "notes": _notes(codec, channels, rate, samples, data, bank_size),
+        "notes": _notes(codec, channels, rate, samples, data, bank_size, streamed),
     }
 
 

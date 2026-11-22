@@ -110,7 +110,7 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual((rows[sid]["codec"], rows[sid]["codec_name"]), (codec, name))
         for sid, channels, rate, samples, seconds in [("00000010", 1, 48000, 4800, 0.1),
                                                       ("00000020", 2, 44100, 4410, 0.1),
-                                                      ("00000030", 2, 48000, 96000, 2.0),
+                                                      ("00000030", 2, 48000, 96000, 1.0),
                                                       ("00000040", 1, 48000, 48000, 1.0)]:
             row = rows[sid]
             self.assertEqual((row["channels"], row["sample_rate"], row["declared_samples"]),
@@ -120,6 +120,23 @@ class ManifestTest(unittest.TestCase):
                          {"00000010": "no", "00000040": "yes", "00000041": "yes"})
         self.assertEqual((int(rows["00000010"]["data_size"]), int(rows["00000040"]["data_size"])),
                          (9600, 6144))
+
+    def test_plain_opus_duration_is_48khz_frames_per_channel(self):
+        # The tag's rate is not the unit of the count: 4800 frames at a 32 kHz tag is 0.1 s
+        # at 48 kHz, and a stereo count of 9600 is 4800 frames per channel.
+        opus = bytearray(2048)
+        struct.pack_into("<H", opus, 0, 1)
+        opus[2] = 0xF8
+        bank = build_bank([(1, [(0x76, fmt(4800, 32000, 0x0B, 1)), (0x55, bytes(opus))]),
+                           (2, [(0x76, fmt(9600, 48000, 0x0B, 2)), (0x55, bytes(opus))])])
+        path = os.path.join(self.tmp.name, "opus_rates.awc")
+        with open(path, "wb") as f:
+            f.write(bank)
+        p = self.run_tool(path)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = {r["stream"]: r for r in csv.DictReader(io.StringIO(p.stdout))}
+        self.assertAlmostEqual(float(rows["00000001"]["duration_s"]), 0.1, places=6)
+        self.assertAlmostEqual(float(rows["00000002"]["duration_s"]), 0.1, places=6)
 
     def test_json_out_is_inferred_from_extension(self):
         bank = self.write_bank(with_music=False)
