@@ -581,6 +581,17 @@ int main() {
                 D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&warp.p));
             }
         }
+        // The reference needs typed R9G9B9E5 UAVs. Windows 10's WARP has none (Support1 0x008013f0: its
+        // CreateCommittedResource with ALLOW_UNORDERED_ACCESS returns E_INVALIDARG), so it can't be compared with.
+        if (warp.p) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT warp_fs{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
+            if (FAILED(warp->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &warp_fs, sizeof(warp_fs))) ||
+                !(warp_fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) {
+                std::printf("WARP has no typed R9G9B9E5 UAVs (Support1=0x%08x): UAV clears not compared with it\n",
+                            unsigned(warp_fs.Support1));
+                warp.reset();
+            }
+        }
         std::vector<std::vector<ClearStep>> clear_cases = {
             {{true, {1.0f, 2.0f, 4.0f, 0.0f}, {}, {}}},
             {{true, {1.0f + 0.5f / 256, 1.0f + 1.5f / 256, 1.0f + 2.5f / 256, 0.0f}, {}, {}}},
