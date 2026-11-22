@@ -74,6 +74,22 @@ def _placement_scale(value) -> float:
     return scale if math.isfinite(scale) else 1.0
 
 
+def _parse_archetype(value) -> int:
+    """Parse one placement's archetype: a real JSON integer is used as-is, a string is base-16.
+
+    bool is an int subclass but is never a valid archetype. Any other type (float, list, ...) is invalid and
+    raises, so the callers count the row as malformed. Shared by ``load_placements`` and ``iter_placements``
+    so the two readers stay in step.
+    """
+    if isinstance(value, bool):
+        raise ValueError("bool is not an archetype")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value, 16)
+    raise TypeError("archetype must be an integer or a hex string")
+
+
 def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tuple[list[dict], dict]:
     """Read ``world_index.py --entities-out`` rows. Returns (selected rows, counts).
 
@@ -93,7 +109,7 @@ def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tu
             counts["rows"] += 1
             try:
                 row = json.loads(line)
-                arch = int(str(row["archetype"]), 16)
+                arch = _parse_archetype(row["archetype"])
                 pos = [float(v) for v in row["position"]]
                 rot = [float(v) for v in row["rotation"]]
                 selected_lod = row.get("lod_level") in levels
@@ -137,7 +153,7 @@ def iter_placements(path: str, counts: dict, lod_levels=DEFAULT_LOD_LEVELS, regi
             counts["rows"] += 1
             try:
                 row = json.loads(line)
-                arch = int(str(row["archetype"]), 16)
+                arch = _parse_archetype(row["archetype"])
                 pos = [float(v) for v in row["position"]]
                 rot = [float(v) for v in row["rotation"]]
                 selected_lod = row.get("lod_level") in levels
