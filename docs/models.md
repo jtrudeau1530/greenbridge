@@ -471,6 +471,35 @@ Names are per model and a building holds glass, decal and opaque shaders alike, 
 in absolute terms; the enrichment against bucket 0 is the signal. For export: bucket 1 needs blending, 2 is
 a projected decal, 3 needs alpha testing, 6 is a water surface.
 
+## Material shader hashes and the carved programs
+
+`rpf9dump` also writes each material's shader hash (`manifest.json` → `Materials[].Shader`, u32 as 8 hex digits).
+It is the joaat (lower-cased) of the material's **effect** name. The carve index (`<work>/shaders/dxbc/index.json`)
+names compute programs `<effect>:<entry>_<8 hex>_Wrapped` after a one-byte length prefix (the `:` becomes `_` in
+file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy, `data.rpf` models and the full
+26,503-program carve:
+
+| | Count |
+|---|---:|
+| Materials (3,175 models) | 3,340 |
+| Distinct material shader hashes | 18 |
+| Compute programs named `<effect>:<entry>` | 2,689 (every CS), 564 effects |
+| Effects with `RaytracingResolve` CS programs | 341 (1,004 programs; 3 each for 324) |
+| Materials whose hash is the joaat of a carved effect name | 3,211 (96%), 8 of the 18 hashes |
+
+So a material leads to its effect and that effect's ray-tracing resolve programs. It does **not** lead to the
+draw (VS/PS/MS) programs from the package alone:
+
+- None of the 23,619 graphics programs (VS/PS/MS) carries an effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
+- `shaders.rpf` stores programs grouped by kind, not by effect (the 1,004 `RaytracingResolve` programs sit next
+  to each other), so position doesn't group an effect's programs either.
+- The graphics programs' 8-hex suffix groups them (1,226 suffixes over 23,016 programs, the largest shared by
+  1,775) but is not the joaat of the program name, and only 1 of the 896 suffixes on the effect-named CS programs
+  appears on any graphics program.
+
+The effect → technique → VS/PS table is therefore not in the carved programs' names, order or suffixes; it is
+presumably in the executable (RT-5). Until then, a real model is drawn with a chosen pair ([first_light.md](first_light.md)).
+
 ## Vehicle distant-light recipes
 
 `common.rpf` has one `CVehicleDistantLightData` XML document (see [gamedata.md](gamedata.md)) that ties
