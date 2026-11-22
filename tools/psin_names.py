@@ -188,11 +188,14 @@ def main():
     ap.add_argument("--refs", help="write every resolved value as TSV (local only: it holds game names)")
     ap.add_argument("--limit", type=psin_index.count, help="stop after this many PSIN files")
     a = ap.parse_args()
-    for path in [a.src] + a.names:
+    inputs = [a.src, *a.names]
+    for path in inputs:
         if not os.path.exists(path):
             print(f"ERROR: {path}: no such file or folder", file=sys.stderr)
             return 2
     try:
+        if a.refs and os.path.exists(a.refs) and any(os.path.samefile(path, a.refs) for path in inputs):
+            ap.error("--refs must not overwrite an input")
         names = load_names(a.names)
         if a.refs:
             with open(a.refs, "w", encoding="utf-8", newline="\n") as refs:
