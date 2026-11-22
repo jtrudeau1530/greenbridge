@@ -1031,5 +1031,66 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(carry0, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_addition_without_clamp(self) -> None:
+        sub1 = 0x0001
+        sub2 = 0x0002
+        res = oracle_v_add_clamp_f16(sub1, sub2)
+        self.assertEqual(res, 0x0003)
+        self.assertTrue(is_subnormal(res))
+
+    def test_subnormal_to_normal_transition(self) -> None:
+        # Largest subnormal: 0x03FF
+        max_sub = 0x03FF
+        min_sub = 0x0001
+        # Sum is 0x0400 = smallest normal (2^-14)
+        res = oracle_v_add_clamp_f16(max_sub, min_sub)
+        self.assertEqual(res, 0x0400)
+        self.assertFalse(is_subnormal(res))
+        self.assertEqual(split_f16_bits(res)[1], 1)  # exponent = 1
+        self.assertEqual(split_f16_bits(res)[2], 0)  # fraction = 0
+
+    def test_subnormal_cancellation(self) -> None:
+        sub = 0x0123
+        neg_sub = sub | SIGN_MASK
+        res = oracle_v_add_clamp_f16(sub, neg_sub)
+        self.assertEqual(res, POS_ZERO)
+
+    def test_nan_clamp_to_zero(self) -> None:
+        snan = 0x7C05
+        qnan = CANONICAL_QNAN
+        # RDNA2 clamp modifier maps all NaNs to +0.0
+        self.assertEqual(oracle_v_add_clamp_f16(snan, f16_to_bits(0.5)), POS_ZERO)
+        self.assertEqual(oracle_v_add_clamp_f16(qnan, f16_to_bits(0.5)), POS_ZERO)
+        self.assertEqual(oracle_v_add_clamp_f16(snan, qnan), POS_ZERO)
+
+    def test_infinity_clamped_boundaries(self) -> None:
+        self.assertEqual(oracle_v_add_clamp_f16(POS_INF, f16_to_bits(100.0)), ONE_F16)
+        self.assertEqual(oracle_v_add_clamp_f16(NEG_INF, f16_to_bits(100.0)), POS_ZERO)
+        self.assertEqual(oracle_v_add_clamp_f16(POS_INF, NEG_INF), POS_ZERO)
+        self.assertEqual(oracle_v_add_clamp_f16(NEG_INF, POS_INF), POS_ZERO)
+        self.assertEqual(oracle_v_add_clamp_f16(POS_INF, POS_INF), ONE_F16)
+        self.assertEqual(oracle_v_add_clamp_f16(NEG_INF, NEG_INF), POS_ZERO)
+
+    def test_round_to_nearest_even_ties(self) -> None:
+        # In IEEE 754 half precision (11 bits significand):
+        # 0.5 has bits 0x3800 (even LSB = 0)
+        # 0.5 + 2^-11 has bits 0x3801 (odd LSB = 1)
+        # 2^-12 is halfway between representable numbers.
+        half_ulp = 2.0 ** -12
+        val_even = 0.5
+        val_odd = bits_to_f16(0x3801)
+
+        # Case 1: 0.5 (even LSB) + 2^-12: tie rounds to even (0.5)
+        res1 = oracle_v_add_clamp_f16(f16_to_bits(val_even), f16_to_bits(half_ulp))
+        self.assertEqual(res1, f16_to_bits(val_even))
+
+        # Case 2: (0.5 + 2^-11) (odd LSB) + 2^-12: tie rounds to even (0.5 + 2 * 2^-11, 0x3802)
+        res2 = oracle_v_add_clamp_f16(f16_to_bits(val_odd), f16_to_bits(half_ulp))
+        self.assertEqual(res2, 0x3802)
+
+
 if __name__ == "__main__":
     unittest.main()
