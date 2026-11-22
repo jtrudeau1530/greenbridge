@@ -554,6 +554,14 @@ int main() {
             return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
         if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
             return fail("GetLastPresentCount(nullptr) should return E_INVALIDARG");
+
+        DXGI_FRAME_STATISTICS stats{};
+        if (FAILED(sc->GetFrameStatistics(&stats)) || stats.PresentCount != count_before ||
+            stats.PresentRefreshCount != count_before || stats.SyncRefreshCount != count_before ||
+            stats.SyncQPCTime.QuadPart == 0)
+            return fail("GetFrameStatistics values");
+        if (sc->GetFrameStatistics(nullptr) != E_INVALIDARG)
+            return fail("GetFrameStatistics(nullptr) should return E_INVALIDARG");
     }
 
     // SwapChain::GetParent and non-waitable SetMaximumFrameLatency/GetMaximumFrameLatency (host DXGI returns
