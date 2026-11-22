@@ -1016,5 +1016,72 @@ class TestValuFrexpExpI32F64ConditionCodes(unittest.TestCase):
         self.assertEqual(simd.vcc, canary)
 
 
+class TestValuFrexpExpI32F64IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeros(self) -> None:
+        self.assertEqual(ref_frexp_exp_i32_f64(POS_ZERO_F64), 0)
+        self.assertEqual(ref_frexp_exp_i32_f64(NEG_ZERO_F64), 0)
+
+    def test_infinities(self) -> None:
+        self.assertEqual(ref_frexp_exp_i32_f64(POS_INF_F64), 0)
+        self.assertEqual(ref_frexp_exp_i32_f64(NEG_INF_F64), 0)
+
+    def test_nans_payloads(self) -> None:
+        nan_payloads = [
+            QNAN_F64,
+            NEG_QNAN_F64,
+            0x7FF8000000000001,
+            0xFFF8000012345678,
+            SNAN_F64,
+            0xFFF0000000000001,
+        ]
+        for nan in nan_payloads:
+            with self.subTest(nan=f"{nan:#018x}"):
+                self.assertEqual(ref_frexp_exp_i32_f64(nan), 0)
+
+    def test_normal_extremes(self) -> None:
+        # DBL_MIN: 2^-1022 -> exp = -1021
+        self.assertEqual(s32(ref_frexp_exp_i32_f64(DBL_MIN)), -1021)
+        self.assertEqual(s32(ref_frexp_exp_i32_f64(NEG_DBL_MIN)), -1021)
+
+        # DBL_MAX: biased exp 2046 -> exp = 1024
+        self.assertEqual(s32(ref_frexp_exp_i32_f64(DBL_MAX)), 1024)
+        self.assertEqual(s32(ref_frexp_exp_i32_f64(NEG_DBL_MAX)), 1024)
+
+    def test_subnormals_range(self) -> None:
+        # SUBNORM_MIN: 2^-1074 -> exp = -1073
+        self.assertEqual(s32(ref_frexp_exp_i32_f64(SUBNORM_MIN_F64)), -1073)
+        self.assertEqual(s32(ref_frexp_exp_i32_f64(NEG_SUBNORM_MIN_F64)), -1073)
+
+        # SUBNORM_MAX: frac bit 51 set -> lz = 0 -> exp = -1022
+        self.assertEqual(s32(ref_frexp_exp_i32_f64(SUBNORM_MAX_F64)), -1022)
+        self.assertEqual(s32(ref_frexp_exp_i32_f64(NEG_SUBNORM_MAX_F64)), -1022)
+
+        # Intermediate subnormals with varying leading zeros
+        for lz in range(52):
+            frac = 1 << (51 - lz)
+            subnorm_bits = frac  # biased_exp = 0
+            expected_exp = -1022 - lz
+            self.assertEqual(s32(ref_frexp_exp_i32_f64(subnorm_bits)), expected_exp)
+
+    def test_subnormals_ftz(self) -> None:
+        for lz in range(0, 52, 5):
+            frac = 1 << (51 - lz)
+            self.assertEqual(ref_frexp_exp_i32_f64(frac, ftz=True), 0)
+
+    def test_modifiers_on_boundary_values(self) -> None:
+        boundary_values = [
+            POS_ZERO_F64, NEG_ZERO_F64, POS_INF_F64, NEG_INF_F64,
+            QNAN_F64, SNAN_F64, DBL_MIN, NEG_DBL_MIN, DBL_MAX, NEG_DBL_MAX,
+            SUBNORM_MIN_F64, SUBNORM_MAX_F64,
+        ]
+        for val in boundary_values:
+            base_exp = ref_frexp_exp_i32_f64(val)
+            self.assertEqual(ref_frexp_exp_i32_ext(val, neg=True), base_exp)
+            self.assertEqual(ref_frexp_exp_i32_ext(val, abs_val=True), base_exp)
+            self.assertEqual(ref_frexp_exp_i32_ext(val, neg=True, abs_val=True), base_exp)
+
+
 if __name__ == "__main__":
     unittest.main()
