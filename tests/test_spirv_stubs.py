@@ -181,6 +181,8 @@ class MalformedIndexTest(unittest.TestCase):
                 self.assertNotEqual(p.returncode, 0)
                 self.assertIn("cannot generate stubs", p.stderr)
                 self.assertIn("index.json", p.stderr)
+                if name in ("ms_bad", "gs_bad"):
+                    self.assertIn("invalid Location", p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
 
 
