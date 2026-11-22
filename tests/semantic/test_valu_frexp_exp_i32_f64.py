@@ -318,6 +318,52 @@ class Program:
 
 
 # ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ConditionCodes:
+    """Architectural integer condition codes for v_frexp_exp_i32_f64 output."""
+    zero: bool
+    negative: bool
+    positive: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class FPStatusFlags:
+    """IEEE 754 floating-point status flags for the input operand."""
+    invalid: bool       # e.g. signaling NaN input
+    denormal: bool      # e.g. subnormal double input
+    inexact: bool = False
+    overflow: bool = False
+    underflow: bool = False
+
+
+def compute_condition_codes(result: int) -> ConditionCodes:
+    """Computes condition codes evaluating the extracted 32-bit integer exponent."""
+    signed_val = s32(result)
+    return ConditionCodes(
+        zero=(signed_val == 0),
+        negative=(signed_val < 0),
+        positive=(signed_val > 0),
+    )
+
+
+def compute_fp_status_flags(s0_bits: int) -> FPStatusFlags:
+    """Computes IEEE 754 status flags for double-precision input."""
+    bits = s0_bits & MASK64
+    invalid = bool((bits & EXP_MASK_F64) == EXP_MASK_F64 and (bits & MANT_MASK_F64) != 0 and not (bits & 0x0008000000000000))
+    denormal = is_subnormal_f64(bits)
+    return FPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=False,
+        overflow=False,
+        underflow=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
@@ -328,6 +374,9 @@ class ScalarVALUInterpreter:
         self.vgprs: list[int] = [0] * 256
         self.sgprs: list[int] = [0] * 106
         self.mode_ftz: bool = mode_ftz
+        self.vcc: int = 0
+        self.last_condition_codes: ConditionCodes | None = None
+        self.last_status_flags: FPStatusFlags | None = None
         self.trace: list[str] = []
 
     def read_reg_u32(self, kind: RegKind, idx: int) -> int:
@@ -374,6 +423,9 @@ class ScalarVALUInterpreter:
             raise NotImplementedError(f"Unsupported opcode in scalar interpreter: {inst.opcode}")
 
         self.write_reg_u32(inst.dst.kind, inst.dst.index, res)
+        self.last_condition_codes = compute_condition_codes(res)
+        self.last_status_flags = compute_fp_status_flags(s0_val)
+        # Note: v_frexp_exp_i32_f64 does not generate carry or borrow; VCC is isolated and unchanged
         self.trace.append(f"{inst.to_assembly()} => {res:#010x} ({s32(res)})")
         return res
 
@@ -881,6 +933,87 @@ class TestValuFrexpExpI32F64RegisterAliasing(unittest.TestCase):
                 # Inactive: v0 and v1 both preserved
                 self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), lo_orig)
                 self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), hi_orig)
+
+
+class TestValuFrexpExpI32F64ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_zero_pos_neg(self) -> None:
+        interp = ScalarVALUInterpreter()
+
+        # Input 0.5 -> exp = 0
+        interp.step(Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(0.5),
+        ))
+        cc_zero = interp.last_condition_codes
+        self.assertIsNotNone(cc_zero)
+        assert cc_zero is not None
+        self.assertTrue(cc_zero.zero)
+        self.assertFalse(cc_zero.negative)
+        self.assertFalse(cc_zero.positive)
+
+        # Input 2.0 -> exp = 2 (positive)
+        interp.step(Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(2.0),
+        ))
+        cc_pos = interp.last_condition_codes
+        self.assertIsNotNone(cc_pos)
+        assert cc_pos is not None
+        self.assertFalse(cc_pos.zero)
+        self.assertFalse(cc_pos.negative)
+        self.assertTrue(cc_pos.positive)
+
+        # Input 0.25 -> exp = -1 (negative)
+        interp.step(Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(0.25),
+        ))
+        cc_neg = interp.last_condition_codes
+        self.assertIsNotNone(cc_neg)
+        assert cc_neg is not None
+        self.assertFalse(cc_neg.zero)
+        self.assertTrue(cc_neg.negative)
+        self.assertFalse(cc_neg.positive)
+
+    def test_status_flags_snan_invalid(self) -> None:
+        flags_snan = compute_fp_status_flags(SNAN_F64)
+        self.assertTrue(flags_snan.invalid)
+        self.assertFalse(flags_snan.denormal)
+
+        flags_qnan = compute_fp_status_flags(QNAN_F64)
+        self.assertFalse(flags_qnan.invalid)
+
+    def test_status_flags_denormal(self) -> None:
+        flags_sub = compute_fp_status_flags(SUBNORM_MIN_F64)
+        self.assertTrue(flags_sub.denormal)
+        self.assertFalse(flags_sub.invalid)
+
+        flags_norm = compute_fp_status_flags(POS_ONE_F64)
+        self.assertFalse(flags_norm.denormal)
+        self.assertFalse(flags_norm.invalid)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary = 0xCAFEBABE
+        interp.vcc = canary
+
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(1.0),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.vcc, canary)
+
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.vcc = canary
+        simd.step(inst)
+        self.assertEqual(simd.vcc, canary)
 
 
 if __name__ == "__main__":
