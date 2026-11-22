@@ -149,6 +149,12 @@ The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. The anima
 to the bones, but a skeleton carries its own names (`joaat32` at bone record `+0x1C`, name at `+0x30`,
 [character_skeleton.md](character_skeleton.md)), so the match is measured: see
 [Bone tables and motion matchers](#bone-tables-and-motion-matchers).
+The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. Measured across all `SKEL_*` streams in
+`anim.rpf` (`177` streams, `118` distinct `SKEL_*` tokens) against the decoded skeleton name tables in
+`packs.rpf` (`2,866` `SKEL_`-bearing streams, `691` distinct `SKEL_*` tokens) using `tools/anim_skeleton_match.py`:
+`117` of `118` (`99.2%`) match by exact case and all `118` of `118` (`100%`) match case-insensitively (and by
+lowercased `joaat32`, since `SKEL_HEAD` corresponds to `SKEL_Head`); `166` of `177` streams match all of their
+tokens by exact case. The animation pages still carry no model name next to the bones.
 
 ### Type-hash containers
 
