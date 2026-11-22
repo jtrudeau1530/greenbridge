@@ -5,6 +5,7 @@
 Zero game data: the "DLL" is synthetic bytes around hand-built containers (tests/test_fspx_unpack.py builds them), and
 the stage tests mock the tools the way tests/test_shader_stage_resume.py does.
 """
+import contextlib
 import hashlib
 import io
 import json
@@ -179,6 +180,40 @@ class FspxStage(unittest.TestCase):
         self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
         self.assertEqual(self.run_step(), [])
+
+    def test_failed_disassembly_leaves_no_marker_and_is_retried(self):
+        mc = os.path.join(self.tmp.name, "fake_mc.py")
+        with open(mc, "w", encoding="utf-8", newline="\n") as f:
+            f.write("import sys\nsys.stderr.write('error: disassembly stopped\\n')\nsys.exit(23)\n")
+        real_py = make_game.py
+
+        def run_tool(tool, *args):
+            if tool == "fspx_unpack.py":
+                self.calls.append((tool, args))
+                real_py(tool, *args)
+            else:
+                self.fake_py(tool, *args)
+
+        env = dict(LLVM_MC=f'"{sys.executable}" "{mc}"')
+        with mock.patch.dict(os.environ, env), mock.patch.object(make_game, "py", run_tool), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            with self.assertRaises(SystemExit) as error, contextlib.redirect_stderr(io.StringIO()):
+                make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+            self.assertEqual(error.exception.code, 1)
+            self.assertEqual([tool for tool, _ in self.calls], ["fspx_unpack.py"])
+            self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+            self.assertFalse(os.path.exists(os.path.join(self.spirv, "fspx_build.json")))
+            self.assertEqual(os.listdir(os.path.join(self.unpacked, "disasm")), [])
+            with open(mc, "w", encoding="utf-8", newline="\n") as f:
+                f.write("print('\\ts_endpgm')\n")
+            self.calls = []
+            make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+            self.assertEqual([tool for tool, _ in self.calls], ["fspx_unpack.py", "rdna2spirv.py"])
+            self.assertTrue(os.path.isfile(os.path.join(self.spirv, "index.json")))
+            self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
+            self.calls = []
+            make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+            self.assertEqual(self.calls, [])
 
     def test_missing_cached_module_is_rebuilt(self) -> None:
         self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
