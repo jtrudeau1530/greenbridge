@@ -70,10 +70,10 @@ class WorldCensusTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_census(self, shard_size=1 << 30, jobs=1):
+    def run_census(self, shard_size=1 << 30, jobs=1, out_name="out"):
         arc = os.path.join(self.dir, "sample.rpf")
         make_archive(arc)
-        out = os.path.join(self.dir, "out")
+        out = os.path.join(self.dir, out_name)
         code = WC.main([arc, "--out", out, "--shard-size", str(shard_size), "--jobs", str(jobs)])
         with open(os.path.join(out, "summary.json"), encoding="utf-8") as f:
             return code, json.load(f)
@@ -103,6 +103,17 @@ class WorldCensusTest(unittest.TestCase):
         self.assertEqual(s["entities"], 4)
         self.assertEqual(s["duplicate_offsets"], 0)
         self.assertEqual(s["coverage"]["accounted"], s["coverage"]["span"])
+
+    def test_tiny_shards_give_the_same_stream_totals(self):
+        """Each shard starts scanning WARMUP bytes early to find its first stream boundary. Streams that start in
+        that window belong to the previous shard, so the stream and byte totals must not depend on the shard size."""
+        _, whole = self.run_census(out_name="whole")
+        _, tiny = self.run_census(shard_size=400, out_name="tiny")
+        self.assertGreater(tiny["shards_expected"], 1)
+        for key, value in whole["totals"].items():
+            with self.subTest(total=key):
+                self.assertEqual(tiny["totals"].get(key), value)
+        self.assertGreater(whole["totals"]["streams"], 0)
 
     def test_required_len_detects_split_page(self):
         blob = TWI.make_resource(True)
