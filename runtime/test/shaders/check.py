@@ -89,6 +89,7 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
           ("cs_dpp8", [7, 6, 5, 4, 3, 2, 1, 0]),
           ("cs_dpp_ops", [100, 10, 11, 12, 13, 14, 15, 16]),
+          ("cs_dpp_bound", [10, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
           ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
@@ -204,7 +205,14 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
-              "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000)}
+              "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
+              # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
+              "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
+              "ps_cvt_off": (0xbf000000, 0x3ee00000, 0xbe800000, 0x3f800000),
+              "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
+              "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
+              "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
+              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
@@ -223,7 +231,8 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
-PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack"}
+PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
+                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 GATHER_LOD_TEST = "ps_gather_sampler_lod"
@@ -263,12 +272,13 @@ def gpu_test_timeout():
     text = (os.environ.get("LEONIDA_GPU_TEST_TIMEOUT") or "").strip()
     if not text:
         return DEFAULT_GPU_TEST_TIMEOUT
+    error = f"LEONIDA_GPU_TEST_TIMEOUT must be a finite number of seconds (0 = no limit), not {text!r}"
     try:
         limit = float(text)
     except ValueError:
-        sys.exit(f"LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not {text!r}")
-    if math.isnan(limit):
-        sys.exit("LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not nan")
+        sys.exit(error)
+    if not math.isfinite(limit):
+        sys.exit(error)
     return None if limit <= 0 else limit
 
 
@@ -284,11 +294,12 @@ def run(*cmd, env=None):
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:
-        if not isinstance(e, FileNotFoundError):
-            return 1, start_failure(cmd[0], e)
-        tools = os.path.abspath(os.path.dirname(cmd[0]))
-        missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
-        sys.exit(not_found_message(tools, missing))
+        if isinstance(e, FileNotFoundError):
+            tools = os.path.abspath(os.path.dirname(cmd[0]))
+            missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
+            if missing:
+                sys.exit(not_found_message(tools, missing))
+        return 1, start_failure(cmd[0], e)
     return r.returncode, r.stdout + r.stderr
 
 
@@ -427,6 +438,22 @@ def unpinned_subgroup_skip(out):
 def wave32_lane_skip(out):
     """The skip rule for WAVE32_LANE_DUMPS, shared with run_gpu_tests.py."""
     return narrow_subgroup_skip(out) or unpinned_subgroup_skip(out)
+
+
+def bitmask_perm_narrow_skip(out, px):
+    """A Skip when ps_bitmask_perm ran narrower than 32 lanes on a device whose subgroup range permits it (#618).
+    Requires every lane 0..width-1 of a power-of-two width in [min, 32), so a broken v_mbcnt still fails."""
+    m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
+    if not m or len(px) != 64 * 64:
+        return None
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if lo >= 32:
+        return None
+    lanes = {p[0] for p in px}
+    width = max(lanes) + 1
+    if lo <= width < 32 and width & (width - 1) == 0 and lanes == set(range(width)):
+        return Skip(f"SKIP (fragment subgroup ran at {width} lanes on {lo}..{hi} device; needs 32)")
+    return None
 
 
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
@@ -785,6 +812,8 @@ def pixel_test(tools, spirv, name):
     if name == "ps_interp_f16_high":
         return interp_f16_high_problem(px)
     if name == "ps_bitmask_perm":
+        if skip := bitmask_perm_narrow_skip(out, px):
+            return skip
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"

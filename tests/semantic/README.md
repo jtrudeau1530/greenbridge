@@ -48,6 +48,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_float_nan_fract.py` runs float min/max/min3/max3/med3 with a quiet NaN and `v_fract` next to 1.0 (f32 and
   f16) with inputs from memory, and the GPU fixtures `ps_fnan_med3` and `ps_fnan_fract`; the expected words were
   measured on an AMD Radeon RX 6800 (gfx1030). A NaN result is asserted as "a NaN", not by its bits.
+- `test_rule_gpu_fixtures.py` runs the GPU fixtures for the `docs/design.md` rules that used to be CPU-only (TEST-175:
+  `v_cmp(x)_nlg`, `v_cvt_off_f32_i4`, the `v_fmac_f16` / `v_interp_p2/mov_f32` output modifiers and VOP3 modifiers on
+  constants) through the interpreter, and checks that the words each `.asm` header derives are the ones `check.py`
+  and `scripts/run_gpu_tests.py` expect. The two interp fixtures get the constants their vertex shader,
+  `vs_interp_consts`, exports.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
