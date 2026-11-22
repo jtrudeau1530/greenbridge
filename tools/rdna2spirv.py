@@ -4997,6 +4997,12 @@ class Gen:
         elif op in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
             # D = {S1 half, S0 half}: the low result half comes from S0, the high one from S1; the letters name the
             # half taken from each (l = bits 15:0, h = bits 31:16), S0 first. SCC is not written.
+            val = None
+            x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+            if x_val is not None and y_val is not None:
+                lo_v = (x_val >> 16) if op == "s_pack_hh_b32_b16" else (x_val & 0xFFFF)
+                hi_v = ((y_val & 0xFFFF) << 16) if op == "s_pack_ll_b32_b16" else (y_val & 0xFFFF0000)
+                val = (lo_v | hi_v) & 0xFFFFFFFF
             x, y = self.src_u(a[1]), self.src_u(a[2])
             lo, hi, r = self.tmp(), self.tmp(), self.tmp()
             if op == "s_pack_hh_b32_b16":
@@ -5009,8 +5015,16 @@ class Gen:
                 self.emit(f"{hi} = OpBitwiseAnd %uint {y} {self.cu(0xFFFF0000)}")
             self.emit(f"{r} = OpBitwiseOr %uint {lo} {hi}")
             self.dst(a[0], r)
+            if val is not None and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                self.sgpr_imm[a[0]["r"]] = val
         elif op == "s_bfm_b32":
             # D = ((1 << (S0 & 31)) - 1) << (S1 & 31): an ordinary scalar value
+            val = None
+            x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+            if x_val is not None and y_val is not None:
+                w_v = x_val & 31
+                o_v = y_val & 31
+                val = (((1 << w_v) - 1) << o_v) & 0xFFFFFFFF
             x, y = self.src_u(a[1]), self.src_u(a[2])
             w, o, one, sh, mm, r = (self.tmp() for _ in range(6))
             self.emit(f"{w} = OpBitwiseAnd %uint {x} {self.cu(31)}")
@@ -5019,6 +5033,8 @@ class Gen:
             self.emit(f"{mm} = OpISub %uint {sh} {self.cu(1)}")
             self.emit(f"{r} = OpShiftLeftLogical %uint {mm} {o}")
             self.dst(a[0], r)
+            if val is not None and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                self.sgpr_imm[a[0]["r"]] = val
         elif op == "ds_bpermute_b32":
             # vD = vData from lane ((vAddr + offset) / 4) mod 32: a subgroup shuffle (no LDS memory involved).
             d, ad, dat = a[0], self.src_u(a[1]), self.src_u(a[2])
@@ -5295,6 +5311,16 @@ class Gen:
             self.dst(a[0], yc)
             self.dst(a[1], xc)
         elif op == "s_abs_i32":
+            x_val = self.imm_val(a[1])
+            if x_val is not None:
+                xi = x_val if x_val < 0x80000000 else x_val - 0x100000000
+                val = abs(xi) & 0xFFFFFFFF
+                r = self.cu(val)
+                self.dst(a[0], r)
+                if a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                    self.sgpr_imm[a[0]["r"]] = val
+                self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
+                return
             x = self.src_u(a[1])
             i, ab, r, nz, sc = (self.tmp() for _ in range(5))
             self.emit(f"{i} = OpBitcast %int {x}")
@@ -5306,6 +5332,19 @@ class Gen:
             self.emit(f"OpStore %scc {sc}")
         elif op in ("s_sext_i32_i8", "s_sext_i32_i16"):
             # D = S0's low byte / half, sign-extended to 32 bits; SCC is not written.
+            x_val = self.imm_val(a[1])
+            if x_val is not None:
+                if op.endswith("i8"):
+                    b = x_val & 0xFF
+                    val = ((b ^ 0x80) - 0x80) & 0xFFFFFFFF
+                else:
+                    h = x_val & 0xFFFF
+                    val = ((h ^ 0x8000) - 0x8000) & 0xFFFFFFFF
+                r = self.cu(val)
+                self.dst(a[0], r)
+                if a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                    self.sgpr_imm[a[0]["r"]] = val
+                return
             x = self.src_u(a[1])
             r = self.tmp()
             self.emit(f"{r} = OpBitFieldSExtract %uint {x} {self.cu(0)} {self.cu(8 if op.endswith('i8') else 16)}")
@@ -5632,6 +5671,22 @@ class Gen:
             self.emit(f"{r} = OpBitwiseAnd %uint {self.src_u(a[0])} {n}")
             self.dst(a[0], r)
         elif op in ("s_min_i32", "s_max_i32"):
+            x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+            if x_val is not None and y_val is not None:
+                xi = x_val if x_val < 0x80000000 else x_val - 0x100000000
+                yi = y_val if y_val < 0x80000000 else y_val - 0x100000000
+                if "min" in op:
+                    val = (xi if xi < yi else yi) & 0xFFFFFFFF
+                    scc = 1 if xi < yi else 0
+                else:
+                    val = (xi if xi > yi else yi) & 0xFFFFFFFF
+                    scc = 1 if xi > yi else 0
+                r = self.cu(val)
+                self.dst(a[0], r)
+                if a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                    self.sgpr_imm[a[0]["r"]] = val
+                self.emit(f"OpStore %scc {self.cu(scc)}")
+                return
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %uint %glsl {'SMin' if 'min' in op else 'SMax'} {x} {y}")
@@ -6099,6 +6154,8 @@ class Gen:
                 val = (~x_val) & 0xFFFFFFFF
                 r = self.cu(val)
                 self.dst(a[0], r)
+                if a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                    self.sgpr_imm[a[0]["r"]] = val
                 self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
             else:
                 x = self.src_u(a[1])
@@ -6296,8 +6353,16 @@ class Gen:
             self.global_mem(op, a, mods)
         elif op in ("s_add_u32", "s_addc_u32", "s_sub_u32", "s_subb_u32"):
             # 32-bit add/sub with carry/borrow through SCC (used for 64-bit address arithmetic, e.g. s_getpc + offset).
-            x, y = self.src_u(a[1]), self.src_u(a[2])
             sub = op.startswith("s_sub")
+            val = None
+            if op in ("s_add_u32", "s_sub_u32"):
+                x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+                if x_val is not None and y_val is not None:
+                    if sub:
+                        val = (x_val - y_val) & 0xFFFFFFFF
+                    else:
+                        val = (x_val + y_val) & 0xFFFFFFFF
+            x, y = self.src_u(a[1]), self.src_u(a[2])
             s1, r1, c1 = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{s1} = {'OpISubBorrow' if sub else 'OpIAddCarry'} %umul {x} {y}")
             self.emit(f"{r1} = OpCompositeExtract %uint {s1} 0")
@@ -6313,10 +6378,16 @@ class Gen:
                 r, carry = r2, cc
             self.dst(a[0], r)
             self.emit(f"OpStore %scc {carry}")
+            if val is not None and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                self.sgpr_imm[a[0]["r"]] = val
         elif op in ("s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32"):
             # D = (S0 << N) + S1. SCC = unsigned overflow of the sum taken in 64 bits (RDNA ISA pseudocode:
             # tmp = (64'U(S0) << N) + 64'U(S1); SCC = tmp >= 2^32), so bits shifted out of S0 count as a carry too.
             n = int(op[6])
+            val = None
+            x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+            if x_val is not None and y_val is not None:
+                val = ((x_val << n) + y_val) & 0xFFFFFFFF
             x, y = self.src_u(a[1]), self.src_u(a[2])
             sh, out, s, r, c, ovf = (self.tmp() for _ in range(6))
             self.emit(f"{sh} = OpShiftLeftLogical %uint {x} {self.cu(n)}")
@@ -6327,6 +6398,8 @@ class Gen:
             self.emit(f"{ovf} = OpBitwiseOr %uint {out} {c}")
             self.dst(a[0], r)
             self.scc_nonzero(ovf)
+            if val is not None and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                self.sgpr_imm[a[0]["r"]] = val
         elif op == "s_get_waveid_in_workgroup":
             # D = this wave's index in its workgroup: thread i of a group is in wave i / W (W = 64 or 32), the rule
             # wave_lane uses for the lane. Only compute and mesh shaders have a workgroup. SCC is not written.
@@ -6357,16 +6430,40 @@ class Gen:
             self.cu(3), self.cu(4)
         elif op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_xor_b32", "s_andn2_b32",
                     "s_cselect_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
-            if op == "s_xor_b32":
+            val = None
+            if op in ("s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
                 x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
                 writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
                 is_mask = not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2]))
                 if x_val is not None and y_val is not None and not is_mask:
-                    val = (x_val ^ y_val) & 0xFFFFFFFF
-                    r = self.cu(val)
-                    self.dst(a[0], r)
-                    self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
-                    return
+                    if op == "s_xor_b32":
+                        val = (x_val ^ y_val) & 0xFFFFFFFF
+                        r = self.cu(val)
+                        self.dst(a[0], r)
+                        if a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                            self.sgpr_imm[a[0]["r"]] = val
+                        self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
+                        return
+                    elif op == "s_andn2_b32":
+                        val = (x_val & (~y_val)) & 0xFFFFFFFF
+                    elif op == "s_orn2_b32":
+                        val = (x_val | (~y_val)) & 0xFFFFFFFF
+                    elif op == "s_nand_b32":
+                        val = (~(x_val & y_val)) & 0xFFFFFFFF
+                    elif op == "s_nor_b32":
+                        val = (~(x_val | y_val)) & 0xFFFFFFFF
+                    elif op == "s_xnor_b32":
+                        val = (~(x_val ^ y_val)) & 0xFFFFFFFF
+            elif op in ("s_min_u32", "s_max_u32"):
+                x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+                if x_val is not None and y_val is not None:
+                    val = min(x_val, y_val) if "min" in op else max(x_val, y_val)
+            elif op in ("s_add_i32", "s_sub_i32"):
+                x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+                if x_val is not None and y_val is not None:
+                    xi = x_val if x_val < 0x80000000 else x_val - 0x100000000
+                    yi = y_val if y_val < 0x80000000 else y_val - 0x100000000
+                    val = (xi + yi if op == "s_add_i32" else xi - yi) & 0xFFFFFFFF
             x, y = self.sop2_b32_srcs(op, a)
             r = self.tmp()
             if op == "s_cselect_b32":
@@ -6404,6 +6501,8 @@ class Gen:
                 b = self.tmp()
                 self.emit(f"{b} = {'OpULessThan' if 'min' in op else 'OpUGreaterThan'} %bool {x} {y}")
                 self.set_scc(b)
+            if val is not None and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                self.sgpr_imm[a[0]["r"]] = val
         elif op in ("s_wqm_b64", "s_wqm_b32"):
             self.wqm(op, a)
         elif op == "v_fma_mix_f32":
@@ -6757,6 +6856,42 @@ class Gen:
             self.uses_psb = True        # Int64 capability and %ulong / %long come with the PSB declarations
         elif op in ("s_bfe_u32", "s_bfe_i32"):
             # src1 packs offset in bits [4:0] and width in bits [22:16].
+            ctl_val = self.imm_val(a[2])
+            if ctl_val is not None:
+                off_c = ctl_val & 31
+                wid_raw = (ctl_val >> 16) & 0x7F
+                wid_c = min(wid_raw, 32 - off_c)
+                x_val = self.imm_val(a[1])
+                if x_val is not None:
+                    if wid_c == 0:
+                        val = 0
+                    elif op == "s_bfe_u32":
+                        val = (x_val >> off_c) & ((1 << wid_c) - 1)
+                    else:
+                        raw = (x_val >> off_c) & ((1 << wid_c) - 1)
+                        sign_bit = 1 << (wid_c - 1)
+                        val = ((raw ^ sign_bit) - sign_bit) & 0xFFFFFFFF
+                    r = self.cu(val)
+                    self.dst(a[0], r)
+                    if a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                        self.sgpr_imm[a[0]["r"]] = val
+                    self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
+                    return
+                off = self.cu(off_c)
+                wid = self.cu(wid_c)
+                x = self.src_u(a[1])
+                r = self.tmp()
+                if op == "s_bfe_u32":
+                    self.emit(f"{r} = OpBitFieldUExtract %uint {x} {off} {wid}")
+                else:
+                    xi, ri = self.as_int(x), self.tmp()
+                    self.emit(f"{ri} = OpBitFieldSExtract %int {xi} {off} {wid}")
+                    self.emit(f"{r} = OpBitcast %uint {ri}")
+                self.dst(a[0], r)
+                z = self.tmp()
+                self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
+                self.emit(f"OpStore %scc {z}")
+                return
             x, ctl = self.src_u(a[1]), self.src_u(a[2])
             off, wid, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{off} = OpBitwiseAnd %uint {ctl} {self.cu(31)}")
@@ -6922,6 +7057,17 @@ class Gen:
         elif op == "s_absdiff_i32":
             # RDNA2 ISA: D = S0 - S1 as a 32-bit signed value, negated if negative; SCC = (D != 0). The difference
             # wraps before the absolute value (0x7FFFFFFF - 0x80000000 = -1 -> 1), and SAbs keeps 0x80000000 as is.
+            x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
+            if x_val is not None and y_val is not None:
+                diff = (x_val - y_val) & 0xFFFFFFFF
+                diff_i = diff if diff < 0x80000000 else diff - 0x100000000
+                val = abs(diff_i) & 0xFFFFFFFF
+                r = self.cu(val)
+                self.dst(a[0], r)
+                if a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+                    self.sgpr_imm[a[0]["r"]] = val
+                self.emit(f"OpStore %scc {self.cu(1 if val != 0 else 0)}")
+                return
             x, y = self.src_u(a[1]), self.src_u(a[2])
             d, ab, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{d} = OpISub %uint {x} {y}")
@@ -7215,6 +7361,8 @@ class Gen:
                     if folded is not None:
                         r = self.cu(folded)
                         self.dst(a[0], r)
+                        if a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1 and op != "s_or_b32":
+                            self.sgpr_imm[a[0]["r"]] = folded
                         if op in ("s_and_b32", "s_or_b32", "s_lshl_b32", "s_lshr_b32"):
                             self.emit(f"OpStore %scc {self.cu(1 if folded != 0 else 0)}")
                         return
@@ -7263,6 +7411,18 @@ class Gen:
             if o_val is not None and w_val is not None:
                 off = o_val & 31
                 wid = min(w_val & 31, 32 - off)
+                x_val = self.imm_val(a[1])
+                if x_val is not None:
+                    if wid == 0:
+                        val = 0
+                    elif op == "v_bfe_u32":
+                        val = (x_val >> off) & ((1 << wid) - 1)
+                    else:
+                        raw = (x_val >> off) & ((1 << wid) - 1)
+                        sign_bit = 1 << (wid - 1)
+                        val = ((raw ^ sign_bit) - sign_bit) & 0xFFFFFFFF
+                    self.dst(a[0], self.cu(val))
+                    return
                 om = self.cu(off)
                 wc = self.cu(wid)
             else:
