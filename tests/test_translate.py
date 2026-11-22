@@ -692,6 +692,25 @@ def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
         assert defs[value] == f"OpConstant %uint {bits}"
 
 
+def test_gather4_l_run_time_lod_bounds_clamp_without_fclamp(make_shader):
+    # A run-time S# here (the real game shape) must not use FClamp: LLPC 26.10.1 miscompiles it on this path and
+    # leaves the gather at mip 0 when MIN_LOD should raise it (#1032). FMax then FMin is the same clamp.
+    asm = ("s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+           "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+           "s_load_dwordx4 s[16:19], s[0:1], 0\n"
+           "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
+           "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
+    shader = make_shader(program(asm))
+    text = shader.translate()
+    shader.validate(text)
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
+    rounded, = (expr for expr in defs.values() if " RoundEven " in expr)
+    clamp = defs[rounded.split()[-1]].split()
+    assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FMin"]
+    assert "FMax" in text
+    assert "FClamp" not in text
+
+
 def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     shader = make_shader(_gather_l(0x12, dynamic=True))
     text = shader.translate()
