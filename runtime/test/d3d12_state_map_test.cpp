@@ -128,6 +128,24 @@ constexpr bool video_queue_common_matches_sdk() {
     return leonida::d3d12_layout::video_queue_common == 30;
 }
 static_assert(video_queue_common_matches_sdk<D3D12_BARRIER_LAYOUT>());
+static_assert(leonida::d3d12_query_heap::occlusion == std::uint32_t(D3D12_QUERY_HEAP_TYPE_OCCLUSION));
+static_assert(leonida::d3d12_query_heap::timestamp == std::uint32_t(D3D12_QUERY_HEAP_TYPE_TIMESTAMP));
+static_assert(leonida::d3d12_query_heap::pipeline_statistics == std::uint32_t(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS));
+static_assert(leonida::d3d12_query_heap::so_statistics == std::uint32_t(D3D12_QUERY_HEAP_TYPE_SO_STATISTICS));
+static_assert(leonida::d3d12_query_heap::video_decode_statistics ==
+              std::uint32_t(D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS));
+static_assert(leonida::d3d12_query_heap::copy_queue_timestamp == std::uint32_t(D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP));
+static_assert(leonida::d3d12_query_heap::pipeline_statistics1 == std::uint32_t(D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1));
+static_assert(leonida::d3d12_query::occlusion == std::uint32_t(D3D12_QUERY_TYPE_OCCLUSION));
+static_assert(leonida::d3d12_query::binary_occlusion == std::uint32_t(D3D12_QUERY_TYPE_BINARY_OCCLUSION));
+static_assert(leonida::d3d12_query::timestamp == std::uint32_t(D3D12_QUERY_TYPE_TIMESTAMP));
+static_assert(leonida::d3d12_query::pipeline_statistics == std::uint32_t(D3D12_QUERY_TYPE_PIPELINE_STATISTICS));
+static_assert(leonida::d3d12_query::so_statistics_stream0 == std::uint32_t(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0));
+static_assert(leonida::d3d12_query::so_statistics_stream3 == std::uint32_t(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3));
+static_assert(leonida::d3d12_query::video_decode_statistics == std::uint32_t(D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS));
+static_assert(leonida::d3d12_query::pipeline_statistics1 == std::uint32_t(D3D12_QUERY_TYPE_PIPELINE_STATISTICS1));
+static_assert(leonida::query_result_size(leonida::d3d12_query::pipeline_statistics) ==
+              sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
 #endif
 
 #include <cstdio>

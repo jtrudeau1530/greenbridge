@@ -21,7 +21,8 @@
 //   use the same attachment path because vkCmdClearColorImage has no view-format argument;
 // - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3);
 // - unordered-access clears need fill_buffer, update_buffer and copy_buffer for buffers; texture views cleared with
-//   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment).
+//   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment);
+// - query commands need the query functions, fill_buffer and query_pool; resolve destinations have TRANSFER_DST usage.
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
@@ -573,6 +574,16 @@ private:
     std::unordered_map<ResourceId, Entry> entries_;
 };
 
+// A D3D12 query heap on Vulkan. `ended` is kept on the host: which queries hold a result, updated as lists are
+// emitted in submission order. A resolve of a query that was never ended writes zeros instead of waiting on it.
+struct QueryPool {
+    VkQueryPool pool = VK_NULL_HANDLE;
+    std::uint32_t heap_type = 0;  // d3d12_query_heap
+    std::uint32_t count = 0;
+    bool precise = false;         // occlusionQueryPrecise: D3D12_QUERY_TYPE_OCCLUSION counts exact samples
+    std::vector<bool> ended;
+};
+
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -595,8 +606,15 @@ struct ReplayFunctions {
     // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
     PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
     PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr;
+    PFN_vkCmdResetQueryPool reset_query_pool = nullptr;  // queries, with fill_buffer for unavailable results
+    PFN_vkCmdBeginQuery begin_query = nullptr;
+    PFN_vkCmdEndQuery end_query = nullptr;
+    PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
+    PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
+    // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
+    std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
 };
 
@@ -608,6 +626,7 @@ enum class ReplayResult {
     invalid_clear,
     invalid_copy,
     invalid_predication,
+    invalid_query,
     unsupported
 };
 
@@ -632,6 +651,7 @@ struct Prepared {
     uav_clear::Element element;                      // unordered-access clears: one element of the view's format
     VkClearColorValue clear_color{};                 // ... the value that writes it into the image
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
+    QueryPool* queries = nullptr;  // query commands: the heap
 };
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
@@ -1150,6 +1170,21 @@ inline std::pair<ResourceId, ResourceId> copy_ids(const Command& command) {
     return {0, 0};
 }
 
+// The heap, type and query range of a query command; count 0 for any other command.
+struct QueryRange {
+    QueryHeapId heap = 0;
+    std::uint32_t type = 0;
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+};
+
+inline QueryRange query_range(const Command& command) {
+    if (const auto* q = std::get_if<BeginQuery>(&command)) return {q->heap, q->type, q->index, 1};
+    if (const auto* q = std::get_if<EndQuery>(&command)) return {q->heap, q->type, q->index, 1};
+    if (const auto* q = std::get_if<ResolveQueries>(&command)) return {q->heap, q->type, q->first, q->count};
+    return {};
+}
+
 // A list checked against the current resources, ready to emit.
 class PreparedList {
 public:
@@ -1166,6 +1201,7 @@ public:
 template<typename Resolve>
 ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out) {
     if (!list.closed()) return ReplayResult::list_open;
+    if (list.queries_open()) return ReplayResult::invalid_query;  // a Vulkan query must end in its command buffer
     const auto commands = list.commands();
     out.list = &list;
     out.commands.assign(commands.size(), {});
@@ -1180,6 +1216,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         return predicated && rects.empty() ? std::span<const Rect>(&whole_view, 1) : rects;
     };
     out.unpredicated_copies = 0;
+    const bool queries = vk.reset_query_pool && vk.begin_query && vk.end_query && vk.write_timestamp &&
+                         vk.copy_query_pool_results && vk.fill_buffer && vk.query_pool;
+    // Vulkan allows one active query of each type in a command buffer (VUID-vkCmdBeginQuery-queryPool-01922);
+    // D3D12 lets queries overlap. Overlapping occlusion (either kind) or pipeline-statistics queries need virtual
+    // queries (end the running Vulkan query, start another, sum on resolve); until then such a list is unsupported.
+    bool occlusion_active = false, statistics_active = false;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -1365,6 +1407,30 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // aligned one, so its low word is read (docs/d3d12_vulkan.md section 4.7).
             if (!p.binding.buffer || !detail::within(predication->offset, 4, p.binding.size))
                 return ReplayResult::invalid_predication;
+        } else if (const QueryRange range = query_range(command); range.count) {
+            // BeginQuery, EndQuery and ResolveQueryData are not among D3D12's predicated calls, and Vulkan's
+            // conditional rendering leaves query commands and transfers alone, so a predicate changes nothing here.
+            if (!queries) return ReplayResult::unsupported;
+            p.queries = vk.query_pool(range.heap);
+            if (!p.queries) return ReplayResult::unresolved_resource;
+            if (!query_fits_heap(p.queries->heap_type, range.type)) return ReplayResult::invalid_query;
+            if (range.first >= p.queries->count || range.count > p.queries->count - range.first)
+                return ReplayResult::invalid_query;
+            if (!query_result_size(range.type)) return ReplayResult::unsupported;
+            if (range.type != d3d12_query::timestamp && !std::holds_alternative<ResolveQueries>(command)) {
+                bool& active = range.type == d3d12_query::pipeline_statistics ? statistics_active : occlusion_active;
+                const bool begin = std::holds_alternative<BeginQuery>(command);
+                if (begin && active) return ReplayResult::unsupported;
+                active = begin;  // the list pairs every End with its Begin
+            }
+            if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
+                // The destination is a buffer, as D3D12 requires, large enough for every result.
+                if (!bind(resolve_queries->dst)) return ReplayResult::unresolved_resource;
+                if (!p.binding.buffer ||
+                    !detail::within(resolve_queries->offset, std::uint64_t(range.count) * query_result_size(range.type),
+                                    p.binding.size))
+                    return ReplayResult::invalid_query;
+            }
         }
     }
     return ReplayResult::success;
@@ -1685,6 +1751,43 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
+        } else if (const auto* begin = std::get_if<BeginQuery>(&command)) {
+            // D3D12 queries need no reset; a Vulkan query is reset before every use. Nothing here runs inside a
+            // render pass, where a reset is not allowed: a draw path that opens one around queries must reset
+            // them before it.
+            QueryPool& heap = *p.queries;
+            vk.reset_query_pool(command_buffer, heap.pool, begin->index, 1);
+            heap.ended[begin->index] = false;
+            const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
+            vk.begin_query(command_buffer, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        } else if (const auto* end = std::get_if<EndQuery>(&command)) {
+            QueryPool& heap = *p.queries;
+            if (end->type == d3d12_query::timestamp) {
+                vk.reset_query_pool(command_buffer, heap.pool, end->index, 1);
+                vk.write_timestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, heap.pool, end->index);
+            } else {
+                vk.end_query(command_buffer, heap.pool, end->index);
+            }
+            heap.ended[end->index] = true;
+        } else if (const auto* resolve = std::get_if<ResolveQueries>(&command)) {
+            // Runs of ended queries are copied as UINT64s, waiting for their results; D3D12 leaves a query that
+            // was never ended undefined, and it is written as zeros here rather than waited on forever.
+            const QueryPool& heap = *p.queries;
+            const std::uint32_t size = query_result_size(resolve->type);
+            std::uint32_t index = resolve->first;
+            const std::uint32_t last = resolve->first + resolve->count;
+            while (index < last) {
+                const bool ended = heap.ended[index];
+                std::uint32_t run = 1;
+                while (index + run < last && heap.ended[index + run] == ended) ++run;
+                const VkDeviceSize offset = resolve->offset + VkDeviceSize(index - resolve->first) * size;
+                if (ended)
+                    vk.copy_query_pool_results(command_buffer, heap.pool, index, run, p.binding.buffer, offset, size,
+                                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                else
+                    vk.fill_buffer(command_buffer, p.binding.buffer, offset, VkDeviceSize(run) * size, 0);
+                index += run;
+            }
         }
     }
     // Predication does not carry over to the next command list.

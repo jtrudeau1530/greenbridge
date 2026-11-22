@@ -6,6 +6,7 @@
 //
 // Contracts with the rest of the layer (the device proxy that will hand these objects out):
 // - an ID3D12Resource's leonida::ResourceId is its pointer value; the device registers it with the VulkanContext;
+// - so is an ID3D12QueryHeap's leonida::QueryHeapId, registered with its VkQueryPool;
 // - the CPU handle of an RTV or DSV points at a leonida::TargetView in the device's descriptor heap.
 #pragma once
 
@@ -56,6 +57,10 @@ struct VulkanDeviceInfo {
     bool host_image_copy = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
+    // Optional device features the caller enabled. Without occlusionQueryPrecise, D3D12_QUERY_TYPE_OCCLUSION counts
+    // are only zero or non-zero; without pipelineStatisticsQuery, pipeline-statistics query heaps are refused.
+    bool occlusion_query_precise = false;
+    bool pipeline_statistics_query = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -99,6 +104,11 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
+}
+
+// A query heap's ID in the command-list IR and the VulkanContext: its pointer value, as for resources.
+inline leonida::QueryHeapId query_heap_id(const ID3D12QueryHeap* heap) {
+    return reinterpret_cast<leonida::QueryHeapId>(heap);
 }
 
 }  // namespace rt::d3d12

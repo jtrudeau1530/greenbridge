@@ -1,7 +1,7 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears)
+render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears, and query heaps)
 runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
 set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
 implemented.** This is the plan for replacing the console's
@@ -155,8 +155,9 @@ What is implemented (all of it testable without the game):
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
   replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles,
   `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, colour resolves,
-  `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat` (whole view or rectangles), and (D3D-26)
-  `DiscardResource`, `WriteBufferImmediate` and `AtomicCopyBufferUINT` / `AtomicCopyBufferUINT64`.
+  `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat` (whole view or rectangles), (D3D-26)
+  `DiscardResource`, `WriteBufferImmediate` and `AtomicCopyBufferUINT` / `AtomicCopyBufferUINT64`, and `BeginQuery` /
+  `EndQuery` / `ResolveQueryData` (section 4.6).
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
@@ -254,6 +255,8 @@ What is implemented (all of it testable without the game):
     support, format support and multisample quality levels. Other queries (including `OPTIONS1`/`6`/`8`/`10`/`12`, `FORMAT_INFO`, `SHADER_MODEL`, and `ROOT_SIGNATURE` left to sibling PRs) are logged and refused until the trace
     shows what the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
+  - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
+    (section 4.6);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
@@ -306,7 +309,8 @@ What is implemented (all of it testable without the game):
     | non-normalized, a point filter with `MaxAnisotropy` or `ComparisonFunc` set | written; both are ignored (the debug layer warns about `ComparisonFunc`) |
     | both flags | written |
 
-  BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
+  BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it, as it does
+  `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
 
   New textures are not touched at creation. They are tracked as `UNDEFINED`, and the first command that uses a
   part of one zero-fills it (D3D12 committed resources start zeroed; `CREATE_NOT_ZEROED` skips this) and moves it
@@ -1238,15 +1242,48 @@ Layer plan:
 
 ### 4.6 Queries
 
-- Occlusion: `D3D12_QUERY_TYPE_OCCLUSION` → `VK_QUERY_TYPE_OCCLUSION` with `VK_QUERY_CONTROL_PRECISE_BIT`;
-  `BINARY_OCCLUSION` → the same pool without the precise bit, clamping the result to 0/1. `ResolveQueryData` →
-  `vkCmdCopyQueryPoolResults` with `VK_QUERY_RESULT_64_BIT` (D3D12 returns UINT64).
-- Pipeline statistics: `VK_QUERY_TYPE_PIPELINE_STATISTICS` with the flags implied by
-  `D3D12_QUERY_DATA_PIPELINE_STATISTICS`; map the fields one-to-one.
-- Timestamps: `VK_QUERY_TYPE_TIMESTAMP`; `GetTimestampFrequency` from the Vulkan timestamp period; calibration
-  from `VK_EXT_calibrated_timestamps`.
-- D3D12 query resolve destinations must be in `COPY_DEST`; honour the game's offsets and alignment.
-- Xbox-specific query heap types (if any) are **Open**; log unknown enum values.
+Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query commands in `command_list.h` and
+`vulkan_replay.h`), checked on one GPU by `d3d12_vulkan_device_test` under the validation layer:
+
+- **Heaps.** One `VkQueryPool` per `ID3D12QueryHeap`, registered with the `VulkanContext` by its pointer, as
+  resources are. `OCCLUSION` heaps are `VK_QUERY_TYPE_OCCLUSION` pools and hold both `OCCLUSION` and
+  `BINARY_OCCLUSION` queries, as in D3D12. `TIMESTAMP` and `COPY_QUEUE_TIMESTAMP` heaps are
+  `VK_QUERY_TYPE_TIMESTAMP` pools; they are refused when the queue family's `timestampValidBits` is 0.
+  `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
+  of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
+  clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
+  `pipelineStatisticsQuery`. `SO_STATISTICS`, `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and
+  amplification counts) are logged and refused with `E_NOTIMPL`.
+- **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
+  begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
+  it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and
+  is refused at execution. Heap types, index ranges and the destination buffer are checked at
+  `ExecuteCommandLists`, when the heap and buffer are known (`ReplayResult::invalid_query`).
+- **Replay.** D3D12 queries need no reset; a Vulkan query does. Each `BeginQuery` and each timestamp `EndQuery` is
+  preceded by `vkCmdResetQueryPool` of that one query. Nothing in the layer runs inside a render pass yet, so the
+  reset is legal where it stands; a draw path that opens a render pass around queries must reset them before it.
+  `OCCLUSION` begins with `VK_QUERY_CONTROL_PRECISE_BIT` when `occlusionQueryPrecise` is enabled. A timestamp is
+  `vkCmdWriteTimestamp` at `BOTTOM_OF_PIPE` (every earlier command finished). `ResolveQueryData` is
+  `vkCmdCopyQueryPoolResults` with `VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT`. A query keeps its result
+  across executions until it is begun or written again, as in D3D12.
+- **Queries never ended.** D3D12 leaves their result undefined; a Vulkan copy with `WAIT_BIT` would wait for them
+  forever. Each heap records on the host which queries were ended, in submission order, and a resolve writes zeros
+  (`vkCmdFillBuffer`) for the ones that were not.
+- **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
+  shares one `VkQueue` for now (question 12), so they share one frequency.
+
+Not implemented yet:
+
+- **Overlapping queries.** Vulkan allows one active query of each type in a command buffer
+  (`VUID-vkCmdBeginQuery-queryPool-01922`); D3D12 lets occlusion queries overlap. A list that begins an occlusion
+  query (either kind) or a pipeline-statistics query while another of the same kind runs is refused with
+  `ReplayResult::unsupported`. The fix is virtual queries: end the running Vulkan query, start another, and sum the
+  pieces when resolving (a compute pass). The trace will show whether the game overlaps them.
+- **Binary occlusion** is not clamped: Vulkan writes the sample count (or, without the precise bit, any non-zero
+  value) where D3D12 writes 1. Predication only compares with zero, but a game that reads the value needs the clamp,
+  a small compute pass over the resolved range once the compute path (D3D-3) exists.
+- `GetClockCalibration` (from `VK_EXT_calibrated_timestamps`), stream-output and mesh-shader statistics.
+- Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
 ### 4.7 Indirect commands and command signatures
 
