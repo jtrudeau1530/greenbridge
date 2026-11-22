@@ -291,6 +291,20 @@ class WorldIndexTest(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual((agg.counts, agg.incomplete), ({}, 1))
 
+    def test_entity_block_starting_past_the_inflated_bytes_is_incomplete(self):
+        # The entity block is moved to 0x700, after the bytes kept; its entities must still be reported.
+        b = bytearray(make_resource()) + bytearray(0x90)
+        struct.pack_into("<IIQ", b, 0x200, WI.ENTITY, 0x90, ptr(0x700))
+        b[0x700:0x790] = b[0x400:0x490]
+        full = WI.ArchetypeCounts()
+        WI.parse_resource(bytes(b), full)
+        self.assertEqual((full.counts, full.incomplete), ({0xDEADBEEF: 1}, 0))
+        for cut in (0x710, 0x700):
+            with self.subTest(cut=cut):
+                agg = WI.ArchetypeCounts()
+                self.assertIsNotNone(WI.parse_resource(bytes(b[:cut]), agg))
+                self.assertEqual((agg.counts, agg.incomplete), ({}, 1))
+
     def test_archetypes_out_is_a_world_names_input(self):
         spec = importlib.util.spec_from_file_location("world_names_for_index", os.path.join(ROOT, "tools", "world_names.py"))
         WN = importlib.util.module_from_spec(spec)
