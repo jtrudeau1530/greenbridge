@@ -1347,7 +1347,7 @@ The `hw` side runs one lane per case in wave32 and wave64, under five MODEs:
 It reports the NaN halves that give 0, the words equal to the translator's, and the near-tie words equal to a single
 rounding of the exact product. Exit 0 means every hardware word equals the translator's, 1 means one differs, 77
 means the oracle is unavailable. `tests/test_pknorm_probe.py` checks four near-tie words against a derivation written
-out by hand, and checks that the translator side rounds twice there and gives 0 for a NaN half.
+out by hand, and checks that the translator side rounds once there (since SHADER-363) and gives 0 for a NaN half.
 
 Results (134 cases per run):
 
@@ -1361,8 +1361,10 @@ product once, to nearest even. Examples:
 - `0x38400180` (exact 1.5 - 1.4e-9) gives 1, where the translator gives 2;
 - `0x3c004101` (exact 256.5 + 1.5e-5) gives 257, where the translator gives 256.
 
-The translator is not changed here. It needs the exact product: the product's rounding error is exact through `Fma`
-(`Fma(x, s, -p)`), and only its sign matters on a tie.
+SHADER-363 fixes the translator. It keeps the f32 product p and its exact error `Fma(x, s, -p)`. When p lies exactly
+on k + 0.5, the error's sign gives floor(p) + 1 or floor(p), and a zero error keeps `RoundEven` (an exact tie). The
+probe then exits 0 on the same iGPU: all 134 words equal the translator's in all ten runs (wave32 and wave64, five
+MODEs), including the 28 near ties.
 
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
