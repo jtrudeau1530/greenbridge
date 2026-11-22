@@ -92,12 +92,14 @@ def dds_bytes(w, h, fmt, payload):
 def score_image(w, h, fmt, payload, bpe):
     a = None
     if fmt in PILLOW_OK:
-        from PIL import Image
         try:
+            from PIL import Image
+
             im = Image.open(io.BytesIO(dds_bytes(w, h, DECODE_AS.get(fmt, fmt), payload))).convert("RGB")
             a = np.asarray(im.reduce(4) if min(w, h) >= 64 else im, np.float32)
-        except NotImplementedError:
-            pass  # Pillow 13.0.0 can't decode DXGI 81 and 87 (91 as 87): score raw elements, not a tied 9e9 in export_one
+        except (ImportError, NotImplementedError, OSError):
+            # Some Pillow installations cannot decode these formats. Score the raw elements below.
+            a = None
     if a is None:
         block = FMT[fmt][1]
         we, he = (w + block - 1) // block, (h + block - 1) // block
