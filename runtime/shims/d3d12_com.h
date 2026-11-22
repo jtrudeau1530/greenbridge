@@ -12,6 +12,8 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <memory>
+#include <vector>
 
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
@@ -33,7 +35,8 @@ struct QueueClock {
 // `device` (optional) is what the object's GetDevice returns; the object holds a reference to it.
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
-                             IUnknown* device = nullptr, const QueueClock& clock = {});
+                             IUnknown* device = nullptr, const QueueClock& clock = {},
+                             std::shared_ptr<void> queue_lease = {});
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device = nullptr);
@@ -56,8 +59,11 @@ struct VulkanDeviceInfo {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;  // a graphics queue; every D3D12 queue of the device submits to it
+    VkQueue queue = VK_NULL_HANDLE;  // graphics queue used by staging and legacy single-queue callers
     std::uint32_t queue_family = 0;
+    // Distinct handles from queue_family, when the creator requested more than one queue.
+    // Empty for caller-owned devices that only supplied queue above.
+    std::vector<VkQueue> command_queues;
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
