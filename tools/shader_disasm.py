@@ -165,10 +165,21 @@ def main():
         os.makedirs(out, exist_ok=True)
     except OSError as e:
         fail(f"cannot create the output folder {out}: {e.strerror or e}")
+    probe(a.mcpu)
+    from collections import Counter
+    with ThreadPoolExecutor(a.jobs) as ex:
+        res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))
+    print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
+    if FAILED:
+        path, reason = FAILED[0]
+        fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
+    if not (res["clean"] or res["invalid words"]):
+        fail(f"no disassembly produced for {a.src}")
     if os.path.isdir(a.src) and not a.limit:
         # A shader dropped by a re-carve must not keep its old listing: the translator reads every .s in this folder,
-        # so a stale one would still be translated and indexed even though the corpus no longer has it. --limit is a
-        # partial run on purpose, so it leaves the rest of the folder alone.
+        # so a stale one would still be translated and indexed even though the corpus no longer has it. Prune only
+        # after a successful decode, so a missing llvm-mc or a failed shader never deletes a usable listing. --limit
+        # is a partial run on purpose and leaves the rest of the folder alone.
         stems = {os.path.splitext(os.path.basename(p))[0] for p in files}
         stale = []
         try:
@@ -181,16 +192,6 @@ def main():
             fail(f"cannot prune stale .s files in {out}: {e.strerror or e}")
         if stale:
             print(f"removed {len(stale)} stale .s file(s) that no .fssm in {a.src} names")
-    probe(a.mcpu)
-    from collections import Counter
-    with ThreadPoolExecutor(a.jobs) as ex:
-        res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))
-    print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
-    if FAILED:
-        path, reason = FAILED[0]
-        fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
-    if not (res["clean"] or res["invalid words"]):
-        fail(f"no disassembly produced for {a.src}")
     return 0
 
 

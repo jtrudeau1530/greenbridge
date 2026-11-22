@@ -226,6 +226,19 @@ class DisasmInputTest(unittest.TestCase):
         with open(os.path.join(out, "b_shader.s"), encoding="utf-8") as f:
             self.assertEqual(f.read(), "; already there\n")
 
+    def test_a_failed_probe_does_not_delete_an_older_listing(self):
+        self.write("one.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        with open(os.path.join(out, "old.s"), "w", encoding="utf-8") as f:
+            f.write("; usable\n")
+        env = dict(os.environ, LLVM_MC="definitely-not-an-llvm-mc")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src, "--out", out], capture_output=True, text=True,
+                           env=env)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("could not be started", p.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(out, "old.s")))   # pruning waits for a successful decode
+
     def test_jobs_and_limit_must_be_at_least_one(self):
         self.write("one.fssm", fssm())
         out = os.path.join(self.dir, "out")
