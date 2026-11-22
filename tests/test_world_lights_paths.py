@@ -495,6 +495,37 @@ class ScanTest(unittest.TestCase):
             with self.subTest(owner=row["owner"], expected=position):
                 self.assertEqual(row["position"], position)
 
+    def test_bad_entities_leaves_the_previous_lights_report_alone(self):
+        # --lights-out used to be opened (truncating it) before --entities was parsed.
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        with open(lights, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"old": true}\n')
+        bad = os.path.join(self.tmp.name, "bad.jsonl")
+        with open(bad, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{not json\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = T.main([self.rpf, "--entities", bad, "--lights-out", lights])
+        self.assertEqual(rc, 2)
+        with open(lights, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"old": true}\n')
+        self.assertFalse(os.path.exists(lights + ".partial"), "a failed run left its staged report behind")
+        lines = err.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("bad.jsonl", lines[0])
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_lights_report_that_is_a_directory_leaves_no_partial(self):
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        os.makedirs(lights)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = T.main([self.rpf, "--entities", self.entities, "--lights-out", lights])
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(lights + ".partial"), "a failed replace left its staged report behind")
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
     def test_bad_input_is_one_line(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

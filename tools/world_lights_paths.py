@@ -683,9 +683,12 @@ def summarize(total, entities=None, lights_out=None):
     }
     placed = collections.Counter()
     out = None
+    staged = None
     try:
         if lights_out:
-            out = open(lights_out, "w", encoding="utf-8", newline="\n")
+            # Stage the report: a bad --entities row below must not truncate a report from an earlier run.
+            staged = lights_out + ".partial"
+            out = open(staged, "w", encoding="utf-8", newline="\n")
             for row in total["world_lights"]:
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
@@ -711,9 +714,27 @@ def summarize(total, entities=None, lights_out=None):
                                          e.get("scale_xy"), e.get("scale_z"))
                             out.write(json.dumps(_light_row(p, d, L, "archetype", a),
                                                  separators=(",", ":")) + "\n")
+    except BaseException:
+        if out is not None:
+            try:
+                out.close()
+            except OSError:
+                pass
+            out = None
+        if staged is not None and os.path.exists(staged):
+            os.remove(staged)
+        raise
     finally:
         if out is not None:
             out.close()
+    if staged is not None:
+        try:
+            os.replace(staged, lights_out)
+        except BaseException:
+            # A destination that is a directory (or read-only) must not leave the staged copy behind.
+            if os.path.exists(staged):
+                os.remove(staged)
+            raise
     summary["placement"] = dict(placed)
     nodes = [n for part in total["nodes"] for n in part]
     links = [l for part in total["links"] for l in part]
@@ -785,7 +806,14 @@ def main(argv=None):
     if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
         ap.error("--out and --lights-out must use different paths")
     total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
-    summary = summarize(total, a.entities, a.lights_out)
+    try:
+        summary = summarize(total, a.entities, a.lights_out)
+    except ValueError as e:            # a bad --entities row, or an archetype that is not a number
+        print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
