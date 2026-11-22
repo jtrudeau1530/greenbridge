@@ -133,13 +133,14 @@ struct Draws {
     std::vector<std::uint32_t> extents;
     std::size_t next = 0;
     bool overflow = false;
-    bool every = false;  // --bisect: one 1x1 draw before every end, no schedule
+    bool every = false;    // --bisect: one 1x1 draw before every end, no schedule
+    bool no_draw = false;  // --bisect --no-draw: no draws at all, every query stays empty
 };
 Draws* draws = nullptr;
 
 VKAPI_ATTR void VKAPI_CALL end_query_with_draw(VkCommandBuffer cb, VkQueryPool pool, std::uint32_t index) {
     if (draws->every) {
-        draws->fixture.draw(cb, 1);
+        if (!draws->no_draw) draws->fixture.draw(cb, 1);
     } else if (draws->next == draws->extents.size()) {
         draws->overflow = true;
     } else if (const auto extent = draws->extents[draws->next++]) {
@@ -157,9 +158,13 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device_proc(VkDevice device, const 
 // submission is waited for before the next, so the last "running" line before a hang or a lost device names the
 // pattern. --gated queues them all behind one semaphore the CPU signals afterwards, as the full test does. Named
 // phases run only those, in the order below. Only completion is checked, not values.
+// Two switches separate the draw from the resolve: --no-draw leaves every query empty (no rendering scope inside
+// it), --no-resolve records the queries but never copies or sums their results.
 struct Bisect {
     bool enabled = false;
     bool gated = false;
+    bool no_draw = false;
+    bool no_resolve = false;
     std::vector<std::string> phases;
     bool wants(const char* name) const {
         return phases.empty() || std::find(phases.begin(), phases.end(), name) != phases.end();
@@ -178,11 +183,11 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     Fixture fixture{d};
     EXPECT(fixture.create(vertex, fragment));
     constexpr std::uint32_t bursts = 130;
-    // crossing ends four physical queries (the resolve inside it splits the last one), nested three.
-    Draws schedule{fixture, {8, 4, 2, 0, 8, 4, 2, 3}};
+    Draws schedule{fixture, {8, 4, 2, 8, 4, 2, 3}};
     schedule.extents.insert(schedule.extents.end(), 2 * bursts + 1, 1);
-    schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0, 1, 1});
+    schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0, 1});
     schedule.every = bisect.enabled;
+    schedule.no_draw = bisect.no_draw;
     draws = &schedule;
     VulkanContext context(get_device_proc, d.device, true, d.conditional_rendering);
     EXPECT(context.loaded());
@@ -232,34 +237,37 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
             if (!bisect.wants(name)) return nullptr;
             return &lists.emplace_back(name, CommandList{}).second;
         };
+        const auto resolve = [&](CommandList* l, const ResolveQueries& r) {
+            return bisect.no_resolve || l->resolve_queries(r);
+        };
         if (auto* l = add("crossing")) {  // two queries of one heap overlap; resolve while one is active
             EXPECT(l->begin_query({a, occ, 0}) && l->begin_query({a, occ, 1}) && l->end_query({a, occ, 0}));
-            EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 8}) && l->end_query({a, occ, 1}));
-            EXPECT(l->resolve_queries({a, occ, 0, 2, dst_id, 24}));
+            EXPECT(resolve(l, {a, occ, 0, 1, dst_id, 8}) && l->end_query({a, occ, 1}));
+            EXPECT(resolve(l, {a, occ, 0, 2, dst_id, 24}));
         }
         if (auto* l = add("active")) {  // a resolve inside one active query, without an overlap
             EXPECT(l->begin_query({a, occ, 0}) && l->end_query({a, occ, 0}) && l->begin_query({a, occ, 3}));
-            EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 128}) && l->end_query({a, occ, 3}));
+            EXPECT(resolve(l, {a, occ, 0, 1, dst_id, 128}) && l->end_query({a, occ, 3}));
         }
         if (auto* l = add("nested")) {  // the same index in two heaps, one inside the other
             EXPECT(l->begin_query({a, occ, 2}) && l->begin_query({b, occ, 2}));
             EXPECT(l->end_query({b, occ, 2}) && l->end_query({a, occ, 2}));
-            EXPECT(l->resolve_queries({a, occ, 2, 1, dst_id, 40}) && l->resolve_queries({b, occ, 2, 1, dst_id, 48}));
+            EXPECT(resolve(l, {a, occ, 2, 1, dst_id, 40}) && resolve(l, {b, occ, 2, 1, dst_id, 48}));
         }
         if (auto* l = add("unwritten")) {  // a query never begun: zero fill
-            EXPECT(l->resolve_queries({b, occ, 0, 1, dst_id, 56}));
+            EXPECT(resolve(l, {b, occ, 0, 1, dst_id, 56}));
         }
         if (auto* l = add("binary")) {  // the binary-occlusion compute resolve
             EXPECT(l->begin_query({a, binary, 3}) && l->end_query({a, binary, 3}));
-            EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 64}));
+            EXPECT(resolve(l, {a, binary, 3, 1, dst_id, 64}));
         }
         if (d.conditional_rendering) {
             if (auto* l = add("predicated")) {  // both compute resolves under a false predicate
                 EXPECT(l->begin_query({a, binary, 3}) && l->end_query({a, binary, 3}));
                 EXPECT(l->set_predication({predicate_id, 0, d3d12_predication::equal_zero}));
-                EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 64}));
-                EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 72}));
-                EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 80}));
+                EXPECT(resolve(l, {a, binary, 3, 1, dst_id, 64}));
+                EXPECT(resolve(l, {a, occ, 0, 1, dst_id, 72}));
+                EXPECT(resolve(l, {a, binary, 3, 1, dst_id, 80}));
                 EXPECT(copy_control.record(*l));
             }
         }
@@ -267,14 +275,16 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
             EXPECT(l->begin_query({a, occ, 3}));
             for (std::uint32_t i = 0; i < bursts; ++i) EXPECT(l->begin_query({b, occ, 0}) && l->end_query({b, occ, 0}));
             EXPECT(l->end_query({a, occ, 3}));
-            EXPECT(l->resolve_queries({a, occ, 3, 1, dst_id, 88}) && l->resolve_queries({b, occ, 0, 1, dst_id, 96}));
+            EXPECT(resolve(l, {a, occ, 3, 1, dst_id, 88}) && resolve(l, {b, occ, 0, 1, dst_id, 96}));
         }
         if (auto* l = add("replace")) {  // every heap query begun and ended again, then resolved
             for (const auto& [heap, index] : {std::pair{a, 0u}, std::pair{a, 1u}, std::pair{a, 2u}, std::pair{b, 2u}})
                 EXPECT(l->begin_query({heap, occ, index}) && l->end_query({heap, occ, index}));
-            EXPECT(l->resolve_queries({a, occ, 0, 2, dst_id, 112}));
+            EXPECT(resolve(l, {a, occ, 0, 2, dst_id, 112}));
         }
         EXPECT(!lists.empty());
+        std::printf("bisect:%s%s%s\n", bisect.gated ? " gated" : " ungated", bisect.no_draw ? " no-draw" : " draws",
+                    bisect.no_resolve ? " no-resolve" : " resolves");
         // After a TDR, AMD's Windows driver lets vkQueueWaitIdle succeed (#1540); the queue's timeline then reads
         // UINT64_MAX, so that is checked as well.
         const auto get_value = d.fn<PFN_vkGetSemaphoreCounterValue>("vkGetSemaphoreCounterValue");
@@ -391,7 +401,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     const CommandList* fourth[] = {&replace};
     EXPECT(queue.execute(fourth) == ReplayResult::success);
 
-    // A resolve inside one active query, with no overlap: the active query is paused around it (D3D-189).
+    // A resolve inside one active query, with no overlap.
     CommandList single;
     EXPECT(single.begin_query({a, occ, 3}));
     EXPECT(single.resolve_queries({a, occ, 0, 1, dst_id, 128}));
@@ -427,13 +437,15 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
 
 } // namespace
 
-// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--bisect [--gated] [phase...]]
+// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--bisect [--gated] [--no-draw] [--no-resolve] [phase...]]
 int main(int argc, char** argv) {
     EXPECT(argc >= 3);
     Bisect bisect;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bisect") == 0) bisect.enabled = true;
         else if (std::strcmp(argv[i], "--gated") == 0) bisect.gated = true;
+        else if (std::strcmp(argv[i], "--no-draw") == 0) bisect.no_draw = true;
+        else if (std::strcmp(argv[i], "--no-resolve") == 0) bisect.no_resolve = true;
         else bisect.phases.emplace_back(argv[i]);
     }
     EXPECT(argc == 3 || bisect.enabled);
