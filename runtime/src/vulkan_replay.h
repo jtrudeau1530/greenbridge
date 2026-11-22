@@ -560,6 +560,10 @@ struct ReplayFunctions {
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
+    // VK_EXT_conditional_rendering: SetPredication. The predicate buffer must have been created with
+    // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
+    PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
+    PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -572,6 +576,7 @@ enum class ReplayResult {
     invalid_subresource,
     invalid_clear,
     invalid_copy,
+    invalid_predication,
     unsupported
 };
 
@@ -936,6 +941,10 @@ class PreparedList {
 public:
     const CommandList* list = nullptr;
     std::vector<detail::Prepared> commands;
+    // Copies and resolves recorded while a predicate was set. D3D12 skips them when the predicate says so, but
+    // Vulkan's conditional rendering does not cover transfer commands, so they run unconditionally
+    // (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
+    std::size_t unpredicated_copies = 0;
 };
 
 // Resolves and checks every command. Nothing is written to a command buffer.
@@ -948,6 +957,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.commands.assign(commands.size(), {});
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
+    const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
+    // While a predicate is set, a whole-view clear is replayed as one rectangle over the view: vkCmdClearColorImage
+    // and vkCmdClearDepthStencilImage ignore conditional rendering, vkCmdClearAttachments does not.
+    bool predicated = false;
+    constexpr Rect whole_view{0, 0, INT32_MAX, INT32_MAX};
+    const auto clear_rects = [&](std::span<const Rect> rects) {
+        return predicated && rects.empty() ? std::span<const Rect>(&whole_view, 1) : rects;
+    };
+    out.unpredicated_copies = 0;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -993,7 +1011,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
                 return ReplayResult::invalid_subresource;
-            if (const auto r = rect_view(color_clear->rects, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
+            if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
+                r != ReplayResult::success)
                 return r;
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
@@ -1005,11 +1024,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
                 return ReplayResult::invalid_subresource;
-            if (const auto r = rect_view(depth_clear->rects, depth_clear->target, p.binding.aspects); r != ReplayResult::success)
+            if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
+                r != ReplayResult::success)
                 return r;
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
+            if (predicated) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
@@ -1029,11 +1050,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (result != ReplayResult::success) return result;
         } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
             if (!vk.resolve_image) return ReplayResult::unsupported;
+            if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
             if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
+        } else if (const auto* predication = std::get_if<Predication>(&command)) {
+            predicated = predication->buffer != 0;
+            if (!predicated) continue;
+            if (!conditional) return ReplayResult::unsupported;
+            if (!bind(predication->buffer)) return ReplayResult::unresolved_resource;
+            // Vulkan reads one 32-bit word at a 4-byte aligned offset; D3D12's value is 64 bits at an 8-byte
+            // aligned one, so its low word is read (docs/d3d12_vulkan.md section 4.7).
+            if (!p.binding.buffer || !detail::within(predication->offset, 4, p.binding.size))
+                return ReplayResult::invalid_predication;
         }
     }
     return ReplayResult::success;
@@ -1045,10 +1076,27 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const auto commands = prepared.list->commands();
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
+    bool conditional_rendering = false;  // inside vkCmdBeginConditionalRenderingEXT
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (const auto* predication = std::get_if<Predication>(&command)) {
+            // Conditional rendering cannot nest, so a new predicate ends the previous one first.
+            if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
+            conditional_rendering = predication->buffer != 0;
+            if (conditional_rendering) {
+                VkConditionalRenderingBeginInfoEXT begin{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+                begin.buffer = p.binding.buffer;
+                begin.offset = predication->offset;
+                // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
+                begin.flags = predication->op == d3d12_predication::not_equal_zero
+                                  ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT
+                                  : 0;
+                vk.begin_conditional_rendering(command_buffer, &begin);
+            }
+            continue;
+        }
         const ResourceId id = std::visit(
             [](const auto& c) -> ResourceId {
                 using T = std::decay_t<decltype(c)>;
@@ -1248,6 +1296,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
         }
     }
+    // Predication does not carry over to the next command list.
+    if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.

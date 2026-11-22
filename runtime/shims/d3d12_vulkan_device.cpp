@@ -10,6 +10,7 @@
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_bindless.h"
+#include "../src/resource_tiling.h"
 
 #include <algorithm>
 #include <atomic>
@@ -456,6 +457,7 @@ public:
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
@@ -524,7 +526,18 @@ public:
 
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
 
+    // A reserved resource is a committed one underneath (docs/d3d12_vulkan.md section 4.2); it reports the layout it
+    // was created with and has no heap of its own.
+    void make_reserved(D3D12_TEXTURE_LAYOUT layout) {
+        reserved_ = true;
+        desc_.Layout = layout;
+    }
+    bool reserved() const { return reserved_; }
+
+    // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
+    // runtime).
     HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) override {
+        if (reserved_) return E_INVALIDARG;
         if (properties) *properties = heap_;
         if (flags) *flags = heap_flags_;
         return S_OK;
@@ -556,6 +569,7 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects_ = 0;
     std::uint64_t image_address_ = 0;
+    bool reserved_ = false;
 };
 
 // A view of a texture as Create*View describes it, before the resource's own shape is applied.
@@ -719,7 +733,8 @@ public:
         }
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
-                                                                  info.separate_depth_stencil_layouts);
+                                                                  info.separate_depth_stencil_layouts,
+                                                                  info.conditional_rendering);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
     }
@@ -769,6 +784,56 @@ public:
 
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return S_OK; }
+
+    // Residency and power (D3D-33, docs/d3d12_vulkan.md section 4.1). Vulkan has no residency API: memory from
+    // vkAllocateMemory stays usable by the device until vkFreeMemory, and paging under pressure is the kernel
+    // driver's job (WDDM on Windows), invisible to the application. So every pageable object of this device is
+    // always resident, MakeResident has nothing to do and Evict, which D3D12 documents as a hint the runtime may
+    // defer, can be dropped. Only the arguments are checked; the objects themselves are not touched.
+    HRESULT STDMETHODCALLTYPE MakeResident(UINT count, ID3D12Pageable* const* objects) override {
+        return count && !objects ? E_INVALIDARG : S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Evict(UINT count, ID3D12Pageable* const* objects) override {
+        return count && !objects ? E_INVALIDARG : S_OK;
+    }
+
+    // Device1: priorities only order what the OS evicts first under memory pressure. VK_EXT_pageable_device_local_memory
+    // could pass them on, but it is optional and changes no result, so they are accepted and dropped. Any UINT is a
+    // valid priority (the D3D12_RESIDENCY_PRIORITY values are named points, the low 24 bits a refinement).
+    HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT count, ID3D12Pageable* const* objects,
+                                                   const D3D12_RESIDENCY_PRIORITY* priorities) override {
+        return count && (!objects || !priorities) ? E_INVALIDARG : S_OK;
+    }
+
+    // Device3: the asynchronous MakeResident. The objects are already resident, so the work is complete at once
+    // and the fence is signalled from the CPU now. The caller's queue Wait on it must not hang, which is why the
+    // signal is kept although the residency part is a no-op. DENY_OVERBUDGET cannot fail: nothing is paged in.
+    HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS flags, UINT count,
+                                                  ID3D12Pageable* const* objects, ID3D12Fence* fence,
+                                                  UINT64 value) override {
+        if (!fence || (count && !objects) || (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)) return E_INVALIDARG;
+        return fence->Signal(value);
+    }
+
+    // Stable power state pins GPU clocks for profiling, a developer-mode feature on Windows. Vulkan has no clock
+    // control (vendor tools do it outside the API), and the game's frame does not depend on the clocks, so the
+    // request is accepted. Success is what D3D12 returns on a machine where the call is allowed.
+    HRESULT STDMETHODCALLTYPE SetStablePowerState(BOOL) override { return S_OK; }
+
+    // Device6: lets the driver run background shader recompilation and profiling-guided optimisation. Vulkan
+    // drivers do that, if at all, without an API to steer it, so there is nothing to start or stop. The completion
+    // event is set at once, since no measurement is running, and no further measurements are wanted.
+    HRESULT STDMETHODCALLTYPE SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE mode,
+                                                          D3D12_MEASUREMENTS_ACTION action, HANDLE event,
+                                                          BOOL* further_measurements) override {
+        if (unsigned(mode) > unsigned(D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_PROFILING_BY_SYSTEM) ||
+            unsigned(action) > unsigned(D3D12_MEASUREMENTS_ACTION_DISCARD_PREVIOUS))
+            return E_INVALIDARG;
+        if (further_measurements) *further_measurements = FALSE;
+        if (event) SetEvent(event);
+        return S_OK;
+    }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
@@ -1062,6 +1127,67 @@ public:
             return S_FALSE;
         }
         return hand_out(resource, riid, out);
+    }
+
+    // Reserved (tiled) resources, for the first boot (docs/d3d12_vulkan.md section 4.2): the whole resource is
+    // reserved linearly and backed at creation, as a committed resource on a default heap would be. Tile mappings
+    // are not emulated (queue UpdateTileMappings and CopyTileMappings log and do nothing), so every tile reads and
+    // writes its own memory; unmapped tiles start zeroed, as D3D12 tier 2 reads them. The rules for the description
+    // are D3D12's: buffers are ROW_MAJOR, textures 64KB_UNDEFINED_SWIZZLE in a format with a tile shape
+    // (64KB_STANDARD_SWIZZLE needs StandardSwizzle64KBSupported, which CheckFeatureSupport reports as FALSE). The
+    // Xbox tiled layout word 0x101 (slot 76, section 4.2) is accepted as 64KB_UNDEFINED_SWIZZLE; that the console
+    // uses it for reserved resources too is an assumption.
+    HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                                     const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+        return create_reserved(desc, riid, out);
+    }
+
+    // Device4. Protected sessions are not supported.
+    HRESULT STDMETHODCALLTYPE CreateReservedResource1(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                                      const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession* session,
+                                                      REFIID riid, void** out) override {
+        if (session) {
+            if (out) *out = nullptr;
+            log_once("CreateReservedResource1 with a protected session not supported:", 1);
+            return E_NOTIMPL;
+        }
+        return create_reserved(desc, riid, out);
+    }
+
+    // Device10: an initial layout instead of a state (resources start in their first use's layout here anyway).
+    // Castable formats are not used: typeless resources are already mutable-format images.
+    HRESULT STDMETHODCALLTYPE CreateReservedResource2(const D3D12_RESOURCE_DESC* desc, D3D12_BARRIER_LAYOUT,
+                                                      const D3D12_CLEAR_VALUE*, ID3D12ProtectedResourceSession* session,
+                                                      UINT32 castable_formats, const DXGI_FORMAT*, REFIID riid,
+                                                      void** out) override {
+        if (castable_formats) log_once("CreateReservedResource2: castable formats ignored, count", int(castable_formats));
+        return CreateReservedResource1(desc, D3D12_RESOURCE_STATE_COMMON, nullptr, session, riid, out);
+    }
+
+    // Tiling of a reserved resource (src/resource_tiling.h). Anything else, as on the PC runtime, has no tiles:
+    // every output is zero and no subresource tiling is written.
+    void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource* resource, UINT* total, D3D12_PACKED_MIP_INFO* packed,
+                                             D3D12_TILE_SHAPE* shape, UINT* count, UINT first,
+                                             D3D12_SUBRESOURCE_TILING* tilings) override {
+        leonida::ResourceTiling tiling;
+        Resource* r = Resource::from<Resource>(resource);
+        const bool ok = r && r->reserved() && resource_tiling(r->GetDesc(), tiling);
+        if (total) *total = ok ? tiling.total_tiles : 0;
+        if (packed)
+            *packed = ok ? D3D12_PACKED_MIP_INFO{UINT8(tiling.standard_mips), UINT8(tiling.packed_mips),
+                                                 tiling.packed_tiles, tiling.packed_start}
+                         : D3D12_PACKED_MIP_INFO{};
+        if (shape)
+            *shape = ok ? D3D12_TILE_SHAPE{tiling.shape.width, tiling.shape.height, tiling.shape.depth}
+                        : D3D12_TILE_SHAPE{};
+        if (!count) return;
+        const UINT available = ok && first < tiling.subresources.size() ? UINT(tiling.subresources.size() - first) : 0;
+        const UINT n = tilings ? std::min(*count, available) : 0;
+        for (UINT i = 0; i < n; ++i) {
+            const leonida::SubresourceTiling& s = tiling.subresources[first + i];
+            tilings[i] = {s.width, UINT16(s.height), UINT16(s.depth), s.start};
+        }
+        *count = n;
     }
 
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
@@ -1388,6 +1514,69 @@ private:
         state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(), storage);
     }
 
+    // D3D12's layout rules for a reserved resource, then a committed resource on a default heap under it.
+    HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, REFIID riid, void** out) {
+        if (out) *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        constexpr auto xbox_tiled = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+        D3D12_RESOURCE_DESC backing = *desc;
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+        } else {
+            if (desc->Layout == xbox_tiled) {
+                log_once("reserved resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
+                         desc->Dimension);
+            } else if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
+                return E_INVALIDARG;  // 64KB_STANDARD_SWIZZLE too: CheckFeatureSupport reports it unsupported
+            }
+            backing.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            leonida::ResourceTiling tiling;
+            backing.MipLevels = std::max<UINT16>(desc->MipLevels, 1);  // any count: only the format is checked here
+            if (!resource_tiling(backing, tiling)) {
+                log_once("reserved texture format has no tile shape:", desc->Format);
+                return E_INVALIDARG;
+            }
+            backing.MipLevels = desc->MipLevels;
+        }
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        ID3D12Resource* resource = nullptr;
+        HRESULT hr = CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &backing, D3D12_RESOURCE_STATE_COMMON,
+                                             nullptr, IID_PPV_ARGS(&resource));
+        if (FAILED(hr)) return hr;
+        Resource::from<Resource>(resource)->make_reserved(desc->Layout);
+        if (!out) {  // a capability check: D3D12 allows a null output
+            resource->Release();
+            return S_FALSE;
+        }
+        hr = resource->QueryInterface(riid, out);
+        resource->Release();
+        return hr;
+    }
+
+    // The tiling of a reserved resource's description; false for formats without a tile shape (three- and
+    // twelve-byte texels, two-plane depth-stencil).
+    static bool resource_tiling(const D3D12_RESOURCE_DESC& desc, leonida::ResourceTiling& out) {
+        leonida::TilingDesc tiling{};
+        tiling.width = desc.Width;
+        tiling.height = desc.Height;
+        tiling.depth_or_layers = desc.DepthOrArraySize;
+        tiling.mips = desc.MipLevels;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            tiling.kind = leonida::TiledKind::buffer;
+            return leonida::resource_tiling(tiling, out);
+        }
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            return false;
+        tiling.kind = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? leonida::TiledKind::texture3d
+                                                                           : leonida::TiledKind::texture2d;
+        const Format format = vulkan_format(desc.Format, false);
+        if (!format.format || (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) return false;
+        const leonida::BlockFormat block = leonida::block_format(format.format, format.aspects);
+        tiling.element_bytes = block.bytes;
+        tiling.block = block.block;
+        return leonida::resource_tiling(tiling, out);
+    }
+
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -1507,6 +1696,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
+    LEONIDA_INSTANCE(vkEnumerateDeviceExtensionProperties);
     LEONIDA_INSTANCE(vkCreateDevice);
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
 #undef LEONIDA_INSTANCE
@@ -1555,7 +1745,29 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return fail("no Vulkan 1.3 GPU with dynamicRendering, synchronization2, timelineSemaphore and "
                     "separateDepthStencilLayouts");
 
-    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    // VK_EXT_conditional_rendering for SetPredication, when the GPU has it (optional: docs/d3d12_vulkan.md 4.7).
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    {
+        std::uint32_t extension_count = 0;
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> extensions(extension_count);
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
+        for (const auto& e : extensions)
+            if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
+            }
+        if (!info.conditional_rendering)
+            std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_conditional_rendering: SetPredication is unsupported\n");
+    }
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT enable_conditional{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    enable_conditional.conditionalRendering = VK_TRUE;
+
+    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                              info.conditional_rendering ? &enable_conditional : nullptr};
     enable13.dynamicRendering = VK_TRUE;
     enable13.synchronization2 = VK_TRUE;
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
@@ -1590,10 +1802,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
     enable.samplerAnisotropy = info.sampler_anisotropy;
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
+    const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
+    if (info.conditional_rendering) {
+        device_info.enabledExtensionCount = 1;
+        device_info.ppEnabledExtensionNames = &conditional_extension;
+    }
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;

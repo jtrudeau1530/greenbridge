@@ -351,6 +351,19 @@ class StreamedMusicTest(unittest.TestCase):
 
 
 class MalformedBankTest(unittest.TestCase):
+    def test_truncated_pcm_bank_creates_no_outputs(self):
+        pcm = b"\x01\x00" * 4
+        fmt = format_block(4, 48000, 0, 1)
+        bank = build_bank([(1, fmt, pcm), (2, fmt, pcm)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "short.awc")
+            with open(path, "wb") as f:
+                f.write(bank[:-2])
+            out = os.path.join(tmp, "out")
+            with self.assertRaisesRegex(ValueError, "0x55.*outside"):
+                awc.export_bank(path, out)
+            self.assertFalse(os.path.exists(out))
+
     def test_bad_magic_raises_value_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "bad.awc")

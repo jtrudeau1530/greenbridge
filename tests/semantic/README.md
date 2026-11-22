@@ -24,7 +24,14 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_alu_movrel.py` runs hand-written listings for `v_movrels_b32`, `v_movreld_b32` and `v_movrelsd_b32`
   (10 cases): sentinels in v1..v8, M0 set by `s_mov_b32`, then the indexed register and its neighbours are
   exported, so a write must land only in `VGPR[D.addr + M0]`. A plain-Python register-file model checks the
-  hand-written constants. `v_movrelsd_2_b32` must be rejected as unsupported.
+  hand-written constants. `v_movrelsd_2_b32` is not handled by the translator yet.
+- `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
+  (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
+  operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
+  `test_spirv_wave_interp.py` pins its convergence rules on hand-written modules.
+- `test_global_mem_offset.py` runs the address arithmetic `global_load*`/`global_store*` emit (its own small
+  evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
+  accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
@@ -41,6 +48,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   `cs_wavemask`): on one 64-wide subgroup every word equals the GPU check; on two 32-wide subgroups the
   words pinned there are the ones an RTX 4070 SUPER (driver 610.88) wrote without `--wave64-emulate`. The
   cs_w64x tests with branches need llvm-mc encodings and are not covered.
+- `test_alu_int_misc.py` translates one-instruction synthetic listings for `v_bfm_b32`, `v_and_or_b32`,
+  `v_add_lshl_u32`, `v_lshl_or_b32`, `v_mad_i32_i24` and `v_mul_lo_u32` and checks the mrt0 word against
+  hand-computed ISA values (masked shift counts, wrapping adds/products, 24-bit sign extension).
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,

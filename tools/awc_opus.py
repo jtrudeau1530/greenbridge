@@ -140,6 +140,8 @@ def parse_awc(d: bytes):
             t = struct.unpack_from("<Q", d, p)[0]
             p += 8
             typ, size, at = t >> 56, (t >> 28) & 0x0FFFFFFF, t & 0x0FFFFFFF
+            if typ in (0x55, 0x76, 0x48) and at + size > len(d):
+                raise ValueError(f"AWC tag 0x{typ:02x} extends outside the bank")
             if typ == 0x55:
                 data = (at, size)
             elif typ == 0x76:
@@ -221,11 +223,11 @@ def opus_packets(d: bytes, at: int, size: int):
 def export_bank(path: str, out_dir: str):
     with open(path, "rb") as f:
         d = f.read()
+    streams, music = parse_awc(d)
     name = os.path.splitext(os.path.basename(path))[0]
     od = os.path.join(out_dir, name)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
-    streams, music = parse_awc(d)
     for mus, data in music:
         for cid, samples, rate, codec, pk, packet_channels in music_channels(d, mus, data):
             if pk:

@@ -222,9 +222,11 @@ def test_unsupported_format_is_reported():
     assert T.export_one(texture(9999, "X", 4, 4, 1), "unused", "unused", {}) == "unsupported format"
 
 
-@pytest.mark.parametrize("fmt,bpe", [(61, 1), (56, 2), (10, 8)])
+@pytest.mark.parametrize("fmt,bpe", [(61, 1), (56, 2), (10, 8), (28, 4)])
 @pytest.mark.parametrize("w,h", [(5, 3), (5, 1), (1, 5)])
-def test_raw_score_prefers_a_smooth_gradient(fmt, bpe, w, h):
+def test_score_prefers_a_smooth_gradient(fmt, bpe, w, h):
+    if fmt in T.PILLOW_OK:
+        pytest.importorskip("PIL")
     pixels = max(w, h)
     values = [i * 240 // (pixels - 1) for i in range(pixels)]
     zigzag = values[::2] + values[1::2][::-1]
