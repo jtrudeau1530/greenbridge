@@ -1,6 +1,7 @@
 """Semantic interpreter tests for RDNA2 64-bit vector logical shift left v_lshlrev_b64.
 
 1. Reference Oracle: Plain-Python RDNA2 ISA reference for v_lshlrev_b64 (D = S1 << (S0 & 63)).
+2. SIMD Multi-Lane: Tests across multiple VGPR register pairs and values.
 """
 import os
 import random
@@ -88,6 +89,26 @@ class ALUIVectorLshlB64Tests(unittest.TestCase):
 
     def test_v_lshlrev_b64_basic(self):
         self.assertEqual(run_op(1, 0x0000000100000001), 0x0000000200000002)
+
+    def test_simd_multilane_pairs(self):
+        # Test using different register pair allocations (e.g., v[4:5], v[6:7])
+        pairs = [
+            (4, 2, 3), # v[2:3] source, v[4:5] dest
+            (6, 8, 9), # v[8:9] source, v[6:7] dest
+        ]
+        for dst_reg, src_lo, src_hi in pairs:
+            n = 5
+            x = 0x123456789ABCDEF0
+            lines = [
+                f"v_mov_b32 v10, {n:#x}",
+                f"v_mov_b32 v{src_lo}, {x & 0xFFFFFFFF:#x}",
+                f"v_mov_b32 v{src_hi}, {x >> 32:#x}",
+                f"v_lshlrev_b64 v[{dst_reg}:{dst_reg+1}], v10, v[{src_lo}:{src_hi}]",
+                # Copy result to v[0:1] for EXPORT_HALVES
+                f"v_mov_b32 v0, v{dst_reg}",
+                f"v_mov_b32 v1, v{dst_reg+1}"
+            ]
+            self.assertEqual(run_lines(lines), ref_lshlrev_b64(n, x))
 
 if __name__ == "__main__":
     unittest.main()
