@@ -12730,7 +12730,7 @@ def main():
         sv = os.path.join(a.out, name + ".spv")
         write_asm = not (a.no_asm and a.assembler == "python")
         if write_asm:
-            with open(sa, "w", newline="\n") as f:
+            with open(sa, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
         r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler)
         if r.returncode == 0:
@@ -12742,7 +12742,7 @@ def main():
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
             if not write_asm:
-                with open(sa, "w", newline="\n") as f:
+                with open(sa, "w", encoding="utf-8", newline="\n") as f:
                     f.write(asm)
             drop_stale(name)
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1

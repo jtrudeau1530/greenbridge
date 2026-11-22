@@ -245,7 +245,7 @@ def extract(p, out):
             e['file'] = f'blocks/{e["index"]:03d}_{e["group"]}_{e["hash"]}.json'
             with open(os.path.join(out, e['file']), 'wb') as f:
                 f.write(b)
-        with open(os.path.join(out, 'index.json'), 'w', newline="\n") as f:
+        with open(os.path.join(out, 'index.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump({'header': h, 'entries': es}, f, indent=1)
         body = d[h['body_offset']:h['body_end']].decode('utf-8')
         with open(os.path.join(out, 'save.pretty.json'), 'w', encoding='utf-8', newline="\n") as f:
@@ -254,7 +254,7 @@ def extract(p, out):
     elif k == 'ASAV':
         h = parse_asav(d)
         pl = asav_payload(d, h)
-        with open(os.path.join(out, 'header.json'), 'w', newline="\n") as f:
+        with open(os.path.join(out, 'header.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump(h, f, indent=1)
         with open(os.path.join(out, 'header.bin'), 'wb') as f:
             f.write(d[:h['payload_offset']])
