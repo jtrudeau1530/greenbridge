@@ -905,7 +905,16 @@ def _summary(path, mode, start, end, carver, classes, checks, stats, elapsed):
     }
 
 
+def _make_parent(path):
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_csv(path, rows):
+    _make_parent(path)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         w.writeheader()
@@ -960,6 +969,7 @@ def main(argv=None):
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
+    _make_parent(out)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1, allow_nan=False)
     if a.csv:
