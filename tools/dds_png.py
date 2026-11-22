@@ -10,12 +10,15 @@ bit in the first byte) decodes as transparent black. BC6H is not supported.
 DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG; sRGB colors are
 unpremultiplied in linear light and returned in their sRGB encoding.
 
+R11G11B10_FLOAT previews clamp RGB to [0, 1], map NaN to zero and use opaque alpha.
+
 Usage:
     python -I tools/dds_png.py <in.dds> <out.png> [--max-size N]
 """
 from __future__ import annotations
 
 import argparse
+from functools import cache
 import math
 import os
 import struct
@@ -66,6 +69,7 @@ _DXGI_MAP: dict[int, str] = {
     88: "BGRX8",
     92: "BGRX8",
     93: "BGRX8",
+    26: "R11G11B10_FLOAT",
     70: "BC1",
     71: "BC1",
     72: "BC1",
@@ -775,6 +779,46 @@ def _decode_bc5(
     return bytes(out)
 
 
+@cache
+def _unsigned_float_to_u8(mantissa_bits: int) -> bytes:
+    """Map a five-bit-exponent unsigned float channel to preview bytes."""
+    table = bytearray(1 << (5 + mantissa_bits))
+    fraction_mask = (1 << mantissa_bits) - 1
+    for code in range(len(table)):
+        exponent = code >> mantissa_bits
+        fraction = code & fraction_mask
+        if exponent == 31:
+            table[code] = 0 if fraction else 255
+            continue
+        significand = fraction + ((1 << mantissa_bits) if exponent else 0)
+        value = math.ldexp(significand, max(1, exponent) - 15 - mantissa_bits)
+        table[code] = int(min(1.0, value) * 255 + 0.5)
+    return bytes(table)
+
+
+def _decode_r11g11b10(payload: memoryview, width: int, height: int, pitch: int) -> bytes:
+    row_bytes = width * 4
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid R11G11B10_FLOAT row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated R11G11B10_FLOAT payload: {len(payload)} bytes (need {expected})")
+
+    rg_table = _unsigned_float_to_u8(6)
+    b_table = _unsigned_float_to_u8(5)
+    rgba = bytearray(width * height * 4)
+    rgba[3::4] = b"\xff" * (width * height)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        for (pixel,) in struct.iter_unpack("<I", payload[start:start + row_bytes]):
+            rgba[dst] = rg_table[pixel & 0x7FF]
+            rgba[dst + 1] = rg_table[(pixel >> 11) & 0x7FF]
+            rgba[dst + 2] = b_table[pixel >> 22]
+            dst += 4
+    return bytes(rgba)
+
+
 def _bc7_read_indices(bits: int, index_bits: int, is_anchor: tuple[int, ...]) -> tuple[list[int], int]:
     """Read 16 LSB-first pixel indices; anchor pixels omit their implicit zero MSB."""
     indices = []
@@ -949,6 +993,10 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
         rgba = _decode_bc5(data, offset, width, height, signed=False)
     elif fmt == "BC5_SNORM":
         rgba = _decode_bc5(data, offset, width, height, signed=True)
+    elif fmt == "R11G11B10_FLOAT":
+        flags = struct.unpack_from("<I", data, 8)[0]
+        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
+        rgba = _decode_r11g11b10(memoryview(data)[offset:], width, height, pitch)
     elif fmt == "BC7":
         rgba = _decode_bc7(data, offset, width, height)
     else:
