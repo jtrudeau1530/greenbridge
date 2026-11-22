@@ -227,7 +227,7 @@ int check_direct(const char* label, ID3D12Device* real, bool vulkan) {
         EXPECT(xs::set_device_adapter_provider(proxy, nullptr));  // back to the default (the host's adapter)
         Ref<IDXGIAdapter> host;
         EXPECT(dxgi->GetAdapter(&host.p) == S_OK && host.p);
-        int not_a_proxy = 0;
+        void* not_a_proxy = nullptr;  // pointer-sized: the helpers read a vtable pointer from what they are given
         EXPECT(!xs::set_device_adapter_provider(&not_a_proxy, refuse) && !xs::set_device_adapter_provider(real, refuse));
         EXPECT(!xs::device_proxy_primary(&not_a_proxy) && !xs::device_proxy_primary(nullptr));
     }
