@@ -509,6 +509,12 @@ class DownscaleTests(unittest.TestCase):
         with self.assertRaises(dds.DdsError):
             dds.downscale_rgba(0, 4, b"", 2)
 
+    def test_negative_max_size_rejected(self):
+        buf = self.rgba_grid(4, 4)
+        with self.assertRaisesRegex(dds.DdsError, "Invalid max_size: -1"):
+            dds.downscale_rgba(4, 4, buf, -1)
+        self.assertEqual(dds.downscale_rgba(4, 4, buf, 0), (4, 4, buf))
+
 
 class PngTests(unittest.TestCase):
     def test_png_structure_and_crcs(self):
@@ -552,6 +558,14 @@ class PngTests(unittest.TestCase):
         ), max_size=4)
         self.assertEqual(struct.unpack(">II", png_chunks(png)[0][1][:8]), (4, 4))
 
+    def test_dds_to_png_rejects_negative_max_size(self):
+        payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
+        data = dds_buffer(8, 8, payload, flags=DDPF_FOURCC, fourcc=b"DXT1")
+        with self.assertRaisesRegex(dds.DdsError, "Invalid max_size: -1"):
+            dds.dds_to_png_bytes(data, max_size=-1)
+        png = dds.dds_to_png_bytes(data, max_size=0)
+        self.assertEqual(struct.unpack(">II", png_chunks(png)[0][1][:8]), (8, 8))
+
 
 class CliTests(unittest.TestCase):
     def test_cli_writes_png(self):
@@ -576,6 +590,31 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(dds.main([src, dst]), 1)
             self.assertIn("FourCC", err.getvalue())
             self.assertFalse(os.path.exists(dst))
+
+    def test_cli_rejects_negative_max_size(self):
+        payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            dst = os.path.join(tmp, "out.png")
+            with open(src, "wb") as f:
+                f.write(dds_buffer(8, 8, payload, flags=DDPF_FOURCC, fourcc=b"DXT1"))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                dds.main([src, dst, "--max-size", "-1"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--max-size must be 0 or more", err.getvalue())
+            self.assertFalse(os.path.exists(dst))
+
+    def test_cli_allows_zero_max_size(self):
+        payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            dst = os.path.join(tmp, "out.png")
+            with open(src, "wb") as f:
+                f.write(dds_buffer(8, 8, payload, flags=DDPF_FOURCC, fourcc=b"DXT1"))
+            self.assertEqual(dds.main([src, dst, "--max-size", "0"]), 0)
+            with open(dst, "rb") as f:
+                self.assertEqual(f.read(8), dds.PNG_SIGNATURE)
 
 
 if __name__ == "__main__":
