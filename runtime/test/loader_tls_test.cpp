@@ -492,35 +492,36 @@ void test_orphan_slot_generation_reuse(const fs::path& dll) {
     check(td() == 0, "orphaned worker exit does not dispatch DLL_THREAD_DETACH to the new generation's module");
 }
 
-// Spawns cmd.exe to obtain one guaranteed-dead PID and one guaranteed-live one for the purge-ownership checks.
+// A copy of this executable started suspended gives one guaranteed-dead PID (once ended) and one guaranteed-live one
+// for the purge-ownership checks. The child never runs and, detached, gets no console: a console child would start a
+// conhost, and Wine's headless conhost can outlive it holding the test runner's output pipe, hanging ctest.
 struct ChildProcess {
     HANDLE process = nullptr;
     DWORD pid = 0;
-    explicit ChildProcess(const wchar_t* args) {
+    ChildProcess() {
+        wchar_t self[MAX_PATH];
+        const DWORD length = GetModuleFileNameW(nullptr, self, MAX_PATH);
+        if (length == 0 || length == MAX_PATH) throw std::runtime_error("GetModuleFileNameW for the test failed");
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
-        std::wstring cmd = std::wstring(L"cmd.exe ") + args;
-        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
-                            &pi))
-            throw std::runtime_error("CreateProcessW for cmd.exe failed");
+        if (!CreateProcessW(self, nullptr, nullptr, nullptr, FALSE, CREATE_SUSPENDED | DETACHED_PROCESS, nullptr,
+                            nullptr, &si, &pi))
+            throw std::runtime_error("CreateProcessW for the suspended child failed");
         CloseHandle(pi.hThread);
         process = pi.hProcess;
         pid = pi.dwProcessId;
     }
     ChildProcess(const ChildProcess&) = delete;
     ChildProcess& operator=(const ChildProcess&) = delete;
-    void wait_exit() {
+    void end() {
+        TerminateProcess(process, 0);
         WaitForSingleObject(process, INFINITE);
         CloseHandle(process);
         process = nullptr;
     }
     ~ChildProcess() {
-        if (process) {
-            TerminateProcess(process, 0);
-            WaitForSingleObject(process, INFINITE);
-            CloseHandle(process);
-        }
+        if (process) end();
     }
 };
 
@@ -544,9 +545,9 @@ std::vector<fs::path> own_clone_files() {
 // test, because the sweep fires once per process.
 void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     std::printf("\n-- startup purge deletes only ownerless clones --\n");
-    ChildProcess dead(L"/c exit 0");
-    dead.wait_exit();
-    ChildProcess live(L"/c timeout /t 30 /nobreak > nul");
+    ChildProcess dead;
+    dead.end();
+    ChildProcess live;
 
     const fs::path clone_root = fs::temp_directory_path();
     // An own-PID name stands in for a leftover of a dead run whose PID this process reused: the sweep runs before
