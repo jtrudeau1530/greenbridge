@@ -369,10 +369,11 @@ that byte therefore sees this DLL's descriptor copies as calls. Like the list's 
 vtable pointer of a public object.
 
 - **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
-  with `IID_ID3D12PipelineState` and a console-only desc: the root signature at `+0x00`, two pointers into the DLL
-  with sizes (`0x1c` and `0x14` bytes here) at `+0x08`..`+0x20`, and a copy of a code blob at `+0x28` with its size
-  at `+0x30` (`0x1080` bytes here; most likely the shader's native code). The proxy used to forward it to the PC
-  method at the same index; it now refuses it (`E_NOTIMPL`). When it fails, the DLL takes slot 62.
+  with `IID_ID3D12PipelineState`. The DLL's own messages name it `DeserializeComputePipelineStateX`. Its desc is the
+  root signature at `+0x00`, then pointer and size pairs for the shader's `FSPX` entries: kind 0 at `+0x08`, kind 1
+  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy used to
+  forward it to the PC method at the same index; it now refuses it (`E_NOTIMPL`). When it fails, the DLL takes
+  slot 62; its message for that failure calls the fallback "NewBE".
 - **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
   runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
   `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
@@ -389,8 +390,9 @@ vtable pointer of a public object.
   of the leading `2`.
 - The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
   and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
-  inside `XBCH` ([design.md](design.md)). What `FSPX` holds, and whether the existing unpacker and translator can
-  take it, is open; running FSR needs that, not the executable.
+  inside `XBCH` ([design.md](design.md)). `FSPX` is a directory around an uncompressed RDNA2 program and its
+  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 13 of the 29 today. The 13 that
+  use `v_dot4` instructions are not translated yet ([fspx.md](fspx.md)).
 
 **Command list.** The console list is **not** the PC order past `ResourceBarrier`. Each row is backed by the
 argument shape at the call and, where marked "run", by the call seen in the run. Rows marked "inferred" fit the

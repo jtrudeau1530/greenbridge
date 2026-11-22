@@ -2721,11 +2721,13 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     (61), and there are console-only methods at 85 and 141. The list object also carries a write cursor and limits
     (`+0x18`, `+0x28`, `+0x30`) the DLL writes commands through while there is room. Table and evidence:
     [d3d12_command_objects.md §3.5a](d3d12_command_objects.md).
-    Device slot 67 is a console-only compute-pipeline call (a code blob in its desc), not the PC method at that
-    index; the proxy now refuses it. The dispatch stops where the PC runtime refuses the DLL's compute code at slot
-    62: the DLL's shaders carry an `ACCC` part instead of DXIL.
-  - Its `throw 1` reaches the caller: `_CxxThrowException` finds no image base for a manually mapped image, so the
-    DLL's own handlers cannot catch it (the loader gap `tiny_game`'s `LEONIDA_RUN_EH` check also shows).
+    Device slot 67 is a console-only compute-pipeline call, `DeserializeComputePipelineStateX` in the DLL's own
+    messages, not the PC method at that index; the proxy now refuses it. The dispatch stops where the PC runtime
+    refuses the DLL's compute code at slot 62: the DLL's shaders carry an `ACCC` part instead of DXIL, an `FSPX`
+    payload with an RDNA2 program ([fspx.md](fspx.md)).
+  - Its `throw 1` reaches the caller. Before #965 the throw carried an image base of 0, because `_CxxThrowException`
+    did not know manually mapped images; with #965 it carries the DLL's base, and the DLL still does not catch it on
+    that path (measured with `fsr_dispatch_test` and `LEONIDA_FSR_NO_STANDIN=1`).
   - `xmem.dll!XMemGetWorkingSetStatistics` takes two arguments, `(0x20000001, stats*)`, at all seven call sites;
     the one-argument shim wrote through the constant. Fixed in `runtime/shims/xmem.cpp`.
 
