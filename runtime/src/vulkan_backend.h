@@ -507,6 +507,9 @@ public:
 
     using SignalEventFn = void (*)(void* event_handle);
 
+    // Longest single vkWaitSemaphores call in run(): bounds how long the thread can sit in an uninterruptible wait.
+    static constexpr std::uint64_t kWaitSliceNs = 100'000'000;  // 100 ms
+
     FenceWaitDispatcher(VkDevice device, const VulkanDeviceFunctions& vk, std::atomic<bool>& device_lost)
         : device_(device), vk_(vk), device_lost_(device_lost) {
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -671,7 +674,12 @@ private:
             wi.semaphoreCount = static_cast<std::uint32_t>(semaphores_.size());
             wi.pSemaphores = semaphores_.data();
             wi.pValues = values_.data();
-            const VkResult res = vk_.vkWaitSemaphores(device_, &wi, UINT64_MAX);
+            // A bounded slice, not UINT64_MAX. Under GPU paravirtualization (measured in Windows Sandbox on an
+            // RTX 5060 Ti) this wait is a kernel wait the OS cannot interrupt: a process that exits while a wait
+            // is pending (d3d12_queue_wait_timeout's _Exit, or quitting with a fence outstanding) never finishes
+            // exiting, and TerminateProcess cannot end it either. A timeout returns here and the loop re-arms the
+            // same wait; completions still wake it at once through the ANY wait.
+            const VkResult res = vk_.vkWaitSemaphores(device_, &wi, kWaitSliceNs);
 
             lock.lock();
             waiting_ = false;
