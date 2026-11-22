@@ -128,6 +128,25 @@ class InstancedGlbTest(unittest.TestCase):
         self.assertEqual(len(gltf["meshes"]), 1)
         self.assertEqual(st["instances"], 2)
 
+    def test_indexed_material_is_preserved_in_both_instancing_modes(self) -> None:
+        primitive = {
+            "positions": [(0, 0, 0), (1, 0, 0), (0, 1, 0)],
+            "indices": [0, 1, 2],
+            "material_index": 2,
+        }
+        materials = {2: {"name": "paint", "base_color_factor": [0.25, 0.5, 0.75, 1.0]}}
+        meshes = [{"primitives": [glb_writer.pack_primitive(primitive)],
+                   "instances": [((0, 0, 0), (0, 0, 0, 1), (1, 1, 1))]}]
+        for mode in ("gpu", "nodes"):
+            with self.subTest(mode=mode):
+                data, _ = glb_writer.build_instanced_glb(meshes, materials, mode=mode)
+                gltf, _ = twb.parse_and_validate_glb(data)
+                material_index = gltf["meshes"][0]["primitives"][0]["material"]
+                material = gltf["materials"][material_index]
+                self.assertEqual(material["name"], "paint")
+                self.assertEqual(material["pbrMetallicRoughness"]["baseColorFactor"],
+                                 [0.25, 0.5, 0.75, 1.0])
+
     def test_rejects_mirroring_scale_and_bad_input(self):
         bad = [{"primitives": [tri_prim()], "instances": [((0, 0, 0), (0, 0, 0, 1), (1, -1, 1))]}]
         with self.assertRaisesRegex(glb_writer.GlbError, "determinant"):

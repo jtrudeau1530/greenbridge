@@ -617,8 +617,9 @@ def pack_primitive(prim: dict) -> dict:
     """Packed little-endian glTF buffers for one primitive from ``parse_obj``.
 
     Returns ``positions``/``normals``/``uvs``/``indices`` as bytes (``uvs`` is b"" without UVs), the index
-    component type, the vertex and index counts, the POSITION ``min``/``max`` and the primitive's ``material``
-    key. The same packed primitive can be written into a GLB once and drawn by many instances.
+    component type, the vertex and index counts, the POSITION ``min``/``max``, and the primitive's
+    ``material`` key and optional ``material_index``. The same packed primitive can be written into
+    a GLB once and drawn by many instances.
     """
     positions = list(prim["positions"])
     indices = list(prim["indices"])
@@ -668,6 +669,7 @@ def pack_primitive(prim: dict) -> dict:
         "min": [_clean_zero(min(xs)), _clean_zero(min(ys)), _clean_zero(min(zs))],
         "max": [_clean_zero(max(xs)), _clean_zero(max(ys)), _clean_zero(max(zs))],
         "material": material if isinstance(material, (str, int)) and not isinstance(material, bool) else "",
+        "material_index": prim.get("material_index"),
     }
 
 
@@ -1072,7 +1074,7 @@ def instance_bounds(box_min, box_max, translation, rotation, scale) -> list[floa
 
 def build_instanced_glb(
     meshes: list[dict],
-    materials: dict[str, dict] | None = None,
+    materials: dict[str | int, dict] | None = None,
     *,
     mode: str = "gpu",
     generator: str = "Leonida glb_writer",
@@ -1084,9 +1086,9 @@ def build_instanced_glb(
     determinant (no mirroring scale); give mirrored instances their own mirrored mesh instead, so the winding is
     right in every loader. ``mode`` "gpu" writes one node per mesh with ``EXT_mesh_gpu_instancing`` (listed in
     extensionsUsed and extensionsRequired); "nodes" writes one plain glTF node per instance, which every loader
-    reads but which costs a draw call per instance. ``materials`` takes the spec keys documented on
-    ``build_glb``, looked up by each packed primitive's ``material``. Returns (GLB bytes, stats) where stats
-    counts rendered triangles (each mesh's triangles times its instances) and the bounds of every instance.
+    reads but which costs a draw call per instance. ``materials`` uses the same lookup and spec keys as
+    ``build_glb``. Returns (GLB bytes, stats), including rendered triangles (each mesh's triangles times its
+    instances) and the bounds of every instance.
     """
     if mode not in INSTANCING_MODES:
         raise GlbError(f"instancing mode must be one of {INSTANCING_MODES}, got {mode!r}")
