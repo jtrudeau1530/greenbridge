@@ -1960,9 +1960,32 @@ class Gen:
             return g
         return v
 
+    def clamp_mods_f64(self, v, mods):
+        """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
+        for f32 the clamp is GLSL.std.450 FClamp, so a NaN result and the sign of a -0 result are left to the
+        driver (the hardware, with DX10_CLAMP set, gives +0 for NaN)."""
+        for m in mods:
+            if m in ("mul:2", "mul:4", "div:2"):
+                g = self.tmp()
+                self.emit(f"{g} = OpFMul %double {v} {self.dconst({'mul:2': 2.0, 'mul:4': 4.0, 'div:2': 0.5}[m])}")
+                v = g
+        if "clamp" in mods:
+            g = self.tmp()
+            self.emit(f"{g} = OpExtInst %double %glsl FClamp {v} {self.dconst(0.0)} {self.dconst(1.0)}")
+            return g
+        return v
+
     def fconst(self, x):
         bits = struct.unpack("<I", struct.pack("<f", x))[0]
         return self.tof(self.cu(bits))
+
+    def dconst(self, x):
+        """A %double value (needs uses_f64): the two words of x, bitcast."""
+        bits = struct.unpack("<Q", struct.pack("<d", x))[0]
+        v2, d = self.tmp(), self.tmp()
+        self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {self.cu(bits & 0xFFFFFFFF)} {self.cu(bits >> 32)}")
+        self.emit(f"{d} = OpBitcast %double {v2}")
+        return d
 
     # ---- instructions ----
     SDWA_SEL = {"BYTE_0": (0, 8), "BYTE_1": (8, 8), "BYTE_2": (16, 8), "BYTE_3": (24, 8),
@@ -2462,6 +2485,8 @@ class Gen:
                 x, y = f64(a[1]), f64(a[2])
                 r, v2, lo, hi = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{r} = OpFAdd %double {x} {y}")
+                # VOP3_Profile<VOP_F64_F64_F64>: HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
+                r = self.clamp_mods_f64(r, mods)
                 self.emit(f"{v2} = OpBitcast %v2uint_d {r}")
                 self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
                 self.emit(f"{hi} = OpCompositeExtract %uint {v2} 1")
