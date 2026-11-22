@@ -1991,8 +1991,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
                 const bool upload = texture_copy->src.footprint;
                 const ResourceBinding& image = upload ? p.binding : p.source;
-                if (result == ReplayResult::success && image.depth24_as_float && !p.buffer_image_copies.empty() &&
-                    p.buffer_image_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) {
+                const bool depth24_footprint = result == ReplayResult::success && image.depth24_as_float &&
+                    !p.buffer_image_copies.empty() &&
+                    p.buffer_image_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT;
+                const bool rgb96_footprint = result == ReplayResult::success && image.rgb96 &&
+                    !p.buffer_image_copies.empty();
+                // These footprint conversions emit compute dispatches in emit(). Refuse them before allocating their
+                // conversion scratch/descriptors because an active statistics query would include their CSInvocations.
+                if (statistics_active && (depth24_footprint || rgb96_footprint)) return ReplayResult::unsupported;
+                if (depth24_footprint) {
                     const VkBufferImageCopy& region = p.buffer_image_copies[0];
                     const ResourceBinding& buffer = upload ? p.source : p.binding;
                     Depth24Job& job = p.depth24;
@@ -2007,7 +2014,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.app_slice_words = job.app_row_words * (region.bufferImageHeight ? region.bufferImageHeight : job.height);
                     if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
-                } else if (result == ReplayResult::success && image.rgb96 && !p.buffer_image_copies.empty()) {
+                } else if (rgb96_footprint) {
                     // A footprint of a 96-bit texture: 12-byte texels, 16 in the image. The same pass and scratch.
                     const VkBufferImageCopy& region = p.buffer_image_copies[0];
                     const ResourceBinding& buffer = upload ? p.source : p.binding;
@@ -2025,9 +2032,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
                 }
-                // These footprint conversions emit compute dispatches in emit(). Until pipeline-statistics
-                // segmentation can bracket arbitrary helper dispatches, don't let them inflate CSInvocations.
-                if (p.has_depth24 && statistics_active) return ReplayResult::unsupported;
             } else {
                 result = detail::prepare_resource_copy(p);
             }
