@@ -1,12 +1,13 @@
-"""Decode a deterministic Ogg Opus to PCM WAV and pin the exact sample count.
+"""Check Ogg Opus end trimming, chained audio, and WAV output paths.
 
     python -I tests/test_audio_wav.py
 
-The test skips when ffmpeg is not on PATH; the tool needs it. It checks the WAV with the standard library's
-wave module, and the exact 48,000 frames also pin the granule end-trim (ffmpeg can otherwise keep a partial frame).
+The decode tests use synthetic audio and skip when ffmpeg is not on PATH.
 """
 import os
+from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,10 @@ import wave
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "audio_wav.py")
 FFMPEG = shutil.which("ffmpeg")
+
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import audio_wav  # noqa: E402
+import awc_opus  # noqa: E402
 
 
 @unittest.skipUnless(FFMPEG, "ffmpeg is not on PATH")
@@ -50,6 +55,41 @@ class AudioWavTest(unittest.TestCase):
             self.assertEqual(w.getframerate(), 48000)
             self.assertEqual(w.getnframes(), 48000)
 
+    def test_repackaged_stream_keeps_its_declared_end(self):
+        # The first data page contains 50 silence packets (48,000 samples). The declared end falls before it.
+        declared = 47877
+        awc_opus.write_ogg_opus(self.src, [bytes.fromhex("f8fffe")] * 51, 1, 42, declared)
+        self.assertEqual(audio_wav.ogg_output_samples(self.src), declared)
+        p = self.run_tool(self.src, "--out", self.out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with wave.open(self.dst, "rb") as w:
+            self.assertEqual(w.getnframes(), declared)
+
+    def test_chained_links_match_direct_ffmpeg_decode(self):
+        for name, tones in [("unequal", [(440, 100), (880, 200)]), ("repeated", [(440, 100)] * 3)]:
+            with self.subTest(name=name):
+                links = []
+                for serial, (hz, ms) in enumerate(tones, 1):
+                    tone = f"sine=frequency={hz}:sample_rate=48000:duration={ms / 1000}"
+                    link = subprocess.check_output([FFMPEG, "-v", "error", "-f", "lavfi", "-i", tone,
+                                                    "-c:a", "libopus", "-fflags", "+bitexact", "-serial_offset",
+                                                    str(serial), "-f", "ogg", "pipe:1"])
+                    self.assertEqual(int.from_bytes(link[14:18], "little"), serial)
+                    links.append(link)
+                src = Path(self.dir, name + ".ogg")
+                src.write_bytes(b"".join(links))
+                reference = os.path.join(self.dir, "reference.wav")
+                subprocess.run([FFMPEG, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", reference],
+                               check=True, capture_output=True)
+                with wave.open(reference, "rb") as w:
+                    self.assertEqual(w.getnframes(), sum(ms for _, ms in tones) * 48)
+                    pcm = w.readframes(w.getnframes())
+                p = self.run_tool(src)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                with wave.open(str(src.with_suffix(".wav")), "rb") as w:
+                    self.assertEqual(w.getnframes() * 2, len(pcm))
+                    self.assertTrue(w.readframes(w.getnframes()) == pcm, "decoded PCM differs")
+
     def test_second_run_skips_the_existing_wav(self):
         self.assertEqual(self.run_tool(self.src, "--out", self.out).returncode, 0)
         p = self.run_tool(self.src, "--out", self.out)
@@ -78,8 +118,28 @@ class AudioWavTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
-sys.path.insert(0, os.path.join(ROOT, "tools"))
-import audio_wav  # noqa: E402
+class GranuleTest(unittest.TestCase):
+    def test_trim_requires_identifiable_matching_endpoints(self):
+        # A 240-channel family-255 header occupies two laces. Every output maps to the same mono stream.
+        head = b"OpusHead" + struct.pack("<BBHIhBBB", 1, 240, 312, 48000, 0, 255, 1, 0) + bytes(240)
+        bos = awc_opus.ogg_page(10, 0, 0, [head], 2)
+        eos = awc_opus.ogg_page(10, 2, 1272, [b"\xf8\xff\xfe"], 4)
+        cases = [
+            ("matching", bos, eos, 960),
+            ("different serial", bos, awc_opus.ogg_page(11, 2, 1272, [b"x"], 4), 0),
+            ("no EOS", bos, awc_opus.ogg_page(10, 2, 1272, [b"x"], 0), 0),
+            ("no BOS", awc_opus.ogg_page(10, 0, 0, [head], 0), eos, 0),
+            ("embedded signature", awc_opus.ogg_page(10, 0, 0, [b"x" + head], 2), eos, 0),
+            ("short header", awc_opus.ogg_page(10, 0, 0, [head[:12]], 2), eos, 0),
+            ("split across packets", awc_opus.ogg_page(10, 0, 0, [head[:12], head[12:]], 2), eos, 0),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "sample.ogg")
+            for name, first, last, expected in cases:
+                with self.subTest(name=name):
+                    path.write_bytes(first + last)
+                    self.assertEqual(audio_wav.ogg_output_samples(path), expected)
+
 
 # Stands in for ffmpeg: writes the input's file name into the output, so each WAV shows which file it came from.
 FAKE_FFMPEG = """import os, sys

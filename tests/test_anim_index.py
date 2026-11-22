@@ -4,6 +4,7 @@
 
 Every byte here is built by the test. No game file or game asset name is used.
 """
+import contextlib
 import csv
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +21,26 @@ TOOL = os.path.join(ROOT, "tools", "anim_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import anim_index  # noqa: E402
+
+
+@contextlib.contextmanager
+def tracked_mmaps():
+    """Record every mmap.mmap opened by anim_index and close any leak on exit."""
+    real_mmap = anim_index.mmap.mmap
+    created = []
+
+    def wrap(*args, **kwargs):
+        mapping = real_mmap(*args, **kwargs)
+        created.append(mapping)
+        return mapping
+
+    try:
+        with mock.patch.object(anim_index.mmap, "mmap", side_effect=wrap):
+            yield created
+    finally:
+        for mapping in created:
+            if not mapping.closed:
+                mapping.close()
 
 
 def move():
@@ -299,6 +321,15 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
         self.assertEqual([r["signature"] for r in rows], ["move", "page-directory", "name-table"])
         self.assertEqual(summary["mode"], "directory")
+
+    def test_scan_rpf_closes_mmap_on_invalid_start(self):
+        with tracked_mmaps() as created:
+            with self.assertRaisesRegex(ValueError, "outside the archive"):
+                anim_index.scan_rpf(self.rpf, start=os.path.getsize(self.rpf) + 1)
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            os.remove(self.rpf)
+            self.assertFalse(os.path.exists(self.rpf))
 
 
 class RigArchiveTest(unittest.TestCase):

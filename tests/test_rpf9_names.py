@@ -4,6 +4,7 @@
 
 Every byte is built by the test; no game file or game asset name is used.
 """
+import contextlib
 import json
 import os
 import struct
@@ -11,10 +12,34 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "rpf9_names.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+import rpf9_names  # noqa: E402
+
+
+@contextlib.contextmanager
+def tracked_mmaps():
+    """Record every mmap.mmap opened by rpf9_names and close any leak on exit."""
+    real_mmap = rpf9_names.mmap.mmap
+    created = []
+
+    def wrap(*args, **kwargs):
+        mapping = real_mmap(*args, **kwargs)
+        created.append(mapping)
+        return mapping
+
+    try:
+        with mock.patch.object(rpf9_names.mmap, "mmap", side_effect=wrap):
+            yield created
+    finally:
+        for mapping in created:
+            if not mapping.closed:
+                mapping.close()
 
 
 def stream(text):
@@ -126,6 +151,56 @@ class NamesTest(unittest.TestCase):
             p = self.run_tool(os.path.join(tmp, "missing.rpf"), out, "--quiet")
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertFalse(os.path.exists(out))
+
+    def test_empty_archive_raises_not_rpf9(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, "empty.rpf")
+            open(empty, "wb").close()
+            with tracked_mmaps() as created:
+                with self.assertRaisesRegex(ValueError, "not an RPF9 archive"):
+                    rpf9_names.scan_archive(empty)
+                self.assertEqual(created, [])
+
+    def test_scan_archive_closes_mmap_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            make_archive(arc)
+            with tracked_mmaps() as created:
+                rows, summary = rpf9_names.scan_archive(arc)
+                self.assertEqual(len(rows), 3)
+                self.assertEqual(summary["streams"], 4)
+                self.assertEqual(len(created), 1)
+                self.assertTrue(created[0].closed)
+                os.remove(arc)
+                self.assertFalse(os.path.exists(arc))
+
+    def _assert_validation_error_closes_mmap(self, arc, start, message):
+        """Assert scan_archive raises ValueError and closes its mmap before returning."""
+        with tracked_mmaps() as created:
+            with self.assertRaisesRegex(ValueError, message):
+                rpf9_names.scan_archive(arc, start=start)
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+            os.remove(arc)
+            self.assertFalse(os.path.exists(arc))
+
+    def test_scan_archive_closes_mmap_on_validation_errors(self):
+        cases = (
+            ("bad_magic", b"NOPE" + bytes(60), None, "not an RPF9 archive"),
+            ("bad_data_start", b"RPF9" + struct.pack("<I", 0x1000) + bytes(56), None,
+             "RPF9 data start is outside the archive"),
+            ("bad_start", None, 99999, "--start is outside the archive"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, payload, start, message in cases:
+                arc = os.path.join(tmp, f"{name}.rpf")
+                if payload is None:
+                    make_archive(arc)
+                else:
+                    with open(arc, "wb") as f:
+                        f.write(payload)
+                with self.subTest(case=name):
+                    self._assert_validation_error_closes_mmap(arc, start, message)
 
 
 if __name__ == "__main__":

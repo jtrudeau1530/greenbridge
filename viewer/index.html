@@ -249,7 +249,9 @@ async function loadChunk(entry) {
     if (!response.ok) throw new Error(`Chunk request failed: ${response.status}`);
     const bytes = await response.arrayBuffer();
     if (controller.signal.aborted) return;
-    const g = await loader.parseAsync(bytes, THREE.LoaderUtils.extractUrlBase(def.url));
+    const url = response.url || def.url;
+    const resourcePath = THREE.LoaderUtils.extractUrlBase(url.split(/[?#]/, 1)[0]);
+    const g = await loader.parseAsync(bytes, resourcePath);
     // GLTFLoader cannot cancel a parse already underway. Dispose its late result.
     if (live.get(def.id) !== entry) { disposeObject(g.scene); return; }
     entry.obj = g.scene; scene.add(g.scene); applyClay(g.scene); applyWire(g.scene);

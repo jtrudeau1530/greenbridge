@@ -767,7 +767,9 @@ def downscale_rgba(width: int, height: int, rgba: bytes, max_size: int) -> tuple
     if len(rgba) != expected:
         raise DdsError(f"Invalid RGBA buffer length: {len(rgba)} (expected {expected})")
 
-    if max_size <= 0 or max(width, height) <= max_size:
+    if max_size < 0:
+        raise DdsError(f"Invalid max_size: {max_size}")
+    if max_size == 0 or max(width, height) <= max_size:
         return width, height, bytes(rgba) if not isinstance(rgba, bytes) else rgba
 
     w, h = width, height
@@ -810,6 +812,8 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
 
 def dds_to_png_bytes(data: bytes, max_size: int = 0) -> bytes:
     """Decode a DDS buffer (optionally downscaling) and encode as PNG bytes."""
+    if max_size < 0:
+        raise DdsError(f"Invalid max_size: {max_size}")
     w, h, rgba = decode_dds(data)
     if max_size > 0:
         w, h, rgba = downscale_rgba(w, h, rgba, max_size)
@@ -834,6 +838,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Downscale via repeated 2x box filter until max(width, height) <= N (0 = disabled)",
     )
     args = ap.parse_args(argv)
+    if args.max_size < 0:
+        ap.error("--max-size must be 0 or more")
 
     try:
         png = dds_file_to_png_bytes(args.input, max_size=args.max_size)
