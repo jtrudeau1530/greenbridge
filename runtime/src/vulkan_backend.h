@@ -682,6 +682,12 @@ public:
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     bool loaded() const { return loaded_; }
+    void configure_predication(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
+                               VkDeviceSize max_range, std::uint32_t family) {
+        std::unique_lock lock(resource_mutex_);
+        predicate_family_ = family;
+        predicate_reducer_ = std::make_unique<PredicateReducer>(get, device_, memory, max_range);
+    }
     VkDevice device() const { return device_; }
 
     // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
@@ -931,6 +937,8 @@ private:
     double timestamp_period_ = 0;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
+    std::unique_ptr<PredicateReducer> predicate_reducer_;
+    std::uint32_t predicate_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
 #ifdef _MSC_VER
@@ -1007,7 +1015,7 @@ public:
     }
 
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind = QueueKind::direct)
-        : context_(context), queue_(queue), kind_(kind) {
+        : context_(context), queue_(queue), kind_(kind), family_(family) {
         auto& vk = context.vk;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1058,6 +1066,26 @@ public:
         bindless_commit = context_.bindless_commit_;
         std::vector<PreparedList> prepared(lists.size());
         ReplayFunctions replay = context_.replay_;
+        std::uint64_t captures = 0;
+        for (const auto* list : lists)
+            for (const auto& command : list->commands())
+                if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
+        std::unique_ptr<PredicateReducer::Batch> batch;
+        if (captures) {
+            if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
+                return ReplayResult::unsupported;
+            // The helper's lazy pipeline is shared by queues. Serialize preparation with the tracker lock,
+            // retaining main's resource -> tracker -> submit lock order through emit and submission.
+            if (!tracker_lock.owns_lock()) tracker_lock.lock();
+            batch = context_.predicate_reducer_->batch(captures);
+            if (!batch) return ReplayResult::unsupported;
+            replay.prepare_predicate = [&](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
+                return batch->prepare(buffer, offset, out);
+            };
+            replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
+                context_.predicate_reducer_->capture(cb, p);
+            };
+        }
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
         const bool can_resolve_occlusion = occlusion_memory.memoryTypeCount != 0;
         if (can_resolve_occlusion) {
@@ -1130,11 +1158,12 @@ public:
             return ReplayResult::unsupported;
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
+        auto next_tracker = context_.tracker_;
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
         for (const auto& list : prepared) {
-            emit(list, command_buffer, replay, &context_.tracker_, &open_labels);
+            emit(list, command_buffer, replay, &next_tracker, &open_labels);
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;
         }
@@ -1173,6 +1202,8 @@ public:
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
         if (submitted) {
+            context_.tracker_ = std::move(next_tracker);
+            slot->predicate = std::move(batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
@@ -1224,6 +1255,7 @@ private:
         VkCommandBuffer buffer;
         std::uint64_t ticket;
         std::vector<std::shared_ptr<const OcclusionSegmentPool>> segments;
+        std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
 
     CommandSlot* acquire() {
@@ -1239,6 +1271,7 @@ private:
         }
         if (reuse) {
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
+            reuse->predicate.reset();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }
@@ -1305,6 +1338,7 @@ private:
     VulkanContext& context_;
     VkQueue queue_;
     QueueKind kind_ = QueueKind::direct;
+    std::uint32_t family_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;

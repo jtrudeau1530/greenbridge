@@ -24,7 +24,12 @@ class CarveAllGamePathTest(unittest.TestCase):
             for name in ("common", "pack_p1_p1"):
                 (out / name).mkdir(parents=True)
                 (out / name / "index.json").write_text(json.dumps(INDEX), encoding="utf-8")
-            for arg in ("game", ".\\game", str(game) + "\\"):
+            args = ["game", ".\\game", str(game) + "\\"]
+            short_game = ctypes.create_unicode_buffer(32768)
+            short_path_length = ctypes.windll.kernel32.GetShortPathNameW(str(game), short_game, len(short_game))
+            if short_path_length and short_game.value.casefold() != str(game).casefold():
+                args.append(short_game.value + "\\")
+            for arg in args:
                 with self.subTest(game=arg):
                     result = subprocess.run(
                         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),

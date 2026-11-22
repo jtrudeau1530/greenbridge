@@ -1480,6 +1480,22 @@ public:
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing);
+        if (info.conditional_rendering) {
+            const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
+            const auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+            if (properties && families) {
+                VkPhysicalDeviceProperties limits{};
+                properties(info.physical, &limits);
+                std::uint32_t count = 0;
+                families(info.physical, &count, nullptr);
+                std::vector<VkQueueFamilyProperties> queues(count);
+                families(info.physical, &count, queues.data());
+                if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                    state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
+            }
+        }
         if (info.host_image_copy) load_host_image_copy(get_device);
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
         std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
