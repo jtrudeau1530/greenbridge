@@ -103,6 +103,8 @@ int main() {
     leonida::ShaderLibrary library;
     EXPECT(library.load(dir.string()));
     EXPECT(library.find("vs", vs_hash) && library.find("ps", ps_hash));
+    // The lookup is keyed by stage as well as hash: each program must not be found as the other stage.
+    EXPECT(!library.find("vs", ps_hash) && !library.find("ps", vs_hash));
 
     // mesh.bin: u32 vertex_count, u32 index_count, (x, y, z, u, v) f32 per vertex, u32 indices.
     const auto mesh = read_file(dir / "mesh.bin");
@@ -161,6 +163,13 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         pso_desc.SampleDesc.Count = 1;
+        {
+            // The pixel shader's container as the VS: the proxy finds no vs program with that hash, so no PSO.
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC swapped = pso_desc;
+            swapped.VS = pso_desc.PS;
+            Ref<ID3D12PipelineState> wrong;
+            EXPECT(FAILED(device->CreateGraphicsPipelineState(&swapped, IID_PPV_ARGS(&wrong.p))) && !wrong.p);
+        }
         Ref<ID3D12PipelineState> pso;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
 
