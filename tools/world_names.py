@@ -426,7 +426,8 @@ def load_rows(path: str) -> list[dict]:
 
 
 def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = False) -> dict:
-    names = {parse_u64(row.get("map_name", row.get("name"))) for row in rows}
+    map_rows = [row for row in rows if isinstance(row, dict) and row.get("kind") in (None, "map")]
+    names = {parse_u64(row.get("map_name", row.get("name"))) for row in map_rows}
     names.discard(None)
     stats = {
         "rows": 0, "name_present": 0, "name_resolved": 0, "name_verified": 0,
@@ -434,11 +435,7 @@ def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = Fa
         "parent_present": 0, "parent_resolved": 0, "parent_ambiguous": 0,
         "parent_unresolved": 0, "parent_links": 0, "parent_links_resolved": 0,
     }
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if row.get("kind") not in (None, "map"):
-            continue
+    for row in map_rows:
         stats["rows"] += 1
         name = parse_u64(row.get("map_name", row.get("name")))
         parent = parse_u64(row.get("parent"))
