@@ -63,7 +63,14 @@ def entropy(sample):
 def below_normal():
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k = ctypes.windll.kernel32
+        # GetCurrentProcess returns a pointer-sized pseudo-handle.
+        k.GetCurrentProcess.argtypes = ()
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.SetPriorityClass.restype = wintypes.BOOL
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
 
 

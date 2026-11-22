@@ -59,6 +59,7 @@ def below_normal():
 
         k = ctypes.windll.kernel32
         # The current-process pseudo-handle is pointer-sized on 64-bit Windows.
+        k.GetCurrentProcess.argtypes = ()
         k.GetCurrentProcess.restype = wintypes.HANDLE
         k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
         k.SetPriorityClass.restype = wintypes.BOOL
