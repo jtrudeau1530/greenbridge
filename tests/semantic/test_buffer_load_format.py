@@ -255,6 +255,22 @@ class TbufferDefaultFormat(unittest.TestCase):
                                   mods=" format:[BUF_FMT_8_8_8_8_UINT]")
                 self.assertEqual(got[:len(want)], want)
 
+    def test_fixed_format_identity_ignores_descriptor_selectors(self):
+        # Descriptor selectors are 0,0,0,1. MTBUF supplies its own X000, XY00 or XYZW.
+        for fmt, source, want in (("32_UINT", 0x44, (0x44, 0, 0, 0)),
+                                  ("16_16_UINT", 0x00330044, (0x44, 0x33, 0, 0)),
+                                  ("8_8_8_8_UINT", 0x11223344, (0x44, 0x33, 0x22, 0x11))):
+            for d16 in (False, True):
+                with self.subTest(fmt=fmt, d16=d16):
+                    got = load_format(FMT_U32, 0, 4, dst_sel=1 << 9, memory={BASE: source},
+                                      d16=d16, op="tbuffer_load_format",
+                                      mods=f" format:[BUF_FMT_{fmt}]")
+                    if d16:
+                        self.assertEqual(got[:2], (want[0] | want[1] << 16, want[2] | want[3] << 16))
+                    else:
+                        self.assertEqual(got, want)
+        self.assertEqual(load_format(FMT_UINT8X4, 0, 4, dst_sel=1 << 9), (0, 0, 0, 1))
+
     def test_packed_default_8_unorm(self):
         # The first byte is 0xff: 1.0 in f16 is 0x3c00. Preserve the upper destination half.
         got = load_format(FMT_U32, 0, 1, memory=self.MEM, d16=True, op="tbuffer_load_format")

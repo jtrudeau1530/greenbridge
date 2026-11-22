@@ -186,7 +186,9 @@ public:
             for (const auto& e : extensions)
                 debug_utils = debug_utils || std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
         }
-        if (debug_utils) instance_extensions.push_back(debug_utils_name);
+        if (debug_utils) {
+            instance_extensions.push_back(debug_utils_name);
+        }
         instance_info.enabledExtensionCount = std::uint32_t(instance_extensions.size());
         instance_info.ppEnabledExtensionNames = instance_extensions.data();
         VkResult result = create_instance(&instance_info, nullptr, &instance);

@@ -3,15 +3,17 @@ r"""Build the PC port from your own copy of the game.
     Build.bat                                                   # double-click: finds your copy and builds
     python -I make_game.py                                      # same, from a terminal
     python -I make_game.py --find                               # list the copies found on this PC
+    python -I make_game.py --pick                               # choose the game folder in a folder dialog
     python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida"
     python -I make_game.py --game "..." --check                 # only check the copy, build nothing
     python -I make_game.py --stages shaders,assets              # only some stages
 
 The game folder is your own Xbox Series package, version 1.0.2.1, with its files already readable on disk
-(see game/xbox-1.0.2.1.json for the file list). It is found automatically in Downloads, Desktop, Documents,
-Games, your home folder and the top of each drive (two folder levels down). This script never decrypts or
-works around anything: it reads plain files and writes everything it makes under --out. The only thing it
-downloads is the third_party/rpf9-explorer submodule, when it is missing. Never share what it makes.
+(see game/xbox-1.0.2.1.json for the file list). It is found automatically in Downloads, Desktop, Documents
+(also where Windows keeps them, such as in OneDrive), Games, your home folder and the top of each drive (two
+folder levels down). This script never decrypts or works around anything: it reads plain files and writes
+everything it makes under --out. The only thing it downloads is the third_party/rpf9-explorer submodule, when
+it is missing. Never share what it makes.
 
 Stages, in order (each skips work that is already done, so a stopped build continues where it left off):
     check     file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
@@ -185,11 +187,49 @@ def load_version(game: str) -> dict:
          + "\n".join(reports or ["  No version manifests found."]))
 
 
+# Windows known-folder IDs (KnownFolders.h): Downloads, Desktop, Documents. OneDrive's Known Folder Move puts
+# Desktop and Documents in ~\OneDrive, and each can be moved anywhere from its Properties > Location tab, so the
+# folders Explorer shows aren't always the ones under the home folder.
+KNOWN_FOLDERS = ("{374DE290-123F-4565-9164-39C4925E467B}", "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+                 "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}")
+
+
+def known_folders() -> list:
+    """Windows: where Downloads, Desktop and Documents really are (SHGetKnownFolderPath). Empty elsewhere, and
+    without the ones the shell can't report."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+    try:
+        shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+    except OSError:
+        return []
+    get = shell32.SHGetKnownFolderPath
+    get.argtypes = [ctypes.c_char_p, wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+    get.restype = ctypes.c_long
+    free = ole32.CoTaskMemFree
+    free.argtypes = [ctypes.c_void_p]
+    free.restype = None
+    found = []
+    for folder in KNOWN_FOLDERS:
+        path = ctypes.c_void_p()
+        result = get(uuid.UUID(folder).bytes_le, 0, None, ctypes.byref(path))
+        try:
+            if result == 0 and path.value:
+                found.append(ctypes.wstring_at(path.value))
+        finally:
+            free(path)   # the shell's buffer is freed whether or not the call succeeded
+    return found
+
+
 def find_dumps() -> list:
-    """Folders on this PC that hold a supported version: Downloads, Desktop, Documents, the home folder and the
-    top of each drive, up to two folder levels down. Only folder names and a few file sizes are read."""
+    """Folders on this PC that hold a supported version: Downloads, Desktop, Documents (under the home folder and
+    where Windows really keeps them), the home folder and the top of each drive, up to two folder levels down.
+    Only folder names and a few file sizes are read."""
     home = os.path.expanduser("~")
-    roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + [home]
+    roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + known_folders() + [home]
     if os.name == "nt":
         import string
         roots += [f"{d}:\\" for d in string.ascii_uppercase if os.path.isdir(f"{d}:\\")]
@@ -229,6 +269,34 @@ def find_dumps() -> list:
         if os.path.isdir(r):
             visit(r, 2)
     return list(found.values())
+
+
+def pick_game() -> str:
+    """--pick: choose the game folder in the system's folder dialog. Asks again until the folder is a supported
+    version; cancelling stops the build."""
+    try:
+        import tkinter
+        from tkinter import filedialog, messagebox
+        root = tkinter.Tk()
+    except Exception as e:      # no tkinter, or no display (SSH, headless Linux)
+        fail(f"The folder dialog couldn't open ({e}). Give the folder with --game.")
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        while True:
+            d = filedialog.askdirectory(parent=root, mustexist=True,
+                                        title="Choose the folder that holds MicrosoftGame.Config")
+            if not d:
+                fail("No folder chosen: choose one with --pick or --game.")
+            d = os.path.normpath(d)
+            v = match_version(d)
+            if v:
+                log(f"chose {v['title']} {v['version']} in {d}")
+                return d
+            messagebox.showwarning("Leonida", "That folder isn't a supported version of the game. Choose the "
+                                   "folder that holds MicrosoftGame.Config and the .rpf archives.", parent=root)
+    finally:
+        root.destroy()
 
 
 def choose_game() -> str:
@@ -721,18 +789,17 @@ def wave64_emulate(mode: str) -> bool:
         return True
     on = size < 64
     if not on and runtime_gpu_native64() is False:
-        log(f"shaders: smallest maximum subgroup size is {size}, but the GPU the runtime would use can't be made to "
-            "run compute and mesh shaders 64-wide (subgroupSizeControl and the stage bits): wave64 emulation on")
+        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for both "
+            "compute and mesh (fixed default size or required-size control): wave64 emulation on")
         return True
     log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
     return on
 
 
 def runtime_gpu_native64():
-    """True or False as tools/vk_subgroup_info.py answers for the GPU the runtime would use (the same test as
-    vk_pipeline_check's can_require_sg: subgroupSizeControl, and compute and mesh in requiredSubgroupSizeStages),
-    or None when it can't tell. It only ever turns emulation on: vulkaninfo's maxSubgroupSize alone doesn't say
-    that a 64-wide subgroup can be requested."""
+    """Whether current translated shaders can use native wave64 on the GPU the runtime would use, or None when
+    the Vulkan query cannot tell. For the current SPIR-V 1.5 modules, either a fixed default size of 64 in both
+    stages or required-size support for both compute and mesh avoids emulation."""
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
                            capture_output=True, text=True, timeout=60)
@@ -913,7 +980,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     if not os.path.isfile(ogg_done):
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
-        py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg)
+        py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))
         mark(ogg_done, "awc_opus.py")
     if wav:
         if not os.path.isdir(ogg):
@@ -963,7 +1030,9 @@ def decode_xma(ff: str, xma_dir: str) -> None:
     for src in sorted(todo):
         dst = src[:-8] + ".wav"
         tmp = dst + ".part"
-        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp])
+        # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
+        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
+                           stdin=subprocess.DEVNULL)
         if r.returncode == 0 and os.path.isfile(tmp):
             os.replace(tmp, dst)
         else:
@@ -1044,7 +1113,11 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
     os.makedirs(out, exist_ok=True)
     for built in artifacts:
-        shutil.copy2(built, out)
+        # --runtime-build may be the output folder itself (a runtime build unpacked where the port goes): the
+        # files are in place then, and copying a file onto itself raises SameFileError.
+        if not os.path.exists(os.path.join(out, os.path.basename(built))) or \
+                not os.path.samefile(built, os.path.join(out, os.path.basename(built))):
+            shutil.copy2(built, out)
     with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8") as f:
         f.write(os.path.abspath(game))
     start = os.path.join(out, "gta6rt.exe")
@@ -1102,6 +1175,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
+    ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
     ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
@@ -1140,6 +1214,8 @@ def main() -> int:
         for s in stages:
             if s not in STAGES:
                 ap.error(f"--stages: unknown stage '{s}' (choose from: {','.join(STAGES)})")
+    if a.pick and a.game:
+        ap.error("--pick and --game both choose the game folder: give one")
     below_normal()
     if a.find:
         found = find_dumps()
@@ -1147,7 +1223,7 @@ def main() -> int:
             print(f"{d}  ({v['title']} {v['version']})")
         print(f"{len(found)} found")
         return 0
-    game = os.path.abspath(a.game or choose_game())
+    game = os.path.abspath(a.game or (pick_game() if a.pick else choose_game()))
     v = check(game, a.full_check)
     if a.check:
         return 0

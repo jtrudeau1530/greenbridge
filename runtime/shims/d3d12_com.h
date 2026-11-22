@@ -16,6 +16,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
 
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -192,7 +193,15 @@ public:
 
     // `back_buffer` is a colour texture in D3D12's PRESENT state. sync_interval 0 presents without vsync.
     // S_OK also covers a skipped present while the window is minimised.
-    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval);
+    // `src_rect` (when not null) limits the blit to that part of the texture, which is stretched to the window.
+    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr);
+    // A black frame, nothing read (PresentX with no planes).
+    HRESULT present_blank(UINT sync_interval);
+    // Screenshot support for tests: every presented frame is also copied to host memory (call before presenting).
+    bool enable_capture();
+    // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
+    void set_abort(std::function<bool()> abort);
+    bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format);
     VkExtent2D extent() const;
     std::uint64_t presented() const;
 

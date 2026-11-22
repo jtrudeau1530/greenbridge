@@ -34,7 +34,7 @@ class AudioWavTest(unittest.TestCase):
         os.makedirs(os.path.dirname(self.src))
         subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
                         "sine=frequency=440:sample_rate=48000:duration=1",
-                        "-ac", "1", "-c:a", "libopus", self.src], check=True)
+                        "-ac", "1", "-c:a", "libopus", self.src], stdin=subprocess.DEVNULL, check=True)
         self.out = os.path.join(self.dir, "wav")
         self.dst = os.path.join(self.out, "one.wav")
 
@@ -75,14 +75,14 @@ class AudioWavTest(unittest.TestCase):
                     tone = f"sine=frequency={hz}:sample_rate=48000:duration={ms / 1000}"
                     link = subprocess.check_output([FFMPEG, "-v", "error", "-f", "lavfi", "-i", tone,
                                                     "-c:a", "libopus", "-fflags", "+bitexact", "-serial_offset",
-                                                    str(serial), "-f", "ogg", "pipe:1"])
+                                                    str(serial), "-f", "ogg", "pipe:1"], stdin=subprocess.DEVNULL)
                     self.assertEqual(int.from_bytes(link[14:18], "little"), serial)
                     links.append(link)
                 src = Path(self.dir, name + ".ogg")
                 src.write_bytes(b"".join(links))
                 reference = os.path.join(self.dir, "reference.wav")
                 subprocess.run([FFMPEG, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", reference],
-                               check=True, capture_output=True)
+                               stdin=subprocess.DEVNULL, check=True, capture_output=True)
                 with wave.open(reference, "rb") as w:
                     self.assertEqual(w.getnframes(), sum(ms for _, ms in tones) * 48)
                     pcm = w.readframes(w.getnframes())
@@ -118,8 +118,9 @@ class AudioWavTest(unittest.TestCase):
         tagged = os.path.join(self.dir, "tagged.wav")
         silent = os.path.join(self.dir, "silent.wav")
         subprocess.run([FFMPEG, "-v", "error", "-i", self.dst, "-c:a", "copy", "-metadata", "comment=other", tagged],
-                       check=True)
-        subprocess.run([FFMPEG, "-v", "error", "-i", self.dst, "-af", "volume=0", silent], check=True)
+                       stdin=subprocess.DEVNULL, check=True)
+        subprocess.run([FFMPEG, "-v", "error", "-i", self.dst, "-af", "volume=0", silent],
+                       stdin=subprocess.DEVNULL, check=True)
         expected = audio_wav.audio_digest(FFMPEG, self.src, source=True)
         self.assertIsNotNone(expected)
         self.assertEqual(audio_wav.audio_digest(FFMPEG, tagged, source=False), expected)
@@ -135,7 +136,7 @@ class AudioWavTest(unittest.TestCase):
         if not os.path.exists(os.path.join(self.out, "caseprobe")):
             second = os.path.join(src_dir, "Track.opus")  # a lexical collision on a case-sensitive test volume
         subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=1",
-                        "-c:a", "libopus", second], check=True)
+                        "-c:a", "libopus", second], stdin=subprocess.DEVNULL, check=True)
         shared = os.path.join(self.out, "Track.wav")
         occupied = os.path.join(self.out, os.path.basename(second) + ".wav")
         for name in (shared, occupied):
@@ -202,7 +203,7 @@ class AudioWavTest(unittest.TestCase):
     def test_unlabelled_quad_pcm_matches_without_guessing_a_speaker_layout(self):
         src, dst = (os.path.join(self.dir, name) for name in ("quad.ogg", "quad.wav"))
         subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=quad", "-t", "0.12",
-                        "-c:a", "libopus", "-mapping_family", "255", src], check=True)
+                        "-c:a", "libopus", "-mapping_family", "255", src], stdin=subprocess.DEVNULL, check=True)
         with open(src, "rb") as f:
             header = f.read(512)
         self.assertEqual(header[header.index(b"OpusHead") + 18], 255)
@@ -216,7 +217,7 @@ class AudioWavTest(unittest.TestCase):
         for layout in ("5.1", "5.1(side)"):
             path = os.path.join(self.dir, layout + ".wav")
             subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=" + layout, "-t", "0.1",
-                            "-c:a", "pcm_s16le", path], check=True)
+                            "-c:a", "pcm_s16le", path], stdin=subprocess.DEVNULL, check=True)
             signatures.append(audio_wav.audio_digest(FFMPEG, path, source=False))
         self.assertNotIn(None, signatures)
         self.assertNotEqual(*signatures)
@@ -344,6 +345,37 @@ else:
     with open(args[-1], "wb") as f:
         f.write(data)
 """
+
+# FAKE_FFMPEG that also logs what it could read from its stdin, one line per run, to $FAKE_FFMPEG_STDIN_LOG.
+STDIN_LOGGING_FFMPEG = FAKE_FFMPEG + """
+with open(os.environ["FAKE_FFMPEG_STDIN_LOG"], "a", encoding="utf-8") as log:
+    log.write(repr(sys.stdin.buffer.read() if sys.stdin else b"") + "\\n")
+"""
+
+
+def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
+    """Write source as a Python script and return an ffmpeg command for --ffmpeg that runs it."""
+    script = os.path.join(directory, "fake_ffmpeg.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(source)
+    if os.name == "nt":
+        ffmpeg = os.path.join(directory, "ffmpeg.cmd")
+        with open(ffmpeg, "w", encoding="utf-8") as f:
+            f.write(f'@"{sys.executable}" "{script}" %*\n')
+    else:
+        ffmpeg = os.path.join(directory, "ffmpeg")
+        with open(ffmpeg, "w", encoding="utf-8") as f:
+            f.write(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+        os.chmod(ffmpeg, 0o755)
+    return ffmpeg
+
+
+def write_fake_opus_inputs(directory, names=("x.ogg", "x.opus", "y.ogg")):
+    """Ogg Opus look-alikes: enough for the tool to accept them; the fake ffmpeg never parses them."""
+    os.makedirs(directory)
+    for name in names:
+        with open(os.path.join(directory, name), "wb") as f:
+            f.write(b"OggS" + b"\0" * 24 + b"OpusHead" + bytes(64))
 
 
 class SameStemTest(unittest.TestCase):
@@ -491,22 +523,8 @@ class FakeFfmpegDecodeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in")
             out = os.path.join(tmp, "out")
-            os.makedirs(src)
-            for name in ("x.ogg", "x.opus", "y.ogg"):
-                with open(os.path.join(src, name), "wb") as f:
-                    f.write(b"OggS" + b"\0" * 24 + b"OpusHead" + bytes(64))
-            script = os.path.join(tmp, "fake_ffmpeg.py")
-            with open(script, "w", encoding="utf-8") as f:
-                f.write(FAKE_FFMPEG)
-            if os.name == "nt":
-                ffmpeg = os.path.join(tmp, "ffmpeg.cmd")
-                with open(ffmpeg, "w", encoding="utf-8") as f:
-                    f.write(f'@"{sys.executable}" "{script}" %*\n')
-            else:
-                ffmpeg = os.path.join(tmp, "ffmpeg")
-                with open(ffmpeg, "w", encoding="utf-8") as f:
-                    f.write(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
-                os.chmod(ffmpeg, 0o755)
+            write_fake_opus_inputs(src)
+            ffmpeg = write_fake_ffmpeg(tmp)
 
             run = [sys.executable, "-I", TOOL, src, "--out", out, "--jobs", "3", "--ffmpeg", ffmpeg]
             p = subprocess.run(run, capture_output=True, text=True)
@@ -522,6 +540,29 @@ class FakeFfmpegDecodeTest(unittest.TestCase):
             p = subprocess.run(run, capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("0 WAV written, 3 already present", p.stdout)
+
+    def test_ffmpeg_gets_no_stdin(self):
+        # ffmpeg reads stdin for key commands. Given the caller's stdin, it stops a run in the background of a
+        # terminal ("Stopped (tty output)") and swallows input piped to the caller, such as a shell loop's file list.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            write_fake_opus_inputs(src)
+            log = os.path.join(tmp, "stdin.log")
+            env = dict(os.environ, FAKE_FFMPEG_STDIN_LOG=log)
+            run = [sys.executable, "-I", TOOL, src, "--out", os.path.join(tmp, "out"), "--jobs", "1",
+                   "--ffmpeg", write_fake_ffmpeg(tmp, STDIN_LOGGING_FFMPEG)]
+            # The first run decodes; the second checks the WAVs of the inputs that share a name (audio_digest).
+            for step, summary in (("decode", "3 WAV written"), ("resume check", "0 WAV written, 3 already present")):
+                with self.subTest(step):
+                    if os.path.exists(log):
+                        os.remove(log)
+                    p = subprocess.run(run, input="tests/test_next.py\n", capture_output=True, text=True, env=env)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn(summary, p.stdout)
+                    with open(log, encoding="utf-8") as f:
+                        reads = f.read().splitlines()
+                    self.assertTrue(reads, "the fake ffmpeg never ran")
+                    self.assertEqual(reads, ["b''"] * len(reads))
 
 
 class AudioWavCliTest(unittest.TestCase):

@@ -411,8 +411,13 @@ def test_ms_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     assert "OpMemberDecorate %ms_vtx_blk 1 BuiltIn ClipDistance" in spvasm
     assert f"%ms_arr_clip = OpTypeArray %float %c{n_comp}" in spvasm
     chains = re.findall(r"OpAccessChain %_ptr_Function_float %ms_clip %c(\d+)", spvasm)
-    assert [int(x) for x in chains] == list(range(n_comp))
+    assert [int(x) for x in chains] == list(range(n_comp)) * 2   # the export writes, then the copy to the output
     assert _vgpr_to_index_map(spvasm, "%ms_clip", "%_ptr_Function_float") == {i: 10 + i for i in range(n_comp)}
+    # Copied to the mesh output one float at a time: SPIRV-Cross turns a whole-array store there into a C array
+    # assignment that Metal rejects (SHADER-155).
+    out_chains = re.findall(r"OpAccessChain %_ptr_Out_float_ms %ms_out_vtx %mli %c1 %c(\d+)", spvasm)
+    assert [int(x) for x in out_chains] == list(range(n_comp))
+    assert "OpLoad %ms_arr_clip" not in spvasm
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
     assert "shaderClipDistance" in meta["features"]
     assert 1 not in meta.get("outputs", [])
@@ -1286,6 +1291,31 @@ def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
     memory = {0x1000: 0}
     _load_mini_interp().run_fragment(shader.translate(), memory=memory)
     assert memory[0x1000] == 0xFFC01000
+
+
+@pytest.mark.parametrize("fmt, shifts, channels", [(56, (0, 8, 16, 24), (64, 128, 191, 255)),
+                                                (50, (0, 10, 20, 30), (256, 512, 767, 3))])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("components", [1, 4])
+@pytest.mark.parametrize("bgra", [False, True])
+def test_buffer_store_format_bgra(fmt, shifts, channels, packed, components, bgra, make_shader):
+    # gfx1036 writes the red source into the third field of the BGRA view, even for store_format_x.
+    values = (0x38003400, 0x3c003a00) if packed else (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000)
+    order = (2, 1, 0, 3) if bgra else (0, 1, 2, 3)
+    selectors = sum((4 + channel) << (3 * i) for i, channel in enumerate(order))
+    inputs = "".join(f"v_mov_b32 v{4 + i}, {value:#x}\n" for i, value in enumerate(values))
+    regs = "v4" if components == 1 else ("v[4:5]" if packed else "v[4:7]")
+    op = "buffer_store_format_" + ("d16_" if packed else "") + "xyzw"[:components]
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 4\n"
+           f"s_mov_b32 s3, {0x31000000 | fmt << 12 | selectors:#x}\n" + inputs +
+           f"{op} {regs}, off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_bgra")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000: 0xdeadbeef}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    expected = sum(channels[c] << shift for c, shift in zip(order, shifts) if c < components)
+    assert memory[0x1000] == expected
 
 
 def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
