@@ -691,6 +691,18 @@ int main() {
         EXPECT(sampler.address_u == g::AddressMode::wrap && sampler.address_v == g::AddressMode::clamp_last_texel &&
                sampler.address_w == g::AddressMode::clamp_last_texel);
         EXPECT(sampler.compare == g::CompareFunction::never && sampler.min_lod == 0.0f && sampler.max_lod > 14.9f);
+        // Two literal S#s, as a shader builds from immediates: the same wrapping sampler with other LOD ranges, so
+        // other keys. The first is registered without a heap slot (twice: the second time changes nothing), the
+        // second not, so a shader finds the first and gets the fallback for the second.
+        g::Sampler literal = sampler;
+        literal.max_lod = 4.0f;
+        const g::SamplerWords literal_words = g::encode(literal);
+        literal.max_lod = 5.0f;
+        const g::SamplerWords unregistered_words = g::encode(literal);
+        EXPECT(literal_words != sampler_words && unregistered_words != literal_words);
+        EXPECT(rt::d3d12::register_samplers(device.p, {&literal_words, 1}) == S_OK);
+        EXPECT(rt::d3d12::register_samplers(device.p, {&literal_words, 1}) == S_OK);
+        EXPECT(rt::d3d12::register_samplers(nullptr, {&literal_words, 1}) == E_INVALIDARG);
 
         // The UINT texture's view in slot 0, and three border samplers after the first: UINT (0,0,0,0) and
         // (1,1,1,1) from CreateSampler2, which the proxy does not have (the inner device does), and float white.
@@ -1227,6 +1239,24 @@ int main() {
         }
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
+        {
+            // The registered literal S# wraps (the texture, texel for texel); the other one clamps as the fallback
+            // sampler does (the right edge).
+            SampleKeys literal_keys[2] = {keys[0], keys[0]};
+            std::memcpy(literal_keys[0].ssharp, literal_words.data(), sizeof(literal_keys[0].ssharp));
+            std::memcpy(literal_keys[1].ssharp, unregistered_words.data(), sizeof(literal_keys[1].ssharp));
+            literal_keys[1].first = texels;
+            std::array<std::uint8_t, 2 * bytes> literal_pixels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, literal_keys, literal_pixels.data()));
+            UINT wrapped = 0, clamped = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                wrapped += std::memcmp(literal_pixels.data() + 4 * i, texel(i % size, i / size).data(), 4) == 0;
+                clamped += std::memcmp(literal_pixels.data() + bytes + 4 * i, texel(size - 1, i / size).data(), 4) == 0;
+            }
+            std::printf("literal S#s: registered %u/%u texels wrapped, unregistered %u/%u clamped\n", wrapped, texels,
+                        clamped, texels);
+            EXPECT(wrapped == texels && clamped == texels);
+        }
         if (bc.p) {
             SampleKeys bc_key = keys[0];
             std::memcpy(bc_key.tsharp, view_bytes(null_slot), sizeof(bc_key.tsharp));

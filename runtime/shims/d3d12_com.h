@@ -13,7 +13,10 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
+
+#include <span>
 
 namespace rt::d3d12 {
 
@@ -147,6 +150,11 @@ bool device_upload_in_vram(ID3D12Device* device);
 // brought up to date at every ExecuteCommandLists.
 VkDescriptorSet bindless_set(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
+// Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
+// the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
+// already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
+// registered (no bindless set, or its sampler array is full), the others are registered all the same.
+HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers);
 // True when GetClockCalibration on `queue` reads calibrated timestamps, false when it submits a timestamp query
 // (or `queue` is not one of this module's queues). For tests.
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
