@@ -1137,6 +1137,11 @@ The trace will enumerate them.
   on the PC runtime, so none here either. Texture sizes are the driver's on both runtimes, so only buffer sizes,
   alignments and invalid descriptions are compared with the host. One known difference: a mip count beyond the
   full chain is invalid here (Vulkan can't create it), while the PC runtime still answers with a size.
+  A total over several resources that passes 2^64 saturates at `0xFFFFFFFFFFFF0000` here. Hosts disagree on it:
+  WARP and the RTX 5070 host of #1204 saturate too, while on Windows 26300.9974 (D3D12Core 10.0.26100.9818) the
+  Intel Raptor Lake-S (101.7092) and RTX 5060 Laptop (621.24) hosts wrap, two 2^63 buffers to 0, and WARP on that
+  PC still saturates. A wrapped total could make a caller allocate less than one of its resources, so the layer
+  keeps saturating, and the test accepts a host that wraps.
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
   adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
   621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.

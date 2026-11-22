@@ -730,9 +730,24 @@ int compare_allocation_info(ID3D12Device* ours) {
     };
     const char* total_names[] = {"buffer + 4 KiB texture", "4x MSAA + buffer", "two 2^63 buffers",
                                  "largest buffer + buffer"};
+    // The last two overflow 2^64. Hosts disagree there: WARP and the RTX 5070/4070 SUPER hosts of #1204 saturate at
+    // 0xFFFFFFFFFFFF0000, while the Intel Raptor Lake-S (101.7092) and RTX 5060 Laptop (621.24) hosts on Windows
+    // 26300.9974 (D3D12Core 10.0.26100.9818) wrap, to 0 and 65536, and WARP on that same PC saturates. Ours is pinned
+    // to the saturated answer, which can't make a caller allocate less than one of its resources; a host whose total
+    // is below its largest resource has wrapped, and is reported rather than compared.
+    constexpr UINT64 saturated = UINT64_MAX / k64 * k64;
     for (int i = 0; i < 4; ++i) {
         const D3D12_RESOURCE_ALLOCATION_INFO x = ours->GetResourceAllocationInfo(0, 2, to_total[i]);
         const D3D12_RESOURCE_ALLOCATION_INFO y = host->GetResourceAllocationInfo(0, 2, to_total[i]);
+        if (i >= 2) {
+            if (x.SizeInBytes != saturated || x.Alignment != k64) mismatch(total_names[i], x, y);
+            else if (y.SizeInBytes < to_total[i][0].Width && y.Alignment == k64)
+                std::printf("allocation info %s: host wraps to %llu, ours saturates\n", total_names[i],
+                            (unsigned long long)y.SizeInBytes);
+            else if (y.SizeInBytes != x.SizeInBytes || y.Alignment != x.Alignment)
+                mismatch(total_names[i], x, y);
+            continue;
+        }
         if (x.SizeInBytes != y.SizeInBytes || x.Alignment != y.Alignment) mismatch(total_names[i], x, y);
     }
     const D3D12_RESOURCE_ALLOCATION_INFO empty_a = ours->GetResourceAllocationInfo(0, 0, nullptr);
