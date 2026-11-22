@@ -41,6 +41,7 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [audio.md](audio.md) | AWC banks: Opus, PCM and XMA2; lossless Ogg Opus repack and WAV paths. |
+| [rsc8_audio.md](rsc8_audio.md) | 641,428 `RSC8` v8001 resources across 4 archives: 100% AWC tag `0x5c` facial/lip-sync `crClipDictionary` paired with 48 kHz mono Opus dialogue, 0 hidden audio containers. |
 | [awc_shorts.md](awc_shorts.md) | Export short streamed-music idents/stings by duration; stereo-aware, no re-encode. |
 | [audio_config.md](audio_config.md) | The music/radio record table: 1,589 records, exact durations, AWC stream ids; no start offsets. |
 | [radio_stations.md](radio_stations.md) | Audio-config station blocks: 19 records, boundary u32, content-id lists; VCRR 80/80 mapping; no start offsets. |
