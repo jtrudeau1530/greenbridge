@@ -6,6 +6,7 @@ r"""Build the PC port from your own copy of the game.
     python -I make_game.py --pick                               # choose the game folder in a folder dialog
     python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida"
     python -I make_game.py --game "..." --check                 # only check the copy, build nothing
+    python -I make_game.py --platform ps5 --game "...\app0" --check
     python -I make_game.py --stages shaders,assets              # only some stages
 
 The game folder is your own Xbox Series package, version 1.0.2.1, with its files already readable on disk
@@ -45,6 +46,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
+from ps5_app0 import check_app0  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
@@ -1494,6 +1496,7 @@ def crashes_alone(exe: str, spirv: str, cache: str, name: str) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
+    ap.add_argument("--platform", choices=("xbox", "ps5"), default="xbox", help="input platform (default xbox)")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
     ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
@@ -1530,6 +1533,17 @@ def main() -> int:
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
     a = ap.parse_args()
+    if a.platform == "ps5":
+        if not a.game or not a.check or a.find or a.pick:
+            ap.error("PS5 currently requires --game <app0> --check")
+        if any((a.out, a.work, a.stages, a.runtime_build, a.full_check, a.wav)):
+            ap.error("PS5 currently supports only the read-only app0 check")
+        try:
+            title = check_app0(a.game)
+        except (OSError, ValueError) as error:
+            fail(str(error))
+        log(f"PS5 app0 check passed for {title} (ELF and title metadata)")
+        return 0
     stages = STAGES
     if a.stages is not None:
         stages = [s.strip() for s in a.stages.split(",") if s.strip()]

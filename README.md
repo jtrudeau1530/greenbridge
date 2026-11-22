@@ -58,6 +58,16 @@ work on booting can start as soon as one is available to a developer.
 | Ray tracing (BVH) | ⚠️ In progress. `BuildRaytracingAccelerationStructure` builds BLASes and TLASes on the GPU in the console's XDXR BVH4 layout, which the translated shaders walk themselves (`image_bvh_intersect_ray`, TRI0/TRI1 leaves); `LEONIDA_RT_AS=khr` uses Vulkan's own acceleration structures instead. The build descriptions are recovered from the package's `XboxBvhBuilder.dll` ([notes](docs/xdxr.md)). The game's `*_bvh4.rpf` packs are measured: offline-built, dehydrated BLASes that rehydrate through that DLL with their geometry from the drawables in `levels.rpf` ([notes](docs/bvh.md)). Not done in the builder: TRI1 pairing, BOX16 nodes, serialization. Open: whether the game rehydrates the packs or rebuilds them, and the XDXR-vs-KHR default ([#313](https://github.com/ItsNotRexed/Leonida/issues/313)) |
 
 
+## PS5 input check
+
+The experimental PS5 mode inspects an explicitly supplied, readable `app0` directory. It checks the x86-64 ELF program headers in `eboot.bin` and the PlayStation 5 title ID in `sce_sys/param.json`.
+
+```powershell
+python -I make_game.py --platform ps5 --game "D:\path\to\app0" --check
+```
+
+The check requires an ELF executable and reports SELF containers as unsupported input. It reads the input in place. PS5 module loading, asset and shader conversion, and runtime setup remain separate work.
+
 ## How to build
 
 The port isn't downloaded ready-made. It's built on your PC from your own copy.
