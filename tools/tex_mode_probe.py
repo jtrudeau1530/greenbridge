@@ -108,7 +108,10 @@ def main():
             align = 1 << bb
             top = mip_bytes(t["w"], t["h"], bpe, align)
             chain = sum(mip_bytes(max(1, t["w"] >> i), max(1, t["h"] >> i), bpe, align) for i in range(max(1, mips)))
-            for place, start in (("first", t["data_off"]), ("last", t["data_off"] + chain - top)):
+            placements = [("first", t["data_off"])]
+            if chain != top:
+                placements.append(("last", t["data_off"] + chain - top))
+            for place, start in placements:
                 o = offsets_for(list(eq), bb, bpe, wb, hb)
                 seg = G[start:start + (int(o.max()) + 1) * bpe]
                 if len(seg) < (int(o.max()) + 1) * bpe:
