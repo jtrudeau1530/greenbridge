@@ -412,6 +412,13 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         with open(out, encoding="utf-8") as f:
             summary = json.load(f)
+        limited = os.path.join(self.tmp.name, "limited.json")
+        limited_lights = os.path.join(self.tmp.name, "limited.jsonl")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(T.main([self.rpf, "--limit", "0x1000", "--out", limited,
+                                     "--entities", self.entities, "--lights-out", limited_lights]), 0)
+        with open(limited, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), summary)
         with open(lights, encoding="utf-8") as f:
             rows = [json.loads(line) for line in f]
         self.assertEqual(len(rows), 1 + 4)                            # one entity light, 2 x 2 archetype lights
@@ -426,7 +433,12 @@ class ScanTest(unittest.TestCase):
             self.assertEqual(T.main([os.path.join(self.tmp.name, "missing.rpf")]), 2)
             self.assertEqual(T.main([self.rpf, "--jobs", "0"]), 2)
             self.assertEqual(T.main([self.rpf, "--entities", os.path.join(self.tmp.name, "none.jsonl")]), 2)
-        self.assertEqual(len(err.getvalue().strip().splitlines()), 3)
+            self.assertEqual(T.main([self.rpf, "--limit", "0"]), 2)
+            self.assertEqual(T.main([self.rpf, "--limit", "-1"]), 2)
+        lines = err.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(lines[3], "ERROR: --limit must be at least 1")
+        self.assertEqual(lines[4], "ERROR: --limit must be at least 1")
 
 
 if __name__ == "__main__":
