@@ -3900,6 +3900,27 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
 
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+    // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
+    // Translated shaders built with `rdna2spirv.py --fma khr` need it (index capability FMAKHR, feature
+    // shaderFmaFloat32); when it is missing they must not be created, so use `--fma glsl` there.
+    VkPhysicalDeviceShaderFmaFeaturesKHR shader_fma{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_KHR_SHADER_FMA_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &shader_fma};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.shader_fma = shader_fma.shaderFmaFloat32 == VK_TRUE;
+        if (info.shader_fma) {
+            shader_fma.pNext = enable13.pNext;
+            enable13.pNext = &shader_fma;
+        }
+    }
+#endif
+    if (!info.shader_fma)
+        std::fprintf(stderr, "[rt] d3d12: no VK_KHR_shader_fma (shaderFmaFloat32); shaders translated with --fma khr "
+                             "(OpFmaKHR) will be refused, use --fma glsl\n");
+
     // GetClockCalibration reads both clocks at once with calibrated timestamps (KHR, or the older EXT).
     const char* calibrated = nullptr;
     for (const char* name :
@@ -3918,6 +3939,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+    if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+#endif
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);

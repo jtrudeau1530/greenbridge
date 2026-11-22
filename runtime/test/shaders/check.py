@@ -145,6 +145,11 @@ GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
+# them; the words are the exact fused results (derivations in the .asm header). The same with --fma glsl and --fma khr
+# (LEONIDA_FMA=khr for build.py): GLSL Fma may be split into two roundings by a driver, OpFmaKHR may not.
+FMA_FUSED_ENV = {"VKC_SGPRS": "0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002"}
+FMA_FUSED = [0x33800000, 0xa8800000, 0x3a000400, 0x33800000, 0x33800000, 0x33800000, 0x28800000, 0x00007351]
 # cs_cvt_f32_sat.asm (#300): s4 is a binary32 input, out[0] = v_cvt_u32_f32, out[1] = v_cvt_i32_f32 (truncate,
 # saturate, NaN -> 0). One dispatch per input through VKC_SGPRS; the inputs of tests/semantic/test_float_to_int.py.
 CVT_F32_SAT_CASES = (
@@ -882,6 +887,8 @@ def main():
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
+    results.append(("cs_fma_fused", compute_test(tools, spirv, "cs_fma_fused", "1", "dump", expected_words=FMA_FUSED,
+                                                 env=FMA_FUSED_ENV)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))

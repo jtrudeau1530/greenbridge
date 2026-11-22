@@ -13,6 +13,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
+#include "vk_shader_fma.h"
 
 #include <cctype>
 #include <cstddef>
@@ -192,8 +193,16 @@ int main(int argc, char** argv) {
                      argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         return 77;
     }
+    // OpFmaKHR (rdna2spirv.py --fma khr) needs VK_KHR_shader_fma; the fragment shader decides whether it is refused.
+    leonida::vk_test::ShaderFma fma;
+    fma.query(gipa, inst, pd);
+    if (!fma.accepts(fs_code.data(), fs_code.size() * 4, argv[2])) return 77;
     std::vector<const char*> enable;
     void* chain = nullptr;
+    if (fma.supported()) {
+        enable.push_back(fma.extension());
+        fma.features.pNext = chain; chain = &fma.features;
+    }
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {

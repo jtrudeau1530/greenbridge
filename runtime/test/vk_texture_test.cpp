@@ -22,6 +22,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
+#include "vk_shader_fma.h"
 
 #include <algorithm>
 #include <cmath>
@@ -180,6 +181,9 @@ int main(int argc, char** argv) {
         return 77;
     }
     std::vector<const char*> enable;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
+    fma.query(gipa, inst, pd);
+    if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
     // Older Vulkan headers (as on some CI images) do not declare maintenance8; the test is then unsupported.
