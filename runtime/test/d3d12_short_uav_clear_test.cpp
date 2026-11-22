@@ -111,13 +111,15 @@ int main() {
     std::printf("short UAV clear reference: %s\n", adapter.c_str());
     copycmp::Run a, b;
     if (!a.init(ours.p, true) || !b.init(host.p, false)) return 1;
-    const UINT half = std::bit_cast<UINT>(0.5f);
+    // Avoid a conversion midpoint in portable comparisons: native NVIDIA clears 0.5 to 0x7f/0x7fff,
+    // where WARP/AMD clear to 0x80/0x8000. Keep exact byte comparisons and test 0.5 separately against WARP.
+    const UINT quarter = std::bit_cast<UINT>(0.25f);
     const Format formats[] = {
         {DXGI_FORMAT_R8_UINT, 1, false, {0x7b, 0, 0, 0}, {0x7b, 0}},
         {DXGI_FORMAT_R16_UINT, 2, false, {0xbeef, 0, 0, 0}, {0xef, 0xbe}},
         {DXGI_FORMAT_R8G8_UINT, 2, false, {0x7b, 0x35, 0, 0}, {0x7b, 0x35}},
-        {DXGI_FORMAT_R8_UNORM, 1, true, {half, 0, 0, 0}, {0x80, 0}},
-        {DXGI_FORMAT_R16_UNORM, 2, true, {half, 0, 0, 0}, {0x00, 0x80}},
+        {DXGI_FORMAT_R8_UNORM, 1, true, {quarter, 0, 0, 0}, {0x40, 0}},
+        {DXGI_FORMAT_R16_UNORM, 2, true, {quarter, 0, 0, 0}, {0x00, 0x40}},
     };
     unsigned cases = 0;
     const auto check = [&](copycmp::Run& reference_run, const Format& format, UINT first, UINT count,
@@ -173,5 +175,18 @@ int main() {
     }
     std::printf("short buffer UAV clears: %u WARP-only out-of-row controls matched literal bytes; excluded from native comparisons\n",
                 cases - portable_cases);
+    const unsigned before_midpoints = cases;
+    for (auto format : formats) {
+        if (!format.floating) continue;
+        format.values[0] = std::bit_cast<UINT>(0.5f);
+        format.expected = format.bytes == 1 ? std::array<unsigned char, 2>{0x80, 0}
+                                           : std::array<unsigned char, 2>{0x00, 0x80};
+        if (!check(warp_run, format, 0, 1, {})) return 1;
+        if (!check(warp_run, format, 1, 1, {})) return 1;
+        if (!check(warp_run, format, 256 / format.bytes - 1, 1, {})) return 1;
+        if (!check(warp_run, format, 1, 8, {{0, 0, 1, 1}, {3, 0, 4, 1}, {7, 0, 8, 1}})) return 1;
+    }
+    std::printf("short buffer UAV clears: %u WARP-only UNORM midpoint controls matched literal bytes\n",
+                cases - before_midpoints);
     return vk.validation_errors() ? 1 : 0;
 }
