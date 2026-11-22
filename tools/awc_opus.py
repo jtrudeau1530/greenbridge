@@ -260,10 +260,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("out")
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--limit", type=int, help="maximum number of banks to export (default: all)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="banks to export at once (default: half the CPU count)")
     a = ap.parse_args()
+    if a.limit is not None and a.limit < 0:
+        ap.error("--limit must be non-negative")
     if os.path.isdir(a.src):
         banks = []
         for root, _, files in os.walk(a.src):
@@ -273,7 +275,8 @@ def main() -> int:
         banks.sort()
     else:
         banks = [(a.src, a.out)]
-    banks = banks[: a.limit] if a.limit else banks
+    if a.limit is not None:
+        banks = banks[:a.limit]
     tot = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     jobs = max(1, a.jobs)
 

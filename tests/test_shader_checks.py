@@ -1,4 +1,5 @@
 """Exercise the synthetic Vulkan test runner without a Vulkan device."""
+import ast
 import contextlib
 import io
 import struct
@@ -25,13 +26,29 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 # tests, pixel tests, the two-mip draw and three mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
-         + 7)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32 and both texture draws
+         + 9)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, both texture draws, cs_user_sgprs and cs_cvt_f32_sat
+CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
+
+
+def cvt_answer(env, wrong_for=None):
+    """A device running cs_cvt_f32_sat on the word in VKC_SGPRS (s4 reads 0 without it)."""
+    bits = int((env or {}).get("VKC_SGPRS", "0"), 0)
+    words = [0xBAD, 0xBAD] if bits == wrong_for else CVT.get(bits, [0, 0])
+    return 0, "out[0..7] = " + " ".join(map(str, words + [0xEEEEEEEE] * 6)) + "\n"
 
 
 class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False):
-        def harness(_tool, shader, *args):
+        def harness(_tool, shader, *args, env=None):
             name = Path(shader).stem
+            if name == "cs_user_sgprs":
+                # The seeded words come back only if check.py passed them in VKC_SGPRS.
+                seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
+                words = check.USER_SGPRS_WORDS if seeded else [0] * 4 + [0xEEEEEEEE] * 4
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
+            if name == "cs_cvt_f32_sat":
+                return cvt_answer(env)
+            self.assertNotIn("VKC_SGPRS", env or {})
             if name in PARTIAL:
                 self.assertNotIn("--require-wave64", args)
                 words = (WAVE64_DUMPS[name] + [0] * 8)[:8]
@@ -143,6 +160,38 @@ class Wave64Checks(unittest.TestCase):
         status, out = self.run_checks(unsupported, unsupported, missing_ballot=True)
         self.assertEqual(status, 1, out)
         self.assertIn("missing cs_wave64_ballot.spv", out)
+
+
+class FloatToIntSweep(unittest.TestCase):
+    """check.cvt_f32_sat_test sends each input in VKC_SGPRS and judges both words of every dispatch."""
+
+    def sweep(self, wrong_for=None):
+        sent = []
+
+        def harness(_tool, shader, *_args, env=None):
+            self.assertEqual(Path(shader).stem, "cs_cvt_f32_sat")
+            sent.append(int(env["VKC_SGPRS"], 0))
+            return cvt_answer(env, wrong_for)
+
+        with patch.object(check, "run", side_effect=harness):
+            return check.cvt_f32_sat_test("tools", "spirv"), sent
+
+    def test_every_input_is_sent_and_exact(self):
+        problem, sent = self.sweep()
+        self.assertEqual(problem, "")
+        self.assertEqual(sent, [bits for bits, _, _ in check.CVT_F32_SAT_CASES])
+
+    def test_one_wrong_input_fails_and_is_named(self):
+        problem, _ = self.sweep(wrong_for=0x4F000000)
+        self.assertIn("1 of 16 inputs wrong", problem)
+        self.assertIn("0x4f000000", problem)
+
+    def test_inputs_match_the_interpreter_test(self):
+        # The GPU sweep and tests/semantic/test_float_to_int.py must judge the same inputs the same way.
+        src = (Path(__file__).resolve().parent / "semantic" / "test_float_to_int.py").read_text(encoding="utf-8")
+        cases = next(ast.literal_eval(n.value) for n in ast.walk(ast.parse(src))
+                     if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "CASES")
+        self.assertEqual(tuple(cases), check.CVT_F32_SAT_CASES)
 
 
 class MeshWorkgroupChecks(unittest.TestCase):
@@ -396,3 +445,22 @@ class Wave32LaneDumps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PixelTestRegistry(unittest.TestCase):
+    def test_pixel_tests_include_every_pixel_fixture(self):
+        # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.
+        for name in ("ps_texoff", "ps_wqm", "ps_scc_mask32"):
+            with self.subTest(name=name):
+                self.assertIn(name, check.PIXEL_TESTS)
+        self.assertEqual(len(check.PIXEL_TESTS), len(set(check.PIXEL_TESTS)))
+
+    def test_pixel_test_runs_the_harness_once(self):
+        # A duplicated pixels() line ran the whole shader twice and could hide a first-call failure behind a
+        # second-call success.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_legacy_mul.spv").touch()
+            want = check.PIXEL_BITS["ps_legacy_mul"]
+            with patch.object(check, "pixels", return_value=([want], "")) as pixels:
+                self.assertEqual(check.pixel_test("tools", tmp, "ps_legacy_mul"), "")
+            self.assertEqual(pixels.call_count, 1)

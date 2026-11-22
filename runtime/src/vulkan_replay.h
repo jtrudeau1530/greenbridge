@@ -19,15 +19,19 @@
 // - images cleared without rectangles have TRANSFER_DST usage; images cleared with rectangles have attachment usage
 //   and image_view must return views for them (dynamicRendering, Vulkan 1.3); reinterpreted whole-view clears
 //   use the same attachment path because vkCmdClearColorImage has no view-format argument;
-// - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3).
+// - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3);
+// - unordered-access clears need fill_buffer, update_buffer and copy_buffer for buffers; texture views cleared with
+//   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment).
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
 #include "depth24.h"
+#include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -64,6 +68,7 @@ struct ResourceBinding {
     // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
     // (depth24.h) and clears quantise to 24 bits.
     bool depth24_as_float = false;
+    bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
 };
 
 struct VulkanAccess {
@@ -377,8 +382,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R32G32_SINT: return {8, 1};
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
     case VK_FORMAT_A2B10G10R10_UINT_PACK32:
-    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
     case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_R8G8B8A8_SNORM:
@@ -583,6 +588,8 @@ struct ReplayFunctions {
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
+    PFN_vkCmdFillBuffer fill_buffer = nullptr;                  // unordered-access buffer clears, with copy_buffer
+    PFN_vkCmdUpdateBuffer update_buffer = nullptr;
     // VK_EXT_conditional_rendering: SetPredication. The predicate buffer must have been created with
     // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
     PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
@@ -625,6 +632,9 @@ struct Prepared {
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
     Depth24Job depth24;                    // the whole copy: where its scratch floats are
     std::vector<Depth24Job> depth24_parts;  // the dispatches that convert it
+    uav_clear::Element element;                      // unordered-access clears: one element of the view's format
+    VkClearColorValue clear_color{};                 // ... the value that writes it into the image
+    std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
 };
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
@@ -689,9 +699,7 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     default: return VK_FORMAT_UNDEFINED;
     }
     if (!resource.rgba8_typeless) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.mip_levels != 1 || resource.array_layers != 1 ||
-        resource.volume || resource.depth != 1 || resource.samples != 1 ||
-        target.mip || target.first_layer || target.layer_count != 1)
+    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1 || resource.samples != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
 }
@@ -699,6 +707,14 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
                        VkImageSubresourceRange& out) {
     if (view.mip >= resource.mip_levels) return false;
+    if (resource.volume) {
+        const auto depth = std::max(1u, resource.depth >> view.mip);
+        if (aspects != VK_IMAGE_ASPECT_COLOR_BIT || view.first_layer >= depth ||
+            !view.layer_count || view.layer_count > depth - view.first_layer) return false;
+        // Layouts and transfers address one array layer for the whole 3D mip.
+        out = {aspects, view.mip, 1, 0, 1};
+        return true;
+    }
     if (view.first_layer >= resource.array_layers || view.layer_count > resource.array_layers - view.first_layer)
         return false;
     out = {aspects, view.mip, 1, view.first_layer, view.layer_count};
@@ -729,7 +745,13 @@ inline std::vector<VkClearRect> clip(std::span<const Rect> rects, VkExtent2D ext
     return out;
 }
 
-inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkImage image,
+// A D3D12 barrier on a volume mip covers every W slice, including on devices with maintenance9.
+inline VkImageSubresourceRange layout_range(const ResourceBinding& resource, VkImageSubresourceRange range) {
+    if (resource.volume) range.layerCount = VK_REMAINING_ARRAY_LAYERS;
+    return range;
+}
+
+inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                           const VkImageSubresourceRange& range, VkImageLayout old_layout, VkImageLayout new_layout,
                           VkAccessFlags src_access, VkPipelineStageFlags src_stages, VkAccessFlags dst_access,
                           VkPipelineStageFlags dst_stages) {
@@ -741,8 +763,8 @@ inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buf
     barrier.newLayout = new_layout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange = range;
+    barrier.image = resource.image;
+    barrier.subresourceRange = layout_range(resource, range);
     vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
@@ -775,11 +797,11 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         // Vulkan cannot clear block-compressed images; those start undefined (applications upload them first).
         const bool compressed = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1;
         if (resource.not_zeroed || compressed) {
-            image_barrier(vk, command_buffer, resource.image, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
+            image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         } else {
             const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            image_barrier(vk, command_buffer, resource.image, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
+            image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_TRANSFER_BIT);
             if (piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -789,7 +811,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
                 const VkClearDepthStencilValue zero{};
                 vk.clear_depth_stencil_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
             }
-            image_barrier(vk, command_buffer, resource.image, piece.range, dst, layout, VK_ACCESS_TRANSFER_WRITE_BIT,
+            image_barrier(vk, command_buffer, resource, piece.range, dst, layout, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         }
         piece.layout = layout;
@@ -799,6 +821,87 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
 
 inline bool within(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
     return offset <= total && size <= total - offset;
+}
+
+// The bytes of a buffer UAV clear, and whether the transfer commands can write them. Elements of up to 4 bytes
+// repeat in every aligned word, so vkCmdFillBuffer writes the aligned middle and copies from it the unaligned ends
+// (vkCmdCopyBuffer has no alignment rule); that needs one whole word in the middle. Wider elements are written
+// with vkCmdUpdateBuffer and doubled with copies, which needs a word-aligned range.
+inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, Prepared& p) {
+    const UavView& view = clear.view;
+    if (!p.binding.buffer || p.binding.image) return ReplayResult::invalid_clear;
+    if (view.offset >= p.binding.size) return ReplayResult::invalid_subresource;
+    // A V# may reach past the end of the buffer (the hardware bounds-checks it); the clear stops at the end.
+    const std::uint64_t size = std::min(view.size, p.binding.size - view.offset);
+    if (view.format) {
+        if (!uav_clear::encode(VkFormat(view.format), clear.is_float, clear.values, p.element))
+            return ReplayResult::unsupported;
+        if (view.element_size != p.element.size) return ReplayResult::invalid_clear;
+    } else {
+        p.element = uav_clear::raw_element(clear.values);
+    }
+    const std::uint32_t e = p.element.size;
+    const auto add = [&](std::uint64_t offset, std::uint64_t bytes) {
+        if (!bytes) return ReplayResult::success;
+        if (offset % std::min(e, 4u)) return ReplayResult::invalid_clear;
+        if (e <= 4) {
+            const std::uint64_t a0 = (offset + 3) / 4 * 4, a1 = (offset + bytes) / 4 * 4;
+            if ((a0 != offset || a1 != offset + bytes) && a1 < a0 + 4) return ReplayResult::unsupported;
+        } else if (bytes % 4) {
+            return ReplayResult::unsupported;
+        }
+        p.fills.push_back({offset, bytes});
+        return ReplayResult::success;
+    };
+    if (clear.rects.empty()) return add(view.offset, size);
+    const std::uint64_t elements = size / view.element_size;
+    for (const Rect& r : clear.rects) {
+        if (r.top > 0 || r.bottom <= 0) continue;  // a buffer has one row
+        const std::uint64_t left = std::uint64_t(std::max<std::int64_t>(r.left, 0));
+        const std::uint64_t right = std::min<std::uint64_t>(std::uint64_t(std::max<std::int64_t>(r.right, 0)), elements);
+        if (right <= left) continue;
+        if (const auto result = add(view.offset + left * view.element_size, (right - left) * view.element_size);
+            result != ReplayResult::success)
+            return result;
+    }
+    if (p.fills.empty()) p.skip = true;
+    return ReplayResult::success;
+}
+
+// Writes one prepared range; the caller has made the buffer writable by transfers.
+inline void emit_buffer_fill(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkBuffer buffer,
+                             const uav_clear::Element& element, VkDeviceSize offset, VkDeviceSize size) {
+    const auto transfer_barrier = [&] {
+        memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    };
+    if (element.size <= 4) {
+        std::uint32_t word = 0;
+        for (unsigned i = 0; i < 4; ++i) word |= std::uint32_t(element.bytes[i % element.size]) << (8 * i);
+        const VkDeviceSize a0 = (offset + 3) / 4 * 4, a1 = (offset + size) / 4 * 4;
+        if (a1 > a0) vk.fill_buffer(command_buffer, buffer, a0, a1 - a0, word);
+        VkBufferCopy ends[2]{};
+        std::uint32_t count = 0;
+        if (a0 > offset) ends[count++] = {offset + 4, offset, a0 - offset};
+        if (a1 < offset + size) ends[count++] = {a1 - 4, a1, offset + size - a1};
+        if (count) {
+            transfer_barrier();
+            vk.copy_buffer(command_buffer, buffer, buffer, count, ends);
+        }
+        return;
+    }
+    constexpr VkDeviceSize update_limit = 65536;  // vkCmdUpdateBuffer's, a multiple of every element size
+    const VkDeviceSize first = std::min(size, update_limit);
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(first));
+    for (std::size_t i = 0; i < data.size(); ++i) data[i] = element.bytes[i % element.size];
+    vk.update_buffer(command_buffer, buffer, offset, first, data.data());
+    for (VkDeviceSize filled = first; filled < size;) {
+        const VkDeviceSize step = std::min(filled, size - filled);
+        transfer_barrier();
+        const VkBufferCopy copy{offset, offset + filled, step};
+        vk.copy_buffer(command_buffer, buffer, buffer, 1, &copy);
+        filled += step;
+    }
 }
 
 // The one plane of one subresource a texture copy location names.
@@ -991,7 +1094,7 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
         return pieces[0].layout;
     for (const auto& piece : pieces) {
         if (piece.layout == target) continue;
-        image_barrier(vk, command_buffer, resource.image, piece.range, piece.layout, target,
+        image_barrier(vk, command_buffer, resource, piece.range, piece.layout, target,
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access,
                       VK_PIPELINE_STAGE_TRANSFER_BIT);
     }
@@ -1002,7 +1105,7 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
 // Moves every piece to `target` (src: the D3D12 state the operation requires), runs `body`, and moves the pieces
 // back to where they were. Pieces already in `target` need no transition.
 template<typename Body>
-void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkImage image,
+void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                 const std::vector<LayoutPiece>& pieces, VkImageLayout target, const VulkanAccess& state,
                 VkAccessFlags target_access, VkPipelineStageFlags target_stages, Body&& body) {
     for (const auto& piece : pieces) {
@@ -1010,7 +1113,7 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkIma
             memory_barrier(vk, command_buffer, state.access, state.stages, target_access, target_stages);
             continue;
         }
-        image_barrier(vk, command_buffer, image, piece.range, piece.layout, target, state.access, state.stages,
+        image_barrier(vk, command_buffer, resource, piece.range, piece.layout, target, state.access, state.stages,
                       target_access, target_stages);
     }
     body();
@@ -1019,7 +1122,7 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkIma
             memory_barrier(vk, command_buffer, target_access, target_stages, state.access, state.stages);
             continue;
         }
-        image_barrier(vk, command_buffer, image, piece.range, target, piece.layout, target_access, target_stages,
+        image_barrier(vk, command_buffer, resource, piece.range, target, piece.layout, target_access, target_stages,
                       state.access, state.stages);
     }
 }
@@ -1040,9 +1143,9 @@ class PreparedList {
 public:
     const CommandList* list = nullptr;
     std::vector<detail::Prepared> commands;
-    // Copies and resolves recorded while a predicate was set. D3D12 skips them when the predicate says so, but
-    // Vulkan's conditional rendering does not cover transfer commands, so they run unconditionally
-    // (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
+    // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
+    // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
+    // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
     std::size_t unpredicated_copies = 0;
 };
 
@@ -1084,6 +1187,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             VkImageSubresourceRange range = p.range;
             range.aspectMask = view_aspects;
+            if (p.binding.volume) {
+                // A 2D-array attachment view of a 3D image selects W slices here.
+                range.baseArrayLayer = target.first_layer;
+                range.layerCount = target.layer_count;
+            }
             ResourceBinding view_binding = p.binding;
             if (p.clear_format != VK_FORMAT_UNDEFINED) view_binding.format = p.clear_format;
             p.view = vk.image_view(view_binding, range);
@@ -1118,9 +1226,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (p.clear_format == VK_FORMAT_UNDEFINED &&
                 (p.binding.rgba8_typeless || color_clear->target.format != ColorViewFormat::resource))
                 return ReplayResult::invalid_clear;
-            if (p.clear_format != p.binding.format && color_clear->rects.empty()) {
-                // vkCmdClearColorImage has no view-format parameter. Reinterpreted whole-view clears need
-                // an attachment view too, including sRGB conversion and UINT numeric interpretation.
+            const bool partial_volume = p.binding.volume &&
+                color_clear->target.layer_count != std::max(1u, p.binding.depth >> color_clear->target.mip);
+            if ((p.clear_format != p.binding.format || partial_volume) && color_clear->rects.empty()) {
+                // vkCmdClearColorImage can neither reinterpret the format nor select W slices of a mip.
                 const auto extent = detail::mip_extent(p.binding, color_clear->target.mip);
                 const Rect full{0, 0, std::int32_t(extent.width), std::int32_t(extent.height)};
                 if (const auto r = rect_view(std::span<const Rect>(&full, 1), color_clear->target,
@@ -1139,6 +1248,33 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_subresource;
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
+                return r;
+        } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
+            const UavView& view = uav->view;
+            if (!bind(view.resource)) return ReplayResult::unresolved_resource;
+            if (view.buffer) {
+                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
+                if (predicated) ++out.unpredicated_copies;  // fills and copies are transfer commands
+                if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) return r;
+                continue;
+            }
+            if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
+            const TargetView target{view.resource, view.mip, view.first_layer, view.layer_count};
+            if (!detail::view_range(p.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
+                return ReplayResult::invalid_subresource;
+            // The view's format turns the values into bytes; the image's own format clears them in.
+            const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
+            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element) ||
+                !uav_clear::decode(p.binding.format, p.element, p.clear_color))
+                return ReplayResult::unsupported;
+            if (!uav->rects.empty() && (!p.binding.color_attachment || p.binding.volume))
+                return ReplayResult::unsupported;
+            // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
+            // render targets are; otherwise vkCmdClearColorImage runs unconditionally and is counted.
+            const bool attachment = p.binding.color_attachment && !p.binding.volume;
+            if (predicated && uav->rects.empty() && !attachment) ++out.unpredicated_copies;
+            const auto rects = attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
+            if (const auto r = rect_view(rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
                 return r;
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
@@ -1242,6 +1378,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 using T = std::decay_t<decltype(c)>;
                 if constexpr (std::is_same_v<T, ClearRenderTarget> || std::is_same_v<T, ClearDepthStencil>)
                     return c.target.resource;
+                else if constexpr (std::is_same_v<T, ClearUnorderedAccess>)
+                    return c.view.resource;
                 else if constexpr (requires { c.resource; })
                     return c.resource;
                 else
@@ -1261,7 +1399,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, from.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, from.layout), tracker);
             for (const auto& piece : pieces)
-                detail::image_barrier(vk, command_buffer, p.binding.image, piece.range, piece.layout, new_layout,
+                detail::image_barrier(vk, command_buffer, p.binding, piece.range, piece.layout, new_layout,
                                       from.access, from.stages, to.access, to.stages);
             if (tracker) tracker->set(id, range, new_layout);
         } else if (std::holds_alternative<UavBarrier>(command)) {
@@ -1320,7 +1458,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 b.image = p.binding.image;
-                b.subresourceRange = piece.range;
+                b.subresourceRange = detail::layout_range(p.binding, piece.range);
                 barriers.push_back(b);
             }
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -1335,7 +1473,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
             const VkClearColorValue color = detail::render_target_clear_color(p.clear_format, color_clear->color);
             if (p.rects.empty()) {
-                detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
+                detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
                     vk.clear_color_image(command_buffer, p.binding.image, image_layout(p.binding, transfer_dst.layout),
                                          &color, 1, &p.range);
@@ -1343,7 +1481,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 continue;
             }
             const VkImageLayout attachment = image_layout(p.binding, state.layout);
-            detail::round_trip(vk, command_buffer, p.binding.image, pieces, attachment, state, state.access,
+            detail::round_trip(vk, command_buffer, p.binding, pieces, attachment, state, state.access,
                                state.stages, [&] {
                 VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
                 info.imageView = p.view;
@@ -1372,7 +1510,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                                            : depth_clear->depth;
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
-                detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
+                detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
                     vk.clear_depth_stencil_image(command_buffer, p.binding.image,
                                                  image_layout(p.binding, transfer_dst.layout), &value, 1, &p.range);
@@ -1380,7 +1518,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 continue;
             }
             const VkImageLayout attachment = image_layout(p.binding, state.layout);
-            detail::round_trip(vk, command_buffer, p.binding.image, pieces, attachment, state, state.access,
+            detail::round_trip(vk, command_buffer, p.binding, pieces, attachment, state, state.access,
                                state.stages, [&] {
                 VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
                 info.imageView = p.view;
@@ -1395,6 +1533,58 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.begin_rendering(command_buffer, &rendering);
                 VkClearAttachment attachment_clear{p.range.aspectMask, 0, {}};
                 attachment_clear.clearValue.depthStencil = value;
+                vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
+                vk.end_rendering(command_buffer);
+            });
+        } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
+            if (p.skip) continue;
+            // The UAV state, widened to transfers: a later barrier from SYNC_CLEAR_UNORDERED_ACCESS_VIEW names the
+            // clear stage, which is a transfer stage in the legacy masks.
+            VulkanAccess state = vulkan_access(d3d12_state::unordered_access, false);
+            state.access |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            state.stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+            if (uav->view.buffer) {
+                constexpr VkAccessFlags transfer = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                detail::memory_barrier(vk, command_buffer, state.access, state.stages, transfer,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+                for (std::size_t f = 0; f < p.fills.size(); ++f) {
+                    if (f)  // rectangles may overlap
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT, transfer, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    detail::emit_buffer_fill(vk, command_buffer, p.binding.buffer, p.element, p.fills[f][0],
+                                             p.fills[f][1]);
+                }
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       state.access, state.stages);
+                continue;
+            }
+            // Cleared in place in GENERAL, the UAV layout, which transfer clears and attachments both accept.
+            const VkImageLayout layout = image_layout(p.binding, state.layout);
+            auto pieces = detail::current(tracker, id, p.range, layout);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
+            if (p.rects.empty()) {
+                detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
+                    vk.clear_color_image(command_buffer, p.binding.image, layout, &p.clear_color, 1, &p.range);
+                });
+                continue;
+            }
+            detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
+                               VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, [&] {
+                VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                info.imageView = p.view;
+                info.imageLayout = layout;
+                info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                rendering.renderArea = {{0, 0}, detail::mip_extent(p.binding, uav->view.mip)};
+                rendering.layerCount = uav->view.layer_count;
+                rendering.colorAttachmentCount = 1;
+                rendering.pColorAttachments = &info;
+                vk.begin_rendering(command_buffer, &rendering);
+                VkClearAttachment attachment_clear{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+                attachment_clear.clearValue.color = p.clear_color;
                 vk.clear_attachments(command_buffer, 1, &attachment_clear, std::uint32_t(p.rects.size()), p.rects.data());
                 vk.end_rendering(command_buffer);
             });
