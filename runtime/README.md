@@ -118,9 +118,10 @@ process lifetime and answers as Windows does when no `Loader` is alive.
 different index space from the `TlsAlloc` slots, and only the OS loader can allocate a module index.
 The runtime therefore ships a minimal `gta6rt_tls_host.dll`; the loader reuses the index the OS assigns
 it, writes that index into the image's `AddressOfIndex`, and copies the image's TLS template into the
-slot. This reserves one index, so **one manually mapped TLS module can be live at a time**; a second
-one is rejected with an error instead of sharing the slot. Images without a TLS directory (or with an
-all-zero one) load normally.
+slot. This reserves one index; every additional simultaneous TLS module gets its own by mapping a fresh
+clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16 modules can be live at
+once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
+directory (or with an all-zero one) load normally.
 
 Current limits, by design:
 
