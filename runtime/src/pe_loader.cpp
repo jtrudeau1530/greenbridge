@@ -630,7 +630,7 @@ void* Loader::resolve_module_export(void* module_handle, const std::string& sym,
 }
 
 bool Loader::find_address(uint64_t address, std::string& module, uint32_t& rva) const {
-    std::lock_guard lock(ranges_mutex_);
+    std::shared_lock lock(ranges_mutex_);
     for (const MappedRange& r : ranges_) {
         if (address >= r.base && address - r.base < r.size) {
             module = r.name;
@@ -772,7 +772,7 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     {
         // From here an address inside the image names it. The memory stays until ~Loader, which unregisters the
         // lookup first.
-        std::lock_guard lock(ranges_mutex_);
+        std::unique_lock lock(ranges_mutex_);
         ranges_.push_back({reinterpret_cast<uint64_t>(m->base), m->size, m->name});
     }
 

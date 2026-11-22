@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -141,7 +142,7 @@ private:
         uint32_t size = 0;
         std::string name;
     };
-    mutable std::mutex ranges_mutex_;
+    mutable std::shared_mutex ranges_mutex_;  // shared in find_address: lookups on different threads do not queue
     std::vector<MappedRange> ranges_;
 };
 
