@@ -311,18 +311,25 @@ def _bfe_ctl(rng):
     return f"0x{(width << 16) | off:x}"
 
 
+def _shared_literal_sources(src0: str, src1: str, register: int) -> str:
+    # A scalar instruction can carry only one literal dword. Equal literals can share it.
+    if src0 != src1 and _is_literal(src0) and _is_literal(src1):
+        src0 = f"s{register}"
+    return f"{src0}, {src1}"
+
+
 def emit(rng, name):
     form = OPS[name][0]
     d, p = rng.choice(REGS), rng.choice(PAIRS)
     if form == "sop2":
         b = _src32(rng) if name.startswith("s_bfe") and BFE_ANY and rng.random() < 0.3 else             _bfe_ctl(rng) if name.startswith("s_bfe") else _src32(rng)
-        return f"{name} s{d}, {_src32(rng)}, {b}"
+        return f"{name} s{d}, {_shared_literal_sources(_src32(rng), b, d)}"
     if form == "sop2_64":
         return f"{name} {_pair(p)}, {_src64(rng)}, {_src64(rng)}"
     if form == "sop2_64s":
         return f"{name} {_pair(p)}, {_src64(rng)}, {_src32(rng)}"
     if form == "sop2_bfm64":
-        return f"{name} {_pair(p)}, {_src32(rng)}, {_src32(rng)}"
+        return f"{name} {_pair(p)}, {_shared_literal_sources(_src32(rng), _src32(rng), d)}"
     if form in ("sop1", "sop1_rmw"):
         return f"{name} s{d}, {_src32(rng)}"
     if form == "sop1_64":
@@ -330,7 +337,7 @@ def emit(rng, name):
     if form == "sop1_64to32":
         return f"{name} s{d}, {_src64(rng)}"
     if form == "sopc":
-        return f"{name} {_src32(rng)}, {_src32(rng)}"
+        return f"{name} {_shared_literal_sources(_src32(rng), _src32(rng), d)}"
     if form == "sopc_64":
         return f"{name} {_src64(rng)}, {_src64(rng)}"
     k = rng.choice((0, 1, 0x7FFF, 0x8000, 0xFFFF, 0xFFFE, rng.getrandbits(16)))
