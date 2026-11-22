@@ -356,6 +356,19 @@ class CheckBuild(unittest.TestCase):
     def test_corrupted_leaves_fail(self):
         self.assertTrue(self.run_check(True))
 
+    def test_literal_bracket_path_via_main(self):
+        # a directory with '[' and ']' in its name must not be treated as a glob: main must
+        # discover the cases and run validation rather than silently returning the 77 skip code.
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "cases[1]")
+            os.mkdir(d)
+            self.write_cases(d, corrupt=False)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = X.main(["check-build", d])
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertIn("all cases match", out.getvalue())
+
     def test_empty_directory(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(X.check_build(d), [f"no cases in {d}"])
