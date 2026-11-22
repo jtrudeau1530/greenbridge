@@ -54,7 +54,7 @@ The exporters use three tag types:
 | `0x48` | streamed-music descriptor |
 
 `tools/rsc8_audio.py` additionally decodes the speech companions `0x36` (peaks), `0xa3` (seek
-table), `0xb2` (loudness), `0xbd` (marker) and the two structural tags below; every other tag type
+table), `0xb2` (loudness), `0xbd` (cue records) and the two structural tags below; every other tag type
 is skipped.
 
 | Tag | Meaning |

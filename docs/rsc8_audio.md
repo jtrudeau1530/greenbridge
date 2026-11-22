@@ -114,7 +114,46 @@ streamed-music descriptor), speech streams carrying `0x5c` consistently carry th
 | `0x36` | Peak envelope | Array of `u16` amplitude peaks |
 | `0xa3` | Opus seek table | `u32` cumulative sample offsets per 2048-byte Opus block (step `0x2D00 = 11,520` = `12 × 960` samples) |
 | `0xb2` | Loudness curve | `(u32 sample_index, f32 dB)` pairs sampled every `4,800` samples (`100 ms` at 48 kHz) |
-| `0xbd` | Event / marker block | 16-byte header starting with magic `0xE5C74063` |
+| `0xbd` | Cue list (`markers`) | 16-byte records `{u32 name hash, u32 value, u32 sample offset, u32 extra}`, no header; see [below](#the-0xbd-cue-records) |
+
+### The `0xbd` cue records
+
+An earlier version of this table called `0xbd` "a 16-byte header starting with magic `0xE5C74063`". It is a list
+of 16-byte records with no header, and `0xE5C74063` is one cue name among 167. `tools/rsc8_audio.py` decodes the
+list (`decode_marker_records`) and counts it in every scan (`marker_*` summary keys: 420,168 streams, 781,350
+records, 0 invalid on `audio.rpf`). Over all of `audio.rpf`:
+
+| Check | Result |
+|---|---:|
+| `0xbd` tags, records | 420,168 / 781,350 |
+| tag size a multiple of 16 | 420,168 / 420,168 |
+| sample offsets never decrease inside a tag | 420,168 / 420,168 |
+| offset at most the stream's `0x76` sample count (the 419,223 tags whose stream has a `0x76` tag) | 750,020 / 750,020 records |
+| records per tag | 1 on 88,542, 2 on 330,777, 3 or more on 849 |
+| distinct name hashes | 167 |
+| first record's name | `0xdbedd43c` on 330,756 tags, `0xE5C74063` on 88,082, 150 other values on 1,330 |
+
+```
++0    u32  name     joaat of the cue name
++4    u32  value    an f32 for most names; a second name hash for region cues
++8    u32  offset   sample position in the stream
++12   u32  extra    0 on 363,166 records, 1..6 on the rest
+```
+
+- **The name is a joaat of a lowercase word.** Four of the stored values are the hashes of `beat` (`0xe89ae78c`,
+  17,770 records), `trackid` (`0xa6d93246`, 1,042), `intro` (`0xda8f5f53`, 835) and `outro` (`0x5d40b28d`, 825),
+  as the [GTA6-Asset-Info](https://github.com/TrinitronClient/GTA6-Asset-Info) byte reference reports
+  (`structure/03-audio-awc.md`, commit `029e4c3`); the hashes were computed here, not copied. The names behind
+  `0xE5C74063` (418,838 records, 402,357 of them on speech streams with a `0x5c` clip) and `0xdbedd43c` (330,756,
+  all on such streams and all with `extra = 0`) are not known.
+- **`value`** is a whole number stored as `f32` on every record of those six names. On five of the other names it
+  is `joaat("start")` or `joaat("end")` in equal or near-equal numbers (196/197, 101/101, 54/54, 49/49, 20/19),
+  which reads as region start/end pairs (hypothesis: the split was counted, not matched record by record).
+- The same reference states that an AWC tag id is the low byte of the joaat of the chunk name. That holds for
+  `markers` (`0xbd`), `data` (`0x55`), `peak` (`0x36`), `seektable` (`0xa3`) and `streamformat` (`0x48`), which
+  `tests/test_rsc8_audio.py` checks, and by the same rule `0x5a` and `0xd9` are `granulargrains` and
+  `granularloops`. It does not hold for `0x5c`, `0x76` and `0xb2` under the names `animation`, `format` and
+  `metadata`, so those three names stay open.
 
 ## Binary format of `RSC8` (version `8001`)
 
