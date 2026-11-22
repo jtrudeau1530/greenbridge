@@ -742,11 +742,13 @@ referencing an unconfirmed or unknown built-in history entry raises
 
 ## Next step
 
-1. **Add BC6H and BC7 block rebuilders (ASSET-5 follow-up PR).** The rANS entropy layer
-   already decodes both 16-lane formats; adding the BC6H/BC7 block rebuilders and history
-   tables covers the remaining 5,435 BCPack chunks (752 skipped + remaining partial textures).
-2. **Port the compact layout rule and BCPack decoder to `TtpfReader` (`rpf9-explorer` /
-   `tools/rpf9dump`).** In C#, select `tile = 65536` when `((mode >> 1) & 0xF) == 0` and
+1. **BC6H and BC7 block rebuilders: in review (#576, ASSET-5).** The rANS entropy layer
+   already decodes both 16-lane formats; the BC6H/BC7 block rebuilders and history tables in #576
+   cover the remaining 5,435 BCPack chunks (752 skipped + remaining partial textures). They are not
+   on `main` until #576 merges, so steps 1 and 3 below stay open until then.
+2. **Port the BCPack decoder to `TtpfReader` (`rpf9-explorer` / `tools/rpf9dump`; ASSET-44).**
+   The compact layout rule and the multi-slice layouts are already upstream in `rpf9-explorer`;
+   what is left is the BCPack decoder. For reference, the layout rule in C#: select `tile = 65536` when `((mode >> 1) & 0xF) == 0` and
    4096 otherwise, replace `ValidatedCompactProfile` with the allocation-span check, set
    `UsableMipLimit` to `FirstTail` (or `mips` when the tail tile is decodable), and wire
    BCPack behind `TtpfReader.DecodeChunk`.
@@ -756,10 +758,11 @@ referencing an unconfirmed or unknown built-in history entry raises
 4. **Add DXGI 11 (`R16G16B16A16_UNORM`, 5 records) and validate 2D uncompressed tiling (formats
    11, 28, 49, 56).** The 19 records formerly listed as DXGI 156/199/211/226 are resolved as
    two-slice 2D arrays (`docs/textures_arrays.md`).
-5. **Port multi-slice layouts to C# `TtpfReader`.** All 697 multi-slice descriptors (127 2D
-   arrays, 567 cubemaps, and 3 3D volumes) are now validated and exported in
-   `tools/tex_headers.py` and `tools/ttpf_mips.py` (`docs/textures_arrays.md`); upstream C#
-   `TtpfReader` parity has landed upstream in `breadbbbb/rpf9-explorer` PRs #5 and #6 (pending a submodule pin update).
+5. **Update the `rpf9-explorer` submodule pin (BUILD-101).** The multi-slice layouts are done: all 697
+   multi-slice descriptors (127 2D arrays, 567 cubemaps, and 3 3D volumes) are validated and exported
+   in `tools/tex_headers.py` and `tools/ttpf_mips.py` (`docs/textures_arrays.md`, #520), and the C#
+   `TtpfReader` parity landed in `breadbbbb/rpf9-explorer` PRs #5 and #6. `rpf9dump` only gets it
+   once the pin moves.
 6. **Do not fake a BCPack decoder.** The current fallback (export the largest lower mip that
    is zlib/raw) is used by 5,845 textures and should stay. The public BC1 candidate is not
    adopted: it is mip-consistent on 40/200 chunks, not byte-exact, and its window is
