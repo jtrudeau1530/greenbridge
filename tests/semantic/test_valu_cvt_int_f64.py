@@ -1494,5 +1494,200 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(oracle_v_cvt_f64_u32(UINT32_MAX, clamp=True), POS_ONE_64)
 
 
+class TestNegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -5, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_invalid_register_counts(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=0)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=3)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 4, count=4)
+
+    def test_invalid_destination_kind(self) -> None:
+        # VALU destination cannot be SGPR
+        with self.assertRaises(TypeError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_F64_I32,
+                dst=Register(RegKind.SGPR, 0, count=2),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=1)),
+            )
+
+    def test_invalid_destination_count(self) -> None:
+        # v_cvt_f64_i32 requires 64-bit dst (count=2)
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_F64_I32,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=1)),
+            )
+        # v_cvt_i32_f64 requires 32-bit dst (count=1)
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_I32_F64,
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2)),
+            )
+
+    def test_invalid_source_count(self) -> None:
+        # v_cvt_f64_i32 requires 32-bit src0 (count=1)
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_F64_I32,
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2)),
+            )
+        # v_cvt_i32_f64 requires 64-bit src0 (count=2)
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_I32_F64,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=1)),
+            )
+
+    def test_invalid_modifiers(self) -> None:
+        # Clamp invalid on integer destination
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_I32_F64,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=2)),
+                clamp=True,
+            )
+        # Float modifiers invalid on integer sources
+        with self.assertRaises(ValueError):
+            VCvtInstruction(
+                opcode=Opcode.V_CVT_F64_I32,
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=VOP1Operand(Register(RegKind.VGPR, 2, count=1), abs_mod=True),
+            )
+
+    def test_scalar_interpreter_out_of_bounds_access(self) -> None:
+        state = ScalarMachineState()
+        with self.assertRaises(IndexError):
+            state.read_reg(RegKind.VGPR, 256, count=1)
+        with self.assertRaises(IndexError):
+            state.write_reg(RegKind.SGPR, 255, count=2, value=0)
+
+    def test_simd_interpreter_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_simd_interpreter_lane_bounds(self) -> None:
+        state = SIMDState(num_lanes=32)
+        with self.assertRaises(IndexError):
+            state.read_lane_reg(32, RegKind.VGPR, 0, count=1)
+        with self.assertRaises(IndexError):
+            state.write_lane_reg(-1, RegKind.VGPR, 0, count=1, value=0)
+
+
+class TestMutationDetection(unittest.TestCase):
+    """Mutation tests: verify that intentional sabotages/bugs in the conversion logic are detected."""
+
+    def test_mutation_signed_unsigned_confusion(self) -> None:
+        # Sabotage: treating negative signed int as large unsigned int in v_cvt_f64_i32
+        def mutated_v_cvt_f64_i32_unsigned_bug(src: int) -> int:
+            return f64_to_bits(float(src & MASK32))
+
+        # Converting -5 must produce -5.0, not +4294967291.0
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                mutated_v_cvt_f64_i32_unsigned_bug(i32_to_u32(-5)),
+                oracle_v_cvt_f64_i32(i32_to_u32(-5)),
+            )
+
+    def test_mutation_saturation_wrap_around_bug(self) -> None:
+        # Sabotage: integer overflow wraps around instead of saturating to INT32_MAX
+        def mutated_v_cvt_i32_f64_wrap_bug(src_bits: int) -> int:
+            val = bits_to_f64(src_bits)
+            return int(val) & MASK32
+
+        # 3e9 exceeds INT32_MAX; must saturate to INT32_MAX (0x7FFFFFFF), not wrap to negative
+        large_bits = f64_to_bits(3e9)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                mutated_v_cvt_i32_f64_wrap_bug(large_bits),
+                oracle_v_cvt_i32_f64(large_bits),
+            )
+
+    def test_mutation_nan_nonzero_bug(self) -> None:
+        # Sabotage: NaN returns non-zero default
+        def mutated_v_cvt_i32_f64_nan_bug(src_bits: int) -> int:
+            if is_nan_f64(src_bits):
+                return 0x7FFF_FFFF
+            return oracle_v_cvt_i32_f64(src_bits)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                mutated_v_cvt_i32_f64_nan_bug(CANONICAL_QNAN_64),
+                oracle_v_cvt_i32_f64(CANONICAL_QNAN_64),
+            )
+
+    def test_mutation_negative_unsigned_clamp_bug(self) -> None:
+        # Sabotage: negative float in u32 conversion casts to signed int bits instead of 0
+        def mutated_v_cvt_u32_f64_neg_bug(src_bits: int) -> int:
+            val = bits_to_f64(src_bits)
+            return int(val) & MASK32  # e.g. -1 becomes 0xFFFFFFFF
+
+        neg_bits = f64_to_bits(-1.0)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                mutated_v_cvt_u32_f64_neg_bug(neg_bits),
+                oracle_v_cvt_u32_f64(neg_bits),
+            )
+
+    def test_mutation_clamp_negative_zero_bug(self) -> None:
+        # Sabotage: clamping -0.0 retains NEG_ZERO_64 instead of POS_ZERO_64
+        def mutated_apply_f64_clamp_neg_zero(bits: int) -> int:
+            val = bits_to_f64(bits)
+            if val < 0.0:
+                return POS_ZERO_64
+            if val > 1.0:
+                return POS_ONE_64
+            return bits  # returns NEG_ZERO_64 unchanged
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                mutated_apply_f64_clamp_neg_zero(NEG_ZERO_64),
+                apply_f64_clamp(NEG_ZERO_64),
+            )
+
+    def test_mutation_exec_mask_leak(self) -> None:
+        # Sabotage: inactive lanes write to destination VGPR
+        simd = SIMDInterpreter()
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)  # all inactive
+        canary = 0xABCD_EF01
+        for lane in range(32):
+            state.write_lane_reg(lane, RegKind.VGPR, 0, 1, canary)
+
+        inst = VCvtInstruction(
+            opcode=Opcode.V_CVT_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=VOP1Operand(Literal64.from_float(50.0)),
+        )
+        simd.step(inst, state)
+        # Proper interpreter preserves canary in all lanes
+        for lane in range(32):
+            self.assertEqual(state.read_lane_reg(lane, RegKind.VGPR, 0, count=1), canary)
+
+        # Mutated write unconditionally overwrites inactive lane
+        state.write_lane_reg(0, RegKind.VGPR, 0, 1, 50)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(state.read_lane_reg(0, RegKind.VGPR, 0, count=1), canary)
+
+
 if __name__ == "__main__":
     unittest.main()
