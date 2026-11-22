@@ -114,6 +114,15 @@ class ShortsTest(unittest.TestCase):
         self.assertEqual(rows[0]["channels"], "2")
         self.assertTrue(rows[0]["file"].endswith("00001234.ogg"))
 
+    def test_rejects_nonpositive_job_counts(self):
+        for jobs in ("0", "-1"):
+            with self.subTest(jobs=jobs):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", jobs]), 2)
+                self.assertIn("--jobs must be at least 1", stderr.getvalue())
+                self.assertFalse(os.path.exists(self.out))
+
     def test_bad_range(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(shorts.main(["x", self.out, "--min-seconds", "6", "--max-seconds", "5"]), 2)
