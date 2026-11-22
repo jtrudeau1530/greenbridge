@@ -251,8 +251,23 @@ The final 433 MiB of `navmeshes.rpf` holds `27,482` `pgBase` resources (`+6` con
 Reserved slots `+0x38..+0x3f`, `+0x4c..+0x4f`, and `+0x54..+0x5f` are zero on `27,482 / 27,482`. Each 272-byte group at
 `+0x60` is a 16-way SwissTable block (`16` control bytes where `0x80` = empty and `< 0x80` = occupied tag, followed by
 `16 Ã— {u64 key, u64 value}`). Across all `27,482 / 27,482` resources, occupied slots equal `N` and their `value` fields
-form an exact bijection onto `[0 .. N - 1]`. The engine subsystem name, `u64` key encoding, and `u32[N]` bit semantics
-remain **open**.
+form an exact bijection onto `[0 .. N - 1]`: `value` indexes the `u32[N]` payload.
+
+**Keys (ASSET-287).** The `u64` keys are sentinel-bit linear octree keys over the cubic volume: `1` is the root and a
+child is `(parent << 3) | octant`, so the highest set bit sits at bit `3 × depth`. Measured on `27,482 / 27,482`
+resources: the root is present, every key's highest set bit is a multiple of 3, and every non-root key's parent (`key >>
+3`) is in the same table. Octant bit 2 is the vertical axis (cells stack on it); which of bits 0/1 is x and where the
+cube sits against the sector are **open**. Depths run `0..10` (`53,835,068` keys). The cell size at a resource's deepest
+level (`extent >> depth`) is 16 m on `12,694` resources (`12,693` 128 m tiles at depth 3, one 256 m tile), 8 m on `859`
+and 4 m on `13,929`.
+
+**`u32[N]` words.** `51` distinct values over the whole package. Every inner node (a key with at least one child:
+`8,617,353`) holds `0x0000ff00`. Leaves (`45,217,715`) hold `0x0000ff00` (`1,791,096`, never at a resource's deepest
+level), a word with low byte `0x01` (`26,659,574`; bits `8-11` take `0, 5, 7, 9, B, D, F`; bits `17-18` are a 2-bit
+field), or a word with low byte `0x03` (`16,767,045`; bit 8 is a flag, bits `11-14` a 4-bit value `0..15`). What the two
+leaf kinds and their fields mean, and the engine subsystem name, are **open**. `navmesh_decode.py --deep` checks the key
+and inner-word rules (`keys_octree`, `inner_payload_ff00`) and reports `key_depth`, `inner_nodes` and `leaf_payload`
+counts.
 
 ## Remaining unknowns
 
@@ -266,8 +281,10 @@ remain **open**.
 4. **Per-record bitfields inside `0x00010015` tiles.** `u32@0x10` bit 3's secondary trigger on `289` tiles and bit 6's
    name, `u32@0xE8` build-stamp encoding, polygon/adjacent-edge/special-link flag bitfields, and the C++ type of the
    96-byte `+0xB8` records remain open.
-5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, `u64` key encoding and `u32[N]`
-   payload bits are open, as is why the final `PSIN` (version `79`) terminates before `LSNS` ends.
+5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, the x/y order of the octree key's
+   octant bits 0/1, the cube's placement against its sector and the meaning of the `u32[N]` leaf fields are open
+   (the key encoding and the inner-node word are decoded above), as is why the final `PSIN` (version `79`)
+   terminates before `LSNS` ends.
 
 ## Vehicle navmesh settings (`CVehiclePoints`, `common.rpf`)
 
@@ -321,8 +338,8 @@ For both tools, `--start` must be 0 or more and `--limit` at least 1; anything e
 Validation on the full real archive (`navmeshes.rpf`, `6,707,512,496` bytes) with `--deep`: `90,295` carver streams +
 `10` tiny continuations; `9,603` `0DRP` (`15,629,979` cover nodes), `27,644` `0x00010015` navmesh tiles (`138,041,746`
 vertices, `124,768,148` polygons, `2,337,904` quadtree nodes), `27,482` `grid` resources (`53,835,068` entries, `0`
-sector mismatches), `22` `PSIN` (`21` complete), **0 check failures**, in 236 s. Both test suites build synthetic
-archives in memory/tempdir and need no game files.
+sector mismatches, `keys_octree` and `inner_payload_ff00` pass on all), `22` `PSIN` (`21` complete), **0 check
+failures**, in 236 s. Both test suites build synthetic archives in memory/tempdir and need no game files.
 
 ## No-sharing rule
 

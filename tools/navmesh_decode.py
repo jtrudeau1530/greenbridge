@@ -651,6 +651,11 @@ def decode_grid(b, nstreams, stats, deep):
         chk["occupied_equals_entries"] = valid_ctrl and used == entries
         if deep:
             chk["values_bijective"] = chk["occupied_equals_entries"] and _grid_values(b, groups, entries)
+            if chk["values_bijective"] and chk["payload_in_bounds"]:
+                keys = _grid_slots(b, groups)
+                chk["keys_octree"] = _grid_octree(keys)
+                if chk["keys_octree"]:
+                    chk["inner_payload_ff00"] = _grid_payloads(b, payload, keys, stats)
     stats["groups"][groups] += 1
     stats["extent"][ex[0]] += 1
     oz = origin[2] if (origin and math.isfinite(origin[2])) else None
@@ -674,6 +679,47 @@ def _grid_values(b, groups, entries):
     return all(seen)
 
 
+def _grid_slots(b, groups):
+    """{key: value} of every occupied slot (call after _grid_values has accepted the table)."""
+    keys = {}
+    for g in range(groups):
+        base = 0x60 + GRID_GROUP * g
+        for k, c in enumerate(b[base:base + 16]):
+            if c < 0x80:
+                keys[_u64(b, base + 16 + 16 * k)] = _u64(b, base + 16 + 16 * k + 8)
+    return keys
+
+
+def _grid_octree(keys):
+    """Keys are sentinel-bit linear octree keys: 1 is the root, a child is (parent << 3) | octant."""
+    if 1 not in keys:
+        return False
+    for key in keys:
+        if key == 0 or (key.bit_length() - 1) % 3 or (key != 1 and key >> 3 not in keys):
+            return False
+    return True
+
+
+GRID_INNER = 0x0000FF00  # payload of every node that has children
+GRID_LEAF_KIND = {0x01: "low_byte_01", 0x03: "low_byte_03"}
+
+
+def _grid_payloads(b, payload, keys, stats):
+    """Inner nodes carry 0x0000ff00; count leaf payloads by low byte and every key by depth."""
+    inner = {key >> 3 for key in keys if key != 1}
+    words = {key: _u32(b, payload + 4 * value) for key, value in keys.items()}
+    if any(words[key] != GRID_INNER for key in inner):
+        return False
+    stats["inner_nodes"] += len(inner)
+    for key, word in words.items():
+        stats["key_depth"][(key.bit_length() - 1) // 3] += 1
+        if key in inner:
+            continue
+        kind = "ff00" if word == GRID_INNER else GRID_LEAF_KIND.get(word & 0xFF, "other")
+        stats["leaf_payload"][kind] += 1
+    return True
+
+
 # ------------------------------------------------------------------------------------------------------ scan
 
 def new_stats():
@@ -691,7 +737,7 @@ def new_stats():
                     "tile_bounds": [[inf] * 3, [-inf] * 3], "water_bit3": Counter(),
                     "quadtree": {"nodes": 0, "leaves": 0, "max_depth": 0}},
         "grid": {"groups": Counter(), "extent": Counter(), "oz": Counter(), "sectors": set(), "entries_total": 0,
-                 "entries_max": 0},
+                 "entries_max": 0, "key_depth": Counter(), "inner_nodes": 0, "leaf_payload": Counter()},
         "psin": {"version": Counter(), "complete": 0},
     }
 
@@ -916,6 +962,9 @@ def _summary(path, mode, start, end, carver, classes, checks, stats, elapsed):
             "navmesh_sectors_not_in_grid": len(static - g["sectors"]),
             "entries_total": g["entries_total"],
             "entries_max": g["entries_max"],
+            "key_depth": _counter(g["key_depth"]),
+            "inner_nodes": g["inner_nodes"],
+            "leaf_payload": _counter(g["leaf_payload"]),
         },
         "psin": {"version": _counter(stats["psin"]["version"]), "complete": stats["psin"]["complete"]},
         "elapsed_s": round(elapsed, 1),

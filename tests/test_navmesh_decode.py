@@ -324,8 +324,19 @@ def build_grid(
     two_streams=False,
     bad_ctrl=False,
     dup_value=False,
+    keys=None,
+    words=None,
 ):
-    """Build a synthetic Band-3 grid resource (0x60 header + 16-way SwissTable + u32[entries])."""
+    """Build a synthetic Band-3 grid resource (0x60 header + 16-way SwissTable + u32[entries]).
+
+    By default the keys are an octree written by hand (root 1, its children 8.. in order, then the children of
+    8 from 64): every key with a child gets 0x0000ff00, every other key a 0x01 leaf word."""
+    if keys is None:
+        keys = [1] + list(range(8, 8 + min(entries - 1, 8))) + list(range(64, 64 + max(entries - 9, 0)))
+        keys = keys[:entries]
+    if words is None:
+        parents = {k >> 3 for k in keys if k != 1}
+        words = [0x0000FF00 if k in parents else 0x00020001 for k in keys]
     table_end = 0x60 + nd.GRID_GROUP * groups
     bm_off = (table_end + 15) & ~15
     payload_off = (bm_off + 32 + 15) & ~15
@@ -351,11 +362,11 @@ def build_grid(
         base = 0x60 + nd.GRID_GROUP * g
         buf[base + slot] = (k * 7) & 0x7F
         val = 0 if (dup_value and k == 1) else k
-        struct.pack_into("<QQ", buf, base + 16 + 16 * slot, 0x10000 + k, val)
+        struct.pack_into("<QQ", buf, base + 16 + 16 * slot, keys[k], val)
     if bad_ctrl:
         buf[0x60 + 15] = 0xFF
     for k in range(entries):
-        struct.pack_into("<I", buf, payload_off + 4 * k, 0x00010001)
+        struct.pack_into("<I", buf, payload_off + 4 * k, words[k])
 
     if two_streams:
         if total - payload_off < 64:
@@ -456,7 +467,47 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["grid"]["sectors"], 4)
         self.assertEqual(doc["grid"]["sectors_not_in_navmesh"], 0)
         self.assertEqual(doc["grid"]["navmesh_sectors_not_in_grid"], 0)
+        # 16 keys: the 4 roots have children, the 12 others are 0x01 leaves one level down.
+        self.assertEqual(doc["grid"]["key_depth"], {"1": 12, "0": 4})
+        self.assertEqual(doc["grid"]["inner_nodes"], 4)
+        self.assertEqual(doc["grid"]["leaf_payload"], {"low_byte_01": 12})
+        self.assertEqual(doc["checks"]["grid"]["keys_octree"], {"pass": 4, "fail": 0})
+        self.assertEqual(doc["checks"]["grid"]["inner_payload_ff00"], {"pass": 4, "fail": 0})
         self.assertEqual(doc["psin"]["complete"], 1)
+
+    def test_grid_octree_keys_and_payload_words(self):
+        # Root 1 -> 8 -> 64 -> 512 (depths 0..3), plus leaves 9, 10, 65.
+        keys = [1, 8, 64, 512, 9, 10, 65]
+        words = [0xFF00, 0xFF00, 0xFF00, 0x00007803, 0xFF00, 0x00060F01, 0x00000002]
+        good = build_grid(entries=7, keys=keys, words=words)
+        bad = [
+            build_grid(entries=3, keys=[8, 9, 10]),                       # no root
+            build_grid(entries=3, keys=[1, 8, 72]),                       # 72 >> 3 == 9 is absent
+            build_grid(entries=3, keys=[1, 8, 16]),                       # 16 has its top bit at 4, not 3 or 6
+            build_grid(entries=3, keys=[1, 0, 8]),                        # 0 is not a key
+            build_grid(entries=3, keys=[1, 8, 9], words=[0x01, 0x01, 0x01]),  # inner root without 0xff00
+            build_grid(entries=3, keys=[1, 8, 64], words=[0xFF00, 0x01, 0x01]),  # inner 8 without 0xff00
+        ]
+        # 17 keys over two groups: 8 sits in slot 15 of group 0 and 9 in group 1, both parents of other keys.
+        two_groups = build_grid(groups=2, entries=17, keys=[1] + list(range(64, 78)) + [8, 9])
+        # Payload pointer past the end: the table is accepted but the words are not read.
+        oob = bytearray(build_grid(entries=3)[0])
+        struct.pack_into("<Q", oob, 0x20, BASE + len(oob))
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "grid.rpf")
+            make_rpf(arc, good + two_groups + [s for g in bad for s in g] + [bytes(oob)])
+            doc = nd.scan(arc, deep=True)
+            shallow = nd.scan(arc)
+        cg = doc["checks"]["grid"]
+        self.assertEqual(cg["payload_in_bounds"]["fail"], 1)
+        self.assertEqual(cg["values_bijective"], {"pass": 9, "fail": 0})
+        self.assertEqual(cg["keys_octree"], {"pass": 4, "fail": 4})
+        self.assertEqual(cg["inner_payload_ff00"], {"pass": 2, "fail": 2})
+        self.assertEqual(doc["grid"]["key_depth"], {"2": 16, "1": 5, "0": 2, "3": 1})
+        self.assertEqual(doc["grid"]["inner_nodes"], 6)
+        self.assertEqual(doc["grid"]["leaf_payload"], {"low_byte_01": 15, "ff00": 1, "low_byte_03": 1, "other": 1})
+        self.assertNotIn("keys_octree", shallow["checks"]["grid"])
+        self.assertEqual(shallow["grid"]["key_depth"], {})
 
     def test_multiblock_split_array(self):
         # 380 polygons exceeds one 16 KiB block (floor(16384 / 44) == 372), exercising nblocks == 2.
