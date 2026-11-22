@@ -637,6 +637,15 @@ int main() {
             std::memset(view_bytes(null_slot), 0x77, step);
             device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
             EXPECT(null_at(null_slot));
+
+            // The other family's stencil view format is refused too, as D3D12 refuses it: X24_TYPELESS_G8_UINT
+            // belongs to R24G8 only, X32_TYPELESS_G8X24_UINT to R32G8X24 only.
+            plane_view.Format = stencil_view_format == DXGI_FORMAT_X24_TYPELESS_G8_UINT
+                                    ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT
+                                    : DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC colour_plane{};
         colour_plane.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
