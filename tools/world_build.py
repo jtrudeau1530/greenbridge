@@ -538,15 +538,32 @@ CHUNK_STAGING_PREFIX = ".chunks-staging-"
 _STAGING_BACKUP = "previous"
 
 
+def _holds_unrestored_chunks(staging_dir: str) -> bool:
+    backup_dir = os.path.join(staging_dir, _STAGING_BACKUP)
+    try:
+        return os.path.isdir(backup_dir) and bool(os.listdir(backup_dir))
+    except OSError:
+        return True  # cannot tell: keep it rather than risk deleting a recovery copy
+
+
 def _remove_stale_staging(out_dir: str) -> None:
-    """Remove staging directories left behind by builds that were killed."""
+    """Remove staging directories left behind by builds that were killed.
+
+    A staging directory whose previous/ still holds chunks is a recovery copy from a publish
+    that could not be rolled back; it is kept until someone restores or deletes it.
+    """
     try:
         entries = os.listdir(out_dir)
     except OSError:
         return
     for name in entries:
         path = os.path.join(out_dir, name)
-        if name.startswith(CHUNK_STAGING_PREFIX) and os.path.isdir(path) and not os.path.islink(path):
+        if (
+            name.startswith(CHUNK_STAGING_PREFIX)
+            and os.path.isdir(path)
+            and not os.path.islink(path)
+            and not _holds_unrestored_chunks(path)
+        ):
             shutil.rmtree(path, ignore_errors=True)
 
 
@@ -607,7 +624,8 @@ def _publish_world(
         if unrestored:
             raise OSError(
                 f"publishing chunks failed ({exc!r}) and {len(unrestored)} previous chunk(s) could not be "
-                f"put back; they are in {backup_dir}: {', '.join(sorted(unrestored))}"
+                f"put back; they are in {backup_dir} (kept by later builds until restored or deleted): "
+                f"{', '.join(sorted(unrestored))}"
             ) from exc
         raise
 
@@ -634,8 +652,10 @@ def build_world(
     Chunks are written to a staging directory inside out_dir and verified before any live
     chunk is replaced. If writing, verifying or publishing fails, or the build is interrupted,
     the staging directory is removed and the previous world.json and chunks stay as they were.
-    Only a hard kill during the final renames (one per chunk, then world.json) can leave new
-    chunks next to the old world.json; the next build then removes the leftover staging.
+    Publishing renames one chunk at a time and then replaces world.json, so a reader during
+    those renames can see old and new chunks mixed, and a hard kill there leaves them mixed
+    under the old world.json. A staging directory whose previous/ still holds chunks is kept
+    by later builds as a recovery copy; other leftover staging is removed by the next build.
     """
     if chunk_size <= 0 or not math.isfinite(chunk_size):
         raise ValueError(f"chunk_size must be positive, got {chunk_size!r}")
@@ -759,8 +779,7 @@ def build_world(
             workers=workers, chunk_size=chunk_size, grid_layout=grid_layout,
         )
     except BaseException:
-        backup_dir = os.path.join(staging_dir, _STAGING_BACKUP)
-        if not (os.path.isdir(backup_dir) and os.listdir(backup_dir)):
+        if not _holds_unrestored_chunks(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
         for d in reversed(created_dirs):
             try:
