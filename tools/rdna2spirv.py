@@ -491,6 +491,30 @@ class Gen:
         bits = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0] * (nsrc + 1)
         return bits[:nsrc], bits[nsrc]
 
+    def u16_half(self, u, hi=0):
+        """Zero-extended 16-bit half of u32 ``u`` (high half when ``hi`` is truthy).
+        Do not follow ``OpShiftRightLogical %uint u 16`` with a redundant ``OpBitwiseAnd ... 0xFFFF``:
+        AMD's Windows LLPC driver (measured on RDNA2, drivers 22.40.84.06 in #1506 and 24.10.24) drops the
+        ``>> 16`` when ``(u >> 16) & 0xFFFF`` follows two partial-half writes and feeds ``OpIAdd``, ``OpIMul``,
+        or ``OpShiftLeftLogical``."""
+        h = self.tmp()
+        if hi:
+            self.emit(f"{h} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+        else:
+            self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+        return h
+
+    def i16_half(self, u, hi=0):
+        """Sign-extended 16-bit half of u32 ``u`` as ``%int`` (high half when ``hi`` is truthy).
+        Avoids ``OpBitFieldSExtract (OpShiftRightLogical u 16) 0 16``, which hits the same AMD Windows LLPC
+        bug as ``(u >> 16) & 0xFFFF`` (#1506) and drops the shift."""
+        h = self.tmp()
+        if hi:
+            self.emit(f"{h} = OpShiftRightArithmetic %int {self.as_int(u)} {self.cu(16)}")
+        else:
+            self.emit(f"{h} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
+        return h
+
     def src_h(self, s):
         """Raw 32 bits of an operand of a 16-bit float op, before its neg/abs. An inline float constant (0.5, 1.0,
         -2.0, ...) is the f16 value in the low half over a zero high half, not f32 bits. Measured on an RX 6800
@@ -3014,10 +3038,8 @@ class Gen:
                 comps, icomps = [], []
                 for i in range(n):
                     r = regs[i // 2]
-                    v2, f, iv = self.tmp(), self.tmp(), self.tmp()
-                    sh = self.tmp()
-                    self.emit(f"{sh} = OpShiftRightLogical %uint {r} {self.cu(16 * (i % 2))}")
-                    self.emit(f"{iv} = OpBitwiseAnd %uint {sh} {self.cu(0xFFFF)}")
+                    iv = self.u16_half(r, i % 2)
+                    v2, f = self.tmp(), self.tmp()
                     self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {iv}")
                     self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
                     comps.append(self.tou(f))
@@ -3096,11 +3118,7 @@ class Gen:
             unorm_view = [red, unorm_rgba[1], blue, unorm_rgba[3]]
             signed_ic = ic
             if d16:
-                signed_ic = []
-                for component in ic[:n]:
-                    extended = self.tmp()
-                    self.emit(f"{extended} = OpBitFieldSExtract %int {self.as_int(component)} {self.cu(0)} {self.cu(16)}")
-                    signed_ic.append(self.tou(extended))
+                signed_ic = [self.tou(self.i16_half(regs[i // 2], i % 2)) for i in range(n)]
                 signed_ic = signed_ic + [self.cu(0)] * (4 - len(signed_ic))
             # MUBUF 2-component stores infer COMP_SWAP from V# DST_SEL_X/Y/Z (measured natively on gfx1036 across
             # all 1,296 valid DST_SEL tuples, wave32 and wave64): XY01 -> (x, y), YX01 -> (y, x), XYZW -> (x, w),
@@ -5279,19 +5297,14 @@ class Gen:
                 words = [self.src_u(x)]
             if op == "s_bitreplicate_b64_b32":
                 out = []
-                for half in (0, 16):
-                    t = self.tmp()
-                    self.emit(f"{t} = OpShiftRightLogical %uint {words[0]} {self.cu(half)}")
+                for hi in (0, 1):
+                    t = self.u16_half(words[0], hi)
                     # Spread the 16 bits to the even positions, then copy each to the odd one above it.
-                    for sh, m in ((None, 0xFFFF), (8, 0x00FF00FF), (4, 0x0F0F0F0F), (2, 0x33333333),
-                                  (1, 0x55555555)):
-                        if sh is not None:
-                            u, o = self.tmp(), self.tmp()
-                            self.emit(f"{u} = OpShiftLeftLogical %uint {t} {self.cu(sh)}")
-                            self.emit(f"{o} = OpBitwiseOr %uint {t} {u}")
-                            t = o
-                        n = self.tmp()
-                        self.emit(f"{n} = OpBitwiseAnd %uint {t} {self.cu(m)}")
+                    for sh, m in ((8, 0x00FF00FF), (4, 0x0F0F0F0F), (2, 0x33333333), (1, 0x55555555)):
+                        u, o, n = self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{u} = OpShiftLeftLogical %uint {t} {self.cu(sh)}")
+                        self.emit(f"{o} = OpBitwiseOr %uint {t} {u}")
+                        self.emit(f"{n} = OpBitwiseAnd %uint {o} {self.cu(m)}")
                         t = n
                     u, r = self.tmp(), self.tmp()
                     self.emit(f"{u} = OpShiftLeftLogical %uint {t} {self.cu(1)}")
@@ -5619,12 +5632,7 @@ class Gen:
             halves = []
             for i, src in enumerate(a[1:3]):
                 u = self.src_h(src)
-                if sb[i]:
-                    s = self.tmp()
-                    self.emit(f"{s} = OpShiftRightLogical %uint {u} {self.cu(16)}")
-                    u = s
-                m = self.tmp()
-                self.emit(f"{m} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                m = self.u16_half(u, sb[i])
                 if src.get("abs"):
                     # The ISA defines ABS on a float operand as |S|, clearing the sign bit (bit 15), applied before
                     # neg. Measured natively on gfx1036 across 1,088 raw kernels: clears bit 15 on all values.
@@ -6536,45 +6544,39 @@ class Gen:
             sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0, 0, 0]
             if not e64 and sb[:2] != [0, 0]:
                 raise Unsupported(op + " op_sel")
-            halves = []
-            for k, s in enumerate(a[1:3]):
-                u = self.src_u(s)
-                if sb[k]:
-                    t = self.tmp()
-                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
-                    u = t
-                h = self.tmp()
-                self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
-                halves.append(h)
-            x, y = halves
             r = self.tmp()
             if op in ("v_lshrrev_b16", "v_lshlrev_b16", "v_ashrrev_i16"):
+                x = self.u16_half(self.src_u(a[1]), sb[0])
                 sh = self.tmp()                      # shift amount is src0 (reversed operand order), low 4 bits
                 self.emit(f"{sh} = OpBitwiseAnd %uint {x} {self.cu(15)}")
                 if op == "v_lshrrev_b16":
+                    y = self.u16_half(self.src_u(a[2]), sb[1])
                     self.emit(f"{r} = OpShiftRightLogical %uint {y} {sh}")
                 elif op == "v_lshlrev_b16":
+                    y = self.u16_half(self.src_u(a[2]), sb[1])
                     self.emit(f"{r} = OpShiftLeftLogical %uint {y} {sh}")
                 else:
-                    yi, ri = self.tmp(), self.tmp()
-                    self.emit(f"{yi} = OpBitFieldSExtract %int {self.as_int(y)} {self.cu(0)} {self.cu(16)}")
+                    yi = self.i16_half(self.src_u(a[2]), sb[1])
+                    ri = self.tmp()
                     self.emit(f"{ri} = OpShiftRightArithmetic %int {yi} {sh}")
                     self.emit(f"{r} = OpBitcast %uint {ri}")
             elif op in ("v_add_i16", "v_sub_i16"):
                 # signed 16-bit add / sub (v_add_nc_i16 / v_sub_nc_i16): the exact sum of the sign-extended halves;
                 # its low 16 bits are the wrapped result, clamp below saturates it to [-32768, 32767]
-                xi, yi, ri = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{xi} = OpBitFieldSExtract %int {self.as_int(x)} {self.cu(0)} {self.cu(16)}")
-                self.emit(f"{yi} = OpBitFieldSExtract %int {self.as_int(y)} {self.cu(0)} {self.cu(16)}")
+                xi = self.i16_half(self.src_u(a[1]), sb[0])
+                yi = self.i16_half(self.src_u(a[2]), sb[1])
+                ri = self.tmp()
                 self.emit(f"{ri} = {'OpIAdd' if op == 'v_add_i16' else 'OpISub'} %int {xi} {yi}")
                 self.emit(f"{r} = OpBitcast %uint {ri}")
             elif op in ("v_max_i16", "v_min_i16"):
-                xi, yi, ri = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{xi} = OpBitFieldSExtract %int {self.as_int(x)} {self.cu(0)} {self.cu(16)}")
-                self.emit(f"{yi} = OpBitFieldSExtract %int {self.as_int(y)} {self.cu(0)} {self.cu(16)}")
+                xi = self.i16_half(self.src_u(a[1]), sb[0])
+                yi = self.i16_half(self.src_u(a[2]), sb[1])
+                ri = self.tmp()
                 self.emit(f"{ri} = OpExtInst %int %glsl {'SMax' if 'max' in op else 'SMin'} {xi} {yi}")
                 self.emit(f"{r} = OpBitcast %uint {ri}")
             else:
+                x = self.u16_half(self.src_u(a[1]), sb[0])
+                y = self.u16_half(self.src_u(a[2]), sb[1])
                 k = {"v_add_u16": "OpIAdd", "v_sub_u16": "OpISub", "v_mul_lo_u16": "OpIMul", "v_and_b16": "OpBitwiseAnd",
                      "v_or_b16": "OpBitwiseOr", "v_xor_b16": "OpBitwiseXor"}.get(op)
                 if op == "v_subrev_u16":
@@ -6619,17 +6621,7 @@ class Gen:
             vals = []
             for k, s_ in enumerate(a[1:4]):
                 u = self.src_u(s_)
-                if sb[k]:
-                    t = self.tmp()
-                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
-                    u = t
-                h = self.tmp()
-                if op == "v_mad_u16":
-                    self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
-                else:
-                    hi_ = self.tmp()
-                    self.emit(f"{hi_} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
-                    self.emit(f"{h} = OpBitcast %uint {hi_}")
+                h = self.u16_half(u, sb[k]) if op == "v_mad_u16" else self.tou(self.i16_half(u, sb[k]))
                 vals.append(h)
             x, y, z = vals
             prod, tot = self.tmp(), self.tmp()
@@ -6672,16 +6664,7 @@ class Gen:
             vals = []
             for k, s_ in enumerate(a[1:4]):
                 u = self.src_u(s_)
-                if sb[k]:
-                    t = self.tmp()
-                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
-                    u = t
-                h = self.tmp()
-                if signed:
-                    self.emit(f"{h} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
-                else:
-                    self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
-                vals.append(h)
+                vals.append(self.i16_half(u, sb[k]) if signed else self.u16_half(u, sb[k]))
             x, y, z = vals
             ty, pfx = ("%int", "S") if signed else ("%uint", "U")
             if "med3" in op:
@@ -7838,18 +7821,12 @@ class Gen:
             sel, dhi = self.opsel_bits(mods, 1)
             if op in ("v_cvt_f16_u16", "v_cvt_f16_i16"):
                 u = self.src_u({**a[1], "neg": False, "abs": False})
-                if sel[0]:
-                    t = self.tmp()
-                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
-                    u = t
                 f = self.tmp()
                 if op == "v_cvt_f16_u16":
-                    m = self.tmp()
-                    self.emit(f"{m} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                    m = self.u16_half(u, sel[0])
                     self.emit(f"{f} = OpConvertUToF %float {m}")
                 else:
-                    m = self.tmp()
-                    self.emit(f"{m} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
+                    m = self.i16_half(u, sel[0])
                     self.emit(f"{f} = OpConvertSToF %float {m}")
                 self.f16_out(a[0], f, dhi)
             else:
@@ -7933,12 +7910,7 @@ class Gen:
             nsrc = 2 if op == "v_ldexp_f16" else 1
             sel, dhi = self.opsel_bits(mods, nsrc)
             u = self.src_h(a[1])
-            if sel[0]:
-                t = self.tmp()
-                self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
-                u = t
-            x = self.tmp()
-            self.emit(f"{x} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+            x = self.u16_half(u, sel[0])
             if a[1].get("abs"):
                 t = self.tmp()
                 self.emit(f"{t} = OpBitwiseAnd %uint {x} {self.cu(0x7FFF)}")
@@ -7986,12 +7958,8 @@ class Gen:
                 # above 30 the result is +-inf; at 0 or below it is a denormal: the significand shifted right by
                 # 1 - field and rounded to nearest even (a carry into bit 10 gives the smallest normal).
                 n = self.src_u(a[2])
-                if sel[1]:
-                    t = self.tmp()
-                    self.emit(f"{t} = OpShiftRightLogical %uint {n} {self.cu(16)}")
-                    n = t
-                n16, nu, nb, small, neg, lim, nc = (self.tmp() for _ in range(7))
-                self.emit(f"{n16} = OpBitFieldSExtract %int {self.as_int(n)} {self.cu(0)} {self.cu(16)}")
+                n16 = self.i16_half(n, sel[1])
+                nu, nb, small, neg, lim, nc = (self.tmp() for _ in range(6))
                 self.emit(f"{nu} = OpBitcast %uint {n16}")
                 self.emit(f"{nb} = OpIAdd %uint {nu} {self.cu(64)}")
                 self.emit(f"{small} = OpULessThan %bool {nb} {self.cu(129)}")          # -64 <= n <= 64
