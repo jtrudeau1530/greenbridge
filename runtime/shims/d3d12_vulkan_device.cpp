@@ -420,8 +420,12 @@ struct DeviceState {
             return {};
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if (desc.SampleDesc.Count != 1 ||
-                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                               D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+                return {};
+            if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+                (!color_attachment_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) ||
+                 ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                  !storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))))
                 return {};
             if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && r9g9b9e5_uav_emulated) {
                 log_once("R9G9B9E5_SHAREDEXP UAV unavailable natively, using mutable R32_UINT; format", desc.Format);
@@ -2076,10 +2080,13 @@ public:
             const bool typeless_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
-            if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM) ||
-                rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
-                (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
+            if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
                 view = {};
+            } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
+                       (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
+                if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+                    (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format))
+                    view = {};
             } else if (typeless_rgba8 || typed_rgba8) {
                 const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
                 if (typeless_rgba8) {
