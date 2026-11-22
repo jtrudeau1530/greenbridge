@@ -1889,8 +1889,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     };
 
     p.colors.assign(pipeline->color_formats.size(), {});
-    for (std::size_t slot = 0; slot < draw.render_target_count && slot < draw.render_targets.size() && slot < p.colors.size(); ++slot) {
-        const TargetView& target = draw.render_targets[slot];
+    const std::uint32_t render_target_count = draw.views ? draw.views->render_target_count : 0;
+    for (std::size_t slot = 0; slot < render_target_count && slot < p.colors.size(); ++slot) {
+        const TargetView& target = draw.views->render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);
         if (!binding) return ReplayResult::unresolved_resource;
@@ -1948,7 +1949,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         p.vertex_offsets.resize(slot + 1, 0);
         p.vertex_sizes.resize(slot + 1, VK_WHOLE_SIZE);
         p.vertex_strides.resize(slot + 1, 0);
-        const bool bound = slot < draw.vertex_buffers.size() && draw.vertex_buffers[slot].va;
+        const bool bound = draw.views && slot < draw.views->vertex_buffers.size() &&
+                           draw.views->vertex_buffers[slot].va;
         if (!bound) {
             if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
             p.vertex_buffers[slot] = vk.zero_buffer;
@@ -1957,7 +1959,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             p.vertex_strides[slot] = 0;
             continue;
         }
-        const VertexBufferView& view = draw.vertex_buffers[slot];
+        const VertexBufferView& view = draw.views->vertex_buffers[slot];
         std::uint64_t size = view.size;
         if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
             return ReplayResult::unresolved_resource;
