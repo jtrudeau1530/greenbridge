@@ -36,7 +36,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
-from compute_fixture import compute_header  # noqa: E402
+from compute_fixture import compute_header, find_test_program  # noqa: E402
 
 THREADS = 64
 LDS_BYTES = 4096
@@ -552,6 +552,9 @@ def translate(progs, work, emulate):
 
 def run_gpu(p, spv, build, index_entry, emulate, dump):
     exe = os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+    if not os.path.isfile(exe):
+        sys.exit(f"vk_compute_test not found in {build} or its RelWithDebInfo/Release folder; "
+                 "build it first (cmake --build <build dir> --target vk_compute_test)")
     env = dict(os.environ, VKC_OUT_WORDS=str(OUT_WORDS), VKC_DUMP=str(dump))
     args = [exe, str(spv), "1", "dump"]
     if p.wave == 64 and not emulate:
@@ -607,6 +610,7 @@ def main():
             p.model()
         print(f"{len(progs)} programs generated and modelled")
         return 0
+    a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
     work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix="lds_fuzz_"))
     work.mkdir(parents=True, exist_ok=True)
     try:
