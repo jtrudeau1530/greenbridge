@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Synthetic unit tests for tools/vk_subgroup_info.py.
 
 Standard library only; no GPU, no Vulkan loader DLL, and no game data: the Vulkan loader ctypes API is replaced
@@ -277,6 +279,90 @@ class StructHelpersTest(unittest.TestCase):
         for off, value in ((0, 0), (4, 1), (8, 0x12345678), (16, 0x80000000), (20, 0xFFFFFFFF)):
             ctypes.c_uint32.from_buffer(buf, off).value = value
             self.assertEqual(vk_info.u32(buf, off), value)
+
+
+
+
+class ConstantsAndLayoutTest(unittest.TestCase):
+    def test_vulkan_structure_types(self):
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_APPLICATION_INFO, 0)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, 1)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, 1000059000)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, 1000059001)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, 1000094000)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 51)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, 53)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, 1000225000)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, 1000196000)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR, 1000203000)
+
+    def test_shader_stage_bits(self):
+        self.assertEqual(vk_info.VK_SHADER_STAGE_COMPUTE_BIT, 0x20)
+        self.assertEqual(vk_info.VK_SHADER_STAGE_MESH_BIT_EXT, 0x80)
+        self.assertEqual(vk_info.VK_SHADER_STAGE_COMPUTE_BIT & vk_info.VK_SHADER_STAGE_MESH_BIT_EXT, 0)
+
+    def test_queue_and_device_flags(self):
+        self.assertEqual(vk_info.VK_QUEUE_GRAPHICS_BIT, 1)
+        self.assertEqual(vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, 2)
+        self.assertEqual(vk_info.VK_INCOMPLETE, 5)
+
+    def test_driver_and_vendor_constants(self):
+        self.assertEqual(vk_info.VK_DRIVER_ID_AMD_PROPRIETARY, 1)
+        self.assertEqual(vk_info.VK_DRIVER_ID_MOLTENVK, 14)
+        self.assertEqual(vk_info.AMD_VENDOR_ID, 0x1002)
+
+    def test_api_version_1_3_encoding(self):
+        expected = (1 << 22) | (3 << 12)
+        self.assertEqual(vk_info.VK_API_VERSION_1_3, expected)
+        self.assertGreater(vk_info.VK_API_VERSION_1_3, (1 << 22) | (2 << 12))
+
+    def test_structure_sizes(self):
+        self.assertEqual(vk_info.PROPS_SIZE, 824)
+        self.assertEqual(vk_info.FEATURES2_SIZE, 240)
+        self.assertEqual(vk_info.F12_SIZE, 208)
+        self.assertEqual(vk_info.F13_SIZE, 80)
+        self.assertEqual(vk_info.BARY_FEATURES_SIZE, 24)
+        self.assertEqual(vk_info.DRIVER_PROPS_SIZE, 536)
+        self.assertEqual(vk_info.QUEUE_FAMILY_SIZE, 24)
+
+    def test_feature_and_property_offsets(self):
+        self.assertEqual(vk_info.F12_SEPARATE_DEPTH_STENCIL_LAYOUTS, 16 + 4 * 35)
+        self.assertEqual(vk_info.F12_TIMELINE_SEMAPHORE, 16 + 4 * 37)
+        self.assertEqual(vk_info.F13_SUBGROUP_SIZE_CONTROL, 16 + 4 * 7)
+        self.assertEqual(vk_info.F13_SYNCHRONIZATION2, 16 + 4 * 9)
+        self.assertEqual(vk_info.F13_DYNAMIC_RENDERING, 16 + 4 * 12)
+        self.assertEqual(vk_info.PROPS_API_VERSION, 0)
+        self.assertEqual(vk_info.PROPS_VENDOR_ID, 8)
+        self.assertEqual(vk_info.PROPS_DEVICE_ID, 12)
+        self.assertEqual(vk_info.PROPS_DEVICE_TYPE, 16)
+        self.assertEqual(vk_info.PROPS_DEVICE_NAME, 20)
+
+    def test_ctypes_structure_layouts(self):
+        sg = vk_info.SubgroupSizeControl(
+            sType=vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
+            pNext=None,
+            minSubgroupSize=16,
+            maxSubgroupSize=64,
+            maxComputeWorkgroupSubgroups=128,
+            requiredSubgroupSizeStages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT,
+        )
+        self.assertEqual(sg.sType, vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES)
+        self.assertIsNone(sg.pNext)
+        self.assertEqual(sg.minSubgroupSize, 16)
+        self.assertEqual(sg.maxSubgroupSize, 64)
+        self.assertEqual(sg.maxComputeWorkgroupSubgroups, 128)
+        self.assertEqual(sg.requiredSubgroupSizeStages, vk_info.VK_SHADER_STAGE_COMPUTE_BIT)
+
+        props = vk_info.SubgroupProperties(
+            sType=vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+            pNext=None,
+            subgroupSize=32,
+            supportedStages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT,
+            supportedOperations=0x1FF,
+            quadOperationsInAllStages=1,
+        )
+        self.assertEqual(props.subgroupSize, 32)
+        self.assertEqual(props.supportedStages, vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT)
 
 
 class LoadVulkanTest(unittest.TestCase):
@@ -585,6 +671,22 @@ class QueryTest(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, rf"LEONIDA_VK_DEVICE={filt}"):
                         vk_info.query()
                 self.assertEqual(vk.destroyed_instances, [FakeVulkan.INSTANCE_HANDLE])
+
+    def test_stage_bitmask_with_additional_shader_stages(self):
+        extra_stages = (
+            vk_info.VK_SHADER_STAGE_COMPUTE_BIT
+            | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
+            | 0x01
+            | 0x10
+        )
+        dev = FakeDevice(
+            required_subgroup_size_stages=extra_stages,
+            subgroup_supported_stages=extra_stages,
+        )
+        res, _vk = self._run_query(dev)
+        self.assertTrue(res["compute_in_required_stages"])
+        self.assertTrue(res["mesh_in_required_stages"])
+        self.assertTrue(res["native64"])
 
     def test_native64_conditions_and_boundaries(self):
         both = vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
