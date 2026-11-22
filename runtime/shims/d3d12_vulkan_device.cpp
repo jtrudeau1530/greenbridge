@@ -33,7 +33,6 @@
 #include <iterator>
 #include <map>
 #include <cstring>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -65,6 +64,37 @@ void log_once(const char* what, int value) {
     static std::set<std::pair<std::string, int>> seen;
     std::lock_guard lock(mutex);
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+}
+
+// A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
+// for a wave32 shader on a 64-wide default, reads lanes that are not its own). Logged once per stage with the first
+// shader's name, then again at 10, 100, 1000... of that stage so a whole corpus stays readable.
+void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonida::SubgroupRequest& request,
+                                 const leonida::SubgroupSizeCaps& caps) {
+    static std::mutex mutex;
+    static std::map<std::string, std::pair<std::set<std::string>, unsigned>> seen;  // stage -> names, next report
+    std::lock_guard lock(mutex);
+    auto& [names, next_report] = seen[entry.stage];
+    if (!names.insert(entry.name).second) return;
+    if (names.size() == 1) next_report = 10;
+    else if (names.size() != next_report) return;
+    else next_report *= 10;
+    const bool emulable = entry.stage == "cs" || entry.stage == "ms";
+    const std::string so_far =
+        names.size() > 1 ? " (shaders of this stage so far: " + std::to_string(names.size()) + ")" : "";
+    std::fprintf(stderr,
+                 "[rt] d3d12: %s (%s) is a %u-wide shader but this device cannot require that subgroup size for the "
+                 "stage (device sizes %u..%u, default %u, subgroupSizeControl %s); it runs at the device's size and "
+                 "is inexact where lanes of the other half matter%s\n",
+                 entry.name.c_str(), entry.stage.c_str(), request.wanted, caps.min_size, caps.max_size,
+                 caps.default_size, caps.subgroup_size_control ? "on" : "off",
+                 so_far.c_str());
+    if (emulable && request.wanted == 64)
+        std::fprintf(stderr, "[rt] d3d12: translate wave64 %s shaders with --wave64-emulate for this GPU "
+                             "(make_game.py --wave64-emulate auto does)\n", entry.stage.c_str());
+    else if (request.wanted == 64)
+        std::fprintf(stderr, "[rt] d3d12: no emulation exists for wave64 %s shaders yet (docs/d3d12_vulkan.md, "
+                             "subgroup size)\n", entry.stage.c_str());
 }
 
 struct Format {
@@ -131,6 +161,10 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     // Vulkan 1.3 requires sampling it (formerly VK_EXT_4444_formats).
     case DXGI_FORMAT_B4G4R4A4_UNORM: return {VK_FORMAT_A4R4G4B4_UNORM_PACK16, color};
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return {VK_FORMAT_B8G8R8A8_SRGB, color};
+    // The X byte has no channel of its own: the BGRA8 images hold it, and shader views read alpha as 1.
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return {VK_FORMAT_B8G8R8A8_UNORM, color, true};
+    case DXGI_FORMAT_B8G8R8X8_UNORM: return {VK_FORMAT_B8G8R8A8_UNORM, color};
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return {VK_FORMAT_B8G8R8A8_SRGB, color};
     case DXGI_FORMAT_R16G16_TYPELESS: return {VK_FORMAT_R16G16_SFLOAT, color, true};
     case DXGI_FORMAT_R16G16_FLOAT: return {VK_FORMAT_R16G16_SFLOAT, color};
     case DXGI_FORMAT_R16G16_UINT: return {VK_FORMAT_R16G16_UINT, color};
@@ -225,6 +259,13 @@ bool rgb96_refused(const D3D12_RESOURCE_DESC& desc) {
                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
 }
 
+// B8G8R8X8: the BGRA8 Vulkan formats with the alpha byte unused. Its typeless family is a family of its own, so
+// views never cross between it and B8G8R8A8, although both land on the same VkFormat.
+bool alpha_unused(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_B8G8R8X8_TYPELESS || format == DXGI_FORMAT_B8G8R8X8_UNORM ||
+           format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+}
+
 // The full mip chain's length for a texture this size.
 UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
@@ -239,6 +280,14 @@ bool xr_bias_compatible(const D3D12_RESOURCE_DESC& desc) {
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return false;
     const UINT mips = desc.MipLevels ? desc.MipLevels : full_mips(desc.Width, desc.Height, 1);
     return mips == 1;
+}
+
+// The Xbox tiled layout word (slot 76, docs/d3d12_vulkan.md section 4.2) is outside D3D12_TEXTURE_LAYOUT's
+// enumerators, so compare as an integer.
+constexpr UINT kXboxTiledLayout = 0x101;
+
+bool is_tiled_layout(D3D12_TEXTURE_LAYOUT layout) {
+    return layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE || static_cast<UINT>(layout) == kXboxTiledLayout;
 }
 
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
@@ -284,7 +333,8 @@ struct TextureCreateInfo {
         info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+        // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format)) {
             info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
             if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -573,6 +623,13 @@ struct DeviceState {
         if (rgb96_refused(desc)) {
             if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
                 log_once("96-bit (R32G32B32) render targets not supported; format", desc.Format);
+            return {};
+        }
+        // The host runtime refuses typed B8G8R8X8 with unordered access (its typeless family is accepted): the
+        // BGRA8 image could take storage writes, but D3D12 has no typed UAV for these formats.
+        if (alpha_unused(desc.Format) && desc.Format != DXGI_FORMAT_B8G8R8X8_TYPELESS &&
+            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            log_once("B8G8R8X8 textures cannot allow unordered access; format", desc.Format);
             return {};
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
@@ -1970,9 +2027,22 @@ public:
         return false;
     }
 
+    // Asks for the subgroup size the shader was translated for, where the device allows (src/subgroup_size.h): the
+    // stage gets VkPipelineShaderStageRequiredSubgroupSizeCreateInfo in `storage` (which must outlive pipeline
+    // creation) and, for compute, REQUIRE_FULL_SUBGROUPS. A size the device cannot give is reported, not hidden.
+    void subgroup_size_for(const leonida::ShaderEntry& entry, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo& storage,
+                           VkPipelineShaderStageCreateInfo& stage) {
+        const leonida::SubgroupRequest request = leonida::decide_subgroup_size(entry, device_.info.subgroup);
+        if (request.outcome == leonida::SubgroupOutcome::unavailable)
+            report_subgroup_unavailable(entry, request, device_.info.subgroup);
+        leonida::apply_subgroup_request(request, storage, stage);
+        subgroup_requests_.push_back(request);
+    }
+
     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
     bool compute() const { return registered_ && !is_graphics_; }
     bool graphics() const { return registered_ && is_graphics_; }
+    const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
 
     // A VS (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the VS's
     // input signature by semantic name and index: location = the element's register, the translator's rule
@@ -1997,9 +2067,14 @@ public:
             log_once("graphics pipeline stage not supported yet (hull/domain/geometry/stream output):", 0);
             return E_NOTIMPL;
         }
-        if (desc.SampleDesc.Count > 1) {
-            log_once("multisampled graphics pipelines not supported yet; samples", int(desc.SampleDesc.Count));
-            return E_NOTIMPL;
+        const UINT samples = desc.SampleDesc.Count;
+        if (!samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || (samples & (samples - 1))) {
+            log_once("invalid graphics pipeline sample count:", int(samples));
+            return E_INVALIDARG;
+        }
+        if (desc.SampleDesc.Quality != 0) {
+            log_once("invalid graphics pipeline sample quality:", int(desc.SampleDesc.Quality));
+            return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) return E_FAIL;
@@ -2014,6 +2089,8 @@ public:
         Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
+        // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
+        auto& required_sizes = recipe_.required_sizes;
         const Stage* code_stage = nullptr;
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
@@ -2061,6 +2138,7 @@ public:
             info.stage = stage.bit;
             info.module = module;
             info.pName = "main";
+            subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
 
@@ -2145,7 +2223,7 @@ public:
         raster.depthClampEnable = r.DepthClipEnable ? VK_FALSE : VK_TRUE;
 
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = VkSampleCountFlagBits(samples);
         const VkSampleMask sample_mask = desc.SampleMask;
         multisample.pSampleMask = &sample_mask;
         multisample.alphaToCoverageEnable = desc.BlendState.AlphaToCoverageEnable;
@@ -2231,6 +2309,55 @@ public:
             graphics_.depth_format = f.format;
             graphics_.depth_aspects = f.aspects;
         }
+        if (samples > 1) {
+            const auto& dinfo = device_.info;
+            const bool has_color = std::any_of(graphics_.color_formats.begin(), graphics_.color_formats.end(),
+                                               [](VkFormat f) { return f != VK_FORMAT_UNDEFINED; });
+            const bool has_depth = graphics_.depth_format != VK_FORMAT_UNDEFINED;
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    dinfo.get_instance_proc ? dinfo.get_instance_proc(dinfo.instance, "vkGetPhysicalDeviceProperties")
+                                            : nullptr)) {
+                VkPhysicalDeviceProperties props{};
+                get_props(dinfo.physical, &props);
+                VkSampleCountFlags supported = ~VkSampleCountFlags(0);
+                if (has_color) supported &= props.limits.framebufferColorSampleCounts;
+                if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+                    supported &= props.limits.framebufferDepthSampleCounts;
+                if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
+                    supported &= props.limits.framebufferStencilSampleCounts;
+                if (!has_color && !has_depth) supported &= props.limits.framebufferNoAttachmentsSampleCounts;
+                if (!(supported & samples)) {
+                    log_once("multisample count not supported by framebuffer limits; samples", int(samples));
+                    return E_INVALIDARG;
+                }
+            }
+            if ((has_color || has_depth) && !device_.image_format_properties) {
+                log_once("cannot query per-format multisample support; samples", int(samples));
+                return E_INVALIDARG;
+            }
+            for (const VkFormat fmt : graphics_.color_formats) {
+                if (fmt == VK_FORMAT_UNDEFINED) continue;
+                VkImageFormatProperties img_props{};
+                if (device_.image_format_properties(dinfo.physical, fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &img_props) != VK_SUCCESS ||
+                    !(img_props.sampleCounts & samples)) {
+                    log_once("multisample count not supported by color attachment format; samples", int(samples));
+                    return E_INVALIDARG;
+                }
+            }
+            if (has_depth) {
+                VkImageFormatProperties img_props{};
+                if (device_.image_format_properties(dinfo.physical, graphics_.depth_format, VK_IMAGE_TYPE_2D,
+                                                    VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
+                                                    &img_props) != VK_SUCCESS ||
+                    !(img_props.sampleCounts & samples)) {
+                    log_once("multisample count not supported by depth/stencil attachment format; samples",
+                             int(samples));
+                    return E_INVALIDARG;
+                }
+            }
+        }
         // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
         // stages present. A stage added to the table (geometry, mesh) is covered without touching this.
         for (const Stage& stage : stages) graphics_.push_stages |= stage.bit;
@@ -2308,7 +2435,6 @@ public:
                          entry->name.c_str());
             return E_NOTIMPL;
         }
-        if (entry->wave64) log_once("wave64 compute shader runs 32-wide (subgroup size control not requested yet)", 0);
         const std::vector<std::uint32_t> words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
@@ -2336,6 +2462,8 @@ public:
         pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipeline_info.stage.module = module_;
         pipeline_info.stage.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+        subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
         if (vk.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
             VK_SUCCESS)
@@ -2357,6 +2485,7 @@ private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[2]{};  // what `stages` chain
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
@@ -2452,6 +2581,7 @@ private:
     VkDeviceSize code_bytes_ = 0;
     bool registered_ = false;
     bool is_graphics_ = false;
+    std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
 };
 
 // A view of a texture as Create*View describes it, before the resource's own shape is applied.
@@ -2544,6 +2674,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("incompatible typed A8 view format:", int(view.format));
             return false;
         }
+        if (alpha_unused(view.format) != alpha_unused(desc.Format)) {
+            log_once("view format from another typeless family (B8G8R8X8 and B8G8R8A8):", int(view.format));
+            return false;
+        }
         if ((view.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) != (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
             log_once("incompatible R9G9B9E5 view format:", int(view.format));
             return false;
@@ -2611,9 +2745,11 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
     // A stencil view's format has its eight bits in G and no R, B or A of its own (0, 0, 1 when read).
+    // B8G8R8X8 has no alpha: it reads 1.
     g::Swizzle channels = g::format_swizzle(view_format);
     if (stencil) channels = {g::select_zero, g::select_x, g::select_zero, g::select_one};
     else if (desc.Format == DXGI_FORMAT_A8_UNORM) channels = {g::select_zero, g::select_zero, g::select_zero, g::select_x};
+    else if (alpha_unused(desc.Format)) channels[3] = g::select_one;
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         if (msaa && from > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) {
@@ -3844,6 +3980,11 @@ public:
                 return;
             }
         }
+        // B8G8R8X8 has no typed UAV, so no format of its family gives an unordered-access view.
+        if (alpha_unused(r->desc().Format) || alpha_unused(view.format)) {
+            log_once("unordered-access view of a B8G8R8X8 format; format", int(view.format));
+            return;
+        }
         write_image_descriptor(*r, view, destination, true);
     }
 
@@ -3984,14 +4125,15 @@ public:
         return CreateReservedResource1(desc, D3D12_RESOURCE_STATE_COMMON, nullptr, session, riid, out);
     }
 
-    // Tiling of a reserved resource (src/resource_tiling.h). Anything else, as on the PC runtime, has no tiles:
-    // every output is zero and no subresource tiling is written.
+    // Tiling of a reserved resource or a tiled (64KB_UNDEFINED_SWIZZLE) texture (src/resource_tiling.h). Anything
+    // else, as on the PC runtime, has no tiles: every output is zero and no subresource tiling is written.
     void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource* resource, UINT* total, D3D12_PACKED_MIP_INFO* packed,
                                              D3D12_TILE_SHAPE* shape, UINT* count, UINT first,
                                              D3D12_SUBRESOURCE_TILING* tilings) override {
         leonida::ResourceTiling tiling;
         Resource* r = Resource::from<Resource>(resource);
-        const bool ok = r && r->reserved() && resource_tiling(r->GetDesc(), tiling);
+        const bool ok = r && (r->reserved() || is_tiled_layout(r->GetDesc().Layout)) &&
+                        resource_tiling(r->GetDesc(), tiling);
         if (total) *total = ok ? tiling.total_tiles : 0;
         if (packed)
             *packed = ok ? D3D12_PACKED_MIP_INFO{UINT8(tiling.standard_mips), UINT8(tiling.packed_mips),
@@ -4148,14 +4290,28 @@ public:
             log_once("placed resource offset not 64 KiB aligned:", int(heap_offset));
             return E_INVALIDARG;
         }
+        const bool tiled = is_tiled_layout(desc->Layout);
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            if (heap_offset + desc->Width > heap->bytes()) return E_INVALIDARG;
+            if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+            if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width) return E_INVALIDARG;
         } else if (heap_offset >= heap->bytes()) {
             return E_INVALIDARG;
         }
-        if (desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
-            log_once("tiled placed resource not supported yet; dimension", int(desc->Dimension));
-            return E_NOTIMPL;
+        if (tiled) {
+            if (heap->properties().Type == D3D12_HEAP_TYPE_UPLOAD ||
+                heap->properties().Type == D3D12_HEAP_TYPE_READBACK)
+                return E_INVALIDARG;
+            if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                return E_INVALIDARG;
+            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
+            if (alloc.SizeInBytes == UINT64_MAX || alloc.SizeInBytes > heap->bytes() ||
+                heap_offset > heap->bytes() - alloc.SizeInBytes)
+                return E_INVALIDARG;
+            if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+                log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
+                         int(desc->Dimension));
+            }
         }
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
@@ -4164,7 +4320,7 @@ public:
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             hr = resource->create_placed_buffer();
-        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        } else if (!tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             log_once("placed resource dimension not supported:", int(desc->Dimension));
         } else if (desc->SampleDesc.Count > 1) {
             log_once("multisampled placed resource not supported; samples", int(desc->SampleDesc.Count));
@@ -4693,8 +4849,9 @@ public:
             if (optimal & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
                 s1 |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
             }
-            if ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
-                (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) {
+            // B8G8R8X8 has no typed UAV in D3D12 (texture_format refuses it), whatever the BGRA8 image could do.
+            if (!alpha_unused(fs->Format) && ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
+                                              (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT))) {
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
                 // A typed UAV texture read is not a storage-image read: the translator reads it through the
                 // texture's sampled binding with the T#'s numeric type (rdna2spirv.py image_read_typed), so a
@@ -4941,8 +5098,16 @@ private:
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
             (volume && depth_stencil))
             return kInvalidAllocation;
-        if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
+        const bool tiled = is_tiled_layout(desc.Layout);
+        if (tiled) {
+            if (one_d) return kInvalidAllocation;
+            if (desc.Alignment && desc.Alignment != align_64k) return kInvalidAllocation;
+            // Tiled MSAA is 4x single-mip 2D attachment only (measured on RTX 5070 Ti and WARP).
+            if (samples > 1 && (samples != 4 || !(desc.Flags & attachment) || (desc.Flags & attachment) == attachment))
+                return kInvalidAllocation;
+        } else if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
+        }
 
         const Format format = state_.texture_format(desc);
         if (!format.format) {
@@ -4952,6 +5117,11 @@ private:
         VkMemoryRequirements need{};
         const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
+        if (tiled) {
+            leonida::ResourceTiling tiling;
+            if (!resource_tiling(resolved, tiling)) return kInvalidAllocation;
+            return {UINT64(tiling.total_tiles) * leonida::tile_size_in_bytes, align_64k};
+        }
 
         // D3D12's alignment: 64 KiB, or 4 MiB with MSAA, unless the description asks for a small one (4 KiB, 64 KiB
         // with MSAA). 4 KiB needs the top mip of one array slice to fit in 16 tiles of 4 KiB and the resource not to
@@ -5131,14 +5301,11 @@ private:
     HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, REFIID riid, void** out) {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
-        // The Xbox tiled layout word. 0x101 is outside D3D12_TEXTURE_LAYOUT's enumerators, so it can't be a
-        // constexpr enum value (clang rejects the cast in a constant expression); compare it as an integer.
-        constexpr UINT xbox_tiled = 0x101;
         D3D12_RESOURCE_DESC backing = *desc;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
         } else {
-            if (static_cast<UINT>(desc->Layout) == xbox_tiled) {
+            if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
                 log_once("reserved resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          desc->Dimension);
             } else if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
@@ -5190,6 +5357,7 @@ private:
         const leonida::BlockFormat block = leonida::block_format(format.format, format.aspects);
         tiling.element_bytes = block.bytes;
         tiling.block = block.block;
+        tiling.samples = desc.SampleDesc.Count;
         return leonida::resource_tiling(tiling, out);
     }
 
@@ -5286,6 +5454,11 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->graphics() ? p->id() : 0;
+}
+
+const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
 }
 
 VkImage vulkan_image(ID3D12Resource* resource) {
@@ -5509,7 +5682,15 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
     auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
                                                                 info.instance, info.physical, info.queue,
                                                                 info.queue_family, surface,  // owns the surface
-                                                                info.swapchain_maintenance1 && tear_allowed);
+                                                                info.swapchain_maintenance1 && tear_allowed,
+                                                                [window]() -> VkExtent2D {
+                                                                    RECT r{};
+                                                                    if (GetClientRect(window, &r)) {
+                                                                        return {static_cast<uint32_t>(r.right - r.left),
+                                                                                static_cast<uint32_t>(r.bottom - r.top)};
+                                                                    }
+                                                                    return {0, 0};
+                                                                });
     if (!presenter->ok()) {
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
@@ -5636,6 +5817,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
+    LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties2);
     LEONIDA_INSTANCE(vkEnumerateDeviceExtensionProperties);
     LEONIDA_INSTANCE(vkCreateDevice);
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
@@ -5653,6 +5835,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
+    VkPhysicalDeviceVulkan13Features chosen13{};
     bool chosen_draw_params = false;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
@@ -5681,6 +5864,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 chosen_bc = bc;
                 chosen_features = features.features;
                 chosen12 = f12;
+                chosen13 = f13;
                 chosen_draw_params = draw_params;
             }
             break;
@@ -5764,6 +5948,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, ext_chain};
     enable13.dynamicRendering = VK_TRUE;
     enable13.synchronization2 = VK_TRUE;
+    // Subgroup size control: a pipeline stage asks for the size its shader was translated for (src/subgroup_size.h).
+    enable13.subgroupSizeControl = chosen13.subgroupSizeControl;
+    enable13.computeFullSubgroups = chosen13.computeFullSubgroups;
+    leonida::query_subgroup_size_caps(vkGetPhysicalDeviceProperties2, info.physical, chosen13.subgroupSizeControl,
+                                      chosen13.computeFullSubgroups, info.subgroup);
     // Translated vertex shaders read BaseVertex / BaseInstance (SPIR-V DrawParameters) to give v0 / v3 the
     // hardware's zero-based vertex and instance ids (docs/design.md, Inputs and outputs).
     VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
@@ -5966,6 +6155,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,
                  chosen.limits.maxPushConstantsSize);
+    std::fprintf(stderr,
+                 "[rt] d3d12: subgroup sizes %u..%u (default %u), requirable in stages 0x%x, subgroupSizeControl %s, "
+                 "computeFullSubgroups %s\n",
+                 info.subgroup.min_size, info.subgroup.max_size, info.subgroup.default_size,
+                 unsigned(info.subgroup.required_stages), info.subgroup.subgroup_size_control ? "on" : "off",
+                 info.subgroup.compute_full_subgroups ? "on" : "off");
     if (info.push_constants_need_fallback) {
         std::fprintf(stderr,
                      "[rt] d3d12: WARNING: GPU maxPushConstantsSize (%u bytes) is below the 144 bytes required by "

@@ -29,7 +29,7 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 # All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
 # vk_store_test "words" fixtures and image_get_lod draws.
-TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
+TOTAL = (len(check.COMPUTE) + 4 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
@@ -65,6 +65,10 @@ class Wave64Checks(unittest.TestCase):
                 if fmt[1] is not None:
                     dump.write_bytes(fmt[1])
                 return fmt[0], "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
+            if name == "cs_fmt_sint32":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
+                return 0, ""
             if name == "cs_fmt_xy_xyz":
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
                 Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ)
@@ -321,6 +325,24 @@ class PixelDeviceLimits(unittest.TestCase):
         problem = self.run_pixel("ps_bitmask_perm", 0, "ok 64x64\n", data=self.bitmask_pixels(32))
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("no subgroup width", problem)
+
+    @staticmethod
+    def readlane_pixels(words=(0x40000079, 0x40000010, 0x40000064, 0x400000be)):
+        return struct.pack("<4I", *words) * (64 * 64)
+
+    def test_wave64_pixel_shader_skips_where_64_cannot_be_required(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("64-wide fragment subgroup", problem)
+        self.assertIn("8..8", problem)
+
+    def test_wave64_pixel_shader_is_judged_when_64_was_required(self):
+        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64 required\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels()), "")
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("pixels differ", problem)
 
     def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
         out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"

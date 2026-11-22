@@ -465,6 +465,9 @@ ALL_OPS = {
     "v_trunc_f32": _op("f", lambda x: rounding(x, "trunc")),
     "v_rndne_f32": _op("f", lambda x: rounding(x, "rne")),
     "v_rcp_f32": _op("t", lambda x: transcendental("v_rcp_f32", x)),
+    # v_rcp_iflag_f32 is v_rcp_f32 without the FP exception flags: bit-identical on gfx1030 (design.md, "Denormal
+    # flush and special results"), so it shares the model; clamp and omod are what is new here (SHADER-136).
+    "v_rcp_iflag_f32": _op("t", lambda x: transcendental("v_rcp_f32", x)),
     "v_rsq_f32": _op("t", lambda x: transcendental("v_rsq_f32", x)),
     "v_sqrt_f32": _op("t", lambda x: transcendental("v_sqrt_f32", x)),
     "v_exp_f32": _op("e", lambda x: transcendental("v_exp_f32", x)),
@@ -822,8 +825,8 @@ HW_PRIMARY = "flush"
 
 # Ops whose omod does not depend on the f32 denormal mode: the transcendental unit and the cube ops flush or select
 # whatever MODE says, and gfx1150 applies their omod with denormals kept (measured, 'omod' table).
-OMOD_IGNORES_DENORM_MODE = ("v_rcp_f32", "v_rsq_f32", "v_sqrt_f32", "v_exp_f32", "v_log_f32", "v_cubeid_f32",
-                            "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32")
+OMOD_IGNORES_DENORM_MODE = ("v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32", "v_exp_f32", "v_log_f32",
+                            "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32")
 
 
 def omod_active(mode, op=None):
@@ -1140,8 +1143,8 @@ FAMILIES = [
     ("f16 convert", ("v_cvt_f32_f16", "v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32")),
     ("v_cvt_pk_u8_f32", ("v_cvt_pk_u8_f32",)),
     ("floor / ceil / trunc / rndne", ("v_floor_f32", "v_ceil_f32", "v_trunc_f32", "v_rndne_f32")),
-    ("rcp / rsq / sqrt / exp / log (exact inputs)", ("v_rcp_f32", "v_rsq_f32", "v_sqrt_f32", "v_exp_f32",
-                                                      "v_log_f32")),
+    ("rcp / rsq / sqrt / exp / log (exact inputs)", ("v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32",
+                                                      "v_exp_f32", "v_log_f32")),
     ("cube", ("v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32")),
     ("v_cmp_class_f32", ("v_cmp_class_f32",)),
     ("min / max / med3 (hardware only)", HW_ONLY_OPS),
