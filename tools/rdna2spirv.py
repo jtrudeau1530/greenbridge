@@ -3666,7 +3666,7 @@ class Gen:
                 self.emit(f"{lo} = OpExtInst %float %glsl FMin {x} {y}")
                 self.emit(f"{hi} = OpExtInst %float %glsl FMax {x} {y}")
                 self.emit(f"{r} = OpExtInst %float %glsl FClamp {z} {lo} {hi}")
-                self.dst(a[0], self.tou(r))
+                self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
