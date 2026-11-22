@@ -553,6 +553,21 @@ int main() {
             std::memset(view_bytes(null_slot), 0x77, step);
             device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
             EXPECT(null_at(null_slot));
+
+            // Both planes of a depth-stencil resource can be denied to shaders. Start each negative
+            // case with a live SRV so leaving a stale T# in the destination also fails.
+            depth_desc.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+            Ref<ID3D12Resource> denied;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &depth_desc,
+                            D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr, IID_PPV_ARGS(&denied.p))));
+            for (UINT plane = 0; plane < 2; ++plane) {
+                plane_view.Format = plane == 0 ? depth_view_format : stencil_view_format;
+                plane_view.Texture2D.PlaneSlice = plane;
+                device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+                EXPECT(!null_at(null_slot));
+                device->CreateShaderResourceView(denied.p, &plane_view, view_slot(null_slot));
+                EXPECT(null_at(null_slot));
+            }
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC colour_plane{};
         colour_plane.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;

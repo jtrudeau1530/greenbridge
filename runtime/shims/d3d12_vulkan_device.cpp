@@ -1366,6 +1366,10 @@ public:
             return;
         }
         if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
+        if (r->desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
+            log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
+            return;
+        }
         TextureView view{};
         if (!desc) {
             if (r->desc().DepthOrArraySize > 1) view.type = leonida::gfx10::ImageType::image_2d_array;
