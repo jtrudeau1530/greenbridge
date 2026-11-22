@@ -159,6 +159,17 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("1 malformed", p.stdout)
         self.assertIn("line 1", p.stdout)
 
+    def test_comments_inside_cdata_are_not_counted(self):
+        doc = self.write("comments.xml", b"<!-- real --><Root><![CDATA[<!-- text -->]]></Root><!-- real -->")
+        out = os.path.join(self.root, "catalog.json")
+        p = self.run_tool(doc, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertTrue(report["rows"][0]["well_formed"])
+        self.assertEqual(report["rows"][0]["comments"], 2)
+        self.assertEqual(report["summary"]["comments"], 2)
+
     def test_carve_directory_joins_chunks_and_marks_fragment(self):
         carve = os.path.join(self.root, "carve")
         os.makedirs(carve)
