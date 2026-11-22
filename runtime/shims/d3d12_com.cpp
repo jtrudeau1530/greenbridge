@@ -247,6 +247,7 @@ public:
     // Root signatures, pipeline state and root arguments. The arguments are packed into the 32 user-data dwords
     // the translated shaders read (root_signature.h; docs section 3.5); a draw or dispatch records a copy.
     void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature* signature) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetComputeRootSignature");
         bind_root(compute_, signature);
     }
     void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* signature) override {
@@ -304,6 +305,7 @@ public:
     }
 
     void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::Dispatch");
         if (defer([=](GraphicsCommandList& l) { l.record_dispatch(x, y, z); }, true)) return;
         record_dispatch(x, y, z);
     }
