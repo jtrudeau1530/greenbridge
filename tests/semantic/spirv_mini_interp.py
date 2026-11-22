@@ -680,10 +680,16 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = x or y
         elif op == "OpLogicalNot":
             values[res] = not val(a[1])
-        elif op in ("OpFAdd", "OpFSub", "OpFMul"):
+        elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
-            fn = (lambda p, q: f32(p + q)) if op == "OpFAdd" else (
-                (lambda p, q: f32(p - q)) if op == "OpFSub" else (lambda p, q: f32(p * q)))
+
+            def _fdiv(p, q):
+                if q != 0.0:
+                    return f32(p / q)
+                return f32(math.copysign(math.inf, p) if p != 0.0 else math.nan)
+
+            fn = {"OpFAdd": (lambda p, q: f32(p + q)), "OpFSub": (lambda p, q: f32(p - q)),
+                  "OpFMul": (lambda p, q: f32(p * q)), "OpFDiv": _fdiv}[op]
             if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
                     isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
                 values[res] = tuple(fn(p, q) for p, q in zip(x, y))

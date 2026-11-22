@@ -810,16 +810,20 @@ class Gen:
         return words
 
     def decode_format(self, words, code):
-        """Decode one element of format `code` from raw dwords -> 4 uint ids holding f32 bits (or uint for *_UINT/uint)."""
+        """Decode one element of format `code` from raw dwords -> 4 uint ids holding f32 bits (or uint for *_UINT/uint).
+
+        Missing channels repeat the format's own (component c = c mod n): measured on RX 6700 for SHADER-86.
+        UNORM/SNORM use correctly rounded OpFDiv by (2^n-1), not a reciprocal multiply."""
         try:
             size, kind, widths = self.FORMATS[code]
         except KeyError:
             raise Unsupported(f"format {code} (not in FORMATS)")
         if kind in ("f32", "u32"):
-            vals = list(words[:len(widths)])
-            if kind == "u32":
-                vals = vals    # integers are passed through as their bits
-            return vals + [self.cu(0)] * (3 - len(vals) + 1 if len(vals) < 4 else 0)
+            n = len(widths)
+            vals = list(words[:n])
+            while len(vals) < 4:
+                vals.append(vals[len(vals) % n])
+            return vals
         out, bit = [], 0
         for w in widths:
             src = words[bit // 32]
@@ -833,21 +837,21 @@ class Gen:
             elif kind == "unorm":
                 c, x = self.tmp(), self.tmp()
                 self.emit(f"{c} = OpConvertUToF %float {f}")
-                self.emit(f"{x} = OpFMul %float {c} {self.fconst(1.0 / ((1 << w) - 1))}")
+                self.emit(f"{x} = OpFDiv %float {c} {self.fconst(float((1 << w) - 1))}")
                 out.append(self.tou(x))
             elif kind == "snorm":
                 si, c, x, cl = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{si} = OpBitFieldSExtract %int {self.as_int(src)} {self.cu(bit % 32)} {self.cu(w)}")
                 self.emit(f"{c} = OpConvertSToF %float {si}")
-                self.emit(f"{x} = OpFMul %float {c} {self.fconst(1.0 / ((1 << (w - 1)) - 1))}")
+                self.emit(f"{x} = OpFDiv %float {c} {self.fconst(float((1 << (w - 1)) - 1))}")
                 self.emit(f"{cl} = OpExtInst %float %glsl FMax {x} {self.fconst(-1.0)}")
                 out.append(self.tou(cl))
             else:   # uint: raw integer
                 out.append(f)
             bit += w
-        one = self.cu(0x3F800000) if kind in ("f16", "unorm", "snorm") else self.cu(1)
+        n = len(out)
         while len(out) < 4:
-            out.append(self.cu(0) if len(out) < 3 else one)
+            out.append(out[len(out) % n])
         return out
 
     BUF_ATOMICS = {"add": ("OpAtomicIAdd", 0), "sub": ("OpAtomicISub", 0), "umin": ("OpAtomicUMin", 0xFFFFFFFF),
@@ -1023,13 +1027,22 @@ class Gen:
                 self.emit(f"{s} = OpSelect %uint {e} {dec[c]} {comps[c]}")
                 nxt.append(s)
             comps = nxt
-        # DST_SEL swizzle: 0 -> 0, 1 -> 1.0, 4..7 -> X..W.
+        # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
+        is_int_fmt = "%false"
+        for code_v, (_, kind, _) in self.FORMATS.items():
+            if kind in ("u32", "uint"):
+                e, o = self.tmp(), self.tmp()
+                self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
+                self.emit(f"{o} = OpLogicalOr %bool {is_int_fmt} {e}")
+                is_int_fmt = o
+        dst1 = self.tmp()
+        self.emit(f"{dst1} = OpSelect %uint {is_int_fmt} {self.cu(1)} {self.cu(0x3F800000)}")
         outs = []
         for c in range(ncomp):
             sel = self.tmp()
             self.emit(f"{sel} = OpBitFieldUExtract %uint {d3} {self.cu(3 * c)} {self.cu(3)}")
             r = self.cu(0)
-            for code_v, src in ((1, self.cu(0x3F800000)), (4, comps[0]), (5, comps[1]), (6, comps[2]), (7, comps[3])):
+            for code_v, src in ((1, dst1), (4, comps[0]), (5, comps[1]), (6, comps[2]), (7, comps[3])):
                 e, s = self.tmp(), self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {sel} {self.cu(code_v)}")
                 self.emit(f"{s} = OpSelect %uint {e} {src} {r}")
