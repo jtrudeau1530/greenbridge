@@ -1126,7 +1126,9 @@ int compare_feature_support(ID3D12Device* ours) {
 
 int main() {
     vktest::Device d;
-    if (!d.create()) return 77;   // no Vulkan GPU: CTest treats 77 as skipped
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) return 77;
+    if (status == vktest::DeviceStatus::failed) return 1;
     EXPECT(d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT));
     VkSampleCountFlags depth_sample_counts = 0, color_sample_counts = 0;
     {
