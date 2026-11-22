@@ -430,6 +430,7 @@ public:
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
+#if defined(VK_KHR_swapchain_maintenance1)
         VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
         if (presentation) {
@@ -451,6 +452,7 @@ public:
                 }
             }
         }
+#endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
