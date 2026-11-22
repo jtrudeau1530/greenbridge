@@ -588,5 +588,124 @@ class TestValuMed3SymbolicAST(unittest.TestCase):
             InstructionAST("v_med3_i32", dst_i, s0_mod, s1_i, s2_i).validate()
 
 
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU median instructions."""
+
+    def __init__(self) -> None:
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgpr = [0] * self.num_vgprs
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = MASK64
+
+    def reset(self) -> None:
+        self.vgpr = [0] * self.num_vgprs
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = MASK64
+
+    def get_vgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_vgprs):
+            raise IndexError(f"VGPR index {idx} out of range [0, {self.num_vgprs})")
+        return self.vgpr[idx] & MASK32
+
+    def set_vgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_vgprs):
+            raise IndexError(f"VGPR index {idx} out of range [0, {self.num_vgprs})")
+        self.vgpr[idx] = val & MASK32
+
+    def get_sgpr_u32(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index {idx} out of range [0, {self.num_sgprs})")
+        return self.sgpr[idx] & MASK32
+
+    def set_sgpr_u32(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index {idx} out of range [0, {self.num_sgprs})")
+        self.sgpr[idx] = val & MASK32
+
+    def eval_operand(self, op: Operand) -> int:
+        if op.kind == OperandKind.VGPR:
+            val = self.get_vgpr_u32(op.reg_index)
+        elif op.kind == OperandKind.SGPR:
+            val = self.get_sgpr_u32(op.reg_index)
+        elif op.kind in (OperandKind.LITERAL_I32, OperandKind.LITERAL_U32, OperandKind.LITERAL_F32, OperandKind.INLINE_CONST):
+            val = op.literal_val & MASK32
+        else:
+            raise ValueError(f"Unsupported operand kind: {op.kind}")
+
+        if op.data_type == DataType.F32:
+            if op.abs_mod:
+                val &= ~SIGN_MASK_F32
+            if op.neg_mod:
+                val ^= SIGN_MASK_F32
+        return val
+
+    def execute(self, ast: InstructionAST) -> int:
+        ast.validate()
+        s0 = self.eval_operand(ast.src0)
+        s1 = self.eval_operand(ast.src1)
+        s2 = self.eval_operand(ast.src2)
+
+        if ast.opcode == "v_med3_f32":
+            res = ref_med3_f32(s0, s1, s2, clamp=ast.clamp, omod=ast.omod)
+        elif ast.opcode == "v_med3_i32":
+            res = ref_med3_i32(s0, s1, s2, clamp=ast.clamp)
+        elif ast.opcode == "v_med3_u32":
+            res = ref_med3_u32(s0, s1, s2, clamp=ast.clamp)
+        else:
+            raise NotImplementedError(f"Opcode {ast.opcode} not implemented")
+
+        self.set_vgpr_u32(ast.dst.reg_index, res)
+        return res
+
+    def execute_asm(self, asm_line: str) -> int:
+        ast = parse_vop3_med3(asm_line)
+        return self.execute(ast)
+
+
+class TestValuMed3ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self):
+        self.interp = ScalarVALUInterpreter()
+
+    def test_scalar_interpreter_vgpr_sources_f32(self):
+        self.interp.set_vgpr_u32(1, f32_to_bits(10.0))
+        self.interp.set_vgpr_u32(2, f32_to_bits(30.0))
+        self.interp.set_vgpr_u32(3, f32_to_bits(20.0))
+        res = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3")
+        self.assertEqual(bits_to_f32(res), 20.0)
+        self.assertEqual(self.interp.get_vgpr_u32(0), res)
+
+    def test_scalar_interpreter_sgpr_sources_i32(self):
+        self.interp.set_sgpr_u32(0, 100)
+        self.interp.set_sgpr_u32(1, -50 & MASK32)
+        self.interp.set_sgpr_u32(2, 0)
+        res = self.interp.execute_asm("v_med3_i32 v4, s0, s1, s2")
+        self.assertEqual(s32(res), 0)
+        self.assertEqual(self.interp.get_vgpr_u32(4), res)
+
+    def test_scalar_interpreter_mixed_operands_u32(self):
+        self.interp.set_vgpr_u32(1, 0xFFFFFFFF)
+        self.interp.set_sgpr_u32(0, 10)
+        res = self.interp.execute_asm("v_med3_u32 v0, v1, s0, 50")
+        self.assertEqual(res, 50)
+
+    def test_scalar_interpreter_modifiers(self):
+        self.interp.set_vgpr_u32(1, f32_to_bits(2.0))
+        self.interp.set_vgpr_u32(2, f32_to_bits(-4.0))
+        self.interp.set_vgpr_u32(3, f32_to_bits(6.0))
+        res = self.interp.execute_asm("v_med3_f32 v0, v1, |v2|, v3")
+        self.assertEqual(bits_to_f32(res), 4.0)
+
+        self.interp.set_vgpr_u32(1, f32_to_bits(0.25))
+        self.interp.set_vgpr_u32(2, f32_to_bits(0.5))
+        self.interp.set_vgpr_u32(3, f32_to_bits(0.75))
+        res_clamp = self.interp.execute_asm("v_med3_f32 v0, v1, v2, v3 clamp mul:4")
+        self.assertEqual(bits_to_f32(res_clamp), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
