@@ -176,6 +176,19 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("1 malformed", p.stdout)
         self.assertIn("line 1", p.stdout)
 
+        # An end-truncated file that starts at <COther> and cuts off right after a closed child </x>
+        # must keep root "COther" and report malformed (not tail_only under bogus root "x").
+        cut = self.write("cut.xml", b"<COther><x>1</x>")
+        out = os.path.join(self.root, "cut.json")
+        p = self.run_tool(cut, "--check", "--json", out)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            row = json.load(f)["rows"][0]
+        self.assertEqual(row["root"], "COther")
+        self.assertFalse(row["tail_only"])
+        self.assertFalse(row["truncated"])
+        self.assertTrue(row["malformed"])
+
     def test_check_reports_unknown_encoding_as_malformed(self):
         unknown = self.write("unknown.xml", b'<?xml version="1.0" encoding="not-a-charset"?><root/>')
         valid = self.write("valid.xml", b"<root/>")

@@ -469,7 +469,8 @@ def load_documents(targets: list):
 def file_document(path: str) -> dict:
     with open(path, "rb") as f:
         data = f.read()
-    root = gi.tail_root(data) or gi.xml_root(data)
+    head, tail = gi.xml_root(data), gi.tail_root(data)
+    root = head if (head and (gi.has_xml_decl(data) or not gi.xml_complete(head, data))) else (tail or head)
     return {
         "data": data,
         "from_carve": False,
