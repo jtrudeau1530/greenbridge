@@ -108,6 +108,25 @@ class RigDictionaryTest(unittest.TestCase):
             "distinct_rigs": 6, "in_another_dictionary": 1, "key_missing": 1, "keys": 4,
             "keys_named_by_an_entry": 3, "no_dictionary_named_source": 1, "resolved": 3})
 
+    def test_join_uses_all_same_named_rig_dictionaries(self) -> None:
+        source = "src@one"
+        first, second = RIGS[source].items()
+        shared = {"anim/rig/x/shared": [(KIND_A, [10])]}
+        write_rpf(self.rpf, [
+            rig_dictionary(source, dict([first]) | shared),
+            rig_dictionary(source, dict([second]) | shared),
+            rig_dictionary("src@two", RIGS["src@two"]),
+        ])
+        dicts, _ = anim_rigs.scan(self.rpf)
+        self.assertEqual([d["name"] for d in dicts], [source, source, "src@two"])
+
+        for dictionaries in (dicts, dicts[::-1]):
+            joined = anim_rigs.join_rbf0(dictionaries, RIGSETS)
+            self.assertEqual(joined["resolved"], 3)
+            self.assertEqual(joined["keys_named_by_an_entry"], 3)
+            self.assertEqual(joined["key_missing"], 1)
+            self.assertEqual(joined["keys"], 5)
+
     def test_bad_block_is_reported_not_raised(self):
         page = bytearray(rig_dictionary("src@bad", {"anim/rig/b": [(KIND_A, [1])]}))
         at = page.rfind(b"RIG\x02")
@@ -147,6 +166,68 @@ class RigDictionaryTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["rbf0_join"]["resolved"], 3)
         self.assertEqual([row["entries"] for row in doc["rig_dictionaries"]], [2, 2])
         self.assertNotIn("tables", json.dumps(doc["rig_dictionaries"]))
+
+
+class ReportPathTests(unittest.TestCase):
+    """The output .json must not replace the archive or the --rigs input."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.rpf = os.path.join(self.tmp.name, "synthetic.rpf")
+        self.rigs = os.path.join(self.tmp.name, "rigs.json")
+        with open(self.rigs, "w", encoding="utf-8") as f:
+            json.dump(RIGSETS, f)
+        streams = [rig_dictionary(name, rigs) for name, rigs in RIGS.items()] + [two_sequence_dictionary()]
+        write_rpf(self.rpf, streams)
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+
+    def test_out_must_not_overwrite_the_archive(self):
+        with open(self.rpf, "rb") as f:
+            before = f.read()
+        r = self.run_tool(self.rpf, self.rpf)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("would overwrite the input archive", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_out_must_not_overwrite_the_rigs_input(self):
+        with open(self.rigs, encoding="utf-8") as f:
+            before = f.read()
+        r = self.run_tool(self.rpf, self.rigs, "--rigs", self.rigs)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("would overwrite the --rigs input", r.stderr)
+        with open(self.rigs, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_out_must_be_a_file(self):
+        folder = os.path.join(self.tmp.name, "out")
+        os.makedirs(folder)
+        r = self.run_tool(self.rpf, folder)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("is a folder, not a file", r.stderr)
+
+    def test_missing_report_folder_is_created(self):
+        out = os.path.join(self.tmp.name, "reports", "deeper", "out.json")
+        r = self.run_tool(self.rpf, out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("rig_dictionaries", json.load(f))
+
+    def test_a_failed_report_write_is_one_line(self):
+        blocker = os.path.join(self.tmp.name, "not_a_folder")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        out = os.path.join(blocker, "out.json")
+        r = self.run_tool(self.rpf, out)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("ERROR: cannot write", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
 
 
 if __name__ == "__main__":

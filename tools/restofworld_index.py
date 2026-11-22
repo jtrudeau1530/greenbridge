@@ -17,6 +17,8 @@ Usage:
     python -I restofworld_index.py <carved-dir> <out.csv|out.json>
 """
 import argparse
+import array
+from collections import Counter
 import csv
 import json
 import mmap
@@ -32,6 +34,83 @@ ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 PSIN_TAGS = (b"LSCH", b"LENM", b"LSNS", b"LGID", b"LRSC", b"CHKS")
 COLUMNS = ["offset", "stored", "size", "signature", "version", "count", "detail"]
 MAX_INFLATE = 512 << 20
+MAX_TEX_SCAN = 16 << 20
+_UINT64_CODE = "Q" if array.array("Q").itemsize == 8 else None
+
+# DXGI format codes observed in RAGE9 0x980 texture descriptors (kept in step with tools/tex_headers.py).
+DXGI_FORMATS = {
+    2: "R32G32B32A32_FLOAT", 3: "R32G32B32A32_UINT", 4: "R32G32B32A32_SINT",
+    6: "R32G32B32_FLOAT", 7: "R32G32B32_UINT", 8: "R32G32B32_SINT",
+    10: "R16G16B16A16_FLOAT", 11: "R16G16B16A16_UNORM", 12: "R16G16B16A16_UINT",
+    13: "R16G16B16A16_SNORM", 14: "R16G16B16A16_SINT",
+    16: "R32G32_FLOAT", 17: "R32G32_UINT", 18: "R32G32_SINT",
+    24: "R10G10B10A2_UNORM", 25: "R10G10B10A2_UINT", 26: "R11G11B10_FLOAT",
+    28: "R8G8B8A8_UNORM", 29: "R8G8B8A8_UNORM_SRGB", 30: "R8G8B8A8_UINT",
+    31: "R8G8B8A8_SNORM", 32: "R8G8B8A8_SINT",
+    34: "R16G16_FLOAT", 35: "R16G16_UNORM", 36: "R16G16_UINT",
+    37: "R16G16_SNORM", 38: "R16G16_SINT",
+    41: "R32_FLOAT", 42: "R32_UINT", 43: "R32_SINT",
+    49: "R8G8_UNORM", 50: "R8G8_UINT", 51: "R8G8_SNORM", 52: "R8G8_SINT",
+    54: "R16_FLOAT", 56: "R16_UNORM", 57: "R16_UINT", 58: "R16_SNORM", 59: "R16_SINT",
+    61: "R8_UNORM", 62: "R8_UINT", 63: "R8_SNORM", 64: "R8_SINT",
+    71: "BC1_UNORM", 72: "BC1_UNORM_SRGB",
+    74: "BC2_UNORM", 75: "BC2_UNORM_SRGB",
+    77: "BC3_UNORM", 78: "BC3_UNORM_SRGB",
+    80: "BC4_UNORM", 81: "BC4_SNORM",
+    83: "BC5_UNORM", 84: "BC5_SNORM",
+    87: "B8G8R8A8_UNORM", 91: "B8G8R8A8_UNORM_SRGB",
+    95: "BC6H_UF16", 96: "BC6H_SF16",
+    98: "BC7_UNORM", 99: "BC7_UNORM_SRGB",
+}
+
+
+def find_rage_textures(data):
+    """Find validated RAGE9 0x980 texture descriptors (ASSET-148; layout from tools/tex_headers.py).
+
+    Returns a list of (width, height, depth, dxgi_name, flags_lo, mips) tuples. Requires dtype == 0x980,
+    256-byte-aligned 0x60000000..0x6FFFFFFF GPU pointer, known DXGI format, and sane dimensions.
+    """
+    n_qwords = len(data) // 8
+    if n_qwords < 8:
+        return []
+    mv = memoryview(data)[:n_qwords * 8]
+    if _UINT64_CODE is not None:
+        q = array.array(_UINT64_CODE)
+        q.frombytes(mv)
+        if sys.byteorder != "little":
+            q.byteswap()
+    else:
+        q = struct.unpack(f"<{n_qwords}Q", mv)
+    out = []
+    for k in range(2, n_qwords - 5):
+        ptr = q[k]
+        if not (0x60000000 <= ptr <= 0x6FFFFFFF) or (ptr & 0xFF) != 0:
+            continue
+        if q[k - 1] != 0x980:
+            continue
+        d = q[k + 4].to_bytes(8, "little")
+        fmt = d[7]
+        if fmt not in DXGI_FORMATS:
+            continue
+        w = int.from_bytes(d[0:2], "little")
+        h = int.from_bytes(d[2:4], "little")
+        depth = int.from_bytes(d[4:6], "little")
+        if not (4 <= w <= 16384 and 4 <= h <= 16384 and 1 <= depth <= 2048):
+            continue
+        fword = q[k + 5]
+        out.append((w, h, depth, DXGI_FORMATS[fmt], fword & 0xFFFF, (fword >> 16) & 0xFF))
+    return out
+
+
+def is_pg_tex_dictionary(data, count):
+    """True when a zero-prefix stream carries a standalone pgDictionary<grcTexture> header matching count."""
+    if count <= 0 or len(data) < 0x40:
+        return False
+    u8, u10 = struct.unpack_from("<QQ", data, 8)
+    if (u8 >> 28) != 5 or u10 != 0:
+        return False
+    p20, c28, _cap2a, p30, c38, _cap3a = struct.unpack_from("<QHHxxxxQHH", data, 0x20)
+    return (p20 >> 28) == 5 and (p30 >> 28) == 5 and c28 == c38 == count
 
 
 def _u32(data, at):
@@ -172,8 +251,16 @@ def classify(data, offset, stored):
         return row
     if data[:8] == b"\x00" * 8:
         pointer = _u64(data, 8)
-        row.update(signature="zero-prefix",
-                   detail=f"u64@8={pointer:#x}" if pointer is not None else "u64@8=?")
+        detail = f"u64@8={pointer:#x}" if pointer is not None else "u64@8=?"
+        texs = find_rage_textures(data) if pointer not in (None, 0) else []
+        if texs:
+            is_dict = is_pg_tex_dictionary(data, len(texs))
+            fmts = Counter(t[3] for t in texs).most_common(4)
+            fmt_str = ",".join(f"{name}:{n}" for name, n in fmts)
+            detail += f";tex980={len(texs)};dict={int(is_dict)};fmts={fmt_str}"
+            row.update(signature="zero-prefix", count=len(texs), detail=detail)
+        else:
+            row.update(signature="zero-prefix", detail=detail)
         return row
     if _printable(data):
         row.update(signature="text", detail="printable text")
@@ -221,8 +308,9 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     last = pos = s + blen
                     continue
                 d = zlib.decompressobj()
-                p, total, head, psin = s, 0, b"", bytearray()
+                p, total, head, body = s, 0, b"", bytearray()
                 too_big = False
+                keep_body = True
                 try:
                     while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
                         block = m[p:min(p + (1 << 20), end)]
@@ -239,8 +327,15 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                                     break
                                 if len(head) < 256:
                                     head += chunk[:256 - len(head)]
-                                if len(head) < 4 or head[:4] == b"PSIN":   # classify walks the whole PSIN chain
-                                    psin += chunk
+                                if keep_body:
+                                    if len(head) >= 16:
+                                        is_psin = head[:4] == b"PSIN"
+                                        is_cpu = head[:8] == b"\x00" * 8 and head[:16] != b"\x00" * 16
+                                        if not is_psin and not (is_cpu and total <= MAX_TEX_SCAN):
+                                            keep_body = False
+                                            body.clear()
+                                    if keep_body:
+                                        body += chunk
                             if not block:
                                 break
                         if too_big:
@@ -256,7 +351,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 z, u = _gap(m[last:s])
                 zero += z
                 unread += u
-                row = classify(bytes(psin) if head[:4] == b"PSIN" else head, s, used)
+                row = classify(bytes(body) if keep_body and body else head, s, used)
                 row["size"] = total
                 rows.append(row)
                 last = pos = s + used
@@ -269,11 +364,28 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     return rows, summary
 
 
+def _carve_index(path):
+    """rpf9_carve.py's index.json in `path`: ({file name: stored bytes}, summary), or ({}, {}) without one."""
+    try:
+        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        stored = {f"{int(e['off']):012x}.bin": int(e["stored"]) for e in index.get("files", [])}
+        summary = index.get("summary", {})
+        return stored, summary if isinstance(summary, dict) else {}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}, {}
+
+
 def scan_dir(path, max_inflate=MAX_INFLATE):
-    """Index already-carved files. A leading hexadecimal file name supplies the offset."""
+    """Index already-carved files. A leading hexadecimal file name supplies the offset.
+
+    With rpf9_carve.py's index.json in the folder, each file's stored (compressed) size and the carve's span,
+    zero padding and unread bytes come from it, so compressed_bytes and readable_fraction mean what they mean in
+    archive mode. Without it, a file's stored size can only be its length on disk (the inflated size)."""
     rows = []
     skipped = 0
     t0 = time.time()
+    carve_stored, carve_summary = _carve_index(path)
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if not os.path.isfile(full) or not (name.endswith(".bin") or name.endswith(".bk2")):
@@ -285,13 +397,18 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
         offset = int(found.group(1), 16) if found else len(rows)
         with open(full, "rb") as f:
             data = f.read()
+        stored = carve_stored.get(name, len(data))
         if len(data) >= 3 and data[:3] == b"KB2":
-            row = classify(data, offset, len(data))
+            row = classify(data, offset, stored)
         else:
-            row = classify(data, offset, len(data))
+            row = classify(data, offset, stored)
             row["size"] = len(data)
         rows.append(row)
-    summary = summarise(rows, sum(r["stored"] for r in rows), 0, 0)
+    if carve_stored and "span" in carve_summary:
+        summary = summarise(rows, int(carve_summary["span"]), int(carve_summary.get("zero_padding", 0)),
+                            int(carve_summary.get("unread_bytes", 0)))
+    else:
+        summary = summarise(rows, sum(r["stored"] for r in rows), 0, 0)
     summary.update(mode="directory", directory=path, elapsed_seconds=round(time.time() - t0, 3),
                    skipped_candidates=skipped)
     return rows, summary
@@ -305,12 +422,16 @@ def summarise(rows, span, zero, unread):
         entry["stored"] += row["stored"]
         entry["inflated"] += row["size"]
     stored = sum(row["stored"] for row in rows)
+    tex_rows = [row for row in rows if row["signature"] == "zero-prefix" and ";tex980=" in row["detail"]]
     return {
         "files": len(rows),
         "compressed_bytes": stored,
         "inflated_bytes": sum(row["size"] for row in rows),
         "bink2_files": sum(1 for row in rows if row["signature"] == "bink2"),
         "bink2_bytes": sum(row["stored"] for row in rows if row["signature"] == "bink2"),
+        "texture_streams": len(tex_rows),
+        "texture_dictionaries": sum(1 for row in tex_rows if ";dict=1" in row["detail"]),
+        "texture_headers": sum(row["count"] or 0 for row in tex_rows),
         "zero_padding": zero,
         "unread_bytes": unread,
         "span": span,

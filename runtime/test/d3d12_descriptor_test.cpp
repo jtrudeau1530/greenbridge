@@ -1784,11 +1784,19 @@ int main() {
         // More than 4096 SRVs and more than a full shader-visible sampler heap (2048): 5000 distinct views of the
         // texture (mip ranges by swizzles), then one more that samples as the texture, and 2100 distinct wrapping
         // samplers (MaxLOD apart). The last view through the last sampler must give the texture, one tile to the
-        // right; a fallback view or the fallback (clamping) sampler would not.
+        // right; a fallback view or the fallback (clamping) sampler would not. A set with less room than that
+        // (MoltenVK's keeps the default 4096 2D images and 1024 samplers, docs/d3d12_vulkan.md section 5) gets as
+        // many as fill each short array exactly: its last view and sampler must still give the texture, and one
+        // more of each must be refused and read as the fallbacks.
         {
-            constexpr UINT many_views = 5000, many_samplers = 2100, heap_samplers = 2048;
+            constexpr UINT wanted_views = 5000, wanted_samplers = 2100, heap_samplers = 2048;
+            const auto room = rt::d3d12::bindless_room(device.p);
+            EXPECT(room.images_2d >= 2 && room.samplers >= 1);
+            const bool views_capped = room.images_2d < wanted_views + 1, samplers_capped = room.samplers < wanted_samplers;
+            const UINT many_views = views_capped ? room.images_2d - 1 : wanted_views;
+            const UINT many_samplers = samplers_capped ? room.samplers : wanted_samplers;
             Ref<ID3D12DescriptorHeap> many_view_heap, many_sampler_heaps[2];
-            D3D12_DESCRIPTOR_HEAP_DESC many_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, many_views + 1,
+            D3D12_DESCRIPTOR_HEAP_DESC many_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, many_views + 2,
                                                  D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
             EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&many_desc, IID_PPV_ARGS(&many_view_heap.p))));
             many_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, heap_samplers, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
@@ -1815,28 +1823,41 @@ int main() {
                 std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(many_view_cpu + i * step), 32);
             }
             // Every mip with alpha forced to one: the texture's texels (alpha 255), under a T# no other view has.
+            // The one past it, a short array's extra, forces alpha to zero.
             D3D12_SHADER_RESOURCE_VIEW_DESC last_srv{};
             last_srv.Format = sampled_desc.Format;
             last_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             last_srv.Shader4ComponentMapping =
                 D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
             last_srv.Texture2D = {0, UINT(-1), 0, 0};
-            const std::uint64_t last_view = many_view_cpu + many_views * step;
+            const std::uint64_t last_view = many_view_cpu + many_views * step, extra_view = last_view + step;
             device->CreateShaderResourceView(texture.p, &last_srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(last_view)});
             std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(last_view), 32);
+            if (views_capped) {
+                EXPECT(rt::d3d12::bindless_room(device.p).images_2d == 0);
+                last_srv.Shader4ComponentMapping =
+                    D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+                device->CreateShaderResourceView(texture.p, &last_srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(extra_view)});
+                std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(extra_view), 32);
+            }
             std::memcpy(tsharps.emplace_back().data(), view_bytes(own), 32);
             std::sort(tsharps.begin(), tsharps.end());
             EXPECT(std::unique(tsharps.begin(), tsharps.end()) == tsharps.end());  // distinct set entries
 
             std::vector<std::array<std::uint32_t, 4>> ssharps;
             std::uint64_t last_sampler = 0;
-            for (UINT i = 0; i < many_samplers; ++i) {
+            const UINT created_samplers = many_samplers + (samplers_capped ? 1 : 0);
+            for (UINT i = 0; i < created_samplers; ++i) {
+                if (i == many_samplers) EXPECT(rt::d3d12::bindless_room(device.p).samplers == 0);
                 D3D12_SAMPLER_DESC many_sampler = sampler_desc;
                 many_sampler.MaxLOD = float(i + 1) / 256.0f;  // the S# keeps 8 fraction bits; LOD 0 is sampled
-                last_sampler = cpu_start(many_sampler_heaps[i / heap_samplers].p) + (i % heap_samplers) * sampler_step;
-                device->CreateSampler(&many_sampler, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(last_sampler)});
-                std::memcpy(ssharps.emplace_back().data(), reinterpret_cast<const void*>(last_sampler), 16);
+                const std::uint64_t at =
+                    cpu_start(many_sampler_heaps[i / heap_samplers].p) + (i % heap_samplers) * sampler_step;
+                device->CreateSampler(&many_sampler, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(at)});
+                std::memcpy(ssharps.emplace_back().data(), reinterpret_cast<const void*>(at), 16);
+                if (i < many_samplers) last_sampler = at;
             }
+            const std::uint64_t extra_sampler = last_sampler + sampler_step;  // many_samplers < heap_samplers then
             std::memcpy(ssharps.emplace_back().data(), sampler_bytes, 16);
             std::sort(ssharps.begin(), ssharps.end());
             EXPECT(std::unique(ssharps.begin(), ssharps.end()) == ssharps.end());
@@ -1847,20 +1868,63 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             d.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(d.device);
-            SampleKeys last_keys{};
-            std::memcpy(last_keys.tsharp, reinterpret_cast<const void*>(last_view), sizeof(last_keys.tsharp));
-            std::memcpy(last_keys.ssharp, reinterpret_cast<const void*>(last_sampler), sizeof(last_keys.ssharp));
-            std::array<std::uint8_t, bytes> last_texels{};
-            EXPECT(sample_through_set(d, set0, set0_layout, {&last_keys, 1}, last_texels.data()));
+            const auto in_table = [&](std::uint64_t descriptor, bool sampler) {
+                std::uint32_t key[8]{~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+                std::memcpy(key, reinterpret_cast<const void*>(descriptor), sampler ? 16 : 32);
+                return rt::d3d12::bindless_hash_lookup(device.p, key) != 0;
+            };
+            EXPECT(in_table(last_view, false) && in_table(last_sampler, true));
+            if (views_capped) EXPECT(!in_table(extra_view, false));
+            if (samplers_capped) EXPECT(!in_table(extra_sampler, true));
+
+            // The last view through the last sampler; then a short array's extra in its place, which reads as the
+            // fallback: zeros for the view, and the clamping sampler's edge column for the sampler.
+            SampleKeys last_keys[3]{};
+            std::memcpy(last_keys[0].tsharp, reinterpret_cast<const void*>(last_view), sizeof(last_keys[0].tsharp));
+            std::memcpy(last_keys[0].ssharp, reinterpret_cast<const void*>(last_sampler), sizeof(last_keys[0].ssharp));
+            UINT key_count = 1;
+            if (views_capped) {
+                last_keys[key_count] = last_keys[0];
+                std::memcpy(last_keys[key_count].tsharp, reinterpret_cast<const void*>(extra_view),
+                            sizeof(last_keys[key_count].tsharp));
+                last_keys[key_count].first = key_count * texels;
+                ++key_count;
+            }
+            if (samplers_capped) {
+                last_keys[key_count] = last_keys[0];
+                std::memcpy(last_keys[key_count].ssharp, reinterpret_cast<const void*>(extra_sampler),
+                            sizeof(last_keys[key_count].ssharp));
+                last_keys[key_count].first = key_count * texels;
+                ++key_count;
+            }
+            std::array<std::uint8_t, 3 * bytes> last_texels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, {last_keys, key_count}, last_texels.data()));
+            const char* const names[] = {"the last view through the last sampler", "the refused view",
+                                         "the refused sampler"};
             UINT differ = 0;
-            for (UINT i = 0; i < texels; ++i)
-                if (std::memcmp(last_texels.data() + 4 * i, texel(i % size, i / size).data(), 4) != 0 && differ++ < 4)
-                    std::fprintf(stderr, "view %u through sampler %u, texel %u: got %u,%u,%u,%u\n", many_views + 1,
-                                 many_samplers, i, last_texels[4 * i], last_texels[4 * i + 1], last_texels[4 * i + 2],
-                                 last_texels[4 * i + 3]);
+            for (UINT k = 0; k < key_count; ++k) {
+                const UINT kind = k == 0 ? 0 : views_capped && k == 1 ? 1 : 2;
+                for (UINT i = 0; i < texels; ++i) {
+                    const auto want = kind == 0 ? texel(i % size, i / size)
+                                      : kind == 1 ? std::array<std::uint8_t, 4>{}
+                                                  : texel(size - 1, i / size);
+                    const auto* got = last_texels.data() + k * bytes + 4 * i;
+                    if (std::memcmp(got, want.data(), 4) != 0 && differ++ < 4)
+                        std::fprintf(stderr, "%s, texel %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n", names[kind], i,
+                                     got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                }
+            }
             EXPECT(differ == 0);
-            std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n", many_views + 1,
-                        many_samplers);
+            if (!views_capped && !samplers_capped)
+                std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n",
+                            many_views + 1, many_samplers);
+            else
+                std::printf("bindless capacity: the set had room for %u more 2D views and %u more samplers, fewer than "
+                            "%u and %u: the last of each gave the texture, and one more %s refused and read as the "
+                            "fallback\n", room.images_2d, room.samplers, wanted_views + 1, wanted_samplers,
+                            views_capped && samplers_capped ? "of each was"
+                            : views_capped                  ? "view was"
+                                                            : "sampler was");
         }
 
         // 96-bit textures (D3D-62): R32G32B32_FLOAT holding the texture's red, green and blue as n/255,
@@ -2259,6 +2323,262 @@ int main() {
             std::uint32_t cast_key[8]{};
             std::memcpy(cast_key, cast_words.data(), sizeof(cast_key));
             EXPECT(rt::d3d12::bindless_hash_lookup(device.p, cast_key) != 0);
+        }
+
+        // Depth SRVs: D16_UNORM / R16_TYPELESS (depth) and D32_FLOAT / R32_TYPELESS (depth) only allow matching depth
+        // view formats (R16_UNORM / R32_FLOAT, plus UNKNOWN on typed D16/D32). Colour casts on depth textures
+        // (R16_FLOAT/SNORM/UINT/SINT on D16, R32_UINT/SINT on D32, or any colour format on D24S8/D32S8) must produce
+        // null descriptors with zero Vulkan validation errors.
+        {
+            const unsigned validation_before_depth = d.validation_errors();
+            constexpr UINT depth_tex_count = 4;
+            constexpr DXGI_FORMAT depth_tex_formats[depth_tex_count] = {
+                DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_TYPELESS};
+            constexpr DXGI_FORMAT depth_dsv_formats[depth_tex_count] = {
+                DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT};
+            // Multiples of 1/255 are exact in both D16_UNORM (65535 = 255 * 257) and D32_FLOAT.
+            constexpr std::uint8_t depth_clear_u8[depth_tex_count] = {51, 102, 153, 204};
+            Ref<ID3D12Resource> depth_textures[depth_tex_count];
+            for (UINT i = 0; i < depth_tex_count; ++i) {
+                D3D12_RESOURCE_DESC dd = texture_desc;
+                dd.Format = depth_tex_formats[i];
+                dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &dd,
+                                                                 D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                                                                 IID_PPV_ARGS(&depth_textures[i].p))));
+            }
+            Ref<ID3D12DescriptorHeap> depth_dsv_heap, depth_srv_heap;
+            const D3D12_DESCRIPTOR_HEAP_DESC depth_dsv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, depth_tex_count,
+                                                          D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&depth_dsv_hd, IID_PPV_ARGS(&depth_dsv_heap.p))));
+            const UINT dsv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            const std::uint64_t dsv_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(depth_dsv_heap.p, 9))(depth_dsv_heap.p);
+            const auto dsv_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(dsv_cpu + i * dsv_step)}; };
+            for (UINT i = 0; i < depth_tex_count; ++i) {
+                D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+                dsv.Format = depth_dsv_formats[i];
+                dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+                device->CreateDepthStencilView(depth_textures[i].p, &dsv, dsv_slot(i));
+            }
+
+            // Valid depth SRVs: 0: D16 default, 1: D16->R16_UNORM, 2: R16_TYPELESS->R16_UNORM,
+            //                   3: D32 default, 4: D32->R32_FLOAT, 5: R32_TYPELESS->R32_FLOAT; 6: scratch for invalid.
+            constexpr UINT valid_depth_srvs = 6, depth_scratch = 6;
+            const D3D12_DESCRIPTOR_HEAP_DESC depth_srv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, valid_depth_srvs + 1,
+                                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&depth_srv_hd, IID_PPV_ARGS(&depth_srv_heap.p))));
+            const std::uint64_t depth_srv_cpu =
+                reinterpret_cast<XboxHeapHandleFn>(slot(depth_srv_heap.p, 9))(depth_srv_heap.p);
+            const auto depth_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(depth_srv_cpu + i * step)}; };
+            const auto depth_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(depth_srv_cpu + i * step); };
+            const auto depth_null = [&](UINT i) {
+                return std::all_of(depth_bytes(i), depth_bytes(i) + step, [](std::uint8_t b) { return b == 0; });
+            };
+
+            struct ValidDepthSrv {
+                UINT tex_index;
+                DXGI_FORMAT view_format;  // UNKNOWN => pass nullptr
+                VkFormat expected_vk;
+            };
+            constexpr ValidDepthSrv valid_cases[valid_depth_srvs] = {
+                {0, DXGI_FORMAT_UNKNOWN, VK_FORMAT_D16_UNORM},
+                {0, DXGI_FORMAT_R16_UNORM, VK_FORMAT_D16_UNORM},
+                {1, DXGI_FORMAT_R16_UNORM, VK_FORMAT_D16_UNORM},
+                {2, DXGI_FORMAT_UNKNOWN, VK_FORMAT_D32_SFLOAT},
+                {2, DXGI_FORMAT_R32_FLOAT, VK_FORMAT_D32_SFLOAT},
+                {3, DXGI_FORMAT_R32_FLOAT, VK_FORMAT_D32_SFLOAT},
+            };
+            for (UINT i = 0; i < valid_depth_srvs; ++i) {
+                const auto& vc = valid_cases[i];
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = vc.view_format;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(depth_textures[vc.tex_index].p,
+                                                 vc.view_format == DXGI_FORMAT_UNKNOWN ? nullptr : &srv, depth_slot(i));
+                g::ImageWords words{};
+                std::memcpy(words.data(), depth_bytes(i), sizeof(words));
+                g::Image decoded{};
+                EXPECT(g::is_image(words) && g::decode(words, decoded));
+                EXPECT(decoded.type == g::ImageType::image_2d);
+                EXPECT(decoded.format == g::format_from_vulkan(vc.expected_vk));
+                EXPECT(decoded.swizzle == g::channels_r);
+                std::uint32_t key[8]{};
+                std::memcpy(key, words.data(), sizeof(key));
+                EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key) != 0);
+            }
+
+            // Invalid depth SRVs: every non-depth colour format and mismatched/typeless format must leave a null
+            // descriptor and emit zero Vulkan validation errors.
+            const auto expect_depth_srv_null = [&](ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* srv) {
+                std::memset(depth_bytes(depth_scratch), 0x77, step);
+                device->CreateShaderResourceView(res, srv, depth_slot(depth_scratch));
+                return depth_null(depth_scratch);
+            };
+            const auto check_bad_formats = [&](ID3D12Resource* res, std::initializer_list<DXGI_FORMAT> bad_formats) {
+                for (const DXGI_FORMAT fmt : bad_formats) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                    srv.Format = fmt;
+                    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    srv.Texture2D.MipLevels = 1;
+                    if (!expect_depth_srv_null(res, &srv)) return false;
+                }
+                return true;
+            };
+            // D16_UNORM and R16_TYPELESS (depth): R16_FLOAT, R16_SNORM, R16_UINT, R16_SINT and other mismatched views.
+            EXPECT(check_bad_formats(depth_textures[0].p,
+                                     {DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UINT,
+                                      DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM,
+                                      DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM}));
+            EXPECT(expect_depth_srv_null(depth_textures[1].p, nullptr));  // UNKNOWN on R16_TYPELESS (depth)
+            EXPECT(check_bad_formats(depth_textures[1].p,
+                                     {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_SNORM,
+                                      DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R16_TYPELESS,
+                                      DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM}));
+            // D32_FLOAT and R32_TYPELESS (depth): R32_UINT, R32_SINT and other mismatched views.
+            EXPECT(check_bad_formats(depth_textures[2].p,
+                                     {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_TYPELESS,
+                                      DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM}));
+            EXPECT(expect_depth_srv_null(depth_textures[3].p, nullptr));  // UNKNOWN on R32_TYPELESS (depth)
+            EXPECT(check_bad_formats(depth_textures[3].p,
+                                     {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT,
+                                      DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R16_UNORM,
+                                      DXGI_FORMAT_R8G8B8A8_UNORM}));
+
+            // D24_UNORM_S8_UINT / R24G8_TYPELESS and D32_FLOAT_S8X24_UINT / R32G8X24_TYPELESS: colour view formats
+            // must also be rejected, while depth-plane and stencil-plane views continue working.
+            for (const auto& [res_fmt, valid_depth_fmt, valid_stencil_fmt, is_typeless] :
+                 {std::tuple{DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                             DXGI_FORMAT_X24_TYPELESS_G8_UINT, false},
+                  std::tuple{DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                             DXGI_FORMAT_X24_TYPELESS_G8_UINT, true},
+                  std::tuple{DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                             DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, false},
+                  std::tuple{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                             DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, true}}) {
+                D3D12_RESOURCE_DESC ds_desc = texture_desc;
+                ds_desc.Format = res_fmt;
+                ds_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                Ref<ID3D12Resource> ds_tex;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ds_desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&ds_tex.p))));
+                if (is_typeless) EXPECT(expect_depth_srv_null(ds_tex.p, nullptr));
+                EXPECT(check_bad_formats(ds_tex.p,
+                                         {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT,
+                                          DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                          DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                                          DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS}));
+                D3D12_SHADER_RESOURCE_VIEW_DESC ds_srv{};
+                ds_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                ds_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                ds_srv.Texture2D.MipLevels = 1;
+                ds_srv.Format = valid_depth_fmt;
+                ds_srv.Texture2D.PlaneSlice = 0;
+                device->CreateShaderResourceView(ds_tex.p, &ds_srv, depth_slot(depth_scratch));
+                EXPECT(!depth_null(depth_scratch));
+                ds_srv.Format = valid_stencil_fmt;
+                ds_srv.Texture2D.PlaneSlice = 1;
+                device->CreateShaderResourceView(ds_tex.p, &ds_srv, depth_slot(depth_scratch));
+                EXPECT(!depth_null(depth_scratch));
+            }
+
+            // Colour R16_TYPELESS and R32_TYPELESS (without ALLOW_DEPTH_STENCIL) still allow colour casts,
+            // while rejecting depth view formats on colour textures.
+            for (const auto& [colour_typeless, good_colour, bad_depth] :
+                 {std::tuple{DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_D16_UNORM},
+                  std::tuple{DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_D32_FLOAT}}) {
+                D3D12_RESOURCE_DESC col_desc = texture_desc;
+                col_desc.Format = colour_typeless;
+                Ref<ID3D12Resource> col_tex;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &col_desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&col_tex.p))));
+                D3D12_SHADER_RESOURCE_VIEW_DESC col_srv{};
+                col_srv.Format = good_colour;
+                col_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                col_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                col_srv.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(col_tex.p, &col_srv, depth_slot(depth_scratch));
+                EXPECT(!depth_null(depth_scratch));
+                EXPECT(check_bad_formats(col_tex.p, {bad_depth}));
+            }
+
+            // Depth resource with a castable format list (allow_channel_cast = true): valid depth SRV still works
+            // and colour SRVs still leave a null descriptor with zero validation errors.
+            {
+                Ref<ID3D12Device10> inner10;
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&inner10.p))));
+                D3D12_RESOURCE_DESC1 d16_cast_desc{};
+                d16_cast_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                d16_cast_desc.Width = size;
+                d16_cast_desc.Height = size;
+                d16_cast_desc.DepthOrArraySize = 1;
+                d16_cast_desc.MipLevels = 1;
+                d16_cast_desc.Format = DXGI_FORMAT_D16_UNORM;
+                d16_cast_desc.SampleDesc = {1, 0};
+                d16_cast_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                const DXGI_FORMAT d16_list[] = {DXGI_FORMAT_D16_UNORM};
+                Ref<ID3D12Resource> d16_cast_tex;
+                EXPECT(SUCCEEDED(inner10->CreateCommittedResource3(
+                    &default_heap, D3D12_HEAP_FLAG_NONE, &d16_cast_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr,
+                    1, d16_list, IID_PPV_ARGS(&d16_cast_tex.p))));
+                D3D12_SHADER_RESOURCE_VIEW_DESC d16_srv{};
+                d16_srv.Format = DXGI_FORMAT_R16_UNORM;
+                d16_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                d16_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                d16_srv.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(d16_cast_tex.p, &d16_srv, depth_slot(depth_scratch));
+                EXPECT(!depth_null(depth_scratch));
+                EXPECT(check_bad_formats(d16_cast_tex.p,
+                                         {DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_UINT,
+                                          DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R8G8B8A8_UNORM}));
+            }
+
+            // Clear each depth texture and sample all 6 valid depth SRVs on the GPU to confirm they read back their
+            // cleared depth value in R (with G=0, B=0, A=1).
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            for (UINT i = 0; i < depth_tex_count; ++i) {
+                list->ClearDepthStencilView(dsv_slot(i), D3D12_CLEAR_FLAG_DEPTH, float(depth_clear_u8[i]) / 255.0f, 0,
+                                            0, nullptr);
+                const D3D12_RESOURCE_BARRIER barrier = transition(
+                    depth_textures[i].p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &barrier);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            ++packed_signal;
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+            SampleKeys depth_keys[valid_depth_srvs]{};
+            for (UINT i = 0; i < valid_depth_srvs; ++i) {
+                std::memcpy(depth_keys[i].tsharp, depth_bytes(i), sizeof(depth_keys[i].tsharp));
+                std::memcpy(depth_keys[i].ssharp, sampler_bytes, sizeof(depth_keys[i].ssharp));
+                depth_keys[i].first = i * texels;
+            }
+            std::vector<std::uint8_t> depth_pixels(valid_depth_srvs * bytes);
+            EXPECT(sample_through_set(d, set0, set0_layout, depth_keys, depth_pixels.data()));
+            UINT depth_differ = 0;
+            for (UINT k = 0; k < valid_depth_srvs; ++k) {
+                const std::uint8_t want[4] = {depth_clear_u8[valid_cases[k].tex_index], 0, 0, 255};
+                for (UINT i = 0; i < texels; ++i) {
+                    const std::uint8_t* got = depth_pixels.data() + k * bytes + i * 4;
+                    if (std::memcmp(got, want, 4) != 0 && depth_differ++ < 4)
+                        std::fprintf(stderr, "depth SRV %u texel %u: got %u,%u,%u,%u, want %u,%u,%u,%u\n", k, i,
+                                     unsigned(got[0]), unsigned(got[1]), unsigned(got[2]), unsigned(got[3]),
+                                     unsigned(want[0]), unsigned(want[1]), unsigned(want[2]), unsigned(want[3]));
+                }
+            }
+            EXPECT(depth_differ == 0);
+            std::printf("depth SRVs: %u valid D16/D32 views sampled cleared depth values; invalid colour casts rejected "
+                        "as null descriptors (validation errors: %u)\n",
+                        valid_depth_srvs, d.validation_errors() - validation_before_depth);
+#endif
+            EXPECT(d.validation_errors() == validation_before_depth);
         }
 
         upload.reset();

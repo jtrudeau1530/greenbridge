@@ -186,6 +186,23 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("1 malformed", p.stdout)
         self.assertIn("not-a-charset", p.stdout)
 
+    def test_comments_in_a_document_that_does_not_parse_are_counted(self):
+        # A truncated or tail-only document stops the parser at the error; its comments still count, and
+        # comment-like text in CDATA (closed or cut off) still doesn't.
+        cases = {"open.xml": (b"<a><!--x--><!--y-->", 2),
+                 "tail.xml": (b"</b><!--x--></a><!--y-->", 2),
+                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1)}
+        for name, (body, want) in cases.items():
+            with self.subTest(name=name):
+                doc = self.write(name, body)
+                out = os.path.join(self.root, name + ".json")
+                p = self.run_tool(doc, "--json", out)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                with open(out, encoding="utf-8") as f:
+                    row = json.load(f)["rows"][0]
+                self.assertFalse(row["well_formed"])
+                self.assertEqual(row["comments"], want)
+
     def test_comments_inside_cdata_are_not_counted(self):
         doc = self.write("comments.xml", b"<!-- real --><Root><![CDATA[<!-- text -->]]></Root><!-- real -->")
         out = os.path.join(self.root, "catalog.json")

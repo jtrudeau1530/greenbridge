@@ -78,17 +78,20 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
 COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
-WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+# -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
+SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
+WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst")
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst",
+                "cs_mask_vgpr_exec")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
-                     "cs_w32_mask_imm", "cs_lds_b64_cmpst")
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_mask_vgpr_exec")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -125,6 +128,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # not bit 0 for every lane; word = set lanes | lowest lane << 8 (derivations in each .asm header)
             ("cs_w32_mask_imm", [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
+            # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
+            ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
@@ -141,7 +146,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-91: waves that end without an s_barrier don't hold the barrier of the ones still running
             ("cs_barrier_early_end", [127, 126, 125, 124, 123, 122, 121, 120]),
             # SHADER-91: a barrier in a loop with a per-wave trip count; the k-th one waits for the waves still running
-            ("cs_barrier_loop", [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE])]
+            ("cs_barrier_loop", [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE]),
+            # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC (inactive lanes keep the old VGPR)
+            ("cs_mask_vgpr_exec", [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                                   0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 # The SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm header): one thread too.
 # Never run cs_smem_sload_neg with a translator that zero-extends the s_load immediate: it reads 4 GiB past the heap.
@@ -155,12 +163,33 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           ("cs_oob_select", [0x5eed000c, 0, 0x5eed0014, 0, 0x5eed0018, 0xeeeeeeee, 0, 0]),
           # the end of an access decides (a start check, Mesa's GFX10 column, reads more); x4 loads and stores per dword, typed all or nothing
           ("cs_oob_tail", [0, 0, 0x5eed0010, 0, 0xbeef0000, 0xeeeeeeee, 0, 0x5eed0010]),
-          # swizzled MUBUF addressing (RDNA2 ISA 8.1.5) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
-          ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed0028, 0, 0xbeef0000, 0xbeef0001])]
+          # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
+          ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed000c, 0, 0xbeef0000, 0xbeef0001])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
+# cs_fmt_int_narrow.asm: 8- and 16-bit UINT/SINT typed buffer loads and stores (layout in the .asm header). The
+# words are the same program's output on gfx1036 run natively (tools/hw_oracle, wave32 and wave64 identical).
+FMT_INT_NARROW_WORDS = [
+    0x00000080, 0x00000080, 0x00000080, 0x00000080, 0xFFFFFF80, 0xFFFFFF80, 0xFFFFFF80, 0xFFFFFF80,
+    0x0000FF80, 0x0000FF80, 0x0000FF80, 0x0000FF80, 0xFFFFFF80, 0xFFFFFF80, 0xFFFFFF80, 0xFFFFFF80,
+    0x00000080, 0x000000FF, 0x00000080, 0x000000FF, 0xFFFFFF80, 0xFFFFFFFF, 0xFFFFFF80, 0xFFFFFFFF,
+    0xFFFFFF80, 0x00007F01, 0xFFFFFF80, 0x00007F01, 0xFFFFFF80, 0xFFFFFFFF, 0x00000001, 0x0000007F,
+    0xFFFFFF80, 0x00007F01, 0xFFFFFFFF, 0xFFFF8000, 0xFFFFFF80, 0x00000000, 0x00000001, 0x00000001,
+    0x0000FF80, 0x00000000, 0x00000001, 0x00000001, 0xFF80FF80, 0xFF80FF80, 0xFFFFFF80, 0x007F0001,
+    0x7F01FF80, 0x8000FFFF, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEE7F, 0xEEEEEEEE, 0xEEEEEE7F, 0xEEEEEEEE, 0xEEEE7FFF, 0xEEEEEEEE, 0xEEEE7FFF, 0xEEEEEEEE,
+    0xEEEE807F, 0xEEEEEEEE, 0xEEEE7F7F, 0xEEEEEEEE, 0x7FFF7FFF, 0xEEEEEEEE, 0x80807F7F, 0xEEEEEEEE,
+    0x7FFF7FFF, 0x80008000, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0x7F01FF80, 0x8000FFFF, 0x12345678, 0x9ABCDEF0, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+]
 # cs_fmt_sint32.asm: hand-derived full-width and D16 load results, inputs, stores, and untouched words.
 FMT_SINT32_WORDS = [
     0x80000000, 0x7FFFFFFF, 0x80000000, 1,
@@ -289,6 +318,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200),
               # v_pack_b32_f16 neg/abs on the selected half: a sign flip / clear before packing (SHADER-260)
               "ps_f16_pack_mods": (0x4400b400, 0xc4003400, 0x4400c200, 0xb400b400),
+              # SDWA src_sel on a float inline constant in an f16 op (measured on gfx1036)
+              "ps_sdwa_f16_const": (0xaaaa3800, 0xaaaa1c00, 0xaaaa3e00, 0xaaaa73f0),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
@@ -308,7 +339,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
-# a required subgroup size onto the fragment stage ("fragment subgroup size: N required"). A device that cannot
+# a required subgroup size onto the fragment stage ("fragment subgroup size: N", the whole line; a device that could
+# not take the size gets "fragment subgroup size: N not available" or no line). A device that cannot
 # require 64 there (NVIDIA: 32 only; llvmpipe: 8) has no frame to judge: the test is skipped, not failed.
 WIDE_PIXEL_TESTS = {"ps_w64x_readlane": 64}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
@@ -478,6 +510,10 @@ def fmt_1010102_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_1010102", FMT_1010102_WORDS + [0xEEEEEEEE] * 48, 64, env)
 
 
+def fmt_int_narrow_test(tools, spirv, env=None):
+    return dump_test(tools, spirv, "cs_fmt_int_narrow", FMT_INT_NARROW_WORDS, len(FMT_INT_NARROW_WORDS), env)
+
+
 def fmt_sint32_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_sint32", FMT_SINT32_WORDS, len(FMT_SINT32_WORDS), env)
 
@@ -638,6 +674,29 @@ def vcmpx_forms_narrow_skip(out):
     return None
 
 
+# Dump words a driver gets wrong with or without SignedZeroInfNanPreserve, by the first word of the device name on
+# vk_compute_test's "device: ..." line. Only these words go unjudged there. Shared with run_gpu_tests.py.
+# - Apple GPUs (MoltenVK) return +0 for cs_signed_zero_nan's -0 products, words 0, 2 and 3 (v_mul_f32, v_pk_mul_f16,
+#   v_mul_f16; #1203, SHADER-182).
+# - Mesa llvmpipe returns 0 in word 5, the NaN check of 0 * inf (an inline-constant 0), while its other NaN checks give
+#   1 (#664, Mesa with LLVM 21.1.8). The CI runs the GPU tests on llvmpipe.
+UNJUDGED_WORDS = {"Apple": {"cs_signed_zero_nan": (0, 2, 3)},
+                  "llvmpipe": {"cs_signed_zero_nan": (5,)}}
+
+
+def judged_words(name, out, words):
+    """The expected words with None where nothing is judged: UNJUDGED_WORDS for the device that vk_compute_test's
+    "device: ..." line names, else every word as given."""
+    m = re.search(r"^device: (\S+)", out, re.MULTILINE)
+    unjudged = UNJUDGED_WORDS.get(m.group(1), {}).get(name, ()) if m else ()
+    return [None if i in unjudged else w for i, w in enumerate(words)]
+
+
+def words_match(got, want):
+    """The dump's words against want, which may be shorter; a None in want is not judged."""
+    return len(got) >= len(want) and all(w is None or g == w for g, w in zip(got, want))
+
+
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
                  env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
@@ -673,7 +732,7 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
             return ""
     elif expected_words is not None:
         m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
-        if m and [int(x) for x in m.group(1).split()][:len(expected_words)] == expected_words:
+        if m and words_match([int(x) for x in m.group(1).split()], judged_words(name, out, expected_words)):
             return ""
     else:
         m = re.search(r"(\d+) mismatches", out)
@@ -1126,7 +1185,7 @@ def wide_pixel_skip(name, out):
     """A Skip when `name` needs a 64-wide pixel stage (WIDE_PIXEL_TESTS) and vk_harness's output does not say that size
     was required of the fragment stage, else None."""
     want = WIDE_PIXEL_TESTS.get(name)
-    if not want or re.search(rf"^fragment subgroup size: {want} required$", out, re.MULTILINE):
+    if not want or re.search(rf"^fragment subgroup size: {want}$", out, re.MULTILINE):
         return None
     m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
     seen = f": subgroup {m.group(1)}..{m.group(2)}" if m else ""
@@ -1182,7 +1241,7 @@ def pixel_test(tools, spirv, name):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit"):
         return texoff_test(tools, spirv, name)
-    if name == "ps_interp_f16_high" and BARY_FALLBACK:
+    if name == "ps_interp_f16_high" and BARY_FALLBACK and not F16_HALVES:   # with F16_HALVES it reads decoded halves
         return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")
     fmt = "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
     px, out = pixels(tools, spirv, name, fmt, PIXEL_VERTEX.get(name, "vs_ids"))
@@ -1293,6 +1352,7 @@ def main():
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
+    results.append(("cs_fmt_int_narrow", fmt_int_narrow_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
