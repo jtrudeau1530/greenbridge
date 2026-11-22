@@ -318,17 +318,62 @@ int main() {
 
     if (!check_statistics_disjoint(sc)) return fail("initial frame-statistics disjoint notification");
 
-    ID3D12CommandQueue* got_queue = nullptr;
-    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_queue))) || got_queue != queue) {
-        if (got_queue) got_queue->Release();
-        return fail("GetDevice");
+    ID3D12Device* got_device = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_device))) || got_device != dev) {
+        if (got_device) got_device->Release();
+        return fail("GetDevice did not return the command queue's parent device");
     }
-    got_queue->Release();
+    got_device->Release();
+
+    IUnknown* got_unknown = nullptr;
+    IUnknown* expected_device_unknown = nullptr;
+    IUnknown* queue_unknown = nullptr;
+    const HRESULT got_unknown_hr = sc->GetDevice(IID_PPV_ARGS(&got_unknown));
+    if (FAILED(got_unknown_hr) || !got_unknown) {
+        if (got_unknown) got_unknown->Release();
+        return fail("GetDevice(IUnknown) failed");
+    }
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&expected_device_unknown))) || !expected_device_unknown) {
+        got_unknown->Release();
+        return fail("QueryInterface(IUnknown) on device failed");
+    }
+    if (FAILED(queue->QueryInterface(IID_PPV_ARGS(&queue_unknown))) || !queue_unknown) {
+        expected_device_unknown->Release();
+        got_unknown->Release();
+        return fail("QueryInterface(IUnknown) on queue failed");
+    }
+    const bool has_device_identity = got_unknown == expected_device_unknown && got_unknown != queue_unknown;
+    queue_unknown->Release();
+    expected_device_unknown->Release();
+    got_unknown->Release();
+    if (!has_device_identity)
+        return fail("GetDevice(IUnknown) returned the queue identity instead of its parent device");
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen{};
     if (FAILED(sc->GetFullscreenDesc(&fullscreen)) || !fullscreen.Windowed ||
         fullscreen.Scaling != DXGI_MODE_SCALING_UNSPECIFIED ||
         fullscreen.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED)
         return fail("GetFullscreenDesc");
+
+    // Factory::GetParent: root DXGI object has no parent; native DXGI returns E_NOINTERFACE
+    void* parent_out = reinterpret_cast<void*>(1);
+    if (factory->GetParent(IID_IUnknown, nullptr) != E_POINTER)
+        return fail("Factory::GetParent with null out should return E_POINTER");
+    if (factory->GetParent(IID_IUnknown, &parent_out) != E_NOINTERFACE || parent_out != nullptr)
+        return fail("Factory::GetParent should return E_NOINTERFACE and set null out");
+
+    // SwapChain::GetCoreWindow: HWND swapchain is not associated with a CoreWindow
+    void* cw_out = reinterpret_cast<void*>(1);
+    if (sc->GetCoreWindow(IID_IUnknown, nullptr) != DXGI_ERROR_INVALID_CALL)
+        return fail("GetCoreWindow with null out should return DXGI_ERROR_INVALID_CALL");
+    if (sc->GetCoreWindow(IID_IUnknown, &cw_out) != DXGI_ERROR_INVALID_CALL || cw_out != nullptr)
+        return fail("GetCoreWindow on HWND swapchain should return DXGI_ERROR_INVALID_CALL and set null out");
+
+    // SwapChain::GetRestrictToOutput: unrestricted swapchain returns DXGI_ERROR_NOT_FOUND
+    IDXGIOutput* restrict_out = reinterpret_cast<IDXGIOutput*>(1);
+    if (sc->GetRestrictToOutput(nullptr) != E_INVALIDARG)
+        return fail("GetRestrictToOutput with null out should return E_INVALIDARG");
+    if (sc->GetRestrictToOutput(&restrict_out) != DXGI_ERROR_NOT_FOUND || restrict_out != nullptr)
+        return fail("GetRestrictToOutput on unrestricted swapchain should return DXGI_ERROR_NOT_FOUND and set null out");
 
     D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ID3D12DescriptorHeap* rtv_heap = nullptr;
@@ -1088,6 +1133,77 @@ int main() {
         CloseHandle(ev);
     }
 
+    // Classic IDXGIFactory::CreateSwapChain delegation
+    {
+        if (factory->CreateSwapChain(nullptr, nullptr, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(null out) should return DXGI_ERROR_INVALID_CALL");
+        IDXGISwapChain* legacy_sc = nullptr;
+        if (factory->CreateSwapChain(nullptr, nullptr, &legacy_sc) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(null device, null desc) should return DXGI_ERROR_INVALID_CALL");
+        if (factory->CreateSwapChain(queue, nullptr, &legacy_sc) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(valid device, null desc) should return DXGI_ERROR_INVALID_CALL");
+
+        HWND hwnd_legacy = create_test_window(160, 120);
+        if (!hwnd_legacy) return fail("CreateWindowExW (legacy)");
+
+        DXGI_SWAP_CHAIN_DESC leg_desc{};
+        leg_desc.BufferDesc.Width = 160;
+        leg_desc.BufferDesc.Height = 120;
+        leg_desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        leg_desc.SampleDesc.Count = 1;
+        leg_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        leg_desc.BufferCount = 2;
+        leg_desc.OutputWindow = hwnd_legacy;
+        leg_desc.Windowed = TRUE;
+        leg_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+        if (FAILED(factory->CreateSwapChain(queue, &leg_desc, &legacy_sc)) || !legacy_sc) {
+            DestroyWindow(hwnd_legacy);
+            return fail("CreateSwapChain failed");
+        }
+
+        DXGI_SWAP_CHAIN_DESC got_leg_desc{};
+        if (FAILED(legacy_sc->GetDesc(&got_leg_desc)) || got_leg_desc.BufferDesc.Width != 160 ||
+            got_leg_desc.BufferDesc.Height != 120) {
+            legacy_sc->Release();
+            DestroyWindow(hwnd_legacy);
+            return fail("GetDesc on legacy swapchain mismatch");
+        }
+
+        // Fullscreen request fallback: when exclusive fullscreen is unavailable,
+        // CreateSwapChain falls back to windowed chain and returns DXGI_STATUS_OCCLUDED.
+        HWND hwnd_fs = create_test_window(160, 120);
+        if (!hwnd_fs) return fail("CreateWindowExW (fullscreen fallback)");
+        DXGI_SWAP_CHAIN_DESC fs_req_desc = leg_desc;
+        fs_req_desc.OutputWindow = hwnd_fs;
+        fs_req_desc.Windowed = FALSE;
+        IDXGISwapChain* fs_sc = nullptr;
+        const HRESULT fs_hr = factory->CreateSwapChain(queue, &fs_req_desc, &fs_sc);
+        if (fs_hr != DXGI_STATUS_OCCLUDED || !fs_sc) {
+            if (fs_sc) fs_sc->Release();
+            DestroyWindow(hwnd_fs);
+            return fail("CreateSwapChain(Windowed == FALSE) should return DXGI_STATUS_OCCLUDED fallback");
+        }
+        BOOL is_fs = TRUE;
+        fs_sc->GetFullscreenState(&is_fs, nullptr);
+        if (is_fs != FALSE) {
+            fs_sc->Release();
+            DestroyWindow(hwnd_fs);
+            return fail("GetFullscreenState should remain FALSE on fallback windowed swapchain");
+        }
+        fs_sc->Release();
+        DestroyWindow(hwnd_fs);
+
+        if (FAILED(legacy_sc->Present(0, 0))) {
+            legacy_sc->Release();
+            DestroyWindow(hwnd_legacy);
+            return fail("Present on legacy swapchain failed");
+        }
+
+        legacy_sc->Release();
+        DestroyWindow(hwnd_legacy);
+    }
+
     rtv_heap->Release();
     sc->Release();
     fence->Release();
@@ -1107,7 +1223,7 @@ int main() {
         return 1;
     }
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
-    std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, CreateSwapChainForCoreWindow, occlusion status, "
+    std::printf("dxgi_swapchain_test: PASS (CreateSwapChain, CreateSwapChainForHwnd, CreateSwapChainForCoreWindow, occlusion status, "
                 "GetBuffer+GetDesc, clear+readback, Present, ResizeBuffers; 0 validation errors)\n");
     return 0;
 }

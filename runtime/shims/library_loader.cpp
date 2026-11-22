@@ -214,6 +214,17 @@ BOOL WINAPI free_library(HMODULE module) {
     return FreeLibrary(module);
 }
 
+// DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
+// Windows loader mapped, so for ours it fails, and a DllMain that returns its result (the MSVC runtime's satellite
+// DLLs do) fails Loader::initialise() with "DllMain returned FALSE". Owned and mapped modules answer TRUE. The loader
+// sends no thread events to a DllMain, so there is nothing further to switch off; every other handle goes to the
+// real function.
+BOOL WINAPI disable_thread_calls(HMODULE module) {
+    if (pseudo(module)) return TRUE;
+    if (owns_bundled_module_handle(module)) return TRUE;
+    return DisableThreadLibraryCalls(module);
+}
+
 #define LOADER(dll)                                                                         \
     {dll, "LoadLibraryA", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_a)},                        \
     {dll, "LoadLibraryW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_w)},                        \
@@ -222,7 +233,8 @@ BOOL WINAPI free_library(HMODULE module) {
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
-    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)}
+    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
+    {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}
 
 }  // namespace
 }  // namespace rt::shims::library_loader

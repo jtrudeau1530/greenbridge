@@ -260,6 +260,7 @@ def find_chunks(blob, end, elements):
                 covered[record_at:record_at + RECORD_SIZE] = b"\x01" * RECORD_SIZE
             at = nxt
         else:
+            # A rejected lone window is not a real record, so resume scanning at the next 4-byte slot.
             at += 4
     return chunks
 
@@ -323,7 +324,8 @@ def resolve(record, elements, pool_base, blocks=None, stride=None):
     default_step = stride or ELEMENT_SIZE
     candidates = [(record["poolOffset"], "absolute", ELEMENT_SIZE)]
     if pool_base is not None:
-        candidates.append((pool_base + (record["poolOffset"] >> POOL_SHIFT), "pool", ELEMENT_SIZE))
+        address = pool_base + (record["poolOffset"] >> POOL_SHIFT)
+        candidates.append((address, "pool", ELEMENT_SIZE))
     base, size = block_at(blocks, record)
     if base is not None:
         offset = pool_byte_offset(record)
@@ -340,29 +342,28 @@ def resolve(record, elements, pool_base, blocks=None, stride=None):
                 skipped += 1
             else:
                 entities.append((address, element))
-        if entities and (best is None or len(entities) > len(best[0])):
+        if best is None or len(entities) > len(best[0]):
             best = (entities, mode, skipped)
-    if best is None:
-        return [], "unresolved", count
-    return best
+    entities, mode, skipped = best
+    if not entities:
+        return [], "unresolved", skipped
+    return entities, mode, skipped
 
 
 def parse_blob(blob, name="<memory>"):
     """Parse one inflated stream (PSIN or bare bytes) into the tool's per-file record."""
     first_section = len(blob)
-    is_psin = False
     blocks = []
     if psin_index is not None and blob[:4] == b"PSIN":
         parsed = psin_index.parse(blob)
         if parsed is not None:
-            is_psin = True
             first_section = min(max(parsed["first_section"], 0), len(blob))
             if psin_data is not None:
                 try:
                     blocks, _fill = psin_data.block_table(blob, first_section)
                 except (ValueError, struct.error):
                     blocks = []
-    end = first_section if (is_psin and first_section > 0) or first_section >= RECORD_SIZE else len(blob)
+    end = first_section
     elements = scan_elements(blob, end)
     chunks = find_chunks(blob, end, elements)
     table_blocks = record_blocks(blob, blocks) if blocks else []

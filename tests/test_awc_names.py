@@ -11,6 +11,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -90,6 +91,24 @@ class TestBanks(unittest.TestCase):
             path = write(os.path.join(tmp, "t.awc"), make_bank(["a", "b"])[:-3])
             with self.assertRaises(ValueError):
                 A.bank_ids(path)
+
+    def test_truncated_stream_table_reads_only_header(self):
+        # A truncated ordinary bank with a stream count larger than the file holds must fail from the header
+        # and file size alone: os.fstat reports the real size without a seek, so only the 16-byte header is
+        # ever read before the size check fails.
+        n = 12
+        header = b"ADAT" + struct.pack("<III", 0, n, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.awc")
+            with open(path, "wb") as f:
+                f.write(header + bytes(3))
+
+            with open(path, "rb") as source:
+                spy = mock.Mock(wraps=source)
+                with mock.patch.object(A, "open", create=True, return_value=contextlib.nullcontext(spy)):
+                    with self.assertRaisesRegex(ValueError, "stream table extends past"):
+                        A.bank_ids(path)
+            self.assertEqual(spy.read.call_args_list, [mock.call(16)])
 
 
 class TestRules(unittest.TestCase):

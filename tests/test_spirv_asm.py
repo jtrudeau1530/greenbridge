@@ -126,6 +126,57 @@ class SpirvAsmUnitTests(unittest.TestCase):
         self.assertIn(0x80000000, words)
         self.assertIn(0x3FC00000, words)  # 0x1.8p+0 = 1.5f
 
+    def test_hex_float_inf_nan_and_string_escapes_match_spirv_as(self):
+        # Regression tests for PR #2251 review (@FreddyxS):
+        # 1) Width-aware hex-float Inf and NaN payload spellings (f16, f32, f64).
+        # 2) SPIRV-Tools string backslash decoding (\n -> literal 'n', not LF).
+        asm = (
+            "OpCapability Shader\n"
+            "OpCapability Float16\n"
+            "OpCapability Float64\n"
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            'OpName %main "left\\nright"\n'
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%f16 = OpTypeFloat 16\n"
+            "%f32 = OpTypeFloat 32\n"
+            "%f64 = OpTypeFloat 64\n"
+            "%h_inf = OpConstant %f16 0x1p+16\n"
+            "%h_nan = OpConstant %f16 0x1.8p+16\n"
+            "%f_inf = OpConstant %f32 0x1p+128\n"
+            "%f_ninf = OpConstant %f32 -0x1p+128\n"
+            "%f_nan = OpConstant %f32 0x1.8p+128\n"
+            "%d_inf = OpConstant %f64 0x1p+1024\n"
+            "%d_nan = OpConstant %f64 0x1.8p+1024\n"
+            "%main = OpFunction %void None %fn\n"
+            "%entry = OpLabel\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        spv = spirv_asm.assemble(asm, target_env="vulkan1.2")
+        _validate(spv)
+        words = struct.unpack(f"<{len(spv) // 4}I", spv)
+        self.assertIn(0x7C00, words)       # f16 +Inf
+        self.assertIn(0x7E00, words)       # f16 qNaN
+        self.assertIn(0x7F800000, words)   # f32 +Inf
+        self.assertIn(0xFF800000, words)   # f32 -Inf
+        self.assertIn(0x7FC00000, words)   # f32 qNaN
+        self.assertIn(0x7FF00000, words)   # f64 +Inf hi word
+        self.assertIn(0x7FF80000, words)   # f64 qNaN hi word
+        # Verify exact byte-for-byte parity (excluding header generator word [2]) with spirv-as when present.
+        if SPIRV_AS:
+            with tempfile.TemporaryDirectory() as d:
+                sa, sv = os.path.join(d, "m.spvasm"), os.path.join(d, "m.spv")
+                with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(asm)
+                subprocess.run([SPIRV_AS, sa, "-o", sv, "--target-env", "vulkan1.2"], check=True)
+                with open(sv, "rb") as f:
+                    ref_words = struct.unpack(f"<{os.path.getsize(sv) // 4}I", f.read())
+            self.assertEqual(len(words), len(ref_words))
+            self.assertEqual(words[:2] + words[3:], ref_words[:2] + ref_words[3:])
+
     def test_translated_shaders_validate_and_match_spirv_as(self):
         # Translate diverse synthetic shaders (PS ALU/dot4/f16/branches, CS LDS/atomics/wave64-emulate)
         # and verify every binary assembled by spirv_asm passes spirv-val.

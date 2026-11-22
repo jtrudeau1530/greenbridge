@@ -460,7 +460,7 @@ Measured over the 267 payloads (43,284,925 B):
 
 | Measure | Value |
 |---|---:|
-| Well-formed | 259 (257 with a declaration, 2 tail-only) |
+| Well-formed | 259 (257 with a declaration, 2 complete without a declaration) |
 | Truncated at the start | 7 |
 | Rootless fragment | 1 |
 | Malformed | 0 |

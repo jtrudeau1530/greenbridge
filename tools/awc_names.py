@@ -29,6 +29,8 @@ Usage:
     python -I awc_names.py <banks> [<banks> ...] (--words FILE | --conversations PATH) [...]
                            [--min-token N] [--out names.csv|.json]
 
+A JSON inventory from ``awc_manifest.py`` can also supply the bank names and stream IDs.
+
 Standard library only. The output names game files: it is a local work product and must not be committed or
 attached to an issue. The tests use synthetic banks and words.
 """
@@ -90,6 +92,9 @@ def bank_ids(path: str) -> list:
         flags, n, _header_size = struct.unpack_from("<III", head, 4)
         skip = (4 if flags & 0x400000 else 0) + (n * 2 if flags & 0x10000 else 0) \
             + ((n + 1) * 4 if flags & 0x200000 else 0)
+        table_end = 16 + skip + 4 * n
+        if table_end > os.fstat(fh.fileno()).st_size:
+            raise ValueError(f"{path}: stream table extends past the end of the file")
         fh.seek(16 + skip)
         table = fh.read(4 * n)
     if len(table) < 4 * n:
@@ -98,10 +103,18 @@ def bank_ids(path: str) -> list:
 
 
 def load_banks(source: str) -> dict:
-    """{bank label: [stream ids]} from an .awc file, a directory of them, or an audio_manifest.json."""
+    """{bank label: [stream ids]} from AWC banks, a Python inventory, or an rpf9dump manifest."""
     if os.path.isfile(source) and source.lower().endswith(".json"):
         with open(source, encoding="utf-8") as fh:
             doc = json.load(fh)
+        if isinstance(doc, dict) and "bank_count" in doc and "streams" in doc:
+            grouped = collections.defaultdict(list)
+            for row in doc["streams"]:
+                bank = row["bank"]
+                # Match the export folder used by awc_opus, including nested bank paths.
+                label = os.path.splitext(bank)[0] if bank.lower().endswith(".awc") else bank
+                grouped[label].append(int(row["stream"], 16) & M29)
+            return dict(grouped)
         banks = doc.get("Banks", doc) if isinstance(doc, dict) else doc
         out = {}
         for bank in banks:
@@ -287,7 +300,7 @@ def source_labels(sources):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("banks", nargs="+", help="an .awc file, a directory of banks, or an audio_manifest.json")
+    ap.add_argument("banks", nargs="+", help="an .awc file, a bank directory, or JSON from awc_manifest.py or rpf9dump audio")
     ap.add_argument("--words", action="append", default=[], help="word list or hashdict.py JSON (repeatable)")
     ap.add_argument("--conversations", action="append", default=[],
                     help="file or directory with conversation key/label pairs (repeatable)")

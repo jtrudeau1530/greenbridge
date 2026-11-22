@@ -51,16 +51,11 @@ using AsyncCompleteFn = void(__stdcall*)(XAsyncBlock*, HRESULT, size_t);
 using AsyncResultSizeFn = HRESULT(__stdcall*)(XAsyncBlock*, size_t*);
 using AsyncResultFn = HRESULT(__stdcall*)(XAsyncBlock*, const void*, size_t, void*, size_t*);
 
-struct XVersion {
-    union {
-        struct {
-            uint16_t major;
-            uint16_t minor;
-            uint16_t build;
-            uint16_t revision;
-        };
-        uint64_t Value;
-    };
+struct alignas(8) XVersion {
+    uint16_t major;
+    uint16_t minor;
+    uint16_t build;
+    uint16_t revision;
 };
 static_assert(sizeof(XVersion) == 8, "XVersion must be 8 bytes per GDK spec");
 
@@ -72,14 +67,22 @@ struct XSystemAnalyticsInfo {
 };
 static_assert(sizeof(XSystemAnalyticsInfo) == 144, "XSystemAnalyticsInfo must be 144 bytes per GDK spec");
 
+struct XPackageMountHandle {
+    uint64_t handle;
+};
+
 using AnalyticsInfoFn = XSystemAnalyticsInfo(__stdcall*)();
 using PackageIdentifierFn = HRESULT(__stdcall*)(size_t, char*);
-using PackageMountPathFn = HRESULT(__stdcall*)(void*, size_t, char*);
+using PackageMountFn = HRESULT(__stdcall*)(const char*, XPackageMountHandle*);
+using PackageCloseMountHandleFn = void(__stdcall*)(XPackageMountHandle);
+using PackageMountPathSizeFn = HRESULT(__stdcall*)(XPackageMountHandle, size_t*);
+using PackageMountPathFn = HRESULT(__stdcall*)(XPackageMountHandle, size_t, char*);
 using PackagedProcessFn = bool(__stdcall*)();
 
 const char* const kNames[] = {
     "XGameRuntimeInitialize", "XGameRuntimeUninitialize", "XSystemGetDeviceType", "XSystemGetConsoleId",
-    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackageIdentifier", "XPackageGetMountPath",
+    "XSystemGetAnalyticsInfo", "XPackageGetCurrentProcessPackageIdentifier", "XPackageMount",
+    "XPackageCloseMountHandle", "XPackageGetMountPathSize", "XPackageGetMountPath",
     "XPackageIsPackagedProcess",
     "XTaskQueueCreate", "XTaskQueueCreateComposite", "XTaskQueueGetPort", "XTaskQueueDuplicateHandle",
     "XTaskQueueCloseHandle", "XTaskQueueTerminate", "XTaskQueueDispatch", "XTaskQueueSubmitCallback",
@@ -194,6 +197,23 @@ void check_run_time_load() {
     check(get_proc(rt_mod, nullptr) == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
           "a null proc name is NULL with ERROR_PROC_NOT_FOUND");
 
+    // XCurl.dll's other way in: LoadLibraryExW(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32),
+    // then GetApiVersionImpl(uint64_t*, uint64_t*) and QueryApiImpl. Served by the shims, never the PC's own.
+    using LoadExW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+    auto load_ex_w = reinterpret_cast<LoadExW>(rt::shims::find(set, "LoadLibraryExW"));
+    HMODULE gps = load_ex_w ? load_ex_w(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) : nullptr;
+    check(rt::shims::owns_dll("gameplatformservices.dll") && gps != nullptr && gps != rt_mod,
+          "LoadLibraryExW(gameplatformservices.dll, SEARCH_SYSTEM32) is served by the shims");
+    using ApiVersion = HRESULT(WINAPI*)(uint64_t*, uint64_t*);
+    auto api_version = gps ? reinterpret_cast<ApiVersion>(get_proc(gps, "GetApiVersionImpl")) : nullptr;
+    uint64_t v1 = 0, v2 = 0, w1 = 0, w2 = 0;
+    check(api_version && api_version(&v1, &v2) == S_OK && api_version(&w1, &w2) == S_OK && v1 && v2 && v1 == w1 &&
+              v2 == w2,
+          "GetApiVersionImpl writes the same two non-zero versions on every call");
+    check(gps && reinterpret_cast<void*>(get_proc(gps, "QueryApiImpl")) ==
+                     rt::shims::find("xgameruntime.dll", "QueryApiImpl"),
+          "its QueryApiImpl is the offline runtime's");
+
     struct Options {
         uint32_t unknown;
         BOOL is_inline;
@@ -283,75 +303,122 @@ void check_run_time_load() {
             return true;
         };
         using SetCallback = void(STDMETHODCALLTYPE*)(void*, Callback, void*);
-        using Report = void(STDMETHODCALLTYPE*)(void*, HRESULT, const char*);
+        using Report = HRESULT(STDMETHODCALLTYPE*)(void*, HRESULT, const char*);
         reinterpret_cast<SetCallback>(slot(e, 4))(e, on_error, &seen);
-        reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
-        check(seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
+        const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
+        check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
-        using SetOptions = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);
-        check(reinterpret_cast<SetOptions>(slot(e, 5))(e, 0, 0) == S_OK, "slot 5 is XErrorSetOptions");
+        using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
+        reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
         release(e);
     }
 
-    const GUID networking_cls = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
-    void* n = get(networking_cls);
-    check(n != nullptr, "QueryApiImpl hands out XNetworkingImpl for its class id");
+    // XNetworkingImpl, asked for as XCurl.dll does: the class id with IXNetworkingImpl2's interface id.
+    const GUID networking = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+    const GUID networking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
+    const HRESULT no_network = HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE);
+    void* n = nullptr;
+    check(query(&networking, networking2, &n) == S_OK && n, "QueryApiImpl hands out XNetworkingImpl for IXNetworkingImpl2");
+    void* n1 = nullptr;
+    check(query(&networking, networking, &n1) == S_OK && n1 == n, "and the same object for IXNetworkingImpl");
+    if (n1) release(n1);
     if (n) {
-        void* again = get(networking_cls);
-        check(again == n, "XNetworkingImpl is one process-wide object");
-        release(again);
-
-        // Slot 15: XNetworkingGetConnectivityHint
-        struct ConnectivityHint {
-            uint32_t level;
-            uint32_t cost;
-            uint32_t iana_type;
-            bool network_initialized;
-            bool approaching_limit;
-            bool over_limit;
-            bool roaming;
-        } hint{};
-        using GetHint = HRESULT(STDMETHODCALLTYPE*)(void*, ConnectivityHint*);
-        check(reinterpret_cast<GetHint>(slot(n, 15))(n, nullptr) == E_POINTER,
-              "slot 15 rejects null pointer with E_POINTER");
-        check(reinterpret_cast<GetHint>(slot(n, 15))(n, &hint) == S_OK && hint.network_initialized &&
-                  hint.level == 3 && hint.cost == 1,
-              "slot 15 is XNetworkingGetConnectivityHint reporting initialized network and internet access");
-
-        // Slot 14: XNetworkingVerifyServerCertificate
-        using VerifyCert = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
-        check(reinterpret_cast<VerifyCert>(slot(n, 14))(n, nullptr, nullptr) == S_OK,
-              "slot 14 is XNetworkingVerifyServerCertificate returning S_OK offline");
-
-        // Slot 16 & 17: XNetworkingRegisterConnectivityHintChanged and Unregister
-        using RegisterHint = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
-        using UnregisterHint = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
-        XTaskQueueRegistrationToken tok1{0}, tok2{0};
-        check(reinterpret_cast<RegisterHint>(slot(n, 16))(n, nullptr, nullptr, nullptr, &tok1) == S_OK &&
-                  reinterpret_cast<RegisterHint>(slot(n, 16))(n, nullptr, nullptr, nullptr, &tok2) == S_OK &&
-                  tok1.token != tok2.token && tok1.token > 0,
-              "slot 16 registers connectivity hint callbacks and hands out tokens");
-        check(reinterpret_cast<UnregisterHint>(slot(n, 17))(n, tok1, false) == true &&
-                  reinterpret_cast<UnregisterHint>(slot(n, 17))(n, tok2, true) == true,
-              "slot 17 unregisters connectivity hint callbacks");
-
-        // Slots 11-13: Async security info query
-        using QuerySecAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*, XAsyncBlock*);
-        using QuerySecSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
-        using QuerySecResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, size_t*, uint8_t*, void**);
-        check(reinterpret_cast<QuerySecAsync>(slot(n, 11))(n, L"https://example.com", nullptr) == S_OK,
-              "slot 11 is XNetworkingQuerySecurityInformationForUrlUtf16Async");
-        size_t sec_size = 42;
-        check(reinterpret_cast<QuerySecSize>(slot(n, 12))(n, nullptr, &sec_size) == S_OK && sec_size == 0,
-              "slot 12 is XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize returning 0 bytes");
-        size_t used = 42;
-        void* sec_info = reinterpret_cast<void*>(1);
-        check(reinterpret_cast<QuerySecResult>(slot(n, 13))(n, nullptr, 0, &used, nullptr, &sec_info) == S_OK &&
-                  used == 0 && sec_info == nullptr,
-              "slot 13 is XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult returning S_OK with null result");
-
+        struct Hint {
+            uint32_t level, cost, iana;
+            bool initialized, approaching, over, roaming;
+        } hint{9, 9, 9, false, true, true, true};
+        using GetHint = HRESULT(STDMETHODCALLTYPE*)(void*, Hint*);
+        check(reinterpret_cast<GetHint>(slot(n, 15))(n, &hint) == S_OK && hint.level == 1 && hint.cost == 0 &&
+                  hint.initialized && !hint.approaching && !hint.over && !hint.roaming,
+              "slot 15 (XNetworkingGetConnectivityHint): initialized, no connectivity");
+        XAsyncBlock block{};
+        using SecurityAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*, XAsyncBlock*);
+        using ResultSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
+        size_t size = 99;
+        check(reinterpret_cast<SecurityAsync>(slot(n, 11))(n, L"https://example.invalid/", &block) == S_OK &&
+                  XAsyncGetStatus(&block, true) == no_network &&
+                  reinterpret_cast<ResultSize>(slot(n, 12))(n, &block, &size) == no_network && size == 0,
+              "slots 11/12 (UTF-16 URL security info): the async call completes with no network");
+        // Slots 10/13 in Microsoft's order: (async, bufferByteCount, bufferByteCountUsed*, buffer*, information**).
+        // A sentinel buffer must stay untouched; the two outputs are written where they are, not into the buffer.
+        using SecurityResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, size_t*, uint8_t*, void**);
+        for (int s : {10, 13}) {
+            uint8_t buffer[32];
+            std::memset(buffer, 0xA5, sizeof(buffer));
+            size_t used = 77;
+            void* info = &used;
+            const HRESULT hr = reinterpret_cast<SecurityResult>(slot(n, s))(n, &block, sizeof(buffer), &used, buffer, &info);
+            bool untouched = true;
+            for (uint8_t byte : buffer) untouched = untouched && byte == 0xA5;
+            check(hr == no_network && used == 0 && info == nullptr && untouched,
+                  s == 10 ? "slot 10 (ANSI result): outputs zeroed in place, the caller's buffer untouched"
+                          : "slot 13 (UTF-16 result): outputs zeroed in place, the caller's buffer untouched");
+        }
+        using Verify = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
+        check(reinterpret_cast<Verify>(slot(n, 14))(n, nullptr, nullptr) == no_network,
+              "slot 14 (XNetworkingVerifyServerCertificate) fails offline");
+        XTaskQueueRegistrationToken token{};
+        using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+        using Unregister = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
+        check(reinterpret_cast<Register>(slot(n, 16))(n, nullptr, nullptr, nullptr, &token) == S_OK && token.token &&
+                  reinterpret_cast<Unregister>(slot(n, 17))(n, token, true),
+              "slots 16/17 register and unregister a connectivity-hint callback");
+        uint16_t port = 7;
+        using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);
+        using NotImpl = HRESULT(STDMETHODCALLTYPE*)(void*);
+        check(reinterpret_cast<QueryPort>(slot(n, 3))(n, &port) == no_network && port == 0 &&
+                  reinterpret_cast<NotImpl>(slot(n, 20))(n) == E_NOTIMPL,
+              "slot 3 (preferred UDP port) has no answer offline; slot 20 (IXNetworkingImpl2) is E_NOTIMPL");
         release(n);
+    }
+
+    // XSystemImpl, asked for as libHttpClient.GDK.dll does: the class id with IXSystemImpl5's interface id.
+    const GUID system_cls = {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};
+    const GUID system5 = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
+    void* sy = nullptr;
+    check(query(&system_cls, system5, &sy) == S_OK && sy, "QueryApiImpl hands out XSystemImpl for IXSystemImpl5");
+    if (sy) {
+        using IdQuery = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*, size_t*);
+        char buf[64] = {};
+        size_t used = 0;
+        check(reinterpret_cast<IdQuery>(slot(sy, 3))(sy, sizeof(buf), buf, &used) == S_OK && used == 39 &&
+                  std::strlen(buf) == 38,
+              "slot 3 (XSystemGetConsoleId): the 39-byte placeholder");
+        check(reinterpret_cast<IdQuery>(slot(sy, 4))(sy, sizeof(buf), buf, &used) == S_OK &&
+                  std::strcmp(buf, "RETAIL") == 0 && used == 7,
+              "slot 4 (XSystemGetXboxLiveSandboxId): RETAIL");
+        check(reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 15, buf, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+                  reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 16, buf, &used) == S_OK,
+              "slot 4 needs XSystemXboxLiveSandboxIdMaxBytes (16), not just the id's 7 bytes");
+        const GUID chain[] = {
+            system_cls,
+            {0x6fd71f09, 0x7513, 0x49f0, {0x89, 0xbc, 0xbf, 0xaf, 0x5d, 0xf6, 0xf8, 0x52}},
+            {0x67ce4bfc, 0xb1d1, 0x4ac7, {0xbc, 0x3a, 0xcb, 0x92, 0x19, 0xa9, 0x7a, 0x85}},
+            {0xdadc2895, 0x34b0, 0x4ef5, {0xa8, 0x3e, 0x45, 0x11, 0x4d, 0x62, 0x9b, 0x80}},
+            system5};
+        bool all = true;
+        for (const GUID& iid : chain) {
+            void* same = nullptr;
+            all = all && query(&system_cls, iid, &same) == S_OK && same == sy;
+            if (same) release(same);
+        }
+        check(all, "IXSystemImpl5 answers for every interface it inherits (IXSystemImpl .. IXSystemImpl4)");
+        check(reinterpret_cast<IdQuery>(slot(sy, 5))(sy, sizeof(buf), buf, &used) == S_OK && used == 45 &&
+                  reinterpret_cast<IdQuery>(slot(sy, 5))(sy, 44, buf, &used) ==
+                      HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+                  reinterpret_cast<IdQuery>(slot(sy, 5))(sy, 45, nullptr, &used) == E_INVALIDARG,
+              "slot 5 (XSystemGetAppSpecificDeviceId): 45 bytes; a short or null buffer is refused");
+        using Track = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
+        using IsValid = bool(STDMETHODCALLTYPE*)(void*, void*);  // bool, per Microsoft's reference page
+        using Bandwidth = void(STDMETHODCALLTYPE*)(void*, bool);
+        int ctx = 0;
+        reinterpret_cast<Bandwidth>(slot(sy, 8))(sy, true);
+        check(reinterpret_cast<Track>(slot(sy, 6))(sy, &ctx, &ctx) == S_OK &&
+                  reinterpret_cast<IsValid>(slot(sy, 7))(sy, &ctx) &&
+                  !reinterpret_cast<IsValid>(slot(sy, 7))(sy, nullptr),
+              "slots 6-8 (handle tracking, handle check, download bandwidth) answer offline");
+        release(sy);
     }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
@@ -426,20 +493,63 @@ int main() {
               std::strcmp(pkg_id, "CustomTestPackageId_123456789012") == 0,
           "XPackageGetCurrentProcessPackageIdentifier respects LEONIDA_PACKAGE_ID override");
     SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", nullptr);
+    // pkg_id still holds the override; the mount checks below need the game's own identifier again.
+    check(package_id(sizeof(pkg_id), pkg_id) == S_OK && std::strlen(pkg_id) == 32,
+          "XPackageGetCurrentProcessPackageIdentifier returns the default again once the override is cleared");
 
+    auto mount_pkg = get<PackageMountFn>("XPackageMount");
+    auto close_mount = get<PackageCloseMountHandleFn>("XPackageCloseMountHandle");
+    auto mount_path_size = get<PackageMountPathSizeFn>("XPackageGetMountPathSize");
     auto mount_path = get<PackageMountPathFn>("XPackageGetMountPath");
-    check(mount_path(nullptr, 0, nullptr) == E_INVALIDARG, "XPackageGetMountPath rejects null buffer and size 0");
-    char mnt_path[MAX_PATH] = {};
-    check(mount_path(nullptr, 0, mnt_path) == E_INVALIDARG, "XPackageGetMountPath rejects size 0 with buffer");
-    check(mount_path(nullptr, 10, nullptr) == E_INVALIDARG, "XPackageGetMountPath rejects null pointer with size");
 
-    SetEnvironmentVariableA("LEONIDA_GAME_DIR", "C:\\LeonidaGameDir");
-    check(mount_path(nullptr, 5, mnt_path) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+    const XPackageMountHandle kInvalidMount{0};
+    const XPackageMountHandle kStaleMount{999};
+
+    XPackageMountHandle test_out{0};
+    check(mount_pkg(nullptr, nullptr) == E_INVALIDARG, "XPackageMount rejects null identifier and null out pointer");
+    check(mount_pkg(pkg_id, nullptr) == E_INVALIDARG, "XPackageMount rejects null out pointer with identifier");
+    check(mount_pkg(nullptr, &test_out) == E_INVALIDARG, "XPackageMount rejects null identifier with out pointer");
+    check(mount_pkg(pkg_id, &test_out) == E_ACCESSDENIED,
+          "XPackageMount rejects game package identifier with E_ACCESSDENIED");
+    check(mount_pkg("UninstalledPackage_0000000000000", &test_out) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageMount rejects uninstalled package identifier with ERROR_NOT_FOUND");
+
+    size_t req_size = 0;
+    check(mount_path_size(kInvalidMount, &req_size) == E_INVALIDARG,
+          "XPackageGetMountPathSize rejects invalid mount handle 0");
+    check(mount_path_size(kStaleMount, &req_size) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageGetMountPathSize rejects unknown mount handle");
+
+    char mnt_path[MAX_PATH] = {};
+    check(mount_path(kInvalidMount, 0, nullptr) == E_INVALIDARG,
+          "XPackageGetMountPath rejects invalid mount handle 0");
+    check(mount_path(kStaleMount, sizeof(mnt_path), mnt_path) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageGetMountPath rejects unknown mount handle");
+
+    SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", "DLC1_123456789012345678901234567=C:\\LeonidaDLC1");
+    XPackageMountHandle dlc_mount{0};
+    check(mount_pkg("DLC1_123456789012345678901234567", &dlc_mount) == S_OK && dlc_mount.handle != 0,
+          "XPackageMount mounts content package from LEONIDA_CONTENT_PACKAGES");
+    check(mount_path_size(dlc_mount, nullptr) == E_INVALIDARG,
+          "XPackageGetMountPathSize rejects null size pointer");
+    check(mount_path_size(dlc_mount, &req_size) == S_OK && req_size == std::strlen("C:\\LeonidaDLC1") + 1,
+          "XPackageGetMountPathSize returns required buffer size including null terminator for mounted handle");
+    check(mount_path(dlc_mount, 0, mnt_path) == E_INVALIDARG,
+          "XPackageGetMountPath rejects size 0 with buffer");
+    check(mount_path(dlc_mount, 10, nullptr) == E_INVALIDARG,
+          "XPackageGetMountPath rejects null pointer with size");
+    check(mount_path(dlc_mount, 5, mnt_path) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
           "XPackageGetMountPath rejects insufficient buffer");
-    check(mount_path(nullptr, sizeof(mnt_path), mnt_path) == S_OK &&
-              std::strcmp(mnt_path, "C:\\LeonidaGameDir") == 0,
-          "XPackageGetMountPath returns configured game directory");
-    SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+    check(mount_path(dlc_mount, sizeof(mnt_path), mnt_path) == S_OK &&
+              std::strcmp(mnt_path, "C:\\LeonidaDLC1") == 0,
+          "XPackageGetMountPath returns configured content directory for mounted handle");
+
+    close_mount(dlc_mount);
+    check(mount_path_size(dlc_mount, &req_size) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageGetMountPathSize rejects closed/stale mount handle");
+    check(mount_path(dlc_mount, sizeof(mnt_path), mnt_path) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageGetMountPath rejects closed/stale mount handle");
+    SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
 
     auto is_packaged = get<PackagedProcessFn>("XPackageIsPackagedProcess");
     check(is_packaged() == true, "XPackageIsPackagedProcess returns true by default");
