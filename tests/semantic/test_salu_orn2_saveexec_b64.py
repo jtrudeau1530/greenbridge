@@ -826,5 +826,140 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
         self.assertEqual(self.state.read_exec(), expected_exec)
 
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+
+@dataclass
+class FlowControlStatusFlags:
+    """Detailed status metrics evaluating execution mask state transitions."""
+
+    all_lanes_active: bool
+    no_lanes_active: bool
+    partial_lanes_active: bool
+    divergence_altered: bool
+    lanes_enabled_count: int
+    lanes_disabled_count: int
+
+
+def evaluate_saveexec_status_flags(old_exec: int, new_exec: int) -> FlowControlStatusFlags:
+    """Calculate lane transition dynamics and convergence status."""
+    all_active = (new_exec == MASK64)
+    no_active = (new_exec == 0)
+    partial_active = (0 < new_exec < MASK64)
+    divergence_altered = (new_exec != old_exec)
+    lanes_enabled = bin(new_exec & (~old_exec & MASK64)).count("1")
+    lanes_disabled = bin((~new_exec & MASK64) & old_exec).count("1")
+    return FlowControlStatusFlags(
+        all_lanes_active=all_active,
+        no_lanes_active=no_active,
+        partial_lanes_active=partial_active,
+        divergence_altered=divergence_altered,
+        lanes_enabled_count=lanes_enabled,
+        lanes_disabled_count=lanes_disabled,
+    )
+
+
+def scalar_addc_u32(s0: int, s1: int, carry_in: int) -> Tuple[int, int]:
+    """Simulate RDNA2 s_addc_u32 consuming SCC carry bit. Returns (sum32, carry_out)."""
+    total = (s0 & MASK32) + (s1 & MASK32) + (carry_in & 1)
+    return total & MASK32, 1 if total > MASK32 else 0
+
+
+def scalar_subb_u32(s0: int, s1: int, borrow_in: int) -> Tuple[int, int]:
+    """Simulate RDNA2 s_subb_u32 consuming SCC borrow bit. Returns (diff32, borrow_out)."""
+    diff = (s0 & MASK32) - (s1 & MASK32) - (borrow_in & 1)
+    return diff & MASK32, 1 if diff < 0 else 0
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation tests."""
+
+    def test_scc_exhaustive_zero_conditions(self) -> None:
+        """Verify that SCC is 0 ONLY when src0 is 0 and exec is all-ones, 1 otherwise."""
+        _, new_exec, scc = oracle_s_orn2_saveexec_b64(0, EXEC_ALL_ONES)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, SCC_CLEARED)
+
+        for bit in range(64):
+            _, new_exec, scc = oracle_s_orn2_saveexec_b64(1 << bit, EXEC_ALL_ONES)
+            self.assertNotEqual(new_exec, 0)
+            self.assertEqual(scc, SCC_SET)
+
+        for bit in range(64):
+            _, new_exec, scc = oracle_s_orn2_saveexec_b64(0, EXEC_ALL_ONES ^ (1 << bit))
+            self.assertNotEqual(new_exec, 0)
+            self.assertEqual(scc, SCC_SET)
+
+    def test_status_flags_metrics(self) -> None:
+        """Verify status metrics across transitions: full, empty, partial divergence."""
+        old_exec = 0x0000_0000_FFFF_FFFF
+        src0 = 0xFFFF_0000_0000_0000
+        _, new_exec, _ = oracle_s_orn2_saveexec_b64(src0, old_exec)
+        flags = evaluate_saveexec_status_flags(old_exec, new_exec)
+        self.assertFalse(flags.all_lanes_active)
+        self.assertFalse(flags.no_lanes_active)
+        self.assertTrue(flags.partial_lanes_active)
+        self.assertTrue(flags.divergence_altered)
+        self.assertEqual(flags.lanes_enabled_count, 32)
+        self.assertEqual(flags.lanes_disabled_count, 32)
+
+        _, new_exec_all, _ = oracle_s_orn2_saveexec_b64(EXEC_ALL_ONES, old_exec)
+        flags_all = evaluate_saveexec_status_flags(old_exec, new_exec_all)
+        self.assertTrue(flags_all.all_lanes_active)
+        self.assertFalse(flags_all.no_lanes_active)
+        self.assertEqual(flags_all.lanes_enabled_count, 32)
+        self.assertEqual(flags_all.lanes_disabled_count, 0)
+
+        _, new_exec_none, _ = oracle_s_orn2_saveexec_b64(0, EXEC_ALL_ONES)
+        flags_none = evaluate_saveexec_status_flags(EXEC_ALL_ONES, new_exec_none)
+        self.assertFalse(flags_none.all_lanes_active)
+        self.assertTrue(flags_none.no_lanes_active)
+        self.assertEqual(flags_none.lanes_enabled_count, 0)
+        self.assertEqual(flags_none.lanes_disabled_count, 64)
+
+    def test_scc_forwarding_to_scalar_addc(self) -> None:
+        """Test carry generation chain: s_orn2_saveexec_b64 -> SCC -> s_addc_u32."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.write_exec(0)
+        interp.step(ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[0:1]", src0=0), state)
+        self.assertEqual(state.read_scc(), 1)
+
+        sum_val, carry_out = scalar_addc_u32(0xFFFF_FFFF, 0, state.read_scc())
+        self.assertEqual(sum_val, 0)
+        self.assertEqual(carry_out, 1)
+
+        state.write_exec(EXEC_ALL_ONES)
+        interp.step(ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[0:1]", src0=0), state)
+        self.assertEqual(state.read_scc(), 0)
+
+        sum_val2, carry_out2 = scalar_addc_u32(0xFFFF_FFFF, 0, state.read_scc())
+        self.assertEqual(sum_val2, 0xFFFF_FFFF)
+        self.assertEqual(carry_out2, 0)
+
+    def test_scc_forwarding_to_scalar_subb(self) -> None:
+        """Test borrow generation chain: s_orn2_saveexec_b64 -> SCC -> s_subb_u32."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.write_exec(0)
+        interp.step(ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[0:1]", src0=0), state)
+        self.assertEqual(state.read_scc(), 1)
+
+        diff, borrow_out = scalar_subb_u32(0, 0, state.read_scc())
+        self.assertEqual(diff, 0xFFFF_FFFF)
+        self.assertEqual(borrow_out, 1)
+
+        state.write_exec(EXEC_ALL_ONES)
+        interp.step(ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[0:1]", src0=0), state)
+        self.assertEqual(state.read_scc(), 0)
+
+        diff2, borrow_out2 = scalar_subb_u32(0, 0, state.read_scc())
+        self.assertEqual(diff2, 0)
+        self.assertEqual(borrow_out2, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
