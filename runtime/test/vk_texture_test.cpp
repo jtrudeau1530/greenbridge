@@ -211,7 +211,7 @@ int main(int argc, char** argv) {
     for (auto& x : exts) m8_on = m8_on || !std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     if (m8_on) {
         enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
-        m8.maintenance8 = VK_TRUE; f12.pNext = &m8;
+        m8.maintenance8 = VK_TRUE; f11.pNext = &m8;
         std::fprintf(stderr, "enabled %s\n", VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     }
 #endif
