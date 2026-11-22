@@ -7993,6 +7993,43 @@ class Gen:
         self.emit(f"OpBranch {L['end']}")
         self.emit(f"{L['end']} = OpLabel")
 
+    def resinfo_words(self, img, level, array_query, word3):
+        """[width, height, depth, levels] (int ids) of image_get_resinfo for the uint mip level `level`, as RDNA2
+        returns them (measured on gfx1036 with tools/image_query_probe.py, SHADER-388): the level count of the view;
+        past the last level (level >= levels, unsigned) width, height and depth are 0, and the size is not queried
+        there (OpImageQuerySizeLod is undefined past the view's levels); a 2D image's depth word is 0; a 2D array's
+        is its layer count minified like a 3D depth, max(1, layers >> (BASE_LEVEL + level)), BASE_LEVEL being T#
+        word 3 [15:12] (`word3`, a uint id), which is also the view's first level."""
+        zero = self.as_int(self.cu(0))
+        lv, lvu, ok, safe, sz = (self.tmp() for _ in range(5))
+        self.emit(f"{lv} = OpImageQueryLevels %int {img}")
+        self.emit(f"{lvu} = OpBitcast %uint {lv}")
+        self.emit(f"{ok} = OpULessThan %bool {level} {lvu}")
+        lod = self.as_int(level)
+        self.emit(f"{safe} = OpSelect %int {ok} {lod} {zero}")
+        self.emit(f"{sz} = OpImageQuerySizeLod {'%v3int' if array_query else '%v2int'} {img} {safe}")
+        vals = []
+        for axis in range(3 if array_query else 2):
+            extent = self.tmp()
+            self.emit(f"{extent} = OpCompositeExtract %int {sz} {axis}")
+            vals.append(extent)
+        if array_query:
+            base, shift, layers, mini, at_least = (self.tmp() for _ in range(5))
+            self.emit(f"{base} = OpBitFieldUExtract %uint {word3} {self.cu(12)} {self.cu(4)}")
+            self.emit(f"{shift} = OpIAdd %uint {base} {level}")
+            self.emit(f"{layers} = OpBitcast %uint {vals[2]}")
+            self.emit(f"{mini} = OpShiftRightLogical %uint {layers} {shift}")
+            self.emit(f"{at_least} = OpExtInst %uint %glsl UMax {mini} {self.cu(1)}")
+            vals[2] = self.as_int(at_least)
+        else:
+            vals.append(zero)
+        for i in range(3):
+            if i < 2 or array_query:
+                kept = self.tmp()
+                self.emit(f"{kept} = OpSelect %int {ok} {vals[i]} {zero}")
+                vals[i] = kept
+        return vals + [lv]
+
     def image_misc(self, op, a, mods):
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
@@ -8122,19 +8159,8 @@ class Gen:
         dmask = int(dm.split(":")[1], 0)
         self.uses_query = True
         if op == "image_get_resinfo":
-            lod = self.as_int(self.load_reg("vgpr", addr[0]))
-            sz, lv = self.tmp(), self.tmp()
-            size_type = "%v3int" if array_query else "%v2int"
-            self.emit(f"{sz} = OpImageQuerySizeLod {size_type} {img} {lod}")
-            self.emit(f"{lv} = OpImageQueryLevels %int {img}")
-            vals = []
-            for axis in range(3 if array_query else 2):
-                extent = self.tmp()
-                self.emit(f"{extent} = OpCompositeExtract %int {sz} {axis}")
-                vals.append(extent)
-            if not array_query:
-                vals.append(self.as_int(self.cu(1)))
-            vals.append(lv)
+            vals = self.resinfo_words(img, self.load_reg("vgpr", addr[0]), array_query,
+                                      self.load_reg("sgpr", a[2]["r"] + 3))
             out = 0
             for c in range(4):
                 if dmask >> c & 1:
