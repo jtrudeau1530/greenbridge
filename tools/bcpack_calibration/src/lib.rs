@@ -256,7 +256,7 @@ pub unsafe extern "C" fn unpack(
     if bits.iter().any(|&b| b > 7) {
         return -1;
     }
-    let Ok(decoded) = bcpack::rans::decode_slice(stream, bits, target) else {
+    let Ok(decoded) = bcpack_rans::rans::decode_slice(stream, bits, target) else {
         return -1;
     };
     let out = slice::from_raw_parts_mut(output, target * lanes);

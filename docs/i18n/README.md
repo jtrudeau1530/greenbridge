@@ -13,3 +13,4 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Language | File | Synced commit | Maintainer |
 |---|---|---|---|
 | Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `d3841c0c` | `@Andretuta` |
+| 简体中文 (`zh-CN`) | [`zh-CN/quickstart.md`](zh-CN/quickstart.md) | `0d61c357` | `@liang-kai-shui` |

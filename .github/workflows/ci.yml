@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install -c tests/requirements.txt numpy
-          cargo build --release --locked --manifest-path tools/bcpack_calibration/Cargo.toml
+          CARGO_HOME="$(mktemp -d)" cargo build --release --locked --offline --manifest-path tools/bcpack_calibration/Cargo.toml
           python -I -c "import sys; sys.path.insert(0, 'tools'); import calibrated_texture; calibrated_texture.native()"
           python -I tests/test_calibrated_texture.py
           python -I tests/test_ttpf_assets.py

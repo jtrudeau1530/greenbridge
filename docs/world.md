@@ -318,6 +318,34 @@ Hash-only or opaque:
 6. **Model/texture layer.** The existing manifest gives names/bounds; texture keys are 64-bit asset keys in
    model materials. Placement itself contains neither geometry nor texture names.
 
+## Region tint map (`RegionTintMap`)
+
+One `RegionTintMap` XML document in `common.rpf` (see [gamedata.md](gamedata.md)) places a single streamed,
+tiled tint texture over the world. Counts only; no names.
+
+| Field | Value |
+|---|---|
+| `RegionTintMaps/Item` | 1 |
+| `WorldAABBMin`, `WorldAABBMax` | x -13,312 to 5,120, y -9,728 to 11,264 (18,432 x 20,992 units) |
+| `StreamingDesc/NumberOfTilesX`, `Y` | 36 x 41 |
+| `StreamingDesc/TileSize` | 512 x 512 |
+| `TintMapType`, `RegionTintMapFilename` | one token each |
+| `channelRed`, `channelGreen`, `channelBlue`, `channelAlpha`, `settings/pairs` | empty |
+
+Two exact matches tie this to the rest of the world data:
+
+- The tiles cover the box exactly: 36 x 512 = 18,432 and 41 x 512 = 20,992, so there is no partial tile.
+- The box is identical to the six-float bounds of the `PAMH` max/min heightmap in [gamedata.md](gamedata.md),
+  `(-13312, -9728)` to `(5120, 11264)` in x and y. The tint map and the coarse heightmap therefore share one
+  world rectangle, and that rectangle also has the same minimum x as the four `GridAtlasInfo` grids.
+
+Entity positions from a local index of map resources (2,036,542 placements, 2,011,519 of them in `levels.rpf`)
+lie within x -9,955 to 4,577 and y -8,096 to 9,440 at the 0.1th/99.9th percentiles, inside this rectangle.
+
+The texture named by `RegionTintMapFilename` is not an archive entry or texture-dictionary item in the local
+catalog, so the tile contents are unknown. With all four channel names empty, which tint each channel carries
+is not stated here either.
+
 ## Tool
 
 `tools/world_index.py` scans an RPF9 archive or a directory of carved streams and writes JSON/CSV with
@@ -403,6 +431,32 @@ python -I tests\test_world_place.py
 ```
 
 The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.
+## Trains (`CTrainConfigs`)
+
+Trains are configured by one `CTrainConfigs` XML document in `common.rpf` (see [gamedata.md](gamedata.md)).
+Counts only; no names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `trainConfigs/Item` | 46 | `name` (46 distinct), station stop durations, announce/beep/hang/swing flags, `carriageGap`, `defaultMaxSpeed`, `maxAcceleration`, `maxDeceleration`, `populateTrainDist`, `deathToReviveTime`, `carriages` |
+| `.../carriages/Item` | 314 | `modelName` (304), `modelSetName` (300), `maxPedsPerCarriage`, `flipModelDir`, `doInteriorLights`; 1 to 17 per train (median 8) |
+| `trainGroups/Item` | 5 | `name` and `trainConfigRefs` (24, 4, 5, 1 and 2 refs) |
+| `.../trainConfigRefs/Item` | 36 | `trainConfigsName` and `trainConfigIndex` |
+
+**Group references: resolve by name, not by index.** All 36 `trainConfigsName` values name a config and all 36
+`trainConfigIndex` values are in range, but only 25 indices equal the position of the named config. The other 11
+are exactly one less. The split is clean: every reference to a config at (0-based) position 23 or earlier agrees, and every
+reference to a config at position 26 or later is off by one. That is what one config inserted at position 24 or
+25 after the indices were written would produce, so `trainConfigIndex` looks stale: a loader that trusts it
+would pick a different config for 11 of the 36 references. 12 of the 46 configs are in no group.
+
+Carriage models: the 304 `modelName` values use 13 distinct names; 9 are `.yft` base names in the local archive
+catalog and all 9 are among the vehicle distant-light models, while 4 match no archive entry. The 23 distinct
+`modelSetName` values resolve to an archive entry name in 9 cases. Every carriage has a model name, a model set,
+or both (290 have both).
+
+Ranges: `defaultMaxSpeed` 8 to 15 (median 8), `maxAcceleration` 1 and `maxDeceleration` 2 in all 46,
+`populateTrainDist` 40 in all 46, `carriageGap` -0.5 to 0.1.
 
 ## Instanced props and grass
 
@@ -446,6 +500,39 @@ Grass (225,532,603 instances): 225,379,032 `NormalX`/`NormalY` pairs (byte / 127
 disc; `RotationIdx` is 0 to 72; `ScaleZ` equals `Scale` in 52,021,564 and `Scale` is 0 in 47,679,734, so
 `ScaleZ` is its own value, not ambient occlusion. `OrientToTerrain` is 1.0 in all 208,239 lists, `IsSLODList`
 is set in 5,802, and `lodLevel` is ORPHAN_HD in 205,181 and SLOD1 in 3,058.
+
+## Deformable snow and mud (`CSnowTrackData`)
+
+The tracks left in snow, mud and similar ground are configured by one
+`CSnowTrackData` XML document in `common.rpf` (see [gamedata.md](gamedata.md) for how it is carved). Counts
+only; no values or names.
+
+| Path | Count | Content |
+|---|---:|---|
+| `CommonDeepSurfaceParams/Item` | 16 | `Name`, `DebugColor`, `PhysicsMaterials`, and three parameter blocks: `HeightMapGenerationParams` (14 fields: depth, berm, noise, viscosity, lifetime, fade, blur, `POMScale`, plus `SupportPropFlatten` on 2), `TerrainRenderParams` (height, bump-map and displacement blend, normal scale), `PathRegenAndFlattenParams` (berm height, trail width, vegetation and explosion flattening) |
+| `.../PhysicsMaterials/Item` | 24 | one material name each; 0 to 6 per surface (0 on 6 surfaces, 1 on 5) |
+| `MudParams` | 1 | 23 fields: soak and puddle-fill ramps, puddle scale/ripple/slope/mask/specular, mip bias, POM and height-map puddle scale, two tint colours |
+| `TrackTypeData/Item` | 9 | `Name`, `Type` (3 distinct, used 5, 2 and 2 times), 17 numeric fields (sphere and berm scale, depth offset and bias, trail width/V-scale/depth/velocity ranges, grass flattening on land and in water), and three texture names: trail, print, mud displacement |
+| `SnowNormalMapName` | 1 | one texture name |
+| `GlobalDeepSurfaceParams` | 1 | tessellation-mask mip bias, deformation and parallax world-space widths, path-segment cull distance and time |
+| `TrailmapParams` | 1 | width and side offsets, and water-push sphere and trail strengths |
+
+So the system is a world-space height map stamped by moving spheres and trails, rendered with tessellation,
+parallax occlusion mapping and a normal map, with a separate mud/puddle layer; that is the reading of the field
+names, and the values were not tested in a renderer.
+
+Cross-checks:
+
+- **Physics materials.** The 24 names are distinct. `MaterialDataList`, the material table, survives only from
+  the middle of the document (its first block is in the unread region of `common.rpf`); 13 of the 24 names occur
+  in the retained part. The other 11 may be in the lost part, so no name is shown to be missing.
+- **Textures.** The 9 distinct texture names (8 track textures and the snow normal map) match no archive entry
+  name and no texture-dictionary item name or its joaat hash in the local catalog (118,925 named items). The
+  catalog is incomplete for names, so this does not show the textures are absent.
+
+Not measured here (hypothesis): which surfaces the 16 entries are (their names suggest snow, mud and sand
+variants), how `Type` selects a track type for peds, animals and vehicles, and the size of the deformation map
+(`DeformationWorldSpaceWidth` is the obvious input).
 
 ## No-sharing rule
 

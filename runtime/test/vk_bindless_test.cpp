@@ -422,7 +422,7 @@ int main(int argc, char** argv) {
     const struct { VkImage image; std::uint32_t size; VkDeviceSize offset; VkImageLayout layout; } uploads[] = {
         {gradient, TW, 0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {decoy, 1, 1024, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {stored, 1, 1024, VK_IMAGE_LAYOUT_GENERAL}};
+        {stored, 1, 0, VK_IMAGE_LAYOUT_GENERAL}};
     for (const auto& u : uploads) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -488,10 +488,11 @@ int main(int argc, char** argv) {
                l.maxDescriptorSetStorageImages >= storage_total;
     };
 
-    unsigned mismatches = 0, runs = 0;
+    unsigned mismatches = 0, runs = 0, readbacks = 0;
     float worst = 0;
     // What the 64x64 target must hold: the texel under each pixel, or one colour everywhere.
     const auto compare = [&](const char* what, const float* colour) {
+        ++readbacks;
         const float* got = static_cast<const float*>(readback_map);
         for (std::uint32_t y = 0; y < H; ++y) {
             for (std::uint32_t x = 0; x < W; ++x) {
@@ -772,6 +773,26 @@ int main(int argc, char** argv) {
             EXPECT(flush());
             CHECK(draw());
             compare("9 past 4096 images and 2048 samplers", nullptr);
+
+            // Keep another high slot live while the sampled slot is removed and then reused.
+            const auto neighbour = set.add_image(ImageDimension::dim_2d, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            EXPECT(neighbour > 5000 && neighbour != far_image);
+            set.remove_image(ImageDimension::dim_2d, far_image);
+            EXPECT(flush());
+            CHECK(draw());
+            compare("10 freed high slot", zeros);
+
+            const auto replacement = set.add_image(ImageDimension::dim_2d, stored_view, VK_IMAGE_LAYOUT_GENERAL);
+            EXPECT(replacement == far_image);
+            EXPECT(flush());
+            CHECK(draw());
+            const float blue[4] = {0, 0, 128.0f / 255.0f, 1};  // stored image uses the first gradient texel
+            compare("11 reused high slot", blue);
+
+            EXPECT(set.insert_key(tsharp, neighbour));
+            EXPECT(flush());
+            CHECK(draw());
+            compare("12 live neighbour", orange_colour);
         } else {
             std::printf("%s: no room past 5000 2D images and 2100 samplers on this device; step 9 skipped\n", name);
         }
@@ -812,7 +833,7 @@ int main(int argc, char** argv) {
         std::printf("unsupported: the bindless set does not fit this device's descriptor limits\n");
         return unsupported;
     }
-    std::printf("bindless: %u draws read back, %u bad pixels, largest error %g\n", runs * 7, mismatches, double(worst));
+    std::printf("bindless: %u draws read back, %u bad pixels, largest error %g\n", readbacks, mismatches, double(worst));
     if (g_validation_errors) {
         std::fprintf(stderr, "%u validation errors\n", g_validation_errors);
         return 1;
