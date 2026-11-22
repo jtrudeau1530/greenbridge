@@ -5071,6 +5071,7 @@ public:
                 }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values});
         }
+        register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
             std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
         signature->attach_device(identity());
@@ -5728,17 +5729,25 @@ public:
             log_once(refusal, desc->Flags);
             return;
         }
-        const bool uint_border = desc->Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
-        D3D12_SAMPLER_DESC base{desc->Filter,   desc->AddressU,      desc->AddressV,       desc->AddressW,
-                                desc->MipLODBias, desc->MaxAnisotropy, desc->ComparisonFunc, {},
-                                desc->MinLOD,   desc->MaxLOD};
-        if (!uint_border) std::memcpy(base.BorderColor, desc->FloatBorderColor, sizeof(base.BorderColor));
+        const leonida::gfx10::SamplerWords words = sampler2_words(*desc);
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.bind_sampler(words);
+    }
+
+    // The S# of a D3D12_SAMPLER_DESC2 that sampler2_refusal accepts.
+    leonida::gfx10::SamplerWords sampler2_words(const D3D12_SAMPLER_DESC2& desc) {
+        const bool uint_border = desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+        D3D12_SAMPLER_DESC base{desc.Filter,     desc.AddressU,      desc.AddressV,       desc.AddressW,
+                                desc.MipLODBias, desc.MaxAnisotropy, desc.ComparisonFunc, {},
+                                desc.MinLOD,     desc.MaxLOD};
+        if (!uint_border) std::memcpy(base.BorderColor, desc.FloatBorderColor, sizeof(base.BorderColor));
         leonida::gfx10::Sampler sampler = sampler_descriptor(base, uint_border ? nullptr : &state_);
         if (uint_border) {
             // The S#'s border types are the float ones', plus the layer's integer mark (kIntegerBorderPtr), which
             // gives the integer border its own key and VK_BORDER_COLOR_INT_* in Vulkan.
             namespace g = leonida::gfx10;
-            const UINT* c = desc->UintBorderColor;
+            const UINT* c = desc.UintBorderColor;
             const bool black = c[0] == 0 && c[1] == 0 && c[2] == 0;
             if (black && c[3] == 0) {
                 sampler.border_color = g::BorderColor::transparent_black;
@@ -5752,11 +5761,54 @@ public:
             }
             sampler.integer_border = true;
         }
-        sampler.unnormalized = desc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
-        const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler);
-        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
-        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        state_.bind_sampler(words);
+        sampler.unnormalized = desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+        return leonida::gfx10::encode(sampler);
+    }
+
+    // A root signature's static samplers take no root argument: a shader that uses one holds its S# by value
+    // (docs/d3d12_vulkan.md section 3.5). So each gets a sampler in set 0 and a key in the hash table here, as
+    // CreateSampler gives a heap slot's S#; without them the shader's lookup misses and it samples through the
+    // fallback sampler. A static sampler is a D3D12_SAMPLER_DESC2 whose border colour is one of five named ones
+    // (D3D12_STATIC_BORDER_COLOR; the two UINT ones can be in a blob of any version, the flags only in 1.2).
+    void register_static_samplers(const rt::rootsig::RootSignature& signature) {
+        for (const rt::rootsig::StaticSampler& s : signature.static_samplers) {
+            D3D12_SAMPLER_DESC2 desc{};
+            desc.Filter = D3D12_FILTER(s.filter);
+            desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE(s.address_u);
+            desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE(s.address_v);
+            desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE(s.address_w);
+            desc.MipLODBias = s.mip_lod_bias;
+            desc.MaxAnisotropy = s.max_anisotropy;
+            desc.ComparisonFunc = D3D12_COMPARISON_FUNC(s.comparison_func);
+            desc.MinLOD = s.min_lod;
+            desc.MaxLOD = s.max_lod;
+            desc.Flags = D3D12_SAMPLER_FLAGS(s.flags);
+            const bool white = s.border_color == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ||
+                               s.border_color == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT;
+            if (s.border_color == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT ||
+                s.border_color == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT) {
+                desc.Flags |= D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+                desc.UintBorderColor[0] = desc.UintBorderColor[1] = desc.UintBorderColor[2] = white ? 1u : 0u;
+                desc.UintBorderColor[3] = 1;
+            } else if (s.border_color > D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT ||
+                       (desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) {
+                // A value past the enum, or the UINT flag with a float border: not a sampler D3D12 defines.
+                log_once("static sampler not registered: border colour and flags do not go together; border colour",
+                         int(s.border_color));
+                continue;
+            } else {
+                desc.FloatBorderColor[0] = desc.FloatBorderColor[1] = desc.FloatBorderColor[2] = white ? 1.0f : 0.0f;
+                desc.FloatBorderColor[3] =
+                    s.border_color == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK ? 0.0f : 1.0f;
+            }
+            if (sampler2_refusal(desc)) {
+                log_once("static sampler not registered: a sampler CreateSampler2 refuses; flags", int(desc.Flags));
+                continue;
+            }
+            if (!state_.bind_sampler(sampler2_words(desc)))
+                log_once("static sampler not registered: no room in the bindless set; register",
+                         int(s.shader_register));
+        }
     }
 
     // Why the PC runtime refuses a D3D12_SAMPLER_DESC2, or null. The non-normalized rules are its debug layer's
