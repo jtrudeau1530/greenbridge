@@ -4150,6 +4150,11 @@ int main() {
             EXPECT(above.HighestShaderModel == D3D_SHADER_MODEL_6_0);  // clamped to what the layer accepts
             D3D12_FEATURE_DATA_SHADER_MODEL below{static_cast<D3D_SHADER_MODEL>(0)};
             EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &below, sizeof(below))));
+            // Between 5.1 and 6.0 no runtime names a model: refused (the host's E_INVALIDARG), not echoed back.
+            for (const UINT undefined : {0x52u, 0x5au, 0x5fu}) {
+                D3D12_FEATURE_DATA_SHADER_MODEL gap{static_cast<D3D_SHADER_MODEL>(undefined)};
+                EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &gap, sizeof(gap)) == E_INVALIDARG);
+            }
 
             D3D12_FEATURE_DATA_ROOT_SIGNATURE signature{D3D_ROOT_SIGNATURE_VERSION_1_1};
             EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &signature, sizeof(signature))));
