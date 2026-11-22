@@ -17,8 +17,13 @@ namespace {
 
 using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using CreateFileAFn = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using CreateFile2Fn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, DWORD, LPCREATEFILE2_EXTENDED_PARAMETERS);
 using FindFirstFileWFn = HANDLE(WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
 using FindFirstFileAFn = HANDLE(WINAPI*)(LPCSTR, LPWIN32_FIND_DATAA);
+using FindFirstFileExWFn =
+    HANDLE(WINAPI*)(LPCWSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
+using FindFirstFileExAFn =
+    HANDLE(WINAPI*)(LPCSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
 using FindNextFileWFn = BOOL(WINAPI*)(HANDLE, LPWIN32_FIND_DATAW);
 using FindCloseFn = BOOL(WINAPI*)(HANDLE);
 using GetFileAttributesWFn = DWORD(WINAPI*)(LPCWSTR);
@@ -528,6 +533,78 @@ int main() {
         check(first_w(L"GAME:\\data\\*", nullptr) == INVALID_HANDLE_VALUE &&
                   GetLastError() == ERROR_INVALID_PARAMETER,
               "a null listing buffer is refused");
+    }
+
+    // CreateFile2 and FindFirstFileExA/W (used by GDK/OneCore titles and std::filesystem).
+    {
+        const auto create2 = resolve<CreateFile2Fn>("api-ms-win-core-file-l1-2-0.dll", "CreateFile2");
+        const auto first_ex_w = resolve<FindFirstFileExWFn>("api-ms-win-core-file-l1-1-0.dll", "FindFirstFileExW");
+        const auto first_ex_a = resolve<FindFirstFileExAFn>("kernelbase.dll", "FindFirstFileExA");
+        check(create2 && first_ex_w && first_ex_a, "CreateFile2 and FindFirstFileExA/W are registered");
+
+        // CreateFile2 reads an untouched package file without modifying it.
+        write_path(package / "data" / "cf2_pkg.txt", "pkg-cf2");
+        CREATEFILE2_EXTENDED_PARAMETERS ext{};
+        ext.dwSize = sizeof(ext);
+        ext.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        const HANDLE h_read = create2(L"GAME:\\data\\cf2_pkg.txt", GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, &ext);
+        check(h_read != INVALID_HANDLE_VALUE && read_handle(h_read) == "pkg-cf2",
+              "CreateFile2 reads a GAME: file from the package");
+        if (h_read != INVALID_HANDLE_VALUE) ::CloseHandle(h_read);
+
+        // CreateFile2 write goes to the overlay, leaving the package untouched.
+        const HANDLE h_write = create2(L"GAME:\\data\\cf2.txt", GENERIC_WRITE, 0, CREATE_ALWAYS, &ext);
+        check(h_write != INVALID_HANDLE_VALUE, "CreateFile2 creates a new GAME: file in the overlay");
+        if (h_write != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            ::WriteFile(h_write, "cf2", 3, &written, nullptr);
+            ::CloseHandle(h_write);
+        }
+        check(read_path(overlay / "data" / "cf2.txt") == "cf2" && !std::filesystem::exists(package / "data" / "cf2.txt"),
+              "CreateFile2 writes land in the overlay and never in the package");
+
+        // CreateFile2 refuses path traversal.
+        SetLastError(0);
+        const HANDLE h_esc = create2(L"GAME:\\..\\cf2_escape.txt", GENERIC_WRITE, 0, CREATE_ALWAYS, &ext);
+        check(h_esc == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+              "CreateFile2 refuses a path above GAME:");
+        if (h_esc != INVALID_HANDLE_VALUE) ::CloseHandle(h_esc);
+
+        // FindFirstFileExW merges package + overlay and honours FindExInfoBasic & FindExSearchLimitToDirectories.
+        WIN32_FIND_DATAW fd{};
+        std::vector<std::wstring> basic_names;
+        bool alt_empty = true;
+        HANDLE hf = first_ex_w(L"GAME:\\data\\*", FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+        check(hf != INVALID_HANDLE_VALUE, "FindFirstFileExW opens a GAME: directory listing");
+        if (hf != INVALID_HANDLE_VALUE) {
+            do {
+                basic_names.emplace_back(fd.cFileName);
+                if (fd.cAlternateFileName[0] != L'\0') alt_empty = false;
+            } while (next_w(hf, &fd));
+            find_close(hf);
+        }
+        check(contains(basic_names, L"hello.txt") && contains(basic_names, L"cf2.txt") && !contains(basic_names, L"bye.txt"),
+              "FindFirstFileExW merges overlay + package and hides deleted files");
+        check(alt_empty, "FindFirstFileExW(FindExInfoBasic) leaves cAlternateFileName empty");
+
+        std::vector<std::wstring> dir_names;
+        HANDLE hdir = first_ex_w(L"GAME:\\data\\*", FindExInfoStandard, &fd, FindExSearchLimitToDirectories, nullptr, 0);
+        check(hdir != INVALID_HANDLE_VALUE, "FindFirstFileExW(FindExSearchLimitToDirectories) succeeds");
+        if (hdir != INVALID_HANDLE_VALUE) {
+            do {
+                dir_names.emplace_back(fd.cFileName);
+            } while (next_w(hdir, &fd));
+            find_close(hdir);
+        }
+        check(contains(dir_names, L"sub") && !contains(dir_names, L"hello.txt"),
+              "FindFirstFileExW(FindExSearchLimitToDirectories) returns only directories");
+
+        // FindFirstFileExA works on GAME: paths too.
+        WIN32_FIND_DATAA fda{};
+        HANDLE hfa = first_ex_a("GAME:\\data\\cf2.txt", FindExInfoBasic, &fda, FindExSearchNameMatch, nullptr, 0);
+        check(hfa != INVALID_HANDLE_VALUE && std::string(fda.cFileName) == "cf2.txt",
+              "FindFirstFileExA finds an overlay file under GAME:");
+        if (hfa != INVALID_HANDLE_VALUE) find_close(hfa);
     }
 
     std::filesystem::remove_all(root);

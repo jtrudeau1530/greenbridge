@@ -478,6 +478,20 @@ HANDLE WINAPI create_file_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_A
     return create_file_w(wide.c_str(), access, share, attributes, disposition, flags, template_file);
 }
 
+HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD disposition,
+                           LPCREATEFILE2_EXTENDED_PARAMETERS params) {
+    if (!name) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    const Target t = open_target(name, access, disposition);
+    if (t.error) {
+        SetLastError(t.error);
+        return INVALID_HANDLE_VALUE;
+    }
+    return ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+}
+
 DWORD WINAPI get_file_attributes_w(LPCWSTR name) {
     if (!name) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -546,6 +560,72 @@ HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
     e->next = 1;
     *data = e->entries[0];
     return register_enumeration(std::move(e));
+}
+
+HANDLE WINAPI find_first_file_ex_w(LPCWSTR pattern, FINDEX_INFO_LEVELS info_level, LPVOID data,
+                                   FINDEX_SEARCH_OPS search_op, LPVOID search_filter, DWORD additional_flags) {
+    if (!pattern || !data) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(pattern, parts);
+    if (parsed == Parsed::Host)
+        return ::FindFirstFileExW(pattern, info_level, data, search_op, search_filter, additional_flags);
+    if (parsed == Parsed::Refused) {
+        SetLastError(ERROR_INVALID_NAME);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (info_level != FindExInfoStandard && info_level != FindExInfoBasic) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (search_op != FindExSearchNameMatch && search_op != FindExSearchLimitToDirectories) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    std::vector<WIN32_FIND_DATAW> entries;
+    DWORD error = 0;
+    if (!collect(pattern, parts, entries, error)) {
+        SetLastError(error);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (search_op == FindExSearchLimitToDirectories) {
+        std::vector<WIN32_FIND_DATAW> dirs_only;
+        for (auto& entry : entries)
+            if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) dirs_only.push_back(entry);
+        entries = std::move(dirs_only);
+        if (entries.empty()) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    if (info_level == FindExInfoBasic) {
+        for (auto& entry : entries) entry.cAlternateFileName[0] = L'\0';
+    }
+    auto e = std::make_unique<Enumeration>();
+    e->entries = std::move(entries);
+    e->next = 1;
+    *static_cast<LPWIN32_FIND_DATAW>(data) = e->entries[0];
+    return register_enumeration(std::move(e));
+}
+
+HANDLE WINAPI find_first_file_ex_a(LPCSTR pattern, FINDEX_INFO_LEVELS info_level, LPVOID data,
+                                   FINDEX_SEARCH_OPS search_op, LPVOID search_filter, DWORD additional_flags) {
+    if (!pattern || !data) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    const std::wstring wide = widen_ansi(pattern);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(wide, parts);
+    if (parsed == Parsed::Host)
+        return ::FindFirstFileExA(pattern, info_level, data, search_op, search_filter, additional_flags);
+    WIN32_FIND_DATAW wide_data{};
+    const HANDLE h = find_first_file_ex_w(wide.c_str(), info_level, &wide_data, search_op, search_filter, additional_flags);
+    if (h != INVALID_HANDLE_VALUE) to_ansi(wide_data, static_cast<LPWIN32_FIND_DATAA>(data));
+    return h;
 }
 
 HANDLE WINAPI find_first_file_a(LPCSTR pattern, LPWIN32_FIND_DATAA data) {
@@ -949,8 +1029,11 @@ using namespace rt::fs;
 #define FILE_API(dll)                                                                                    \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
+        {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
         {dll, "FindFirstFileA", reinterpret_cast<void*>(&find_first_file_a)},                            \
         {dll, "FindFirstFileW", reinterpret_cast<void*>(&find_first_file_w)},                            \
+        {dll, "FindFirstFileExA", reinterpret_cast<void*>(&find_first_file_ex_a)},                       \
+        {dll, "FindFirstFileExW", reinterpret_cast<void*>(&find_first_file_ex_w)},                       \
         {dll, "FindNextFileA", reinterpret_cast<void*>(&find_next_file_a)},                              \
         {dll, "FindNextFileW", reinterpret_cast<void*>(&find_next_file_w)},                              \
         {dll, "FindClose", reinterpret_cast<void*>(&find_close)},                                        \
