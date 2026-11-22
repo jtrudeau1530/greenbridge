@@ -579,7 +579,7 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
     info.mipLodBias = sampler.lod_bias;
     info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
-    info.compareEnable = sampler.compare_never || sampler.compare != CompareFunction::never;
+    info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;
     info.compareOp = VkCompareOp(sampler.compare);
     info.minLod = sampler.min_lod;
     info.maxLod = sampler.max_lod;
