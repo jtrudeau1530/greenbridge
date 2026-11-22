@@ -7,6 +7,7 @@ import glob
 import math
 import os
 import re
+import struct
 
 import pytest
 
@@ -831,13 +832,62 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     text = shader.translate()
     shader.validate(text)
     assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
-    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
+    # OpSLessThan: 4 for mirror, 8 for the border-mode range tests (SHADER-348: two per texel coordinate)
+    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 12 and _count(text, "OpSGreaterThanEqual") == 4
 
 
-@pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])
-def test_gather4_l_literal_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
+@pytest.mark.parametrize("word0", [4, 0x28, 0x8000])
+def test_gather4_l_literal_half_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
     with pytest.raises(rdna2spirv.Unsupported):
         make_shader(_gather_l(word0)).translate()
+
+
+# SHADER-348: modes 6 (clamp border) and 7 (mirror once border) give a tap outside the image the border colour's
+# channel, BORDER_COLOR_TYPE = S# word 3 [31:30] (0 transparent black, 1 opaque black, 2 opaque white, 3 table).
+def _gather_l_border(word0, word3, dynamic=False, dmask=1):
+    return program(
+        "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+        "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+        f"s_mov_b32 s16, {word0}\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, {word3}\n"
+        + ("s_add_u32 s16, s16, 0\ns_add_u32 s19, s19, 0\n" if dynamic else "")
+        + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
+        f"image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:{dmask:#x} dim:SQ_RSRC_IMG_2D")
+
+
+def _float_bits(text, name):
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
+    expr = defs[name].split()
+    if expr[:2] == ["OpBitcast", "%float"]:
+        expr = defs[expr[2]].split()
+    assert expr[:2] in (["OpConstant", "%uint"], ["OpConstant", "%float"]), expr
+    return int(expr[2]) if expr[1] == "%uint" else struct.unpack("<I", struct.pack("<f", float(expr[2])))[0]
+
+
+@pytest.mark.parametrize("word0, taps", [(0x6, 4), (0x30, 4), (0x36, 4), (0x7, 4), (0x38, 4)])
+# Word 3 keeps BORDER_COLOR_PTR = 0x100 so llvm-mc prints it as an integer: 0x40000000 alone is the inline float 2.0,
+# which the translator reads at run time (covered by the run-time test below).
+@pytest.mark.parametrize("word3, dmask, one", [(0x100, 1, False), (1 << 30 | 0x100, 1, False), (1 << 30 | 0x100, 8, True),
+                                               (2 << 30 | 0x100, 1, True)])
+def test_gather4_l_literal_border_mode_selects_the_border_colour(word0, taps, word3, dmask, one, make_shader):
+    shader = make_shader(_gather_l_border(word0, word3, dmask=dmask))
+    text = shader.translate()
+    shader.validate(text)
+    selects = re.findall(r"= OpSelect %float %\w+ (%\w+) %\w+$", text, re.M)
+    assert len(selects) == taps                     # each of the four taps can leave the image
+    assert {_float_bits(text, s) for s in selects} == {0x3F800000 if one else 0}
+
+
+def test_gather4_l_literal_border_colour_from_the_table_is_unsupported(make_shader):
+    with pytest.raises(rdna2spirv.Unsupported):
+        make_shader(_gather_l_border(0x36, 3 << 30 | 0x100)).translate()
+
+
+def test_gather4_l_run_time_sampler_reads_the_border_type_from_word3(make_shader):
+    shader = make_shader(_gather_l_border(0x36, 2 << 30, dynamic=True))
+    text = shader.translate()
+    shader.validate(text)
+    assert re.search(r"= OpShiftRightLogical %uint %\w+ (%\w+)$", text, re.M)
+    assert len(re.findall(r"= OpSelect %float %\w+ %\w+ %\w+$", text, re.M)) >= 4
 
 
 # SHADER-152: the explicit-LOD gather's mip is floor(LOD + 0.5), ties up, like the native gather on Radeon

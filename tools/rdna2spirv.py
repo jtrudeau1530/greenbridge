@@ -7687,8 +7687,9 @@ class Gen:
         """(x, y) address modes of an S# for the gather emulation, each either a Python int (the S# word 0 is a
         literal an s_mov_b32 wrote earlier in this basic block) or the id of a uint computed from the S# at run time.
 
-        A literal S# whose mode needs a border colour (4..7), or that sets FORCE_UNNORMALIZED, is Unsupported: the
-        four fetches can't reproduce it. A run-time S# can't be judged at translation time, so modes 4..7 are
+        Modes 6 (clamp border) and 7 (mirror once border) map a tap outside the image to the border colour (see
+        gather_border); a literal S# with a half-border mode (4, 5), or that sets FORCE_UNNORMALIZED, is Unsupported:
+        the four fetches can't reproduce it. A run-time S# can't be judged at translation time, so modes 4 and 5 are
         treated as clamp-to-edge there, and FORCE_UNNORMALIZED (bit 15) is not applied (the two remaining
         approximations)."""
         if s_op["k"] != "sgpr" or s_op.get("n", 1) < 4:
@@ -7698,8 +7699,9 @@ class Gen:
             if lit & 0x8000:
                 raise Unsupported("image_gather4_l with FORCE_UNNORMALIZED")
             m = (lit & 7, lit >> 3 & 7)
-            if max(m) > 3:
-                raise Unsupported(f"image_gather4_l address mode {max(m)} (border)")
+            for mode in m:
+                if mode in (4, 5):
+                    raise Unsupported(f"image_gather4_l address mode {mode} (half border)")
             return m
         w0 = self.load_reg("sgpr", s_op["r"])
         out = []
@@ -7708,6 +7710,28 @@ class Gen:
             self.emit(f"{m} = OpBitFieldUExtract %uint {w0} {self.cu(3 * k)} {self.cu(3)}")
             out.append(m)
         return tuple(out)
+
+    def gather_border_one(self, s_op, ch: int):
+        """Whether channel ch of the S#'s border colour is 1 (else 0), for a tap that a border mode (6, 7) puts
+        outside the image: a Python bool for a literal S# word 3, else a bool id. BORDER_COLOR_TYPE is word 3 [31:30]
+        (Mesa gfx10-rsrc.json SQ_IMG_SAMP_WORD3; SQ_TEX_BORDER_COLOR_* in gfx6.json): 0 transparent black (0,0,0,0),
+        1 opaque black (0,0,0,1), 2 opaque white (1,1,1,1), 3 a colour from the border-colour table (BORDER_COLOR_PTR),
+        which the translator can't read: Unsupported on a literal S#, transparent black at run time."""
+        lit = self.sgpr_imm.get(s_op["r"] + 3)
+        if lit is not None:
+            kind = lit >> 30 & 3
+            if kind == 3:
+                raise Unsupported("image_gather4_l border colour from the table (BORDER_COLOR_TYPE 3)")
+            return kind == 2 or (kind == 1 and ch == 3)
+        kind, white = self.tmp(), self.tmp()
+        self.emit(f"{kind} = OpShiftRightLogical %uint {self.load_reg('sgpr', s_op['r'] + 3)} {self.cu(30)}")
+        self.emit(f"{white} = OpIEqual %bool {kind} {self.cu(2)}")
+        if ch != 3:
+            return white
+        black, one = self.tmp(), self.tmp()
+        self.emit(f"{black} = OpIEqual %bool {kind} {self.cu(1)}")
+        self.emit(f"{one} = OpLogicalOr %bool {white} {black}")
+        return one
 
     def clamp_gather_lod(self, lod: str, word_reg: int) -> str:
         """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip.
@@ -7739,14 +7763,19 @@ class Gen:
     def gather_addr(self, c, n, mode):
         """Texel coordinate c (int id) after the address mode (int, or a uint id) for an axis of n texels (int id):
         wrap: c mod n; mirror: c mod 2n, reflected in the upper half; mirror once: the negative side reflected
-        (-1 - c), then clamped; otherwise (clamp, and border modes at run time) clamped to [0, n-1]. As in the
+        (-1 - c), then clamped; otherwise (clamp, and half-border modes at run time) clamped to [0, n-1]. As in the
         Vulkan address-mode definitions (and RADV's radv_tex_wrap mapping of them onto SQ_TEX_*). A literal mode
-        emits only the code it needs; a run-time one emits all four and selects."""
+        emits only the code it needs; a run-time one emits all four and selects.
+        Returns (coordinate, outside): outside is a bool id that is true when a border mode (6 clamp border, 7 mirror
+        once border) puts the tap outside [0, n-1] before the clamp, so it takes the border colour, or None when the
+        literal mode has no border."""
         zero, one = self.as_int(self.cu(0)), self.as_int(self.cu(1))
         static = isinstance(mode, int)
-        want = {mode if mode <= 3 else 2} if static else {0, 1, 2, 3}
+        base = {6: 2, 7: 3}.get(mode, mode if mode <= 3 else 2) if static else None
+        want = {base} if static else {0, 1, 2, 3}
         nm1 = self.tmp()
         self.emit(f"{nm1} = OpISub %int {n} {one}")
+        pre = {}                                        # the coordinate a border test sees: before the clamp
         res = {}
         if 2 in want:
             res[2] = self.tmp()
@@ -7769,15 +7798,35 @@ class Gen:
             self.emit(f"{ge} = OpSGreaterThanEqual %bool {c} {zero}")
             self.emit(f"{mo} = OpSelect %int {ge} {c} {refl}")
             self.emit(f"{res[3]} = OpExtInst %int %glsl SClamp {mo} {zero} {nm1}")
+            pre[3] = mo
+        pre[2] = c
+
+        def outside(v):
+            lo, hi, out = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{lo} = OpSLessThan %bool {v} {zero}")
+            self.emit(f"{hi} = OpSGreaterThan %bool {v} {nm1}")
+            self.emit(f"{out} = OpLogicalOr %bool {lo} {hi}")
+            return out
+
         if static:
-            return res[mode if mode <= 3 else 2]
+            return res[base], (outside(pre[base]) if mode in (6, 7) else None)
         r = res[2]
         for val in (3, 1, 0):
             eq, nr = self.tmp(), self.tmp()
             self.emit(f"{eq} = OpIEqual %bool {mode} {self.cu(val)}")
             self.emit(f"{nr} = OpSelect %int {eq} {res[val]} {r}")
             r = nr
-        return r
+        # Mode 7 is mirror once in range; modes 6 and 7 send a tap outside the image to the border colour.
+        eq7, r7 = self.tmp(), self.tmp()
+        self.emit(f"{eq7} = OpIEqual %bool {mode} {self.cu(7)}")
+        self.emit(f"{r7} = OpSelect %int {eq7} {res[3]} {r}")
+        is6, b6, b7, out = (self.tmp() for _ in range(4))
+        o6, o7 = outside(pre[2]), outside(pre[3])
+        self.emit(f"{is6} = OpIEqual %bool {mode} {self.cu(6)}")
+        self.emit(f"{b6} = OpLogicalAnd %bool {is6} {o6}")
+        self.emit(f"{b7} = OpLogicalAnd %bool {eq7} {o7}")
+        self.emit(f"{out} = OpLogicalOr %bool {b6} {b7}")
+        return r7, out
 
     def desc_lookup_sgpr(self, a, n):
         """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
@@ -8020,19 +8069,39 @@ class Gen:
                 self.emit(f"{szy} = OpCompositeExtract %int {sz} 1")
                 ax = [self.gather_addr(c, szx, modes[0]) for c in (x0, x1)]
                 ay = [self.gather_addr(c, szy, modes[1]) for c in (y0, y1)]
-                texels = []
-                for xx, yy in ((ax[0], ay[1]), (ax[1], ay[1]), (ax[1], ay[0]), (ax[0], ay[0])):
+                texels, outs = [], []
+                for (xx, ox), (yy, oy) in ((ax[0], ay[1]), (ax[1], ay[1]), (ax[1], ay[0]), (ax[0], ay[0])):
                     cc = self.tmp()
                     self.emit(f"{cc} = OpCompositeConstruct %v2int {xx} {yy}")
                     texels.append(cc)
+                    if ox is not None and oy is not None:
+                        both = self.tmp()
+                        self.emit(f"{both} = OpLogicalOr %bool {ox} {oy}")
+                        outs.append(both)
+                    else:
+                        outs.append(ox if ox is not None else oy)
+                # SHADER-348: border modes give a tap outside the image the S# border colour's channel.
+                border_one = self.gather_border_one(a[3], ch) if any(o is not None for o in outs) else None
 
                 def gather_mip(image: str, cls: int, ty: str) -> str:
                     scalar = ("%float", "%uint", "%int")[cls]
+                    if border_one is not None:
+                        zero_v, one_v = (self.fconst(0.0), self.fconst(1.0)) if cls == 0 else \
+                            (self.cu(0), self.cu(1)) if cls == 1 else (self.as_int(self.cu(0)), self.as_int(self.cu(1)))
+                        if isinstance(border_one, bool):
+                            border_v = one_v if border_one else zero_v
+                        else:
+                            border_v = self.tmp()
+                            self.emit(f"{border_v} = OpSelect {scalar} {border_one} {one_v} {zero_v}")
                     taps = []
-                    for cc in texels:
+                    for cc, out in zip(texels, outs):
                         tx, comp = self.tmp(), self.tmp()
                         self.emit(f"{tx} = OpImageFetch {ty} {image} {cc} Lod {mc}")
                         self.emit(f"{comp} = OpCompositeExtract {scalar} {tx} {ch}")
+                        if out is not None:
+                            sel = self.tmp()
+                            self.emit(f"{sel} = OpSelect {scalar} {out} {border_v} {comp}")
+                            comp = sel
                         taps.append(comp)
                     result = self.tmp()
                     self.emit(f"{result} = OpCompositeConstruct {ty} {' '.join(taps)}")
