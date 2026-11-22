@@ -75,6 +75,10 @@ struct VulkanDeviceInfo {
     // Distinct handles from queue_family, when the creator requested more than one queue.
     // Empty for caller-owned devices that only supplied queue above.
     std::vector<VkQueue> command_queues;
+    std::uint32_t compute_family = UINT32_MAX;
+    std::uint32_t copy_family = UINT32_MAX;
+    std::vector<VkQueue> compute_queues;
+    std::vector<VkQueue> copy_queues;
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
