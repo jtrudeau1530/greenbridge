@@ -14,6 +14,7 @@ runtime/build/generated). For those, the drive of --windows-root is pointed at -
 
 Every test is run and reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
+--timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
 """
 import argparse
 import json
@@ -136,13 +137,23 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
     if not cwd or not os.path.isdir(cwd):
         cwd = os.path.dirname(exe)
+    timeout = args.timeout
+    if "TIMEOUT" in props:
+        try:
+            ctest_timeout = float(props["TIMEOUT"])
+        except (TypeError, ValueError):
+            return "fail", "invalid CTest TIMEOUT"
+        if not math.isfinite(ctest_timeout) or ctest_timeout < 0:
+            return "fail", "invalid CTest TIMEOUT"
+        if ctest_timeout > 0:
+            timeout = min(timeout, ctest_timeout)
     start = time.monotonic()
     try:
         proc = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=args.timeout)
+                              timeout=timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
-        return "fail", f"timed out after {args.timeout} s\n{out}"
+        return "fail", f"timed out after {timeout} s\n{out}"
     except OSError as e:                  # a mistyped --wine, or a missing one: report the test, do not abort the run
         return "fail", f"could not start {argv[0]}: {e.strerror or e}"
     elapsed = time.monotonic() - start
@@ -216,7 +227,8 @@ def main() -> int:
     ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
                     help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
-    ap.add_argument("--timeout", type=positive_seconds, default=120.0, help="seconds per test (default 120)")
+    ap.add_argument("--timeout", type=positive_seconds, default=120.0,
+                    help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()

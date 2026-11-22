@@ -185,6 +185,24 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "fail")
         self.assertIn("timed out after 0.2 s", detail)
 
+    def test_a_short_ctest_timeout_still_fails_a_will_fail_test(self):
+        slow = self.program("slow_failure.py", "import sys, time\ntime.sleep(1)\nsys.exit(1)\n")
+        entry = ctest_entry("slow_failure", self.command_for(slow), {"TIMEOUT": 0.2, "WILL_FAIL": True})
+        status, detail = self.run_entry(entry)
+        self.assertEqual(status, "fail", detail)
+        self.assertIn("timed out after 0.2 s", detail)
+
+    def test_ctest_timeout_cannot_remove_or_extend_the_runner_limit(self):
+        exe = self.exiting(0)
+        for timeout in (0, "20"):
+            with self.subTest(timeout=timeout):
+                entry = ctest_entry("bounded", self.command_for(exe), {"TIMEOUT": timeout})
+                result = rwt.subprocess.CompletedProcess([], 0, stdout=b"")
+                with mock.patch.object(rwt.subprocess, "run", return_value=result) as run:
+                    status, detail = self.run_entry(entry)
+                self.assertEqual(status, "pass", detail)
+                self.assertEqual(run.call_args.kwargs["timeout"], self.args.timeout)
+
     def test_an_unstartable_wine_fails_the_test_instead_of_aborting_the_run(self):
         status, detail = rwt.run_test(ctest_entry("ok", self.command_for(self.exiting(0))), self.args,
                                       ["definitely-not-a-real-wine-xyz"])
