@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test
+from check import Skip, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
@@ -838,6 +838,10 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_fmt_xy_xyz":
             # TEST-185: xy/xyz format loads and stores, words measured natively on a Radeon 680M (the .asm header)
             problem = fmt_xy_xyz_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "128/128 dumped words exact"))
+        elif name == "cs_tbuffer_store":
+            # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
+            problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name == "cs_global_neg_offset":
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
