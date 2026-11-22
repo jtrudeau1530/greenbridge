@@ -368,6 +368,20 @@ class CrossBuildTest(unittest.TestCase):
 
 
 class RuntimeBuildPackagingTest(unittest.TestCase):
+    def test_windows_native_build_receives_the_requested_jobs(self):
+        with tempfile.TemporaryDirectory() as root:
+            build = os.path.join(root, "runtime", "build")
+            os.makedirs(build)
+            for name in make_game.RUNTIME_FILES:
+                open(os.path.join(build, name), "wb").close()
+            with mock.patch.object(make_game.os, "name", "nt"), \
+                    mock.patch.object(make_game, "ROOT", root), \
+                    mock.patch.object(make_game, "run") as run, mock.patch.object(make_game, "log"):
+                make_game.runtime(root, os.path.join(root, "out"), {"expected_exe": "game.exe"}, jobs=1)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("-File") + 1:],
+                             [os.path.join(root, "scripts", "build_runtime.ps1"), "-Jobs", "1"])
+
     def test_off_windows_copies_the_build_and_writes_a_wine_launcher(self):
         with tempfile.TemporaryDirectory() as root:
             build, game, out = (os.path.join(root, n) for n in ("build", "game", "out"))
