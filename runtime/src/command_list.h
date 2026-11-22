@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
@@ -269,13 +270,20 @@ struct CopyResource {
     ResourceId src;
 };
 
-// ResolveSubresource: a multisampled subresource into a single-sampled one of the same size. The call's format is
-// not kept: the resolve uses the textures' own format, which D3D12 requires to be compatible.
+struct ResolveRegion {
+    std::uint32_t dst_x;
+    std::uint32_t dst_y;
+    std::optional<Rect> src_rect;
+};
+
+// Without a region, both subresources have the same extent. A region with no source rectangle takes the
+// entire source to the given destination offset. The resolve uses the images' own format.
 struct ResolveSubresource {
     ResourceId dst;
     std::uint32_t dst_subresource;
     ResourceId src;
     std::uint32_t src_subresource;
+    std::optional<ResolveRegion> region = std::nullopt;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -363,6 +371,12 @@ public:
     // A resource has one sample count, so it cannot be resolved into itself.
     bool resolve_subresource(const ResolveSubresource& resolve) {
         if (!resolve.dst || !resolve.src || resolve.dst == resolve.src) return false;
+        if (const auto& region = resolve.region) {
+            if (region->dst_x > INT32_MAX || region->dst_y > INT32_MAX) return false;
+            if (const auto& r = region->src_rect;
+                r && (r->left < 0 || r->top < 0 || r->right <= r->left || r->bottom <= r->top))
+                return false;
+        }
         return append(resolve);
     }
 
@@ -380,6 +394,14 @@ public:
         if (!flags || (flags & ~(clear_depth | clear_stencil))) return false;
         if ((flags & clear_depth) && !(depth >= 0.0f && depth <= 1.0f)) return false;
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
+    }
+
+    // ExecuteBundle copies the closed bundle's commands at the call site. The COM layer validates D3D12 list
+    // types and bundle-only restrictions before calling this method.
+    bool execute_bundle(const CommandList& bundle) {
+        if (this == &bundle || closed_ || !bundle.closed_) return false;
+        commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
+        return true;
     }
 
     bool close() {

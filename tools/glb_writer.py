@@ -166,6 +166,7 @@ def parse_obj(
         text = text_or_path
 
     z_up = up == "z"
+    mirrored = sc < 0
     raw_v: list[tuple[float, float, float] | None] = []
     raw_vt: list[tuple[float, float]] = []
     raw_vn: list[tuple[float, float, float]] = []
@@ -252,6 +253,8 @@ def parse_obj(
                 continue
             if z_up:
                 nx, ny, nz = nx, nz, -ny
+            if mirrored:
+                nx, ny, nz = -nx, -ny, -nz
             raw_vn_append(_normalize3(nx, ny, nz))
 
         elif cmd == "g":
@@ -325,7 +328,7 @@ def parse_obj(
                 c2 = corners[i + 1]
                 if c0[0] == c1[0] or c1[0] == c2[0] or c0[0] == c2[0]:
                     continue
-                tris.append((c0, c1, c2))
+                tris.append((c0, c2, c1) if mirrored else (c0, c1, c2))
 
             if not tris:
                 continue

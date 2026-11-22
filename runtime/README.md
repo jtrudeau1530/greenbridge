@@ -14,7 +14,8 @@ powershell -File scripts/build_runtime.ps1
 ```
 
 It uses CMake + Ninja from Visual Studio when available, otherwise `cl.exe`, and writes
-`runtime\build\gta6rt.exe`. The direct CMake path works too:
+`runtime\build\gta6rt.exe` plus `gta6rt_tls_host.dll` (the loader's TLS-index helper; it must stay next to
+the executable). The direct CMake path works too:
 
 ```powershell
 cmake -S runtime -B runtime/build
@@ -32,9 +33,15 @@ gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>]
 ```
 
 The dry run maps the image and the bundled modules it imports, applies base relocations, binds every
-import through the shim registry, a host DLL, or another bundled module, parses exports, applies
-section protections, and prints a per-module report. It does **not** call `DllMain`, TLS callbacks,
-or the entry point, so no image code runs.
+import through the shim registry, a host DLL, or another bundled module, parses exports, installs static
+TLS for the calling thread, applies section protections, and
+prints a per-module report. It does **not** call `DllMain`, TLS callbacks, or the entry point, so no
+code from the mapped images runs. TLS reserves its module index through the runtime's own
+`gta6rt_tls_host.dll`, and host imports load system DLLs, as they did before.
+
+`gta6rt --init <image>` runs the same mapping and then `Loader::initialise()`: each module's TLS
+callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
+run.
 
 The report line is:
 
@@ -56,9 +63,24 @@ through a mapped image are dispatched and stack walks can step over its frames. 
 first (entries in bounds, sorted and non-overlapping) and removed when the loader is destroyed. Modules
 are deduped by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
 
+`load()` also installs static TLS for the calling thread. `__declspec(thread)` reads `TEB->ThreadLocalStoragePointer[_tls_index]`, which is a
+different index space from the `TlsAlloc` slots, and only the OS loader can allocate a module index.
+The runtime therefore ships a minimal `gta6rt_tls_host.dll`; the loader reuses the index the OS assigns
+it, writes that index into the image's `AddressOfIndex`, and copies the image's TLS template into the
+slot. This reserves one index, so **one manually mapped TLS module can be live at a time**; a second
+one is rejected with an error instead of sharing the slot. Images without a TLS directory (or with an
+all-zero one) load normally.
+
 Current limits, by design:
 
-- `DllMain`, TLS callbacks and the entry point are left to the caller; `--dry-run` never runs them.
+- `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own
+  `gta6rt_tls_host.dll`; host imports still load system DLLs as before.
+- `--dry-run` never runs image code. `initialise()` runs TLS callbacks and a DLL's `DllMain`;
+  `run_tls_callbacks()` is the opt-in seam for `DLL_THREAD_ATTACH`/`DETACH` and for callers that do not
+  use `initialise()`. An EXE's entry point is the caller's to run.
+- The loader does not deliver thread attach/detach events. Call `install_tls_for_thread()` before mapped
+  code runs on a thread the runtime created and `uninstall_tls_for_thread()` before it exits; destroy the
+  `Loader` on the thread that called `load()`.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -111,6 +133,8 @@ the files in place and never copy or commit game data.
 
 ## Current limits
 
+`gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its
+own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
@@ -120,3 +144,17 @@ in [docs/design.md](../docs/design.md), and the differential-validation design i
 work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
+
+### Typed UINT clear regression
+
+`clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
+`d3d12_uint_clear_test` compares 21 full/rectangle readbacks with Windows WARP across the three
+currently supported typed UINT render-target formats. Fixtures are synthetic; no shaders or game data are needed.
+The GPU test runs explicitly, while the CPU test is registered in CTest.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^clear_color$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_uint_clear_test.exe
+```

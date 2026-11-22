@@ -1,17 +1,21 @@
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
-// committed buffers and textures (2D, multisampled 2D, 3D), a few feature queries. Everything else is a generated stub that reports
-// itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what is still open.
+// committed buffers and textures (2D, multisampled 2D, 3D), allocation info, a few feature queries. Everything
+// else is a generated stub that reports itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer
+// means and what is still open.
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
 #include "d3d12_xs_device.h"
+#include "../src/gfx10_descriptors.h"
+#include "../src/vulkan_bindless.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -105,6 +109,33 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     }
 }
 
+// The full mip chain's length for a texture this size.
+UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
+    UINT16 mips = 0;
+    for (UINT64 size = std::max<UINT64>({width, height, depth}); size; size >>= 1) ++mips;
+    return mips;
+}
+
+// The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
+// texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
+VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format) {
+    const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    info.format = format.format;
+    info.extent = {std::uint32_t(desc.Width), desc.Height, volume ? UINT(desc.DepthOrArraySize) : 1u};
+    info.mipLevels = desc.MipLevels;
+    info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
+    info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
+    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    return info;
+}
+
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
     VulkanDeviceInfo info;
@@ -112,6 +143,7 @@ struct DeviceState {
     VkPhysicalDeviceMemoryProperties memory{};
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
+    PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
 
     bool depth_usable(VkFormat format) const {
         VkFormatProperties properties{};
@@ -125,6 +157,225 @@ struct DeviceState {
         return image_format_properties(info.physical, image.format, image.imageType, image.tiling, image.usage,
                                        image.flags, &properties) == VK_SUCCESS &&
                (properties.sampleCounts & image.samples);
+    }
+
+    // The format a texture description is created with, D24S8's fallback included.
+    Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
+        Format format = vulkan_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
+            log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
+            format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        }
+        return format;
+    }
+
+    // The memory an image made from `create` needs, or false if the device can't make that image.
+    bool memory_requirements(const VkImageCreateInfo& create, VkMemoryRequirements& out) const {
+        VkImageFormatProperties limits{};
+        if (!image_format_properties ||
+            image_format_properties(info.physical, create.format, create.imageType, VK_IMAGE_TILING_OPTIMAL,
+                                    create.usage, create.flags, &limits) != VK_SUCCESS ||
+            create.extent.width > limits.maxExtent.width || create.extent.height > limits.maxExtent.height ||
+            create.extent.depth > limits.maxExtent.depth || create.mipLevels > limits.maxMipLevels ||
+            create.arrayLayers > limits.maxArrayLayers || !(limits.sampleCounts & create.samples))
+            return false;
+        if (image_requirements) {
+            VkDeviceImageMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
+            query.pCreateInfo = &create;
+            VkMemoryRequirements2 result{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+            image_requirements(info.device, &query, &result);
+            out = result.memoryRequirements;
+            return true;
+        }
+        auto& vk = context->vk;  // without the query, a throwaway image
+        VkImage image = VK_NULL_HANDLE;
+        if (vk.vkCreateImage(info.device, &create, nullptr, &image) != VK_SUCCESS) return false;
+        vk.vkGetImageMemoryRequirements(info.device, image, &out);
+        vk.vkDestroyImage(info.device, image, nullptr);
+        return true;
+    }
+
+    // Set 0 of the translated shaders (vulkan_bindless.h, docs section 3.4) and what has been put in it. A shader
+    // finds a T# or S# by its bytes (the descriptor hash table), so one entry serves every heap slot that holds
+    // those bytes: a copied descriptor needs nothing more. An image's entries live until its texture is
+    // destroyed, samplers until the device is.
+    struct ImageEntry {
+        leonida::ImageDimension dimension;
+        std::uint32_t index;
+        VkImageView sampled;
+        VkImageView storage;  // the same range without a component mapping, for the storage bindings; or null
+        std::uint64_t address;
+    };
+    std::unique_ptr<leonida::BindlessSet> bindless;
+    std::mutex descriptor_mutex;  // the set and the containers below
+    std::map<leonida::DescriptorKey, ImageEntry> image_entries;
+    std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
+    std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
+    std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
+    // A T# names a texture by an address of its own: above 4 GiB, which the GPU address arena for buffers (docs
+    // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
+    // dereferences it.
+    std::atomic<std::uint64_t> next_image_address{std::uint64_t(1) << 32};
+
+    // 0 float, 1 unsigned integer, 2 signed integer: which of the three storage-image arrays a view belongs in.
+    static int numeric_class(VkFormat format) {
+        switch (format) {
+        case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8G8_UINT:
+        case VK_FORMAT_R8G8B8A8_UINT:
+        case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16G16_UINT:
+        case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R32_UINT:
+        case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32B32A32_UINT:
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 1;
+        case VK_FORMAT_R8_SINT:
+        case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16G16_SINT:
+        case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R32_SINT:
+        case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32B32A32_SINT: return 2;
+        default: return 0;
+        }
+    }
+
+    void release(const ImageEntry& entry) {  // descriptor_mutex held
+        bindless->remove_image(entry.dimension, entry.index);
+        context->vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+        if (entry.storage) context->vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+    }
+
+    // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
+    // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
+    // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
+    bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
+                    VkFormat image_format, VkImageAspectFlags aspects, bool storage) {
+        namespace g = leonida::gfx10;
+        std::lock_guard lock(descriptor_mutex);
+        if (!bindless) return false;
+        const auto existing = image_entries.find(words);
+        if (existing != image_entries.end() && (existing->second.storage || !storage)) return true;
+
+        leonida::ImageDimension dimension;
+        switch (image.type) {
+        case g::ImageType::image_2d: dimension = leonida::ImageDimension::dim_2d; break;
+        case g::ImageType::image_2d_array:
+        case g::ImageType::cube: dimension = leonida::ImageDimension::dim_2d_array; break;
+        case g::ImageType::image_3d: dimension = leonida::ImageDimension::dim_3d; break;
+        case g::ImageType::image_1d: dimension = leonida::ImageDimension::dim_1d; break;
+        default:
+            log_once("set 0 has no array for this image type (1D array or multisampled):", int(image.type));
+            return false;
+        }
+        const VkFormat view_format = g::vulkan_view_format(image_format, image.format);
+        if (view_format == VK_FORMAT_UNDEFINED) {
+            log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
+            return false;
+        }
+        auto& vk = context->vk;
+        VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_info.image = vk_image;
+        view_info.viewType = g::vulkan_view_type(image.type);
+        view_info.format = view_format;
+        view_info.components = g::vulkan_swizzle(image.swizzle, view_format);
+        // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
+        view_info.subresourceRange = {
+            VkImageAspectFlags((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                     : VK_IMAGE_ASPECT_COLOR_BIT),
+            image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+        ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
+        if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
+        leonida::StorageViews views{};
+        if (storage) {
+            view_info.components = {};
+            if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.storage) != VK_SUCCESS) {
+                vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+                return false;
+            }
+            const int numeric = numeric_class(view_format);
+            (numeric == 1 ? views.as_uint : numeric == 2 ? views.as_sint : views.as_float) = entry.storage;
+            if (view_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
+        }
+        // Every state a shader can read or write the texture in is GENERAL (ResourceBinding::sampled_in_general).
+        entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views);
+        if (!entry.index) {
+            log_once("a bindless image array is full; dimension", int(dimension));
+            vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+            if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+            return false;
+        }
+        if (existing != image_entries.end()) {
+            replaced_images.push_back(existing->second);  // the read-only entry of the same bytes
+            existing->second = entry;
+        } else {
+            image_entries.emplace(words, entry);
+            image_keys.emplace(image.address, words);
+        }
+        bindless->insert_key(words, entry.index);
+        return true;
+    }
+
+    // The texture at `address` is gone: its views leave set 0 and its T#s the hash table.
+    void forget_image(std::uint64_t address) {
+        std::lock_guard lock(descriptor_mutex);
+        if (!bindless) return;
+        const auto [first, last] = image_keys.equal_range(address);
+        for (auto it = first; it != last; ++it) {
+            const auto entry = image_entries.find(it->second);
+            bindless->erase_key(it->second);
+            release(entry->second);
+            image_entries.erase(entry);
+        }
+        image_keys.erase(first, last);
+        std::erase_if(replaced_images, [&](const ImageEntry& entry) {
+            if (entry.address != address) return false;
+            release(entry);
+            return true;
+        });
+    }
+
+    // Gives the S# `words` a sampler in set 0 and an entry in the hash table, unless it has them.
+    bool bind_sampler(const leonida::gfx10::SamplerWords& words) {
+        namespace g = leonida::gfx10;
+        std::lock_guard lock(descriptor_mutex);
+        if (!bindless) return false;
+        const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
+        if (sampler_entries.count(key)) return true;
+        const g::Sampler sampler = g::decode(words);
+        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler);
+        // What vulkan_sampler leaves to its caller, and features this device may not have enabled.
+        if (sampler_info.anisotropyEnable && !info.sampler_anisotropy) {
+            log_once("anisotropic sampler without samplerAnisotropy; anisotropy", int(sampler.max_anisotropy));
+            sampler_info.anisotropyEnable = VK_FALSE;
+        }
+        for (VkSamplerAddressMode* mode :
+             {&sampler_info.addressModeU, &sampler_info.addressModeV, &sampler_info.addressModeW}) {
+            if (*mode != VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE || info.sampler_mirror_clamp_to_edge) continue;
+            log_once("mirror-once sampler without samplerMirrorClampToEdge; clamped instead, mode", int(*mode));
+            *mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        }
+        if (sampler.filter_mode != g::FilterMode::blend)
+            log_once("minimum/maximum filter samplers blend for now; filter mode", int(sampler.filter_mode));
+        if (sampler.border_color == g::BorderColor::table)
+            log_once("custom sampler border colours are transparent black for now; index",
+                     int(sampler.border_color_index));
+        VkSampler vk_sampler = VK_NULL_HANDLE;
+        if (!context->vk.vkCreateSampler ||
+            context->vk.vkCreateSampler(info.device, &sampler_info, nullptr, &vk_sampler) != VK_SUCCESS)
+            return false;
+        const std::uint32_t index = bindless->add_sampler(vk_sampler);
+        if (!index) {
+            log_once("the bindless sampler array is full; samplers", int(sampler_entries.size()));
+            context->vk.vkDestroySampler(info.device, vk_sampler, nullptr);
+            return false;
+        }
+        sampler_entries.emplace(key, vk_sampler);
+        bindless->insert_key(key, index);
+        return true;
     }
 
     // The first memory type with `required`, preferring one that also has `preferred`.
@@ -183,6 +434,7 @@ public:
     ~Resource() override {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
+        if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
         if (image_) vk.vkDestroyImage(dev, image_, nullptr);
         if (buffer_) vk.vkDestroyBuffer(dev, buffer_, nullptr);
@@ -191,6 +443,10 @@ public:
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
+    const D3D12_RESOURCE_DESC& desc() const { return desc_; }
+    VkFormat format() const { return format_; }                  // of the image
+    VkImageAspectFlags aspects() const { return aspects_; }
+    std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
 
     HRESULT create_buffer() {
         auto& vk = device_.context->vk;
@@ -228,30 +484,9 @@ public:
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
-        if (desc_.MipLevels == 0) {
-            UINT64 size = std::max<UINT64>({desc_.Width, desc_.Height, depth});
-            UINT16 mips = 1;
-            while (size > 1) {
-                size >>= 1;
-                ++mips;
-            }
-            desc_.MipLevels = mips;
-        }
-        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-        info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-        info.format = format.format;
-        info.extent = {std::uint32_t(desc_.Width), desc_.Height, depth};
-        info.mipLevels = desc_.MipLevels;
-        info.arrayLayers = volume ? 1 : desc_.DepthOrArraySize;
-        const std::uint32_t samples = std::max<UINT>(1, desc_.SampleDesc.Count);
-        info.samples = VkSampleCountFlagBits(samples);
-        info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-            info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        if (!(desc_.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
+        const VkImageCreateInfo info = texture_create_info(desc_, format);
+        const std::uint32_t samples = info.samples;
         if (samples > 1 && !device_.samples_usable(info)) {
             log_once("sample count not supported by the GPU for this format:", int(samples));
             return E_INVALIDARG;
@@ -276,6 +511,11 @@ public:
         binding.samples = samples;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
+        // With the bindless set, a view's descriptor has one layout for as long as it lives (bind_image).
+        binding.sampled_in_general = device_.bindless != nullptr;
+        format_ = format.format;
+        aspects_ = format.aspects;
+        image_address_ = device_.next_image_address.fetch_add(256);
         // Never used yet: the first command that touches a part zero-fills it and moves it to the layout of the
         // state that command expects (vulkan_replay.h, initialize), so no submission is needed here.
         device_.context->add_resource(id(), binding, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -313,7 +553,126 @@ private:
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
+    VkFormat format_ = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags aspects_ = 0;
+    std::uint64_t image_address_ = 0;
 };
+
+// A view of a texture as Create*View describes it, before the resource's own shape is applied.
+struct TextureView {
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;  // UNKNOWN: the resource's
+    leonida::gfx10::ImageType type = leonida::gfx10::ImageType::image_2d;
+    UINT first_mip = 0;
+    UINT mip_count = ~0u;  // ~0: to the last
+    UINT first_layer = 0;
+    UINT layer_count = ~0u;
+    UINT mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    UINT plane = 0;
+    float min_lod = 0.0f;
+};
+
+// The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
+// False (with a log) for a view set 0 cannot show yet.
+bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
+    namespace g = leonida::gfx10;
+    const D3D12_RESOURCE_DESC& desc = resource.desc();
+    if (view.plane != 0) {
+        log_once("views of the stencil plane are not supported; plane", int(view.plane));
+        return false;
+    }
+    // Every view here is a 2D one (plain, array or cube), which a volume or a multisampled image cannot back.
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count > 1) {
+        log_once("shader views of 3D and multisampled textures are not supported; dimension", int(desc.Dimension));
+        return false;
+    }
+    VkFormat named = resource.format();
+    if (view.format != DXGI_FORMAT_UNKNOWN) named = vulkan_format(view.format, false).format;
+    const std::uint32_t code = g::format_from_vulkan(named);
+    const VkFormat view_format = code ? g::vulkan_view_format(resource.format(), code) : VK_FORMAT_UNDEFINED;
+    if (view_format == VK_FORMAT_UNDEFINED) {
+        log_once("view format not supported for this texture:", int(view.format));
+        return false;
+    }
+    if (view.first_mip >= desc.MipLevels || view.first_layer >= desc.DepthOrArraySize) {
+        log_once("view starts past the texture's mips or layers; first mip", int(view.first_mip));
+        return false;
+    }
+    out = {};
+    out.address = resource.image_address();
+    out.format = code;
+    out.type = view.type;
+    out.width = std::uint32_t(desc.Width);
+    out.height = desc.Height;
+    out.first_mip = view.first_mip;
+    out.mip_count = std::min<UINT>(view.mip_count, desc.MipLevels - view.first_mip);
+    out.first_layer = view.first_layer;
+    out.layer_count = std::min<UINT>(view.layer_count, desc.DepthOrArraySize - view.first_layer);
+    if (view.type == g::ImageType::cube) out.layer_count -= out.layer_count % 6;  // whole cubes
+    out.resource_mips = desc.MipLevels;
+    out.min_lod = view.min_lod;
+    if (!out.mip_count || !out.layer_count) {
+        log_once("view of no mips or no layers; type", int(view.type));
+        return false;
+    }
+    // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
+    // says the same about the hardware's channels, which the format places.
+    const g::Swizzle channels = g::format_swizzle(view_format);
+    for (UINT i = 0; i < 4; ++i) {
+        const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
+        out.swizzle[i] = from < 4 ? channels[from]
+                                  : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0 ? g::select_zero : g::select_one;
+    }
+    return true;
+}
+
+// The S# of a D3D12 sampler.
+leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc) {
+    namespace g = leonida::gfx10;
+    const auto address = [](D3D12_TEXTURE_ADDRESS_MODE mode) {
+        switch (mode) {
+        case D3D12_TEXTURE_ADDRESS_MODE_MIRROR: return g::AddressMode::mirror;
+        case D3D12_TEXTURE_ADDRESS_MODE_CLAMP: return g::AddressMode::clamp_last_texel;
+        case D3D12_TEXTURE_ADDRESS_MODE_BORDER: return g::AddressMode::clamp_border;
+        case D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE: return g::AddressMode::mirror_once_last_texel;
+        default: return g::AddressMode::wrap;
+        }
+    };
+    const bool anisotropic = D3D12_DECODE_IS_ANISOTROPIC_FILTER(desc.Filter);
+    const auto filter = [&](D3D12_FILTER_TYPE type) {
+        if (anisotropic) return type == D3D12_FILTER_TYPE_LINEAR ? g::Filter::aniso_bilinear : g::Filter::aniso_point;
+        return type == D3D12_FILTER_TYPE_LINEAR ? g::Filter::bilinear : g::Filter::point;
+    };
+    g::Sampler out{};
+    out.address_u = address(desc.AddressU);
+    out.address_v = address(desc.AddressV);
+    out.address_w = address(desc.AddressW);
+    out.mag_filter = filter(D3D12_DECODE_MAG_FILTER(desc.Filter));
+    out.min_filter = filter(D3D12_DECODE_MIN_FILTER(desc.Filter));
+    out.mip_filter = D3D12_DECODE_MIP_FILTER(desc.Filter) == D3D12_FILTER_TYPE_LINEAR ? g::MipFilter::linear
+                                                                                    : g::MipFilter::point;
+    out.max_anisotropy = anisotropic ? std::clamp<UINT>(desc.MaxAnisotropy, 1, 16) : 1;
+    const D3D12_FILTER_REDUCTION_TYPE reduction = D3D12_DECODE_FILTER_REDUCTION(desc.Filter);
+    // D3D12's comparison functions are 1 (NEVER) to 8 (ALWAYS); the S#'s are 0 to 7 in the same order.
+    if (reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON && desc.ComparisonFunc >= D3D12_COMPARISON_FUNC_NEVER)
+        out.compare = g::CompareFunction(desc.ComparisonFunc - D3D12_COMPARISON_FUNC_NEVER);
+    if (reduction == D3D12_FILTER_REDUCTION_TYPE_MINIMUM) out.filter_mode = g::FilterMode::minimum;
+    if (reduction == D3D12_FILTER_REDUCTION_TYPE_MAXIMUM) out.filter_mode = g::FilterMode::maximum;
+    out.min_lod = desc.MinLOD;
+    out.max_lod = desc.MaxLOD;
+    out.lod_bias = desc.MipLODBias;
+    const FLOAT* border = desc.BorderColor;
+    const bool black = border[0] == 0 && border[1] == 0 && border[2] == 0;
+    if (black && border[3] == 0) {
+        out.border_color = g::BorderColor::transparent_black;
+    } else if (black && border[3] == 1) {
+        out.border_color = g::BorderColor::opaque_black;
+    } else if (border[0] == 1 && border[1] == 1 && border[2] == 1 && border[3] == 1) {
+        out.border_color = g::BorderColor::opaque_white;
+    } else {
+        out.border_color = g::BorderColor::table;  // a colour of the application's: no table is kept for it yet
+    }
+    return out;
+}
 
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
@@ -343,6 +702,10 @@ public:
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties"));
         if (!get_device || !state_.format_properties || !state_.image_format_properties || !memory_properties) return;
         memory_properties(info.physical, &state_.memory);
+        for (const char* name : {"vkGetDeviceImageMemoryRequirements", "vkGetDeviceImageMemoryRequirementsKHR"})
+            if (!state_.image_requirements)
+                state_.image_requirements =
+                    reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirements>(get_device(info.device, name));
 
         if (state_.info.max_push_constants_size == 0 && info.physical && info.get_instance_proc) {
             const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
@@ -357,12 +720,41 @@ public:
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts);
+        if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
+            std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
+    }
+
+    // Set 0 of every translated shader that declares bindings: images, samplers and the descriptor hash table
+    // (docs section 3.4). Each ExecuteCommandLists brings it up to date before its commands are written.
+    bool create_bindless(PFN_vkGetDeviceProcAddr get_device) {
+        leonida::BindlessFeatures features{};
+        features.update_after_bind = true;  // VulkanDeviceInfo::bindless promises it
+        features.partially_bound = state_.info.bindless_partially_bound;
+        state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
+        if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
+            state_.bindless.reset();
+            return false;
+        }
+        state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
+            std::lock_guard lock(state_.descriptor_mutex);
+            if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
+            return state_.bindless->flush();
+        });
+        return true;
     }
 
     ~Device() override {
         if (state_.context) {
             std::lock_guard lock(state_.context->submit_mutex());
             state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+        }
+        if (state_.context && state_.bindless) {
+            // Every texture is gone by now (each held this device), and its views with it; samplers remain.
+            std::lock_guard lock(state_.descriptor_mutex);
+            for (const auto& [key, sampler] : state_.sampler_entries)
+                state_.context->vk.vkDestroySampler(state_.info.device, sampler, nullptr);
+            state_.sampler_entries.clear();
+            state_.bindless.reset();
         }
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
@@ -371,6 +763,7 @@ public:
 
     bool ok() const { return state_.context && state_.context->loaded(); }
     const VulkanDeviceInfo& info() const { return state_.info; }
+    const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
@@ -512,6 +905,121 @@ public:
                      std::size_t(count) * kDescriptorSize);
     }
 
+    // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
+    // dwords through its descriptor table and finds the image by them. A slot left as zeros is a null descriptor:
+    // nothing is registered for it, so the shader gets the fallback image. Buffer views are not implemented.
+    void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
+                                                    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                                                    D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!destination.ptr) return;
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        const Resource* r = Resource::from<Resource>(resource);
+        if (!r) {
+            if (resource) stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
+            return;
+        }
+        if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
+        TextureView view{};
+        if (!desc) {
+            if (r->desc().DepthOrArraySize > 1) view.type = leonida::gfx10::ImageType::image_2d_array;
+        } else {
+            view.format = desc->Format;
+            view.mapping = desc->Shader4ComponentMapping;
+            switch (desc->ViewDimension) {
+            case D3D12_SRV_DIMENSION_TEXTURE2D:
+                view.first_mip = desc->Texture2D.MostDetailedMip;
+                view.mip_count = desc->Texture2D.MipLevels;
+                view.layer_count = 1;
+                view.plane = desc->Texture2D.PlaneSlice;
+                view.min_lod = desc->Texture2D.ResourceMinLODClamp;
+                break;
+            case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+                view.type = leonida::gfx10::ImageType::image_2d_array;
+                view.first_mip = desc->Texture2DArray.MostDetailedMip;
+                view.mip_count = desc->Texture2DArray.MipLevels;
+                view.first_layer = desc->Texture2DArray.FirstArraySlice;
+                view.layer_count = desc->Texture2DArray.ArraySize;
+                view.plane = desc->Texture2DArray.PlaneSlice;
+                view.min_lod = desc->Texture2DArray.ResourceMinLODClamp;
+                break;
+            case D3D12_SRV_DIMENSION_TEXTURECUBE:
+                view.type = leonida::gfx10::ImageType::cube;
+                view.first_mip = desc->TextureCube.MostDetailedMip;
+                view.mip_count = desc->TextureCube.MipLevels;
+                view.layer_count = 6;
+                view.min_lod = desc->TextureCube.ResourceMinLODClamp;
+                break;
+            case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+                view.type = leonida::gfx10::ImageType::cube;
+                view.first_mip = desc->TextureCubeArray.MostDetailedMip;
+                view.mip_count = desc->TextureCubeArray.MipLevels;
+                view.first_layer = desc->TextureCubeArray.First2DArrayFace;
+                view.layer_count = desc->TextureCubeArray.NumCubes < ~0u / 6 ? desc->TextureCubeArray.NumCubes * 6 : ~0u;
+                view.min_lod = desc->TextureCubeArray.ResourceMinLODClamp;
+                break;
+            default:
+                log_once("shader-resource view dimension not supported:", desc->ViewDimension);
+                return;
+            }
+        }
+        write_image_descriptor(*r, view, destination, false);
+    }
+
+    // An unordered-access view of a texture is a T# too, of one mip; set 0 also holds it as a storage image.
+    void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter,
+                                                     const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!destination.ptr) return;
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        const Resource* r = Resource::from<Resource>(resource);
+        if (!r) {
+            if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
+            return;
+        }
+        if (!r->image() || counter) return stub("ID3D12Device::CreateUnorderedAccessView(buffer)");
+        if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
+                     int(r->desc().Flags));
+            return;
+        }
+        TextureView view{};
+        view.mip_count = 1;
+        if (!desc) {
+            if (r->desc().DepthOrArraySize > 1) view.type = leonida::gfx10::ImageType::image_2d_array;
+        } else {
+            view.format = desc->Format;
+            switch (desc->ViewDimension) {
+            case D3D12_UAV_DIMENSION_TEXTURE2D:
+                view.first_mip = desc->Texture2D.MipSlice;
+                view.layer_count = 1;
+                view.plane = desc->Texture2D.PlaneSlice;
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+                view.type = leonida::gfx10::ImageType::image_2d_array;
+                view.first_mip = desc->Texture2DArray.MipSlice;
+                view.first_layer = desc->Texture2DArray.FirstArraySlice;
+                view.layer_count = desc->Texture2DArray.ArraySize;
+                view.plane = desc->Texture2DArray.PlaneSlice;
+                break;
+            default:
+                log_once("unordered-access view dimension not supported:", desc->ViewDimension);
+                return;
+            }
+        }
+        write_image_descriptor(*r, view, destination, true);
+    }
+
+    // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
+    void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* desc,
+                                         D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!destination.ptr) return;
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        if (!desc) return;
+        const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler_descriptor(*desc));
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.bind_sampler(words);
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                       const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
@@ -537,11 +1045,7 @@ public:
                                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))) {
             hr = E_INVALIDARG;  // D3D12: a multisampled texture is a single-mip 2D render target or depth-stencil
         } else {
-            Format format = vulkan_format(desc->Format, desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-            if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !state_.depth_usable(format.format)) {
-                log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc->Format);
-                format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-            }
+            const Format format = state_.texture_format(*desc);
             if (format.format == VK_FORMAT_UNDEFINED) {
                 log_once("texture format not supported yet:", desc->Format);
                 hr = E_INVALIDARG;
@@ -627,6 +1131,33 @@ public:
             offset += total_rows * pitch;
         }
         if (total) *total = end - base;
+    }
+
+    // How much heap memory resources need and how to align them, for applications that suballocate heaps (section
+    // 4.1). Buffers follow D3D12's fixed rule. A texture's size is what the Vulkan image it becomes needs, rounded up
+    // to D3D12's alignment for it; the alignment itself is D3D12's, since placed textures bind their own memory
+    // (section 4.2). Several resources are laid out one after another, each at its own alignment. An invalid
+    // description gives SizeInBytes = UINT64_MAX, as on D3D12. d3d12_vulkan_device_test compares with the PC runtime.
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(
+        UINT, UINT count, const D3D12_RESOURCE_DESC* descs) override {
+        return place(count, descs, [&](UINT i) { return descs[i]; }, nullptr);
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo1(
+        UINT, UINT count, const D3D12_RESOURCE_DESC* descs, D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        return place(count, descs, [&](UINT i) { return descs[i]; }, each);
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo2(
+        UINT, UINT count, const D3D12_RESOURCE_DESC1* descs, D3D12_RESOURCE_ALLOCATION_INFO1* each) override {
+        return place(count, descs, [&](UINT i) {
+            const D3D12_RESOURCE_DESC1& d = descs[i];
+            if (d.SamplerFeedbackMipRegion.Width || d.SamplerFeedbackMipRegion.Height ||
+                d.SamplerFeedbackMipRegion.Depth) {
+                log_once("GetResourceAllocationInfo2 sampler feedback not supported, format", d.Format);
+                return D3D12_RESOURCE_DESC{};  // an unknown dimension: invalid
+            }
+            return D3D12_RESOURCE_DESC{d.Dimension, d.Alignment, d.Width, d.Height, d.DepthOrArraySize,
+                                       d.MipLevels, d.Format, d.SampleDesc, d.Layout, d.Flags};
+        }, each);
     }
 
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
@@ -755,6 +1286,108 @@ public:
 private:
     IUnknown* identity() { return outer_ ? outer_ : static_cast<ID3D12Device*>(this); }
 
+    static constexpr D3D12_RESOURCE_ALLOCATION_INFO kInvalidAllocation{UINT64_MAX,
+                                                                       D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+    static UINT64 align_up(UINT64 value, UINT64 to) { return (value + to - 1) / to * to; }
+
+    // Lays `count` resources out one after another; `each` (optional) gets every resource's offset, size and alignment.
+    template<class Desc, class Get>
+    D3D12_RESOURCE_ALLOCATION_INFO place(UINT count, const Desc* descs, Get get,
+                                         D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+        D3D12_RESOURCE_ALLOCATION_INFO total{0, 0};
+        bool failed = count && !descs;
+        for (UINT i = 0; i < count; ++i) {
+            const D3D12_RESOURCE_ALLOCATION_INFO one = failed ? kInvalidAllocation : allocation(get(i));
+            failed = failed || one.SizeInBytes == UINT64_MAX;
+            if (failed) {
+                if (each) each[i] = {UINT64_MAX, one.Alignment, UINT64_MAX};
+                continue;
+            }
+            const UINT64 offset = align_up(total.SizeInBytes, one.Alignment);
+            if (each) each[i] = {offset, one.Alignment, one.SizeInBytes};
+            total = {offset + one.SizeInBytes, std::max(total.Alignment, one.Alignment)};
+        }
+        return failed ? kInvalidAllocation : total;
+    }
+
+    // One resource's size and alignment, or kInvalidAllocation for a description D3D12 (or this device) rejects.
+    D3D12_RESOURCE_ALLOCATION_INFO allocation(const D3D12_RESOURCE_DESC& desc) const {
+        constexpr UINT64 align_4k = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT,
+                         align_64k = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                         align_msaa_64k = D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
+                         align_msaa_4m = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+        constexpr D3D12_RESOURCE_FLAGS attachment =
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (!desc.Width || desc.Width > UINT64_MAX - align_64k || desc.Height != 1 || desc.DepthOrArraySize != 1 ||
+                desc.MipLevels != 1 || desc.Format != DXGI_FORMAT_UNKNOWN || desc.SampleDesc.Count != 1 ||
+                desc.SampleDesc.Quality != 0 || desc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR ||
+                (desc.Alignment && desc.Alignment != align_64k) || (desc.Flags & attachment))
+                return kInvalidAllocation;
+            return {align_up(desc.Width, align_64k), align_64k};
+        }
+        const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_UNKNOWN)
+                log_once("GetResourceAllocationInfo dimension not supported:", desc.Dimension);
+            return kInvalidAllocation;
+        }
+        const UINT samples = desc.SampleDesc.Count, depth = volume ? desc.DepthOrArraySize : 1;
+        const UINT64 max_extent =
+            volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+        const UINT max_layers =
+            volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
+        if (!desc.Width || !desc.Height || !desc.DepthOrArraySize || desc.Width > max_extent ||
+            desc.Height > max_extent || desc.DepthOrArraySize > max_layers || !samples || samples > 16 ||
+            (samples & (samples - 1)) || desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+            return kInvalidAllocation;
+        const UINT16 full = full_mips(desc.Width, desc.Height, depth);
+        D3D12_RESOURCE_DESC resolved = desc;
+        if (!resolved.MipLevels) resolved.MipLevels = full;
+        if (resolved.MipLevels > full) return kInvalidAllocation;
+        if (samples > 1 &&
+            (volume || resolved.MipLevels != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+            return kInvalidAllocation;
+        if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
+            log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
+
+        const Format format = state_.texture_format(desc);
+        if (!format.format) {
+            log_once("GetResourceAllocationInfo format not supported yet:", desc.Format);
+            return kInvalidAllocation;
+        }
+        VkMemoryRequirements need{};
+        if (!state_.memory_requirements(texture_create_info(resolved, format), need)) return kInvalidAllocation;
+
+        // D3D12's alignment: 64 KiB, or 4 MiB with MSAA, unless the description asks for a small one (4 KiB, 64 KiB
+        // with MSAA). 4 KiB needs the resource to fit in 64 KiB and not be a render target or depth buffer; if it
+        // doesn't qualify, the PC runtime calls the description invalid rather than answering with 64 KiB. The MSAA
+        // 64 KiB alignment has no size limit there. Both measured in d3d12_vulkan_device_test.
+        UINT64 alignment = 0;
+        if (samples > 1) {
+            if (desc.Alignment && desc.Alignment != align_msaa_64k && desc.Alignment != align_msaa_4m)
+                return kInvalidAllocation;
+            alignment = desc.Alignment ? desc.Alignment : align_msaa_4m;
+        } else {
+            if (desc.Alignment && desc.Alignment != align_4k && desc.Alignment != align_64k) return kInvalidAllocation;
+            if (desc.Alignment == align_4k && ((desc.Flags & attachment) || need.size > align_64k))
+                return kInvalidAllocation;
+            alignment = desc.Alignment ? desc.Alignment : align_64k;
+        }
+        return {align_up(need.size, alignment), alignment};
+    }
+
+    // Writes the view's T# into the slot and makes sure set 0 and the hash table know it. A view that cannot be
+    // shown leaves the slot a null descriptor.
+    void write_image_descriptor(const Resource& resource, const TextureView& view,
+                                D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
+        leonida::gfx10::Image image{};
+        if (!image_descriptor(resource, view, image)) return;
+        const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(), storage);
+    }
+
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -782,6 +1415,21 @@ VkImage vulkan_image(ID3D12Resource* resource) {
     return r ? r->image() : VK_NULL_HANDLE;
 }
 
+bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (!dst || !src) return false;
+    const Format requested = vulkan_format(format, false);
+    if (requested.typeless || requested.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return false;
+    if (format == DXGI_FORMAT_R32G32B32A32_UINT || format == DXGI_FORMAT_R8G8B8A8_UINT ||
+        format == DXGI_FORMAT_R32_UINT)
+        return false;
+    const auto matches = [&](ID3D12Resource* resource) {
+        const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        return vulkan_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL).format ==
+               requested.format;
+    };
+    return matches(dst) && matches(src);
+}
+
 std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
     if (!device) return 0;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -796,6 +1444,25 @@ bool device_push_constants_need_fallback(ID3D12Device* device) {
     if (!real) real = device;
     if (auto* d = Device::from<Device>(real)) return d->info().push_constants_need_fallback;
     return false;
+}
+
+namespace {
+const leonida::BindlessSet* bindless_of(ID3D12Device* device) {
+    if (!device) return nullptr;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    const Device* d = Device::from<Device>(real ? real : device);
+    return d ? d->bindless() : nullptr;
+}
+} // namespace
+
+VkDescriptorSet bindless_set(ID3D12Device* device) {
+    const leonida::BindlessSet* set = bindless_of(device);
+    return set ? set->set() : VK_NULL_HANDLE;
+}
+
+VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
+    const leonida::BindlessSet* set = bindless_of(device);
+    return set ? set->layout() : VK_NULL_HANDLE;
 }
 
 // Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
@@ -853,6 +1520,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.separate_depth_stencil_layouts = true;
     VkPhysicalDeviceProperties chosen{};
     bool chosen_bc = false;
+    VkPhysicalDeviceFeatures chosen_features{};
+    VkPhysicalDeviceVulkan12Features chosen12{};
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -876,6 +1545,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 info.queue_family = i;
                 chosen = props;
                 chosen_bc = bc;
+                chosen_features = features.features;
+                chosen12 = f12;
             }
             break;
         }
@@ -890,6 +1561,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
+    // Where the GPU has them: what the bindless set 0 needs (VulkanDeviceInfo::bindless), and the sampler features
+    // D3D12 samplers can ask for.
+    info.bindless = chosen12.runtimeDescriptorArray && chosen_features.shaderSampledImageArrayDynamicIndexing &&
+                    chosen_features.shaderStorageImageArrayDynamicIndexing &&
+                    chosen12.descriptorBindingSampledImageUpdateAfterBind &&
+                    chosen12.descriptorBindingStorageImageUpdateAfterBind &&
+                    chosen12.descriptorBindingStorageBufferUpdateAfterBind;
+    info.bindless_partially_bound = info.bindless && chosen12.descriptorBindingPartiallyBound;
+    info.sampler_anisotropy = chosen_features.samplerAnisotropy;
+    info.sampler_mirror_clamp_to_edge = chosen12.samplerMirrorClampToEdge;
+    enable12.runtimeDescriptorArray = info.bindless;
+    enable12.descriptorBindingSampledImageUpdateAfterBind = info.bindless;
+    enable12.descriptorBindingStorageImageUpdateAfterBind = info.bindless;
+    enable12.descriptorBindingStorageBufferUpdateAfterBind = info.bindless;
+    enable12.descriptorBindingPartiallyBound = info.bindless_partially_bound;
+    enable12.samplerMirrorClampToEdge = info.sampler_mirror_clamp_to_edge;
+    if (!info.bindless)
+        std::fprintf(stderr, "[rt] d3d12: the GPU lacks a descriptor-indexing feature the bindless set needs\n");
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue_info.queueFamilyIndex = info.queue_family;
@@ -897,6 +1586,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     queue_info.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enable{};
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
+    enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
+    enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
+    enable.samplerAnisotropy = info.sampler_anisotropy;
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;

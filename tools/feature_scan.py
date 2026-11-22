@@ -46,6 +46,8 @@ WATCHED = ("WAVE_MMA", "SHADING_RATE", "VIEW_ID", "ROVS", "STENCIL_REF", "INNER_
 ALL_STAGES = ("vs", "ps", "gs", "hs", "ds", "cs", "ms", "as", "lib")
 
 MMA = re.compile(r"^\s*(v_mfma\w*|v_wmma\w*|v_smfmac\w*)\b")
+# Ordered count, GWS and the GS-register adds are the GDS-side instructions NGG stream output relies on. ds_append /
+# ds_consume are included as the other counter-style DS ops (LDS unless they carry `gds`, which GDS below catches).
 ORDERED = re.compile(r"^\s*(ds_ordered_count|ds_gws_\w+|ds_append|ds_consume|ds_add_gs_reg\w*|ds_sub_gs_reg\w*)\b")
 GDS = re.compile(r"^\s*ds_\w+\b[^;]*\bgds\b")
 
@@ -61,10 +63,17 @@ def parts(d: bytes) -> dict:
 
 
 def streams(sig: bytes) -> set:
-    """Stream index of every element of an ISG1/OSG1 signature (32-byte elements, stream first)."""
+    """Stream index of every element of an ISG1/OSG1 signature (32-byte elements, stream first).
+
+    A part shorter than its declared element table, or with its first element inside the 8-byte
+    count/offset header, carries no usable stream information: report no streams rather than let
+    struct.error abort the whole count-only scan. Well-formed signatures are read as before.
+    """
     if len(sig) < 8:
         return set()
     count, first = struct.unpack_from("<II", sig, 0)
+    if first < 8 or first + 32 * count > len(sig):
+        return set()
     return {struct.unpack_from("<I", sig, first + 32 * i)[0] for i in range(count)}
 
 

@@ -75,6 +75,33 @@ class CarveEdgeTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["files"], 0)
         self.assertEqual(doc["summary"]["span"], 0)
 
+    def test_bad_range_arguments_fail_before_the_out_dir_is_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            make_archive(arc)
+            for flag, value, message in (("--start", "-1", "must be 0 or more"),
+                                         ("--limit", "0", "must be at least 1"),
+                                         ("--limit", "-1", "must be at least 1")):
+                out = os.path.join(tmp, "out")
+                p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only", flag, value],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(message, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_hex_limit_is_still_accepted(self):
+        # The new converter keeps the repo's decimal-or-0x convention for byte counts.
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            out = os.path.join(tmp, "out")
+            make_archive(arc)
+            p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only", "--limit", "0x40"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["span"], 0x40)
+
 
 if __name__ == "__main__":
     unittest.main()

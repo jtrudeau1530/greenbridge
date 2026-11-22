@@ -84,9 +84,10 @@ def score_image(w, h, fmt, payload, bpe):
         im = Image.open(io.BytesIO(dds_bytes(w, h, DECODE_AS.get(fmt, fmt), payload))).convert("RGB")
         a = np.asarray(im.reduce(4) if min(w, h) >= 64 else im, np.float32)
     else:
-        a = np.frombuffer(payload, np.uint8).reshape(-1, bpe)[:, :4].astype(np.float32)
-        a = a.reshape(-1, max(1, (w + 3) // 4 if bpe >= 8 and FMT[fmt][1] == 4 else w), 4)
-    d = np.abs(np.diff(a, axis=0)).mean() + np.abs(np.diff(a, axis=1)).mean()
+        block = FMT[fmt][1]
+        we, he = (w + block - 1) // block, (h + block - 1) // block
+        a = np.frombuffer(payload, np.uint8).reshape(he, we, bpe)[:, :, :4].astype(np.float32)
+    d = sum(np.abs(np.diff(a, axis=axis)).mean() for axis in (0, 1) if a.shape[axis] > 1)
     return float(d / (a.std() + 1e-6))
 
 

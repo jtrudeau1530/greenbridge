@@ -61,6 +61,16 @@ def _is_nan_bits(word):
     return exp == 0xFF and (word & 0x7FFFFF) != 0
 
 
+def _emit_perm(rng, dst, srcs):
+    """Half the cases pin the selector so bytes 8-13 (sign bits, 0x00, 0xff) are not left to chance."""
+    if rng.random() < 0.5:
+        sel = 0
+        for i in range(4):
+            sel |= rng.randrange(0, 16) << (8 * i)
+        return f"v_perm_b32 v{dst}, v{srcs[0]}, v{srcs[1]}, 0x{sel:08x}"
+    return f"v_perm_b32 v{dst}, v{srcs[0]}, v{srcs[1]}, v{srcs[2]}"
+
+
 def _op_templates():
     """(name, emitter) table owned by this runner. Emitters take
     (rng, dst, srcs) and return one assembly line (without leading tab)."""
@@ -76,6 +86,28 @@ def _op_templates():
         ("v_lshlrev_b32", lambda r, d, s: f"v_lshlrev_b32 v{d}, {r.randrange(0, 8)}, v{s[0]}"),
         ("v_lshrrev_b32", lambda r, d, s: f"v_lshrrev_b32 v{d}, {r.randrange(0, 8)}, v{s[0]}"),
         ("v_ashrrev_i32", lambda r, d, s: f"v_ashrrev_i32 v{d}, {r.randrange(0, 8)}, v{s[0]}"),
+        ("v_add_nc_u32", lambda r, d, s: f"v_add_nc_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_sub_nc_u32", lambda r, d, s: f"v_sub_nc_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_subrev_nc_u32", lambda r, d, s: f"v_subrev_nc_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_u32_u24", lambda r, d, s: f"v_mul_u32_u24 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_i32_i24", lambda r, d, s: f"v_mul_i32_i24 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_lo_u32", lambda r, d, s: f"v_mul_lo_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_hi_u32", lambda r, d, s: f"v_mul_hi_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_hi_i32", lambda r, d, s: f"v_mul_hi_i32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mad_u32_u24", lambda r, d, s: f"v_mad_u32_u24 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_mad_i32_i24", lambda r, d, s: f"v_mad_i32_i24 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_min_u32", lambda r, d, s: f"v_min_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_max_u32", lambda r, d, s: f"v_max_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_min_i32", lambda r, d, s: f"v_min_i32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_max_i32", lambda r, d, s: f"v_max_i32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_bfe_u32", lambda r, d, s: f"v_bfe_u32 v{d}, v{s[0]}, {r.randrange(0, 40)}, {r.randrange(0, 40)}"),
+        ("v_bfe_i32", lambda r, d, s: f"v_bfe_i32 v{d}, v{s[0]}, {r.randrange(0, 40)}, {r.randrange(0, 40)}"),
+        ("v_bfi_b32", lambda r, d, s: f"v_bfi_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_alignbit_b32", lambda r, d, s: f"v_alignbit_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_alignbyte_b32", lambda r, d, s: f"v_alignbyte_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_perm_b32", _emit_perm),
+        ("v_med3_i32", lambda r, d, s: f"v_med3_i32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_med3_u32", lambda r, d, s: f"v_med3_u32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
         ("s_add_u32", lambda r, d, s: f"s_add_u32 s{d}, s{s[0]}, s{s[1]}"),
     ]
 
@@ -88,7 +120,14 @@ def _op_templates():
 # mini-interp (not this runner) re-enables scalar ALU coverage.
 _VEC_OPS = ("v_mov_b32", "v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32",
             "v_and_b32", "v_or_b32", "v_xor_b32", "v_lshlrev_b32",
-            "v_lshrrev_b32", "v_ashrrev_i32")
+            "v_lshrrev_b32", "v_ashrrev_i32",
+            "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_mul_u32_u24",
+            "v_mul_i32_i24", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32",
+            "v_mad_u32_u24", "v_mad_i32_i24", "v_min_u32", "v_max_u32",
+            "v_min_i32", "v_max_i32",
+            "v_bfe_u32", "v_bfe_i32", "v_bfi_b32", "v_alignbit_b32",
+            "v_alignbyte_b32", "v_perm_b32", "v_med3_i32", "v_med3_u32")
+_FLOAT_OPS = ("v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32")
 
 
 def _seed_value(rng):
@@ -113,12 +152,24 @@ def generate_program(rng, n_ops):
     for s in s_regs:
         lines.append(f"s_mov_b32 s{s}, {_seed_value(rng) % 256}")
     vec_ops = [t for t in _op_templates() if t[0] in _VEC_OPS and t[0] != "v_mov_b32"]
+    # A float op may return any NaN payload (Vulkan does not promise one) and the
+    # comparison accepts both-NaN. If that value then fed an integer op, the two
+    # payloads would produce different integer results, so integer ops never read
+    # the destination of a float op. Every untainted register is bit-identical on
+    # both oracles; a later integer write clears the taint.
+    tainted = set()
     for _ in range(n_ops):
         name, emit = rng.choice(vec_ops)
         dst = rng.choice(SCRATCH)
-        srcs = [rng.choice(SCRATCH) for _ in range(4)]
+        clean = [v for v in SCRATCH if v not in tainted]
+        pool = SCRATCH if name in _FLOAT_OPS or not clean else clean
+        srcs = [rng.choice(pool) for _ in range(4)]
         lines.append(emit(rng, dst, srcs))
         writers[dst] = (name, len(lines))
+        if name in _FLOAT_OPS:
+            tainted.add(dst)
+        else:
+            tainted.discard(dst)
     # Observe one scalar through a VGPR so scalar ops are covered too.
     lines.append(f"v_mov_b32 v15, s{rng.choice(s_regs)}")
     writers[15] = ("v_mov_b32/sgpr-copy", len(lines))

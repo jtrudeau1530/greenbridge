@@ -230,7 +230,12 @@ struct JsonParser {
             if (error) return m;
             if (!consume(':')) { fail("expected ':' in shader metadata"); return m; }
             if (k == "stage") m.stage = parse_string();
-            else if (k == "subgroup_size") m.subgroup_size = parse_u32();
+            else if (k == "subgroup_size") {
+                // null: translated with --wave64-emulate, exact on any subgroup size, so request none (0)
+                ws();
+                if (s.compare(i, 4, "null") == 0) { i += 4; m.subgroup_size = 0; }
+                else m.subgroup_size = parse_u32();
+            }
             else if (k == "writes_depth") m.writes_depth = parse_bool();
             else if (k == "needs_maintenance8") m.needs_maintenance8 = parse_bool();
             else if (k == "features") m.features = parse_str_array();

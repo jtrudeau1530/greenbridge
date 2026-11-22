@@ -17,7 +17,11 @@ Model:
 
 Implemented: s_mov_b32, v_mov_b32, v_add_f32, v_sub_f32, v_mul_f32, v_fma_f32, v_cndmask_b32,
 v_and_b32, v_or_b32, v_xor_b32, v_lshlrev_b32, v_lshrrev_b32, v_ashrrev_i32, s_add_u32,
-s_lshl_b32, s_lshr_b32, s_endpgm. Inline constants and literals for those operands are handled.
+s_lshl_b32, s_lshr_b32, s_endpgm. Also the integer/bit VALU block: v_add_nc_u32, v_sub_nc_u32,
+v_subrev_nc_u32, v_mul_u32_u24, v_mul_i32_i24, v_mul_lo_u32, v_mul_hi_u32/v_mul_hi_i32,
+v_mad_u32_u24/v_mad_i32_i24, v_min_u32/v_max_u32, v_min_i32/v_max_i32,
+v_bfe_u32/v_bfe_i32, v_bfi_b32, v_alignbit_b32, v_alignbyte_b32, v_perm_b32 and
+v_med3_i32/v_med3_u32. Inline constants and literals for those operands are handled.
 ``clamp`` is accepted on the f32 ops (NaN -> 0). Registers not initialized by the caller read as
 zero, matching the translator's deterministic register arrays.
 
@@ -81,6 +85,11 @@ SUPPORTED_OPS = {
     "s_mov_b32", "s_add_u32", "s_lshl_b32", "s_lshr_b32",
     "v_mov_b32", "v_cndmask_b32", "v_and_b32", "v_or_b32", "v_xor_b32",
     "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32",
+    "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_mul_u32_u24", "v_mul_i32_i24",
+    "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32", "v_mad_u32_u24", "v_mad_i32_i24",
+    "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32",
+    "v_bfe_u32", "v_bfe_i32", "v_bfi_b32", "v_alignbit_b32", "v_alignbyte_b32",
+    "v_perm_b32", "v_med3_i32", "v_med3_u32",
     "v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32",
     "s_endpgm",
 }
@@ -551,6 +560,118 @@ class Machine:
                     signed = value - (1 << 32) if value & SIGN32 else value
                     r = (signed >> shift) & MASK32
                 self._write_vgpr(args[0], lane, r)
+        elif base in ("v_add_nc_u32", "v_sub_nc_u32", "v_mul_u32_u24", "v_mul_lo_u32",
+                      "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32"):
+            self._expect(ins, 3)
+            for lane in self._active_lanes():
+                a = self._int_src(args[1], lane)
+                b = self._int_src(args[2], lane)
+                if base == "v_add_nc_u32":
+                    r = (a + b) & MASK32
+                elif base == "v_sub_nc_u32":
+                    r = (a - b) & MASK32
+                elif base == "v_mul_u32_u24":
+                    r = ((a & 0xFFFFFF) * (b & 0xFFFFFF)) & MASK32
+                elif base == "v_mul_lo_u32":
+                    r = (a * b) & MASK32
+                elif base in ("v_min_u32", "v_max_u32"):
+                    r = (max if base == "v_max_u32" else min)(a, b)
+                else:
+                    sa = a - (1 << 32) if a & SIGN32 else a
+                    sb = b - (1 << 32) if b & SIGN32 else b
+                    r = (max if base == "v_max_i32" else min)(sa, sb) & MASK32
+                self._write_vgpr(args[0], lane, r)
+        elif base == "v_subrev_nc_u32":
+            self._expect(ins, 3)
+            for lane in self._active_lanes():
+                a = self._int_src(args[1], lane)
+                b = self._int_src(args[2], lane)
+                self._write_vgpr(args[0], lane, (b - a) & MASK32)
+        elif base in ("v_mul_hi_u32", "v_mul_hi_i32"):
+            self._expect(ins, 3)
+            for lane in self._active_lanes():
+                a = self._int_src(args[1], lane)
+                b = self._int_src(args[2], lane)
+                if base == "v_mul_hi_i32":
+                    a = a - (1 << 32) if a & SIGN32 else a
+                    b = b - (1 << 32) if b & SIGN32 else b
+                self._write_vgpr(args[0], lane, ((a * b) >> 32) & MASK32)
+        elif base in ("v_mad_u32_u24", "v_mad_i32_i24"):
+            self._expect(ins, 4)
+            for lane in self._active_lanes():
+                x = self._int_src(args[1], lane) & 0xFFFFFF
+                y = self._int_src(args[2], lane) & 0xFFFFFF
+                if base == "v_mad_i32_i24":
+                    x = x - (1 << 24) if x & 0x800000 else x
+                    y = y - (1 << 24) if y & 0x800000 else y
+                z = self._int_src(args[3], lane)
+                self._write_vgpr(args[0], lane, (x * y + z) & MASK32)
+        elif base == "v_mul_i32_i24":
+            self._expect(ins, 3)
+            for lane in self._active_lanes():
+                x = self._int_src(args[1], lane) & 0xFFFFFF
+                y = self._int_src(args[2], lane) & 0xFFFFFF
+                sx = x - (1 << 24) if x & 0x800000 else x
+                sy = y - (1 << 24) if y & 0x800000 else y
+                self._write_vgpr(args[0], lane, (sx * sy) & MASK32)
+        elif base in ("v_bfe_u32", "v_bfe_i32"):
+            self._expect(ins, 4)
+            for lane in self._active_lanes():
+                value = self._int_src(args[1], lane)
+                off = self._int_src(args[2], lane) & 31
+                width = min(self._int_src(args[3], lane) & 31, 32 - off)
+                if width == 0:
+                    r = 0
+                else:
+                    r = (value >> off) & ((1 << width) - 1)
+                    if base == "v_bfe_i32" and r & (1 << (width - 1)):
+                        r = (r - (1 << width)) & MASK32
+                self._write_vgpr(args[0], lane, r)
+        elif base == "v_bfi_b32":
+            self._expect(ins, 4)
+            for lane in self._active_lanes():
+                x = self._int_src(args[1], lane)
+                y = self._int_src(args[2], lane)
+                z = self._int_src(args[3], lane)
+                self._write_vgpr(args[0], lane, (x & y) | (~x & z))
+        elif base in ("v_alignbit_b32", "v_alignbyte_b32"):
+            self._expect(ins, 4)
+            for lane in self._active_lanes():
+                hi = self._int_src(args[1], lane)
+                lo = self._int_src(args[2], lane)
+                shift = self._int_src(args[3], lane)
+                shift = (shift & 31) if base == "v_alignbit_b32" else (shift & 3) * 8
+                self._write_vgpr(args[0], lane, (((hi << 32) | lo) >> shift) & MASK32)
+        elif base == "v_perm_b32":
+            self._expect(ins, 4)
+            for lane in self._active_lanes():
+                hi = self._int_src(args[1], lane)
+                lo = self._int_src(args[2], lane)
+                sel = self._int_src(args[3], lane)
+                packed = (hi << 32) | lo
+                r = 0
+                for i in range(4):
+                    sb = (sel >> (8 * i)) & 0xFF
+                    if sb < 8:
+                        val = (packed >> (8 * (sb & 7))) & 0xFF
+                    elif sb < 12:
+                        k = sb & 3
+                        src = lo if k < 2 else hi
+                        # Selector 8/9 pick bit 7 of bytes 1/3 of src1 (bits 15/31);
+                        # 10/11 the same bytes of src0 (bits 47/63, i.e. 15/31 again).
+                        val = 0xFF if (src >> (15 + 16 * (k & 1))) & 1 else 0
+                    else:
+                        val = 0 if sb == 12 else 0xFF
+                    r |= val << (8 * i)
+                self._write_vgpr(args[0], lane, r)
+        elif base in ("v_med3_i32", "v_med3_u32"):
+            self._expect(ins, 4)
+            for lane in self._active_lanes():
+                vals = [self._int_src(args[i], lane) for i in (1, 2, 3)]
+                if base == "v_med3_i32":
+                    vals = [v - (1 << 32) if v & SIGN32 else v for v in vals]
+                x, y, z = vals
+                self._write_vgpr(args[0], lane, max(min(x, y), min(max(x, y), z)) & MASK32)
         elif base == "s_mov_b32":
             self._expect(ins, 2)
             self._write_scalar_dst(args[0], self._int_src(args[1], 0, scalar=True))
