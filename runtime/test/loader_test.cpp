@@ -20,6 +20,7 @@
 
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#include "free_image_base.h"
 
 namespace {
 
@@ -56,7 +57,7 @@ std::vector<uint8_t> make_image() {
     nt->FileHeader.NumberOfSections = 1;
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = 0x140000000;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x140000000);
     nt->OptionalHeader.AddressOfEntryPoint = 0x1000;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
@@ -101,7 +102,7 @@ std::filesystem::path write_image_as(const std::vector<uint8_t>& bytes, const st
 std::vector<uint8_t> make_forwarder_image(const char* target, uint64_t image_base) {
     auto img = make_image();
     std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});  // real tables end in a zero descriptor
-    nt_of(img)->OptionalHeader.ImageBase = image_base;
+    nt_of(img)->OptionalHeader.ImageBase = leonida_test::free_image_base(image_base);
     auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
     ed->Base = 1;
     ed->NumberOfFunctions = 1;
@@ -505,8 +506,6 @@ void emit_store_stub(std::vector<uint8_t>& img, size_t off, uint64_t addr, uint3
     img[n++] = 0xC3;
 }
 
-constexpr uint64_t kInitBase = 0x140000000;
-
 // make_image() plus a TLS directory and an entry point, both aimed at real machine code: a stub that stores a
 // sentinel in this process, so the test can tell a callback ran rather than only that it was parsed.
 std::vector<uint8_t> make_init_image() {
@@ -514,7 +513,8 @@ std::vector<uint8_t> make_init_image() {
     auto* nt = nt_of(img);
     nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
     nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
-    auto va = [](uint32_t rva) { return kInitBase + rva; };
+    const uint64_t base = nt->OptionalHeader.ImageBase;  // the TLS callback addresses below are absolute
+    auto va = [base](uint32_t rva) { return base + rva; };
     constexpr size_t text = 0x200;  // file offset of RVA 0x1000
     emit_store_stub(img, text + 0x00, reinterpret_cast<uint64_t>(&g_tls_ran), 1, 0);
     emit_store_stub(img, text + 0x40, reinterpret_cast<uint64_t>(&g_main_ran), 2, 1);
@@ -591,7 +591,7 @@ void test_initialise_rejects() {
     {
         auto img = make_init_image();
         auto* callbacks = reinterpret_cast<uint64_t*>(img.data() + 0x290);  // file offset of RVA 0x1090
-        callbacks[0] = kInitBase + 0x9000;                                  // well past SizeOfImage
+        callbacks[0] = nt_of(img)->OptionalHeader.ImageBase + 0x9000;         // well past SizeOfImage
         expect_init_rejects("a TLS callback outside the image is rejected", img);
     }
     {
@@ -789,7 +789,7 @@ void test_process_detach_without_entry() {
     reset_notifications();
     auto first = make_lifecycle_image();
     auto second = make_image();
-    nt_of(second)->OptionalHeader.ImageBase = 0x180000000;
+    nt_of(second)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x180000000);
     nt_of(second)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
     emit_jump_stub(second, 0x200, reinterpret_cast<uint64_t>(&observe_dllmain));
     void* first_base = nullptr;
