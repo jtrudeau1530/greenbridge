@@ -92,11 +92,19 @@ jobs:
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
       - name: Build
         run: cmake --build runtime/build
-      - name: Verify the descriptor test shader
+      - name: Verify the descriptor test shaders
         shell: pwsh
         run: |
-          if (!(Test-Path -LiteralPath runtime/build/generated/cs_sample.spv -PathType Leaf)) {
-            throw 'The Windows runtime build did not compile the descriptor test shader'
+          $shaders = @(
+            'LEONIDA_TEST_CS_SAMPLE_SPV', 'LEONIDA_TEST_MS_FLOAT_SPV',
+            'LEONIDA_TEST_MS_UINT_SPV', 'LEONIDA_TEST_MS_SINT_SPV',
+            'LEONIDA_TEST_MSAA_VERT_SPV', 'LEONIDA_TEST_MSAA_FRAG_SPV'
+          )
+          foreach ($shader in $shaders) {
+            $path = "runtime/build/generated/$shader.spv"
+            if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "The Windows runtime build did not compile $path"
+            }
           }
       # For the wine job: the test list, the checkout it was made in, and the built executables and DLLs. Only what
       # this repository builds goes in; there is no game data on the runner.
