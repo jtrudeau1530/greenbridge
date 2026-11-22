@@ -155,6 +155,81 @@ class SALUArchitecturalState:
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegKind(Enum):
+    SGPR = auto()
+    VGPR = auto()
+    SPECIAL = auto()
+
+
+@dataclass(frozen=True)
+class Register:
+    """Architectural register representation with kind, base index, and count."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+            if self.index + self.count > 106:
+                raise ValueError(f"SGPR register span {self.index} + {self.count} exceeds SGPR limit 106")
+        elif self.kind == RegKind.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+            if self.index + self.count > 256:
+                raise ValueError(f"VGPR register span {self.index} + {self.count} exceeds VGPR limit 256")
+        if self.count not in (1, 2):
+            raise ValueError(f"Register count must be 1 (32-bit) or 2 (64-bit), got {self.count}")
+
+    @property
+    def name(self) -> str:
+        prefix = "s" if self.kind == RegKind.SGPR else "v"
+        if self.count == 1:
+            return f"{prefix}{self.index}"
+        return f"{prefix}[{self.index}:{self.index + self.count - 1}]"
+
+
+@dataclass(frozen=True)
+class LiteralConstant64:
+    """64-bit scalar immediate or inline literal constant."""
+    val: int
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.val & MASK64:016x}"
+
+
+class SALUOpcode(Enum):
+    S_XOR_SAVEEXEC_B64 = auto()
+
+
+@dataclass(frozen=True)
+class SXorSaveExecB64AST:
+    """Symbolic AST node representing RDNA2 s_xor_saveexec_b64 instruction."""
+    dst: Register
+    src0: Union[Register, LiteralConstant64]
+    opcode: SALUOpcode = SALUOpcode.S_XOR_SAVEEXEC_B64
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.SGPR:
+            raise TypeError(f"Destination of s_xor_saveexec_b64 must be SGPR, got {self.dst.kind}")
+        if self.dst.count != 2:
+            raise ValueError(f"Destination of s_xor_saveexec_b64 must be 64-bit register pair (count=2), got count={self.dst.count}")
+        if isinstance(self.src0, Register):
+            if self.src0.kind != RegKind.SGPR:
+                raise TypeError(f"Register source of s_xor_saveexec_b64 must be SGPR, got {self.src0.kind}")
+            if self.src0.count != 2:
+                raise ValueError(f"Register source of s_xor_saveexec_b64 must be 64-bit register pair (count=2), got count={self.src0.count}")
+
+    def disassemble(self) -> str:
+        return f"s_xor_saveexec_b64 {self.dst.name}, {self.src0.name}"
+
+
+# ==============================================================================
 # Unit Tests: Phase 1 Oracle and Architectural Model
 # ==============================================================================
 
@@ -244,6 +319,65 @@ class TestSXorSaveExecB64Oracle(unittest.TestCase):
             self.assertEqual(saved, pat)
             self.assertEqual(new_exec, 0)
             self.assertEqual(scc, 0)
+
+
+class TestSXorSaveExecB64AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_valid_sgpr_operands(self) -> None:
+        dst = Register(RegKind.SGPR, 4, count=2)
+        src = Register(RegKind.SGPR, 6, count=2)
+        ast = SXorSaveExecB64AST(dst=dst, src0=src)
+        self.assertEqual(ast.opcode, SALUOpcode.S_XOR_SAVEEXEC_B64)
+        self.assertEqual(ast.dst.name, "s[4:5]")
+        self.assertEqual(ast.src0.name, "s[6:7]")
+        self.assertEqual(ast.disassemble(), "s_xor_saveexec_b64 s[4:5], s[6:7]")
+
+    def test_ast_valid_literal_operand(self) -> None:
+        dst = Register(RegKind.SGPR, 0, count=2)
+        lit = LiteralConstant64(0x1234_5678_9ABC_DEF0)
+        ast = SXorSaveExecB64AST(dst=dst, src0=lit)
+        self.assertEqual(ast.disassemble(), "s_xor_saveexec_b64 s[0:1], 0x123456789abcdef0")
+
+    def test_ast_dataclass_equality(self) -> None:
+        ast1 = SXorSaveExecB64AST(Register(RegKind.SGPR, 8, count=2), LiteralConstant64(0x5555))
+        ast2 = SXorSaveExecB64AST(Register(RegKind.SGPR, 8, count=2), LiteralConstant64(0x5555))
+        self.assertEqual(ast1, ast2)
+        self.assertEqual(hash(ast1), hash(ast2))
+
+    def test_rejection_of_vgpr_dst(self) -> None:
+        with self.assertRaises(TypeError):
+            SXorSaveExecB64AST(
+                dst=Register(RegKind.VGPR, 0, count=2),
+                src0=Register(RegKind.SGPR, 2, count=2),
+            )
+
+    def test_rejection_of_vgpr_src(self) -> None:
+        with self.assertRaises(TypeError):
+            SXorSaveExecB64AST(
+                dst=Register(RegKind.SGPR, 0, count=2),
+                src0=Register(RegKind.VGPR, 2, count=2),
+            )
+
+    def test_rejection_of_single_32bit_dst_or_src(self) -> None:
+        with self.assertRaises(ValueError):
+            SXorSaveExecB64AST(
+                dst=Register(RegKind.SGPR, 0, count=1),
+                src0=Register(RegKind.SGPR, 2, count=2),
+            )
+        with self.assertRaises(ValueError):
+            SXorSaveExecB64AST(
+                dst=Register(RegKind.SGPR, 0, count=2),
+                src0=Register(RegKind.SGPR, 2, count=1),
+            )
+
+    def test_rejection_of_out_of_range_sgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -1, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 105, count=2)  # 105+2 = 107 > 106
 
 
 if __name__ == "__main__":
