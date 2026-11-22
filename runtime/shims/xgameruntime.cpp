@@ -238,6 +238,19 @@ HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** ou
     return kClassNotProvided;
 }
 
+// gameplatformservices.dll: XCurl.dll's other way into the runtime (docs/runtime_imports.md). It reads
+// HKLM\Microsoft\GamingServices ServiceRetryTimeout, LoadLibraryExW's this module from System32, calls
+// GetApiVersionImpl through the CFG dispatch with two pointers to 64-bit locals (the result unread), compares them
+// with the pair it saw last and keeps them, and then GetProcAddress'es QueryApiImpl. Served by the shims, so that call
+// never reaches a PC's Gaming Services runtime (which would bypass these offline classes, and could go online) and
+// never fails because the PC has none. The two values only have to be stable: the offline runtime has one version.
+constexpr uint64_t kOfflineApiVersion = 1;
+HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
+    if (first) *first = kOfflineApiVersion;
+    if (second) *second = kOfflineApiVersion;
+    return S_OK;
+}
+
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
     if (g_runtime_refs.fetch_add(1) == 0) std::fprintf(stderr, "[rt] xgameruntime: initialized (offline)\n");
@@ -418,6 +431,9 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
+    {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
+    {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
     XGR(XGameRuntimeInitialize),
     XGR(XGameRuntimeUninitialize),
     XGR(XSystemGetDeviceType),

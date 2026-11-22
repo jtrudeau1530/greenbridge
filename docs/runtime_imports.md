@@ -146,6 +146,14 @@ the class and interface id and returns `0x80070032`, the documented error for a 
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
 
+`XCurl.dll` has a second way in. One of its functions reads `HKLM\Microsoft\GamingServices` value
+`ServiceRetryTimeout`, then `LoadLibraryExW(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` and
+`GetProcAddress`es `GetApiVersionImpl` and `QueryApiImpl`. It calls the first through the CFG dispatch with two
+pointers to 64-bit locals (the result is not read), compares the pair with the one it saw last and keeps it. On the
+host that load would find a PC's Gaming Services runtime, which bypasses the offline classes, or nothing, in which
+case XCurl returns `0x87E00196`. The shims own `gameplatformservices.dll` too: its `QueryApiImpl` is the offline
+one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time.
+
 ### Class layouts, measured
 
 Each `xgameruntime.lib` function the package's DLLs link is a thunk of the same shape: it calls a helper with the
