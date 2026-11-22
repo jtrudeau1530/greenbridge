@@ -614,6 +614,8 @@ def main(argv=None):
                     help="also run spirv-as and spirv-val on every translation (a failure counts as a mismatch)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
+    if a.programs < 1:
+        ap.error("--programs must be at least 1")
     if a.spirv_val:
         missing = [t for t in ("spirv-as", "spirv-val") if not shutil.which(t)]
         if missing:
