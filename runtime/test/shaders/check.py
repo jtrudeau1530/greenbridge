@@ -297,6 +297,9 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # 16-bit float v_cmp, all 16 predicates, e32 and e64 with swapped operands (.asm headers)
               "ps_vcmp_f16": (0x48a12080, 0x4ce9b1a2, 0x4ba72c98, 0x4fefbdba),
               "ps_vcmp_f16_e64": (0x44c11100, 0x4cf171c1, 0x47c71d18, 0x4ff77dd9),
+              # 16-bit float v_cmpx, all 16 predicates, EXEC result with VCC kept (.asm headers)
+              "ps_vcmpx_f16": (0x68a12080, 0x6ce9b1a2, 0x6ba72c98, 0x6fefbdba),
+              "ps_vcmpx_f16_e64": (0x64c11100, 0x6cf171c1, 0x67c71d18, 0x6ff77dd9),
               "ps_cvt_off": (0xbf000000, 0x3ee00000, 0xbe800000, 0x3f800000),
               "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
