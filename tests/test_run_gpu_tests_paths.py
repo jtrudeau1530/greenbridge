@@ -24,6 +24,12 @@ class DrawShaders(unittest.TestCase):
     def test_flat_still_brings_vs_ids(self):
         self.assertEqual(run_gpu_tests.with_draw_shaders(["ps_flat.asm"]), ["ps_flat.asm", "vs_ids.asm"])
 
+    def test_each_filtered_clip_case_brings_ps_ops(self):
+        for name in run_gpu_tests.CLIP_CASES:
+            with self.subTest(name=name):
+                selected = f"{name}.asm"
+                self.assertEqual(run_gpu_tests.with_draw_shaders([selected]), [selected, "ps_ops.asm"])
+
     def test_vs_ids_is_not_added_twice(self):
         files = ["ps_flat.asm", "ps_texture_sample.asm", "vs_ids.asm"]
         self.assertEqual(run_gpu_tests.with_draw_shaders(files), files)
