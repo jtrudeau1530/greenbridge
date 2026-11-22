@@ -485,9 +485,20 @@ From HD to SLOD2, each tier's median `lodDist` is within 5% of the next tier's m
 450/450, 1,000/1,000, 2,000/1,976), so the two fields agree on the bands. For SLOD3 they differ (4,000 and
 6,043.5), and the band follows `childLodDist`.
 
-This is an approximation of point 5, per cell and per tier. Per-entity `lodDist` overrides and the
-`parentIndex`/`numChildren` links are not used: an entity row doesn't say which map file it came from, and
-`parentIndex` is an index into that file's entity table.
+The viewer approximates point 5 with distance bands per cell and tier. The entity export omits the
+map identity and the ordinal in the map's `entities` reference array that a loader needs to follow individual
+parent links.
+
+Two terrain regions on Xbox 1.0.2.1 give a cross-map example. In each tested HD and LOD map, `CMapData.parent` is zero.
+The schema member `75d16adf` at +0x58 is an array with one 32-bit hash in a block of type `0x4a`. That hash
+matches the next map's `CMapData.name`. The child's signed `parentIndex` selects an ordinal in **that map's**
+`entities` reference array. Looking up the index in the HD map itself returns the child in all 127 cases.
+
+For all 127 HD/LOD pairs, the same name stem with the respective tier suffix reproduced both stored archetype
+keys (JOAAT and Murmur3-64). Following the reference from LOD grouped the 127 children under 32 SLOD1 entities.
+At both steps, every parent's incoming count matched its `numChildren`, and its `childLodDist` matched each
+child's `lodDist`. These measurements cover single-entry arrays. Selection among multiple map references and
+the runtime switching distance remain open.
 
 ### Measured
 
