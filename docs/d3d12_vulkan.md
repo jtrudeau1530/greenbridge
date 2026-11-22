@@ -1312,14 +1312,25 @@ in two shapes:
 | 1 CBV + 2 tables | 2 | 8 | 6 | 4 |
 
 The surplus is 2 dwords under the layer's model and 4 under one-per-table, and it is the same for both shapes: the
-driver put a fixed block below the parameters. Arithmetic alone therefore does not separate the two models, because
-each fits with a reserved block of its own size. What it does settle is that the block sits below the parameters.
-The corpus census above places the lowest CS pointer at s4, with `const32` reads at s1, s3, s5 and s7. A 4-dword
-reserved block with one dword per table starts the CS parameters at s4 and reproduces both totals exactly (10 + 4
-and 4 + 4). The layer's two-dwords-per-table model needs a 2-dword block to reach the same totals, and that puts the
-first pointer at s2, which the CS reads contradict. This is consistent with one dword per table behind a 4-dword
-reserved prefix, not proof of it: nothing in the package shows which parameter each SGPR holds, and these 29 are all
-compute with every parameter visible, so they say nothing about the visibility question below.
+driver put a fixed block below the parameters. Arithmetic alone therefore does not separate the two models. The
+disassembly does (`tools/rootsig_census.py --disasm`, over the same 29 programs):
+
+- `s4` is copied into the low half of a pair, the high half zeroed, and passed to `s_load` as the base in 29 of 29;
+  `s5` is in 16. The two declared tables therefore sit at s4 and s5, one dword each, in signature order, and the 13
+  programs that never read `s5` are using only the first.
+- A 64-bit pair is copied whole from `s6:s7` in 27 of the 29. Five of those also copy from `s8:s9`, `s10:s11` and
+  `s12:s13`, which matches their four root CBVs at two dwords each. The other two read none of `s6` to `s13`: they
+  declare four CBVs and never touch them.
+- 27 read none of `s0` to `s3`. In `_05` the program adds `s0` and `s3` to `s4`, and `_07` multiplies by `s0`, so
+  the block below the tables is not always dead, but no program here uses one of those dwords as a pointer.
+
+That is `USER_SGPR = 4 + 2 per table + 2 per CBV`, which gives the measured 14 and 8, and it is the one-dword-per-
+table model behind a four-dword prefix. The CS census above agrees: its lowest pointer is s4, where a four-dword
+block puts the first table, while two dwords per table would put it at s2.
+
+Still open: which CBV index lands in which pair. The four pairs do appear in declaration order, but nothing in the
+package proves that order, and every parameter in these 29 is `D3D12_SHADER_VISIBILITY_ALL`, so they say nothing
+about the visibility question below.
 
 Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
 refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
