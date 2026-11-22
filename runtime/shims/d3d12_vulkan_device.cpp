@@ -558,7 +558,7 @@ struct DeviceState {
         view_info.format = view_format;
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-        const bool color_2d = (image.type == g::ImageType::image_2d || image.type == g::ImageType::image_2d_array) &&
+        const bool color_2d = (image.type == g::ImageType::image_2d || image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube) &&
                               (aspects & VK_IMAGE_ASPECT_COLOR_BIT);
         if (!storage && color_2d) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
@@ -2927,7 +2927,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
-        if (!desc || !desc->Count) return E_INVALIDARG;
+        if (!desc || !desc->Count || desc->NodeMask > 1) return E_INVALIDARG;  // one node
         auto* heap = new QueryHeap(state_);
         heap->attach_device(identity());
         if (const HRESULT hr = heap->create(*desc); FAILED(hr)) {
@@ -4178,13 +4178,18 @@ private:
 
     static constexpr D3D12_RESOURCE_ALLOCATION_INFO kInvalidAllocation{UINT64_MAX,
                                                                        D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
-    static UINT64 align_up(UINT64 value, UINT64 to) { return (value + to - 1) / to * to; }
+    // Saturates at the last multiple of `to` instead of wrapping, as the PC runtime's totals do.
+    static UINT64 align_up(UINT64 value, UINT64 to) {
+        return value > UINT64_MAX - (to - 1) ? UINT64_MAX / to * to : (value + to - 1) / to * to;
+    }
 
-    // Lays `count` resources out one after another; `each` (optional) gets every resource's offset, size and alignment.
+    // Lays `count` resources out one after another; `each` (optional) gets every resource's offset, size and
+    // alignment. As on the PC runtime, the total is rounded up to the largest alignment (1 for no resources) and
+    // saturates near 2^64 rather than wrapping.
     template<class Desc, class Get>
     D3D12_RESOURCE_ALLOCATION_INFO place(UINT count, const Desc* descs, Get get,
                                          D3D12_RESOURCE_ALLOCATION_INFO1* each) {
-        D3D12_RESOURCE_ALLOCATION_INFO total{0, 0};
+        D3D12_RESOURCE_ALLOCATION_INFO total{0, 1};
         bool failed = count && !descs;
         for (UINT i = 0; i < count; ++i) {
             const D3D12_RESOURCE_ALLOCATION_INFO one = failed ? kInvalidAllocation : allocation(get(i));
@@ -4195,9 +4200,11 @@ private:
             }
             const UINT64 offset = align_up(total.SizeInBytes, one.Alignment);
             if (each) each[i] = {offset, one.Alignment, one.SizeInBytes};
-            total = {offset + one.SizeInBytes, std::max(total.Alignment, one.Alignment)};
+            total = {one.SizeInBytes > UINT64_MAX - offset ? UINT64_MAX : offset + one.SizeInBytes,
+                     std::max(total.Alignment, one.Alignment)};
         }
-        return failed ? kInvalidAllocation : total;
+        return failed ? kInvalidAllocation
+                      : D3D12_RESOURCE_ALLOCATION_INFO{align_up(total.SizeInBytes, total.Alignment), total.Alignment};
     }
 
     // One resource's size and alignment, or kInvalidAllocation for a description D3D12 (or this device) rejects.
@@ -4241,6 +4248,11 @@ private:
         if (samples > 1 && (volume || one_d || resolved.MipLevels != 1 ||
                             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
+        // The PC runtime: simultaneous access only single-sampled and without depth-stencil, and no volume depth.
+        const bool depth_stencil = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
+            (volume && depth_stencil))
+            return kInvalidAllocation;
         if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
 
@@ -4254,9 +4266,10 @@ private:
         if (!state_.memory_requirements(image, need)) return kInvalidAllocation;
 
         // D3D12's alignment: 64 KiB, or 4 MiB with MSAA, unless the description asks for a small one (4 KiB, 64 KiB
-        // with MSAA). 4 KiB needs the resource to fit in 64 KiB and not be a render target or depth buffer; if it
-        // doesn't qualify, the PC runtime calls the description invalid rather than answering with 64 KiB. The MSAA
-        // 64 KiB alignment has no size limit there. Both measured in d3d12_vulkan_device_test.
+        // with MSAA). 4 KiB needs the top mip of one array slice to fit in 16 tiles of 4 KiB and the resource not to
+        // be a render target or depth buffer; mips and array slices don't count. If it doesn't qualify, the PC
+        // runtime calls the description invalid rather than answering with 64 KiB. The MSAA 64 KiB alignment has no
+        // size limit there. Both measured in d3d12_vulkan_device_test.
         UINT64 alignment = 0;
         if (samples > 1) {
             if (desc.Alignment && desc.Alignment != align_msaa_64k && desc.Alignment != align_msaa_4m)
@@ -4264,11 +4277,28 @@ private:
             alignment = desc.Alignment ? desc.Alignment : align_msaa_4m;
         } else {
             if (desc.Alignment && desc.Alignment != align_4k && desc.Alignment != align_64k) return kInvalidAllocation;
-            if (desc.Alignment == align_4k && ((desc.Flags & attachment) || need.size > align_64k))
+            if (desc.Alignment == align_4k && ((desc.Flags & attachment) || !small_tiles_fit(desc, format, need.size)))
                 return kInvalidAllocation;
             alignment = desc.Alignment ? desc.Alignment : align_64k;
         }
         return {align_up(need.size, alignment), alignment};
+    }
+
+    // Whether 16 tiles of 4 KiB (leonida::small_tile_shape; 4096 bytes of a row for 1D) cover the top mip of one
+    // array slice, the PC runtime's test for D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT.
+    static bool small_tiles_fit(const D3D12_RESOURCE_DESC& desc, const Format& format, VkDeviceSize vulkan_size) {
+        const leonida::BlockFormat block = leonida::block_format(format.format, VK_IMAGE_ASPECT_COLOR_BIT);
+        const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        leonida::TileShape shape = leonida::small_tile_shape(volume, block.bytes);
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && shape.width) shape = {4096 / block.bytes, 1, 1};
+        // shortcut: untileable element sizes (3- and 12-byte formats) keep the whole-resource 64 KiB test; measure
+        // them on the PC runtime if a game asks for one.
+        if (!shape.width) return vulkan_size <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        const auto tiles = [](UINT64 texels, UINT64 per_block, UINT64 per_tile) {
+            return ((texels + per_block - 1) / per_block + per_tile - 1) / per_tile;
+        };
+        return tiles(desc.Width, block.block, shape.width) * tiles(desc.Height, block.block, shape.height) *
+                   tiles(volume ? desc.DepthOrArraySize : 1, 1, shape.depth) <= 16;
     }
 
     // Writes the view's T# into the slot and makes sure set 0 and the hash table know it. A view that cannot be

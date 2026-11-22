@@ -81,6 +81,23 @@ one of those rules, so it is reported separately and is not rewritten to `$(comm
 The 43 locator sites are 21 distinct strings in 2 non-manifest documents. None of them is used to
 invent a document edge.
 
+### What the locators point at
+
+The two kinds behave differently, and only one needs the table of contents:
+
+| Locator | Sites | Distinct | Shape | Resolves |
+|---|---:|---:|---|---|
+| `parentPath` | 40 | 20 | always `../Item[@key='<key>']` | **40 of 40** to a sibling `Item` in the same list of the same document |
+| `parentFile` | 3 | 1 | `<dir>/<name>.<ext>`, a relative file path | no: needs a file name, so the table of contents |
+
+All 40 `parentPath` sites are in the one `CDoorInteractionDataList` document, on items of its
+`DoorInteractionDataSets` list (56 items, 56 distinct `key`s). Read as an XPath step from the item, `..` is the
+list and `Item[@key='K']` selects the sibling with that key; every `K` exists (case-insensitive). The result is
+single inheritance inside the list: following parents gives depth 0 for 16 items, 1 for 35, 2 for 3, 3 for 1
+and 4 for 1, with no cycles. So these are in-document references that a loader can resolve without any archive
+path, by key lookup within the parent list. The 3 `parentFile` sites are all in `CEnergyConfigInfos` and name
+the same other file.
+
 ## Unresolved references
 
 | Bucket | Sites | Note |
@@ -107,6 +124,12 @@ This is not a runtime schema. The catalog knows 118 root names, 5,293 element na
 names, but not field types. It also cannot supply names for the archive targets: that needs a
 documented TOC reader, which is outside this work.
 
+`parentPath` inheritance is the one reference a loader can follow inside a document. The tool reports it
+under `parent_path_inheritance`: a locator of the form `../Tag[@attr='value']` is resolved against the
+siblings of the element that carries it, by exact string match. On this `common.rpf` all 40 sites take that
+form and all 40 resolve (none ambiguous), in one document; the linked items sit at inheritance depth 1 (35),
+2 (3), 3 (1) and 4 (1), with no cycles. These links stay outside the document graph and its edge counts.
+
 ## Limits
 
 - The table of contents is encrypted, so target paths are namespaces and strings, not document ids.
@@ -115,7 +138,8 @@ documented TOC reader, which is outside this work.
   unknown and contribute no edges.
 - Content-set joining is exact string equality. `common:/`, `$(common)/`, case and slash variants
   are not normalized; the 31 `common:/` entries stay unresolved.
-- `parentPath` and `parentFile` are locators, not mounts. They are counted, not followed.
+- `parentPath` and `parentFile` are locators, not mounts. They are counted, not followed by the tool.
+  The 40 `parentPath` sites resolve inside their own document (see above); the 3 `parentFile` sites do not.
 - Only `filename`, `loadPath`, `includedSets`, `parentPath` and `parentFile` are modeled. No
   XInclude occurs in the corpus, and no general include processor is implemented.
 - The counts are for this version's `common.rpf`; another package can differ.

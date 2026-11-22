@@ -76,6 +76,20 @@ constexpr TileShape element_tile_shape(bool volume, std::uint32_t element_bytes)
     }
 }
 
+// The 4 KiB tile shape in elements the PC runtime counts to allow D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT (16 of
+// them must cover a texture's top mip), or {} as above. Measured with GetResourceAllocationInfo on an RTX 5070 and
+// WARP (d3d12_vulkan_device_test).
+constexpr TileShape small_tile_shape(bool volume, std::uint32_t element_bytes) {
+    switch (element_bytes) {
+    case 1: return volume ? TileShape{16, 16, 16} : TileShape{64, 64, 1};
+    case 2: return volume ? TileShape{16, 16, 8} : TileShape{64, 32, 1};
+    case 4: return volume ? TileShape{16, 8, 8} : TileShape{32, 32, 1};
+    case 8: return volume ? TileShape{8, 8, 8} : TileShape{32, 16, 1};
+    case 16: return volume ? TileShape{8, 8, 4} : TileShape{16, 16, 1};
+    default: return {};
+    }
+}
+
 // False when the resource cannot be tiled: an untileable element size, no mips, or more than 2^32 tiles.
 inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
     out = {};
