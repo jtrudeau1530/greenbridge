@@ -334,6 +334,7 @@ def main(argv=None) -> int:
     # Stage every report next to its destination, then swap them all in. A write that fails part-way must
     # leave the previous reports intact instead of truncating the ones that came before it.
     staged = []
+    originals = {}
     try:
         for dest, fields, rows in jobs:
             parent = os.path.dirname(os.path.abspath(dest))
@@ -346,9 +347,29 @@ def main(argv=None) -> int:
                 raise OSError(f"{dest} is a directory")
         for tmp, dest in staged:
             os.chmod(tmp, published_mode(dest))
+        # Move every old report aside before putting any new one in place. On Windows a report held
+        # open by a reader cannot be renamed; failing here leaves all the originals untouched.
+        for _tmp, dest in staged:
+            if os.path.lexists(dest):
+                fd, backup = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dest)),
+                                              prefix=".text_tables-old-", suffix=".csv")
+                os.close(fd)
+                os.remove(backup)
+                os.replace(dest, backup)
+                originals[dest] = backup
+            else:
+                originals[dest] = None
         for tmp, dest in staged:
             os.replace(tmp, dest)
     except OSError as error:
+        for dest, backup in originals.items():
+            try:
+                if os.path.lexists(dest):
+                    os.remove(dest)
+                if backup is not None:
+                    os.replace(backup, dest)
+            except OSError:
+                pass
         for tmp, _ in staged:
             try:
                 os.remove(tmp)
@@ -356,6 +377,12 @@ def main(argv=None) -> int:
                 pass
         print(f"text_tables: error: cannot write: {error}", file=sys.stderr)
         return 2
+    for backup in originals.values():
+        if backup is not None:
+            try:
+                os.remove(backup)
+            except OSError:
+                pass
     with_text = collections.Counter()
     for row in scan.dialogue_rows():
         for lang in langs:
