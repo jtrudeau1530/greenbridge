@@ -1386,6 +1386,8 @@ class Gen:
         """buffer_atomic_<op> vdata, vaddr, s[V#], soffset ...: 32-bit atomic at the element address (buffer device
         address). With 'glc' the pre-op value is returned in vdata. Inactive lanes don't touch memory."""
         kind = op[len("buffer_atomic_"):]
+        if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
+            return self.buffer_atomic_x2(op, kind[:-3], a, mods)
         if kind not in self.BUF_ATOMICS or "x2" in kind:
             raise Unsupported(op)
         spv, neutral = self.BUF_ATOMICS[kind]
@@ -1415,6 +1417,45 @@ class Gen:
         self.emit(f"{old} = OpPhi %uint {res_do} {lbl_do} {self.cu(0)} {pre_label}")
         if "glc" in mods:
             self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, old)
+
+    def buffer_atomic_x2(self, op, kind, a, mods):
+        """buffer_atomic_{and,or,xor,swap}_x2 vdata[0:1], vaddr, s[V#], soffset: M = op(M, DATA) on the 64-bit element
+        (two dwords, low first); with glc the old 64 bits are returned in vdata. A bitwise op or an exchange leaves the
+        same memory done one dword at a time, so each dword is its own 32-bit atomic and no Int64 atomics are needed;
+        the returned pair is two reads, so another lane's 64-bit op on the same element between them could be seen half
+        done. The bounds check covers the whole 8-byte element, all or nothing, as for a typed element (a 32_32
+        format): how hardware treats a 64-bit atomic that is only partly in range is not measured."""
+        vd = a[0]
+        if vd["k"] != "vgpr" or vd.get("n", 1) != 2:
+            raise Unsupported(op + " data")
+        addr, _, in_b = self.buffer_address(a, mods, elem="fmt", fixed_fmt=62)
+        vals = [self.load_reg("vgpr", vd["r"] + w) for w in range(2)]
+        cond = self.tmp()
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        ptr = self.tmp()
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+        res = []
+        for w in range(2):
+            p, r = self.tmp(), self.tmp()
+            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
+            self.emit(f"{r} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
+            res.append(r)
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        olds = []
+        for w in range(2):                     # both OpPhi first: they must open the merge block
+            old = self.tmp()
+            # an inactive or out-of-range lane returns 0, as buffer_atomic does
+            self.emit(f"{old} = OpPhi %uint {res[w]} {lbl_do} {self.cu(0)} {pre}")
+            olds.append(old)
+        if "glc" in mods:
+            for w in range(2):
+                self.dst({"k": "vgpr", "r": vd["r"] + w, "n": 1}, olds[w])
 
     def current_label_placeholder(self):
         """Label of the block currently being emitted (needed for OpPhi). Blocks are opened by OpLabel lines;
