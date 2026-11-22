@@ -41,6 +41,10 @@ import os
 import sys
 import unicodedata
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 SLOT_ROLES = {
     "C8E8C282": "diffusetex",
     "C6F46E79": "speculartex",
@@ -359,15 +363,6 @@ def _path_key(path):
     if _case_insensitive_volume(path):
         path = unicodedata.normalize("NFD", path.casefold())
     return path
-
-
-def same_report_path(first: str, second: str) -> bool:
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def check_report_path(parser: argparse.ArgumentParser, flag: str, path: str, sources: list) -> None:

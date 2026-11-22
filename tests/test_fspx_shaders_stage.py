@@ -281,6 +281,9 @@ class ShadersStageWithTheDll(unittest.TestCase):
                         f.write('[{"name": "shader"}]')
                 elif tool == "shader_disasm.py":
                     os.makedirs(os.path.join(dxbc, "disasm"), exist_ok=True)
+                    # make_game checks that every unpacked shader got a non-empty listing
+                    with open(os.path.join(dxbc, "disasm", "shader.s"), "w") as f:
+                        f.write("s_endpgm\n")
                 elif tool == "rdna2spirv.py":
                     touch(args[args.index("--out") + 1], "index.json")
                     with open(os.path.join(args[args.index("--out") + 1], "index.json"), "w") as f:

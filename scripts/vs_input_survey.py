@@ -125,10 +125,14 @@ def main():
     legacy = not (m.get("exp prim") or m.get("s_sendmsg") or m.get("v_mbcnt"))
     print("layout:", "legacy (non-NGG) VS" if legacy else "NGG markers present: check the VS input layout")
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(r, f, indent=1)
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

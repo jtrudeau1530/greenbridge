@@ -493,6 +493,9 @@ int main() {
               std::strcmp(pkg_id, "CustomTestPackageId_123456789012") == 0,
           "XPackageGetCurrentProcessPackageIdentifier respects LEONIDA_PACKAGE_ID override");
     SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", nullptr);
+    // pkg_id still holds the override; the mount checks below need the game's own identifier again.
+    check(package_id(sizeof(pkg_id), pkg_id) == S_OK && std::strlen(pkg_id) == 32,
+          "XPackageGetCurrentProcessPackageIdentifier returns the default again once the override is cleared");
 
     auto mount_pkg = get<PackageMountFn>("XPackageMount");
     auto close_mount = get<PackageCloseMountHandleFn>("XPackageCloseMountHandle");

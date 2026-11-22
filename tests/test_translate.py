@@ -865,7 +865,8 @@ def _gather_l(s_word0, dynamic=False, s_word1=0):
         "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
         "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
         f"s_mov_b32 s16, {s_word0}\ns_mov_b32 s17, {s_word1}\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
-        + ("s_add_u32 s16, s16, 0\n" if dynamic else "")
+        # A loaded word, not s16 + 0: SHADER-315 folds scalar ALU on constants, which made the sampler a literal.
+        + ("s_load_dword s16, s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n" if dynamic else "")
         + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
         "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
 
@@ -958,7 +959,8 @@ def _gather_l_border(word0, word3, dynamic=False, dmask=1):
         "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
         "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
         f"s_mov_b32 s16, {word0}\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, {word3}\n"
-        + ("s_add_u32 s16, s16, 0\ns_add_u32 s19, s19, 0\n" if dynamic else "")
+        + ("s_load_dword s16, s[0:1], 0x0\ns_load_dword s19, s[0:1], 0x4\ns_waitcnt lgkmcnt(0)\n"
+           if dynamic else "")
         + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
         f"image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:{dmask:#x} dim:SQ_RSRC_IMG_2D")
 
