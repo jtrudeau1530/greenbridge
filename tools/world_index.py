@@ -400,13 +400,33 @@ def _directory_files(path):
             yield os.path.join(root, name)
 
 
+def _carve_successors(folder):
+    """{file: next file} for streams that were contiguous in the archive, from rpf9_carve.py's index.json in
+    `folder` (each file is <offset>.bin; the next stream starts at the 16-byte boundary after `stored`). Empty
+    when there is no readable index, so files are then parsed one by one."""
+    try:
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+            entries = json.load(f).get("files", [])
+        by_off = {int(e["off"]): int(e["stored"]) for e in entries}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
+    return {f"{off:012x}.bin": f"{(off + stored + 15) & ~15:012x}.bin"
+            for off, stored in by_off.items() if (off + stored + 15) & ~15 in by_off}
+
+
 def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
     """Scan an RPF9 archive, or every carved file in a directory."""
     if directory_files is not None or os.path.isdir(path):
         rows, stats = [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
         if directory_files is None:
             directory_files = _directory_files(path)
+        directory_files = list(directory_files)
+        listed = set(directory_files)
+        successors = {}   # folder -> _carve_successors(folder)
+        consumed = set()
         for p in directory_files:
+            if p in consumed:
+                continue
             with open(p, "rb") as f:
                 head = f.read(4)
             if head == b"9FPR":
@@ -419,9 +439,32 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                 continue
             with open(p, "rb") as f:
                 b = f.read(max_inflate + 1)
-            row = parse_resource(b, collect)
             stats["files"] += 1
             stats["scanned_bytes"] += len(b)
+            # As in scan_rpf: a 0DRPz resource that needs a continuation takes the next stream, when the
+            # carve's index.json shows that stream started right after this one.
+            root = os.path.dirname(p)
+            if root not in successors:
+                successors[root] = _carve_successors(root)
+            nxt = successors[root]
+            current = os.path.basename(p)
+            for _ in range(2):
+                if b[0x10:0x15] != b"0DRPz" or (parse_resource(b) is not None and not _needs_continuation(b)):
+                    break
+                follow = nxt.get(current)
+                q = os.path.join(root, follow) if follow is not None else None
+                if q is None or q not in listed:
+                    break
+                if len(b) + os.path.getsize(q) > max_inflate:
+                    break
+                with open(q, "rb") as f:
+                    more = f.read()
+                b += more
+                consumed.add(q)
+                stats["files"] += 1
+                stats["scanned_bytes"] += len(more)
+                current = follow
+            row = parse_resource(b, collect)   # collect once, on the joined resource
             if row is not None:
                 row["offset"] = 0
                 row["size"] = len(b)
