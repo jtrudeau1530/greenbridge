@@ -224,6 +224,20 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(records[0]["chunks"], 1)
         self.assertEqual(summary["streams"], 2)
 
+    def test_directory_skips_the_carvers_index_and_reports(self):
+        """rpf9_carve.py writes index.json next to the streams; it and a report are not payloads."""
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        with open(os.path.join(self.root, "00000001.bin"), "wb") as f:
+            f.write(b"PSIN" + bytes(60))
+        with open(os.path.join(self.root, "index.json"), "w", encoding="utf-8") as f:
+            f.write('[{"off": 0, "stored": 16}]')
+        with open(os.path.join(self.root, "report.csv"), "w", encoding="utf-8") as f:
+            f.write("offset,size\n")
+        rows, records, summary = rbf0_index.scan_dir(self.root)
+        self.assertEqual(summary["streams"], 2)
+        self.assertEqual(sorted(r["offset"] for r in rows), [0, 1])
+
 
 class ArgumentTest(unittest.TestCase):
     """Out-of-range scan arguments are refused before anything is written."""

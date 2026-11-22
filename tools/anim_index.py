@@ -400,7 +400,8 @@ def scan_dir(path, progress=None):
     entries = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         with open(full, "rb") as f:
             data = f.read()
