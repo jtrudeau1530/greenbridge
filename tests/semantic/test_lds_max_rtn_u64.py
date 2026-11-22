@@ -278,6 +278,56 @@ class DSMaxRtnU64Instruction:
         return cls(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=offset_val)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState64:
+    """Scalar thread architectural execution state with 64-bit VGPR pair access."""
+
+    def __init__(self, lds: Optional[LDSMemory64] = None) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.lds: LDSMemory64 = lds if lds is not None else LDSMemory64()
+
+    def get_vgpr_u32(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def set_vgpr_u32(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+
+    def get_vgpr_u64(self, idx: int) -> int:
+        lo = self.vgprs[idx]
+        hi = self.vgprs[idx + 1]
+        return lo | (hi << 32)
+
+    def set_vgpr_u64(self, idx: int, val: int) -> None:
+        v = u64(val)
+        self.vgprs[idx] = v & MASK32
+        self.vgprs[idx + 1] = (v >> 32) & MASK32
+
+
+class ScalarDSInterpreter64:
+    """Deterministic scalar execution interpreter for 64-bit Data Share (DS) instructions."""
+
+    def execute(self, state: ScalarThreadState64, inst: DSMaxRtnU64Instruction) -> int:
+        """Execute ds_max_rtn_u64 on scalar thread state.
+
+        1. Read address from inst.vaddr (single 32-bit VGPR).
+        2. Read data from inst.vdata0 (64-bit VGPR pair).
+        3. Perform atomic unsigned maximum on LDS at eff_addr = vaddr + offset.
+        4. Write original 64-bit value into inst.vdst (64-bit VGPR pair).
+        5. Returns the returned old 64-bit memory value.
+        """
+        vaddr = state.get_vgpr_u32(inst.vaddr.index)
+        vdata = state.get_vgpr_u64(inst.vdata0.index)
+        old_val, _ = state.lds.atomic_max_rtn_u64(vaddr, vdata, inst.offset)
+        state.set_vgpr_u64(inst.vdst.index, old_val)
+        return old_val
+
+
 class TestLDSMaxRtnU64OracleAndModel(unittest.TestCase):
     """Phase 1: Unit tests for unsigned 64-bit integer oracle and LDS architectural model."""
 
@@ -421,6 +471,114 @@ class TestDSMaxRtnU64AST(unittest.TestCase):
         inst = DSMaxRtnU64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata, offset=128)
         parsed = DSMaxRtnU64Instruction.parse(inst.to_assembly())
         self.assertEqual(inst, parsed)
+
+
+class TestDSMaxRtnU64ScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(size_bytes=4096)
+        self.state = ScalarThreadState64(lds=self.lds)
+        self.interp = ScalarDSInterpreter64()
+
+    def test_scalar_execution_basic_update(self) -> None:
+        addr = 0x20
+        self.lds.write_qword(addr, 0x100000000)
+        self.state.set_vgpr_u32(2, addr)                    # v2 is vaddr
+        self.state.set_vgpr_u64(4, 0x200000000)             # v[4:5] is vdata0
+        self.state.set_vgpr_u64(0, 0xDEADBEEFCAFEBABE)      # v[0:1] is vdst initial
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x100000000)
+        self.assertEqual(self.state.get_vgpr_u64(0), 0x100000000)
+        self.assertEqual(self.lds.read_qword(addr), 0x200000000)
+
+    def test_scalar_execution_no_update(self) -> None:
+        addr = 0x40
+        self.lds.write_qword(addr, 0x500000000)
+        self.state.set_vgpr_u32(2, addr)
+        self.state.set_vgpr_u64(4, 0x300000000)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x500000000)
+        self.assertEqual(self.state.get_vgpr_u64(0), 0x500000000)
+        self.assertEqual(self.lds.read_qword(addr), 0x500000000)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        base_addr = 0x20
+        offset = 0x18  # 24 bytes
+        eff_addr = base_addr + offset  # 0x38 (aligned to 8 bytes)
+        self.lds.write_qword(eff_addr, 0x1111222233334444)
+        self.state.set_vgpr_u32(2, base_addr)
+        self.state.set_vgpr_u64(4, 0x9999888877776666)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+            offset=offset,
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x1111222233334444)
+        self.assertEqual(self.state.get_vgpr_u64(0), 0x1111222233334444)
+        self.assertEqual(self.lds.read_qword(eff_addr), 0x9999888877776666)
+        self.assertEqual(self.lds.read_qword(base_addr), 0)
+
+    def test_scalar_execution_sequential_running_maximum(self) -> None:
+        addr = 0x80
+        self.lds.write_qword(addr, 100)
+        self.state.set_vgpr_u32(2, addr)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+
+        sequence = [
+            (200, 100, 200),
+            (150, 200, 200),
+            (0x100000000, 200, 0x100000000),
+            (0x8000000000000000, 0x100000000, 0x8000000000000000),
+            (UINT64_MAX, 0x8000000000000000, UINT64_MAX),
+            (0x500, UINT64_MAX, UINT64_MAX),
+        ]
+
+        for op_val, expected_old, expected_new in sequence:
+            self.state.set_vgpr_u64(4, op_val)
+            ret = self.interp.execute(self.state, inst)
+            self.assertEqual(ret, expected_old)
+            self.assertEqual(self.state.get_vgpr_u64(0), expected_old)
+            self.assertEqual(self.lds.read_qword(addr), expected_new)
+
+    def test_scalar_unaligned_address_drop_low_3_bits(self) -> None:
+        self.lds.write_qword(0x40, 0xCAFE00000000BABE)
+        # Low 3 bits of 0x47 are 0b111; should map to aligned 0x40
+        self.state.set_vgpr_u32(2, 0x47)
+        self.state.set_vgpr_u64(4, 0xCAFE00000000FFFF)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0xCAFE00000000BABE)
+        self.assertEqual(self.lds.read_qword(0x40), 0xCAFE00000000FFFF)
 
 
 if __name__ == "__main__":
