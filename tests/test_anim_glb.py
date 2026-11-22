@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "anim_glb.py")
@@ -395,6 +396,35 @@ class ExportTest(unittest.TestCase):
         for got, want in zip(values, tracks[0]):
             for a, b in zip(got, want):
                 self.assertAlmostEqual(a, b, places=5)
+
+    def test_dictionary_lookup_stops_before_adjacent_resource(self):
+        data = clips_fixture.two_sequence_dictionary()
+        _, selected, _ = clips_fixture.write_rpf(self.anim, [data] * 3)
+        with patch.object(anim_glb.anim_index, "classify", wraps=anim_glb.anim_index.classify) as classify:
+            system, _dictionary = anim_glb.load_dictionary(self.anim, selected)
+        self.assertEqual(system.d, data)
+        self.assertEqual([call.args[1] for call in classify.call_args_list], [selected])
+
+    def test_export_reads_page_map_on_sixth_page(self):
+        data = bytearray(clips_fixture.two_sequence_dictionary())
+        page_map = len(data)
+        data.extend(bytes(96))
+        struct.pack_into("<Q", data, 8, SYSTEM + page_map)
+        data[page_map + 8] = 6
+        cuts = [0, 256, 512, 768, 1024, page_map, len(data)]
+        pages = [data[a:b] for a, b in zip(cuts, cuts[1:])]
+        self.dict_offset = clips_fixture.write_rpf(self.anim, pages)[0]
+
+        (gltf, binary), _report = self.export()
+        (animation,) = gltf["animations"]
+        channel = next(c for c in animation["channels"]
+                       if gltf["nodes"][c["target"]["node"]]["name"] == "SKEL_A")
+        self.assertEqual(channel["target"]["path"], "rotation")
+        sampler = animation["samplers"][channel["sampler"]]
+        values = accessor_values(gltf, binary, sampler["output"])
+        self.assertEqual(len(values), clips_fixture.NF)
+        for rotation, x in zip(values, clips_fixture.X_INTS):
+            self.assertAlmostEqual(rotation[0], 0.002 * x - 0.05, places=5)
 
     def test_no_root_motion_leaves_the_mover_node_out(self):
         (gltf, _binary), _report = self.export("--no-root-motion")

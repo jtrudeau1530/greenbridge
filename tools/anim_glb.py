@@ -387,11 +387,23 @@ def bind_part(meshes, joints, max_influences=8):
 # ---------------------------------------------------------------- clips
 
 
+def contiguous_rows(m, offset):
+    end = min(len(m), offset + (64 << 20))
+    while 0 <= offset < end and anim_index.ZHDR.match(m, offset):
+        data, used = skin_streams.inflate_at(m, offset, end)
+        if data is None or len(data) < 64:
+            break
+        yield anim_index.classify(data, offset, used)
+        offset = (offset + used + 15) & ~15
+
+
 def load_dictionary(path, offset):
     """Parse the clip dictionary whose root stream starts at `offset` -> (System, dictionary)."""
-    rows, _walk = anim_index.scan_rpf(path, offset, 64 << 20)
     with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        groups, _unresolved, _gaps = anim_clips.group(m, rows[:4])
+        streams = contiguous_rows(m, offset)
+        first = next(streams, None)
+        rows = [first] if first is not None else []
+        groups, _unresolved, _gaps = anim_clips.group(m, rows, first_row_only=True, continuation_rows=streams)
     require(groups and rows[groups[0][0]]["offset"] == offset, f"no clip dictionary starts at 0x{offset:x}")
     data = b""
     with open(path, "rb") as fh:

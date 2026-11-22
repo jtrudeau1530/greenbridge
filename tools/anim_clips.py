@@ -554,11 +554,21 @@ def segment(rows, k):
 _MAP_BOUNDARIES = anim_index.STOP_SIGNATURES - {"name-table", "skeleton-names"}
 
 
-def group(m, rows, *, first_row_only: bool = False):
+def group(m, rows, *, first_row_only: bool = False, continuation_rows=None):
     """-> ([(root index, [stream indices or gap pages])], unresolved count by reason, gap pages by kind). A
     dictionary takes the page map's system page count of back-to-back streams. When the last page is not the next
     listed stream, the bytes right after the stream are tried (`_gap_page`); otherwise the root is reported.
-    With first_row_only, later rows supply continuation pages but cannot start other dictionaries."""
+    With first_row_only, later rows supply continuation pages but cannot start other dictionaries.
+    A selected-root caller can supply continuation_rows to discover rows on demand."""
+    def has_next(k):
+        if k + 1 < len(rows):
+            return True
+        row = next(continuation_rows, None) if continuation_rows is not None else None
+        if row is None:
+            return False
+        rows.append(row)
+        return True
+
     out, unresolved, taken, gaps = [], collections.Counter(), set(), collections.Counter()
     for i, row in enumerate(rows[:1] if first_row_only else rows):
         if i in taken or row["signature"] != "zero-prefix":
@@ -573,7 +583,7 @@ def group(m, rows, *, first_row_only: bool = False):
         count_at = pm + 8
         counts = data[count_at:count_at + 2]
         end = len(data)
-        while len(counts) < 2 and len(parts) < 255 and k + 1 < len(rows):
+        while len(counts) < 2 and len(parts) < 255 and has_next(k):
             following = rows[k + 1]
             if not _next_to(rows[k], following) or following["signature"] in _MAP_BOUNDARIES:
                 break
@@ -599,7 +609,7 @@ def group(m, rows, *, first_row_only: bool = False):
         if graphics:
             unresolved["graphics pages"] += 1
             continue
-        while len(parts) < pages and k + 1 < len(rows) and _next_to(rows[k], rows[k + 1]):
+        while len(parts) < pages and has_next(k) and _next_to(rows[k], rows[k + 1]):
             k += 1
             parts.append(k)
         if len(parts) == pages - 1:
