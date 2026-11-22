@@ -971,5 +971,80 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(root0, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_square_root_precision(self) -> None:
+        # Smallest subnormal: 2^-24 -> sqrt(2^-24) = 2^-12 = 0x0C00
+        min_sub = 0x0001
+        res = oracle_v_sqrt_f16(min_sub)
+        self.assertEqual(res, 0x0C00)
+        self.assertFalse(is_subnormal(res))
+        self.assertEqual(bits_to_f16(res), 2.0 ** -12)
+
+        # 4 * 2^-24 -> sqrt is 2 * 2^-12 = 2^-11 = 0x1000
+        sub_four = 0x0004
+        res_four = oracle_v_sqrt_f16(sub_four)
+        self.assertEqual(res_four, 0x1000)
+        self.assertEqual(bits_to_f16(res_four), 2.0 ** -11)
+
+    def test_subnormal_produces_normal(self) -> None:
+        # Square root of any positive non-zero subnormal in binary16 produces a normal number
+        for sub in [0x0001, 0x0002, 0x0010, 0x0100, 0x03FF]:
+            with self.subTest(sub=hex(sub)):
+                res = oracle_v_sqrt_f16(sub)
+                self.assertFalse(is_subnormal(res))
+                _, exp, _ = split_f16_bits(res)
+                self.assertGreater(exp, 0)
+
+    def test_largest_subnormal_sqrt(self) -> None:
+        max_sub = 0x03FF
+        res = oracle_v_sqrt_f16(max_sub)
+        expected = f16_to_bits(math.sqrt(bits_to_f16(max_sub)))
+        self.assertEqual(res, expected)
+
+    def test_nan_signaling_to_quiet_conversion(self) -> None:
+        snan = 0x7C05
+        self.assertTrue(is_snan(snan))
+        res = oracle_v_sqrt_f16(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertEqual(res, snan | QNAN_BIT)
+
+    def test_nan_payload_preservation(self) -> None:
+        payload_qnan = 0x7E33
+        res = oracle_v_sqrt_f16(payload_qnan)
+        self.assertEqual(res, payload_qnan)
+
+    def test_nan_with_modifiers(self) -> None:
+        qnan = 0x7E12
+        # abs clears sign bit on negative NaN
+        res_abs = oracle_v_sqrt_f16(qnan | SIGN_MASK, abs0=True)
+        self.assertEqual(res_abs & SIGN_MASK, 0)
+        self.assertTrue(is_qnan(res_abs))
+
+        # neg sets sign bit on positive NaN
+        res_neg = oracle_v_sqrt_f16(qnan, neg0=True)
+        self.assertEqual(res_neg & SIGN_MASK, SIGN_MASK)
+
+    def test_nan_with_clamp(self) -> None:
+        qnan = CANONICAL_QNAN
+        res = oracle_v_sqrt_f16(qnan, clamp=True)
+        self.assertEqual(res, POS_ZERO)
+
+    def test_infinity_arithmetic_boundaries(self) -> None:
+        self.assertEqual(oracle_v_sqrt_f16(POS_INF), POS_INF)
+        self.assertEqual(oracle_v_sqrt_f16(NEG_INF), CANONICAL_QNAN)
+        self.assertEqual(oracle_v_sqrt_f16(POS_INF, clamp=True), ONE_F16)
+        self.assertEqual(oracle_v_sqrt_f16(NEG_INF, clamp=True), POS_ZERO)
+
+    def test_round_to_nearest_even_ties(self) -> None:
+        # In binary16, verify RNE rounding on values around 1.0 + epsilon
+        for val in [1.0, 1.5, 2.0, 3.0, 5.0, 7.0]:
+            bits = f16_to_bits(val)
+            res = oracle_v_sqrt_f16(bits)
+            expected = f16_to_bits(math.sqrt(val))
+            self.assertEqual(res, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
