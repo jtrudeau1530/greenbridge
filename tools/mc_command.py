@@ -1,7 +1,8 @@
 """Resolve LLVM_MC to an argv list.
 
-LLVM_MC may be one executable (a path, spaces and all) or a whole command line. Windows needs the command-line
-form when llvm-mc runs inside WSL, because the official Windows LLVM build has no AMDGPU target:
+LLVM_MC may be one executable (a path, spaces and all, with or without its .exe) or a whole command line. Windows
+needs the command-line form when llvm-mc runs inside WSL, because the official Windows LLVM build has no AMDGPU
+target:
 
     set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
 """
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 
 
 def split_command(raw: str) -> list:
@@ -18,6 +20,10 @@ def split_command(raw: str) -> list:
         return []
     if os.path.isfile(raw):
         return [raw]                    # a plain path, spaces and all
+    if ("/" in raw or "\\" in raw) and shutil.which(raw):
+        # A path whose extension is left out (C:\Program Files\LLVM\bin\llvm-mc): Windows finds llvm-mc.exe
+        # for it, but it is no file under that exact name, so it used to be split at its spaces.
+        return [raw]
     try:
         if os.name != "nt":
             parts = shlex.split(raw)
