@@ -1,0 +1,305 @@
+"""Synthetic tests for tools/skinned_glb.py.
+
+    python -I tests/test_skinned_glb.py
+
+Every model, skeleton, skin stream and GLB here is built by the test. No game
+file, value or name is used. The fixture is a three-bone ped skeleton, a
+two-entry drawable palette and a three-vertex 8-influence skin buffer.
+"""
+import json
+import math
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+import glb_writer  # noqa: E402
+import skinned_glb  # noqa: E402
+
+
+def _matrix(translation=(0.0, 0.0, 0.0)):
+    return [1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            float(translation[0]), float(translation[1]), float(translation[2]), 1.0]
+
+
+def _write_json(path, value):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2)
+
+
+def _write_glb(path):
+    primitive = {
+        "positions": [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+        "normals": [(0.0, 0.0, 1.0)] * 3,
+        "uvs": [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+        "indices": [0, 1, 2],
+    }
+    with open(path, "wb") as handle:
+        handle.write(glb_writer.build_glb([primitive]))
+
+
+def _section_word(offset, fmt):
+    return ((offset // 2) << 8) | fmt
+
+
+def _skin_buffer(j0, j1, w0, w1, *, omit_slot=None):
+    """Graphics buffer with the measured 23-word section header and 4-byte rows."""
+    offsets = {6: 0x100, 7: 0x110, 8: 0x120, 9: 0x130}
+    formats = {6: 0x26, 7: 0x26, 8: 0x25, 9: 0x25}
+    data = {6: w0, 7: w1, 8: j0, 9: j1}
+    blob = bytearray(0x160)
+    for slot in (6, 7, 8, 9):
+        if slot == omit_slot:
+            continue
+        struct.pack_into("<I", blob, slot * 4, _section_word(offsets[slot], formats[slot]))
+        blob[offsets[slot]:offsets[slot] + len(data[slot])] = data[slot]
+    return bytes(blob)
+
+
+def _skeleton():
+    """A three-bone RAGE Z-up bind pose: root, spine, left upper arm."""
+    return [
+        {"index": 0, "name": "SKEL_ROOT", "parent": None, "bind_matrix": _matrix()},
+        {"index": 1, "name": "SKEL_Spine", "parent": 0,
+         "bind_matrix": _matrix((0.0, 0.0, 1.0))},
+        {"index": 2, "name": "SKEL_L_UpperArm", "parent": 1,
+         "bind_matrix": _matrix((1.0, 0.0, 1.0))},
+    ]
+
+
+def _palette():
+    return [
+        skinned_glb.joaat32("SKEL_Spine"),
+        skinned_glb.joaat32("GM_TEST_L_UpperArm01_O"),
+    ]
+
+
+def _streams():
+    j0 = bytes([0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0])
+    j1 = bytes(12)
+    w0 = bytes([64, 191, 0, 0, 128, 127, 0, 0, 255, 0, 0, 0])
+    w1 = bytes(12)
+    return j0, j1, w0, w1
+
+
+def _component(root, *, own_skeleton=None, omit_slot=None):
+    directory = os.path.join(root, "component")
+    os.makedirs(os.path.join(directory, "buffers"))
+    j0, j1, w0, w1 = _streams()
+    with open(os.path.join(directory, "buffers", "01_0.bin"), "wb") as handle:
+        handle.write(_skin_buffer(j0, j1, w0, w1, omit_slot=omit_slot))
+    _write_glb(os.path.join(directory, "model.glb"))
+    model = {
+        "buffer_files": ["buffers/01_0.bin"],
+        "glb": "model.glb",
+        "vertex_count": 3,
+        "drawable": {
+            "name": "synthetic",
+            "buffers": [{"bytes": 0x160, "gfx_off": 0}],
+            "geometries": [{"vertex_buffer": 0, "index_buffer": 0}],
+            "models": [{"bone_palette": _palette()}],
+            "strings": ["GM_TEST_L_UpperArm01_O"],
+        },
+        "meshes": [{
+            "geometry": 0,
+            "model": 0,
+            "name": "synthetic_mesh",
+            "vertex_count": 3,
+            "skinned": True,
+            "skin_influences": 8,
+        }],
+    }
+    if own_skeleton is not None:
+        model["drawable"]["skeleton"] = own_skeleton
+    _write_json(os.path.join(directory, "model.json"), model)
+    return directory
+
+
+def _skeleton_dir(root):
+    directory = os.path.join(root, "skeleton")
+    os.makedirs(directory)
+    _write_json(os.path.join(directory, "model.json"), {
+        "drawable": {"skeleton": _skeleton()},
+    })
+    return directory
+
+
+def _accessor(gltf, binary, index):
+    payload, accessor = skinned_glb.accessor_bytes(gltf, binary, index)
+    return payload, accessor
+
+
+def _world_matrices(gltf):
+    nodes = gltf["nodes"]
+    parent = {}
+    for index, node in enumerate(nodes):
+        for child in node.get("children", []):
+            parent[child] = index
+    cache = {}
+
+    def world(index):
+        if index in cache:
+            return cache[index]
+        matrix = nodes[index].get(
+            "matrix", [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                       0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+        if index in parent:
+            matrix = skinned_glb.mat_mul(world(parent[index]), matrix)
+        cache[index] = matrix
+        return matrix
+
+    return world
+
+
+def _transform(matrix, point):
+    return [
+        sum(matrix[column * 4 + row] * point[column] for column in range(3)) + matrix[12 + row]
+        for row in range(3)
+    ]
+
+
+class SkinnedGlbTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = self.temp.name
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _build(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        payload, stats = skinned_glb.build_skinned_glb(skeleton, [component])
+        gltf, binary = skinned_glb.read_glb(self._write(payload))
+        return gltf, binary, stats
+
+    def _write(self, payload):
+        path = os.path.join(self.root, "out.glb")
+        with open(path, "wb") as handle:
+            handle.write(payload)
+        return path
+
+    def test_joint_count_and_palette_resolution(self):
+        _gltf, _binary, stats = self._build()
+        self.assertEqual(stats["ped_joints"], 3)
+        self.assertEqual(stats["component_joints"], 1)
+        self.assertEqual(stats["joints"], 4)
+        self.assertEqual(stats["vertices"], 3)
+        self.assertEqual(stats["triangles"], 1)
+        self.assertEqual(stats["source_weight_sum_min"], 255)
+        self.assertEqual(stats["source_weight_sum_max"], 255)
+
+    def test_weight_sums_are_one(self):
+        gltf, binary, _stats = self._build()
+        primitive = gltf["meshes"][0]["primitives"][0]
+        w0, _ = _accessor(gltf, binary, primitive["attributes"]["WEIGHTS_0"])
+        w1, _ = _accessor(gltf, binary, primitive["attributes"]["WEIGHTS_1"])
+        for vertex in range(3):
+            values = struct.unpack_from("<4f", w0, 16 * vertex) + \
+                struct.unpack_from("<4f", w1, 16 * vertex)
+            self.assertAlmostEqual(sum(values), 1.0, places=6)
+            self.assertGreater(values[0], 0.0)
+
+    def test_joint_indices_are_in_skin_range(self):
+        gltf, binary, _stats = self._build()
+        joint_count = len(gltf["skins"][0]["joints"])
+        self.assertEqual(joint_count, 4)
+        primitive = gltf["meshes"][0]["primitives"][0]
+        j0, _ = _accessor(gltf, binary, primitive["attributes"]["JOINTS_0"])
+        j1, _ = _accessor(gltf, binary, primitive["attributes"]["JOINTS_1"])
+        for vertex in range(3):
+            indices = struct.unpack_from("<4H", j0, 8 * vertex) + \
+                struct.unpack_from("<4H", j1, 8 * vertex)
+            for index in indices:
+                self.assertLess(index, joint_count)
+        # The second palette entry is the added helper joint (index 3).
+        self.assertEqual(struct.unpack_from("<4H", j0, 0), (1, 3, 0, 0))
+
+    def test_inverse_bind_round_trip(self):
+        gltf, binary, _stats = self._build()
+        skin = gltf["skins"][0]
+        ibm_payload, ibm_accessor = _accessor(gltf, binary, skin["inverseBindMatrices"])
+        self.assertEqual(ibm_accessor["count"], len(skin["joints"]))
+        inverse_binds = [struct.unpack_from("<16f", ibm_payload, 64 * index)
+                         for index in range(len(skin["joints"]))]
+        world = _world_matrices(gltf)
+        for joint, inverse_bind in zip(skin["joints"], inverse_binds):
+            product = skinned_glb.mat_mul(world(joint), inverse_bind)
+            expected = [1.0 if index in (0, 5, 10, 15) else 0.0 for index in range(16)]
+            for actual, wanted in zip(product, expected):
+                self.assertAlmostEqual(actual, wanted, places=5)
+
+        primitive = gltf["meshes"][0]["primitives"][0]
+        positions, _ = _accessor(gltf, binary, primitive["attributes"]["POSITION"])
+        j0, _ = _accessor(gltf, binary, primitive["attributes"]["JOINTS_0"])
+        j1, _ = _accessor(gltf, binary, primitive["attributes"]["JOINTS_1"])
+        w0, _ = _accessor(gltf, binary, primitive["attributes"]["WEIGHTS_0"])
+        w1, _ = _accessor(gltf, binary, primitive["attributes"]["WEIGHTS_1"])
+        for vertex in range(3):
+            point = struct.unpack_from("<3f", positions, 12 * vertex)
+            indices = struct.unpack_from("<4H", j0, 8 * vertex) + \
+                struct.unpack_from("<4H", j1, 8 * vertex)
+            weights = struct.unpack_from("<4f", w0, 16 * vertex) + \
+                struct.unpack_from("<4f", w1, 16 * vertex)
+            result = [0.0, 0.0, 0.0]
+            for index, weight in zip(indices, weights):
+                matrix = skinned_glb.mat_mul(world(skin["joints"][index]),
+                                             inverse_binds[index])
+                moved = _transform(matrix, point)
+                for axis in range(3):
+                    result[axis] += weight * moved[axis]
+            for actual, wanted in zip(result, point):
+                self.assertAlmostEqual(actual, wanted, places=5)
+
+    def test_stdlib_weight_path_agrees_with_optional_numpy(self):
+        j0, j1, w0, w1 = _streams()
+        saved = skinned_glb._np
+        try:
+            skinned_glb._np = None
+            result = skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [1, 3], 4)
+        finally:
+            skinned_glb._np = saved
+        self.assertEqual(result["sum_min"], 1.0)
+        self.assertEqual(result["sum_max"], 1.0)
+        self.assertAlmostEqual(struct.unpack_from("<4f", result["w0"], 0)[0], 64 / 255, delta=1e-6)
+
+    def test_missing_joint_stream_is_rejected(self):
+        component = _component(self.root, omit_slot=8)
+        skeleton = _skeleton_dir(self.root)
+        with self.assertRaises(skinned_glb.SkinError):
+            skinned_glb.build_skinned_glb(skeleton, [component])
+
+    def test_zero_weight_vertex_is_rejected(self):
+        j0, j1, w0, w1 = _streams()
+        broken = bytearray(w0)
+        broken[0:4] = b"\0\0\0\0"
+        with self.assertRaises(skinned_glb.SkinError):
+            skinned_glb.normalise_weights(j0, j1, bytes(broken), w1, 3, 2, [1, 3], 4)
+
+    def test_out_of_range_weighted_joint_is_rejected(self):
+        j0, j1, w0, w1 = _streams()
+        broken = bytearray(j0)
+        broken[0] = 2  # local palette has two entries; this weighted index is invalid
+        with self.assertRaises(skinned_glb.SkinError):
+            skinned_glb.normalise_weights(bytes(broken), j1, w0, w1, 3, 2, [1, 3], 4)
+
+    def test_cli_returns_nonzero_for_bad_input(self):
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "skinned_glb.py"),
+             os.path.join(self.root, "out.glb"), "--skeleton", self.root,
+             "--component", self.root],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("error:", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
