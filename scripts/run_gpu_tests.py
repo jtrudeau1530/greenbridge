@@ -799,8 +799,6 @@ def run_suite(a, work: str) -> int:
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
-                m = re.search(r"unsupported: .*", msg)
-                results.append((name, None, f"SKIP ({m.group(0) if m else 'unsupported device'})"))
                 results.append((name, None, unsupported_skip(msg)))
                 continue
             if rc != 0:
