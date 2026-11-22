@@ -17,9 +17,8 @@ method, scope and caveats. No game data is included.
 
 | Document | Measured content |
 |---|---|
-| [models.md](models.md) | 350,248 models at the `917e9b9` pin, including 159,483 drawable-dictionary children; the re-count table is in models.md. |
-| [character_models.md](character_models.md) | `packs.rpf` character parts at `e293917`: 26,585 rows / 11,335 unique names, 2,865 fragments (all a flat 25-vertex / 32-triangle 5x5 bounds grid at z=0), Lucia's 22 named records and the decoded 13-part export, the `player_story000_00` drawable set, slot-name token counts, texture coverage (184/215), and what is not decoded (fragment children, ped variation, hair, bind pose). |
 | [models.md](models.md) | 382,781 models (2.64 billion triangles, 0 decode failures) at the `e293917` pin, including 159,511 drawable-dictionary children and 55,417 fragments; the re-count table is in models.md. |
+| [character_models.md](character_models.md) | `packs.rpf` character parts at `e293917`: 26,585 rows / 11,335 unique names, 2,865 fragments (all a flat 25-vertex / 32-triangle 5x5 bounds grid at z=0), Lucia's 22 named records and the decoded 13-part export, the `player_story000_00` drawable set, slot-name token counts, texture coverage (184/215), and what is not decoded (fragment children, ped variation, hair, bind pose). |
 | [character_skeleton.md](character_skeleton.md) | Character `.#ft` fragments: the 597-name shared skeleton table (596 `joaat32` hashes), the 597-record instance tree with 580 measured parents, the model-side bone-hash mapping, and the measured vertex joint-index/skin-weight layouts (`tools/skin_streams.py`); the reference TRS is not the bind pose. |
 | [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
 | [textures.md](textures.md) | 357,115 TTPF descriptors across 57 pools: `rpf9dump` (`e293917`) decodes 354,991 strict-clean (99.41%) directly including BCPack BC1/BC3/BC4/BC5; `tools/bcpack.py` decodes all six BCPack modes (BC1–BC7). |
