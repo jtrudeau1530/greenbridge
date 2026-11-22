@@ -14,6 +14,7 @@ It does not transcribe or classify the clips; that is a separate analysis step.
 import argparse
 import csv
 import os
+import struct
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -101,7 +102,7 @@ def main(argv=None) -> int:
         for i, (path, bank) in enumerate(banks, 1):
             try:
                 rows += export_bank(path, a.out, a.min_seconds, a.max_seconds, bank=bank)
-            except (ValueError, OSError, IndexError) as e:
+            except (ValueError, struct.error, OSError, IndexError) as e:
                 print(f"  skip {bank}: {e}", file=sys.stderr)
             if i % 200 == 0:
                 print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
@@ -112,7 +113,7 @@ def main(argv=None) -> int:
             for i, fut in enumerate(as_completed(futures), 1):
                 try:
                     rows += fut.result()
-                except (ValueError, OSError, IndexError) as e:
+                except (ValueError, struct.error, OSError, IndexError) as e:
                     print(f"  skip {futures[fut]}: {e}", file=sys.stderr)
                 if i % 200 == 0:
                     print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
