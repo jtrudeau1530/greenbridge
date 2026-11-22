@@ -87,6 +87,7 @@ jobs:
           cmake -S runtime -B runtime/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DLEONIDA_D3D12_SHIM_TESTS=ON
+          -DLEONIDA_REQUIRE_VULKAN=ON
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
@@ -229,6 +230,7 @@ jobs:
           cmake -S runtime -B runtime/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DLEONIDA_REQUIRE_VULKAN=ON
       - name: Build
         run: cmake --build runtime/build --parallel
       - name: Check GPU tools exist
