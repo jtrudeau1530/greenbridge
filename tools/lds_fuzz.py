@@ -364,9 +364,9 @@ class Program:
             if base - lo < 0:
                 return None
             base -= lo
-            # the data pair is read before `vdst` is written, and aliasing them is not modelled here
+            # the data pair is read before `vdst` is written, so `vdst` may alias it (measured on gfx1100)
             srcs = rng.sample(POOL, 2)
-            dst = rng.choice([r for r in range(POOL[0], POOL[-1] + 1) if r not in srcs and r + 1 not in srcs])
+            dst = rng.randrange(POOL[0], POOL[-1])          # dst + 1 stays inside POOL
             return {"kind": kind, "st64": st64, "o0": o0, "o1": o1, "addr": (stride, base, 0), "dst": dst,
                     "src0": srcs[0], "src1": srcs[1], "exec": self.exec_mask()}
         if kind == "atomic":

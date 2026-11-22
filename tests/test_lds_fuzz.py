@@ -104,13 +104,14 @@ class Generator(unittest.TestCase):
         self.assertGreater(found, 0, "expected at least one permute op with non-None exec mask")
 
 
-    def test_wrxchg2_is_generated_with_distinct_registers(self):
+    def test_wrxchg2_is_generated_and_may_alias_the_data(self):
         self.assertIn("wrxchg2", f.EXEC_KINDS)
-        found = [op for idx in range(40) for op in f.Program(2, idx, 64).ops if op["kind"] == "wrxchg2"]
+        found = [op for idx in range(200) for op in f.Program(2, idx, 64).ops if op["kind"] == "wrxchg2"]
         self.assertTrue(found, "expected the generator to emit ds_wrxchg2")
         for op in found:
-            self.assertNotIn(op["dst"], (op["src0"], op["src1"]))
-            self.assertNotIn(op["dst"] + 1, (op["src0"], op["src1"]))
+            self.assertLessEqual(op["dst"] + 1, f.HW_VGPRS - 1)
+        self.assertTrue(any(op["dst"] in (op["src0"], op["src1"]) for op in found),
+                        "expected some ops to alias vdst with the data pair")
 
 
 class Wrxchg2(unittest.TestCase):
@@ -154,6 +155,15 @@ class Wrxchg2(unittest.TestCase):
             self.assertEqual(self.word(lds, d), self.init_reg(p, t, 23))     # data1 wins the dword
             self.assertEqual(regs[t][20], self.init_lds(p, d))               # the old word
             self.assertEqual(regs[t][21], self.init_reg(p, t, 22))           # then data0
+
+    def test_aliasing_the_data_stores_it_and_returns_the_old_words(self):
+        p, regs, lds = self.model(addr=(24, 0, 0), o0=0, o1=4, dst=22, src0=22, src1=23)
+        for t in range(8):
+            a0, a1 = t * 24, t * 24 + 16
+            self.assertEqual(self.word(lds, a0 // 4), self.init_reg(p, t, 22))
+            self.assertEqual(self.word(lds, a1 // 4), self.init_reg(p, t, 23))
+            self.assertEqual(regs[t][22], self.init_lds(p, a0 // 4))
+            self.assertEqual(regs[t][23], self.init_lds(p, a1 // 4))
 
     def test_st64_steps_64_elements(self):
         p, regs, lds = self.model(addr=(264, 0, 0), o0=0, o1=1, st64=True)
