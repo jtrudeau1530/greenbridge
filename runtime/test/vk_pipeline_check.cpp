@@ -827,6 +827,7 @@ int main(int argc, char** argv) {
 #endif
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR exe{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     void* chain = nullptr;
@@ -837,6 +838,7 @@ int main(int argc, char** argv) {
         b->pNext = static_cast<VkBaseOutStructure*>(chain); chain = s;
         return true;
     };
+    link(&f11, reinterpret_cast<VkBaseOutStructure*>(&f11), nullptr, true);   // shaderDrawParameters (VS v0/v3)
     link(&f12, reinterpret_cast<VkBaseOutStructure*>(&f12), nullptr, true);
     link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, true);
     const bool ext_mesh = link(&mesh, reinterpret_cast<VkBaseOutStructure*>(&mesh), VK_EXT_MESH_SHADER_EXTENSION_NAME, want_mesh);
@@ -950,6 +952,7 @@ int main(int argc, char** argv) {
             }
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
+            if (feat == "shaderDrawParameters" && !f11.shaderDrawParameters) return "no shaderDrawParameters";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";
             if (feat == "runtimeDescriptorArray" && !f12.runtimeDescriptorArray) return "no runtimeDescriptorArray";
             if (feat == "shaderImageGatherExtended" && !f2.features.shaderImageGatherExtended) return "no shaderImageGatherExtended";

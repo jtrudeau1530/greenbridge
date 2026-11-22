@@ -80,7 +80,8 @@ def run_cut(asm, wave, push=None):
     for half in range(64 // wave):
         res = wi.run_wave(asm, wave=wave, push_constants=push,
                           builtins={"VertexIndex": lambda lane, base=half * wave: base + lane,
-                                     "InstanceIndex": lambda lane: 0})
+                                     "InstanceIndex": lambda lane: 0, "BaseVertex": lambda lane: 0,
+                                     "BaseInstance": lambda lane: 0})
         words += [o and tuple(sorted(o.items())) for o in res["outputs"]]
     return words
 

@@ -1178,6 +1178,27 @@ def interp_f16_high_problem(px):
     return "" if err < 2e-3 else f"f16 halves off by {err:.3g}"
 
 
+def base_ids_test(tools, spirv):
+    """vs_base_ids with ps_flat, drawn with firstVertex 16 and firstInstance 7: the VS input VGPRs are zero-based on
+    the hardware, so every pixel must still see vertex 0 of instance 0 (0x101, 0x102), not 0x7111."""
+    for n in ("vs_base_ids", "ps_flat"):
+        if not os.path.isfile(os.path.join(spirv, n + ".spv")):
+            return f"missing {n}.spv"
+    env = dict(os.environ, VKH_DRAW="16,7")
+    with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_base_ids.spv"),
+                        os.path.join(spirv, "ps_flat.spv"), raw, env=env)
+        if code == UNSUPPORTED:
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+        if code or not raw.is_file():
+            return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
+        px = list(struct.iter_unpack("<2I2f", raw.read_bytes()))
+    wrong = [p for p in px if (p[0], p[1]) != (0x101, 0x102)]
+    return "" if px and not wrong else f"{len(wrong)} of {len(px)} pixels differ, e.g. {hex(wrong[0][0]) if wrong else '-'}"
+
+
 def wide_pixel_skip(name, out):
     """A Skip when `name` needs a 64-wide pixel stage (WIDE_PIXEL_TESTS) and vk_harness's output does not say that size
     was required of the fragment stage, else None."""
@@ -1389,6 +1410,7 @@ def main():
         results.append((name, pixel_test(tools, spirv, name)))
     for name in TEXTURE_CONSTANTS:
         results.append((name, texture_constant_test(tools, spirv, name)))
+    results.append(("vs_base_ids", base_ids_test(tools, spirv)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append(("ps_ssharp", sampler_test(tools, spirv)))
     results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))

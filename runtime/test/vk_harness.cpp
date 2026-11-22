@@ -326,12 +326,22 @@ int main(int argc, char** argv) {
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
     }
 #endif
+    VkPhysicalDeviceVulkan11Features f11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12q.pNext = &f11q;
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13q.pNext = &f12q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
+    // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) to give v0 / v3 the hardware's
+    // zero-based ids.
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    if (f11q.shaderDrawParameters) {
+        f11.shaderDrawParameters = VK_TRUE;
+        f11.pNext = chain;
+        chain = &f11;
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     if (f13q.subgroupSizeControl) {
         f13.subgroupSizeControl = VK_TRUE;
@@ -712,8 +722,12 @@ int main(int argc, char** argv) {
         vkCmdDraw(cmd, uint32_t(mesh_groups * mesh_prims * 3), 1, 0, 0);
     else if (mesh)
         reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT"))(cmd, groups[0], groups[1], groups[2]);
-    else
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+    else {
+        // VKH_DRAW=<firstVertex>,<firstInstance>: draw the triangle with non-zero bases (vs_base_ids).
+        unsigned first_vertex = 0, first_instance = 0;
+        if (const char* d = std::getenv("VKH_DRAW")) std::sscanf(d, "%u,%u", &first_vertex, &first_instance);
+        vkCmdDraw(cmd, 3, 1, first_vertex, first_instance);
+    }
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);

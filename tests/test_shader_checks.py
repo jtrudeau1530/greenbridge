@@ -35,8 +35,8 @@ TOTAL = (len(check.COMPUTE) + 6 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures and
-         # ps_ssharp
+         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
+         # ps_ssharp and vs_base_ids
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -162,6 +162,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "texture_constant_test", return_value=""),
+                  patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):

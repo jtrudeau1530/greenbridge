@@ -557,7 +557,8 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
-              SIGNED_MIP_TEST: "vs_ids.asm"}
+              SIGNED_MIP_TEST: "vs_ids.asm",
+              "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
 
@@ -1267,6 +1268,19 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
+                results.append((name, ok, detail))
+        elif name == "vs_base_ids":
+            # Zero-based v0 / v3 (the hardware's VS input VGPRs): drawn with firstVertex 16 and firstInstance 7,
+            # ps_flat must still see vertex 0 of instance 0 (0x101), as check.py checks.
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            env = dict(gfx_env or os.environ, VKH_DRAW="16,7")
+            rc, msg = run_cmd([vk_harness, spv, os.path.join(spirv_dir, "ps_flat.spv"), raw], env=env)
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                ok, detail = check_flat(raw)
                 results.append((name, ok, detail))
 
     if a.filter and not results:   # the filter matched only inputs/partners: say so rather than "0/0 passed"
