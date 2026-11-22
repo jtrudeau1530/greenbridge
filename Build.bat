@@ -1,8 +1,14 @@
 @echo off
+title Leonida - Game Builder
 rem Double-click to build. Finds your copy of the game, checks what's installed, and builds into
 rem Documents\Leonida. Extra options pass through, e.g.  Build.bat --out D:\Games\Leonida
 setlocal
 cd /d "%~dp0"
+echo.
+echo  ==========================================
+echo       L E O N I D A  -  Game Builder
+echo  ==========================================
+echo.
 set "PY="
 for %%V in (3.14 3.13 3.12 3) do (
   if not defined PY (
