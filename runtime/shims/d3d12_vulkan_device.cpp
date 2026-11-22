@@ -127,6 +127,10 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     }
 }
 
+Format texture_storage_format(DXGI_FORMAT format, bool depth) {
+    return vulkan_format(format == DXGI_FORMAT_A8_UNORM ? DXGI_FORMAT_R8_UNORM : format, depth);
+}
+
 // The full mip chain's length for a texture this size.
 UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
@@ -190,7 +194,12 @@ struct DeviceState {
 
     // The format a texture description is created with, D24S8's fallback included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
-        Format format = vulkan_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        if (desc.Format == DXGI_FORMAT_A8_UNORM &&
+            (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
+            return {};
+        Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
             log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
             format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
@@ -871,7 +880,13 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     VkFormat named = resource.format();
-    if (view.format != DXGI_FORMAT_UNKNOWN) named = vulkan_format(view.format, false).format;
+    if (view.format != DXGI_FORMAT_UNKNOWN) {
+        if ((view.format == DXGI_FORMAT_A8_UNORM) != (desc.Format == DXGI_FORMAT_A8_UNORM)) {
+            log_once("incompatible typed A8 view format:", int(view.format));
+            return false;
+        }
+        named = texture_storage_format(view.format, false).format;
+    }
     const std::uint32_t code = g::format_from_vulkan(named);
     const VkFormat view_format = code ? g::vulkan_view_format(resource.format(), code) : VK_FORMAT_UNDEFINED;
     if (view_format == VK_FORMAT_UNDEFINED) {
@@ -901,7 +916,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
-    const g::Swizzle channels = g::format_swizzle(view_format);
+    const g::Swizzle channels = desc.Format == DXGI_FORMAT_A8_UNORM
+        ? g::Swizzle{g::select_zero, g::select_zero, g::select_zero, g::select_x}
+        : g::format_swizzle(view_format);
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         out.swizzle[i] = from < 4 ? channels[from]
@@ -1184,7 +1201,9 @@ public:
             const bool typeless_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
-            if (typeless_rgba8 || typed_rgba8) {
+            if (r->desc().Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
+                view = {};
+            } else if (typeless_rgba8 || typed_rgba8) {
                 const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
                 if (typeless_rgba8) {
                     // This first typeless RTV slice deliberately covers only a single 2D subresource.
@@ -1236,6 +1255,7 @@ public:
                 log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
                 view = {};
             }
+            if (r->desc().Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) view = {};
         } else if (resource) {
             stub("ID3D12Device::CreateDepthStencilView(resource from another device)");
         }
@@ -1646,7 +1666,7 @@ public:
             log_once("GetCopyableFootprints dimension not supported:", desc->Dimension);
             return fail();
         }
-        const Format format = vulkan_format(desc->Format, true);  // typeless depth families are planar either way
+        const Format format = texture_storage_format(desc->Format, true);  // typeless depth families are planar either way
         UINT mips = desc->MipLevels;
         const UINT depth = volume ? desc->DepthOrArraySize : 1;
         if (!mips)
@@ -1789,7 +1809,7 @@ public:
             auto* fs = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
             fs->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
             fs->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
-            const Format fmt = vulkan_format(fs->Format, false);
+            const Format fmt = texture_storage_format(fs->Format, false);
             const Format depth_fmt = vulkan_format(fs->Format, true);
             const VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
             if (vk_fmt == VK_FORMAT_UNDEFINED || !state_.format_properties) {
@@ -1802,6 +1822,16 @@ public:
 
             D3D12_FORMAT_SUPPORT1 s1 = D3D12_FORMAT_SUPPORT1_NONE;
             D3D12_FORMAT_SUPPORT2 s2 = D3D12_FORMAT_SUPPORT2_NONE;
+
+            if (fs->Format == DXGI_FORMAT_A8_UNORM) {
+                if (optimal & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+                    fs->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+                                   D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
+                    if (optimal & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+                        fs->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
+                }
+                return S_OK;
+            }
 
             if (buffer != 0) s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
             if (buffer & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) s1 |= D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
@@ -1862,7 +1892,9 @@ public:
                 levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
                 (levels->SampleCount & (levels->SampleCount - 1)) != 0)
                 return E_INVALIDARG;
-            Format format = vulkan_format(levels->Format, false);
+            const bool alpha_only = levels->Format == DXGI_FORMAT_A8_UNORM;
+            if (alpha_only && levels->SampleCount != 1) return S_OK;
+            Format format = texture_storage_format(levels->Format, false);
             if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
                 D3D12_RESOURCE_DESC depth_desc{};
                 depth_desc.Format = levels->Format;
@@ -1877,9 +1909,9 @@ public:
             // usage, plus the transfer and sampled usages used by the resource implementation.
             VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                       VK_IMAGE_USAGE_SAMPLED_BIT;
-            if (format.aspects & VK_IMAGE_ASPECT_COLOR_BIT)
-                usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-            else if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+            if (format.aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+                if (!alpha_only) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            } else if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
                 usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
             else
                 return DXGI_ERROR_UNSUPPORTED;

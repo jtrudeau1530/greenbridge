@@ -205,6 +205,9 @@ What is implemented (all of it testable without the game):
     render-target, depth and texture formats (typeless families become mutable-format images), plus non-attachment
     3D textures with mipmapped upload, image copy and readback, and multisampled 2D textures (single-mip render
     targets or depth-stencils, in the sample counts the GPU has for the format);
+  - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
+    (0, 0, 0, A) before applying the caller's component mapping. Render-target, depth-stencil and UAV creation
+    are unsupported for this format.
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
     support, format support and multisample quality levels. Other queries are logged and refused until the trace
     shows what the game asks (question 11);
