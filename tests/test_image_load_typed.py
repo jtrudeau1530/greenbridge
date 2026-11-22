@@ -56,7 +56,8 @@ def load_shader(dim, dmask=0xF):
 class Module:
     """The instructions of a SPIR-V assembly text by result id, its decorations and capabilities."""
 
-    def __init__(self, text):
+    def __init__(self, text: str, vgprs: dict[int, int] | None = None):
+        self.vgprs = vgprs
         self.text = text
         self.defs, self.binding, self.order = {}, {}, []
         self.caps = set(re.findall(r"^\s*OpCapability (\w+)", text, re.M))
@@ -100,6 +101,8 @@ class Module:
         if op == "OpLoad":
             ptr_op, p = self.defs[a[1]]
             assert ptr_op == "OpAccessChain", ptr_op
+            if p[1] == "%vgpr" and self.vgprs is not None:
+                return self.vgprs[self.value(p[2], word1, index)]
             if p[1] == "%sgpr":
                 assert self.value(p[2], word1, index) == 1, "only T# word 1 is read"
                 return word1
@@ -108,6 +111,8 @@ class Module:
             words = self.defs[v[2]][1][1:]            # OpConstantComposite %fmt_mask_arr <words>
             return self.value(words[self.value(p[2], word1, index)], word1, index)
         u = [self.value(y, word1, index) for y in a[1:]]
+        if op == "OpBitcast":
+            return u[0]
         if op == "OpBitFieldUExtract":
             return (u[0] >> u[1]) & ((1 << u[2]) - 1)
         if op == "OpShiftRightLogical":
@@ -157,6 +162,29 @@ class LoadOnlyShaders(unittest.TestCase):
             op, source = m.defs[load[1]]
             self.assertEqual((op, source[1]), ("OpAccessChain", "%vgpr"))
             self.assertEqual(m.value(source[2], 0, 0), 6)
+
+    def test_a16_2d_mip_address(self) -> None:
+        with open(os.path.join(ROOT, "tests", "semantic", "fixtures", "packed_mip_load_2d.asm"),
+                  encoding="ascii") as fixture:
+            forms = [line.strip() for line in fixture if line.startswith("image_load_mip")]
+        regs = {8: 0xFFFF8001, 9: 0xDEAD0003, 18: 0x8000FFFE, 5: 0xCAFE0007}
+        expected = ((0x8001, 0xFFFF, 3), (0xFFFE, 0x8000, 7))
+        self.assertEqual(len(forms), len(expected))
+        for line, address in zip(forms, expected):
+            with self.subTest(line=line):
+                m = Module(translate([line]), vgprs=regs)
+                fetches = m.fetches()
+                self.assertEqual({image[0] for _, _, image in fetches}, {"%float", "%uint", "%int"})
+                for rid, _, _ in fetches:
+                    _, _, coord, mode, lod = m.defs[rid][1]
+                    op, (ty, x, y) = m.defs[coord]
+                    self.assertEqual((op, ty, mode), ("OpCompositeConstruct", "%v2int", "Lod"))
+                    self.assertEqual(tuple(m.value(v, 0, 0) for v in (x, y, lod)), address)
+
+    def test_a16_2d_mip_status_is_unsupported(self) -> None:
+        for destination, status in (("v[0:1]", "tfe"), ("v0", "lwe")):
+            with self.subTest(status=status), self.assertRaises(rdna2spirv.Unsupported):
+                translate([f"image_load_mip {destination}, v[8:9], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D a16 {status}"])
 
     def test_2d_explicit_mip_d16_packs_only_selected_components(self):
         listing = ["image_load_mip v0, v[4:6], s[0:7] dmask:0x9 dim:SQ_RSRC_IMG_2D d16",
