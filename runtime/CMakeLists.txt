@@ -471,6 +471,18 @@ if(BUILD_TESTING)
       ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
     )
 
+    add_library(tiny_tls_cb_only SHARED test/fixtures/tiny_tls_cb_only.cpp)
+    target_compile_definitions(tiny_tls_cb_only PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_tls_cb_only PRIVATE /W4 /permissive- /utf-8 /GS-)
+    target_link_options(tiny_tls_cb_only PRIVATE /NODEFAULTLIB /ENTRY:DllMainCRTStartup)
+    target_link_libraries(tiny_tls_cb_only PRIVATE kernel32)
+    set_target_properties(tiny_tls_cb_only PROPERTIES
+      OUTPUT_NAME tiny_tls_cb_only
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The fixtures import only host
     # DLLs, so no shim tables are linked.
     add_executable(loader_tls_test
@@ -483,7 +495,7 @@ if(BUILD_TESTING)
     )
     target_compile_definitions(loader_tls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(loader_tls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    add_dependencies(loader_tls_test tiny_tls gta6rt_tls_host)
+    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only gta6rt_tls_host)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
