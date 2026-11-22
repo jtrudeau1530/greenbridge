@@ -970,5 +970,83 @@ class TestValuDot8IntConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(vcc_ge_8, expected_mask)
 
 
+# ---------------------------------------------------------------------------
+# Boundary Extremes, Signed/Unsigned Wrap, and Bit Patterns Tests
+# ---------------------------------------------------------------------------
+
+FLOAT_POS_ZERO: int = 0x0000_0000
+FLOAT_NEG_ZERO: int = 0x8000_0000
+FLOAT_POS_INF: int = 0x7F80_0000
+FLOAT_NEG_INF: int = 0xFF80_0000
+FLOAT_CANONICAL_QNAN: int = 0x7FC0_0000
+FLOAT_SNAN: int = 0x7F80_0001
+FLOAT_MIN_SUBNORMAL: int = 0x0000_0001
+
+
+class TestValuDot8IntBoundaryExtremes(unittest.TestCase):
+    """Boundary extremes, bit patterns, and signed/unsigned wrap unit tests for v_dot8_int."""
+
+    def test_float_qnan_treated_as_raw_nibbles(self) -> None:
+        # FLOAT_CANONICAL_QNAN = 0x7FC00000
+        # Nibbles: [0, 0, 0, 0, 0, 12, 15, 7] in unsigned
+        # In signed: [0, 0, 0, 0, 0, -4, -1, 7]
+        ident = 0x1111_1111  # [1, 1, 1, 1, 1, 1, 1, 1]
+
+        # Unsigned dot8: 12*1 + 15*1 + 7*1 = 34
+        u_res = ref_dot8_u32_u4(FLOAT_CANONICAL_QNAN, ident, 0)
+        self.assertEqual(u_res, 34)
+
+        # Signed dot8: (-4)*1 + (-1)*1 + 7*1 = 2
+        i_res = ref_dot8_i32_i4(FLOAT_CANONICAL_QNAN, ident, 0)
+        self.assertEqual(i_res, 2)
+
+    def test_float_infinities_integer_dot_product(self) -> None:
+        # FLOAT_POS_INF = 0x7F800000 -> nibbles: [0, 0, 0, 0, 0, 8, 15, 7]
+        # In signed: [0, 0, 0, 0, 0, -8, -1, 7]
+        ident = 0x1111_1111
+
+        # Unsigned: 8 + 15 + 7 = 30
+        self.assertEqual(ref_dot8_u32_u4(FLOAT_POS_INF, ident, 0), 30)
+
+        # Signed: (-8) + (-1) + 7 = -2 (0xFFFFFFFE)
+        self.assertEqual(ref_dot8_i32_i4(FLOAT_POS_INF, ident, 0), 0xFFFF_FFFE)
+
+    def test_float_negative_zero_sign_bit_differentiation(self) -> None:
+        # FLOAT_POS_ZERO = 0x00000000 -> all nibbles 0
+        # FLOAT_NEG_ZERO = 0x80000000 -> nibble 7 is 8 (unsigned: 8; signed: -8)
+        ident = 0x1111_1111
+        pos_u = ref_dot8_u32_u4(FLOAT_POS_ZERO, ident, 0)
+        neg_u = ref_dot8_u32_u4(FLOAT_NEG_ZERO, ident, 0)
+        self.assertEqual(pos_u, 0)
+        self.assertEqual(neg_u, 8)
+
+        pos_i = ref_dot8_i32_i4(FLOAT_POS_ZERO, ident, 0)
+        neg_i = ref_dot8_i32_i4(FLOAT_NEG_ZERO, ident, 0)
+        self.assertEqual(pos_i, 0)
+        self.assertEqual(neg_i, (-8) & MASK32)
+
+    def test_integer_extreme_signed_min_max_matrix(self) -> None:
+        s_min = 0x8888_8888  # all nibbles -8
+        s_max = 0x7777_7777  # all nibbles +7
+
+        # (-8) * (-8) * 8 = 512
+        self.assertEqual(ref_dot8_i32_i4(s_min, s_min, 0), 512)
+
+        # 7 * 7 * 8 = 392
+        self.assertEqual(ref_dot8_i32_i4(s_max, s_max, 0), 392)
+
+        # (-8) * 7 * 8 = -448
+        self.assertEqual(ref_dot8_i32_i4(s_min, s_max, 0), (-448) & MASK32)
+
+    def test_integer_extreme_unsigned_overflow_and_saturation(self) -> None:
+        s_max_u = 0xFFFF_FFFF  # all nibbles 15
+        # 8 * 225 = 1800
+        res_wrap = ref_dot8_u32_u4(s_max_u, s_max_u, UINT32_MAX, clamp=False)
+        self.assertEqual(res_wrap, 1799)
+
+        res_sat = ref_dot8_u32_u4(s_max_u, s_max_u, UINT32_MAX, clamp=True)
+        self.assertEqual(res_sat, UINT32_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()
