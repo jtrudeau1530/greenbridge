@@ -420,6 +420,93 @@ class ScalarInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def get_vgpr16(self, lane: int, index: int, half: RegHalf) -> int:
+        dword = self.vgprs[lane][index] & 0xFFFF_FFFF
+        return ((dword >> 16) & 0xFFFF) if half == RegHalf.HI else (dword & 0xFFFF)
+
+    def set_vgpr16(self, lane: int, index: int, half: RegHalf, bits: int) -> None:
+        dword = self.vgprs[lane][index] & 0xFFFF_FFFF
+        bits16 = bits & 0xFFFF
+        if half == RegHalf.HI:
+            self.vgprs[lane][index] = (dword & 0x0000_FFFF) | (bits16 << 16)
+        else:
+            self.vgprs[lane][index] = (dword & 0xFFFF_0000) | bits16
+
+    def get_sgpr16(self, index: int, half: RegHalf) -> int:
+        dword = self.sgprs[index] & 0xFFFF_FFFF
+        return ((dword >> 16) & 0xFFFF) if half == RegHalf.HI else (dword & 0xFFFF)
+
+    def set_sgpr16(self, index: int, half: RegHalf, bits: int) -> None:
+        dword = self.sgprs[index] & 0xFFFF_FFFF
+        bits16 = bits & 0xFFFF
+        if half == RegHalf.HI:
+            self.sgprs[index] = (dword & 0x0000_FFFF) | (bits16 << 16)
+        else:
+            self.sgprs[index] = (dword & 0xFFFF_0000) | bits16
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VOP1Operand, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, Reg16):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr16(lane, op.source.index, op.source.half)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr16(op.source.index, op.source.half)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal16):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VFractF16Instruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+
+        # Atomic read phase across all lanes
+        src_vals = [
+            self.resolve_lane_operand(instr.src, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+
+        # Execution and selective write-back phase
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                res = oracle_v_fract_f16(
+                    src_bits=src_vals[lane],
+                    abs_mod=instr.src.abs_mod,
+                    neg_mod=instr.src.neg_mod,
+                    clamp=instr.clamp,
+                    mul=instr.mul,
+                    div=instr.div,
+                )
+                state.set_vgpr16(lane, instr.dst.index, instr.dst.half, res)
+                results[lane] = res
+
+        return results
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -680,6 +767,99 @@ class TestScalarInterpreter(unittest.TestCase):
             )
             runs.append(self.interp.step(instr, st))
         self.assertTrue(all(r == runs[0] for r in runs))
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.simd_interp = SIMDInterpreter()
+
+    def test_simd_wave32_all_lanes_active(self) -> None:
+        state = SIMDState(num_lanes=32)
+        # Populate lane i with float value (i + 0.25)
+        for lane in range(32):
+            val = float(lane) + 0.25
+            state.set_vgpr16(lane, 1, RegHalf.LO, f16_to_bits(val))
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        res = self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(res[lane], H_0P25)
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), H_0P25)
+
+    def test_simd_wave64_alternating_exec_mask(self) -> None:
+        exec_mask = 0x5555_5555_5555_5555  # Even lanes active, odd lanes inactive
+        state = SIMDState(num_lanes=64, exec_mask=exec_mask)
+        sentinel = 0xCAFE
+
+        for lane in range(64):
+            # Input is 2.5 on all lanes
+            state.set_vgpr16(lane, 1, RegHalf.LO, H_2P5)
+            # Destination initialized to sentinel
+            state.set_vgpr16(lane, 0, RegHalf.LO, sentinel)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        res = self.simd_interp.step(instr, state)
+
+        for lane in range(64):
+            if (exec_mask & (1 << lane)) != 0:
+                self.assertEqual(res[lane], H_0P5)
+                self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), H_0P5)
+            else:
+                self.assertIsNone(res[lane])
+                self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), sentinel)
+
+    def test_simd_uniform_sgpr_broadcast_across_lanes(self) -> None:
+        state = SIMDState(num_lanes=32)
+        state.set_sgpr16(6, RegHalf.LO, H_NEG_1P25)  # -1.25 -> 0.75
+
+        instr = VFractF16Instruction(
+            dst=Reg16(3, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(6, RegType.SGPR, RegHalf.LO)),
+        )
+        res = self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(res[lane], H_0P75)
+            self.assertEqual(state.get_vgpr16(lane, 3, RegHalf.LO), H_0P75)
+
+    def test_simd_all_lanes_inactive_exec_zero(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0)
+        sentinel = 0xBEEF
+        for lane in range(32):
+            state.set_vgpr16(lane, 2, RegHalf.LO, sentinel)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(2, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Literal16.from_float(0.75)),
+        )
+        res = self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertIsNone(res[lane])
+            self.assertEqual(state.get_vgpr16(lane, 2, RegHalf.LO), sentinel)
+
+    def test_simd_high_half_destination_preservation(self) -> None:
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            # vgpr0 dword has low half 0x1234, high half sentinel
+            state.vgprs[lane][0] = 0x5555_1234
+            state.set_vgpr16(lane, 1, RegHalf.LO, H_1P5)  # 1.5 -> 0.5
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.HI), H_0P5)
+            # Low half must remain 0x1234
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), 0x1234)
 
 
 if __name__ == "__main__":
