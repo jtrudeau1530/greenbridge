@@ -666,7 +666,7 @@ public:
             const auto it = graphics_pipelines_.find(id);
             return it == graphics_pipelines_.end() ? nullptr : &it->second;
         };
-        // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
+        // Called with resource_mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
         // A range that runs past its buffer is cut at the buffer's end (`size` is updated): D3D12 reads past a view's
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {

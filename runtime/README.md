@@ -177,6 +177,10 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   and five draws plus a culled triangle, compared pixel by pixel. They also cover an unbound render target and
   DSV, a rebound root signature, instance step rate 0, an unbound vertex slot, and PSOs, buffers and heaps that
   must be refused. A second pass draws a full-screen triangle with no vertex input and an XOR logic op.
+- `d3d12_translated_draw_test` — milestone M1.5: the same with translator output. `test/shaders/vs_m15.asm` (vertex
+  fetch through a V#) and `ps_m15.asm` (constants read through the code base) are built by `test/shaders/build.py`
+  and found by FSSM hash; three draws into a float target, compared bit for bit. Needs `llvm-mc` (`LLVM_MC`) and the
+  Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
   translator-style index, root arguments through the GPU address arena, and two dispatches.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on

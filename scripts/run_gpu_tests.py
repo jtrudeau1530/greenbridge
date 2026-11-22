@@ -487,6 +487,12 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
     return ok, detail
 
 
+# Fixtures run by another harness, which needs what these tools do not have (a D3D12 device, the layer's root
+# arguments and code base). They are still assembled and translated here, so a translator regression shows, but no
+# checker runs them: the test program that owns them judges them.
+OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_translated_draw_test"}
+
+
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
@@ -943,6 +949,8 @@ def run_suite(a, work: str) -> int:
                 with open(raw, "rb") as f:
                     problem, covered = texoff_problem(f.read(), msg)
                 results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
+        elif name in OTHER_HARNESS:
+            results.append((name, None, f"SKIP (run by {OTHER_HARNESS[name]})"))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
