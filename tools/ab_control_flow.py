@@ -28,7 +28,7 @@ import sys
 
 # Left out: anything that writes memory or images, LDS, and the rare instructions the harness has no setup for.
 # Loads are fine: with empty user data they read zeros from the start of the harness's heap, the same for both.
-NEEDS = re.compile(r"^\t(image_store|image_atomic|buffer_store|tbuffer_|global_store|global_atomic|ds_|s_swappc|"
+NEEDS = re.compile(r"^\t(image_store|image_atomic|buffer_(?:store|atomic)|tbuffer_|global_store|global_atomic|ds_|s_swappc|"
                    r"s_getpc|s_sendmsg|s_sleep)", re.M)
 BRANCH = re.compile(r"^\ts_c?branch", re.M)
 BACK = re.compile(r"^\ts_c?branch\S* (\d+)", re.M)

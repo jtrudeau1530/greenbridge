@@ -299,6 +299,15 @@ class CandidateSelectionTest(unittest.TestCase):
         picked = AB.select_candidates(index, self.disasm, self.spirv, count=10)
         self.assertEqual(picked, ["a_valid", "z_valid"])
 
+    def test_automatic_selection_excludes_buffer_atomics_but_keeps_loads(self) -> None:
+        index = {name: self.shader(features=["bufferDeviceAddress", "shaderInt64"])
+                 for name in ("atomic", "read_only")}
+        prefix = "\ts_cbranch_scc0 2\n"
+        suffix = "\ts_branch 0\n\ts_endpgm\n"
+        self.add_shader("atomic", prefix + "\tbuffer_atomic_add v0, off, s[0:3], 0\n" + suffix)
+        self.add_shader("read_only", prefix + "\tbuffer_load_dword v0, off, s[0:3], 0\n" + suffix)
+        self.assertEqual(AB.select_candidates(index, self.disasm, self.spirv), ["read_only"])
+
     def test_metadata_filters_reject_shaders_that_pass_every_file_check(self):
         # Each rejected entry has a valid disassembly and SPIR-V, so only its metadata can drop it.
         index = {
