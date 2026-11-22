@@ -253,6 +253,11 @@ class Validate(unittest.TestCase):
             struct.pack_into("<I", b, self.info["parents"] + 4 * u, 0x1234)
             self.assertTrue(any("parent table" in e for e in X.validate(bytes(b))))
 
+    def test_parent_entry_outside_buffer_is_reported(self) -> None:
+        # offsetToParents is the u32 at +56 in the runtime header.
+        errors = self.corrupt(56, "<I", len(self.data))
+        self.assertTrue(any("parent table entry" in error and "outside the buffer" in error for error in errors))
+
     def test_dehydrated_refused(self):
         errs = self.corrupt(0, "<I", 0x81020006 | X.FLAG_DEHYDRATED)
         self.assertTrue(any("dehydrated" in e for e in errs))
@@ -318,6 +323,23 @@ class Cli(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(X.main(["validate", os.path.join(d, "missing.bin")]), 2)
+
+    def test_validate_rejects_a_root_with_a_parent(self) -> None:
+        data, info = X.build_blas(X.grid_mesh(3), box16=True)
+        self.assertEqual(X.validate(data), [])
+        corrupt = bytearray(data)
+        root_unit = (X.ptr_offset(info["root"]) - info["elements"]) // X.UNIT
+        struct.pack_into("<I", corrupt, info["parents"] + 4 * root_unit, info["root"])
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "root-parent.bin")
+            with open(path, "wb") as f:
+                f.write(corrupt)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(X.main(["validate", path]), 1)
+            self.assertIn("parent table entry", output.getvalue())
+            self.assertIn(f"expected {X.INVALID:#x}", output.getvalue())
 
     def test_selftest(self):
         with contextlib.redirect_stdout(io.StringIO()):

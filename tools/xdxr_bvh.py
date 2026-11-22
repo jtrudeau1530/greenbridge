@@ -674,11 +674,16 @@ def validate(data, expect_bottom=None):
             errs.append(f"{'leaf' if kind <= TRI3 or kind == INSTANCE else 'node'} {p:#x} reached twice")
             continue
         seen.add(p)
-        if parent is not None and kind > TRI3 and parents_off:
+        if kind > TRI3 and parents_off:
             u = (off - elements_off) // UNIT
-            stored = struct.unpack_from("<I", data, parents_off + 4 * u)[0]
-            if stored != parent:
-                errs.append(f"parent table entry of {p:#x} is {stored:#x}, expected {parent:#x}")
+            parent_entry = parents_off + 4 * u
+            if not HEADER_SIZE <= parent_entry <= len(data) - 4:
+                errs.append(f"parent table entry of {p:#x} is outside the buffer")
+            else:
+                stored = struct.unpack_from("<I", data, parent_entry)[0]
+                expected = INVALID if parent is None else parent
+                if stored != expected:
+                    errs.append(f"parent table entry of {p:#x} is {stored:#x}, expected {expected:#x}")
         if kind <= TRI3:
             if not bottom:
                 errs.append(f"triangle node {p:#x} in a top-level BVH")
