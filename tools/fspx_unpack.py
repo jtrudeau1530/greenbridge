@@ -214,15 +214,7 @@ def main(argv=None) -> int:
                 entry["threads"] = meta["threads"]
             if "wave32" in meta:
                 entry["wave32"] = meta["wave32"]
-            if container:
-                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
-                    f.write(container)
-            with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
-                f.write(blob[6])
-            with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
-                f.write(blob[0])
-            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
-                json.dump(meta, f, indent=1)
+            listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
                 asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
@@ -232,11 +224,21 @@ def main(argv=None) -> int:
                     bad += 1
                     continue
                 entry["invalid_words"] = invalid
+                listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
+                if err.strip():
+                    listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
+            if container:
+                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+                    f.write(container)
+            with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+                f.write(blob[6])
+            with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
+                f.write(blob[0])
+            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(meta, f, indent=1)
+            if listing is not None:
                 with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
-                    f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
-                    f.write(asm)
-                    if err.strip():
-                        f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+                    f.write(listing)
             index.append(entry)
     with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)

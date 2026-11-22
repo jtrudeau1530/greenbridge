@@ -202,6 +202,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.stderr.splitlines(), ["one: error: disassembly stopped"])
         self.assertIn("1 input(s) failed", result.stdout)
         self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
+        self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
         with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f), [])
 
@@ -210,6 +211,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stderr.splitlines(), ["one: no output"])
         self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
+        self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
 
     def test_disassembly_with_invalid_words_keeps_listing(self):
         result, out = self.disassemble("import sys\n"
