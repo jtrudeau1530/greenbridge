@@ -108,6 +108,8 @@ The disassembly count is unchanged: the same 42 programs have no invalid word, a
 code. All 10 of those translate; `Box16Rehydration` is one of the 42 clean ones.
 | `tools/rdna2spirv.py` | **51** translate and pass `spirv-val` |
 
+| `tools/rdna2spirv.py` | **51** translate and pass `spirv-val` |
+
 On current `main`, 51 of the 52 programs translate and pass `spirv-val`. The four earlier blockers were
 implemented in #1871 and #1968 (`427c1376`):
 
@@ -150,6 +152,8 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
 * **The missing rules were small, and only one is left.** `global_atomic_fmax`/`fmin` (6 programs),
   `buffer_load_ushort` (3) and `tbuffer_load_format_x` with format 8 (1) were ordinary translator rules, not a new
   compiler backend, and they are on `main`. The one left is `buffer_store_short` (#1864), for `Box16Rehydration`.
+* **The one missing rule is small and has real fixtures.** `buffer_store_short` (#1864) covers `Box16Rehydration`.
+  It is an ordinary translator rule, not a new compiler backend.
 * **The rehydration programs are the ones closest to the shipped data.** `Box16Rehydration`,
   `Box32Rehydration` and `LeafRehydration` are exactly the programs that would turn the dehydrated BVH packs
   into runtime trees ([bvh.md](bvh.md) §3.1). `LeafRehydration` translates since #1871, `Box32Rehydration`
