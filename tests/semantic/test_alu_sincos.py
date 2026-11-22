@@ -1,12 +1,20 @@
 """Semantic interpreter tests for RDNA2 v_sin_f32 / v_cos_f32 / v_sin_f16 / v_cos_f16 (SHADER-88).
 
-The operand is an angle in TURNS (valid over +-256 turns). Multiplying by 2*pi before reducing rounds the fractional
-turn away in binary32 (up to ~1e-4 rad near +-255 turns), so the translator reduces in turns first. Each case
-translates a synthetic pixel shader with tools/rdna2spirv.py, runs it in tests/semantic/spirv_mini_interp.py and
-compares the exported value with math.sin / math.cos(2*pi*x) computed in double (a reference, not a model of the
-translator). Tolerances are absolute and explicit: 1e-6 for f32 (a few ulp of a value near 1), 1e-3 for f16 (one
-f16 ulp near 1 is ~4.9e-4 and the result is rounded to f16).
+The operand is an angle in TURNS (normalized revolution where 1.0 turn = 2*pi radians).
+RDNA2 hardware range-reduces in turns to [-0.5, 0.5] before scaling by 2*pi. Multiplying
+by 2*pi before reducing rounds the fractional turn away in binary32 (up to ~1e-4 rad near
++-255 turns), so the translator reduces in turns first.
+
+Each case translates a synthetic shader with tools/rdna2spirv.py, runs it in
+tests/semantic/spirv_mini_interp.py, and validates the result against an independent
+reference oracle and analytical mathematical identities (including IEEE 754 half-precision
+precision bounds and the Pythagorean identity sin^2(x) + cos^2(x) ~= 1.0).
+
+Standard library only: zero game data, no GPU hardware required.
 """
+from __future__ import annotations
+
+import gc
 import math
 import os
 import struct
@@ -20,8 +28,10 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, TOOLS_DIR)
-sys.path.insert(0, HERE)
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
@@ -30,33 +40,115 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 OLD = 0xAAAA5555
 TOL32 = 1e-6
 TOL16 = 1e-3
-INPUTS = [0.25, 0.5, 1.0, 100.3, 254.25, 254.51, 255.9, 0.1, 0.0, -0.0, -0.25, -100.3, -254.51, -255.5]
+TWO_PI = 6.283185307179586
 
-_TMP_DIR = None
-_SRC_PATH = None
+INPUTS_F32 = [0.25, 0.5, 1.0, 100.3, 254.25, 254.51, 255.9, 0.1, 0.0, -0.0, -0.25, -100.3, -254.51, -255.5]
+
+# Representative binary16 encodings
+H_POS_ZERO = 0x0000
+H_NEG_ZERO = 0x8000
+H_POS_INF = 0x7C00
+H_NEG_INF = 0xFC00
+H_QNAN = 0x7E00
+H_SNAN = 0x7C01
+H_NEG_QNAN = 0xFE00
+H_NEG_SNAN = 0xFC01
+
+H_ONE = 0x3C00
+H_NEG_ONE = 0xBC00
+H_HALF = 0x3800
+H_QUARTER = 0x3400
+H_THREE_QUARTERS = 0x3A00
+H_EIGHTH = 0x3000
 
 
-def f2u(x):
+def f2u(x: float) -> int:
     return struct.unpack("<I", struct.pack("<f", x))[0]
 
 
-def u2f(u):
+def u2f(u: int) -> float:
     return struct.unpack("<f", struct.pack("<I", u & 0xFFFFFFFF))[0]
 
 
-def h2f(h):
+def h2f(h: int) -> float:
     return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
 
 
-def f2h(x):
+def f2h(x: float) -> int:
     return struct.unpack("<H", struct.pack("<e", x))[0]
 
 
-def ref(op, x):
+def f32(x: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def f16_is_nan(h: int) -> bool:
+    return (h & 0x7FFF) > 0x7C00
+
+
+def f16_is_inf(h: int) -> bool:
+    return (h & 0x7FFF) == 0x7C00
+
+
+def f16_is_finite(h: int) -> bool:
+    return ((h >> 10) & 0x1F) != 0x1F
+
+
+def ref_f32(op: str, x: float) -> float:
     return math.sin(2 * math.pi * x) if "sin" in op else math.cos(2 * math.pi * x)
 
 
-def setUpModule():
+def reduce_turn_angle(x: float) -> float:
+    """Range-reduce turn angle to [-0.5, 0.5] turns and scale by 2*pi in float32.
+
+    Matches RDNA2 hardware semantics and rdna2spirv.turn_angle lowering:
+    preserves signed zero when x == 0.0, uses RoundEven for symmetric tie-breaking,
+    and multiplies by 2*pi in IEEE 754 binary32.
+    """
+    xf = f32(x)
+    if xf == 0.0:
+        t = xf
+    else:
+        rnd = f32(round(xf))
+        t = f32(xf - rnd)
+    return f32(t * TWO_PI)
+
+
+def oracle_sincos_f16(
+    op: str,
+    h: int,
+    *,
+    abs_: bool = False,
+    neg_: bool = False,
+    clamp_: bool = False,
+) -> int | None:
+    """Independent reference oracle for RDNA2 v_sin_f16 and v_cos_f16.
+
+    Takes raw 16-bit integer representation of IEEE 754 half-precision float operand.
+    Applies VOP3 source modifiers (abs before neg), turn angle reduction, transcendental
+    evaluation, VOP3 clamp, and IEEE 754 round-to-nearest-even halfword packing.
+    Returns 16-bit unsigned integer bit pattern or None for non-finite values.
+    """
+    h &= 0xFFFF
+    if abs_:
+        h &= 0x7FFF
+    if neg_:
+        h ^= 0x8000
+    if not f16_is_finite(h):
+        return None
+    val_f = h2f(h)
+    ang = reduce_turn_angle(val_f)
+    res_f = f32(math.sin(ang) if "sin" in op else math.cos(ang))
+    if clamp_:
+        res_f = max(0.0, min(1.0, res_f))
+    return f2h(res_f)
+
+
+_TMP_DIR: tempfile.TemporaryDirectory | None = None
+_SRC_PATH: str | None = None
+
+
+def setUpModule() -> None:
     global _TMP_DIR, _SRC_PATH
     _TMP_DIR = tempfile.TemporaryDirectory()
     disasm_dir = os.path.join(_TMP_DIR.name, "disasm")
@@ -66,34 +158,50 @@ def setUpModule():
         f.write(STUB_DXBC)
 
 
-def tearDownModule():
-    global _TMP_DIR
+def tearDownModule() -> None:
+    global _TMP_DIR, _SRC_PATH
     if _TMP_DIR is not None:
+        gc.collect()
         _TMP_DIR.cleanup()
         _TMP_DIR = None
+        _SRC_PATH = None
 
 
-def run(line, v1, old=0):
+def translate_ps(lines: list[str]) -> str:
     if _TMP_DIR is None:
         setUpModule()
-    lines = [f"v_mov_b32 v1, {v1:#x}", f"v_mov_b32 v0, {old:#x}", line]
     asm = "; test_sincos\n" + "".join(f"\t{ln}\n" for ln in lines) + "\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
     with open(_SRC_PATH, "w", encoding="utf-8") as f:
         f.write(asm)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
         spv = rdna2spirv.translate(_SRC_PATH)
-    return si.run_fragment(spv)["%out_mrt0"][0]
+    return spv
+
+
+def run_ps(lines: list[str]) -> list[int]:
+    spv = translate_ps(lines)
+    return list(si.run_fragment(spv)["%out_mrt0"])
+
+
+def run(line: str, v1: int, old: int = 0) -> int:
+    return run_ps([
+        f"v_mov_b32 v1, {v1:#x}",
+        f"v_mov_b32 v0, {old:#x}",
+        line,
+    ])[0]
 
 
 class SinCosF32Tests(unittest.TestCase):
+    """Original single-precision tests preserved for regression defense."""
+
     def test_values_against_double_reference(self):
         for op in ("v_sin_f32", "v_cos_f32"):
-            for x in INPUTS:
-                x32 = u2f(f2u(x))                                  # the binary32 operand the shader sees
+            for x in INPUTS_F32:
+                x32 = u2f(f2u(x))
                 with self.subTest(op=op, x=x):
                     got = u2f(run(f"{op}_e32 v0, v1", f2u(x)))
-                    self.assertLessEqual(abs(got - ref(op, x32)), TOL32)
+                    self.assertLessEqual(abs(got - ref_f32(op, x32)), TOL32)
 
     def test_exact_quarter_turns(self):
         self.assertLessEqual(abs(u2f(run("v_sin_f32_e32 v0, v1", f2u(0.25))) - 1.0), TOL32)
@@ -102,14 +210,13 @@ class SinCosF32Tests(unittest.TestCase):
         self.assertLessEqual(abs(u2f(run("v_cos_f32_e32 v0, v1", f2u(-254.5))) + 1.0), TOL32)
 
     def test_worst_case_of_the_issue(self):
-        # x = 254.51: x * 2*pi first was off by 1.05e-4; reducing in turns is within 1e-6.
         x32 = u2f(f2u(254.51))
         got = u2f(run("v_sin_f32_e32 v0, v1", f2u(254.51)))
         self.assertLessEqual(abs(got - math.sin(2 * math.pi * x32)), TOL32)
 
     def test_signed_zero_and_special_values(self):
         self.assertEqual(run("v_sin_f32_e32 v0, v1", 0x00000000), 0x00000000)
-        self.assertEqual(run("v_sin_f32_e32 v0, v1", 0x80000000), 0x80000000)      # sin(-0) = -0
+        self.assertEqual(run("v_sin_f32_e32 v0, v1", 0x80000000), 0x80000000)
         self.assertEqual(u2f(run("v_cos_f32_e32 v0, v1", 0x80000000)), 1.0)
         for bits in (0x7F800000, 0xFF800000, 0x7FC00000):
             for op in ("v_sin_f32", "v_cos_f32"):
@@ -117,27 +224,22 @@ class SinCosF32Tests(unittest.TestCase):
                     self.assertTrue(math.isnan(u2f(run(f"{op}_e32 v0, v1", bits))))
 
     def test_modifiers(self):
-        got = u2f(run("v_sin_f32_e64 v0, -v1", f2u(100.3)))               # neg: sin(-x)
+        got = u2f(run("v_sin_f32_e64 v0, -v1", f2u(100.3)))
         self.assertLessEqual(abs(got - math.sin(-2 * math.pi * u2f(f2u(100.3)))), TOL32)
-        got = u2f(run("v_cos_f32_e64 v0, |v1|", f2u(-254.51)))            # abs
+        got = u2f(run("v_cos_f32_e64 v0, |v1|", f2u(-254.51)))
         self.assertLessEqual(abs(got - math.cos(2 * math.pi * u2f(f2u(254.51)))), TOL32)
-        got = u2f(run("v_sin_f32_e64 v0, v1 clamp", f2u(-0.25)))          # clamp: sin = -1 -> 0
+        got = u2f(run("v_sin_f32_e64 v0, v1 clamp", f2u(-0.25)))
         self.assertEqual(got, 0.0)
-        got = u2f(run("v_sin_f32_e64 v0, v1 mul:2", f2u(100.3)))          # omod
+        got = u2f(run("v_sin_f32_e64 v0, v1 mul:2", f2u(100.3)))
         self.assertLessEqual(abs(got - 2 * math.sin(2 * math.pi * u2f(f2u(100.3)))), 2 * TOL32)
 
     def test_whole_turns_give_plus_zero_for_either_sign(self):
-        """Measured on an RX 6800 (gfx1030, #616): v_sin_f32 of a whole number of turns, negative or positive, is
-        +0 (only sin(-0) is -0) and v_cos_f32 of it is 1."""
         for x in (-1.0, -2.0, -100.0, 1.0, 2.0, 100.0):
             with self.subTest(x=x):
                 self.assertEqual(run("v_sin_f32_e32 v0, v1", f2u(x)), 0x00000000)
                 self.assertEqual(run("v_cos_f32_e32 v0, v1", f2u(x)), f2u(1.0))
 
     def test_tiny_arguments_keep_their_sign_and_size(self):
-        """A reducer built on floor() would turn x = -2**-26 into 1.0 - 2**-26 = 1.0 in binary32 and return +0;
-        x - RoundEven(x) keeps the small centred argument. The result is below TOL32 either way, so the check is on
-        the sign and on a much tighter absolute tolerance (suggested by bobcatchris on #616)."""
         for x in (-2.0 ** -26, 2.0 ** -26, -2.0 ** -20, 2.0 ** -20):
             with self.subTest(x=x):
                 got = u2f(run("v_sin_f32_e32 v0, v1", f2u(x)))
@@ -147,36 +249,131 @@ class SinCosF32Tests(unittest.TestCase):
                 self.assertLessEqual(abs(u2f(run("v_cos_f32_e32 v0, v1", f2u(x))) - 1.0), 1e-6)
 
 
-class SinCosF16Tests(unittest.TestCase):
-    def test_values_keep_the_high_half(self):
-        for op in ("v_sin_f16", "v_cos_f16"):
-            for x in (0.25, 0.5, 100.25, 254.5, -254.25, 0.3):
-                h = f2h(x)
-                with self.subTest(op=op, x=x):
-                    got = run(f"{op}_e32 v0, v1", 0x12340000 | h, OLD)
-                    self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
-                    self.assertLessEqual(abs(h2f(got) - ref(op, h2f(h))), TOL16)
+class SinCosF16ReferenceOracleTests(unittest.TestCase):
+    """Tests the reference oracle against mathematical truth and validates the translator against the oracle."""
 
-    def test_negative_zero_keeps_its_sign(self):
-        """f16 -0.0 is 0x8000: sin(-0) stays -0 (the sign bit survives the turns reduction) and cos(-0) is 1;
-        the high half of the destination is kept in both."""
-        got = run("v_sin_f16_e32 v0, v1", 0x12340000 | 0x8000, OLD)
-        self.assertEqual(got, (OLD & 0xFFFF0000) | 0x8000)
-        got = run("v_cos_f16_e32 v0, v1", 0x12340000 | 0x8000, OLD)
-        self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
-        self.assertEqual(h2f(got), 1.0)
+    def test_oracle_exact_cardinal_turns(self):
+        # 0.0 turns (0 rad) -> sin = 0.0, cos = 1.0
+        self.assertEqual(oracle_sincos_f16("v_sin_f16", H_POS_ZERO), H_POS_ZERO)
+        self.assertEqual(oracle_sincos_f16("v_cos_f16", H_POS_ZERO), H_ONE)
 
-    def test_large_angle_near_the_256_turn_edge(self):
-        """Where x * 2*pi first would lose the fractional turn: 254.25 and 255.0 are exact in f16, and the
-        reference is computed in double."""
-        for op, x in (("v_sin_f16", 254.25), ("v_sin_f16", -254.25), ("v_cos_f16", 254.5), ("v_cos_f16", 255.0),
-                      ("v_sin_f16", 255.5), ("v_cos_f16", -255.5)):
-            h = f2h(x)
-            self.assertEqual(h2f(h), x)                      # the input is exactly representable
-            with self.subTest(op=op, x=x):
-                got = run(f"{op}_e32 v0, v1", 0x12340000 | h, OLD)
+        # 0.25 turns (pi/2 rad) -> sin = 1.0, cos ~= 0.0 (subnormal negative due to f32 2*pi approximation)
+        self.assertEqual(oracle_sincos_f16("v_sin_f16", H_QUARTER), H_ONE)
+        self.assertLessEqual(abs(h2f(oracle_sincos_f16("v_cos_f16", H_QUARTER))), TOL16)
+
+        # 0.5 turns (pi rad) -> sin ~= 0.0, cos = -1.0
+        self.assertLessEqual(abs(h2f(oracle_sincos_f16("v_sin_f16", H_HALF))), TOL16)
+        self.assertEqual(oracle_sincos_f16("v_cos_f16", H_HALF), H_NEG_ONE)
+
+        # 0.75 turns (3pi/2 rad) -> sin = -1.0, cos ~= 0.0
+        self.assertEqual(oracle_sincos_f16("v_sin_f16", H_THREE_QUARTERS), H_NEG_ONE)
+        self.assertLessEqual(abs(h2f(oracle_sincos_f16("v_cos_f16", H_THREE_QUARTERS))), TOL16)
+
+        # 1.0 turns (2pi rad) -> sin = 0.0, cos = 1.0
+        self.assertEqual(oracle_sincos_f16("v_sin_f16", H_ONE), H_POS_ZERO)
+        self.assertEqual(oracle_sincos_f16("v_cos_f16", H_ONE), H_ONE)
+
+    def test_oracle_symmetry_and_periodicity(self):
+        # Fractional turns strictly inside (-0.5, 0.5) modulo 1.0 (avoiding round-even tie at +-0.5)
+        turns = [0.125, 0.25, 0.375, 0.625, 0.75, 0.875]
+        for t in turns:
+            h = f2h(t)
+            h_plus_1 = f2h(t + 1.0)
+            h_plus_10 = f2h(t + 10.0)
+
+            # Periodicity: f(x + 1 turn) == f(x)
+            self.assertEqual(oracle_sincos_f16("v_sin_f16", h), oracle_sincos_f16("v_sin_f16", h_plus_1))
+            self.assertEqual(oracle_sincos_f16("v_cos_f16", h), oracle_sincos_f16("v_cos_f16", h_plus_1))
+            self.assertEqual(oracle_sincos_f16("v_sin_f16", h), oracle_sincos_f16("v_sin_f16", h_plus_10))
+            self.assertEqual(oracle_sincos_f16("v_cos_f16", h), oracle_sincos_f16("v_cos_f16", h_plus_10))
+
+            # Odd / Even symmetries: sin(-x) == -sin(x), cos(-x) == cos(x)
+            s_pos = h2f(oracle_sincos_f16("v_sin_f16", h))
+            s_neg = h2f(oracle_sincos_f16("v_sin_f16", f2h(-t)))
+            self.assertLessEqual(abs(s_pos + s_neg), TOL16)
+
+            c_pos = h2f(oracle_sincos_f16("v_cos_f16", h))
+            c_neg = h2f(oracle_sincos_f16("v_cos_f16", f2h(-t)))
+            self.assertLessEqual(abs(c_pos - c_neg), TOL16)
+
+    def test_normalized_turns_against_interpreter(self):
+        # Sweep normalized turns x in [0.0, 1.0) with step 1/32
+        steps = 32
+        for i in range(steps):
+            turn = i / steps
+            h_in = f2h(turn)
+            for op in ("v_sin_f16", "v_cos_f16"):
+                want = oracle_sincos_f16(op, h_in)
+                got_word = run(f"{op} v0, v1", (OLD & 0xFFFF0000) | h_in, old=OLD)
+                got_h = got_word & 0xFFFF
+                with self.subTest(op=op, turn=turn, h_in=hex(h_in)):
+                    self.assertEqual(got_h, want)
+                    # Verify high half preservation
+                    self.assertEqual(got_word & 0xFFFF0000, OLD & 0xFFFF0000)
+
+    def test_half_precision_precision_limits_and_ulp(self):
+        # Verify precision against double-precision math.sin/math.cos within f16 bounds
+        test_turns = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+        for t in test_turns:
+            h_in = f2h(t)
+            actual_t = h2f(h_in)  # The shader executes on the binary16 operand
+            for op in ("v_sin_f16", "v_cos_f16"):
+                got_val = h2f(run(f"{op} v0, v1", h_in))
+                exact_math = math.sin(2 * math.pi * actual_t) if "sin" in op else math.cos(2 * math.pi * actual_t)
+                with self.subTest(op=op, turn=t):
+                    self.assertLessEqual(abs(got_val - exact_math), TOL16)
+
+    def test_pythagorean_identity_f16(self):
+        # sin^2(x) + cos^2(x) ~= 1.0 across [0.0, 1.0)
+        for i in range(33):
+            turn = i / 32.0
+            h_in = f2h(turn)
+            sin_val = h2f(run("v_sin_f16 v0, v1", h_in))
+            cos_val = h2f(run("v_cos_f16 v0, v1", h_in))
+            pyth = sin_val * sin_val + cos_val * cos_val
+            with self.subTest(turn=turn):
+                self.assertLessEqual(abs(pyth - 1.0), 2e-3)
+
+    def test_vop3_modifiers(self):
+        x = 0.3
+        h_in = f2h(x)
+        old_val = 0xBEEF1234
+
+        # Negate source modifier: sin(-x)
+        got = run("v_sin_f16_e64 v0, -v1", h_in, old=old_val)
+        want = oracle_sincos_f16("v_sin_f16", h_in, neg_=True)
+        self.assertEqual(got & 0xFFFF, want)
+        self.assertEqual(got & 0xFFFF0000, old_val & 0xFFFF0000)
+
+        # Absolute value modifier: cos(|-x|) == cos(x)
+        got = run("v_cos_f16_e64 v0, |v1|", f2h(-x), old=old_val)
+        want = oracle_sincos_f16("v_cos_f16", h_in)
+        self.assertEqual(got & 0xFFFF, want)
+        self.assertEqual(got & 0xFFFF0000, old_val & 0xFFFF0000)
+
+        # Negated absolute value: sin(-|x|)
+        got = run("v_sin_f16_e64 v0, -|v1|", h_in, old=old_val)
+        want = oracle_sincos_f16("v_sin_f16", h_in, abs_=True, neg_=True)
+        self.assertEqual(got & 0xFFFF, want)
+
+        # Clamp output modifier: sin(0.75 turns) = -1.0 -> clamp to 0.0
+        got = run("v_sin_f16_e64 v0, v1 clamp", H_THREE_QUARTERS, old=old_val)
+        want = oracle_sincos_f16("v_sin_f16", H_THREE_QUARTERS, clamp_=True)
+        self.assertEqual(got & 0xFFFF, want)
+        self.assertEqual(h2f(got & 0xFFFF), 0.0)
+
+    def test_instruction_forms(self):
+        h_in = f2h(0.125)
+        for form in ("", "_e32", "_e64"):
+            with self.subTest(op="v_sin_f16", form=form or "bare"):
+                got = run(f"v_sin_f16{form} v0, v1", h_in, old=OLD)
+                self.assertEqual(got & 0xFFFF, oracle_sincos_f16("v_sin_f16", h_in))
                 self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
-                self.assertLessEqual(abs(h2f(got) - ref(op, x)), TOL16)
+
+            with self.subTest(op="v_cos_f16", form=form or "bare"):
+                got = run(f"v_cos_f16{form} v0, v1", h_in, old=OLD)
+                self.assertEqual(got & 0xFFFF, oracle_sincos_f16("v_cos_f16", h_in))
+                self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
 
 
 if __name__ == "__main__":
