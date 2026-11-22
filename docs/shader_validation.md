@@ -1500,6 +1500,31 @@ on k + 0.5, the error's sign gives floor(p) + 1 or floor(p), and a zero error ke
 probe then exits 0 on the same iGPU: all 134 words equal the translator's in all ten runs (wave32 and wave64, five
 MODEs), including the 28 near ties.
 
+### `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32` denormal flush on RDNA1 (`tools/mad_denorm_probe.py`, SHADER-340)
+
+`docs/design.md` ("Denormal flush in `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32`") had no hardware measurement: GFX10.3+
+dropped these opcodes, and flushing only after `omod` (`div:2`/`mul:2`/`mul:4`) was an unverified assumption. The probe
+covers 48 cases across six groups: subnormal operands in each source slot (`input`, 15), normal operands with a subnormal
+product (`product`, 7), normal operands/products with a subnormal sum (`result`, 6), `omod`/`clamp` crossing the
+subnormal threshold (`omod`, 8), `v_mad_legacy_f32`'s `0 * anything -> +0` with subnormals (`legacy`, 5), and controls
+(`control`, 7). A `v_mul_f32(FLT_MIN, 0.5)` sanity kernel checks that `MODE.denorm32=3` actually keeps f32 denormals on
+the device (`0x00000000` with `denorm32=0`, `0x00400000` with `denorm32=3`).
+
+```
+python -I tools/mad_denorm_probe.py                             # the translator, on the CPU interpreter
+python -I tools/mad_denorm_probe.py --oracle hw                 # also the native instruction on an AMD GPU
+```
+
+Results (48 cases per run, wave32 and wave64 across 5 MODEs; `tests/test_mad_denorm_probe.py` checks the translator side):
+
+| GPU | Driver | `game` / `dx10clamp0` / `denorm32_kept` | `ieee1` / `ieee1_dx10clamp0` (non-`omod` + `omod` ignored) |
+|---|---|---|---|
+| AMD Radeon RX 5600 XT (`gfx1010`, RDNA1), Windows, HIP backend (`amdhip64_6.dll`), AMD clang (`rocm-sdk-core 10.0.0`) | 32.0.21045.29003 | 48 of 48 (wave32 and wave64) | 48 of 48 (wave32 and wave64) |
+
+Two findings from the RDNA1 measurement:
+- **Subnormal inputs, products, sums, and legacy rules flush regardless of `MODE.denorm32`** (40 of 40 non-`omod` cases match bit-for-bit across all 5 MODEs, including `denorm32=3`). Under `MODE.IEEE=1`, hardware ignores `mul:2`/`mul:4`/`div:2` (`FLT_MIN div:2` gives `FLT_MIN`, as for other f32 VALU ops).
+- **Hardware flushes both before and after `omod`.** Before SHADER-340, the translator flushed only after `clamp_mods`, so `(1.5*2^-126 - 2^-126) mul:2` gave `0x00800000` (`FLT_MIN`) and `mul:4` gave `0x01000000`, whereas the RX 5600 XT returns `+0` (`0x00000000`) in `game`, `dx10clamp0`, and `denorm32_kept`. `Gen.flush_f32_mods` now flushes the sum before `clamp_mods` and flushes again after it (`FLT_MIN div:2` → `+0`, `-FLT_MIN div:2` → `-0`), leaving non-modified `v_mad*`/`v_mac*` instructions byte-identical.
+
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
 *Measured on an RDNA2 iGPU (gfx1036), AMD Windows driver 32.0.21044.64, HIP backend, AMD clang 23.0.0git, `main`

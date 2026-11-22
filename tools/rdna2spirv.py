@@ -4902,6 +4902,13 @@ class Gen:
         self.emit(f"{r} = OpSelect %float {small} {z} {f}")
         return r
 
+    def flush_f32_mods(self, v, mods):
+        """Flush a subnormal sum before output modifiers and flush again after them (SHADER-340, RDNA1 gfx1010)."""
+        v = self.flush_f32(v)
+        if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+            v = self.flush_f32(self.clamp_mods(v, mods))
+        return v
+
     def clamp_mods_f64(self, v, mods):
         """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
         for f32 the clamp is GLSL.std.450 FClamp, so a NaN result and the sign of a -0 result are left to the
@@ -7539,7 +7546,7 @@ class Gen:
             self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
             self.emit(f"{sel} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             self.emit(f"{r} = OpFAdd %float {sel} {z}")
-            self.dst(a[0], self.tou(self.flush_f32(self.clamp_mods(r, mods))))
+            self.dst(a[0], self.tou(self.flush_f32_mods(r, mods)))
         elif op in ("v_min3_i32", "v_min3_u32", "v_max3_i32", "v_max3_u32"):
             x, y, z = (self.src_u(t) for t in a[1:4])
             f = ("S" if op.endswith("i32") else "U") + ("Min" if "min" in op else "Max")
@@ -8048,7 +8055,7 @@ class Gen:
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{r} = OpFAdd %float {self.flush_f32(m)} {z}")
-            self.dst(a[0], self.tou(self.flush_f32(self.clamp_mods(r, mods))))
+            self.dst(a[0], self.tou(self.flush_f32_mods(r, mods)))
         elif op in ("v_mul_lo_u32", "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32"):
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
