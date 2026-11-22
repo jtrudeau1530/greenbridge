@@ -3,6 +3,7 @@ import ast
 import contextlib
 import io
 import json
+import re
 import struct
 from pathlib import Path
 import sys
@@ -362,12 +363,31 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertIn("64-wide fragment subgroup", problem)
         self.assertIn("8..8", problem)
 
+    def test_wave64_pixel_shader_skips_where_the_harness_says_64_is_not_available(self):
+        # vk_harness.cpp's line for a size the device could not take; it must not read as "64 was required".
+        out = "device: fake (subgroup 32..32)\nfragment subgroup size: 64 not available\nok 64x64\n"
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("64-wide fragment subgroup", problem)
+
     def test_wave64_pixel_shader_is_judged_when_64_was_required(self):
-        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64 required\nok 64x64\n"
+        # The line as vk_harness.cpp prints it when the size took effect: "fragment subgroup size: %u\n".
+        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels()), "")
         problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
         self.assertNotIsInstance(problem, check.Skip)
         self.assertIn("pixels differ", problem)
+
+    def test_wide_pixel_skip_reads_the_line_vk_harness_prints(self):
+        # Keeps the check and the harness in step: the format string is read from vk_harness.cpp, not written here.
+        harness = Path(__file__).resolve().parents[1] / "runtime" / "test" / "vk_harness.cpp"
+        source = harness.read_text(encoding="utf-8")
+        formats = re.findall(r'"(fragment subgroup size: %u[^"]*)\\n"', source)
+        self.assertEqual(sorted(formats), ["fragment subgroup size: %u", "fragment subgroup size: %u not available"])
+        taken, refused = (f.replace("%u", "64") + "\n" for f in sorted(formats))
+        self.assertIsNone(check.wide_pixel_skip("ps_w64x_readlane", "device: fake (subgroup 32..64)\n" + taken))
+        self.assertIsInstance(check.wide_pixel_skip("ps_w64x_readlane", "device: fake (subgroup 32..32)\n" + refused),
+                              check.Skip)
 
     def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
         out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
