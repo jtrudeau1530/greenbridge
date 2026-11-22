@@ -122,8 +122,19 @@ class Generator(unittest.TestCase):
                                        for i, a in enumerate(srcs)):
                 return "f16-const-sel"
             return None
-        self.assertEqual({known_form(line) for line in self.lines()} - {None}, set())
-        self.assertEqual({known_form(line) for line in self.lines(known=True)} - {None}, set(d.KNOWN_DIVERGENCES))
+        self.assertEqual({known_form(line) for line in self.lines()} - {None}, {"dword-16bit", "f16-const-sel"})
+        self.assertEqual({known_form(line) for line in self.lines(known=True)} - {None},
+                         set(d.KNOWN_DIVERGENCES) | {"dword-16bit", "f16-const-sel"})
+
+    def test_forms_main_translates_again_are_generated_by_default(self):
+        # #2187 (dst_sel:DWORD zeroes a 16-bit result's high half) and #2209 (src_sel on an f16 float constant) are
+        # on main, so a default run must keep both forms in, or a regression of either goes unseen
+        self.assertEqual(set(d.KNOWN_DIVERGENCES), {"shift-const-sel"})
+        lines = self.lines()
+        self.assertTrue(any(d.OPS[line.split()[0][:-5]][2] == 16 and "dst_sel:DWORD" in line for line in lines))
+        self.assertTrue(any(d.OPS[line.split()[0][:-5]][0] == "f16" and
+                            any(f", {c} " in line or f", {c}," in line for c in d.FLOAT_CONSTS) and
+                            "src0_sel:DWORD" not in line for line in lines))
 
 
 class Translated(unittest.TestCase):
