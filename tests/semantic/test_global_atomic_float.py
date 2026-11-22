@@ -10,6 +10,13 @@ Verifies the CAS loop lowering (OpAtomicCompareExchange + GLSL.std.450 NMin/NMax
   - Rejection of invalid modifiers (slc, dlc, lds), operand counts, and multi-dword registers.
   - Dependency analysis (read_before_write_vgprs).
 
+Note on hardware fidelity (measured natively on gfx1036 for #2361 by @Pierre-Kookis):
+  - The expectations below verify what rdna2spirv's CAS lowering with GLSL.std.450 NMin/NMax produces today
+    with denormals kept (Vulkan default).
+  - On native hardware under the game's MODE (f32 denormals flushed), a denormal operand counts as a signed zero.
+  - On native hardware, an sNaN in either operand wins and is stored quieted (0x7fc00001), whereas GLSL NMin/NMax
+    returns the non-NaN operand.
+
 Standard library only; runs through spirv_mini_interp on the CPU without GPU, LLVM, or game files.
 """
 from __future__ import annotations
@@ -135,12 +142,14 @@ class GlobalAtomicFloatSemantics(unittest.TestCase):
             ("fmax", ONE, NEG_INF, ONE),
             ("fmax", NEG_INF, ONE, ONE),
             ("fmax", POS_INF, NEG_INF, POS_INF),
-            # Subnormal numbers
+            # Subnormal numbers: holds with denormals kept (Vulkan default).
+            # On gfx1036 in denormals-flushed MODE, denormals flush to signed zero (#2361).
             ("fmin", POS_ZERO, SUBNORM_MIN, POS_ZERO),
             ("fmin", SUBNORM_MAX, SUBNORM_MIN, SUBNORM_MIN),
             ("fmax", POS_ZERO, SUBNORM_MIN, SUBNORM_MIN),
             ("fmax", SUBNORM_MAX, SUBNORM_MIN, SUBNORM_MAX),
-            # NaN handling: one NaN returns the non-NaN operand
+            # NaN handling: GLSL.std.450 NMin/NMax returns the non-NaN operand.
+            # On native RDNA2 hardware (#2361), sNaN in either operand wins and is stored quieted.
             ("fmin", QNAN, ONE, ONE),
             ("fmin", ONE, QNAN, ONE),
             ("fmin", SNAN, NEG_TWO, NEG_TWO),
