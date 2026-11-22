@@ -85,6 +85,8 @@ struct VulkanDeviceInfo {
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;
+    // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
+    bool image_view_min_lod = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive

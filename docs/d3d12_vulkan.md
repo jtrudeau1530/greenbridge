@@ -248,8 +248,14 @@ What is implemented (all of it testable without the game):
   - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views;
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
-  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
-    support, format support, multisample quality levels, shader model and root signature version.
+  - `R10G10B10_XR_BIAS_A2_UNORM` maps to `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, the same packed 10:10:10:2
+    layout; the bias and scale are the application's shader work. Like the PC runtime, it accepts only a
+    single-mip, single-sample 2D texture: extra mips, multisampling and 3D are refused in creation, allocation
+    and footprints. Format support reports `TEXTURE2D` and `CAST_WITHIN_BIT_LAYOUT`, not the host's display,
+    back-buffer-cast or video-processor bits;
+  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS`,
+    `OPTIONS2`–`5`, `7`–`9`, `11`, `13`–`21`), GPU virtual-address support, format support, format plane counts,
+    multisample quality levels, shader model and root signature version.
     `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device enables BC texture compression.
     Other queries are logged and refused until the trace shows what the game asks (question 11);
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS` and `OPTIONS2`–`5`, `7`, `9`, `11`, `13`–`21`), GPU virtual-address
@@ -262,6 +268,8 @@ What is implemented (all of it testable without the game):
     image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
     support, format support, format plane counts, multisample quality levels, shader model and root signature
     version. Other queries are logged and refused until the trace shows what the game asks (question 11);
+    Other queries, including `OPTIONS1`, `6`, `10` and `12`, are logged and refused until the trace shows what
+    the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
@@ -379,6 +387,9 @@ side inwards:
   `CreateSampler` an S#; each then makes sure set 0 has the view or sampler and the table has the key. Details:
   - The key is the descriptor's bytes, so a copied descriptor needs nothing more, and an unordered-access view
     and a shader-resource view of the same mip are one entry.
+  - A D3D12 comparison sampler with function NEVER and an ordinary sampler both encode zero in the hardware
+    depth comparison field. The layer marks the NEVER comparison in S# word 3, bit 12 (unused with
+    DERIV_ADJUST_EN clear) to give it a separate lookup key and a comparison-enabled Vulkan sampler.
   - A view the layer cannot show (below) leaves a null descriptor, all zeros, which finds the fallback.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
@@ -917,8 +928,11 @@ The layer's descriptor model:
 - RTV/DSV creation builds a `VkImageView` and stores it in the host-side heap; `OMSetRenderTargets` resolves those
   handles to views for the rendering scope. RTV/DSV descriptors are never shader-visible.
 - View creation maps `D3D12_SRV_DIMENSION`/`D3D12_UAV_DIMENSION` to `VkImageViewType`, the mip and layer ranges,
-  sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. `ResourceMinLODClamp` needs
-  `VK_EXT_image_view_min_lod`; log if the device lacks it instead of silently ignoring the clamp.
+  sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. Single-sampled 2D colour SRVs
+  apply the T# minimum LOD in resource mip coordinates. A clamp inside the exposed mip range uses
+  `VK_EXT_image_view_min_lod`. If the logical device lacks the feature, the runtime logs the unsupported view
+  and its descriptor resolves to the fallback. A clamp at or below the first mip needs no extension. Above the
+  last mip, the view retains its dimensions and maps sampled channels to zero while preserving constant channels.
 - Set 0 is a fixed bindless layout. The GPU tests use 4096 sampled 2D images, 1024 samplers, 1024 2D-array
   images, 256 1D, 256 3D, 1024 storage images and 256 per storage dimension/class; start there and grow by
   recreating the set at a frame boundary. Use `UPDATE_AFTER_BIND` and `PARTIALLY_BOUND` so a new view does not
@@ -1131,6 +1145,15 @@ The trace will enumerate them.
   there, so 1.1 is what the game can rely on everywhere. A higher request is clamped down like the shader model, and
   an undefined value is refused. Measured against the host PC runtime (616.86): 1.0-1.2 echo the request, and a
   wrong `DataSize` is `E_INVALIDARG`; the host crashed on a null buffer, so the test never gives it one.
+- `D3D12_FEATURE_D3D12_OPTIONS1`: answer from the Vulkan device's subgroups. `WaveOps` is true only when every
+  operation group the wave intrinsics map to is present (`BASIC`, `VOTE`, `BALLOT`, `SHUFFLE`, `ARITHMETIC`),
+  because D3D12 promises them all behind that one bool. `WaveLaneCountMin`/`Max` are the subgroup size range
+  (`VkPhysicalDeviceSubgroupSizeControlProperties`, or the single `subgroupSize` without those 1.3 properties).
+  `TotalLaneCount` has no Vulkan equivalent: D3D12 counts every lane of the device, and the layer answers one full
+  wave, so a game that sizes work from it plans for less parallelism than the GPU has, never more. Measured
+  against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
+  and `E_INVALIDARG` for a `DataSize` one field too short or too long. The host crashed the process on a null
+  buffer, so the layer refuses one without asking the host (as with root signatures).
 - `D3D12_OPTIONS` families: report the tier the Vulkan feature set can honour (resource binding tier 3 when
   descriptor indexing and update-after-bind are available), plus wave ops, 16-bit, barycentrics, render passes,
   VRS, mesh shader tier, and RT tier 1.1 only if the layer can honour them. The game may branch on these; a false
