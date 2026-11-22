@@ -88,6 +88,13 @@ class TileProbeInputTest(unittest.TestCase):
         self.assertIn("is a directory", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_out_under_a_regular_file_is_a_message_not_a_traceback(self):
+        # Before: os.makedirs raised FileExistsError (NotADirectoryError on Windows) out of check_preview_path.
+        p = self.run_tool(self.blob, "--out", os.path.join(self.blob, "sub", "p.png"))
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("--out", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
     def test_out_creates_a_missing_folder(self):
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         import tile_probe
