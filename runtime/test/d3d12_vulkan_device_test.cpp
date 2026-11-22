@@ -4987,7 +4987,7 @@ int main() {
         ID3D12CommandList* tiled_lists[] = {tiled_list.p};
         queue->ExecuteCommandLists(1, tiled_lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)) && SUCCEEDED(fence->SetEventOnCompletion(7, nullptr)));
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 8)) && SUCCEEDED(fence->SetEventOnCompletion(8, nullptr)));
         void* tiled_bytes = nullptr;
         EXPECT(SUCCEEDED(tiled_rb->Map(0, nullptr, &tiled_bytes)));
         const std::uint8_t want_rgba[4] = {64, 128, 191, 255};
@@ -5218,7 +5218,7 @@ int main() {
             EXPECT(SUCCEEDED(tiled_list->Close()));
             queue->ExecuteCommandLists(1, tiled_lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 8)) && SUCCEEDED(fence->SetEventOnCompletion(8, nullptr)));
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 9)) && SUCCEEDED(fence->SetEventOnCompletion(9, nullptr)));
             void* msaa_bytes = nullptr;
             EXPECT(SUCCEEDED(msaa_rb->Map(0, nullptr, &msaa_bytes)));
             const auto* out_bytes = static_cast<const std::uint8_t*>(msaa_bytes);
