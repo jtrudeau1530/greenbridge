@@ -12,6 +12,7 @@ Vertex block (header 0x60 bytes, first u32 is 0x00003063):
     slot 2  tag 0x63  12 bytes/vertex  float3 normal (absent in some blocks)
     slot 3  tag 0x42   8 bytes/vertex  float2
     slot 4  tag 0x42   8 bytes/vertex  float2 (absent in some blocks)
+    a slot past 4 (seen: slot 12, tag 0x26) takes its tag's stride from the `42 40` table below
     The streams are stored in slot order 0, 2, 1, 3, 4. Only slot 0 is required. The vertex count is the span
     from slot 0 to the next stream in offset order, divided by 12; the block ends 8 * count bytes after its last
     slot.
@@ -27,9 +28,19 @@ Meshlet group (first u32 has bit 31 set):
     then T u32 triangles: three 7-bit meshlet-local indices (bits 0-6, 7-13, 14-20), meshlet index in bits 21-31
     then V u16 vertex references into a vertex block
 
-A page starts with either kind: 45 streams start with a block (`63 30 00 00`) and others start with a group
-(continuation pages). The walk stops, without an error, at a `42 40 00 00` block (the same slot-word header with
-other vertex formats, not sized here) or at a group that continues past the end of the stream. Only counts and layout checks are written; no vertex, index or float value leaves this tool.
+`42 40 00 00` vertex block (header 0x80 bytes, first u32 is 0x00004042; ASSET-146):
+    +0x00..+0x58  23 slot words, encoded as above. Slot 0 is always tag 0x42 at offset 0x80.
+    +0x5C         u32, 0x200 (as in the `63 30` block)
+    +0x60..+0x7C  further header words; not decoded here (counted: +0x6C is 0, 1 or 2, +0x7C is 4.0f)
+    per-vertex stride by tag: 0x42 = 8 bytes, 0x21, 0x26, 0x27 and 0x28 = 4 bytes. The vertex count is the span
+    from slot 0 to the next stream divided by 8; every stream is stride * count bytes and the block ends there.
+    Measured over every `42 40` block of `shared_minigame000.rpf`: 14,671 fit this exactly, and each one is
+    followed by a `42 40` block, a meshlet group, a `63 30` block or the end of the stream. The vertex values
+    (8-byte positions, 4-byte attributes) are not decoded.
+
+A page starts with a `63 30` block, a `42 40` block or a group (continuation pages). The walk stops, without an
+error, at a `42 40` block whose layout doesn't fit the rule above or at a group that continues past the end of
+the stream. Only counts and layout checks are written; no vertex, index or float value leaves this tool.
 
 Usage:
     python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet]
@@ -52,6 +63,8 @@ HEADER_SIZE = 0x60
 SLOT_COUNT = 23
 SLOT_STRIDE = {0: 12, 1: 4, 2: 12, 3: 8, 4: 8}
 SLOT_TAG = {0: 0x63, 1: 0x26, 2: 0x63, 3: 0x42, 4: 0x42}
+OTHER_HEADER_SIZE = 0x80
+OTHER_TAG_STRIDE = {0x42: 8, 0x21: 4, 0x26: 4, 0x27: 4, 0x28: 4}
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 
 
@@ -85,7 +98,7 @@ def parse_block(data, at):
         raise PageError(f"block at +0x{at:x}: slot {order[1]} offset is not 12 * count past slot 0")
     count = span // SLOT_STRIDE[0]
     for here, nxt in zip(order, order[1:]):
-        stride = SLOT_STRIDE.get(here)
+        stride = SLOT_STRIDE.get(here, OTHER_TAG_STRIDE.get(slots[here][0]))   # a slot past 4: its tag's stride
         if stride is None or slots[nxt][1] - slots[here][1] != stride * count:
             raise PageError(f"block at +0x{at:x}: slot {here} size is not stride * count")
     last = order[-1]
@@ -97,6 +110,36 @@ def parse_block(data, at):
     record = {"kind": "block", "offset": at, "vertices": count, "flags": words[23],
               "slots": [[i, slots[i][0], slots[i][1]] for i in sorted(slots)],
               "tags_expected": all(SLOT_TAG.get(i) == t for i, (t, _) in slots.items())}
+    return record, end
+
+
+def parse_other_block(data, at):
+    """Size a `42 40 00 00` vertex block at `at` from its slot words. Returns (record, end offset); the record holds
+    counts and tags only."""
+    if at + OTHER_HEADER_SIZE > len(data):
+        raise PageError(f"42 40 block header truncated at +0x{at:x}")
+    words = struct.unpack_from("<32I", data, at)
+    if words[0] != OTHER_BLOCK_MAGIC:
+        raise PageError(f"no 42 40 block magic at +0x{at:x}")
+    slots = {i: (w & 0xFF, (w >> 8) * 2) for i, w in enumerate(words[:SLOT_COUNT]) if w}
+    if any(tag not in OTHER_TAG_STRIDE for tag, _ in slots.values()):
+        raise PageError(f"42 40 block at +0x{at:x} has a slot tag with no known stride")
+    order = sorted(slots, key=lambda i: slots[i][1])
+    if len(order) < 2 or order[0] != 0 or slots[0][1] != OTHER_HEADER_SIZE:
+        raise PageError(f"42 40 block at +0x{at:x}: slot 0 is not at +0x80 or has no stream after it")
+    span = slots[order[1]][1] - OTHER_HEADER_SIZE
+    if span <= 0 or span % OTHER_TAG_STRIDE[slots[0][0]]:
+        raise PageError(f"42 40 block at +0x{at:x}: slot 0 span is not a whole number of vertices")
+    count = span // OTHER_TAG_STRIDE[slots[0][0]]
+    for here, nxt in zip(order, order[1:]):
+        if slots[nxt][1] - slots[here][1] != OTHER_TAG_STRIDE[slots[here][0]] * count:
+            raise PageError(f"42 40 block at +0x{at:x}: slot {here} size is not stride * count")
+    last = order[-1]
+    end = at + slots[last][1] + OTHER_TAG_STRIDE[slots[last][0]] * count
+    if end > len(data):
+        raise PageError(f"42 40 block at +0x{at:x} runs past the page end")
+    record = {"kind": "block4240", "offset": at, "vertices": count, "flags": words[23], "mode": words[27],
+              "slots": [[i, slots[i][0], slots[i][1]] for i in sorted(slots)]}
     return record, end
 
 
@@ -145,6 +188,12 @@ def is_mesh_page(data):
     word = struct.unpack_from("<I", data, 0)[0]
     if word == BLOCK_MAGIC:
         return True
+    if word == OTHER_BLOCK_MAGIC:
+        try:
+            parse_other_block(data, 0)
+        except PageError:
+            return False
+        return True
     if not word & 0x80000000:
         return False
     try:
@@ -174,9 +223,12 @@ def parse_page(data):
         if word == BLOCK_MAGIC:
             record, pos = parse_block(data, pos)
         elif word == OTHER_BLOCK_MAGIC:
-            # A `42 40 00 00` block: same slot-word header, other vertex formats; not sized here.
-            chunks.append({"kind": "stop", "offset": pos, "reason": "42 40 00 00 block"})
-            break
+            try:
+                record, pos = parse_other_block(data, pos)
+            except PageError:
+                # a `42 40 00 00` block whose layout doesn't fit the measured strides: stop instead of guessing
+                chunks.append({"kind": "stop", "offset": pos, "reason": "42 40 00 00 block"})
+                break
         elif word & 0x80000000:
             try:
                 record, pos = parse_group(data, pos)
@@ -230,6 +282,7 @@ def summarise_page(data, name):
     except PageError as exc:
         return {"name": name, "size": len(data), "error": str(exc)}
     blocks = [c for c in chunks if c["kind"] == "block"]
+    others = [c for c in chunks if c["kind"] == "block4240"]
     groups = [c for c in chunks if c["kind"] == "group"]
     checks = {}
     for b in blocks:
@@ -238,7 +291,7 @@ def summarise_page(data, name):
     counts = {b["vertices"] for b in blocks}
     stop = [c for c in chunks if c["kind"] == "stop"]
     return {"name": name, "size": len(data), "starts_with": chunks[0]["kind"],
-            "sequence": "".join({"block": "B", "group": "G", "stop": "."}[c["kind"]] for c in chunks),
+            "sequence": "".join({"block": "B", "block4240": "Q", "group": "G", "stop": "."}[c["kind"]] for c in chunks),
             "stop": stop[0]["reason"] if stop else None,
             "blocks": len(blocks), "groups": len(groups),
             "blocks_with_colour": sum(1 for b in blocks if any(s[0] == 1 for s in b["slots"])),
@@ -251,6 +304,11 @@ def summarise_page(data, name):
             "vertex_refs": sum(g["vertex_refs"] for g in groups),
             "groups_dense": sum(1 for g in groups if g["unique_refs"] == g["vertex_span"]),
             "groups_matching_block_here": sum(1 for g in groups if g["vertex_span"] in counts),
+            "blocks_4240": len(others), "vertices_4240": sum(b["vertices"] for b in others),
+            "blocks_4240_flags": sorted({b["flags"] for b in others}),
+            "blocks_4240_modes": sorted({b["mode"] for b in others}),
+            "groups_matching_4240_block_here": sum(1 for g in groups
+                                                   if g["vertex_span"] in {b["vertices"] for b in others}),
             "group_spans": [g["vertex_span"] for g in groups],
             "block_counts": [b["vertices"] for b in blocks],
             "checks": checks}
@@ -314,10 +372,12 @@ def iter_inputs(paths):
 
 def totals(pages):
     keys = ("blocks", "groups", "blocks_with_colour", "blocks_with_uv1", "meshlets", "full_meshlets",
-            "triangles", "vertex_refs", "groups_dense", "groups_matching_block_here")
+            "triangles", "vertex_refs", "groups_dense", "groups_matching_block_here", "blocks_4240",
+            "vertices_4240", "groups_matching_4240_block_here")
     out = {"pages": len(pages), "pages_parsed": sum(1 for p in pages if "error" not in p),
            "block_led_pages": sum(1 for p in pages if p.get("starts_with") == "block"),
            "group_led_pages": sum(1 for p in pages if p.get("starts_with") == "group"),
+           "block_4240_led_pages": sum(1 for p in pages if p.get("starts_with") == "block4240"),
            "stopped_at_4240_block": sum(1 for p in pages if p.get("stop") == "42 40 00 00 block"),
            "stopped_in_group": sum(1 for p in pages if p.get("stop") == "group continues past the stream"),
            "bytes": sum(p["size"] for p in pages)}
@@ -331,6 +391,8 @@ def totals(pages):
             checks[k] = checks.get(k, 0) + v
     out["checks"] = checks
     out["block_flags"] = sorted({f for p in good for f in p["block_flags"]})
+    out["blocks_4240_flags"] = sorted({f for p in good for f in p.get("blocks_4240_flags", [])})
+    out["blocks_4240_modes"] = sorted({m for p in good for m in p.get("blocks_4240_modes", [])})
     # A group's vertex span that matches a block in the same page or a neighbouring page (input order).
     near = 0
     for i, p in enumerate(good):
