@@ -327,12 +327,18 @@ def make_inverse_tile_lookup(layout, mip):
 
 def retile_mip(linear, layout, mip):
     """Place a linear DDS mip payload into its RDNA2 tiled byte buffer."""
+    out = bytearray(mip["region"])
+    _retile_mip_into(linear, layout, mip, out)
+    return bytes(out)
+
+
+def _retile_mip_into(linear: bytes, layout: dict, mip: dict, out: bytearray) -> None:
+    """Write one mip's blocks into its region, which may also hold other tail mips."""
     eb = layout["element_bytes"]
     bw, bh = mip["blocks_w"], mip["blocks_h"]
     expected = bw * bh * eb
     if len(linear) < expected:
         raise ValueError(f"DDS mip payload truncated ({len(linear)} < {expected} bytes)")
-    out = bytearray(mip["region"])
     mv = memoryview(linear)
     row_stride = bw * eb
     for by in range(bh):
@@ -341,7 +347,6 @@ def retile_mip(linear, layout, mip):
             off = tiled_offset(layout, mip, bx, by)
             src = row_at + bx * eb
             out[off:off + eb] = mv[src:src + eb]
-    return bytes(out)
 
 
 def read_dds(path):
@@ -2102,12 +2107,14 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
         lay = a["layout"]
         seen_chunks = set()
         # Build virtual-offset map of retiled DDS mip bytes.
-        tiled_ranges = []
+        tiled_ranges: dict[int, bytearray] = {}
         for m, mip in enumerate(lay["mips"]):
             if m >= len(mips):
                 break
-            tiled = retile_mip(mips[m], lay, mip)
-            tiled_ranges.append((d["base"] + mip["offset"], tiled))
+            start = d["base"] + mip["offset"]
+            if start not in tiled_ranges:
+                tiled_ranges[start] = bytearray(mip["region"])
+            _retile_mip_into(mips[m], lay, mip, tiled_ranges[start])
         # Match every BCPack chunk touching those mips.
         for m, mip in enumerate(lay["mips"]):
             if m >= len(mips):
@@ -2123,7 +2130,7 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
                 # Assemble the chunk's reference tiled bytes from `tiled_ranges`.
                 ref_chunk = bytearray(csize)
                 covered = 0
-                for mstart, mtiled in tiled_ranges:
+                for mstart, mtiled in tiled_ranges.items():
                     mend = mstart + len(mtiled)
                     lo = max(virt, mstart)
                     hi = min(virt + csize, mend)

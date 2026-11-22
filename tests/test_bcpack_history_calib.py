@@ -15,6 +15,7 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import Mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -677,6 +678,31 @@ class ReferenceInversionTest(unittest.TestCase):
                     0,
                 )
             self.assertEqual(bcpack.decode(raw_bc1, 1, 8, history=rep_json), blk_bc1)
+
+    def test_reference_dds_preserves_both_mips_in_one_tail_tile(self) -> None:
+        width = height = 16
+        fmt, codec = 71, 1
+        layout = ttpf.surface_layout(width, height, fmt, 2, ttpf.tile_bytes(4))
+        first, second = layout["mips"]
+        self.assertTrue(first["in_tail"] and second["in_tail"])
+        self.assertEqual(first["offset"], second["offset"])
+        mips = [bytes.fromhex("00 f8 00 00 00 00 00 00") * 16,
+                bytes.fromhex("e0 07 00 00 00 00 00 00") * 4]
+        region = first["region"]
+        raw = encode_lanes([[0] * (region // 8) for _ in bcpack.LANE_WIDTHS[codec]], codec)
+        record = _pack_etpf(width, height, 2, 0, fmt, 4096)
+
+        with tempfile.TemporaryDirectory() as temp:
+            pool_path = os.path.join(temp, "tail.ttpf")
+            dds_path = os.path.join(temp, "tail.dds")
+            _write_custom_rds5_pool(pool_path, [record], [(codec, region, raw)])
+            _write_dx10_dds(dds_path, fmt, width, height, mips)
+            calibrator = Mock()
+            calib.apply_ref_dds(pool_path, 0, dds_path, {codec: calibrator})
+
+        self.assertEqual(calibrator.add_reference_chunk.call_count, 1)
+        _, reference, _ = calibrator.add_reference_chunk.call_args.args
+        self.assertEqual([ttpf.detile(layout, mip, reference) for mip in (first, second)], mips)
 
     def test_ref_dds_with_synthetic_ttpf_pool_and_ttpf_export(self):
         with tempfile.TemporaryDirectory() as tmp:
