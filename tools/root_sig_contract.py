@@ -149,6 +149,27 @@ def main():
     if not isinstance(sig, dict):
         print(f"ERROR: {a.rootsig}: expected a JSON object root signature", file=sys.stderr)
         return 2
+    params = sig.get("params", [])
+    if not isinstance(params, list):
+        print(f"ERROR: {a.rootsig}: 'params' must be a JSON array", file=sys.stderr)
+        return 2
+    if any(not isinstance(p, dict) for p in params):
+        print(f"ERROR: {a.rootsig}: each param must be a JSON object", file=sys.stderr)
+        return 2
+    for name in sorted(index):
+        reads = index[name].get("user_sgpr_reads", [])
+        if not isinstance(reads, list):
+            print(f"ERROR: {a.index}: {name}: 'user_sgpr_reads' must be a JSON array", file=sys.stderr)
+            return 2
+        for read in reads:
+            if not isinstance(read, dict) or "sgpr" not in read or "kind" not in read:
+                print(f"ERROR: {a.index}: {name}: each read needs 'sgpr' and 'kind' fields",
+                      file=sys.stderr)
+                return 2
+            if not isinstance(read["kind"], str):
+                print(f"ERROR: {a.index}: {name}: each read kind must be a string",
+                      file=sys.stderr)
+                return 2
     dwords, error = pack_layout(sig)
     if error:
         print(f"root signature refused: {error}")

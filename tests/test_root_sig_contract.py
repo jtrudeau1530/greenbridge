@@ -143,3 +143,32 @@ def test_missing_files_are_one_error(tmp_path):
     assert r.returncode == 2
     assert "ERROR: cannot read" in r.stderr
     assert "Traceback" not in r.stderr
+
+
+@pytest.mark.parametrize("bad_params", ["abc", {"type": "cbv"}, [1], ["cbv"]])
+def test_bad_param_shapes_are_one_error_not_a_traceback(tmp_path, bad_params):
+    index_path = tmp_path / "index.json"
+    index_path.write_text("{}", encoding="utf-8")
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps({"params": bad_params}), encoding="utf-8")
+    r = subprocess.run([sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
+                       capture_output=True, text=True)
+    assert r.returncode == 2
+    assert "ERROR:" in r.stderr
+    assert "Traceback" not in r.stderr
+
+
+@pytest.mark.parametrize("bad_reads", [
+    3, {"sgpr": 0}, ["x"], [{"kind": "const32"}], [{"sgpr": 0}],
+    [{"sgpr": 0, "kind": ["const32"]}], [{"sgpr": 0, "kind": {"a": 1}}],
+])
+def test_bad_read_shapes_are_one_error_not_a_traceback(tmp_path, bad_reads):
+    index_path = tmp_path / "index.json"
+    index_path.write_text(json.dumps({"s": {"user_sgpr_reads": bad_reads}}), encoding="utf-8")
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps(ROOT_SIG), encoding="utf-8")
+    r = subprocess.run([sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
+                       capture_output=True, text=True)
+    assert r.returncode == 2
+    assert "ERROR:" in r.stderr
+    assert "Traceback" not in r.stderr
