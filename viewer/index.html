@@ -66,7 +66,7 @@ function manifestError(world) {
     if (!isPosition(b, 6) || b[0] > b[3] || b[1] > b[4] || b[2] > b[5])
       return `chunks[${i}].bounds must contain six finite, ordered coordinates`;
     if (chunk.lod !== undefined) {
-      const band = world.lod_bands?.[chunk.lod];
+      const band = isNonemptyString(chunk.lod) ? world.lod_bands?.[chunk.lod] : undefined;
       if (!isPosition(band, 2) || band[0] < 0 || band[0] > band[1])
         return `chunks[${i}].lod must name a lod_bands entry with two finite, ordered distances`;
       const c = chunk.cell;
