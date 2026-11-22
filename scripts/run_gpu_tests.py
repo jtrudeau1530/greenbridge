@@ -1062,6 +1062,9 @@ def run_suite(a, work: str) -> int:
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
+                # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)
+                "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
+                "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
