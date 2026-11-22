@@ -91,6 +91,54 @@ bool check_statistics_disjoint(IDXGISwapChain* swapchain) {
     return swapchain->GetFrameStatistics(&stats) == S_OK;
 }
 
+// Counts references: AddRef/Release of the private-data interface are observable through refs.
+struct CountedUnknown final : IUnknown {
+    ULONG refs = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override { return --refs; }
+};
+
+// IDXGIObject private data (Microsoft: IDXGIObject::SetPrivateData / SetPrivateDataInterface / GetPrivateData):
+// the bytes are copied, an interface is held with a reference until it is replaced or removed, and the same GUID
+// replaces the entry. Returns null on success or the failing step.
+const char* check_private_data(IDXGIObject* object) {
+    static constexpr GUID key{0x6c2c5b0e, 0x4d9a, 0x4f43, {0x9e, 0x1b, 0x3a, 0x57, 0x0c, 0x91, 0x2d, 0x44}};
+    UINT size = 99;
+    if (object->GetPrivateData(key, &size, nullptr) != DXGI_ERROR_NOT_FOUND) return "GetPrivateData before any Set";
+    std::uint32_t value = 0x12345678u;
+    if (object->SetPrivateData(key, sizeof(value), &value) != S_OK) return "SetPrivateData";
+    value = 0;  // SetPrivateData copies
+    size = 0;
+    if (object->GetPrivateData(key, &size, nullptr) != S_OK || size != sizeof(value)) return "GetPrivateData size query";
+    std::uint32_t read = 0;
+    size = sizeof(read);
+    if (object->GetPrivateData(key, &size, &read) != S_OK || size != sizeof(read) || read != 0x12345678u)
+        return "GetPrivateData did not return the stored bytes";
+    std::uint16_t too_small = 0;
+    size = sizeof(too_small);
+    if (object->GetPrivateData(key, &size, &too_small) != DXGI_ERROR_MORE_DATA || size != sizeof(read))
+        return "GetPrivateData with a small buffer should be DXGI_ERROR_MORE_DATA and report the size";
+    CountedUnknown counted;
+    if (object->SetPrivateDataInterface(key, &counted) != S_OK || counted.refs != 2) return "SetPrivateDataInterface";
+    IUnknown* got = nullptr;
+    size = sizeof(got);
+    if (object->GetPrivateData(key, &size, &got) != S_OK || got != &counted || counted.refs != 3)
+        return "GetPrivateData did not return the interface with a reference added";
+    got->Release();
+    if (object->SetPrivateData(key, sizeof(read), &read) != S_OK || counted.refs != 1)
+        return "SetPrivateData with the same GUID should release the held interface";
+    if (object->SetPrivateDataInterface(key, &counted) != S_OK || counted.refs != 2) return "SetPrivateDataInterface again";
+    if (object->SetPrivateDataInterface(key, nullptr) != S_OK || counted.refs != 1)
+        return "SetPrivateDataInterface(null) should remove the entry and release the interface";
+    size = 99;
+    if (object->GetPrivateData(key, &size, nullptr) != DXGI_ERROR_NOT_FOUND) return "GetPrivateData after removal";
+    return nullptr;
+}
+
 }  // namespace
 
 int main() {
@@ -820,6 +868,16 @@ int main() {
         if (sc->SetMaximumFrameLatency(3) != DXGI_ERROR_INVALID_CALL ||
             sc->SetMaximumFrameLatency(1) != DXGI_ERROR_INVALID_CALL)
             return fail("Non-waitable SetMaximumFrameLatency should return DXGI_ERROR_INVALID_CALL");
+    }
+
+    // IDXGIObject private data on the swapchain, the factory and an adapter.
+    {
+        if (const char* step = check_private_data(sc)) return fail(step);
+        if (const char* step = check_private_data(factory)) return fail(step);
+        IDXGIAdapter1* pd_adapter = nullptr;
+        if (FAILED(factory->EnumAdapters1(0, &pd_adapter)) || !pd_adapter) return fail("EnumAdapters1(0) for private data");
+        if (const char* step = check_private_data(pd_adapter)) return fail(step);
+        pd_adapter->Release();
     }
 
     // IDXGIFactory4 adapter enumeration, IDXGIAdapter3 descriptors, EnumAdapterByLuid, and QueryVideoMemoryInfo.

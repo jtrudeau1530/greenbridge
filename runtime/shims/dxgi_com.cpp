@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -25,6 +26,90 @@ void stub(const char* method) {
     std::lock_guard lock(mutex);
     if (seen.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
 }
+
+// IDXGIObject private data, shared by the factory, adapter and swapchain. SetPrivateData keeps a copy of the bytes;
+// SetPrivateDataInterface holds one reference until the entry is replaced, removed or the owner dies (Microsoft:
+// IDXGIObject::SetPrivateDataInterface). Zero bytes remove the entry. GetPrivateData gives an interface back with a
+// reference added, and a buffer too small for the entry gets DXGI_ERROR_MORE_DATA and the size to retry with.
+class PrivateDataStore {
+public:
+    PrivateDataStore() = default;
+    PrivateDataStore(const PrivateDataStore&) = delete;
+    PrivateDataStore& operator=(const PrivateDataStore&) = delete;
+    ~PrivateDataStore() {
+        for (auto& entry : data_)
+            if (entry.object) entry.object->Release();
+    }
+
+    HRESULT get(REFGUID guid, UINT* size, void* data) {
+        if (!size) return E_INVALIDARG;
+        std::lock_guard lock(mutex_);
+        for (const auto& entry : data_) {
+            if (entry.key != guid) continue;
+            const UINT bytes = entry.object ? UINT(sizeof(IUnknown*)) : UINT(entry.bytes.size());
+            if (data && *size < bytes) {
+                *size = bytes;
+                return DXGI_ERROR_MORE_DATA;
+            }
+            if (data) {
+                if (entry.object) {
+                    entry.object->AddRef();
+                    std::memcpy(data, &entry.object, sizeof(IUnknown*));
+                } else {
+                    std::memcpy(data, entry.bytes.data(), bytes);
+                }
+            }
+            *size = bytes;
+            return S_OK;
+        }
+        *size = 0;
+        return DXGI_ERROR_NOT_FOUND;
+    }
+
+    HRESULT set(REFGUID guid, UINT size, const void* data) {
+        if (size && !data) return E_INVALIDARG;
+        Entry entry{guid, {}, nullptr};
+        if (size) {
+            const auto* bytes = static_cast<const std::uint8_t*>(data);
+            entry.bytes.assign(bytes, bytes + size);
+        }
+        store(std::move(entry), size != 0);
+        return S_OK;
+    }
+
+    HRESULT set_interface(REFGUID guid, const IUnknown* object) {
+        IUnknown* held = const_cast<IUnknown*>(object);
+        if (held) held->AddRef();
+        store(Entry{guid, {}, held}, held != nullptr);
+        return S_OK;
+    }
+
+private:
+    struct Entry {
+        GUID key;
+        std::vector<std::uint8_t> bytes;
+        IUnknown* object;
+    };
+
+    // The replaced interface is released after the lock is dropped, since its Release may run arbitrary code.
+    void store(Entry entry, bool keep) {
+        IUnknown* released = nullptr;
+        {
+            std::lock_guard lock(mutex_);
+            for (auto it = data_.begin(); it != data_.end(); ++it) {
+                if (it->key != entry.key) continue;
+                released = it->object;
+                data_.erase(it);
+                break;
+            }
+            if (keep) data_.push_back(std::move(entry));
+        }
+        if (released) released->Release();
+    }
+
+    std::mutex mutex_;
+    std::vector<Entry> data_;
+};
 
 bool valid_flip_buffer_count(UINT count) {
     return count >= 2 && count <= DXGI_MAX_SWAP_CHAIN_BUFFERS;
@@ -177,9 +262,15 @@ public:
     }
 
     // IDXGIObject
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
+        return private_data_.set(guid, size, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
+        return private_data_.set_interface(guid, object);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
+        return private_data_.get(guid, size, data);
+    }
     HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -481,6 +572,7 @@ private:
     }
 
     std::atomic<ULONG> refs_{1};
+    PrivateDataStore private_data_;
     IDXGIFactory4* parent_ = nullptr;
     IUnknown* device_ = nullptr;
     leonida::VulkanContext& context_;
@@ -573,9 +665,15 @@ public:
     }
 
     // IDXGIObject
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
+        return private_data_.set(guid, size, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
+        return private_data_.set_interface(guid, object);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
+        return private_data_.get(guid, size, data);
+    }
     HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -767,6 +865,7 @@ private:
 
     std::atomic<DWORD> next_budget_cookie_{1};
     std::atomic<ULONG> refs_{1};
+    PrivateDataStore private_data_;
     IDXGIFactory4* parent_ = nullptr;
     PFN_vkGetInstanceProcAddr gipa_ = nullptr;
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -805,9 +904,15 @@ public:
     }
 
     // IDXGIObject
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
+        return private_data_.set(guid, size, data);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
+        return private_data_.set_interface(guid, object);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
+        return private_data_.get(guid, size, data);
+    }
     HRESULT STDMETHODCALLTYPE GetParent(REFIID, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -1047,6 +1152,7 @@ private:
     }
 
     std::atomic<ULONG> refs_{1};
+    PrivateDataStore private_data_;
     leonida::VulkanContext& context_;
     PFN_vkGetInstanceProcAddr gipa_;
     VkInstance instance_;
