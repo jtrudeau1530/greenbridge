@@ -140,6 +140,10 @@ struct VulkanDeviceInfo {
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
+    // Vulkan 1.2 shaderOutputLayer / shaderOutputViewportIndex enabled on `device`: a translated vertex shader that
+    // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
+    bool shader_output_layer = false;
+    bool shader_output_viewport_index = false;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;
@@ -166,6 +170,8 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 VkImage vulkan_image(ID3D12Resource* resource);
 // The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
+// What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
+const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.

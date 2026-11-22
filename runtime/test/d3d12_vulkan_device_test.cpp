@@ -5599,6 +5599,26 @@ int main() {
     {
         Ref<ID3D12Device> standalone;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone.p))));
+        // What translated shaders can declare beyond Int64/Float64 (the index's `features`) is enabled wherever the GPU
+        // has it: image stores and loads without a format, gather offsets, LOD clamps, a vertex shader's layer and
+        // viewport. Creating a module that declares one without it breaks VUID-VkShaderModuleCreateInfo-pCode-08740.
+        const rt::d3d12::VulkanDeviceInfo* made = rt::d3d12::vulkan_device_info(standalone.p);
+        EXPECT(made != nullptr);
+        if (made) {
+            const auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                made->get_instance_proc(made->instance, "vkGetPhysicalDeviceFeatures2"));
+            EXPECT(features2 != nullptr);
+            VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+            VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
+            if (features2) features2(made->physical, &have);
+            const VkPhysicalDeviceFeatures& on = made->features;
+            EXPECT(on.shaderStorageImageWriteWithoutFormat == have.features.shaderStorageImageWriteWithoutFormat);
+            EXPECT(on.shaderStorageImageReadWithoutFormat == have.features.shaderStorageImageReadWithoutFormat);
+            EXPECT(on.shaderImageGatherExtended == have.features.shaderImageGatherExtended);
+            EXPECT(on.shaderResourceMinLod == have.features.shaderResourceMinLod);
+            EXPECT(made->shader_output_layer == (have12.shaderOutputLayer == VK_TRUE));
+            EXPECT(made->shader_output_viewport_index == (have12.shaderOutputViewportIndex == VK_TRUE));
+        }
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
         Ref<ID3D12Fence> fence;

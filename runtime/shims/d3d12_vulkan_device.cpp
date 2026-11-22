@@ -6317,6 +6317,13 @@ VkBuffer vulkan_buffer(ID3D12Resource* resource) {
     return r ? r->buffer() : VK_NULL_HANDLE;
 }
 
+const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
+    if (!device) return nullptr;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device)) return &d->state().info;
+    return nullptr;
+}
+
 bool device_supports_ray_tracing(ID3D12Device* device) {
     if (!device) return false;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -6830,6 +6837,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.descriptorBindingPartiallyBound = info.bindless_partially_bound;
     enable12.samplerMirrorClampToEdge = info.sampler_mirror_clamp_to_edge;
     enable12.samplerFilterMinmax = info.sampler_filter_minmax;
+    info.shader_output_layer = chosen12.shaderOutputLayer == VK_TRUE;
+    info.shader_output_viewport_index = chosen12.shaderOutputViewportIndex == VK_TRUE;
+    enable12.shaderOutputLayer = info.shader_output_layer;
+    enable12.shaderOutputViewportIndex = info.shader_output_viewport_index;
     if (!info.bindless)
         std::fprintf(stderr, "[rt] d3d12: the GPU lacks a descriptor-indexing feature the bindless set needs\n");
     enable12.bufferDeviceAddress = VK_TRUE;
@@ -6922,13 +6933,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
-    // 26,503 entries), doubles, 16-bit integers, and clip and cull distances in a few vertex shaders. Enabled where
-    // the GPU has them; without one, vkCreateShaderModule reports the capability (VUID-...-pCode-08740).
+    // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores
+    // without a format (StorageImageWriteWithoutFormat), gather offsets (ImageGatherExtended) and LOD-clamped samples
+    // (MinLod), and the layer or viewport a vertex shader writes (above, in Vulkan 1.2). Enabled where the GPU has
+    // them; without one, vkCreateShaderModule reports the capability (VUID-...-pCode-08740).
     enable.shaderInt64 = chosen_features.shaderInt64;
     enable.shaderFloat64 = chosen_features.shaderFloat64;
     enable.shaderInt16 = chosen_features.shaderInt16;
     enable.shaderClipDistance = chosen_features.shaderClipDistance;
     enable.shaderCullDistance = chosen_features.shaderCullDistance;
+    enable.shaderStorageImageWriteWithoutFormat = chosen_features.shaderStorageImageWriteWithoutFormat;
+    enable.shaderStorageImageReadWithoutFormat = chosen_features.shaderStorageImageReadWithoutFormat;
+    enable.shaderImageGatherExtended = chosen_features.shaderImageGatherExtended;
+    enable.shaderResourceMinLod = chosen_features.shaderResourceMinLod;
     info.features = enable;
 
     // GetClockCalibration reads both clocks at once with calibrated timestamps (KHR, or the older EXT).
