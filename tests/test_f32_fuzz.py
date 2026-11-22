@@ -46,6 +46,9 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(ff.cube("v_cubesc_f32", x, y, z), ff.bits(-0.5))
         self.assertEqual(ff.cube("v_cubetc_f32", x, y, z), ff.bits(-0.25))
         self.assertEqual(ff.cube("v_cubema_f32", x, y, z), ff.bits(-4.0))
+        # Measured on RDNA2 (gfx1036): v_cubema_f32 returns +0.0 (never -0.0) when all axes are ±0.0.
+        self.assertEqual(ff.cube("v_cubema_f32", 0, 0, 0x80000000), 0)
+        self.assertEqual(ff.cube("v_cubema_f32", 0x80000000, 0x80000000, 0x80000000), 0)
 
 
 class HarnessTests(unittest.TestCase):

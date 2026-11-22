@@ -4710,9 +4710,14 @@ class Gen:
                 return r
             xn, yn, zn = lt0(x), lt0(y), lt0(z)
             if op == "v_cubema_f32":
+                # Measured natively on RDNA2 (gfx1036, wave32 & wave64, all 4 IEEE/DX10_CLAMP modes):
+                # v_cubema_f32 returns +0.0 (never -0.0) whenever the selected major axis is ±0.0,
+                # while preserving NaNs and signed non-zero major-axis values.
                 m = pick(z, y, x)
-                r = self.tmp()
-                self.emit(f"{r} = OpFMul %float {m} {self.fconst(2.0)}")
+                is_z, m2, r = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{is_z} = OpFOrdEqual %bool {m} %f0")
+                self.emit(f"{m2} = OpFMul %float {m} {self.fconst(2.0)}")
+                self.emit(f"{r} = OpSelect %float {is_z} %f0 {m2}")
             elif op == "v_cubeid_f32":
                 r = pick(sel(zn, self.fconst(5.0), self.fconst(4.0)), sel(yn, self.fconst(3.0), self.fconst(2.0)),
                          sel(xn, self.fconst(1.0), self.fconst(0.0)))
