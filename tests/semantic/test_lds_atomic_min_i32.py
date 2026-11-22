@@ -1,0 +1,664 @@
+"""Semantic interpreter tests for signed 32-bit LDS atomic minimum (ds_min_i32).
+
+Standard library only; no GPU, no LLVM, no external tools, no game files.
+
+    python -I tests/semantic/test_lds_atomic_min_i32.py
+    python -m unittest discover -s tests/semantic -v
+
+Background & Specification Rules:
+  * AMD RDNA2 / GFX10 Local Data Share (LDS) Architecture:
+    - LDS is an on-chip, software-managed scratchpad memory shared across all threads
+      in a workgroup (threadgroup).
+    - `ds_min_i32 vaddr, vdata [offset:N]`:
+        Atomically computes:
+          effective_byte = (vaddr + byte_offset) & 0xFFFFFFFF
+          dword_idx = (effective_byte >> 2) & (lds_dwords - 1)
+          LDS[dword_idx] = min_i32(LDS[dword_idx], vdata)
+        Non-returning form: the prior value in LDS[dword_idx] is discarded.
+    - Two's-Complement Signed 32-bit Integer Semantics:
+        Operands are interpreted as signed integers in [-2^31, 2^31 - 1].
+        Negative values (bit 31 set) compare strictly less than non-negative values:
+          e.g. -1 (0xFFFFFFFF) < 0 (0x00000000)
+          e.g. INT32_MIN (-2^31, 0x80000000) < INT32_MAX (2^31 - 1, 0x7FFFFFFF)
+        This is in sharp contrast to unsigned minimum `ds_min_u32` (OpAtomicUMin) where
+        0x00000000 < 0xFFFFFFFF.
+    - Active lane masking:
+        LDS operations execute under execution mask control (%exec_active).
+        Only active lanes participate in memory modifications and destination register writes.
+    - Hardware wrapping & alignment:
+        Byte addresses are converted to dwords by right shifting by 2, dropping unaligned
+        low bits [1:0]. The dword index is masked with (lds_dwords - 1), wrapping out-of-bounds
+        offsets within the allocated power-of-two LDS allocation.
+  * SPIR-V Representation:
+    - LDS is declared as an array in the Workgroup storage class:
+        %lds_arr = OpTypeArray %uint <lds_dwords>
+        %_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+        %_ptr_WG_uint = OpTypePointer Workgroup %uint
+        %lds = OpVariable %_ptr_WG_lds Workgroup
+    - Atomic signed minimum maps directly to SPIR-V OpAtomicSMin:
+        %old = OpAtomicSMin %uint %ptr %scope %semantics %val
+        where %scope is Workgroup (2) and %semantics is Relaxed / None (0).
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.path.join(ROOT, "tools")
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+import rdna2spirv  # noqa: E402
+
+MASK = 0xFFFFFFFF
+SIGN_BIT = 0x80000000
+INT32_MIN_SIGNED = -0x80000000
+INT32_MAX_SIGNED = 0x7FFFFFFF
+UINT32_INT32_MIN = 0x80000000
+UINT32_INT32_MAX = 0x7FFFFFFF
+
+
+class UnsupportedConstruct(NotImplementedError):
+    """The module uses an unmodelled SPIR-V opcode, type, or storage class."""
+
+
+class WorkgroupBoundsError(ValueError):
+    """Workgroup dimension or memory bounds violation."""
+
+
+_IGNORED = frozenset({
+    "OpCapability", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
+    "OpDecorate", "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel",
+    "OpReturn", "OpFunctionEnd", "OpName", "OpSource", "OpSelectionMerge",
+})
+
+_LINE = re.compile(r"^(?:(%\S+)\s*=\s*)?(Op\w+)\s*(.*)$")
+
+
+def to_signed_i32(val: int) -> int:
+    """Interprets a 32-bit unsigned bit pattern as a signed two's-complement integer."""
+    u = val & MASK
+    return u - 0x100000000 if u & SIGN_BIT else u
+
+
+def to_unsigned_u32(val: int) -> int:
+    """Converts a signed or unsigned integer to a 32-bit unsigned bit pattern."""
+    return val & MASK
+
+
+def reference_atomic_smin(initial: int, val: int) -> int:
+    """Reference 32-bit signed atomic minimum returning 32-bit bit pattern."""
+    s_init = to_signed_i32(initial)
+    s_val = to_signed_i32(val)
+    return to_unsigned_u32(min(s_init, s_val))
+
+
+def reference_atomic_umin(initial: int, val: int) -> int:
+    """Reference 32-bit unsigned atomic minimum returning 32-bit bit pattern."""
+    u_init = initial & MASK
+    u_val = val & MASK
+    return min(u_init, u_val)
+
+
+def reference_lds_index(base_addr: int, byte_offset: int, lds_dwords: int) -> int:
+    """Reference dword index calculation with hardware wrapping."""
+    effective_byte = (base_addr + byte_offset) & MASK
+    dword_idx = effective_byte >> 2
+    return dword_idx & (lds_dwords - 1)
+
+
+def reference_lds_bank(byte_addr: int) -> int:
+    """Reference LDS bank index (32 banks, 4 bytes each, bank = (byte_addr >> 2) & 31)."""
+    return (byte_addr >> 2) & 31
+
+
+class LdsAtomicMinI32Interp:
+    """Strict semantic interpreter for compute SPIR-V modules exercising LDS ds_min_i32 atomics."""
+
+    def __init__(self, spvasm: str):
+        self.spvasm = spvasm
+        self.types: dict[str, tuple] = {}
+        self.constants: dict[str, int | bool] = {}
+        self.ptr_types: dict[str, tuple[str, str]] = {}
+        self.var_class: dict[str, str] = {}
+        self.local_size: tuple[int, int, int] = (1, 1, 1)
+        self.lds_var: str | None = None
+        self.lds_size: int = 0
+        self.body: list[tuple[str | None, str, list[str], str]] = []
+        self._parse()
+
+    def _parse(self) -> None:
+        in_body = False
+        for raw in self.spvasm.splitlines():
+            line = raw.split(";", 1)[0].strip()
+            if not line:
+                continue
+            m = _LINE.match(line)
+            if not m:
+                raise UnsupportedConstruct(f"Cannot parse line: {line!r}")
+            res, op, rest = m.groups()
+            a = rest.split()
+            if in_body:
+                self.body.append((res, op, a, line))
+                continue
+            if op == "OpFunction":
+                in_body = True
+                continue
+            if op == "OpExecutionMode" and len(a) >= 5 and a[1] == "LocalSize":
+                lx, ly, lz = int(a[2]), int(a[3]), int(a[4])
+                if lx < 1 or ly < 1 or lz < 1 or (lx * ly * lz) > 1024:
+                    raise WorkgroupBoundsError(f"Invalid LocalSize {lx}x{ly}x{lz}")
+                self.local_size = (lx, ly, lz)
+                continue
+            if op in _IGNORED:
+                continue
+            if op == "OpTypeInt":
+                if int(a[0]) != 32:
+                    raise UnsupportedConstruct("Only 32-bit int supported")
+                self.types[res] = ("int", int(a[0]), int(a[1]))
+            elif op == "OpTypeBool":
+                self.types[res] = ("bool",)
+            elif op == "OpTypeVector":
+                self.types[res] = ("vec", a[0], int(a[1]))
+            elif op == "OpTypeArray":
+                size = int(self.constants[a[1]])
+                self.types[res] = ("arr", a[0], size)
+            elif op == "OpTypePointer":
+                self.ptr_types[res] = (a[0], a[1])
+            elif op == "OpConstant":
+                self.constants[res] = int(a[1], 0) & MASK
+            elif op == "OpConstantTrue":
+                self.constants[res] = True
+            elif op == "OpConstantFalse":
+                self.constants[res] = False
+            elif op == "OpVariable":
+                cls, pointee = self.ptr_types[a[0]]
+                if a[1] != cls:
+                    raise UnsupportedConstruct("OpVariable storage class mismatch")
+                self.var_class[res] = cls
+                if cls == "Workgroup":
+                    if self.lds_var is not None:
+                        raise UnsupportedConstruct("Multiple Workgroup variables")
+                    self.lds_var = res
+                    arr_ty = self.types[pointee]
+                    if arr_ty[0] != "arr":
+                        raise UnsupportedConstruct("Workgroup variable must be an array")
+                    self.lds_size = arr_ty[2]
+                elif cls not in ("Output", "Function"):
+                    raise UnsupportedConstruct(f"Unsupported storage class {cls}")
+            else:
+                raise UnsupportedConstruct(f"Header opcode {op}")
+
+    def run(
+        self,
+        num_invocations: int | None = None,
+        seed_lds: dict[int, int] | None = None,
+        lane_inputs: list[dict[str, int]] | None = None,
+        lane_order: list[int] | None = None,
+    ) -> tuple[list[int], list[dict[str, int]]]:
+        """Executes the workgroup and returns (final_lds, outputs_per_lane)."""
+        lx, ly, lz = self.local_size
+        total_invocations = lx * ly * lz
+        count = total_invocations if num_invocations is None else min(num_invocations, total_invocations)
+
+        lds = [0] * self.lds_size
+        if seed_lds:
+            for idx, val in seed_lds.items():
+                if 0 <= idx < self.lds_size:
+                    lds[idx] = val & MASK
+
+        order = lane_order if lane_order is not None else list(range(count))
+        lane_outputs: list[dict[str, int]] = [{} for _ in range(count)]
+
+        for lidx in order:
+            if lidx >= count:
+                continue
+            inputs = lane_inputs[lidx] if lane_inputs and lidx < len(lane_inputs) else {}
+            out = self._run_lane(lidx, lds, inputs)
+            lane_outputs[lidx] = out
+
+        return list(lds), lane_outputs
+
+    def _run_lane(self, lidx: int, lds: list[int], inputs: dict[str, int]) -> dict[str, int]:
+        values: dict[str, int | bool] = dict(self.constants)
+        values.update(inputs)
+        var_box: dict[str, list[int]] = {}
+        pointers: dict[str, tuple[str, list[int], int | None]] = {}
+        outputs: list[str] = []
+
+        if self.lds_var:
+            pointers[self.lds_var] = ("lds", lds, None)
+
+        for res, cls in self.var_class.items():
+            if cls == "Output":
+                var_box[res] = [0]
+                pointers[res] = ("out", var_box[res], 0)
+                outputs.append(res)
+            elif cls == "Function":
+                var_box[res] = [0]
+                pointers[res] = ("fn", var_box[res], 0)
+
+        def val(x: str) -> int | bool:
+            if x in values:
+                return values[x]
+            raise UnsupportedConstruct(f"Undefined identifier {x}")
+
+        for res, op, a, _ in self.body:
+            if op in _IGNORED:
+                continue
+            if op in ("OpBranch", "OpBranchConditional"):
+                continue
+            if op == "OpVariable":
+                cls, _ = self.ptr_types[a[0]]
+                if cls != "Function":
+                    raise UnsupportedConstruct("Non-Function variable in body")
+                var_box[res] = [int(val(a[2])) if len(a) > 2 else 0]
+                pointers[res] = ("fn", var_box[res], 0)
+            elif op == "OpAccessChain":
+                base = a[1]
+                if base not in pointers:
+                    raise UnsupportedConstruct(f"OpAccessChain on non-pointer {base}")
+                ptag = pointers[base][0]
+                if ptag == "lds":
+                    idx = int(val(a[2]))
+                    if not (0 <= idx < len(lds)):
+                        raise WorkgroupBoundsError(f"LDS access out of bounds: {idx} >= {len(lds)}")
+                    pointers[res] = ("lds", lds, idx)
+                elif ptag in ("out", "fn"):
+                    pointers[res] = pointers[base]
+                else:
+                    raise UnsupportedConstruct(f"Access chain on {ptag}")
+            elif op == "OpLoad":
+                ptr = pointers[a[1]]
+                ptag = ptr[0]
+                idx = ptr[2]
+                assert idx is not None
+                if ptag in ("lds", "out", "fn"):
+                    values[res] = ptr[1][idx] & MASK
+                else:
+                    raise UnsupportedConstruct(f"OpLoad from {ptag}")
+            elif op == "OpStore":
+                ptr = pointers[a[0]]
+                v = int(val(a[1])) & MASK
+                ptag = ptr[0]
+                idx = ptr[2]
+                assert idx is not None
+                if ptag in ("lds", "out", "fn"):
+                    ptr[1][idx] = v
+                else:
+                    raise UnsupportedConstruct(f"OpStore to {ptag}")
+            elif op == "OpAtomicSMin":
+                # %res = OpAtomicSMin %type %ptr %scope %semantics %val
+                ptr = pointers[a[1]]
+                ptag = ptr[0]
+                if ptag != "lds":
+                    raise UnsupportedConstruct(f"OpAtomicSMin on non-LDS pointer {ptag}")
+                operand = int(val(a[4])) & MASK
+                idx = ptr[2]
+                assert idx is not None
+                old = ptr[1][idx] & MASK
+                s_old = to_signed_i32(old)
+                s_op = to_signed_i32(operand)
+                ptr[1][idx] = to_unsigned_u32(min(s_old, s_op))
+                values[res] = old
+            elif op == "OpAtomicUMin":
+                # %res = OpAtomicUMin %type %ptr %scope %semantics %val
+                ptr = pointers[a[1]]
+                ptag = ptr[0]
+                if ptag != "lds":
+                    raise UnsupportedConstruct(f"OpAtomicUMin on non-LDS pointer {ptag}")
+                operand = int(val(a[4])) & MASK
+                idx = ptr[2]
+                assert idx is not None
+                old = ptr[1][idx] & MASK
+                ptr[1][idx] = min(old, operand)
+                values[res] = old
+            elif op == "OpIAdd":
+                values[res] = (int(val(a[1])) + int(val(a[2]))) & MASK
+            elif op == "OpISub":
+                values[res] = (int(val(a[1])) - int(val(a[2]))) & MASK
+            elif op == "OpShiftRightLogical":
+                sh = int(val(a[2]))
+                if sh >= 32:
+                    raise UnsupportedConstruct(f"Shift right >= 32: {sh}")
+                values[res] = (int(val(a[1])) >> sh) & MASK
+            elif op == "OpShiftLeftLogical":
+                sh = int(val(a[2]))
+                if sh >= 32:
+                    raise UnsupportedConstruct(f"Shift left >= 32: {sh}")
+                values[res] = (int(val(a[1])) << sh) & MASK
+            elif op == "OpBitwiseAnd":
+                values[res] = int(val(a[1])) & int(val(a[2])) & MASK
+            elif op == "OpBitwiseOr":
+                values[res] = (int(val(a[1])) | int(val(a[2]))) & MASK
+            elif op == "OpBitwiseXor":
+                values[res] = (int(val(a[1])) ^ int(val(a[2]))) & MASK
+            elif op == "OpSelect":
+                cond = bool(val(a[1]))
+                values[res] = val(a[2]) if cond else val(a[3])
+            elif op == "OpCopyObject":
+                values[res] = val(a[1])
+            elif op == "OpBitcast":
+                values[res] = int(val(a[1])) & MASK
+            else:
+                raise UnsupportedConstruct(f"Opcode {op} not modelled in body")
+
+        return {name: var_box[name][0] & MASK for name in outputs}
+
+
+class TestSignedAtomicMinReferenceMath(unittest.TestCase):
+    """Verifies reference math oracle for two's complement signed 32-bit minimum."""
+
+    def test_basic_positive_values(self):
+        self.assertEqual(reference_atomic_smin(100, 25), 25)
+        self.assertEqual(reference_atomic_smin(25, 100), 25)
+        self.assertEqual(reference_atomic_smin(7, 42), 7)
+        self.assertEqual(reference_atomic_smin(0, 5), 0)
+        self.assertEqual(reference_atomic_smin(0, 0), 0)
+
+    def test_positive_vs_negative(self):
+        # In signed comparison, any negative is less than any positive or zero
+        self.assertEqual(to_signed_i32(reference_atomic_smin(10, to_unsigned_u32(-5))), -5)
+        self.assertEqual(to_signed_i32(reference_atomic_smin(to_unsigned_u32(-5), 10)), -5)
+        self.assertEqual(to_signed_i32(reference_atomic_smin(0, to_unsigned_u32(-1))), -1)
+        self.assertEqual(to_signed_i32(reference_atomic_smin(to_unsigned_u32(-1), 0)), -1)
+        self.assertEqual(to_signed_i32(reference_atomic_smin(500, to_unsigned_u32(-1000))), -1000)
+
+    def test_negative_vs_negative(self):
+        # More negative is strictly smaller
+        self.assertEqual(to_signed_i32(reference_atomic_smin(to_unsigned_u32(-10), to_unsigned_u32(-50))), -50)
+        self.assertEqual(to_signed_i32(reference_atomic_smin(to_unsigned_u32(-50), to_unsigned_u32(-10))), -50)
+        self.assertEqual(to_signed_i32(reference_atomic_smin(to_unsigned_u32(-2), to_unsigned_u32(-1))), -2)
+        self.assertEqual(to_signed_i32(reference_atomic_smin(to_unsigned_u32(-100), to_unsigned_u32(-100))), -100)
+
+    def test_signed_vs_unsigned_divergence(self):
+        # 0xFFFFFFFF is -1 in signed i32, but 4294967295 in unsigned u32
+        # Comparison with +1:
+        #   smin(+1, -1) -> -1 (0xFFFFFFFF)
+        #   umin(+1, 4294967295) -> +1 (0x00000001)
+        s_res = reference_atomic_smin(1, 0xFFFFFFFF)
+        u_res = reference_atomic_umin(1, 0xFFFFFFFF)
+        self.assertEqual(s_res, 0xFFFFFFFF)
+        self.assertEqual(u_res, 1)
+        self.assertNotEqual(s_res, u_res)
+
+        # Comparison of 0 vs -2 (0xFFFFFFFE):
+        #   smin(0, -2) -> -2 (0xFFFFFFFE)
+        #   umin(0, 4294967294) -> 0 (0x00000000)
+        s_res2 = reference_atomic_smin(0, 0xFFFFFFFE)
+        u_res2 = reference_atomic_umin(0, 0xFFFFFFFE)
+        self.assertEqual(s_res2, 0xFFFFFFFE)
+        self.assertEqual(u_res2, 0)
+        self.assertNotEqual(s_res2, u_res2)
+
+        # Comparison of INT32_MAX (0x7FFFFFFF) vs INT32_MIN (0x80000000):
+        #   smin(0x7FFFFFFF, 0x80000000) -> 0x80000000 (-2147483648)
+        #   umin(0x7FFFFFFF, 0x80000000) -> 0x7FFFFFFF (2147483647)
+        s_extremes = reference_atomic_smin(0x7FFFFFFF, 0x80000000)
+        u_extremes = reference_atomic_umin(0x7FFFFFFF, 0x80000000)
+        self.assertEqual(s_extremes, 0x80000000)
+        self.assertEqual(u_extremes, 0x7FFFFFFF)
+        self.assertNotEqual(s_extremes, u_extremes)
+
+    def test_algebraic_properties(self):
+        samples = [
+            0, 1, -1, 42, -42, 1000, -1000,
+            INT32_MIN_SIGNED, INT32_MAX_SIGNED,
+            INT32_MIN_SIGNED + 1, INT32_MAX_SIGNED - 1
+        ]
+        u_samples = [to_unsigned_u32(x) for x in samples]
+
+        # Idempotence: min(x, x) == x
+        for x in u_samples:
+            self.assertEqual(reference_atomic_smin(x, x), x)
+
+        # Commutativity: min(a, b) == min(b, a)
+        for a in u_samples:
+            for b in u_samples:
+                self.assertEqual(reference_atomic_smin(a, b), reference_atomic_smin(b, a))
+
+        # Identity element (UINT32_INT32_MAX): min(x, INT32_MAX) == x
+        for x in u_samples:
+            self.assertEqual(reference_atomic_smin(x, UINT32_INT32_MAX), x)
+
+        # Annihilator element (UINT32_INT32_MIN): min(x, INT32_MIN) == INT32_MIN
+        for x in u_samples:
+            self.assertEqual(reference_atomic_smin(x, UINT32_INT32_MIN), UINT32_INT32_MIN)
+
+
+class TestSpirvAtomicSMinNonReturning(unittest.TestCase):
+    """Executes compute SPIR-V kernels with LDS OpAtomicSMin non-returning operations."""
+
+    def test_ds_min_i32_positive_smaller(self):
+        # Initial 50, lane provides 20 -> final LDS is 20
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c3 = OpConstant %uint 3
+%c20 = OpConstant %uint 20
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c3
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c20
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, _ = interp.run(seed_lds={3: 50})
+        self.assertEqual(final_lds[3], 20)
+
+    def test_ds_min_i32_positive_larger(self):
+        # Initial 20, lane provides 50 -> final LDS remains 20
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c3 = OpConstant %uint 3
+%c50 = OpConstant %uint 50
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c3
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c50
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, _ = interp.run(seed_lds={3: 20})
+        self.assertEqual(final_lds[3], 20)
+
+    def test_ds_min_i32_negative_vs_positive(self):
+        # Initial 10, lane provides -5 (0xFFFFFFFB) -> final LDS is -5
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c5 = OpConstant %uint 5
+%c_neg5 = OpConstant %uint 0xFFFFFFFB
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c5
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c_neg5
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, _ = interp.run(seed_lds={5: 10})
+        self.assertEqual(final_lds[5], 0xFFFFFFFB)
+        self.assertEqual(to_signed_i32(final_lds[5]), -5)
+
+    def test_ds_min_i32_negative_vs_negative(self):
+        # Initial -10 (0xFFFFFFF6), lane provides -30 (0xFFFFFFE2) -> final LDS is -30
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c64 = OpConstant %uint 64
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c_neg30 = OpConstant %uint 0xFFFFFFE2
+%lds_arr = OpTypeArray %uint %c64
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c1
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c_neg30
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, _ = interp.run(seed_lds={1: 0xFFFFFFF6})
+        self.assertEqual(final_lds[1], 0xFFFFFFE2)
+        self.assertEqual(to_signed_i32(final_lds[1]), -30)
+
+    def test_ds_min_i32_with_byte_offset(self):
+        # Address calculation: base byte 16 + offset 8 = 24 bytes -> dword index 6
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c128 = OpConstant %uint 128
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c16 = OpConstant %uint 16
+%c8 = OpConstant %uint 8
+%c_shift2 = OpConstant %uint 2
+%c_mask127 = OpConstant %uint 127
+%c_neg1 = OpConstant %uint 0xFFFFFFFF
+%lds_arr = OpTypeArray %uint %c128
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%s1 = OpIAdd %uint %c16 %c8
+%i = OpShiftRightLogical %uint %s1 %c_shift2
+%m = OpBitwiseAnd %uint %i %c_mask127
+%ptr = OpAccessChain %_ptr_WG_uint %lds %m
+%dummy = OpAtomicSMin %uint %ptr %c2 %c0 %c_neg1
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMinI32Interp(spvasm)
+        final_lds, _ = interp.run(seed_lds={6: 100})
+        # (16 + 8) >> 2 = 6, min(100, -1) = -1 (0xFFFFFFFF)
+        self.assertEqual(final_lds[6], 0xFFFFFFFF)
+
+
+class TestTranslatorSignedMinIntegration(unittest.TestCase):
+    """Verifies that tools/rdna2spirv.py emits conforming SPIR-V for ds_min_i32 opcodes."""
+
+    def _make_mock_gen(self, stage: str = "cs"):
+        class MockGen:
+            def __init__(self):
+                self.stage = stage
+                self.uses_lds = False
+                self.lds_dwords = 256
+                self.wave64 = True
+                self._tmp = 0
+                self.emitted: list[str] = []
+                self.stored_dsts: list[tuple[dict, str]] = []
+
+            def tmp(self) -> str:
+                self._tmp += 1
+                return f"%t{self._tmp}"
+
+            def cu(self, v: int) -> str:
+                return f"%c{v}"
+
+            def active_b(self) -> str:
+                return "%exec_active"
+
+            def src_u(self, arg: dict) -> str:
+                return f"%v_{arg['r']}"
+
+            def dst(self, d: dict, v: str) -> None:
+                self.stored_dsts.append((d, v))
+
+            def emit(self, line: str) -> None:
+                self.emitted.append(line)
+
+            LDS_ATOMICS = rdna2spirv.Gen.LDS_ATOMICS
+            mod_int = staticmethod(rdna2spirv.Gen.mod_int)
+            lds_ptr = rdna2spirv.Gen.lds_ptr
+            lds_op = rdna2spirv.Gen.lds_op
+
+        return MockGen()
+
+    def test_lds_atomics_table_contains_ds_min_i32(self):
+        self.assertIn("ds_min_i32", rdna2spirv.Gen.LDS_ATOMICS)
+        self.assertEqual(rdna2spirv.Gen.LDS_ATOMICS["ds_min_i32"], "OpAtomicSMin")
+
+    def test_ds_min_i32_non_returning_emission(self):
+        gen = self._make_mock_gen(stage="cs")
+        # ds_min_i32 v0, v1, offset:8 (args: addr=v0, data=v1)
+        gen.lds_op("ds_min_i32", [{"r": 0}, {"r": 1}], ["offset:8"])
+        self.assertTrue(gen.uses_lds)
+        emitted_str = "\n".join(gen.emitted)
+
+        self.assertIn("OpBranchConditional %exec_active", emitted_str)
+        self.assertIn("OpIAdd %uint %v_0 %c8", emitted_str)
+        self.assertIn("OpShiftRightLogical %uint", emitted_str)
+        self.assertIn("OpBitwiseAnd %uint", emitted_str)
+        self.assertIn("OpAccessChain %_ptr_WG_uint %lds", emitted_str)
+        self.assertIn("OpAtomicSMin %uint", emitted_str)
+        self.assertIn("%c2 %c0 %v_1", emitted_str)
+        # Non-returning form must not store any destination register
+        self.assertEqual(len(gen.stored_dsts), 0)
+
+    def test_ds_min_i32_outside_compute_raises(self):
+        gen = self._make_mock_gen(stage="ps")
+        with self.assertRaises(rdna2spirv.Unsupported):
+            gen.lds_op("ds_min_i32", [{"r": 0}, {"r": 1}], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
