@@ -506,7 +506,10 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 # Fixtures run by another harness, which needs what these tools do not have (a D3D12 device, the layer's root
 # arguments and code base). They are still assembled and translated here, so a translator regression shows, but no
 # checker runs them: the test program that owns them judges them.
-OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_translated_draw_test"}
+OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_translated_draw_test",
+                 "ps_m2": "d3d12_m2_textured_test", "vs_m2": "d3d12_m2_textured_test",
+                 "ps_m3": "d3d12_m3_frame_test", "vs_m3": "d3d12_m3_frame_test",
+                 "ps_m3_post": "d3d12_m3_frame_test"}
 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
