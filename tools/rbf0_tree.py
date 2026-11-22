@@ -375,7 +375,8 @@ def _rows(source):
         unnamed = []
         for name in sorted(os.listdir(source)):
             full = os.path.join(source, name)
-            if not os.path.isfile(full):
+            # rpf9_carve.py's index.json and any .csv/.json report sit next to the streams; they are not payloads.
+            if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
                 continue
             with open(full, "rb") as f:
                 head = f.read(8)
@@ -429,7 +430,7 @@ def decode_source(source, roots=None, offset=None, limit=None, progress=None):
         while (doc["status"] == "truncated" and chunks < MAX_CHUNKS and len(blob) < MAX_BYTES
                and rows[i + chunks - 1]["size"] == MAX_CHUNK and i + chunks < len(rows)):
             nxt = rows[i + chunks]
-            if nxt["head"][:4] in (MAGIC, b"PSIN"):
+            if nxt["size"] > MAX_CHUNK or nxt["head"][:4] in (MAGIC, b"PSIN"):
                 break
             blob += read(nxt)
             chunks += 1
