@@ -15,6 +15,9 @@ VKC_DUMP, and every word every thread stores is compared. docs/shader_validation
     python -I tools/crosslane_fuzz.py --oracle hw        # model vs the AMD GPU natively (wave32 and wave64); exit 77
                                                          # when tools/hw_oracle's tools are missing. --oracle translator,hw
                                                          # does both. No llvm-mc, Vulkan or vk_compute_test for hw alone.
+    python -I tools/crosslane_fuzz.py --dpp-sweep --oracle hw   # one program per DPP case instead of random ones:
+                                                         # every DPP16 control x bound_ctrl x fi x EXEC pattern, all
+                                                         # row_mask / bank_mask pairs, DPP8 selects (7,206 per wave size)
 
 Exit code: 0 when every program that ran matches (or differs only in a program with a hypothesis op), 1 on a
 mismatch or an untranslated program, 2 when the only failures are harness errors: vk_compute_test timed out or
@@ -140,6 +143,168 @@ class Op:
         for w in waves:
             hyp |= bool(self.fn(w))
         return hyp
+
+
+DPP16_CONTROLS = ("quad_perm", "row_shl", "row_shr", "row_ror", "row_mirror", "row_half_mirror", "row_share",
+                  "row_xmask")
+DPP_OPS = {"mov": "v_mov_b32", "not": "v_not_b32", "add": "v_add_nc_u32", "xor": "v_xor_b32"}
+
+
+def dpp16_select(control, arg=None):
+    """(modifier text, f) for one DPP16 control; f(x) gives (source lane in the 16-lane row, whether it is in the
+    row) for row lane x. arg: the four quad_perm selects, or the shift / rotate / share / xmask amount."""
+    if control == "quad_perm":
+        q = list(arg)
+        return f"quad_perm:[{','.join(map(str, q))}]", (lambda x: ((x & ~3) | q[x & 3], True))
+    if control == "row_shl":
+        return f"row_shl:{arg}", (lambda x: (x + arg, x + arg < 16))
+    if control == "row_shr":
+        return f"row_shr:{arg}", (lambda x: (x - arg, x >= arg))
+    if control == "row_ror":
+        return f"row_ror:{arg}", (lambda x: ((x - arg) & 15, True))
+    if control == "row_mirror":
+        return "row_mirror", (lambda x: (15 - x, True))
+    if control == "row_half_mirror":
+        return "row_half_mirror", (lambda x: ((x & 8) | (7 - (x & 7)), True))
+    if control == "row_share":
+        return f"row_share:{arg}", (lambda x: (arg, True))
+    if control == "row_xmask":
+        return f"row_xmask:{arg}", (lambda x: (x ^ arg, True))
+    raise ValueError(f"unknown DPP16 control {control!r}")
+
+
+def dpp_op(d, a, b, kind, control=None, dpp8=None, fi=False, bound=False, row_mask=0xF, bank_mask=0xF):
+    """A VOP1/VOP2 op with a DPP16 (control = (name, arg)) or DPP8 (dpp8 = the eight selects) src0, and its
+    effect on the model. From the RDNA 2 ISA guide's DPP section: DPP16 picks the source lane inside the 16-lane
+    row; a source out of the row, or one that is off in EXEC while fi = 0, is invalid: bound_ctrl 1 uses 0 as
+    src0, bound_ctrl 0 leaves the lane unwritten. Lanes in a row or bank that row_mask / bank_mask turn off are
+    not written. DPP8 picks a lane in the 8-lane group; an inactive source with fi = 0 reads 0 (as #238
+    implements it; reported apart as a hypothesis). Every source is read before vD is written, so d may be a."""
+    if dpp8 is not None:
+        sel = list(dpp8)
+        ctl = f"dpp8:[{','.join(map(str, sel))}]" + (" fi:1" if fi else "")
+        pick = lambda l: ((l & ~7) | sel[l & 7], True)
+    else:
+        ctl, f = dpp16_select(*control)
+
+        def pick(l, f=f):
+            s_, ok = f(l & 15)
+            return (l & ~15) | (s_ & 15), ok
+        ctl += f" row_mask:0x{row_mask:x} bank_mask:0x{bank_mask:x}" + (" bound_ctrl:1" if bound else "") + \
+            (" fi:1" if fi else "")
+    name = DPP_OPS[kind]
+    if kind in ("mov", "not"):
+        text = f"{name}_dpp v{d}, v{a} {ctl}"
+    else:
+        text = f"{name}_dpp v{d}, v{a}, v{b} {ctl}"
+    alu = {"mov": lambda x, y: x, "not": lambda x, y: ~x, "add": lambda x, y: x + y,
+           "xor": lambda x, y: x ^ y}[kind]
+
+    def fn(w):
+        src, other = w.vr(a), w.vr(b)
+        vals, hyp = list(w.vr(d)), False
+        for lane in range(w.size):
+            if not w.active(lane):
+                continue
+            sl, ok = pick(lane)
+            if dpp8 is not None:
+                if w.active(sl) or fi:
+                    x = src[sl]
+                else:
+                    x, hyp = 0, True
+            else:
+                if not (row_mask >> (lane >> 4) & 1 and bank_mask >> ((lane >> 2) & 3) & 1):
+                    continue
+                if ok and (w.active(sl) or fi):
+                    x = src[sl]
+                elif bound:
+                    x = 0
+                else:
+                    continue
+            vals[lane] = alu(x, other[lane]) & M32
+        w.vwrite(d, vals)
+        return hyp
+    return Op(text, fn, "dpp")
+
+
+def exec_op(wave, mask):
+    """EXEC = mask (a constant), as op_exec_const writes it."""
+    if wave == 32:
+        text = f"s_mov_b32 exec_lo, 0x{mask & M32:x}"
+    else:
+        text = f"s_mov_b32 exec_lo, 0x{mask & M32:x}\n\ts_mov_b32 exec_hi, 0x{mask >> 32:x}"
+
+    def fn(w):
+        w.exec = mask & ((1 << w.size) - 1)
+    return Op(text, fn, "exec")
+
+
+# --dpp-sweep: EXEC patterns. "all" has no inactive source; "odd" turns off every other lane, so every source a
+# lane reads one or three lanes away is off; "banks" turns off the first lane of each 4-lane bank and the whole
+# second row, so inactive sources sit next to active ones and one row (row 1) runs nothing.
+SWEEP_EXEC = {
+    32: (("all", M32), ("odd", 0x55555555), ("banks", 0x0000EEEE)),
+    64: (("all", M64), ("odd", 0x5555555555555555), ("banks", 0xEEEEEEEE0000EEEE)),
+}
+SWEEP_DPP8 = ((0, 1, 2, 3, 4, 5, 6, 7), (7, 6, 5, 4, 3, 2, 1, 0), (1, 0, 3, 2, 5, 4, 7, 6), (4, 5, 6, 7, 0, 1, 2, 3)) + \
+    tuple((k,) * 8 for k in range(8)) + tuple(tuple((i + k) & 7 for i in range(8)) for k in range(1, 8))
+SWEEP_MASK_CONTROLS = (("row_shr", 1), ("quad_perm", (1, 0, 3, 2)), ("row_share", 5))
+
+
+def dpp16_sweep_controls():
+    """Every DPP16 control the RDNA2 assembler takes: 256 quad_perms, row_shl/shr/ror 1-15, both mirrors,
+    row_share and row_xmask 0-15 (335)."""
+    out = [("quad_perm", tuple(q >> s & 3 for s in (0, 2, 4, 6))) for q in range(256)]
+    out += [(c, n) for c in ("row_shl", "row_shr", "row_ror") for n in range(1, 16)]
+    out += [("row_mirror", None), ("row_half_mirror", None)]
+    out += [(c, n) for c in ("row_share", "row_xmask") for n in range(16)]
+    return out
+
+
+def dpp_sweep_cases(wave):
+    """The --dpp-sweep cases for one wave size, as (family, exec name, exec mask, op kwargs). Three parts:
+    every DPP16 control x bound_ctrl x fi x EXEC pattern with both masks on; all 256 row_mask / bank_mask pairs
+    for three controls, with and without bound_ctrl, under the full and the odd EXEC; every DPP8 select set
+    x fi x EXEC pattern. The op (mov, not, add, xor) and whether vD is also src0 (in place, as a reduction
+    writes it) rotate through the cases, so each control meets all four ops and both register layouts."""
+    cases = []
+    execs = SWEEP_EXEC[wave]
+    for control in dpp16_sweep_controls():
+        for bound in (False, True):
+            for fi in (False, True):
+                for ename, emask in execs:
+                    cases.append((control[0], ename, emask,
+                                  dict(control=control, fi=fi, bound=bound)))
+    for control in SWEEP_MASK_CONTROLS:
+        for row_mask in range(16):
+            for bank_mask in range(16):
+                for bound in (False, True):
+                    for ename, emask in execs[:2]:
+                        cases.append(("masks", ename, emask, dict(control=control, bound=bound, row_mask=row_mask,
+                                                                   bank_mask=bank_mask)))
+    for sel in SWEEP_DPP8:
+        for fi in (False, True):
+            for ename, emask in execs:
+                cases.append(("dpp8", ename, emask, dict(dpp8=sel, fi=fi)))
+    return cases
+
+
+def dpp_sweep_programs(wave):
+    """One program per --dpp-sweep case: the usual prologue (data in v2-v7), EXEC set to the case's pattern, one
+    DPP op, and the usual epilogue (EXEC restored, every word stored). One full wave, so no source lane is missing."""
+    progs = []
+    kinds = tuple(DPP_OPS)
+    for i, (family, ename, emask, kw) in enumerate(dpp_sweep_cases(wave)):
+        rng = random.Random(wave * 1000003 + i)
+        pro, init = prologue(rng, wave)
+        kind = kinds[i % 4]
+        d, a, b = (2, 2, 4) if (i // 4) % 2 else (2, 3, 4)
+        op = dpp_op(d, a, b, kind, **kw)
+        p = Program(f"cs_dpp{wave}_{i}", wave, wave, pro, init, [exec_op(wave, emask), op])
+        p.label = f"{family}, EXEC {ename}: {op.text}"
+        p.family = family
+        progs.append(p)
+    return progs
 
 
 class Gen:
@@ -465,79 +630,24 @@ class Gen:
         d, a, b = self.r(DATA_V), self.vsrc(), self.vsrc()
         kind = self.r(("mov", "mov", "not", "add", "xor"))
         r = self.rng
+        # The draws stay in this order, so a seed gives the same programs as before dpp_op was split out.
         dpp8 = r.random() < 0.25
         fi = r.random() < 0.3
         bound = r.random() < 0.5
         row_mask = 0xF if r.random() < 0.6 else r.randrange(16)
         bank_mask = 0xF if r.random() < 0.6 else r.randrange(16)
         if dpp8:
-            sel = [r.randrange(8) for _ in range(8)]
-            ctl = f"dpp8:[{','.join(map(str, sel))}]" + (" fi:1" if fi else "")
-            pick = lambda l: ((l & ~7) | sel[l & 7], True)
+            return dpp_op(d, a, b, kind, fi=fi, dpp8=[r.randrange(8) for _ in range(8)])
+        c = r.choice(DPP16_CONTROLS)
+        if c == "quad_perm":
+            arg = [r.randrange(4) for _ in range(4)]
+        elif c in ("row_shl", "row_shr", "row_ror"):
+            arg = r.randrange(1, 16)
+        elif c in ("row_share", "row_xmask"):
+            arg = r.randrange(16)
         else:
-            c = r.choice(("quad_perm", "row_shl", "row_shr", "row_ror", "row_mirror", "row_half_mirror",
-                          "row_share", "row_xmask"))
-            if c == "quad_perm":
-                q = [r.randrange(4) for _ in range(4)]
-                ctl = f"quad_perm:[{','.join(map(str, q))}]"
-                f = lambda x: ((x & ~3) | q[x & 3], True)
-            elif c == "row_shl":
-                n = r.randrange(1, 16)
-                ctl, f = f"row_shl:{n}", (lambda x: (x + n, x + n < 16))
-            elif c == "row_shr":
-                n = r.randrange(1, 16)
-                ctl, f = f"row_shr:{n}", (lambda x: (x - n, x >= n))
-            elif c == "row_ror":
-                n = r.randrange(1, 16)
-                ctl, f = f"row_ror:{n}", (lambda x: ((x - n) & 15, True))
-            elif c == "row_mirror":
-                ctl, f = "row_mirror", (lambda x: (15 - x, True))
-            elif c == "row_half_mirror":
-                ctl, f = "row_half_mirror", (lambda x: ((x & 8) | (7 - (x & 7)), True))
-            elif c == "row_share":
-                n = r.randrange(16)
-                ctl, f = f"row_share:{n}", (lambda x: (n, True))
-            else:
-                n = r.randrange(16)
-                ctl, f = f"row_xmask:{n}", (lambda x: (x ^ n, True))
-
-            def pick(l, f=f):
-                s_, ok = f(l & 15)
-                return (l & ~15) | (s_ & 15), ok
-            ctl += f" row_mask:0x{row_mask:x} bank_mask:0x{bank_mask:x}" + (" bound_ctrl:1" if bound else "") +                 (" fi:1" if fi else "")
-        name = {"mov": "v_mov_b32", "not": "v_not_b32", "add": "v_add_nc_u32", "xor": "v_xor_b32"}[kind]
-        if kind in ("mov", "not"):
-            text = f"{name}_dpp v{d}, v{a} {ctl}"
-        else:
-            text = f"{name}_dpp v{d}, v{a}, v{b} {ctl}"
-        alu = {"mov": lambda x, y: x, "not": lambda x, y: ~x, "add": lambda x, y: x + y,
-               "xor": lambda x, y: x ^ y}[kind]
-
-        def fn(w):
-            src, other = w.vr(a), w.vr(b)
-            vals, hyp = list(w.vr(d)), False
-            for lane in range(w.size):
-                if not w.active(lane):
-                    continue
-                sl, ok = pick(lane)
-                if dpp8:
-                    if w.active(sl) or fi:
-                        x = src[sl]
-                    else:
-                        x, hyp = 0, True
-                else:
-                    if not (row_mask >> (lane >> 4) & 1 and bank_mask >> ((lane >> 2) & 3) & 1):
-                        continue
-                    if ok and (w.active(sl) or fi):
-                        x = src[sl]
-                    elif bound:
-                        x = 0
-                    else:
-                        continue
-                vals[lane] = alu(x, other[lane]) & M32
-            w.vwrite(d, vals)
-            return hyp
-        return Op(text, fn, "dpp")
+            arg = None
+        return dpp_op(d, a, b, kind, control=(c, arg), fi=fi, bound=bound, row_mask=row_mask, bank_mask=bank_mask)
 
     def op_valu(self):
         d, a, b = self.r(DATA_V), self.vsrc(), self.vsrc()
@@ -662,6 +772,9 @@ def epilogue(wave, hw=False):
 
 
 class Program:
+    label = None      # --dpp-sweep: what the case tests, printed with a failure
+    family = None     # --dpp-sweep: the control family, for the per-family summary
+
     def __init__(self, name, wave, group, pro, init, ops):
         self.name, self.wave, self.group, self.pro, self.init, self.ops = name, wave, group, pro, init, ops
 
@@ -931,6 +1044,10 @@ def main():
     ap.add_argument("--permlane-fetch-inactive", action="store_true",
                     help="model an inactive permlane source as read (FI = 1) instead of the hypothesis")
     ap.add_argument("--dpp", action="store_true", help="also generate DPP16 / DPP8 ops")
+    ap.add_argument("--dpp-sweep", action="store_true",
+                    help="instead of random programs, one program per DPP case: every DPP16 control x bound_ctrl x "
+                         "fi x EXEC pattern, all row_mask / bank_mask pairs, and a set of DPP8 selects "
+                         "(--programs, --seed, --ops and --dpp are ignored; --wave applies)")
     ap.add_argument("--oracle", default="translator",
                     help="comma-separated: translator (default; needs llvm-mc, the Vulkan SDK and vk_compute_test), hw "
                          "(natively on the AMD GPU, wave32 and native wave64; tools/hw_oracle/), or translator,hw")
@@ -979,7 +1096,11 @@ def main():
     waves = (32, 64) if args.wave == "both" else (int(args.wave),)
     modes = args.modes
     progs = []
-    for i in range(args.programs):
+    if args.dpp_sweep:
+        for wave in waves:
+            progs += dpp_sweep_programs(wave)
+        print(f"dpp sweep: {len(progs)} cases")
+    for i in range(0 if args.dpp_sweep else args.programs):
         wave = waves[i % len(waves)]
         progs.append(make_program(args.seed * 100003 + i, wave, args.ops, allow_maskdata=not args.no_maskdata,
                                   wave32_hi_lanes=not args.no_w32_hi_lanes, dpp=args.dpp))
@@ -1004,6 +1125,8 @@ def main():
         for p, mode, what, bad in fails:
             tags = sorted({t for o in p.ops for t in getattr(o, 'tags', {o.tag})})
             print(f"{p.name} [{mode}] {what}; group {p.group}; ops: {', '.join(tags)}")
+            if p.label:
+                print(f"  case: {p.label}")
             if bad:
                 print(describe(p, bad))
             if args.keep:
@@ -1029,6 +1152,17 @@ def main():
     print("summary:")
     for key, st in sorted(stats.items()):
         print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
+    if args.dpp_sweep:
+        print("dpp sweep by family (cases, failing per oracle mode):")
+        failing = {}
+        for p, mode, what, bad in fails:
+            failing.setdefault((p.wave, p.family, mode), set()).add(p.name)
+        for wave in waves:
+            for family in dict.fromkeys(p.family for p in progs if p.wave == wave):
+                n = sum(p.wave == wave and p.family == family for p in progs)
+                bad = ", ".join(f"{m} {len(s)}" for (w, f, m), s in sorted(failing.items())
+                                if w == wave and f == family) or "none"
+                print(f"  wave{wave} {family}: {n} cases; failing: {bad}")
     if any(st["mismatch"] or st["rejected"] for st in stats.values()):
         return 1
     if any(st.get("harness_errors") for st in stats.values()):
