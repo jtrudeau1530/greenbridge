@@ -551,7 +551,7 @@ class Gen:
         self.emit(f"OpStore %active {self.tmp_bool_nz(mask_u)}")
         self.uses_active = True
 
-    def dst(self, a, val):
+    def dst(self, a, val, *, eager=False):
         if a.get("sdwa_dst") and a["k"] == "vgpr":
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
@@ -568,7 +568,15 @@ class Gen:
             p, old, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a['r'])}")
             self.emit(f"{old} = OpLoad %uint {p}")
-            self.emit(f"{r} = OpSelect %uint {self.active_b()} {val} {old}")
+            if eager:
+                mask = self.exec_value()
+                keep, write, preserve = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{keep} = OpNot %uint {mask}")
+                self.emit(f"{write} = OpBitwiseAnd %uint {val} {mask}")
+                self.emit(f"{preserve} = OpBitwiseAnd %uint {old} {keep}")
+                self.emit(f"{r} = OpBitwiseOr %uint {write} {preserve}")
+            else:
+                self.emit(f"{r} = OpSelect %uint {self.active_b()} {val} {old}")
             self.emit(f"OpStore {p} {r}")
         elif a["k"] == "sgpr" and a.get("n", 1) == 1:
             self.store_reg(a["k"], a["r"], val)
@@ -3109,35 +3117,28 @@ class Gen:
                 self.emit(f"{half} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(32)}")
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
                 self.g_shuffle(r, dat, src, zero_inactive=True)
-            elif self.wave64:
-                # Same on a 64-wide subgroup: the half's base comes from the subgroup lane (on a 32-wide one it
-                # is 0, as before). Until 2026-11-21 lanes 32-63 read lanes 0-31 there, and inactive sources
-                # kept their value. GPU-checked with cs_w64x_bpermute. A shuffle from an invocation that isn't
-                # running (the missing lanes of a partial wave) is undefined in SPIR-V, and RADV returns stale
-                # registers; the ballot makes it read 0 like a lane that is off. GPU-checked with cs_w64x_partial.
-                lane, half, src, z = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            else:
+                lane = self.tmp()
                 self.emit(f"{lane} = OpLoad %uint %sg_lane")
-                self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
-                self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
+                src = ln2
+                if self.wave64:
+                    half, src = self.tmp(), self.tmp()
+                    self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
+                    self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
+                # EXEC-off source lanes supply zero. Redirect missing source lanes to the calling lane before
+                # shuffling so the zero mask never has to consume an undefined result.
+                z, bal, ex, safe_src, sh, mask = (self.tmp() for _ in range(6))
                 self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
-                bal, ex, sh = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
                 self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
-                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {src}")
-                self.emit(f"{r} = OpSelect %uint {ex} {sh} {self.cu(0)}")
+                self.emit(f"{safe_src} = OpSelect %uint {ex} {src} {lane}")
+                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {safe_src}")
+                self.emit(f"{mask} = OpSelect %uint {ex} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                self.emit(f"{r} = OpBitwiseAnd %uint {sh} {mask}")
                 self.uses_subgroup = self.uses_ballot = True
-            else:
-                # Wave32: a source lane that is off in EXEC reads as 0 here too (RDNA ISA 10.4.4). Until
-                # 2026-11-21 the raw value was shuffled. GPU-checked with cs_bpermute32. A source lane that isn't
-                # running (a partial wave) reads 0 as well, through the same ballot as the wave64 path.
-                z, bal, ex, sh = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
-                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
-                self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {ln2}")
-                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {ln2}")
-                self.emit(f"{r} = OpSelect %uint {ex} {sh} {self.cu(0)}")
-                self.uses_subgroup = self.uses_ballot = True
-            self.dst(d, r)
+            # A scalar select can become a short-circuiting ternary in MSL, moving the ballot and shuffle into
+            # divergent control flow. Use bitwise masks for both the result and the destination write.
+            self.dst(d, r, eager=not self.emulate)
         elif op == "ds_permute_b32":
             self.ds_permute(a, mods)
         elif op.startswith("ds_") and self.stage == "gs":

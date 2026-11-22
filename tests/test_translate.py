@@ -531,8 +531,10 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
     assert re.search(
         r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \1 (%t\d+)\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \3\n\s*"
-        r"%t\d+ = OpSelect %uint \2 \4 %c0\n",
+        r"(%t\d+) = OpSelect %uint \2 \3 %t\d+\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \4\n\s*"
+        r"(%t\d+) = OpSelect %uint \2 %cffffffff %c0\n\s*"
+        r"%t\d+ = OpBitwiseAnd %uint \5 \6\n",
         asm,
     ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
 
@@ -546,15 +548,19 @@ def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
     asm = shader.translate()
     shader.validate(asm)
     assert not rdna2spirv.translate.last_gen.wave64
-    assert re.search(
+    shuffle = re.search(
         r"(%t\d+) = OpLoad %bool %active\n\s*"
         r"(%t\d+) = OpSelect %uint \1 %t\d+ %c0\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \3 (%t\d+)\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \2 \5\n\s*"
-        r"%t\d+ = OpSelect %uint \4 \6 %c0\n",
+        r"(%t\d+) = OpSelect %uint \4 \5 %t\d+\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \2 \6\n\s*"
+        r"(%t\d+) = OpSelect %uint \4 %cffffffff %c0\n\s*"
+        r"(?P<result>%t\d+) = OpBitwiseAnd %uint \7 \8\n",
         asm,
-    ), "wave32 ds_bpermute did not zero inactive sources and gate the shuffle on the running source lane"
+    )
+    assert shuffle, "wave32 ds_bpermute must mask inactive and missing source lanes"
+    assert f"OpBitwiseAnd %uint {shuffle['result']} " in asm, "the destination write must also mask the shuffle"
 
 WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
 WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
