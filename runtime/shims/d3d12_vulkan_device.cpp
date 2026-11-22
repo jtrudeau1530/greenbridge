@@ -12,6 +12,7 @@
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_bindless.h"
+#include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 
 #include <algorithm>
@@ -203,6 +204,9 @@ struct DeviceState {
     VulkanDeviceInfo info;
     std::unique_ptr<leonida::VulkanContext> context;
     VkPhysicalDeviceMemoryProperties memory{};
+    // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
+    // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
+    bool upload_in_vram = false;
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
@@ -471,9 +475,10 @@ struct DeviceState {
         return properties3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
     }
 
-    // The first memory type with `required`, preferring one that also has `preferred`.
+    // The first memory type with `required`, preferring one that also has `preferred`. `chosen`, when given, receives
+    // the property flags of the type the memory came from.
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
-                            VkMemoryPropertyFlags preferred) const {
+                            VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr) const {
         for (const VkMemoryPropertyFlags flags : {required | preferred, required}) {
             for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
                 if (!(requirements.memoryTypeBits & (1u << i))) continue;
@@ -482,7 +487,10 @@ struct DeviceState {
                 allocate.allocationSize = requirements.size;
                 allocate.memoryTypeIndex = i;
                 VkDeviceMemory out = VK_NULL_HANDLE;
-                if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) return out;
+                if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
+                    if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
+                    return out;
+                }
             }
         }
         return VK_NULL_HANDLE;
@@ -540,6 +548,7 @@ public:
     VkFormat format() const { return format_; }                  // of the image
     VkImageAspectFlags aspects() const { return aspects_; }
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
+    VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
 
     HRESULT create_buffer() {
         auto& vk = device_.context->vk;
@@ -554,10 +563,16 @@ public:
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         const bool host = cpu_visible();
+        // Readback buffers prefer cached memory, which the CPU reads quickly. Upload buffers prefer VRAM the CPU
+        // writes through Resizable BAR, where the GPU reads them quickly (D3D-96); without it, system memory.
+        VkMemoryPropertyFlags host_preferred = 0;
+        if (heap_.Type == D3D12_HEAP_TYPE_READBACK) host_preferred = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD && device_.upload_in_vram)
+            host_preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         memory_ = host ? device_.allocate(requirements,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                          heap_.Type == D3D12_HEAP_TYPE_READBACK ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0)
-                       : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                                          host_preferred, &memory_flags_)
+                       : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
         if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
         if (host) {
@@ -595,7 +610,7 @@ public:
         if (vk.vkCreateImage(device_.info.device, &info, nullptr, &image_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
-        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
         if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
 
@@ -895,6 +910,7 @@ private:
     VkImage image_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    VkMemoryPropertyFlags memory_flags_ = 0;
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects_ = 0;
@@ -1079,6 +1095,16 @@ public:
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties"));
         if (!get_device || !state_.format_properties || !state_.image_format_properties || !memory_properties) return;
         memory_properties(info.physical, &state_.memory);
+        {
+            char text[4] = {};
+            size_t length = 0;
+            const bool sysmem = getenv_s(&length, text, "LEONIDA_UPLOAD_SYSMEM") == 0 && length > 1 && text[0] != '0';
+            state_.upload_in_vram = leonida::resizable_bar(state_.memory) && !sysmem;
+            std::fprintf(stderr, "[rt] d3d12: upload heaps in %s\n",
+                         state_.upload_in_vram ? "VRAM (DEVICE_LOCAL | HOST_VISIBLE, Resizable BAR)"
+                         : sysmem             ? "system memory (LEONIDA_UPLOAD_SYSMEM)"
+                                              : "system memory (no Resizable BAR)");
+        }
         for (const char* name : {"vkGetDeviceImageMemoryRequirements", "vkGetDeviceImageMemoryRequirementsKHR"})
             if (!state_.image_requirements)
                 state_.image_requirements =
@@ -1156,6 +1182,7 @@ public:
 
     bool ok() const { return state_.context && state_.context->loaded(); }
     const VulkanDeviceInfo& info() const { return state_.info; }
+    bool upload_in_vram() const { return state_.upload_in_vram; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
@@ -2314,6 +2341,11 @@ VkImage vulkan_image(ID3D12Resource* resource) {
     return r ? r->image() : VK_NULL_HANDLE;
 }
 
+VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource) {
+    const Resource* r = Resource::from<Resource>(resource);
+    return r ? r->memory_flags() : 0;
+}
+
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src) {
     if (!dst || !src) return false;
     const Format requested = vulkan_format(format, false);
@@ -2346,6 +2378,14 @@ bool device_push_constants_need_fallback(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (!real) real = device;
     if (auto* d = Device::from<Device>(real)) return d->info().push_constants_need_fallback;
+    return false;
+}
+
+bool device_upload_in_vram(ID3D12Device* device) {
+    if (!device) return false;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    if (auto* d = Device::from<Device>(real)) return d->upload_in_vram();
     return false;
 }
 

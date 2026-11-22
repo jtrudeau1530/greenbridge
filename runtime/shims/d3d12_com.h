@@ -71,6 +71,9 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 
+// The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
+VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
+
 // Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
 
@@ -80,6 +83,10 @@ std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 // True when `device`'s Vulkan physical device has maxPushConstantsSize < 144 bytes, requiring
 // the uniform-buffer fallback for the 16-byte tail (heap/code base).
 bool device_push_constants_need_fallback(ID3D12Device* device);
+
+// True when `device` puts upload-heap buffers in DEVICE_LOCAL | HOST_VISIBLE memory: its GPU has Resizable BAR and
+// LEONIDA_UPLOAD_SYSMEM is not set (D3D-96).
+bool device_upload_in_vram(ID3D12Device* device);
 
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
