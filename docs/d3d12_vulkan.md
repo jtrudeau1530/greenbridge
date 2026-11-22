@@ -1899,6 +1899,9 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     refused on an RTX 5080 (616.92), created on an AMD Radeon and on WARP, where typed UAV writes round-trip; and on
     both GPUs one allocation can serve both uses, a mutable `R32_UINT` Vulkan image with `E5B9G9R9_UFLOAT_PACK32` in
     its format list, written through an `R32_UINT` storage view and sampled through an `E5B9G9R9` view.
+    Open: a float store to that format rounds differently on PC devices (@Vonsek, #864: AMD Radeon truncates the
+    mantissas, WARP rounds to nearest even; 609 of 794 test triples differ). Which rule the console FSR needs, and
+    whether its shaders store floats to that texture at all, waits on decoding its `FSPX` shaders.
   - With that one texture created as `R32_UINT` instead (the test's PC stand-in, `standin_slot76`), or as is on
     WARP, `ffxCreateContext` and `ffxDestroyContext` both return OK. Device slots called: 14 (5), 15 (26), 18 (10),
     19 (16), **27
