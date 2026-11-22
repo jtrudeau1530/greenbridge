@@ -207,6 +207,23 @@ Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixt
    should give it, and run `python -m pytest tests/test_wave64_halves_fixtures.py`.
 4. Run `w64_graphics.py` on a RADV GPU and say which GPU and Mesa version in the pull request.
 
+## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
+
+The translated shaders take 144 bytes of push constants: s0..s31, then the heap base and the code base. A device whose
+`maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
+`vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
+AMD's Windows driver reports 128 on RDNA2 iGPUs (Radeon 680M, 610M, the Ryzen 7000 iGPU); RADV reports more on the
+same chips.
+
+To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
+`run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
+and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
+block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
+`vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
+only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
+(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
+constants, so those tests skip.
+
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 
 Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
