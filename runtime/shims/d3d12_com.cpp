@@ -214,10 +214,14 @@ public:
         bind_root(compute_, signature);
     }
     void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* signature) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetGraphicsRootSignature");
         bind_root(graphics_, signature);
     }
 
-    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override { set_pipeline(state); }
+    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
+        set_pipeline(state);
+    }
 
     // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
     void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {}
