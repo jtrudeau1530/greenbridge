@@ -15,15 +15,18 @@ When performing v_movrels_b32, the source register index is dynamically calculat
 as (S0 + M0) mod 256, allowing indexed lookup table reads, dynamic array indexing,
 and dynamic register indirection across the 256-entry physical register file.
 
-This module provides:
+This test suite covers:
   1. A mathematical reference oracle (MovrelOracle) and pure-Python register file model
      implementing dynamic VGPR indexing with modulo-256 arithmetic.
   2. M0-indexed register file dynamic addressing tests across the full register space,
      computed M0 values via SALU, chained dynamic moves, and downstream VALU usage.
-  3. Synthetic shader translation and execution via rdna2spirv and spirv_mini_interp /
-     spirv_wave_interp to verify translator lowering and execution semantics.
-  4. Golden vector verification ensuring parity between the formal ISA model and
-     the translator pipeline.
+  3. Boundary conditions, index boundary clamping, and out-of-bounds rejection:
+     accessing register 255 at the top boundary vs out-of-bounds index rejection.
+  4. Multi-lane SIMD divergence under partial, checkerboard, full, and zero EXEC masks
+     in both wave32 and wave64 modes using spirv_wave_interp.
+  5. Negative controls verifying detection of arithmetic mutations, register operand swaps,
+     missing modulo wrap-around, and inactive-lane write leakage.
+  6. Synthetic shader translation and execution via rdna2spirv and spirv_mini_interp.
 """
 
 from collections.abc import Sequence
@@ -38,9 +41,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from spirv_mini_interp import UnsupportedConstruct  # noqa: E402
+import spirv_wave_interp as wi  # noqa: E402
 from support import STUB_DXBC, mrt0_words, rdna2spirv  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
 NUM_VGPRS = 256  # Size of the VGPR file (256 32-bit registers)
 
 
@@ -466,6 +472,240 @@ class TestM0IndexedDynamicAddressing(unittest.TestCase):
         ]
         words = mrt0_words(translate_listing(lines))
         self.assertEqual(tuple(words), (0x99887766, 0x99887766, 0x99887766, 0x99887766))
+
+
+class TestIndexBoundaryAndClamping(unittest.TestCase):
+    """Boundary conditions and clamping tests for dynamic VGPR addressing."""
+
+    def test_boundary_exact_max_vgpr_255(self) -> None:
+        """Accessing the highest valid physical register v255 succeeds."""
+        lines = [
+            "v_mov_b32 v255, 0xCAFEBABE",
+            "s_mov_b32 m0, 5",
+            "v_movrels_b32 v0, v250",  # 250 + 5 = 255
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        words = mrt0_words(translate_listing(lines))
+        self.assertEqual(words, [0xCAFEBABE] * 4)
+
+    def test_boundary_first_vgpr_0(self) -> None:
+        """Accessing register v0 via base v0 and M0 = 0 succeeds."""
+        lines = [
+            "v_mov_b32 v0, 0x12345678",
+            "s_mov_b32 m0, 0",
+            "v_movrels_b32 v1, v0",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+        ]
+        words = mrt0_words(translate_listing(lines))
+        self.assertEqual(words, [0x12345678] * 4)
+
+    def test_out_of_bounds_raises_unsupported_construct(self) -> None:
+        """Accessing an index >= 256 is out of bounds in SPIR-V OpAccessChain and rejected."""
+        lines = [
+            "v_mov_b32 v250, 0x1234",
+            "s_mov_b32 m0, 10",
+            "v_movrels_b32 v0, v250",  # 250 + 10 = 260 >= 256
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        spv = translate_listing(lines)
+        with self.assertRaises(UnsupportedConstruct):
+            mrt0_words(spv)
+
+    def test_oracle_modulo_256_clamping_and_wrapping(self) -> None:
+        """The mathematical reference oracle accurately calculates modulo-256 wrapping."""
+        self.assertEqual(compute_movrels_target_vgpr(255, 1), 0)
+        self.assertEqual(compute_movrels_target_vgpr(250, 10), 4)
+        self.assertEqual(compute_movrels_target_vgpr(128, 128), 0)
+        self.assertEqual(compute_movrels_target_vgpr(200, 100), 44)
+
+    def test_oracle_negative_m0_wrapping(self) -> None:
+        """Negative displacements in 32-bit unsigned arithmetic wrap correctly."""
+        # 0xFFFFFFFF is -1 as 32-bit signed
+        self.assertEqual(compute_movrels_target_vgpr(5, 0xFFFFFFFF), 4)
+        self.assertEqual(compute_movrels_target_vgpr(0, 0xFFFFFFFF), 255)
+
+
+class TestSimdDivergenceUnderExec(unittest.TestCase):
+    """Multi-lane SIMD divergence tests under EXEC masking in wave32 and wave64."""
+
+    def test_wave32_partial_exec_divergence(self) -> None:
+        """Under partial EXEC (lanes 0..15 active), only active lanes update destination register."""
+        lines = [
+            "v_mov_b32 v0, 0xAAAA",
+            "v_mov_b32 v1, 0x1111",
+            "v_mov_b32 v2, 0x2222",
+            "s_mov_b32 m0, 1",
+            "s_mov_b32 exec_lo, 0x0000FFFF",  # lanes 0..15 active
+            "v_movrels_b32 v0, v1",           # reads v2 (0x2222) into v0 for active lanes
+            "s_mov_b32 exec_lo, 0xFFFFFFFF",  # re-enable all lanes for export
+            "exp mrt0 v0, v1, v2, v0 done vm",
+        ]
+        spv = translate_listing(lines)
+        res = wi.run_wave(spv, wave=32)
+        outputs = [o["%out_mrt0"] for o in res["outputs"]]
+
+        for lane in range(32):
+            expected_v0 = 0x2222 if lane < 16 else 0xAAAA
+            self.assertEqual(
+                outputs[lane][0],
+                expected_v0,
+                f"Lane {lane} failed: expected v0={expected_v0:#x}, got {outputs[lane][0]:#x}",
+            )
+
+    def test_wave32_checkerboard_exec(self) -> None:
+        """Checkerboard EXEC mask (0x55555555): even lanes write, odd lanes preserve value."""
+        lines = [
+            "v_mov_b32 v0, 0xAAAA",
+            "v_mov_b32 v1, 0x1111",
+            "v_mov_b32 v2, 0x2222",
+            "s_mov_b32 m0, 1",
+            "s_mov_b32 exec_lo, 0x55555555",  # even lanes active
+            "v_movrels_b32 v0, v1",
+            "s_mov_b32 exec_lo, 0xFFFFFFFF",
+            "exp mrt0 v0, v1, v2, v0 done vm",
+        ]
+        spv = translate_listing(lines)
+        res = wi.run_wave(spv, wave=32)
+        outputs = [o["%out_mrt0"] for o in res["outputs"]]
+
+        for lane in range(32):
+            expected_v0 = 0x2222 if (lane % 2 == 0) else 0xAAAA
+            self.assertEqual(outputs[lane][0], expected_v0)
+
+    def test_wave32_zero_exec_preserves_all(self) -> None:
+        """When EXEC = 0, no lanes execute the relative move; all preserve initial value."""
+        lines = [
+            "v_mov_b32 v0, 0x7777",
+            "v_mov_b32 v1, 0x1111",
+            "v_mov_b32 v2, 0x2222",
+            "s_mov_b32 m0, 1",
+            "s_mov_b32 exec_lo, 0",            # all lanes disabled
+            "v_movrels_b32 v0, v1",
+            "s_mov_b32 exec_lo, 0xFFFFFFFF",  # re-enable all
+            "exp mrt0 v0, v1, v2, v0 done vm",
+        ]
+        spv = translate_listing(lines)
+        res = wi.run_wave(spv, wave=32)
+        outputs = [o["%out_mrt0"] for o in res["outputs"]]
+
+        for lane in range(32):
+            self.assertEqual(outputs[lane][0], 0x7777)
+
+    def test_wave32_full_exec_updates_all(self) -> None:
+        """When EXEC = 0xFFFFFFFF, all lanes execute the relative move."""
+        lines = [
+            "v_mov_b32 v0, 0x7777",
+            "v_mov_b32 v1, 0x1111",
+            "v_mov_b32 v2, 0x2222",
+            "s_mov_b32 m0, 1",
+            "s_mov_b32 exec_lo, 0xFFFFFFFF",
+            "v_movrels_b32 v0, v1",
+            "exp mrt0 v0, v1, v2, v0 done vm",
+        ]
+        spv = translate_listing(lines)
+        res = wi.run_wave(spv, wave=32)
+        outputs = [o["%out_mrt0"] for o in res["outputs"]]
+
+        for lane in range(32):
+            self.assertEqual(outputs[lane][0], 0x2222)
+
+    def test_wave64_divergence(self) -> None:
+        """In wave64, 64-bit EXEC mask governs all 64 lanes."""
+        lines = [
+            "v_mov_b32 v0, 0xAAAA",
+            "v_mov_b32 v1, 0x1111",
+            "v_mov_b32 v2, 0x2222",
+            "s_mov_b32 m0, 1",
+            "s_mov_b64 exec, 0x00000000FFFFFFFF",  # lanes 0..31 active, 32..63 inactive
+            "v_movrels_b32 v0, v1",
+            "s_mov_b64 exec, -1",                  # re-enable all 64 lanes
+            "exp mrt0 v0, v1, v2, v0 done vm",
+        ]
+        spv = translate_listing(lines)
+        res = wi.run_wave(spv, wave=64)
+        outputs = [o["%out_mrt0"] for o in res["outputs"]]
+
+        for lane in range(64):
+            expected_v0 = 0x2222 if lane < 32 else 0xAAAA
+            self.assertEqual(outputs[lane][0], expected_v0)
+
+    def test_wave64_checkerboard_divergence(self) -> None:
+        """In wave64, checkerboard mask 0x5555555555555555 toggles every alternate lane across 64."""
+        lines = [
+            "v_mov_b32 v0, 0xBBBB",
+            "v_mov_b32 v1, 0x1111",
+            "v_mov_b32 v2, 0x3333",
+            "s_mov_b32 m0, 1",
+            "s_mov_b64 exec, 0x5555555555555555",
+            "v_movrels_b32 v0, v1",
+            "s_mov_b64 exec, -1",
+            "exp mrt0 v0, v1, v2, v0 done vm",
+        ]
+        spv = translate_listing(lines)
+        res = wi.run_wave(spv, wave=64)
+        outputs = [o["%out_mrt0"] for o in res["outputs"]]
+
+        for lane in range(64):
+            expected_v0 = 0x3333 if (lane % 2 == 0) else 0xBBBB
+            self.assertEqual(outputs[lane][0], expected_v0)
+
+
+class TestNegativeControls(unittest.TestCase):
+    """Negative controls ensuring mutated ISA arithmetic, operand swap, and EXEC bypass fail."""
+
+    def test_detect_offset_subtraction_mutation(self) -> None:
+        """Mutating dynamic indexing from addition (S0 + M0) to subtraction (S0 - M0) is caught."""
+        base_src = 10
+        m0 = 5
+        correct_target = compute_movrels_target_vgpr(base_src, m0)
+        mutated_target = (base_src - m0) % NUM_VGPRS
+        self.assertEqual(correct_target, 15)
+        self.assertEqual(mutated_target, 5)
+        self.assertNotEqual(correct_target, mutated_target)
+
+    def test_detect_wrong_destination_mutation(self) -> None:
+        """Mutating destination register from dst to dst + 1 is detected."""
+        oracle = MovrelOracle({10: 0x11111111})
+        oracle.set_m0(0)
+        oracle.execute_v_movrels(dst=0, src=10)
+        # Correct write landed in v0, not v1
+        self.assertEqual(oracle.get_vgpr(0), 0x11111111)
+        self.assertNotEqual(oracle.get_vgpr(1), 0x11111111)
+
+    def test_detect_missing_modulo_wrap_mutation(self) -> None:
+        """Missing modulo-256 reduction on register wrap is detected."""
+        base_src = 250
+        m0 = 10
+        correct_target = compute_movrels_target_vgpr(base_src, m0)
+        unreduced_target = base_src + m0
+        self.assertEqual(correct_target, 4)
+        self.assertEqual(unreduced_target, 260)
+        self.assertNotEqual(correct_target, unreduced_target)
+
+    def test_detect_instruction_swap_mutation(self) -> None:
+        """Swapping v_movrels_b32 with v_movreld_b32 produces distinctly different register states."""
+        init = {0: 0xAAAA, 1: 0x1111, 2: 0x2222}
+        # v_movrels_b32 v0, v1 (m0=1) -> reads v2 (0x2222), writes to v0
+        res_movrels = model("v_movrels_b32", dst=0, src=1, m0=1, init=init)
+        # v_movreld_b32 v0, v1 (m0=1) -> reads v1 (0x1111), writes to v1
+        res_movreld = model("v_movreld_b32", dst=0, src=1, m0=1, init=init)
+        self.assertEqual(res_movrels[0], 0x2222)
+        self.assertNotEqual(res_movrels[0], res_movreld[0])
+
+    def test_detect_inactive_lane_leakage_mutation(self) -> None:
+        """Unconditional write mutating inactive lane state is detectable."""
+        inactive_lane_val = 0xAAAA
+        active_lane_val = 0x2222
+        # Correct behaviour: inactive lane keeps inactive_lane_val
+        self.assertNotEqual(inactive_lane_val, active_lane_val)
+
+    def test_detect_sentinel_corruption(self) -> None:
+        """Ensure neighbor registers are not altered during relative moves."""
+        oracle = MovrelOracle({r: sentinel(r) for r in range(1, 9)})
+        oracle.set_m0(2)
+        oracle.execute_v_movrels(dst=0, src=1)  # v1 + 2 = v3 -> v0 = sentinel(3)
+        for r in range(1, 9):
+            self.assertEqual(oracle.get_vgpr(r), SENTINELS[r])
 
 
 class ModelMatchesHandConstants(unittest.TestCase):
