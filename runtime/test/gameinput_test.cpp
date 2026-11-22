@@ -1107,6 +1107,17 @@ int main() {
     check(input->GetPreviousReading(idle, GameInputKindGamepad, dev, nullptr) == E_POINTER &&
               input->GetPreviousReading(nullptr, GameInputKindGamepad, dev, &hit) == E_INVALIDARG && !hit,
           "history: a null output is E_POINTER, a null reference E_INVALIDARG");
+    // GetTemporalReading: E_NOTIMPL with a null reading, as GameInput v0 itself, for a timestamp in the history, one
+    // before it and the current time, with and without a device filter.
+    const uint64_t idle_us = idle->GetTimestamp();
+    bool temporal_notimpl = true;
+    for (const uint64_t at : {idle_us, idle_us - 1'000'000, input->GetCurrentTimestamp()})
+        for (IGameInputDevice* filter : {dev, static_cast<IGameInputDevice*>(nullptr)}) {
+            IGameInputReading* temporal = idle;  // a stale value the call must clear
+            temporal_notimpl &= input->GetTemporalReading(at, filter, &temporal) == E_NOTIMPL && !temporal;
+        }
+    check(temporal_notimpl && input->GetTemporalReading(idle_us, dev, nullptr) == E_POINTER,
+          "history: GetTemporalReading is E_NOTIMPL with a null reading, as in GameInput v0");
 
     // Two pads in one stream, one poll each: A on the Xbox pad, B on the DualSense, Y on the Xbox pad.
     IGameInputReading* start = current(input, dev);

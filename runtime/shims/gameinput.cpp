@@ -1382,6 +1382,8 @@ public:
                                                  IGameInputReading** out) override {
         return find_reading(ref, kind, device, out, false);
     }
+    // E_NOTIMPL is GameInput v0's own answer: Microsoft's reference page says the method "was never implemented in
+    // v0" and returns E_NOTIMPL, and v1 removed it. A history lookup here would give a title what no GameInput does.
     HRESULT STDMETHODCALLTYPE GetTemporalReading(uint64_t, IGameInputDevice*, IGameInputReading** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
