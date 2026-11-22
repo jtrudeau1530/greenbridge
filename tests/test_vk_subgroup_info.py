@@ -744,11 +744,13 @@ class QueryTest(unittest.TestCase):
                     "mesh_in_required_stages": want_mesh,
                     "compute_in_supported_stages": True,
                     "mesh_in_supported_stages": True,
+                    "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
+                    "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
                 })
 
@@ -774,6 +776,16 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
                 self.assertEqual((res["vendor_id"], res["device_id"], res["driver_id"]), (vendor, device, driver))
                 self.assertIs(res["rdna2_amd_windows"], want)
+
+    def test_rdna1_amd_windows(self):
+        amd = vk_info.VK_DRIVER_ID_AMD_PROPRIETARY
+        cases = ((0x1002, 0x731F, amd, True), (0x1002, 0x7340, amd, True),
+                 (0x1002, 0x7360, amd, True), (0x1002, 0x731F, 3, False),
+                 (0x1002, 0x73DF, amd, False), (0x10DE, 0x731F, amd, False))
+        for vendor, device, driver, expected in cases:
+            with self.subTest(vendor=vendor, device=device, driver=driver):
+                res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
+                self.assertIs(res["rdna1_amd_windows"], expected)
 
     def test_rdna2_answer_is_for_the_runtime_gpu(self):
         """An Intel iGPU next to an RX 6700: the runtime takes the discrete card, and so does the answer."""
@@ -808,6 +820,7 @@ class QueryTest(unittest.TestCase):
         )
         res, _vk = self._run_query(dev)
         self.assertFalse(res["mesh_in_supported_stages"])
+        self.assertTrue(res["native64_compute"])
         self.assertFalse(res["native64"])
 
     def test_native64_required_size_requires_both_supported_stages(self):
@@ -817,7 +830,17 @@ class QueryTest(unittest.TestCase):
         res, _vk = self._run_query(dev)
         self.assertTrue(res["mesh_in_required_stages"])
         self.assertFalse(res["mesh_in_supported_stages"])
+        self.assertTrue(res["native64_compute"])
         self.assertFalse(res["native64"])
+
+    def test_native64_compute_requires_compute_subgroup_support(self):
+        dev = FakeDevice(
+            subgroup_size=64,
+            subgroup_supported_stages=vk_info.VK_SHADER_STAGE_MESH_BIT_EXT,
+            required_subgroup_size_stages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT,
+        )
+        res, _vk = self._run_query(dev)
+        self.assertFalse(res["native64_compute"])
 
     def test_device_name_stops_at_nul_and_replaces_invalid_utf8(self):
         res_nul, _ = self._run_query(FakeDevice(name=b"RDNA2\x00garbage_after_nul"))

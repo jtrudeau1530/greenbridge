@@ -320,7 +320,7 @@ class JobsHandlingTest(unittest.TestCase):
                                         patch("make_game.runtime_gpu_per_vertex", return_value=None):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
-                                    probe.assert_called_once_with("auto")
+                                    probe.assert_called_once_with("auto", mesh_compute=False)
                                     mock_preflight.assert_called_once_with(
                                         ["shaders"], os.path.abspath(work), False, None,
                                         emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
