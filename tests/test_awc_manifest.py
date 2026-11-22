@@ -3,9 +3,13 @@
     python -I tests/test_awc_manifest.py
 """
 import csv, io, json, os, struct, subprocess, sys, tempfile, unittest
+from unittest import mock
 
 TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "tools", "awc_manifest.py")
+sys.path.insert(0, os.path.dirname(TOOL))
+import awc_manifest  # noqa: E402
+
 HEADER = ["bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes"]
 
@@ -131,6 +135,22 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual([r["stream"] for r in doc["streams"]], ["00000010", "00000020", "00000030"])
         self.assertIs(doc["streams"][0]["streamed_music"], False)
         self.assertAlmostEqual(doc["streams"][0]["duration_s"], 0.1, places=6)
+
+    def test_failed_write_keeps_the_previous_manifest(self):
+        out = os.path.join(self.tmp.name, "manifest.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"previous": true}\n')
+
+        def full_disk(_doc, f, **_kwargs):
+            f.write('{"bank_count": ')
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(awc_manifest.json, "dump", side_effect=full_disk):
+            with self.assertRaises(OSError):
+                awc_manifest.write_manifest([], 0, 0, "json", out)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"previous": true}\n')
+        self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
     def test_recursive_report_distinguishes_banks_with_the_same_basename(self):
         for folder in ("left", "right"):

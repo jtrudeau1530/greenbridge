@@ -7,7 +7,7 @@
 //     the exit code is recorded, the run is signalled as finished and the calling thread ends. atexit handlers
 //     and static destructors of the game are not run (its CRT shares the host's, whose process-wide atexit table
 //     also holds gta6rt's own).
-// Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links) and
+// Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 #include <windows.h>
 
@@ -188,6 +188,7 @@ using namespace rt::process;
 SHIM_TABLE(process,
     UCRT("api-ms-win-crt-runtime-l1-1-0.dll"),
     UCRT("ucrtbase.dll"),
+    UCRT("ucrtbased.dll"),  // the Debug UCRT: a Debug build of the stand-in game (run_tiny_game) links it
     {"msvcrt.dll", "exit", reinterpret_cast<void*>(&game_exit)},
     {"msvcrt.dll", "_exit", reinterpret_cast<void*>(&game_exit)},
     {"msvcrt.dll", "abort", reinterpret_cast<void*>(&game_abort)},

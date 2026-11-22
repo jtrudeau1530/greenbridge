@@ -65,14 +65,14 @@ MUTATIONS = [
      "test_ps_ops4"),
     ("v_sin_f16 omits turns-to-radians 2*pi factor", TRANSLATOR,
      '        elif op in ("v_sin_f16", "v_cos_f16"):\n'
-     '            u = self.src_u({**a[1], "neg": False, "abs": False})\n'
+     '            u = self.src_h(a[1])\n'
      '            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))\n'
      '            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")\n'
      '            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")\n'
      '            f = self.modify_f(f, a[1])\n'
      '            self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")',
      '        elif op in ("v_sin_f16", "v_cos_f16"):\n'
-     '            u = self.src_u({**a[1], "neg": False, "abs": False})\n'
+     '            u = self.src_h(a[1])\n'
      '            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))\n'
      '            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")\n'
      '            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")\n'

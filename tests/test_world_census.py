@@ -2,6 +2,7 @@
 
     python -I tests/test_world_census.py
 """
+import argparse
 import contextlib
 import hashlib
 import importlib.util
@@ -145,6 +146,34 @@ class CensusArgumentTest(unittest.TestCase):
                     self.assertIn("must be at least 1", p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
+
+    def test_jobs_above_the_platform_limit_are_rejected(self):
+        """--jobs 100 crashed on Windows: ProcessPoolExecutor allows at most 61 workers there."""
+        saved = WC.MAX_JOBS
+        try:
+            WC.MAX_JOBS = 61
+            self.assertEqual(WC.job_count("61"), 61)
+            for value in ("62", "100"):
+                with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError) as ctx:
+                    WC.job_count(value)
+                self.assertIn("at most 61", str(ctx.exception))
+            WC.MAX_JOBS = None
+            self.assertEqual(WC.job_count("100"), 100)
+        finally:
+            WC.MAX_JOBS = saved
+        self.assertEqual(WC.MAX_JOBS, 61 if os.name == "nt" else None)
+
+    @unittest.skipUnless(os.name == "nt", "the 61-worker limit is Windows-only")
+    def test_cli_rejects_jobs_above_61_on_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "sample.rpf")
+            make_archive(arc)
+            tool = os.path.join(ROOT, "tools", "world_census.py")
+            p = subprocess.run([sys.executable, "-I", tool, arc, "--out", os.path.join(tmp, "out"), "--jobs", "100"],
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("must be at most 61", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
 
 
 def aligned(*parts):
@@ -547,9 +576,20 @@ class MainTest(unittest.TestCase):
                 self.assertIn("not an RPF9 archive", err)
         self.assertFalse(os.path.exists(self.out))
 
+    def test_missing_or_folder_archive_is_one_line(self):
+        for archive in (os.path.join(self.dir, "no_such.rpf"), self.dir):
+            with self.subTest(archive=os.path.basename(archive)):
+                code, out, err = self.run_main(archive, "--out", self.out)
+                self.assertEqual(code, 2)
+                self.assertTrue(err.startswith(archive + ": "), err)
+                self.assertEqual(len(err.strip().splitlines()), 1)
+                self.assertEqual(out, "")
+        self.assertFalse(os.path.exists(self.out))
+
     def test_bad_scan_range(self):
         size = os.path.getsize(self.arc)
-        for args in (("--start", "16"), ("--start", str(size)), ("--start", str(size + 100)), ("--limit", "-1")):
+        for args in (("--start", "16"), ("--start", str(size)), ("--start", str(size + 100)), ("--limit", "-1"),
+                     ("--limit", "0")):     # 0 bytes is an empty range, not "no limit" (it scanned everything)
             with self.subTest(args=args):
                 code, _, err = self.run_main(self.arc, "--out", self.out, "--jobs", "1", *args)
                 self.assertEqual(code, 2)

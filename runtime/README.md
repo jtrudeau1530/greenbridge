@@ -53,6 +53,40 @@ Shim and unimplemented imports are listed by name. A non-zero `unimplemented` co
 signal: it names the next shim that is missing. The measured result for the 16 DLLs shipped in the
 package is recorded in the runtime-imports documentation.
 
+After the totals the report counts the unimplemented imports by return class, and marks the HRESULT ones in the list:
+
+```
+    UNIMPLEMENTED xgameruntime.dll!XUserAddAsync  [returns HRESULT]
+1 module(s) mapped, 1 unimplemented import(s)
+unimplemented by return policy: hresult=1 other=0
+```
+
+### Unimplemented imports at run time: `LEONIDA_UNIMPLEMENTED`
+
+An import with no shim, host function or bundled module is bound to a thunk. What a call to it does is set by the
+environment variable `LEONIDA_UNIMPLEMENTED`, read once per process:
+
+| value | a call to the thunk |
+|---|---|
+| `log` (default) | prints `[rt] unimplemented: dll!name` once and returns 0 in rax and xmm0. This is what the runtime always did. |
+| `fail` | the same, but returns `E_NOTIMPL` (`0x80004001`) for imports known to return an `HRESULT`, and 0 for all others. |
+| `stop` | on the first call prints the import, the caller's return address as `module+RVA`, and rcx, rdx, r8 and r9 as the game passed them; then breaks if a debugger is attached (continuing returns the `fail` value), else ends the process with exit code 3. |
+
+No mode writes to an out parameter: a function that fills one in on success leaves it as the caller had it. Under
+`log` an `HRESULT` function therefore returns `S_OK` with its outputs unset, which is why `fail` exists; with `fail`
+the caller sees an error and can take its own failure path. Any other value is reported and treated as `log`.
+
+Whether an import returns an `HRESULT` is decided by DLL and name alone (`classify_import` in
+`shims/registry.cpp`, where each entry names its source). The list is short on purpose and every entry was checked
+against the public Microsoft documentation: `D3D12Create*`/`D3D12Serialize*` and the D3D12 debug/experimental
+entries, `CreateDXGIFactory*` and two DXGI functions, `XGameRuntimeInitialize`, and the GDK families `XAsync*`,
+`XTaskQueue*`, `XUser*`, `XStore*`, `XGameSave*`, `XPackage*`, `XGameUi*` minus the functions the same pages document
+as `void`/`bool`/`int`. A function that is not on the list gets 0 under `fail`, exactly as under `log`.
+
+The thunk keeps the Win64 argument registers and the return address intact (it is entered by the game's `call`), and
+reaches a shared stub that saves them, so a floating-point caller still reads 0.0 from xmm0 and a debugger can unwind
+through it.
+
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
@@ -129,6 +163,13 @@ when the Vulkan SDK is found:
   driver's compile time on multi-megabyte ray-tracing shaders. The measured partial pass is in
   [docs/pipeline_check.md](../docs/pipeline_check.md).
 
+`unimplemented_policy_test` builds a small image whose two imports bind to nothing and checks `log`, `fail` and
+`stop` on it: return values, untouched out parameter, xmm0 = 0, environment parsing, and (in a child process) the
+`stop` message with the caller's module+RVA and the argument registers. It also checks that the stub keeps the stack
+16-byte aligned at the call into the runtime, that rbx/rbp/rdi/rsi/r12-r15 and xmm6-xmm15 survive a call
+(`test/fixtures/abi_probe.asm`, MASM; skipped without `ml64`), and that `RtlVirtualUnwind` from inside the call walks
+back to the caller.
+
 The PE-loader and Bink-decode tests that need the retail package are optional: when
 `LEONIDA_GAME_DIR` (and, for Bink, `LEONIDA_MOVIE`) is unset they print `SKIP` and exit 0. They read
 the files in place and never copy or commit game data.
@@ -147,16 +188,31 @@ work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
 
-### Typed UINT clear regression
+### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
-`d3d12_uint_clear_test` compares 21 full/rectangle readbacks with Windows WARP across the three
-currently supported typed UINT render-target formats. Fixtures are synthetic; no shaders or game data are needed.
+`d3d12_clear_test` compares full/rectangle readbacks with Windows WARP across UNORM, SNORM, FLOAT, UINT and SINT
+render-target formats, plus depth and stencil clears. Fixtures are synthetic; no shaders or game data are needed.
 The GPU test runs explicitly, while the CPU test is registered in CTest.
 
 ```powershell
 ctest --test-dir runtime/build -C RelWithDebInfo -R '^clear_color$' --output-on-failure
 $env:LEONIDA_VK_VALIDATION = '1'
 $env:VK_VALIDATION_VALIDATE_SYNC = '1'
-.\runtime\build\RelWithDebInfo\d3d12_uint_clear_test.exe
+.\runtime\build\RelWithDebInfo\d3d12_clear_test.exe
+```
+
+### RGBA8 typeless RTV clear regression (phase 1)
+
+`typeless_rtv_test` checks typed-view recording and replay without a GPU. It is registered in CTest.
+`d3d12_typeless_rtv_test` compares synthetic full and rectangular clears with Windows WARP through explicit
+UNORM/SRGB/UINT RTVs on a one-mip, one-layer, single-sample 2D RGBA8 typeless resource. It checks descriptor
+snapshots, alternating view formats, SRGB with UAV resource usage, and invalid view rejection.
+Other typeless families, typed-resource casts, SINT/SNORM, mip/array expansion, MSAA and 3D views are not added.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^typeless_rtv$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_typeless_rtv_test.exe
 ```
