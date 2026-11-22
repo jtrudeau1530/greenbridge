@@ -96,7 +96,7 @@ class Analyze4240Test(unittest.TestCase):
     def test_missing_input_is_one_error_line(self):
         missing = os.path.join(self.root, "missing.rpf")
         p = self.run_tool(missing)
-        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("does not exist", p.stderr)
         self.assertIn("missing.rpf", p.stderr)
         self.assertNotIn("Traceback", p.stderr)

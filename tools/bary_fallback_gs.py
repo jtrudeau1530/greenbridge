@@ -189,6 +189,8 @@ def main(argv):
     parser.add_argument("spirv_dir")
     parser.add_argument("--pair", nargs=2, metavar=("VS", "PS"), help="build for these index entries")
     args = parser.parse_args(argv[1:])
+    if not os.path.exists(args.spirv_dir):
+        parser.exit(2, f"ERROR: {args.spirv_dir}: does not exist\n")
     if not os.path.isdir(args.spirv_dir):
         parser.exit(1, f"{args.spirv_dir}: not a directory\n")
     try:

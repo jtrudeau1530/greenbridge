@@ -164,6 +164,9 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--out")
     a = ap.parse_args()
+    if not os.path.exists(a.blob):
+        print(f"ERROR: {a.blob}: does not exist", file=sys.stderr)
+        return 2
     if a.out:
         check_preview_path(a.out, a.blob)
     try:

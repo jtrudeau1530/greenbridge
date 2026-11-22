@@ -35,7 +35,7 @@ class TileProbeInputTest(unittest.TestCase):
 
     def test_missing_file_is_a_message_not_a_traceback(self):
         p = self.run_tool(os.path.join(self.tmp.name, "missing.bin"))
-        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("missing.bin", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
