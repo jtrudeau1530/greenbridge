@@ -260,7 +260,8 @@ def find_chunks(blob, end, elements):
                 covered[record_at:record_at + RECORD_SIZE] = b"\x01" * RECORD_SIZE
             at = nxt
         else:
-            at += RECORD_SIZE
+            # A rejected lone window is not a real record, so resume scanning at the next 4-byte slot.
+            at += 4
     return chunks
 
 
