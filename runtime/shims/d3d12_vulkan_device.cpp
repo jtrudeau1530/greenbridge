@@ -1488,8 +1488,13 @@ public:
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
         queue_families(info.physical, &family_count, families.data());
-        if (info.queue_family < family_count && families[info.queue_family].timestampValidBits)
-            state_.context->set_timestamp_period(properties.limits.timestampPeriod);
+        if (info.queue_family < family_count) {
+            const auto& family = families[info.queue_family];
+            if (family.timestampValidBits)
+                state_.context->set_timestamp_period(properties.limits.timestampPeriod);
+            if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
+                state_.context->set_binary_occlusion_memory(state_.memory);
+        }
 
         if (info.debug_utils) {
             leonida::DebugLabelFunctions labels;
