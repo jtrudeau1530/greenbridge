@@ -278,6 +278,8 @@ What is implemented (all of it testable without the game):
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS`,
     `OPTIONS2`–`5`, `7`–`9`, `11`, `13`–`21`), GPU virtual-address support, format support, format plane counts,
     multisample quality levels, shader model and root signature version.
+  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
+    support, format support, multisample quality levels, shader model and root signature version.
     `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device enables BC texture compression.
     Other queries, including `OPTIONS1`, `6`, `10` and `12`, are logged and refused until the trace shows what
     the game asks (question 11);
