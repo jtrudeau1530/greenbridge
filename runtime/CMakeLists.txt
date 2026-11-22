@@ -431,10 +431,10 @@ if(Vulkan_FOUND)
     endif()
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
-    add_executable(d3d12_uint_clear_test test/d3d12_uint_clear_test.cpp)
-    target_link_libraries(d3d12_uint_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
-    target_compile_definitions(d3d12_uint_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(d3d12_uint_clear_test PRIVATE /W4 /permissive- /utf-8)
+    add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
+    target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_clear_test PRIVATE /W4 /permissive- /utf-8)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
