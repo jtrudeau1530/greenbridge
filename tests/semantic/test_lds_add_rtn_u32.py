@@ -204,6 +204,73 @@ class DSAddRtnInstruction:
         return f"{parts[0]} {', '.join(parts[1:])}"
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising register files and LDS memory."""
+
+    def __init__(self, lds_size_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_reg(self, reg: RegisterOperand) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_vgpr(reg.index)
+        return self.get_sgpr(reg.index)
+
+    def set_reg(self, reg: RegisterOperand, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def resolve_operand(self, op: Operand) -> int:
+        if isinstance(op, Immediate):
+            return op.val
+        return self.get_reg(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_add_rtn_u32."""
+
+    def execute(self, instr: DSAddRtnInstruction, state: ScalarState) -> Tuple[int, int]:
+        """Execute a single ds_add_rtn_u32 instruction on scalar state.
+
+        Returns:
+            Tuple[int, int]: (old_val, new_mem)
+        """
+        # 1. Latch inputs prior to any register writeback
+        vaddr = state.get_reg(instr.vaddr)
+        addend = state.resolve_operand(instr.vdata0)
+
+        # 2. Perform atomic LDS update
+        old_val, new_mem = state.lds.atomic_add_rtn_u32(
+            vaddr=vaddr,
+            vdata0=addend,
+            offset=instr.offset,
+        )
+
+        # 3. Write pre-addition value back to destination register
+        state.set_reg(instr.vdst, old_val)
+
+        return old_val, new_mem
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -333,5 +400,116 @@ class TestSymbolicAST(unittest.TestCase):
             DSAddRtnInstruction(vdst=v0, vaddr=v0, vdata0=v0, offset=65536)
 
 
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_atomic_add_execution(self) -> None:
+        # Initial memory at 0x40 is 1000
+        addr = 0x40
+        self.state.lds.write_dword(addr, 1000)
+
+        # v1 has address 0x40, v2 has addend 250, v0 is vdst
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 250)
+        self.state.set_vgpr(0, 0xCAFEBABE)  # Initial sentinel in vdst
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, 1000)
+        self.assertEqual(new_mem, 1250)
+        self.assertEqual(self.state.get_vgpr(0), 1000)  # vdst received old_val
+        self.assertEqual(self.state.lds.read_dword(addr), 1250)  # LDS received new sum
+
+    def test_scalar_execution_with_offset(self) -> None:
+        # Base addr in v1 is 0x100, offset is 0x14 -> effective addr is 0x114
+        base_addr = 0x100
+        offset = 0x14
+        eff_addr = base_addr + offset
+
+        self.state.lds.write_dword(eff_addr, 42)
+        self.state.set_vgpr(1, base_addr)
+        self.state.set_vgpr(2, 58)
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=offset,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, 42)
+        self.assertEqual(new_mem, 100)
+        self.assertEqual(self.state.get_vgpr(0), 42)
+        self.assertEqual(self.state.lds.read_dword(eff_addr), 100)
+
+    def test_scalar_execution_with_immediate_operand(self) -> None:
+        addr = 0x200
+        self.state.lds.write_dword(addr, 0x1000)
+        self.state.set_vgpr(1, addr)
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=Immediate(0x555),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, 0x1000)
+        self.assertEqual(new_mem, 0x1555)
+        self.assertEqual(self.state.get_vgpr(0), 0x1000)
+        self.assertEqual(self.state.lds.read_dword(addr), 0x1555)
+
+    def test_scalar_unaligned_byte_address(self) -> None:
+        # 0x301, 0x302, 0x303 all map to dword 0x300 (low 2 bits dropped)
+        self.state.lds.write_dword(0x300, 77)
+        self.state.set_vgpr(1, 0x303)  # Unaligned byte address
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=Immediate(23),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, 77)
+        self.assertEqual(new_mem, 100)
+        self.assertEqual(self.state.lds.read_dword(0x300), 100)
+
+    def test_scalar_sequential_accumulation(self) -> None:
+        addr = 0x50
+        self.state.lds.write_dword(addr, 0)
+        self.state.set_vgpr(1, addr)
+
+        for step in range(1, 6):
+            instr = DSAddRtnInstruction(
+                vdst=RegisterOperand(0, RegType.VGPR),
+                vaddr=RegisterOperand(1, RegType.VGPR),
+                vdata0=Immediate(step),
+            )
+            old_val, new_mem = self.interp.execute(instr, self.state)
+            self.assertEqual(old_val, sum(range(step)))
+            self.assertEqual(new_mem, sum(range(step + 1)))
+            self.assertEqual(self.state.get_vgpr(0), old_val)
+
+        self.assertEqual(self.state.lds.read_dword(addr), 15)
+
+
 if __name__ == "__main__":
     unittest.main()
+
