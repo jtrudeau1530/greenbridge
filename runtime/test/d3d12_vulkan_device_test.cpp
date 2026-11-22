@@ -2018,6 +2018,7 @@ int new_format_round_trips(ID3D12Device* device, const rt::d3d12::VulkanDeviceIn
     };
     constexpr UINT size = 4, pitch = 256, slot = 1024;
     int failures = 0;
+    unsigned host_compared = 0, host_lacking = 0;
     const auto fail = [&](DXGI_FORMAT format, const char* what) {
         if (failures++ < 16) std::fprintf(stderr, "new format %d: %s\n", int(format), what);
     };
@@ -2091,17 +2092,21 @@ int new_format_round_trips(ID3D12Device* device, const rt::d3d12::VulkanDeviceIn
         }
         if (host.p) {
             // A host runtime older than the format has nothing to match: A4B4G4R4_UNORM is not in Windows 10's D3D12,
-            // which reports no 2D texture support for it and refuses it. Compare only where the host itself says it
-            // has the format, so a host that reports it and still refuses the texture fails as before.
+            // which answers the query with an error (E_FAIL on Windows 10 build 19045, E_INVALIDARG on another 19041
+            // host) or reports no 2D texture, and refuses the texture. Compare only where the host itself says it has
+            // the format, so a host that reports it and still refuses the texture fails as before. The answer is
+            // printed, so an unexpected code stays visible.
             D3D12_FEATURE_DATA_FORMAT_SUPPORT host_support{format};
-            const bool host_has_format =
-                SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &host_support,
-                                                    sizeof(host_support))) &&
-                (host_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+            const HRESULT query = host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &host_support,
+                                                            sizeof(host_support));
+            const bool host_has_format = SUCCEEDED(query) && (host_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
             if (!host_has_format) {
-                std::printf("new format %d: the host runtime has no such 2D texture (e.g. Windows 10), "
-                            "host comparison skipped\n", int(format));
+                ++host_lacking;
+                std::printf("new format %d: the host runtime has no such 2D texture (FORMAT_SUPPORT answered %08lx, "
+                            "e.g. Windows 10), host comparison skipped\n",
+                            int(format), static_cast<unsigned long>(query));
             } else {
+                ++host_compared;
                 Ref<ID3D12Resource> native;
                 if (FAILED(host->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -2222,9 +2227,12 @@ int new_format_round_trips(ID3D12Device* device, const rt::d3d12::VulkanDeviceIn
     }
     upload->Unmap(0, nullptr);
     readback->Unmap(0, nullptr);
+    char compared[64] = "";
+    if (host.p) std::snprintf(compared, sizeof(compared), " (host compared on %u, host lacks %u)", host_compared,
+                              host_lacking);
     std::printf("new formats: %u of %zu created and copied both ways bit for bit%s, %u render-target clears "
                 "matched the host, A4B4G4R4 render target %s, %d failures\n",
-                round_trips, std::size(formats), host.p ? " (host compared)" : "", clears_matched,
+                round_trips, std::size(formats), compared, clears_matched,
                 a4_target ? (a4_cleared == 4 ? "cleared to R, G, B and A" : "cleared wrong") : "not reported, skipped",
                 failures);
     return failures;
