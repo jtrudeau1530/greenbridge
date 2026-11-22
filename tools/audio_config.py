@@ -37,6 +37,7 @@ concatenated config blob. Records are found by their marker and duration range, 
 stream offset, so an incomplete carve simply yields fewer records.
 """
 import argparse
+from bisect import bisect_right
 import json
 import os
 import struct
@@ -148,13 +149,6 @@ def load_names(path):
     return names
 
 
-def _file_at(starts, offset):
-    """Return the stream name that contains a byte offset in a joined blob."""
-    import bisect
-    index = bisect.bisect_right(starts, (offset, "\uffff")) - 1
-    return starts[max(index, 0)][1]
-
-
 def collect(src, min_ms=MIN_MS, max_ms=MAX_MS, names=None, join=False):
     records = []
     parts = list(files_in(src)) if join else files_in(src)
@@ -162,11 +156,12 @@ def collect(src, min_ms=MIN_MS, max_ms=MAX_MS, names=None, join=False):
         blob = b"".join(part for _, part in parts)
         starts = []
         offset = 0
-        for name, part in parts:
-            starts.append((offset, name))
+        for _, part in parts:
+            starts.append(offset)
             offset += len(part)
         for record in scan(blob, min_ms, max_ms):
-            record["file"] = _file_at(starts, record["offset"])
+            index = bisect_right(starts, record["offset"]) - 1
+            record["file"] = parts[index][0]
             if names:
                 record["name"] = names.get(record["hash_b"], "")
             records.append(record)
@@ -208,8 +203,16 @@ def main():
     ap.add_argument("--max-ms", type=int, default=MAX_MS, help="maximum duration (default 2000000)")
     a = ap.parse_args()
 
-    names = load_names(a.names) if a.names else None
-    records = collect(a.src, a.min_ms, a.max_ms, names, a.join)
+    if not os.path.exists(a.src):
+        sys.exit(f"{a.src}: does not exist")
+    try:
+        names = load_names(a.names) if a.names else None
+    except OSError as e:
+        sys.exit(f"{a.names}: cannot read the name pool: {e.strerror or e}")
+    try:
+        records = collect(a.src, a.min_ms, a.max_ms, names, a.join)
+    except OSError as e:
+        sys.exit(f"{e.filename or a.src}: cannot read: {e.strerror or e}")
     if not records:
         sys.exit(f"{a.src}: no audio-config records found")
     summary = summarize(records)

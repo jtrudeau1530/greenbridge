@@ -313,6 +313,20 @@ int main() {
     CHECK(info.borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK);
     info = vulkan_sampler({.border_color = BorderColor::table});  // the colour is not in the S#
     CHECK(info.borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);
+    // An integer border: the layer's mark in BORDER_COLOR_PTR, which the hardware reads only for a table colour.
+    for (const auto [type, want] : {std::pair{BorderColor::transparent_black, VK_BORDER_COLOR_INT_TRANSPARENT_BLACK},
+                                    std::pair{BorderColor::opaque_black, VK_BORDER_COLOR_INT_OPAQUE_BLACK},
+                                    std::pair{BorderColor::opaque_white, VK_BORDER_COLOR_INT_OPAQUE_WHITE}}) {
+        const Sampler integer{.border_color = type, .integer_border = true};
+        const SamplerWords words = encode(integer);
+        CHECK(words[3] == ((std::uint32_t(type) << 30) | kIntegerBorderPtr));
+        CHECK(decode(words) == integer && vulkan_sampler(integer).borderColor == want);
+        CHECK(words != encode(Sampler{.border_color = type}));  // its own key, apart from the float border
+    }
+    // Not for a table colour, whose pointer is its index.
+    CHECK((encode({.border_color = BorderColor::table, .border_color_index = 5, .integer_border = true}) ==
+           SamplerWords{0, 0, 0, (3u << 30) | 5}));
+    CHECK(!decode(SamplerWords{0, 0, 0, (3u << 30) | kIntegerBorderPtr}).integer_border);
     CHECK(vulkan_reduction_mode(FilterMode::blend) == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE);
     CHECK(vulkan_reduction_mode(FilterMode::minimum) == VK_SAMPLER_REDUCTION_MODE_MIN);
     CHECK(vulkan_reduction_mode(FilterMode::maximum) == VK_SAMPLER_REDUCTION_MODE_MAX);

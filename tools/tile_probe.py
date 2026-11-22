@@ -137,7 +137,13 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--out")
     a = ap.parse_args()
-    data = open(a.blob, "rb").read()
+    try:
+        with open(a.blob, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise SystemExit(f"{a.blob}: {e.strerror or e}")
+    if not 0 <= a.offset < len(data):  # a negative offset used to probe the file's tail, one past the end nothing
+        raise SystemExit(f"--offset {a.offset} is outside {a.blob} ({len(data)} bytes)")
     res = probe(data, a.offset)
     for s, bpe, wpx, mode in res[:6]:
         print(f"score {s:8.2f}  {bpe}-byte blocks  width {wpx:5}  {mode}")

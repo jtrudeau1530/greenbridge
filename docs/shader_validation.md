@@ -124,6 +124,18 @@ python -I tools/cpu_ref.py <listing.s> --json
 python -I tests/test_cpu_ref.py
 ```
 
+The scalar ALU has its own differential fuzzer (FUZZ-4), `tools/salu_diff.py`: a separate reference for 87
+SOP1/SOP2/SOPC/SOPK opcodes with SCC kept explicit, seeded programs, the translated SPIR-V run in
+`tests/semantic/spirv_mini_interp.py`, and failing programs shrunk to the instructions that matter.
+64-bit mask ops are left out by default (the translator models them as wave masks), and `s_bfe_*` control
+words stay inside offset + width <= 32 unless `--bfe-any`. Until SHADER-46 (#349) lands, a default run on
+main reports `s_ff0_i32_b32` with a constant source; its docstring lists the known divergences.
+
+```
+python -I tools/salu_diff.py --programs 2000 --seed 1
+python -I tests/test_salu_diff.py
+```
+
 Two assembler facts matter when writing edge cases:
 
 - An integer token in a float-operand position uses AMD's inline-constant encoding for values 0..64
@@ -214,6 +226,136 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
 - **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
 - **Not covered.** The translator rejects `ds_permute_b32` and the 8-bit d16 reads
   (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out.
+### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
+
+`cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`
+carries a small reference model written from the RDNA2 addressing rules (V# base and stride, MUBUF
+`soffset + offset + voffset + vindex * stride`, SMEM pointer/V# plus offsets, signed 12-bit `global_*`
+offsets, 32-bit buffer atomics) and compares it with the translation run in `spirv_mini_interp`. Both
+the exported words and the whole final memory are compared, so stores and atomics are checked too.
+
+```powershell
+python -I tools/mem_diff.py --programs 3000 --seed 1 [--family buffer_load] [--max-ops 4]
+python -I tools/mem_diff.py --self-test
+python -I tests/test_mem_diff.py
+```
+
+Families: `s_load`, `s_buffer_load`, `buffer_load`, `buffer_store`, `buffer_atomic`, `global`
+(dword loads/stores, `ubyte`/`sbyte`/`ushort`/`sshort`). Every access is generated in bounds and
+dword aligned (sub-dword loads at their natural alignment), with no format in word3: out-of-bounds
+results, `OOB_SELECT`, swizzling and the `s_buffer_load` alignment truncation depend on descriptor
+fields the translator does not model yet, so they need a GPU-confirmed rule before they are fuzzed.
+`spirv_mini_interp` gained `OpSConvert` and the 32-bit atomics on PhysicalStorageBuffer memory for
+this. Not covered yet: images.
+
+The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
+random DST_SEL of 0/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
+(`16_16_SNORM`, `8_8_8_8_UNORM`, `8_8_8_8_UINT`, `2_10_10_10_UNORM`, `16_16_16_16_UINT`, about 53,000
+instructions) with an identity swizzle. Its reference decodes each element from the GFX10 format *name*
+(`tools/gfx10_formats.json`; channel widths listed from the top bit), not from the translator's own
+table: UNORM/SNORM correctly rounded, missing channels 0, 0, 0, 1. Elements are naturally aligned. Left
+out: DST_SEL 1 on integer formats, and whether `tbuffer` applies the V#'s DST_SEL (neither is measured).
+
+Two results are counted apart, not as mismatches, until a gfx10 hardware measurement settles them
+(posted in #374): `norm-ulp1`, a UNORM/SNORM result 1 ULP from the correctly rounded value (the
+translator multiplies by a rounded reciprocal), and `missing-w32`, the missing W of a 32-bit format,
+where the translator returns 0 and every other format 1 / 1.0. Over 5,000 programs, everything else
+matches; breaking the `16_16_SNORM` kind, the `8_8_8_8_UINT` widths or the DST_SEL order in the
+translator makes 33, 37 and 191 of 300 programs fail.
+
+A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
+76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
+
+### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
+
+`tools/valu_fuzz.py --family f16|mem` uses the same runner shape as `lds_fuzz.py`. It generates seeded
+64-thread compute programs, translates them, runs them with `vk_compute_test`'s `VKC_DUMP`, and compares every
+thread's 16 result VGPRs (plus the scratch memory for `mem`) bit for bit with a model of the instructions written in
+the same file. The model doesn't import the translator. `tests/test_valu_fuzz.py` checks the models on the CPU:
+the f16/f32 rounding against Python's IEEE packers, signed zeros, the partial-write rules and out-of-range
+buffer accesses. If llvm-mc is present, it also checks that every family's
+programs assemble for gfx1013.
+
+- **`f16`**: f16 add/sub/mul/min/max/fma/fmac/med3, `v_cvt_f16_f32`/`v_cvt_f32_f16`/`v_cvt_pkrtz_f16_f32`,
+  `v_pk_*` (f16 and shifts) with `op_sel`/`op_sel_hi`, 16-bit integer ops and `v_pack_b32_f16`. It only uses
+  encodings `llvm-mc -mcpu=gfx1013` accepts: on GFX10 the VOP3 forms of the f16 VOP2 ops take no `op_sel`, and the
+  16-bit integer ops exist only as `op_sel` VOP3. Which form keeps the other half follows the 16-bit row of
+  `docs/design.md`. Results whose exact value is NaN, infinite or denormal, denormal inputs, and min/max of +0
+  against -0 are marked uncertain and not compared.
+- **`mem`**: raw (`offen` + `soffset` + offset) and structured (`idxen`) `buffer_load/store_dword` to `dwordx4`
+  through V#s built in SGPRs, with a random `num_records` so some threads are out of range (loads read 0, stores
+  are dropped). Each thread uses only its own 64-byte slot. Accesses are wholly in or out of range, because
+  multi-dword accesses straddling `num_records` are the known gap in "Buffer bounds checking". Byte/short buffer
+  loads and scalar loads aren't generated: the translator rejects the former, and SHADER-41 covers the latter.
+
+`--skip-op OP` (an op name) sets a known finding aside without changing the rest of the program.
+`--show SEED:INDEX:WAVE` prints a program and its model.
+
+### Wave and cross-lane ops on the GPU (`tools/crosslane_fuzz.py`, FUZZ-7)
+
+Cross-lane ops read other lanes, so like FUZZ-6 this runs on the GPU and not in the one-lane interpreter.
+Each seeded program is one compute group of a wave32 or wave64 program. Group sizes cover one full wave, two or
+three waves, and a partial last wave (20, 50, 40 or 100 threads). The program runs 24 to 28 random ops, then
+every thread stores its six data VGPRs and eight data SGPRs, so each half of a wave reports its own copy of
+every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP`.
+
+- **Instructions.** `v_readlane_b32` and `v_writelane_b32` (constant and SGPR lane selects; in wave32 also
+  selects of 32 and up), `v_readfirstlane_b32`, `v_cmp` into VCC or an SGPR mask, `v_cmpx`, `s_and_saveexec`
+  and its restore, nested up to three deep, constant EXEC halves, `s_bcnt1`/`s_bcnt0`/`s_ff1` of a mask or
+  EXEC, `v_mbcnt_lo/hi` on a mask, EXEC or plain data, `v_cndmask` on a mask, `s_and/or/xor/andn2` of masks,
+  `v_permlane16_b32` / `v_permlanex16_b32`, and forward `s_cbranch_execz/vccz/vccnz` over one to four of these.
+  With `--dpp`: a DPP16 or DPP8 src0 on `v_mov`/`v_not`/`v_add_nc_u32`/`v_xor`, with every DPP16 control,
+  `row_mask`, `bank_mask`, `bound_ctrl` and `fi`. Masks read as plain data (`v_mov_b32 v, s_mask`) belong to
+  #293 and are left out with `--no-maskdata`.
+- **Reference.** A 64-lane model in the same file, written from the ISA (rules in its docstring). Its unit
+  test, `tests/test_crosslane_fuzz.py`, needs no GPU.
+- **Defined behaviour only.** Lane selects, permlane and DPP never read a lane missing from a partial wave.
+  EXEC constants only enable lanes that exist. Every mask register is zero-initialised, as compiled code does,
+  so a branch that skips the `v_cmp` writing a mask leaves a defined mask after the join.
+- **Hypotheses are reported apart.** `v_permlane16/x16` with op_sel FI = 0 reading a lane that is off in
+  EXEC is modelled as the DPP "invalid source" case (vD kept). That isn't measured on AMD hardware, and the
+  translator always reads the lane. A program that hits it counts as `hyp_only`, not as a mismatch.
+  `--permlane-fetch-inactive` models FI = 1 instead.
+- **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
+  which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.
+- **Reports.** The thread, wave, lane and register of the first differences. `--minimize` drops ops while the
+  mismatch persists, and `--keep DIR` saves the programs. `--translator PATH` tests another checkout's
+  translator (for example an open pull request).
+
+First results on an RTX 4090 (subgroup 32, driver 621.14):
+
+- **SHADER-52 (#407).** In wave32, `v_readlane`/`v_writelane` masked the lane select with 63, not 31. 23 of
+  100 wave32 programs failed, each one minimized to a `v_writelane` with a lane select of 32 or more.
+- **Two DPP bugs in #238** (SHADER-23, posted there). Non-mov DPP ops wrote `op(old vD, src1)` in lanes that
+  should be left unwritten (invalid source without `bound_ctrl`, or a lane off in `row_mask`/`bank_mask`), and
+  DPP16 ignored `fi:1`. Each was confirmed with a hand-written program.
+- **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
+- **Open question (#374):** what hardware does for permlane with FI = 0 (see above). It needs a run on an AMD GPU.
+
+### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
+
+`tools/valu_fuzz.py --family f16|mem` uses the same runner shape as `lds_fuzz.py`. It generates seeded
+64-thread compute programs, translates them, runs them with `vk_compute_test`'s `VKC_DUMP`, and compares every
+thread's 16 result VGPRs (plus the scratch memory for `mem`) bit for bit with a model of the instructions written in
+the same file. The model doesn't import the translator. `tests/test_valu_fuzz.py` checks the models on the CPU:
+the f16/f32 rounding against Python's IEEE packers, signed zeros, the partial-write rules and out-of-range
+buffer accesses. If llvm-mc is present, it also checks that every family's
+programs assemble for gfx1013.
+
+- **`f16`**: f16 add/sub/mul/min/max/fma/fmac/med3, `v_cvt_f16_f32`/`v_cvt_f32_f16`/`v_cvt_pkrtz_f16_f32`,
+  `v_pk_*` (f16 and shifts) with `op_sel`/`op_sel_hi`, 16-bit integer ops and `v_pack_b32_f16`. It only uses
+  encodings `llvm-mc -mcpu=gfx1013` accepts: on GFX10 the VOP3 forms of the f16 VOP2 ops take no `op_sel`, and the
+  16-bit integer ops exist only as `op_sel` VOP3. Which form keeps the other half follows the 16-bit row of
+  `docs/design.md`. Results whose exact value is NaN, infinite or denormal, denormal inputs, and min/max of +0
+  against -0 are marked uncertain and not compared.
+- **`mem`**: raw (`offen` + `soffset` + offset) and structured (`idxen`) `buffer_load/store_dword` to `dwordx4`
+  through V#s built in SGPRs, with a random `num_records` so some threads are out of range (loads read 0, stores
+  are dropped). Each thread uses only its own 64-byte slot. Accesses are wholly in or out of range, because
+  multi-dword accesses straddling `num_records` are the known gap in "Buffer bounds checking". Byte/short buffer
+  loads and scalar loads aren't generated: the translator rejects the former, and SHADER-41 covers the latter.
+
+`--skip-op OP` (an op name) sets a known finding aside without changing the rest of the program.
+`--show SEED:INDEX:WAVE` prints a program and its model.
 
 ## Coverage plan and cost
 
@@ -227,11 +369,17 @@ covers the operations most shaders use. Then add, in order:
    those rules need value tests.
 3. **Branches and loops.** Modelled control flow, then irreducible graphs and the dispatch-loop form.
    The existing control-flow unit tests check graph structure; differential tests check the values.
+   `tools/cf_diff.py` (FUZZ-8) does this for whole waves: seeded programs built from the shapes
+   compilers emit (saveexec if/else, `v_cmpx`, VCC- and SCC-voted branches, uniform and per-lane
+   loops, two-entry cycles), run by `tools/cf_ref.py` (cpu_ref plus branches, compares and saveexec)
+   and by `tests/semantic/spirv_wave_interp.py` (every invocation of a subgroup, with structured
+   reconvergence), compared lane by lane in both the structured and the dispatch-loop form.
 4. **LDS, global memory, buffers and images.** These need a memory model and descriptor setup; the
    existing `vk_compute_test`/`vk_store_test`/`vk_texture_test` programs show the shape.
 5. **Wave operations.** Ballot, shuffles, DPP, `readlane`/`writelane`, `permlane`, `mbcnt`, and the
    wave64 split on 32-wide subgroups. These are the largest semantic gap and need a 64-lane model
-   plus a subgroup-size-aware host.
+   plus a subgroup-size-aware host. `tools/crosslane_fuzz.py` (FUZZ-7, above) is that model, run on
+   the GPU.
 6. **Pixel interpolation and exports.** Barycentrics, per-vertex inputs, compressed exports, MRT and
    depth. The existing GPU tests already pin several of these; a CPU model makes them differential.
 
@@ -253,7 +401,8 @@ The prototype and the first harness stage deliberately do not cover:
   the pixel center. The CPU model would need the same triangle and sample positions as the GPU.
 - **Wave operations.** Ballot, shuffles, DPP, permlane and cross-half wave64 behaviour need a full
   64-lane model and a GPU whose subgroup size matches the wave. On a 32-wide subgroup host, a wave64
-  program is not the same execution.
+  program is not the same execution. The one-lane interpreter still can't run them; the GPU fuzzer
+  `tools/crosslane_fuzz.py` covers them instead, with wave64 checked through `--wave64-emulate`.
 - **Memory and LDS.** Address spaces, out-of-bounds rules, atomics, ordering and barriers. These are
   modelled later, with the same "unsupported, never guessed" rule.
 - **Transcendentals and approximation.** `v_rcp_f32`, `v_rsq_f32`, `v_exp_f32`, `v_log_f32` and the

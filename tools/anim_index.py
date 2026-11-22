@@ -488,7 +488,12 @@ def main():
             rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
     except ValueError as e:
         sys.exit(f"{a.source}: {e}")
-    write_output(a.out, rows, summary)
+    except OSError as e:        # missing, a folder that can't be listed, a file that can't be read
+        sys.exit(f"{e.filename or a.source}: {e.strerror or e}")
+    try:
+        write_output(a.out, rows, summary)
+    except OSError as e:
+        sys.exit(f"{a.out}: cannot write: {e.strerror or e}")
     if a.rigs:
         if os.path.isdir(a.source):
             blob = collect_rbf0_dir(a.source)
@@ -499,8 +504,14 @@ def main():
         if blob is None:
             print("no RBF0 stream found; --rigs needs the archive or carved folder that contains it", file=sys.stderr)
             return 2
+        try:
+            rbf0 = parse_rbf0(blob)
+        except ValueError as e:
+            # Parse before opening --rigs, so a failed parse leaves an existing file as it was.
+            print(f"{a.source}: RBF0 stream: {e}", file=sys.stderr)
+            return 2
         with open(a.rigs, "w", encoding="utf-8") as f:
-            json.dump({"rbf0": parse_rbf0(blob), "skeletons": skeletons}, f, indent=1)
+            json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
     top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
     print(json.dumps({k: summary[k] for k in
                       ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",

@@ -441,8 +441,17 @@ struct Sampler {
     std::uint32_t border_color_index = 0;              // 12 bits
     bool unnormalized = false;
     FilterMode filter_mode = FilterMode::blend;
+    // The layer's own: the border colour is read as integers (D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR). The hardware
+    // picks integer or float by the image's format, but Vulkan needs VK_BORDER_COLOR_INT_* in the sampler, so the
+    // layer keeps it in the S# words, which are the sampler's key: see kIntegerBorderPtr.
+    bool integer_border = false;
     bool operator==(const Sampler&) const = default;
 };
+
+// BORDER_COLOR_PTR of an S# with an integer border. The hardware reads the pointer only for BorderColor::table
+// (Mesa writes it only for SQ_TEX_BORDER_COLOR_REGISTER), so with the three built-in types the field is free, and
+// the layer marks an integer border there. An integer table colour is not marked: table colours are not kept yet.
+inline constexpr std::uint32_t kIntegerBorderPtr = 0x800;
 
 // As ac_build_sampler_descriptor fills it for GFX10:
 //   WORD0  CLAMP_X [2:0], CLAMP_Y [5:3], CLAMP_Z [8:6], MAX_ANISO_RATIO [11:9] = log2(anisotropy), at most 4,
@@ -467,7 +476,9 @@ inline SamplerWords encode(const Sampler& sampler) {
     words[2] = field(detail::signed_fixed(sampler.lod_bias, -32, 31), 0, 14) |
                field(std::uint32_t(sampler.mag_filter), 20, 2) | field(std::uint32_t(sampler.min_filter), 22, 2) |
                field(std::uint32_t(sampler.mip_filter), 26, 2);
-    words[3] = field(sampler.border_color_index, 0, 12) | field(std::uint32_t(sampler.border_color), 30, 2);
+    const bool marked = sampler.integer_border && sampler.border_color != BorderColor::table;
+    words[3] = field(marked ? kIntegerBorderPtr : sampler.border_color_index, 0, 12) |
+               field(std::uint32_t(sampler.border_color), 30, 2);
     return words;
 }
 
@@ -492,6 +503,10 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.mip_filter = MipFilter(get(words[2], 26, 2));
     sampler.border_color_index = get(words[3], 0, 12);
     sampler.border_color = BorderColor(get(words[3], 30, 2));
+    if (sampler.border_color != BorderColor::table && sampler.border_color_index == kIntegerBorderPtr) {
+        sampler.integer_border = true;
+        sampler.border_color_index = 0;
+    }
     return sampler;
 }
 
@@ -555,10 +570,19 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
         info.minLod = 0.0f;
         info.maxLod = 0.25f;
     }
+    // An integer image sampled with a FLOAT border colour reads it as 0 on NVIDIA (Vonsek, #538), so the type follows
+    // integer_border. A table colour is not kept yet: transparent black.
+    const bool integer = sampler.integer_border && sampler.border_color != BorderColor::table;
     switch (sampler.border_color) {
-    case BorderColor::opaque_black: info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;
-    case BorderColor::opaque_white: info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; break;
-    default: info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; break;
+    case BorderColor::opaque_black:
+        info.borderColor = integer ? VK_BORDER_COLOR_INT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+        break;
+    case BorderColor::opaque_white:
+        info.borderColor = integer ? VK_BORDER_COLOR_INT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+        break;
+    default:
+        info.borderColor = integer ? VK_BORDER_COLOR_INT_TRANSPARENT_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        break;
     }
     if (sampler.unnormalized) {
         info.unnormalizedCoordinates = VK_TRUE;
