@@ -1579,14 +1579,23 @@ class Gen:
                     self.emit(f"{o} = OpLogicalOr %bool {is_int} {e}")
                     is_int = o
             for i in range(0, len(outs), 2):
-                lo, hi = outs[i], (outs[i + 1] if i + 1 < len(outs) else self.cu(0))
-                ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))   # a memory d16 result, see there
-                il, ih, pi, r = (self.tmp() for _ in range(4))
+                dest = {"k": "vgpr", "r": vd["r"] + i // 2, "n": 1}
+                lo = outs[i]
+                il, r = self.tmp(), self.tmp()
                 self.emit(f"{il} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFF)}")
+                if i + 1 == len(outs):
+                    # For d16_x and d16_xyz the unaddressed high half keeps its previous bits.
+                    fl = self.f16_bits(self.tof(lo))
+                    self.emit(f"{r} = OpSelect %uint {is_int} {il} {fl}")
+                    self.write_lo16(dest, r)
+                    continue
+                hi = outs[i + 1]
+                ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))
+                ih, pi = self.tmp(), self.tmp()
                 self.emit(f"{ih} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
                 self.emit(f"{pi} = OpBitwiseOr %uint {il} {ih}")
                 self.emit(f"{r} = OpSelect %uint {is_int} {pi} {ph}")
-                self.dst({"k": "vgpr", "r": vd["r"] + i // 2, "n": 1}, r)
+                self.dst(dest, r)
 
     def global_mem(self, op, a, mods):
         """global_load_dword[xN] vD, vaddr, saddr|off offset:N / global_store_dword[xN] vaddr, vD, saddr|off.
