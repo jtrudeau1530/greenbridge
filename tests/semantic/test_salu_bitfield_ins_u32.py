@@ -386,5 +386,69 @@ class ScalarAluInterpreterBasicTests(unittest.TestCase):
         self.assertEqual(self.interp.scc, 0)
 
 
+class MaskCompositionAndRoutingTests(unittest.TestCase):
+    """Tests for mask composition, SCC updates, and register routing."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarAluInterpreter()
+
+    def test_mask_composition_pipeline(self) -> None:
+        # s_bfm_b32 width=12, offset=4 -> mask = 0x0000FFF0
+        self.interp.set_sgpr(10, 12)
+        self.interp.set_sgpr(11, 4)
+        self.interp.step("s_bfm_b32", "s2", "s10", "s11")
+        self.assertEqual(self.interp.get_sgpr(2), 0x0000FFF0)
+
+        # insert=0xABC shifted by 4 -> 0x0000ABC0, masked -> 0x0000ABC0
+        self.interp.set_sgpr(12, 0xABC)
+        self.interp.step("s_lshl_b32", "s3", "s12", "s11")
+        self.assertEqual(self.interp.get_sgpr(3), 0x0000ABC0)
+
+        # base=0x12345678
+        self.interp.set_sgpr(4, 0x12345678)
+
+        # s_bfi_b32 s0, s2 (mask), s3 (insert), s4 (base)
+        res = self.interp.step("s_bfi_b32", "s0", "s2", "s3", "s4")
+        self.assertEqual(res, 0x1234ABC8)
+        self.assertEqual(self.interp.scc, 1)
+
+    def test_scc_updates_across_operations(self) -> None:
+        # s_bfm_b32 does NOT alter SCC
+        self.interp.scc = 1
+        self.interp.set_sgpr(1, 0)
+        self.interp.set_sgpr(2, 0)
+        self.interp.step("s_bfm_b32", "s0", "s1", "s2")
+        self.assertEqual(self.interp.scc, 1)
+
+        # s_bfi_b32 sets SCC = 1 when result != 0
+        self.interp.step("s_bfi_b32", "s0", 0xFFFFFFFF, 0xFFFFFFFF, 0)
+        self.assertEqual(self.interp.scc, 1)
+
+        # s_bfi_b32 sets SCC = 0 when result == 0
+        self.interp.step("s_bfi_b32", "s0", 0, 0, 0)
+        self.assertEqual(self.interp.scc, 0)
+
+    def test_register_routing_and_sgpr_independence(self) -> None:
+        # Populate multiple SGPRs and ensure operations route correctly between specified registers
+        for r in range(10, 16):
+            self.interp.set_sgpr(r, (r * 0x11111111) & MASK32)
+
+        # s_bfi_b32 s5, s12, s13, s14
+        expected_res, expected_scc = ref_s_bfi_b32(
+            self.interp.get_sgpr(12),
+            self.interp.get_sgpr(13),
+            self.interp.get_sgpr(14)
+        )
+        self.interp.step("s_bfi_b32", "s5", "s12", "s13", "s14")
+        self.assertEqual(self.interp.get_sgpr(5), expected_res)
+        self.assertEqual(self.interp.scc, expected_scc)
+
+        # Verify other SGPRs remain untouched
+        for r in range(10, 16):
+            if r == 5:
+                continue
+            self.assertEqual(self.interp.get_sgpr(r), (r * 0x11111111) & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
