@@ -66,7 +66,7 @@ entries are dictionary children.
 ### Re-count at `e293917`
 
 A full `rpf9dump models` re-run over the same archives at the current pin (the manifests are
-local; `levels.rpf` was not re-exported):
+local; `levels.rpf` has a recovery count but no full OBJ export):
 
 | Archive | Rows | Non-fragment | Fragments | Delta vs `917e9b9` |
 |---|---:|---:|---:|---:|
@@ -78,12 +78,17 @@ local; `levels.rpf` was not re-exported):
 | `story000_restofworld` | **3** | 3 | 0 | 0 |
 | `common`, `textures`, `story000_script`, `core_restofworld001` | 0 | 0 | 0 | 0 |
 | **Total, excluding `levels.rpf`** | **39,454** | **34,768** | **4,686** | **+3,203** |
-| `levels.rpf` | not re-exported | - | - | - |
+| `levels.rpf` | recovery count only, see below | - | - | +29,327 |
 
-The gain is fragments: upstream `v1.2` PRs #8-#12 recover zero-radius fragments that the earlier
-export skipped (2,551 in `packs.rpf`, 594 in `data.rpf`), plus one drawable in `story000`.
-`story000_restofworld` has the same 3 models at both pins, so its delta is 0. `levels.rpf` and the
-triangle totals were not re-run.
+The gain outside `levels.rpf` is fragments: upstream `v1.2` PRs #8-#12 recover zero-radius
+fragments that the earlier export skipped (2,551 in `packs.rpf`, 594 in `data.rpf`), plus one
+drawable in `story000`. `story000_restofworld` has the same 3 models at both pins, so its delta
+is 0.
+
+`levels.rpf` was re-counted at `e293917` (10 shards over 235,330 candidates): **343,327 models**
+(130,239 dictionary children + 213,088 standalone), against 314,000 at `917e9b9` (206,981
+candidates; 130,225 children + 183,801). The +29,327 is a recovery count, not a row-for-row delta,
+and no full OBJ export was run. Triangle totals were not re-run either.
 
 The last column is the `c3708fb` recovery for comparison. `story000`'s standalone count is
 3,304 vs 3,305; the full new-pin standalone total is 190,765, 27 below the `c3708fb` 190,792.
@@ -431,5 +436,6 @@ own light bones).
 2. **Done:** the pin is `e293917` (was `917e9b9`, originally `48557ea`).
 3. **Done:** `tools/rpf9dump models` was re-run over the model-bearing archives at `e293917`;
    the six non-`levels.rpf` archives total 39,454 rows (+3,203, almost all recovered fragments).
-   `levels.rpf` and the triangle totals were not re-run.
+   `levels.rpf` has a recovery count (343,327 models, +29,327) but no full OBJ export; triangle
+   totals were not re-run.
 4. Keep the README and issue #29 in sync with the new counts.
