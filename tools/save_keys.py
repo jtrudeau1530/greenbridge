@@ -173,7 +173,17 @@ def collect_keys(paths):
     keys = collections.Counter()
     for d in iter_inputs(paths):
         if d[:4] == b"JSAV":                      # index hashes are block ids too
-            n = sum(struct.unpack_from("<II", d, 8))
+            # A truncated or lying entry count must not abort a whole batch with a struct.error traceback.
+            # Skip only the table: the $0x... text keys below are still readable from the same bytes.
+            if len(d) < 16:
+                print(f"warning: JSAV header is only {len(d)} bytes; skipping its entry table", file=sys.stderr)
+                n = 0
+            else:
+                n = sum(struct.unpack_from("<II", d, 8))
+            if n and 16 + 20 * n > len(d):
+                print(f"warning: JSAV header declares {n} entries but the file has {len(d)} bytes; "
+                      "skipping its entry table", file=sys.stderr)
+                n = 0
             for i in range(n):
                 keys[struct.unpack_from("<I", d, 16 + i * 20)[0]] += 1
         for m in KEY.finditer(d):
