@@ -319,6 +319,23 @@ class InstancedBuildTest(unittest.TestCase):
                 self.assertEqual((width, height), (expected, expected))
                 self.assertEqual(tuple(rgba[:4]), tuple(twb.ALBEDO_RGBA))
 
+    def test_rebuild_embeds_changed_texture_at_the_same_path(self) -> None:
+        assets = os.path.join(self.tmp, "tex_assets")
+        twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
+        ents = os.path.join(self.tmp, "tex.jsonl")
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0))])
+        out = os.path.join(self.tmp, "tex_world")
+        dds = os.path.join(assets, "models", "tri_tex", "001_albedo.dds")
+
+        for color in (tuple(twb.ALBEDO_RGBA), (25, 90, 175, 255)):
+            with self.subTest(color=color):
+                with open(dds, "wb") as texture:
+                    texture.write(twb._uniform_bgra_dds(color))
+                doc = world_build.build_world(assets, out, placements=ents, jobs=1)
+                glb = os.path.join(out, "chunks", doc["chunks"][0]["id"] + ".glb")
+                _, rgba = twb._glb_first_base_color_pixel(glb)
+                self.assertEqual(rgba, color)
+
     def test_cli_instancing_option(self):
         ents = os.path.join(self.tmp, "cli.jsonl")
         twp.write_entities(ents, [twp.entity("test_box", (10, 10, 0))])
