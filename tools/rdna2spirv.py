@@ -3830,6 +3830,36 @@ class Gen:
         self.emit(f"{d} = OpBitcast %double {v2}")
         return d
 
+    def round_f32_flushed(self, fn, x):
+        """v_floor_f32 / v_ceil_f32 / v_fract_f32 of the operand x (source modifiers applied) as RDNA2 computes them in
+        the MODE inferred for the game (IEEE 0, f32 denormals flushed), measured natively on gfx1036: a denormal
+        operand is a zero of its sign (floor(-1e-45) = -0, ceil(+1e-45) = +0, fract of either 0; using the denormal
+        gives -1.0, +1.0 and 0x3f7fffff), and a NaN operand passes through unchanged (signalling ones too).
+        fract(+-inf) is the negative quiet NaN 0xffc00000. Done here rather than left to the driver's f32 denormal
+        handling, which Vulkan does not fix."""
+        bits, mag, exp, den, sgn, sz, xf, r = (self.tmp() for _ in range(8))
+        self.emit(f"{bits} = OpBitcast %uint {x}")
+        self.emit(f"{mag} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{exp} = OpBitwiseAnd %uint {bits} {self.cu(0x7F800000)}")
+        self.emit(f"{den} = OpIEqual %bool {exp} {self.cu(0)}")
+        self.emit(f"{sgn} = OpBitwiseAnd %uint {bits} {self.cu(0x80000000)}")
+        self.emit(f"{sz} = OpSelect %uint {den} {sgn} {bits}")
+        self.emit(f"{xf} = OpBitcast %float {sz}")
+        self.emit(f"{r} = OpExtInst %float %glsl {fn} {xf}")
+        if fn == "Fract":
+            r = self.fract_below_one(r)
+        nan, inf, rb, keep, out = (self.tmp() for _ in range(5))
+        self.emit(f"{rb} = OpBitcast %uint {r}")
+        self.emit(f"{nan} = OpUGreaterThan %bool {mag} {self.cu(0x7F800000)}")
+        self.emit(f"{keep} = OpSelect %uint {nan} {bits} {rb}")
+        if fn == "Fract":
+            fixed = self.tmp()
+            self.emit(f"{inf} = OpIEqual %bool {mag} {self.cu(0x7F800000)}")
+            self.emit(f"{fixed} = OpSelect %uint {inf} {self.cu(0xFFC00000)} {keep}")
+            keep = fixed
+        self.emit(f"{out} = OpBitcast %float {keep}")
+        return out
+
     def fract_below_one(self, r):
         """v_fract: a Fract(x) that rounded up to 1.0 (x a tiny negative number) becomes 0x3f7fffff, the largest
         float below 1, as on hardware. A compare and select, not FMin, so the NaN of fract(+-inf) is kept."""
@@ -7065,10 +7095,10 @@ class Gen:
             r = self.tmp()
             if F1[op] == "rcp":
                 self.emit(f"{r} = OpFDiv %float %f1 {x}")
+            elif F1[op] in ("Floor", "Ceil", "Fract"):
+                r = self.round_f32_flushed(F1[op], x)
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {F1[op]} {x}")
-                if F1[op] == "Fract":
-                    r = self.fract_below_one(r)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_frexp_mant_f32", "v_frexp_exp_i32_f32", "v_ldexp_f32"):
             # Bit-exact on the binary32 word (no float arithmetic). A normal input has biased exponent 1..254;
@@ -7154,8 +7184,14 @@ class Gen:
             self.emit(f"{x_in_range} = OpULessThan %bool {x_mag} {self.cu(0x4F000000)}")  # |x| < 2^31
             self.emit(f"{x_neg} = OpINotEqual %bool {x_bits} {x_mag}")
             self.emit(f"{bound} = OpSelect %uint {x_neg} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
-            # Guard before Floor/FSub/FToS: -2^31 (0xCF000000) takes `bound` = 0x80000000 directly.
-            self.emit(f"{safe_x_u} = OpSelect %uint {x_in_range} {x_bits} {self.cu(0)}")
+            # Guard before Floor/FSub/FToS: -2^31 (0xCF000000) takes `bound` = 0x80000000 directly. A denormal operand
+            # is a zero, as on RDNA2 with f32 denormals flushed (the MODE inferred for the game; gfx1036 gives
+            # flr(-1e-45) = 0, where Floor of the kept denormal gives -1).
+            x_exp, x_norm, keep_x = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{x_exp} = OpBitwiseAnd %uint {x_bits} {self.cu(0x7F800000)}")
+            self.emit(f"{x_norm} = OpINotEqual %bool {x_exp} {self.cu(0)}")
+            self.emit(f"{keep_x} = OpLogicalAnd %bool {x_in_range} {x_norm}")
+            self.emit(f"{safe_x_u} = OpSelect %uint {keep_x} {x_bits} {self.cu(0)}")
             safe_x = self.tof(safe_x_u)
             self.emit(f"{fl} = OpExtInst %float %glsl Floor {safe_x}")
             if op == "v_cvt_rpi_i32_f32":
