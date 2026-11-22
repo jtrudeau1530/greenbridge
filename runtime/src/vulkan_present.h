@@ -158,7 +158,7 @@ public:
     VkResult present(ResourceId source, bool vsync, const PresentRect* source_rect = nullptr) {
         ResourceBinding binding;
         {
-            std::lock_guard lock(context_.mutex_);
+            std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
             const ResourceBinding* found = context_.resolve(source);
             if (!found || !found->image || found->aspects != VK_IMAGE_ASPECT_COLOR_BIT) return VK_ERROR_UNKNOWN;
             binding = *found;
@@ -243,7 +243,7 @@ public:
         bool recorded = false;
         if (binding) {
             // The back buffer's layout is tracked like any other texture; this holds the context while it is read.
-            std::lock_guard lock(context_.mutex_);
+            std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
             const ResourceBinding* current = context_.resolve(source);
             if (current && current->image && current->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
                 record(frame.commands, *current, source, image, source_rect);
@@ -302,7 +302,7 @@ private:
 
     // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
     bool presentable(ResourceId source) {
-        std::lock_guard lock(context_.mutex_);
+        std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
         const ResourceBinding* binding = context_.resolve(source);
         return binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT;
     }
