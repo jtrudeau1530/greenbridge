@@ -237,16 +237,14 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf) -
                          f"(cmake --build <build> --target {HARNESS})")
     r = subprocess.run([harness, os.path.join(spirv, "vs_ids.spv"), os.path.join(spirv, "ps_image_load.spv"),
                         out_path, spec_path], capture_output=True, text=True)
-    reason = None
-    if r.returncode == 77:
-        reason = "unsupported"
-    elif r.returncode != 0:
+    if r.returncode == 77:   # a device limit or missing feature, named on the harness's "unsupported:" line
+        why = next((ln for ln in f"{r.stdout}\n{r.stderr}".splitlines() if ln.startswith("unsupported:")),
+                   "the device does not support the set")
+        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: SKIP ({why})")
+        return None
+    if r.returncode != 0:
         reason = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["harness error"]
-    if reason:
-        if reason == "unsupported":
-            print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: SKIP (the device does not support the set)")
-            return None
-        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: FAIL ({reason[0] if isinstance(reason, list) else reason})")
+        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: FAIL ({reason[0]})")
         return False
     got = read_rgba(out_path)
     problems = compare(fmt_name, texels, width, height, got, dmask)
