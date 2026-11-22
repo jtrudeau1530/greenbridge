@@ -53,13 +53,25 @@ The exporters use three tag types:
 | `0x76` | format |
 | `0x48` | streamed-music descriptor |
 
+`tools/rsc8_audio.py` additionally decodes the speech companions `0x36` (peaks), `0xa3` (seek
+table), `0xb2` (loudness), `0xbd` (marker) and the two structural tags below; every other tag type
+is skipped.
+
+| Tag | Meaning |
+|---|---|
+| `0x5a` | 20-byte-entry grid table (`12345678` marker; see [rsc8_audio.md](rsc8_audio.md#the-undocumented-0x5a0xd9-companion-tags)) |
+| `0xd9` | grouped ascending index runs into the sibling `0x5a` entries |
+
+Both appear only in `audio.rpf`, on 1,185 streams (32,000 Hz; 804 of them carry both).
+
 ### Format tag (`0x76`)
 
 The fields the exporters read:
 
 ```
-+0    u32  sample count
++0    u32  sample count (Opus: 48 kHz frames, interleaved across channels)
 +8    u16  sample rate
++12   u32  Opus per-channel frame count (codec 0x0B; +0 for mono, +0/2 for stereo)
 +28   u8   codec
 +29   u8   channel count
 ```
@@ -81,9 +93,10 @@ not store it, so the exporter writes that value as `OpusHead` pre-skip and sets 
 `pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
 frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
 
-The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and a stereo count is
-interleaved across both channels. The exporter therefore does not scale it by the rate field and halves it for
-stereo; scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
+The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and `+0x0C` is the
+per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams). The
+exporter uses `+0x0C` and falls back to `+0 / channels` when a block leaves it zero; it never scales either count
+by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 
@@ -244,22 +257,22 @@ The dictionary comes from two kinds of input:
 - `--conversations`: conversation data, which pairs a dialogue key with its line labels as
   `<ROOT>AU_<XXXX>\0<LABEL>\0`. A key with N distinct labels yields the waves `<key>_01` .. `<key>_<N>`. Wave `_01`
   speaks the first label, `_02` the second, and so on. In 1.0.2.1 the pairs are in 594 carved `story000.rpf`
-  streams, 4 `shared_minigame000.rpf` streams and 2 `data.rpf` streams, and they give 136,788 wave names.
+  streams, 4 `shared_minigame000.rpf` streams, 2 `data.rpf` streams and 1 `story000_restofworld.rpf` stream, and
+  they give 138,104 wave names.
 
-Measured on the 1.0.2.1 package (2026-11-22). The dictionary is about 2.9 million harvested identifiers plus the
-conversation waves:
+Measured on the 1.0.2.1 package (2026-11-22) with 2,455,498 distinct lowercase words: identifiers harvested from the
+carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves:
 
 | Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
 |---|---:|---:|---:|---:|---:|---:|
 | `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
-| `story000.rpf` | 63,861 | 234,458 | 172,781 | 119,492 | 53,289 | 62 |
+| `story000.rpf` | 63,861 | 234,458 | 173,800 | 120,511 | 53,289 | 62 |
 | `shared_minigame000.rpf` | 638 | 4,334 | 1,957 | 1,957 | 0 | 3 |
 
-`story000.rpf` is 73.7% named: dialogue is named almost entirely, because conversation data lists every key.
+`story000.rpf` is 74.1% named: dialogue is named almost entirely, because conversation data lists every key.
 `audio.rpf` is 5.7% named. Its sound effects, ambience and music have no list, so only numbered families are
-found. Adding 1,319 more dialogue words that exist only as harvested strings (not in any conversation pair) brings
-`story000.rpf` to 173,800. When two accepted families claim the same id in one bank (3 rows), the first family in
-sorted base order keeps it.
+found. Without the one `story000_restofworld.rpf` conversation stream, 1,019 dialogue streams stay unnamed. When two
+accepted families claim the same id in one bank (3 rows), the first family in sorted base order keeps it.
 
 The output names game files: keep it local, and do not commit it or attach it to an issue.
 

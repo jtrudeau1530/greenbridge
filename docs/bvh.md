@@ -299,6 +299,47 @@ template, XML and XML fragments, the two-stream advance bug and CSV/JSON output.
 Measured with the tool on `shared_minigame000_bvh4.rpf`: 2,560 streams, 59,142,787 stored, 970,044,012 inflated,
 1,237 complete `bvh4`, 1,233 `instance208`, 85 descriptors, 5 XML. That matches the carver summary exactly.
 
+## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
+
+The Vulkan layer has to write acceleration structures in this runtime layout, because the game's traversal shaders
+read the nodes themselves (`docs/d3d12_vulkan.md` §4.8). `tools/xdxr_bvh.py` (standard library only) is the CPU
+reference for that builder. It encodes a BLAS from triangles or a TLAS from instances, runs one traversal step
+with the semantics of the hardware instruction, walks a whole BVH to the closest hit, and checks a buffer's
+structure. Its fixtures are synthetic.
+
+What it writes, and where each part comes from (line numbers in the public `.hlsli` quoted in §3.1):
+
+| Part | Layout | Source |
+|---|---|---|
+| Header | §3.1 table; `flags = 0x80000006` (BLAS) or `0x00000006` (TLAS); `crc32` and `compressionParams` 0 | `XboxBvh4Header` L2531, flag masks L2551, `XDXR_VERSION_2403 = 6` |
+| BOX32 / BOX16 | four children, unused slots `0xffffffff` with an empty box (min > max); BOX16 rounds min down and max up to half | `Node32` L2302, `Node16` L2285, `XdxrDecompressBox16` |
+| Leaf | vertex slots 0–3, then `GeometryIndexAndFlags` (index << 8 \| flags), `BasePrimitiveIndex` (TRI0), `PrimitiveIndex2` (TRI1), one remap byte per triangle node type | `Leaf` L2342, `XDXR_Runtime_Callback_GetPrimitiveIndex` |
+| TRI0 / TRI1 | TRI0 reads slots (0, 1, 2), TRI1 reads (1, 3, 2); TRI2/TRI3 read slot 4, which overlaps the metadata, and are not emitted | `Read3Verts`, `XdxrGetVertexIndicesForNodeType` |
+| Barycentric remap | byte `8 * type` of leaf `+60`: bits [1:0] pick which edge function is the first barycentric (0 U, 1 V, 2 W), [3:2] the second; U weighs the first vertex read | `TestXboxBvh4Leaf` |
+| INSTANCE | 128 bytes: object-to-world 3×4, ID \| mask << 24, contribution \| flags << 24, BLAS root pointer with bit 31 = identity rotation, BLAS address >> 8, world-to-object 3×4, instance index, parent | `Instance` L2436, `XDXR_INSTANCE_INTERNAL_FLAGS_*` |
+| Parent table | one dword per 64-byte unit from `offsetToElements` on; the entry for unit `u` is at dword `u - offsetToElements/64 + offsetToParents/4` | `XboxBvh4Node_GetParentTableOffset` |
+
+**ASSUMPTION:** the region order (header, parent table, elements, nodes), the median-split build and the greedy
+pairing of triangles that share an edge into TRI0/TRI1 are this tool's choices. The console builder's own choices
+are not public. A shader reaches every region through the header, so these choices don't change what it reads.
+
+The traversal step (`intersect_node`) follows `TestXboxBvh4Node` and `TestXboxBvh4Leaf`. A box child is kept when
+its entry distance is at most the ray extent, and the children are sorted with the network (0,2) (1,3) (0,1) (2,3)
+(1,2). A triangle returns `(t_num, t_denom, i_num, j_num)`, or `(inf, 1, 0, 0)` on a miss. A box miss stays a miss
+for an unbounded ray: the public code's `<=` against an infinite extent would keep it.
+
+**Translator.** `image_bvh_intersect_ray` in `tools/rdna2spirv.py` used to follow RADV's software path on triangle
+nodes: slots (0, 1, 2) for every type and (V, W) as the barycentrics, because RADV builds only one triangle per
+node. It now reads the slots of the node type and applies the remap byte. AMD GPURT
+(`CalcTriangleCompressionVertexIndices`, `SwizzleBarycentrics`) and the XDXR path agree on both. TRI1 nodes
+therefore traverse to the right triangle (docs/design.md, Ray tracing row; `tests/semantic/test_image_bvh_tri.py`).
+
+```powershell
+python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force
+python -I tools/xdxr_bvh.py validate <dumped BVH buffer>    # structural check of a runtime buffer
+python -I tests/test_xdxr_bvh.py
+```
+
 ## 8. No-sharing rule
 
 Nothing from the packs may be committed: no `.rpf`, carved stream, decompressed buffer, XML text, tile list,

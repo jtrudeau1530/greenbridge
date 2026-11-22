@@ -263,6 +263,25 @@ class TestCommandLine(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("is a folder, not a report file", err.getvalue())
 
+    def test_repeat_run_produces_identical_summary(self):
+        # A directory with one stream and a chosen report.json: the second run
+        # must not inflate files_scanned/span/unread bytes by scanning the report.
+        work = os.path.join(self.tmp.name, "movies")
+        os.makedirs(work)
+        with open(os.path.join(work, "one.bk2"), "wb") as fh:
+            fh.write(make_stream(frames=11))
+        report = os.path.join(work, "report.json")
+        summaries = []
+        for _ in range(2):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bink.main([work, "--out", report, "--format", "json"]), 0)
+            with open(report, encoding="utf-8") as fh:
+                summaries.append(json.load(fh)["summary"])
+        self.assertEqual(summaries[0], summaries[1])
+        self.assertEqual(summaries[0]["files_scanned"], 1)
+        self.assertEqual(summaries[0]["streams"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

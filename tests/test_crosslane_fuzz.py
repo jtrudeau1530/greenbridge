@@ -287,6 +287,35 @@ class GpuEnv(unittest.TestCase):
                          str(max(len(X.OUT_REGS), 64)))
 
 
+class UnpinnedSubgroup(unittest.TestCase):
+    """A wave32 run vk_compute_test couldn't pin to 32 lanes is a skip; an emulated wave64 one is still compared."""
+
+    UNPINNED = "device: llvmpipe (LLVM 20.1.2, 256 bits) (subgroup 8..8)\ncompute subgroup size: 32 not available\n"
+
+    def _run_gpu(self, prog, emulate, stdout):
+        def fake(cmd, **kw):
+            with open(kw["env"]["VKC_DUMP"], "wb") as f:
+                f.write(bytes(4 * prog.group * len(X.OUT_REGS)))
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", side_effect=fake):
+            return X.run_gpu("vk_compute_test", "p.spv", prog, work, emulate)
+
+    def test_unpinned_wave32_raises(self):
+        with self.assertRaises(X.Unpinned) as ctx:
+            self._run_gpu(X.make_program(1, 32, 4), False, self.UNPINNED)
+        self.assertIn("can't run it at 32 lanes", str(ctx.exception))
+
+    def test_pinned_wave32_gives_its_words(self):
+        prog = X.make_program(1, 32, 4)
+        words = self._run_gpu(prog, False, "compute subgroup size: 32\n")
+        self.assertEqual(len(words), prog.group * len(X.OUT_REGS))
+
+    def test_emulated_wave64_gives_its_words(self):
+        prog = X.make_program(1, 64, 4)
+        words = self._run_gpu(prog, True, self.UNPINNED)
+        self.assertEqual(len(words), prog.group * len(X.OUT_REGS))
+
+
 class HardwareOracle(unittest.TestCase):
     """--oracle hw: the native kernel text (no GPU needed) and the exit-77 contract."""
 
@@ -418,6 +447,28 @@ class HarnessErrors(unittest.TestCase):
         self.assertIn(f"{calls[1]} [native] harness error: vk_compute_test timed out after 60 s", out)
         self.assertIn("programs 4, match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 1", out)
         self.assertEqual(kept, [f"{calls[1]}_native.asm"])
+
+    def test_every_program_skipped_exits_2(self):
+        def run_gpu(exe, spv, prog, work, emulate):
+            raise X.Unpinned("the device can't run it at 32 lanes")
+
+        code, out = self._main(run_gpu, ["--programs", "4", "--wave", "32", "--modes", "native"])
+        self.assertEqual(code, 2)
+        self.assertIn("harness_errors 0, skipped 4", out)
+        self.assertIn("no program ran", out)
+        self.assertNotIn("mismatch;", out)
+
+    def test_skips_beside_matches_exit_0(self):
+        def run_gpu(exe, spv, prog, work, emulate):
+            if prog.wave == 32:
+                raise X.Unpinned("the device can't run it at 32 lanes")
+            return self._expected_words(prog)
+
+        code, out = self._main(run_gpu, ["--programs", "4", "--wave", "both", "--no-maskdata"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("wave32 native: programs 2, match 0, mismatch 0, hyp_only 0, rejected 0, harness_errors 0, "
+                      "skipped 2", out)
+        self.assertIn("wave64 emulate: programs 2, match 2", out)
 
     def test_clean_run_still_exits_0(self):
         code, out = self._main(lambda exe, spv, prog, work, emulate: self._expected_words(prog),

@@ -26,6 +26,17 @@ This page collects the setup steps and the problems testers have run into so far
   `valu_fuzz.py --family mem` and `lds_fuzz.py`, but rejects `op_sel` on the 16-bit integer VOP3 forms that
   `valu_fuzz.py --family f16` generates (`v_ashrrev_i16_e64 ... op_sel:[0,0,0]`: "not a valid operand"), so no f16
   program assembles. 23.1.6 assembles them.
+
+  On Windows, ROCm 7.2's bundled `llvm-mc.exe` reports LLVM 21.0.0git. It assembled the TEST-71 memory and
+  LDS programs but rejected the 16-bit shift used by the f16 generator. To check an assembler directly in
+  PowerShell, set `$env:LLVM_MC` to the path of its executable and run:
+
+  ```powershell
+  'v_lshlrev_b16_e64 v34, v27, v27 op_sel:[0,1,1]' | & $env:LLVM_MC -triple=amdgcn--amdpal -mcpu=gfx1013 -show-encoding
+  ```
+
+  If it reports `not a valid operand`, point `LLVM_MC` at a build that accepts this instruction. The Windows
+  conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
   - Windows: Visual Studio 2022 with "Desktop development with C++", the Windows SDK 10.0.26100 or newer, and the
@@ -90,6 +101,10 @@ python -I scripts/run_gpu_tests.py --build runtime/build/linux     # Windows: th
 ```
 
 `--filter <text>` runs only matching tests, and `--work <dir>` keeps the intermediate files.
+
+A GPU test program that runs longer than 120 seconds is killed and counted as a failure, so a hung driver does
+not stall the suite. `LEONIDA_GPU_TEST_TIMEOUT` sets the limit in seconds for both `check.py` and
+`run_gpu_tests.py`; `0` turns the limit off.
 
 The two-step form, which `CONTRIBUTING.md` describes:
 
@@ -234,6 +249,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | `vk_harness` doesn't compile: `VK_KHR_maintenance8` names unknown | Vulkan headers older than the SDK the code was written against | Update to current `main` (the code now builds without it), or use current Khronos Vulkan-Headers; conda-forge's package is too old |
 | `ps_bary` and `ps_uniform_branch` fail by about 0.9 | The GPU runs pixel shaders wave64 without fragment barycentrics (GCN3 and RDNA1 on RADV), or an old AMD Windows driver (22.40) | Current `main` skips them on such devices; on Windows, update the driver |
 | `ps_interp_f16_high` fails on a Mac: `PerVertexKHR decoration is not supported in MSL`, then `vkCreateGraphicsPipelines` -3 | MoltenVK can't convert `PerVertexKHR` inputs to Metal | Current `main` translates it with `--f16-interp-fallback` on MoltenVK (see "Macs: 16-bit interpolation") |
+| `ps_vcmpx_forms` fails on a Mac: word 1 reads `0xf05e8e16`, want `0xf05e8a12` | MoltenVK's fast-math makes a compare of a NaN with itself true (SHADER-234) | Current `main`'s test programs turn it off (`MVK_CONFIG_FAST_MATH_ENABLED=0`, unless you set the variable yourself); rebuild them |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | On a Mac, `valu_fuzz.py --family f16` reads `+0` where the model wants `-0`, from a multiply whose exact product is -0 (`v_mul_f16`, `v_pk_mul_f16`) or from an FMA whose product and addend are both -0 (`v_fma_f16`, `v_fmac_f16`, `v_pk_fma_f16`) | MoltenVK computes a `NoContraction` multiply as `fma(l, r, +0)`, which drops the sign. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-182, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions. To run the rest of the fuzzer clean, add `--skip-op` for each of the five ops. To see them match, install Homebrew's `mesa` and use its KosmicKrisp driver: `LEONIDA_VULKAN_LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json python3 -I tools/valu_fuzz.py --family f16 --build runtime/build/linux`. Or build MoltenVK with SPIRV-Cross `300681bb` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision`, and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |

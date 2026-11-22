@@ -105,6 +105,29 @@ class StringHarvestTest(unittest.TestCase):
         self.assertNotIn("cde", found4)
         self.assertIn("ghij", found4)
 
+    def test_harvest_short_standalone_identifiers(self):
+        # The default run pattern needs three bytes, so --min 1/2 must use a shorter matcher to
+        # keep one- and two-letter identifiers that stand alone (and still keep the longer ones).
+        data = b"\x00a\x00\x00ab\x00\x00abc\x00"
+
+        found1 = set()
+        hashdict.harvest(data, found1, minlen=1)
+        self.assertIn("a", found1)
+        self.assertIn("ab", found1)
+        self.assertIn("abc", found1)
+
+        found2 = set()
+        hashdict.harvest(data, found2, minlen=2)
+        self.assertNotIn("a", found2)
+        self.assertIn("ab", found2)
+        self.assertIn("abc", found2)
+
+        found3 = set()
+        hashdict.harvest(data, found3, minlen=3)
+        self.assertNotIn("a", found3)
+        self.assertNotIn("ab", found3)
+        self.assertIn("abc", found3)
+
 
 class LongRunHarvestTest(unittest.TestCase):
     """A printable run longer than hashdict.MAX_NAME_LEN used to be cut at 201 characters, and the next match

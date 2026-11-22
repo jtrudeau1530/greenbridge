@@ -146,6 +146,31 @@ def test_no_caching_inside_construct():
             r2 = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", sv], capture_output=True, text=True)
             assert r2.returncode == 0, f"spirv-val failed:\n{r2.stderr}"
 
+
+def test_desc_probe_defers_index_load_to_hit_block():
+    # In desc_probe (%desc_lookup_fn), the binding index load from %desc_map at offset 9 must be inside
+    # %dl_hit, not before OpBranchConditional in %dl_body. This avoids up to 8 useless storage-buffer reads
+    # on non-matching probes and misses.
+    asm = translate([SAMPLE, EXP, "s_endpgm"])
+    lines = [l.strip() for l in asm.splitlines()]
+    fn_idx = lines.index("%desc_lookup_fn = OpFunction %uint None %fn_desc_lookup")
+    end_idx = lines.index("OpFunctionEnd", fn_idx)
+    fn_lines = lines[fn_idx:end_idx]
+
+    body_idx = fn_lines.index("%dl_body = OpLabel")
+    hit_idx = fn_lines.index("%dl_hit = OpLabel")
+    next_idx = fn_lines.index("%dl_next = OpLabel")
+
+    pre_hit = fn_lines[body_idx:hit_idx]
+    assert not any("%c9" in l for l in pre_hit), "index offset %c9 loaded before conditional branch in %dl_body"
+
+    hit_block = fn_lines[hit_idx:next_idx]
+    has_c9 = any("%c9" in l and "OpIAdd %uint" in l for l in hit_block)
+    has_load = any("OpLoad %uint" in l for l in hit_block)
+    has_store = any("OpStore %dl_idx" in l for l in hit_block)
+    assert has_c9 and has_load and has_store, f"dl_hit missing deferred load: {hit_block}"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

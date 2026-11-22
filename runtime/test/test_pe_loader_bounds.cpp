@@ -783,6 +783,112 @@ void test_forwarder_ordinal_range() {
     }
 }
 
+void test_headers_and_reloc_tail_bounds() {
+    std::printf("\n--- Headers vs SizeOfHeaders and Truncated Relocation Block Header ---\n");
+
+    // 1. e_lfanew + sizeof(IMAGE_NT_HEADERS64) > SizeOfImage with SizeOfHeaders < e_lfanew.
+    //    Previously passed map_image() checks and crashed dereferencing m->base + e_lfanew.
+    {
+        std::vector<uint8_t> bytes(0x2000, 0);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
+        dos->e_magic = IMAGE_DOS_SIGNATURE;
+        dos->e_lfanew = 0x1000;
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(bytes.data() + dos->e_lfanew);
+        nt->Signature = IMAGE_NT_SIGNATURE;
+        nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+        nt->FileHeader.NumberOfSections = 0;
+        nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+        nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        nt->OptionalHeader.ImageBase = 0x140000000ull;
+        nt->OptionalHeader.SectionAlignment = 0x1000;
+        nt->OptionalHeader.FileAlignment = 0x200;
+        nt->OptionalHeader.SizeOfImage = 0x1000;
+        nt->OptionalHeader.SizeOfHeaders = 0x200;
+        nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+
+        auto path = write_temp_image(bytes);
+        bool threw = false;
+        try {
+            rt::Loader loader(g_temp_dir);
+            loader.load(path);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        check_condition(threw, "NT headers past SizeOfHeaders/SizeOfImage are rejected cleanly");
+    }
+
+    // 2. SizeOfHeaders covers NT headers but truncates the section table.
+    {
+        auto bytes = make_base_image(0x2000, 0x400);
+        auto* nt = nt_header_of(bytes);
+        // e_lfanew(0x80) + sizeof(IMAGE_NT_HEADERS64)(0x108) = 0x188; section header ends at 0x1B0.
+        nt->OptionalHeader.SizeOfHeaders = 0x190;
+        auto path = write_temp_image(bytes);
+        bool threw = false;
+        try {
+            rt::Loader loader(g_temp_dir);
+            loader.load(path);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        check_condition(threw, "Section table extending past SizeOfHeaders is rejected cleanly");
+    }
+
+    // 3. Relocation directory with < 8 bytes remaining at the exact end of SizeOfImage (forced relocation).
+    {
+        void* occupied = VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check_condition(occupied != nullptr, "Reserved preferred base for truncated reloc test");
+        if (occupied) {
+            auto bytes = make_base_image(0x2000, 0x400);
+            auto* nt = nt_header_of(bytes);
+            nt->OptionalHeader.ImageBase = reinterpret_cast<uint64_t>(occupied);
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1FFC, 4};
+            auto path = write_temp_image(bytes);
+            bool threw = false;
+            try {
+                rt::Loader loader(g_temp_dir);
+                loader.load(path);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            VirtualFree(occupied, 0, MEM_RELEASE);
+            check_condition(threw, "Truncated 4-byte relocation block at end of image is rejected cleanly");
+        }
+    }
+
+    // 4. Valid 8-byte relocation block followed by 4 trailing bytes (remaining < sizeof(IMAGE_BASE_RELOCATION)).
+    {
+        void* occupied = VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check_condition(occupied != nullptr, "Reserved preferred base for trailing reloc bytes test");
+        if (occupied) {
+            auto bytes = make_base_image(0x2000, 0x1400);
+            auto* nt = nt_header_of(bytes);
+            nt->OptionalHeader.ImageBase = reinterpret_cast<uint64_t>(occupied);
+            auto* sec = IMAGE_FIRST_SECTION(nt);
+            sec->VirtualAddress = 0x1000;
+            sec->Misc.VirtualSize = 0x1000;
+            sec->PointerToRawData = 0x400;
+            sec->SizeOfRawData = 0x1000;
+            // Place a 12-byte reloc dir at RVA 0x1FF4 (raw offset 0x13F4): 8-byte block + 4 trailing bytes.
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1FF4, 12};
+            IMAGE_BASE_RELOCATION hdr{};
+            hdr.VirtualAddress = 0x1000;
+            hdr.SizeOfBlock = sizeof(IMAGE_BASE_RELOCATION);
+            std::memcpy(bytes.data() + 0x13F4, &hdr, sizeof(hdr));
+            auto path = write_temp_image(bytes);
+            bool threw = false;
+            try {
+                rt::Loader loader(g_temp_dir);
+                loader.load(path);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            VirtualFree(occupied, 0, MEM_RELEASE);
+            check_condition(threw, "Trailing 4 bytes after valid relocation block are rejected cleanly");
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -803,6 +909,7 @@ int main() {
         test_highlow_relocations();
         test_directory_count();
         test_forwarder_ordinal_range();
+        test_headers_and_reloc_tail_bounds();
     } catch (const std::exception& e) {
         std::printf("FATAL: Unhandled exception during test execution: %s\n", e.what());
         ++g_failures;
