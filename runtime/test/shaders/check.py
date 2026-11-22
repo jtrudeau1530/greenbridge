@@ -273,11 +273,12 @@ def run(*cmd, env=None):
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:
-        if not isinstance(e, FileNotFoundError):
-            return 1, start_failure(cmd[0], e)
-        tools = os.path.abspath(os.path.dirname(cmd[0]))
-        missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
-        sys.exit(not_found_message(tools, missing))
+        if isinstance(e, FileNotFoundError):
+            tools = os.path.abspath(os.path.dirname(cmd[0]))
+            missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
+            if missing:
+                sys.exit(not_found_message(tools, missing))
+        return 1, start_failure(cmd[0], e)
     return r.returncode, r.stdout + r.stderr
 
 
