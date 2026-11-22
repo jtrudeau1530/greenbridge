@@ -52,7 +52,10 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     if not command:
         return "fail", "no command (target not built?)"
     exe = map_path(command[0], args.windows_root, args.root)
-    if exe is None or not os.path.isfile(exe):
+    if exe is None:
+        # A test that runs a tool of the Windows runner (cmake -P, python) rather than one this build made.
+        return "skip", f"runs {command[0]}, not a program from the build"
+    if not os.path.isfile(exe):
         return "fail", f"executable not in the artifact: {command[0]}"
     argv = list(wine) + [exe]
     for a in command[1:]:
