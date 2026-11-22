@@ -1,4 +1,4 @@
-"""v_floor_f32, v_ceil_f32 and v_fract_f32 against words an RDNA2 GPU returned for the same instruction.
+"""v_floor_f32, v_ceil_f32, v_fract_f32 and v_cvt_flr/rpi_i32_f32 against words an RDNA2 GPU returned for the same instruction.
 
 Every row ran natively on an AMD Radeon RDNA2 iGPU (gfx1036, Ryzen 9 9950X3D, Windows AMD driver 32.0.21045.16010)
 through tools/hw_oracle with AMD clang 23 (rocm-sdk-core 10.0.0), in the MODE inferred for the game (IEEE 0,
@@ -8,7 +8,9 @@ after the instruction is the expected one. No model in this test.
 What the rows pin: a denormal operand is a zero of its sign (floor(-1e-45) = -0, ceil(+1e-45) = +0, fract of either
 0), which a translation that uses the denormal as it is gets wrong by a whole 1.0; a NaN operand passes through
 unchanged, a signalling one too (IEEE 0); fract(+-inf) is the negative quiet NaN 0xffc00000; and the ordinary values
-around them (fract of a tiny negative normal is 0x3f7fffff, docs/design.md).
+around them (fract of a tiny negative normal is 0x3f7fffff, docs/design.md). v_cvt_flr_i32_f32 of a
+negative denormal is 0 for the same reason (floor of the kept denormal gives -1); v_cvt_rpi_i32_f32 rows
+are the control.
 """
 import os
 import struct
@@ -106,6 +108,50 @@ MEASURED = [
     ('v_ceil_f32_e64 v4, |v1|', 0x80000001, 0x00000000),
     ('v_ceil_f32_e64 v4, |v1|', 0x807FFFFF, 0x00000000),
     ('v_ceil_f32_e64 v4, |v1|', 0xFF800000, 0x7F800000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x00000001, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x80000001, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x00400000, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x807FFFFF, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x007FFFFF, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x80000000, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x00000000, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x00800000, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x80800000, 0xFFFFFFFF),
+    ('v_cvt_flr_i32_f32 v4, v1', 0xBF000000, 0xFFFFFFFF),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x3F000000, 0x00000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0xBF800001, 0xFFFFFFFE),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x3FC00000, 0x00000001),
+    ('v_cvt_flr_i32_f32 v4, v1', 0xBFC00000, 0xFFFFFFFE),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x4EFFFFFF, 0x7FFFFF80),
+    ('v_cvt_flr_i32_f32 v4, v1', 0xCF000000, 0x80000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0xCF000001, 0x80000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x7F800000, 0x7FFFFFFF),
+    ('v_cvt_flr_i32_f32 v4, v1', 0xFF800000, 0x80000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0x7FC00000, 0x7FFFFFFF),
+    ('v_cvt_flr_i32_f32 v4, v1', 0xFFC00000, 0x80000000),
+    ('v_cvt_flr_i32_f32 v4, v1', 0xB3800000, 0xFFFFFFFF),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x00000001, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x80000001, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x00400000, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x807FFFFF, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x007FFFFF, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x80000000, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x00000000, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x00800000, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x80800000, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0xBF000000, 0x00000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x3F000000, 0x00000001),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0xBF800001, 0xFFFFFFFF),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x3FC00000, 0x00000002),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0xBFC00000, 0xFFFFFFFF),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x4EFFFFFF, 0x7FFFFF80),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0xCF000000, 0x80000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0xCF000001, 0x80000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x7F800000, 0x7FFFFFFF),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0xFF800000, 0x80000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0x7FC00000, 0x7FFFFFFF),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0xFFC00000, 0x80000000),
+    ('v_cvt_rpi_i32_f32 v4, v1', 0xB3800000, 0x00000000),
 ]
 
 
