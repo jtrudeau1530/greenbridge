@@ -6734,12 +6734,10 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("v_cvt_f16_u16", "v_cvt_f16_i16", "v_cvt_u16_f16", "v_cvt_i16_f16"):
             # 16-bit <-> f16 conversions of the low half (op_sel:[src,dst] picks the high half of the source / of the
-            # destination); the other half of the destination is kept, as for the other 16-bit-result ops. No clamp or
-            # output multiplier (rejected rather than guessed). f16 -> int truncates toward zero, saturates to the 16-bit
-            # range (an f16 infinity too) and gives 0 for NaN, as the 32-bit conversions do (docs/design.md,
-            # "Float-to-int saturation"). int -> f16 rounds like every f16 result (f16_out).
-            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
-                raise Unsupported(op + " output modifier")
+            # destination); the other half of the destination is kept, as for the other 16-bit-result ops. f16 -> int
+            # truncates toward zero, saturates to the 16-bit range (an f16 infinity too) and gives 0 for NaN, as the
+            # 32-bit conversions do (docs/design.md, "Float-to-int saturation"); output modifiers stay rejected on it.
+            # int -> f16 applies clamp_mods (mul:/div: then [0, 1] clamp) and rounds like every f16 result (f16_out).
             sel, dhi = self.opsel_bits(mods, 1)
             if op in ("v_cvt_f16_u16", "v_cvt_f16_i16"):
                 u = self.src_u({**a[1], "neg": False, "abs": False})
@@ -6756,8 +6754,11 @@ class Gen:
                     m = self.tmp()
                     self.emit(f"{m} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
                     self.emit(f"{f} = OpConvertSToF %float {m}")
+                f = self.clamp_mods(f, mods)
                 self.f16_out(a[0], f, dhi)
             else:
+                if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                    raise Unsupported(op + " output modifier")
                 x = self.f16_in(a[1], sel[0])
                 nan, xs, tr, cl, conv, lo = (self.tmp() for _ in range(6))
                 self.emit(f"{nan} = OpIsNan %bool {x}")
