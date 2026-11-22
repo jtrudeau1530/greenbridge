@@ -507,7 +507,17 @@ int main() {
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         const UINT sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         Ref<ID3D12DescriptorHeap> view_heap, sampler_heap;
-        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 24,
+        struct LodView { UINT first, count; float clamp; bool force_alpha_one = false; };
+        constexpr LodView lod_views[] = {
+            {0, 3, 0.25f}, {0, 3, 0.75f}, {1, 2, 1.75f}, {0, 2, 1.75f}, {1, 2, 0.75f}, {0, 2, 1.75f, true}
+        };
+        constexpr UINT first_lod_slot = 10;
+        // Keep the multisample views after all minimum-LOD views and the preceding volume views.
+        enum : UINT {
+            ms_slot = first_lod_slot + std::size(lod_views), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
+        };
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&view_heap.p))));
         heap_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -518,11 +528,6 @@ int main() {
         const auto view_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(view_cpu + i * step)}; };
         const auto view_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(view_cpu + i * step); };
 
-        struct LodView { UINT first, count; float clamp; bool force_alpha_one = false; };
-        constexpr LodView lod_views[] = {
-            {0, 3, 0.25f}, {0, 3, 0.75f}, {1, 2, 1.75f}, {0, 2, 1.75f}, {1, 2, 0.75f}, {0, 2, 1.75f, true}
-        };
-        constexpr UINT first_lod_slot = 10;
         for (UINT i = 0; i < std::size(lod_views); ++i) {
             const auto& v = lod_views[i];
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -566,7 +571,6 @@ int main() {
         const auto null_at = [&](UINT i) {
             return std::all_of(view_bytes(i), view_bytes(i) + step, [](std::uint8_t byte) { return byte == 0; });
         };
-        constexpr UINT ms_slot = 16, ms_array_slot = 17, ms_slice_slot = 18, ms_first_layer_slot = 23;
         D3D12_RESOURCE_DESC ms_desc = texture_desc;
         ms_desc.Width = ms_desc.Height = 4;
         ms_desc.SampleDesc.Count = 4;
@@ -1073,13 +1077,15 @@ int main() {
             VkFormat vk_format;
             const char* shader;
             std::uint32_t value;
+            UINT slots[2];
             Ref<ID3D12Resource> textures[2];  // single layer and two-layer array
             SampleKeys keys[4]{};             // two hits and a missed key in each dimension
         };
         IntegerMS integer_ms[] = {
-            {DXGI_FORMAT_R32_UINT, VK_FORMAT_R32_UINT, LEONIDA_TEST_MS_UINT_SPV, 0xf1234567u},
-            {DXGI_FORMAT_R32_SINT, VK_FORMAT_R32_SINT, LEONIDA_TEST_MS_SINT_SPV, std::uint32_t(-1234567)}};
-        UINT next_slot = 19;
+            {DXGI_FORMAT_R32_UINT, VK_FORMAT_R32_UINT, LEONIDA_TEST_MS_UINT_SPV, 0xf1234567u,
+             {ms_uint_slot, ms_uint_array_slot}},
+            {DXGI_FORMAT_R32_SINT, VK_FORMAT_R32_SINT, LEONIDA_TEST_MS_SINT_SPV, std::uint32_t(-1234567),
+             {ms_sint_slot, ms_sint_array_slot}}};
         for (auto& test : integer_ms) {
             VkImageFormatProperties props{};
             const auto query = d.instance_fn<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
@@ -1090,9 +1096,9 @@ int main() {
                 std::printf("MSAA SRV format %u: no 2x or 4x sampled render target, skipped\n", UINT(test.format));
                 continue;
             }
-            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{test.format};
-            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
-            if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD)) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT integer_support{test.format};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &integer_support, sizeof(integer_support))));
+            if (!(integer_support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD)) {
                 std::printf("MSAA SRV format %u: device does not advertise multisample loads, skipped\n",
                             UINT(test.format));
                 continue;
@@ -1100,14 +1106,15 @@ int main() {
             D3D12_RESOURCE_DESC desc = ms_desc;
             desc.Format = test.format;
             desc.SampleDesc.Count = (props.sampleCounts & VK_SAMPLE_COUNT_4_BIT) ? 4 : 2;
-            for (UINT shape = 0; shape < 2; ++shape, ++next_slot) {
+            for (UINT shape = 0; shape < 2; ++shape) {
                 desc.DepthOrArraySize = UINT16(1 + shape);
                 auto& resource = test.textures[shape];
                 EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
                              D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource.p))));
-                device->CreateShaderResourceView(resource.p, nullptr, view_slot(next_slot));
-                EXPECT(!null_at(next_slot));
-                std::memcpy(test.keys[shape].tsharp, view_bytes(next_slot), sizeof(test.keys[shape].tsharp));
+                const UINT at = test.slots[shape];
+                device->CreateShaderResourceView(resource.p, nullptr, view_slot(at));
+                EXPECT(!null_at(at));
+                std::memcpy(test.keys[shape].tsharp, view_bytes(at), sizeof(test.keys[shape].tsharp));
                 test.keys[shape].mode = test.keys[2 + shape].mode = 2 + shape;
                 test.keys[shape].first = texels * shape;
                 test.keys[2 + shape].first = texels * (2 + shape);
@@ -1248,6 +1255,9 @@ int main() {
                 {ms_slice_slot, 3, 0, 2}, {ms_slice_slot, 3, 1, 3}, {ms_first_layer_slot, 2, 0, 1}};
             SampleKeys ms_keys[std::size(ms_reads)]{};
             for (UINT k = 0; k < std::size(ms_keys); ++k) {
+                const auto type = ms_reads[k].mode == 2 ? g::ImageType::image_2d_msaa
+                                                        : g::ImageType::image_2d_msaa_array;
+                EXPECT(image_at(ms_reads[k].slot, image) && image.type == type);
                 std::memcpy(ms_keys[k].tsharp, view_bytes(ms_reads[k].slot), sizeof(ms_keys[k].tsharp));
                 ms_keys[k].first = k * texels;
                 ms_keys[k].mode = ms_reads[k].mode;
@@ -1289,6 +1299,8 @@ int main() {
                 return true;
             }));
             std::array<std::uint32_t, 4 * texels> values{};
+            for (UINT shape = 0; shape < 2; ++shape)
+                EXPECT(std::memcmp(test.keys[shape].tsharp, view_bytes(test.slots[shape]), sizeof(test.keys[shape].tsharp)) == 0);
             EXPECT(sample_through_set(d, set0, set0_layout, test.keys, values.data(), test.shader));
             for (UINT k = 0; k < 4; ++k) {
                 const auto expected = k < 2 ? test.value + k : 0u;
