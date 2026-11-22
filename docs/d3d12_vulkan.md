@@ -2434,10 +2434,13 @@ MRT rendering and pixel checks. It does not divide application query results or 
 
 `d3d12_m3_first_pass` runs the same executable with `--first-pass-only`: all six frames, MRT pixels,
 depth/stencil, barriers, queries and slot fences are still checked, and the third target must stay clear.
-It isolates this path from the descriptor-sampling second pass; `d3d12_m3_frame` remains the full test.
-The isolated test passes with validation on both GPUs above (3555 samples). The full test passes on NVIDIA;
+It isolates post-pass pipeline creation and execution: it skips creating the post-process PSO and recording
+the sampled draw. All five FSSM files and their shader-library entries, including `vs_m2` and `ps_m3_post`,
+are still required at startup. The second-pass root signature and descriptor heaps are still created,
+so missing post-pass shaders or failed descriptor setup still fail this mode. `d3d12_m3_frame` remains
+the full test. The first-pass mode passes with validation on both GPUs above (3555 samples). The full test passes on NVIDIA;
 on this older Intel driver it still fails validation because `ps_m3_post` declares `Int64` without
-`shaderInt64` support. That separate capability issue is not suppressed by the isolation test.
+`shaderInt64` support. The full test continues to report that separate capability issue.
 
 ### 6.1 Minimum API set for the first frame
 
