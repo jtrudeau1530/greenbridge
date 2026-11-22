@@ -482,14 +482,14 @@ This is an approximation of point 5, per cell and per tier. Per-entity `lodDist`
 ### Measured
 
 On the 1.0.2.1 package, `levels.rpf`, Linux, 88 cores, `--no-textures`, 256 m chunks. Models were exported with
-rpf9-explorer at Leonida's pin (917e9b9) and with breadbbbb/rpf9-explorer#8 and #10 applied. Each placement was
+rpf9-explorer at the baseline revision (`917e9b9`) and with breadbbbb/rpf9-explorer#8 and #10 applied. Each placement was
 counted against the first export and built from the second.
 
 | Step | Result |
 |---|---|
 | `--entities-out` over the whole data area (24 parallel `--start/--limit` windows) | 1,670,435 rows, 66 s |
 | `lodLevel` split | 0: 1,153,122 · 5: 396,871 · 1: 100,953 · 2: 16,828 · 3: 1,708 · 4: 601 · 6: 352 |
-| HD + ORPHAN_HD placements with a recovered model (joaat + Murmur3-64) | 640,080 of 1,549,993 (41.3%) at the pin; 1,549,347 (99.96%) with #8/#10, from 121,411 resources |
+| HD + ORPHAN_HD placements with a recovered model (joaat + Murmur3-64) | 640,080 of 1,549,993 (41.3%) at `917e9b9`; 1,549,347 (99.96%) with #8/#10, from 121,411 resources |
 | 700 m × 700 m downtown box, 10,729 placements, `--jobs 16` | `bake` (#1183): 5 min, 22 GB peak RSS. `gpu`: 35 s; 0.43 GB in the largest process, 1.93 GB for all 17 processes; same 16 chunks and 29,331,138 triangles |
 | **whole city**, HD + ORPHAN_HD, `gpu`, `--jobs 40` | 1,549,343 placed (646 `unresolved_archetype`, 4 `model_not_loadable`, 0 `key_mismatch`, 0 `mirrored`), 121,407 distinct models → 2,940 chunks; 7.31 G triangles drawn, 3.34 G stored; 125 GB of GLB, median chunk 17 MB, largest 926 MB; 21 min; 3.4 GB in the largest process, 38 GB for all 41 processes |
 | **whole city, all tiers, `--lod-sets`, `gpu`, `--jobs 24`** | 1,669,771 placed (660 `unresolved_archetype`, 4 `model_not_loadable`), 228,566 distinct models → 12,340 chunks: HD 2,911 (median 16.9 MB), LOD 2,836 (0.6 MB), SLOD1 2,811, SLOD2 1,222, SLOD3 501, SLOD4 284 (all ≤ 0.1 MB median), ORPHAN_HD 1,775 (3.0 MB); bands as in the table above; 33 min; 2.6 GB in the largest process, 30 GB for all 25 |
@@ -510,9 +510,11 @@ Checks:
   |dot| ≥ 0.9999 on 29,124 of 29,125 entities matched by position and archetype, and the minimum is 0.99894.
   Scales are equal on all 29,125. The instance TRS equals that transform (see the tests).
 
-The pin's 41.3% is a model-recovery gap, not a naming gap: almost every archetype name resolves (99.85%, see
-*What is readable* above), but only recovered models can be placed. The archetypes that #8/#10 add are `.#ft`
-fragments, whose headers the pinned `LooksLikeFragment` rejects (breadbbbb/rpf9-explorer#8).
+Although 99.85% of archetype names resolve (see *What is readable* above), only 41.3% of HD and ORPHAN_HD
+placements had a recovered model at `917e9b9`. The additional archetypes recovered with #8/#10 were `.#ft`
+fragments. The pinned explorer (`e2939175`) includes both changes. Its fragment check accepts null pointers
+at header offsets 16, 32 and 40 and requires system pointers at offsets 8, 24 and 168.
+[Fragment check at the pinned revision](https://github.com/breadbbbb/rpf9-explorer/blob/e2939175c36a02d6ed25fa2c217b9d6ddcb8b516/Core/RageModelDecoder.cs#L66-L84)
 
 **Not verified or limited:**
 - Nothing here was looked at in a browser. The checks above are structural and numeric.
