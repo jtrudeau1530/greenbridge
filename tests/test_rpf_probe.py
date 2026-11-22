@@ -159,6 +159,76 @@ class MainTests(unittest.TestCase):
         self.assertEqual(self.rows(), [])
         self.assertIn("0 archives", out)
 
+    def assert_input_refused(self, destination, archive):
+        with open(archive, "rb") as f:
+            before = f.read()
+        script = os.path.join(ROOT, "tools", "rpf_probe.py")
+        result = subprocess.run(
+            [sys.executable, "-I", script, self.game, "--out", destination],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("would overwrite an input archive", result.stderr)
+        with open(archive, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_report_cannot_replace_an_input_archive(self):
+        archive = self.write("a.rpf", archive_bytes())
+        self.assert_input_refused(archive, archive)
+
+    def test_report_cannot_replace_a_nested_archive(self):
+        archive = self.write("sub/a.RPF", archive_bytes())
+        self.assert_input_refused(archive, archive)
+
+    def test_report_cannot_replace_a_normalized_input_path(self):
+        archive = self.write("a.rpf", archive_bytes())
+        os.mkdir(os.path.join(self.game, "sub"))
+        destination = os.path.join(self.game, "sub", "..", "a.rpf")
+        self.assert_input_refused(destination, archive)
+
+    def test_report_cannot_replace_a_hard_link_to_an_archive(self):
+        archive = self.write("a.rpf", archive_bytes())
+        destination = os.path.join(self.tmp, "alias.json")
+        try:
+            os.link(archive, destination)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        self.assert_input_refused(destination, archive)
+        self.assertTrue(os.path.samefile(archive, destination))
+
+    def test_report_cannot_replace_a_symlink_to_an_archive(self):
+        archive = self.write("a.rpf", archive_bytes())
+        destination = os.path.join(self.tmp, "alias.json")
+        try:
+            os.symlink(archive, destination)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"symlinks unavailable: {e}")
+        self.assert_input_refused(destination, archive)
+        self.assertTrue(os.path.islink(destination))
+
+    def test_report_cannot_replace_the_target_of_a_scanned_symlink(self):
+        archive = os.path.join(self.tmp, "external.rpf")
+        with open(archive, "wb") as f:
+            f.write(archive_bytes())
+        try:
+            os.symlink(archive, os.path.join(self.game, "linked.rpf"))
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"symlinks unavailable: {e}")
+        self.assert_input_refused(archive, archive)
+
+    def test_existing_unrelated_report_can_be_replaced(self):
+        original = archive_bytes()
+        archive = self.write("a.rpf", original)
+        os.makedirs(os.path.dirname(self.out))
+        with open(self.out, "w", encoding="utf-8") as f:
+            f.write("previous report\n")
+        self.run_main()
+        self.assertEqual([r["file"] for r in self.rows()], [archive])
+        with open(archive, "rb") as f:
+            self.assertEqual(f.read(), original)
+
     @unittest.skipUnless(os.name == "posix", "requires a POSIX file size limit")
     def test_failed_write_preserves_the_existing_report(self):
         self.write("demo.rpf", b"9FPR" + struct.pack("<I", 16) + bytes(32))
