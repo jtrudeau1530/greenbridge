@@ -331,7 +331,8 @@ CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
-                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed"))
+                      "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
+                      "ps_mandelbrot"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
 PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
                 "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
@@ -1123,6 +1124,46 @@ def wide_pixel_skip(name, out):
     return Skip(f"SKIP (this device cannot require a {want}-wide fragment subgroup{seen})")
 
 
+def f32(x):
+    """x rounded to the nearest float32. One double add or multiply of two float32 values, then this, is the exact
+    IEEE float32 result, so a model built from it matches the GPU bit for bit."""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def mandelbrot_counts(w):
+    """ps_mandelbrot.asm's iteration counts over a w x w frame, in the shader's order of float32 operations."""
+    counts = []
+    for y in range(w):
+        cy = f32(f32(3.0 * f32((y + 0.5) / w)) - 1.5)
+        for x in range(w):
+            cx = f32(f32(3.0 * f32((x + 0.5) / w)) - 2.25)
+            zx = zy = 0.0
+            n = 0
+            while n < 64:
+                zx2, zy2 = f32(zx * zx), f32(zy * zy)
+                if not 4.0 >= f32(zx2 + zy2):
+                    break
+                xy = f32(zx * zy)
+                zx, zy = f32(f32(zx2 - zy2) + cx), f32(f32(xy + xy) + cy)
+                n += 1
+            counts.append(n)
+    return counts
+
+
+def mandelbrot_problem(px):
+    """ps_mandelbrot: channel 3 is the lane's iteration count. A lane that leaves EXEC too early or late, or a loop
+    that ends on the wrong branch, changes counts; the colour channels are only for looking at the frame."""
+    w = int(len(px) ** 0.5)
+    if w * w != len(px):
+        return f"{len(px)} pixels is not a square frame"
+    want = mandelbrot_counts(w)
+    wrong = [(i, p[3], e) for i, (p, e) in enumerate(zip(px, want)) if p[3] != e]
+    if not wrong:
+        return ""
+    i, got, e = wrong[0]
+    return f"{len(wrong)} of {len(px)} iteration counts differ, e.g. pixel ({i % w}, {i // w}) {got} instead of {e}"
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
@@ -1189,6 +1230,8 @@ def pixel_test(tools, spirv, name):
         c = collections.Counter((a, b) for a, b, _, _ in px)
         fine = c[(8, 1)] and c[(8, 0)] and c[(7, 0)] and set(c) <= {(8, 1), (8, 0), (7, 0)}
         return "" if fine else f"(s5, bit) counts {dict(c)}"
+    if name == "ps_mandelbrot":
+        return mandelbrot_problem(px)
     return "no check written for this shader"
 
 
