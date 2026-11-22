@@ -568,6 +568,9 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "usage: gta6rt"
         FAIL_REGULAR_EXPRESSION "running |module\\(s\\) mapped")
     endforeach()
+    # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
+    add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
+    add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
