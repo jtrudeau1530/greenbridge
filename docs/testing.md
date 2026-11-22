@@ -147,7 +147,8 @@ say; without a choice the D3D12 tests take the last discrete GPU). `LEONIDA_VK_D
 name, without case: `LEONIDA_VK_DEVICE=5070` or `LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`)
 and the layer's standalone device read it, and a value that matches no device fails the run instead of testing
 another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
-The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) do not read it yet.
+The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
+`vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
 
 ## Known problems
 
