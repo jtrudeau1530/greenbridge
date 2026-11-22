@@ -8,8 +8,8 @@ a shader whose root signature spilled must read a spill pointer from its user da
 measured at s[0:1], below the stage's first root-argument SGPR (section 7). This tool counts, per stage:
 
   * spill-pointer candidates: user-SGPR reads used as an address (ptr32_lo, ptr64_lo, ptr64_hi) below the stage
-    base given with --base (default: the census bases ps=8 vs=8 gs=8 cs=4 ms=16). A shader with none of them has no
-    pointer a spill could sit behind in that block;
+    base (the census bases ps=8 vs=8 gs=8 cs=4 ms=16; --base overrides the stages it names and keeps the others).
+    A shader with none of them has no pointer a spill could sit behind in that block;
   * the highest user SGPR each shader reads, and what that read is (a constant or an address);
   * where index.json records it (user_sgprs, the RSRC2 USER_SGPR count; compute today): the largest count and the
     root-argument dwords that leaves above the base;
@@ -116,8 +116,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("index", help="spirv/index.json written by tools/rdna2spirv.py")
     ap.add_argument("--carve", help="dxbc/index.json written by tools/shader_carve.py (counts RTS0 parts)")
-    ap.add_argument("--base", nargs="*", type=stage_sgpr, metavar="STAGE=SGPR",
-                    help="first root-argument SGPR per stage (default: ps=8 vs=8 gs=8 cs=4 ms=16)")
+    ap.add_argument("--base", nargs="*", type=stage_sgpr, default=[], metavar="STAGE=SGPR",
+                    help="first root-argument SGPR for the stages named; the others keep the defaults "
+                         "ps=8 vs=8 gs=8 cs=4 ms=16")
     ap.add_argument("--json", help="also write the summary here")
     ap.add_argument("--expect-no-spill", action="store_true",
                     help="exit 1 if any shader reads a spill-pointer candidate")
@@ -137,7 +138,9 @@ def main(argv=None):
     if a.carve:
         with open(a.carve, encoding="utf-8") as f:
             carve = json.load(f)
-    summary = census(index, dict(a.base) if a.base is not None else None, carve)
+    # --base overrides the stages it names and keeps the defaults for the rest, so a partial override never drops
+    # a stage from the check.
+    summary = census(index, {**DEFAULT_BASE, **dict(a.base)}, carve)
     if "containers" in summary:
         print(f"containers: {summary['containers']}, with an RTS0 part: {summary['containers_with_rts0']}")
     for stage, s in summary["stages"].items():

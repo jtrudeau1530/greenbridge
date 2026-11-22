@@ -72,6 +72,14 @@ class CensusTest(unittest.TestCase):
         self.assertIsNone(rsc.census(NO_SPILL, base={})["stages"]["ps"]["base"])
         self.assertEqual(rsc.census(NO_SPILL, base={})["stages"]["ps"]["spill_pointer_candidates"], {})
 
+    def test_boundary_at_each_default_base(self):
+        # A pointer one SGPR below the base is a candidate; at the base and one above it is not.
+        for stage, base in rsc.DEFAULT_BASE.items():
+            for sgpr, expected in ((base - 1, 1), (base, 0), (base + 1, 0)):
+                index = {"x": {"stage": stage, "user_sgpr_reads": reads((sgpr, "ptr32_lo"))}}
+                got = rsc.census(index)["stages"][stage]["shaders_with_spill_pointer_candidate"]
+                self.assertEqual(got, expected, f"{stage} s{sgpr}")
+
     def test_rts0_parts_counted(self):
         carve = [{"name": "x", "parts": {"DXIL": 1, "PRIV": 2}},
                  {"name": "y", "parts": {"DXIL": 1, "RTS0": 3}},
@@ -113,6 +121,18 @@ class CliTest(unittest.TestCase):
         self.assertIn("SPILL POINTER CANDIDATES", bad.stderr)
         plain, _ = self.run_tool(SPILLED)  # without the flag a spill is reported, not a failure
         self.assertEqual(plain.returncode, 0, plain.stderr)
+
+    def test_partial_base_keeps_the_other_defaults(self):
+        # The review's case: a PS address read at s7 (below the PS base s8). Overriding only cs must not drop ps.
+        index = {"p.ps": {"stage": "ps", "user_sgpr_reads": reads((7, "ptr32_lo"))}}
+        default, _ = self.run_tool(index, "--expect-no-spill")
+        self.assertEqual(default.returncode, 1, default.stderr)
+        partial, summary = self.run_tool(index, "--expect-no-spill", "--base", "cs=4")
+        self.assertEqual(partial.returncode, 1, partial.stderr)
+        self.assertEqual(summary["stages"]["ps"]["base"], 8)
+        moved, summary = self.run_tool(index, "--expect-no-spill", "--base", "ps=7")
+        self.assertEqual(moved.returncode, 0, moved.stderr)  # a named stage does take the override
+        self.assertEqual(summary["stages"]["ps"]["base"], 7)
 
     def test_bad_base_is_a_usage_error(self):
         for assignment in ("ps", "ps=bad", "=8", "ps=-1"):
