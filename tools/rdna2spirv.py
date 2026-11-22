@@ -4988,9 +4988,12 @@ class Gen:
             self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
             self.emit(f"{r} = OpSelect %float {either} %f0 {m}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
-        elif op == "v_mad_legacy_f32":
+        elif op in ("v_mad_legacy_f32", "v_mac_legacy_f32"):
             # Legacy multiply treats 0 * anything (inf/NaN included) as 0, after the denormal flush.
-            x, y, z = (self.flush_f32(self.src_f(t)) for t in a[1:4])
+            # v_mac_legacy_f32 is the GFX10.1 VOP2 form with D as the addend, as v_mac_f32 is to v_mad_f32 (LLVM
+            # VOP2Instructions.td: V_MAC_LEGACY_F32 is VOP_F32_F32_F32 with $src2 tied to $vdst).
+            srcs = (a[1], a[2], a[0]) if op == "v_mac_legacy_f32" else a[1:4]
+            x, y, z = (self.flush_f32(self.src_f(t)) for t in srcs)
             m, zx, zy, either, sel, r = (self.tmp() for _ in range(6))
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
@@ -8839,7 +8842,7 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_fmac_f16") and a[0]["k"] == "vgpr":
+        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16") and a[0]["k"] == "vgpr":
             regs.append(a[0]["r"])
         for r in regs:
             if r not in written and r not in first:
