@@ -215,6 +215,34 @@ class ValidatedOutput(unittest.TestCase):
                 self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), previous)
                 self.assertEqual(other.read_bytes(), b"unrelated module")
 
+    def test_unsupported_clears_retried_shader_but_preserves_unrelated_output(self):
+        # s_barrier is compute-only, so this PS is Unsupported before any SPIR-V tool runs. A module an
+        # earlier run published for it must not survive: the index is make_game.py's proof of completion.
+        self.src.write_text("\ts_barrier\n\ts_endpgm\n", encoding="utf-8")
+        other = self.out / "cs_other.spv"
+        other.write_bytes(b"unrelated module")
+        previous = {"cs_other": {"stage": "cs"}}
+        self.module.write_bytes(b"old module")
+        self.index.write_text(json.dumps({**previous, "ps_fixture": {"stage": "ps"}}), encoding="utf-8")
+        output = self.translate()
+        self.assertIn("s_barrier outside compute", output)
+        self.assertFalse(self.module.exists())
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), previous)
+        self.assertEqual(other.read_bytes(), b"unrelated module")
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+
+    def test_translator_error_clears_retried_shader(self):
+        self.module.write_bytes(b"old module")
+        self.index.write_text(json.dumps({"ps_fixture": {"stage": "ps"}}), encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(rdna2spirv, "translate", side_effect=ValueError("synthetic translator error")), \
+                mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                redirect_stdout(output):
+            rdna2spirv.main()
+        self.assertIn("translator error ValueError", output.getvalue())
+        self.assertFalse(self.module.exists())
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+
     def test_validation_success_publishes_binary_and_metadata(self):
         self.assertIn("1 pass spirv-val", self.translate())
         self.assertEqual(self.module.read_bytes(), b"new module")

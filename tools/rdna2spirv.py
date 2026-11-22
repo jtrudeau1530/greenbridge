@@ -11409,15 +11409,25 @@ def main():
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
+
+    def drop_stale(name):
+        # A shader that no longer translates must not stay published from an earlier run: remove its old
+        # module, and the index merge below drops its entry, exactly like a spirv-as/val rejection. The
+        # .spvasm text stays for diagnosis, as it does on a rejection.
+        Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
+        invalid.add(name)
+
     for p in files:
         name = os.path.splitext(os.path.basename(p))[0]
         try:
             asm = translate(p)
         except Unsupported as e:
             why[str(e)] += 1
+            drop_stale(name)
             continue
         except (IndexError, KeyError, ValueError) as e:
             why[f"translator error {type(e).__name__}"] += 1
+            drop_stale(name)
             continue
         ok += 1
         sa = os.path.join(a.out, name + ".spvasm")
@@ -11433,7 +11443,7 @@ def main():
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
-            invalid.add(name)
+            drop_stale(name)
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
         if a.no_asm and os.path.exists(sa):
             os.remove(sa)
