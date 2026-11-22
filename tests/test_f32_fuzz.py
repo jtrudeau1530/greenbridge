@@ -132,6 +132,22 @@ class HardwareOracle(unittest.TestCase):
         dn = self.case("v_add_f32", [1, ff.bits(1.0)], [(0, {}), (1, {})])
         self.assertEqual(ff.hw_verdict(dn, [ff.bits(1.0), 0])[0], "skip")
 
+    def test_omod_deviation_needs_an_active_omod(self):
+        d = self.case("v_ceil_f32", [ff.bits(-0.75)], [(0, {})], ["mul:2"], True)
+        want = [0x80000000, 0]
+        self.assertEqual(ff.dev_omod_neg_zero(d, want), [0, 0])
+        self.assertIsNone(ff.dev_omod_neg_zero(d, want, "ieee"))
+        self.assertIsNone(ff.dev_omod_neg_zero(d, want, "keep"))
+        self.assertIsNone(ff.dev_omod_neg_zero(self.case("v_ceil_f32", [0], [(0, {})], [], True), want))
+
+    def test_zero_inf_probes_catch_a_plain_multiply(self):
+        import random
+        cases = [ff.gen_probe(random.Random(i), "v_mul_legacy_f32", "zero_inf") for i in range(8)]
+        self.assertTrue(all(c is not None for c in cases))
+        with ff.perturbed("legacy_is_ieee"):
+            bad = sum(ff.hw_verdict(c, [0, 0])[0] == "match" for c in cases)
+        self.assertLess(bad, len(cases))
+
     def test_f16_nan_halves_compare_as_nan(self):
         self.assertTrue(ff.hw_same([0x7E00, 0], [0x7E06, 0], "v_cvt_f16_f32"))
         self.assertFalse(ff.hw_same([0x7E00, 0], [0x3C00, 0], "v_cvt_f16_f32"))

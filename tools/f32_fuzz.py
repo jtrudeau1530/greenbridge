@@ -828,7 +828,8 @@ OMOD_IGNORES_DENORM_MODE = ("v_rcp_f32", "v_rsq_f32", "v_sqrt_f32", "v_exp_f32",
 
 def omod_active(mode, op=None):
     """Whether mul:2 / mul:4 / div:2 act in this mode (measured on gfx1150): never with MODE.IEEE = 1 (LLVM's
-    SIFoldOperands says the same), and for the ALU ops only with f32 denormals flushed."""
+    SIFoldOperands.cpp: "omod is ignored by hardware if IEEE bit is enabled" and, for f32, if output denormals are
+    enabled), and for the ALU ops only with f32 denormals flushed."""
     m = HW_MODES[mode]
     return not m["ieee"] and (op in OMOD_IGNORES_DENORM_MODE or not m["denorm32"])
 
@@ -926,11 +927,13 @@ def hw_same(want, got, op=None):
 # Each maps (case, want) to the words the hardware gives instead, or None when it does not apply. A hardware result
 # that equals the deviation's words is filed under "known deviation", not "match"; anything else stays a mismatch.
 
-def dev_omod_neg_zero(case, want):
-    """VOP3 omod (mul:2, mul:4, div:2) turns a -0 result into +0. LLVM documents it for every GCN/RDNA part
-    (SIFoldOperands.cpp: "omod also does not correctly handle signed zeros"; D30209: "-0 will be forced to +0
-    prior applying the modifier"), and it is off with MODE.IEEE = 1."""
-    if want[0] == 0x80000000 and any(m in OMOD for m in case.out_mods):
+def dev_omod_neg_zero(case, want, mode=None):
+    """On gfx1150 VOP3 omod (mul:2, mul:4, div:2) turns a -0 result into +0 (RDNA2 unmeasured). LLVM notes that omod
+    mishandles signed zeros (SIFoldOperands.cpp) and D30209 describes -0 being forced to +0 before the modifier. Only
+    where the omod was active: not with MODE.IEEE = 1, not for ALU ops with f32 denormals kept (omod_active)."""
+    if mode is None:
+        mode = HW_PRIMARY
+    if want[0] == 0x80000000 and any(m in OMOD for m in case.out_mods) and omod_active(mode, case.op):
         return [0, want[1]]
     return None
 
@@ -1219,6 +1222,16 @@ def gen_probe(rng, op, kind):
         for i, k in picked:
             _set(case, i, rng.choice(NANS))
         return case
+    if kind == "zero_inf":
+        # the DX9 rule: a zero times anything (inf, NaN included) is +0; small samples need these to see a plain multiply
+        if op not in ("v_mul_legacy_f32", "v_mad_legacy_f32"):
+            return None
+        _set(case, 0, rng.choice([0, 0x80000000]))
+        _set(case, 1, rng.choice([PINF, NINF, QNAN, 0x7F800001, bits(3.0)]))
+        if rng.random() < 0.5:
+            x, y = case.srcs[0], case.srcs[1]
+            case.srcs[0], case.srcs[1] = y, x
+        return case
     if kind == "cancel":
         # z = -round(x * y): a fused multiply-add keeps the rounding residue of the product, an unfused one gives 0
         if op not in ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32"):
@@ -1269,7 +1282,7 @@ def gen_probe(rng, op, kind):
     raise ValueError(kind)
 
 
-PROBE_KINDS = ("denorm_in", "denorm_out", "nan", "clamp", "invalid", "cancel")
+PROBE_KINDS = ("denorm_in", "denorm_out", "nan", "clamp", "invalid", "cancel", "zero_inf")
 
 
 def gen_cases(programs, seed, ops):
@@ -1427,7 +1440,7 @@ def hw_print(rep, show=2, translator_check=None, quiet=False):
         for k, v in r.items():
             f[k] += v
     head = (f"{'family':46s} {'programs':>8s} {'match':>7s} {'mismatch':>8s} {'known dev':>9s} {'GFX11 skip':>10s} "
-            f"{'denormal':>8s} {'other':>6s}")
+            f"{'denormal':>8s} {'other':>6s} {'asm rej':>7s}")
     print(head)
     tot = dict.fromkeys(("programs", "match", "mismatch", "dev", "gfx11", "denorm", "other", "asm"), 0)
     for name, _ in FAMILIES:
@@ -1435,11 +1448,17 @@ def hw_print(rep, show=2, translator_check=None, quiet=False):
         if not r:
             continue
         print(f"{name:46s} {r['programs']:8d} {r['match']:7d} {r['mismatch']:8d} {r['dev']:9d} {r['gfx11']:10d} "
-              f"{r['denorm']:8d} {r['other'] + r['asm']:6d}")
+              f"{r['denorm']:8d} {r['other']:6d} {r['asm']:7d}")
         for k in tot:
             tot[k] += r[k]
     print(f"{'total':46s} {tot['programs']:8d} {tot['match']:7d} {tot['mismatch']:8d} {tot['dev']:9d} "
-          f"{tot['gfx11']:10d} {tot['denorm']:8d} {tot['other'] + tot['asm']:6d}")
+          f"{tot['gfx11']:10d} {tot['denorm']:8d} {tot['other']:6d} {tot['asm']:7d}")
+    if tot["asm"]:
+        print(f"WARNING: the assembler rejected {tot['asm']} program(s) the GFX11 table did not list; this is a harness "
+              "problem, not a skip, and the run fails (exit 2)")
+        for reason, n in sorted(rep.skips.items(), key=lambda t: -t[1]):
+            if reason.startswith("assembler rejected"):
+                print(f"  {n} x {reason}")
     by_dev = {}
     for name, c, _, _ in rep.deviations:
         by_dev.setdefault(name, {}).setdefault(c.op, 0)
@@ -1662,6 +1681,7 @@ def main(argv=None):
             return 77
         print(f"hardware oracle: {oracle.device}")
     rc = 0
+    harness = False
     try:
         cases = gen_cases(a.programs, a.seed, ops)
         if "translator" in backends:
@@ -1685,6 +1705,8 @@ def main(argv=None):
                   f"{len(cases)} programs, mode {HW_PRIMARY} (MODE 0x{words[HW_PRIMARY]:x}), seed {a.seed}:")
             tr = translator_verdict if "translator" in backends else None
             n_mis = hw_print(rep, show=a.show, translator_check=tr)
+            if any(r["asm"] for r in rep.per_op.values()):
+                harness = True
             if tr and rep.deviations:
                 tally = {}
                 for name, c, want, got in rep.deviations:
@@ -1704,7 +1726,7 @@ def main(argv=None):
             if a.perturb:
                 print(f"perturbed model '{a.perturb}': {n_mis} mismatches" + ("" if n_mis else " -- NOT DETECTED"))
                 rc |= not n_mis
-                return int(bool(rc))
+                return 2 if harness else int(bool(rc))
             if a.negative_control:
                 print("\nnegative control (wrong models judged against the same hardware words):")
                 for name, (n, bad) in negative_control(rep).items():
@@ -1715,7 +1737,7 @@ def main(argv=None):
     finally:
         if oracle:
             oracle.close()
-    return int(bool(rc))
+    return 2 if harness else int(bool(rc))
 
 
 if __name__ == "__main__":

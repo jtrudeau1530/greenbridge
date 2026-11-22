@@ -484,8 +484,9 @@ python -I tools/f32_fuzz.py --oracle hw --perturb mul_rtz --programs 500     # o
     (gfx1010/1011/1013, the console's family); gfx1030 and every GFX11 part reject them. The fused replacements
     (`v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fma_dx9_zero_f32`) round once, so they are different instructions. The
     unfused mad semantics (and SHADER-118's flush) therefore stay unmeasured: no RDNA2 desktop part and no GFX11 part has
-    them. Also not generated: `v_madmk_f32`, `v_min_legacy_f32` (GFX10.1 only), `v_fma_legacy_f32`/`v_fmac_legacy_f32`
-    (new in GFX10.3, not in gfx1013).
+    them. Also not generated: `v_madmk_f32` (GFX10.1 only, like the mad opcodes), `v_min_legacy_f32` (in no GFX10 or GFX11
+    part: llvm-mc rejects it for gfx1010, gfx1013, gfx1030 and gfx1150), `v_fma_legacy_f32`/`v_fmac_legacy_f32` (new in
+    GFX10.3, not in gfx1013).
   - *Renamed, run:* `v_mul_legacy_f32` is `v_mul_dx9_zero_f32` in GFX11 (the DX9 rule `0 * x = 0`, inf and NaN included,
     held in every program) and `v_cvt_pkrtz_f16_f32` is `v_cvt_pk_rtz_f16_f32`; the assembler takes the old spelling.
   - *Same, with a syntax change:* GFX11's assembler wants `clamp` before `mul:N`/`div:2`; the native kernels print them in
@@ -505,7 +506,7 @@ python -I tools/f32_fuzz.py --oracle hw --perturb mul_rtz --programs 500     # o
 
 Results (Radeon 880M, gfx1150, driver 26.11.2, AMD clang 23.0.0git), seeds 1 to 6, 5,000 random programs + 24 probes per
 op and kind each, 46,967 programs in all: **30,577 match, 0 mismatch, 57 known deviation**, 5,417 skipped for GFX11,
-5,903 denormal, 5,013 other not judged (clamp of NaN or -0, cube of NaN). Seed 1 by family:
+5,903 denormal, 5,013 other not judged (clamp of NaN or -0, cube of NaN). "Match" accepts any NaN for any NaN: payload, sign and quiet bit are in the informational tables, not judged. Seed 1 by family:
 
 | Family | Programs | Match | Mismatch | Known dev | GFX11 skip | Denormal | Other |
 |---|---|---|---|---|---|---|---|
@@ -525,20 +526,24 @@ op and kind each, 46,967 programs in all: **30,577 match, 0 mismatch, 57 known d
 Negative control: `--negative-control` re-judges the same hardware words with a deliberately wrong model for six ops
 (`v_add_f32` low bit flipped, `v_mul_f32` rounding toward zero, `v_fma_f32` unfused, `v_mul_legacy_f32` as IEEE multiply,
 `v_rndne_f32` as floor, `v_min_f32` NaN rule changed); every one produced mismatches (1 to 112 per run; the `v_fma_f32` one only after the `cancel` probes were added, a plain random sweep missed it in seed 2;
-the legacy multiply is the weakest, 1 to 4, because `0 * inf` is rare). The `cancel` probes (seeds 2, 7, 8) give 72 of 72 fused-FMA matches. Seeds 1 to 6 ran without them.
+the legacy multiply is the weakest, 1 to 4 in seeds 1 to 6, because `0 * inf` is rare in random programs; the `zero_inf` probes (a zero against inf, NaN or a normal number, DX9 multiply) were added afterwards and catch it at small sizes). The `cancel` probes (seeds 2, 7, 8) give 72 of 72 fused-FMA matches. Seeds 1 to 6 ran without them.
 
 What the hardware answered where the model does not judge (gfx1150; RDNA2 is not measured by these runs):
 
 - **No model error found.** The model was right wherever it had an answer, in 30,577 programs; the min/max/med3
   rules measured on RDNA2 in #634 (one NaN gives the other operand, both NaN give src0, -0 < +0, med3 with a NaN is min3)
   also hold on gfx1150 for quiet and signalling NaNs with IEEE off.
-- **Output modifiers turn a -0 result into +0** (`mul:2`, `mul:4`, `div:2`; 57 programs, every seed; a flushed denormal
-  result, which is a -0, too). LLVM documents it for every GCN/RDNA part ("omod also does not correctly handle signed
-  zeros", `SIFoldOperands.cpp`). The model and the translator both keep -0: the translator is wrong here (`translator,hw`:
-  all 6 deviations of 2,000 programs are "matches the model, so it shares the model's answer"). It matters for RDNA2 if
-  the console behaves as LLVM says, and nothing here measured it. Not fixed in this change.
+- **On gfx1150 output modifiers turn a -0 result into +0** (`mul:2`, `mul:4`, `div:2`; 57 programs, every seed; a flushed
+  denormal result, which is a -0, too). RDNA2 is unmeasured. LLVM notes that omod mishandles signed zeros
+  (`SIFoldOperands.cpp`) and D30209 describes -0 being forced to +0 before the modifier, which points the same way. The
+  model and the translator both keep -0, so on that evidence the translator likely differs from the hardware
+  (`translator,hw`: all 6 deviations of 2,000 programs are "matches the model, so it shares the model's answer"). Not
+  fixed in this change; the finding is posted in the coordination issue (see #1006). A deviation is only accepted where
+  the omod was active (not with IEEE on, not for ALU ops with f32 denormals kept).
 - **omod only acts with MODE.IEEE = 0**, and for the ALU ops only with f32 denormals flushed: with `keep` the omod of
-  add/mul/fma/min/max/cvt/rounding ops is ignored; the transcendental ops and the cube ops still apply it. This supports
+  add/mul/fma/min/max/cvt/rounding ops is ignored; the transcendental ops and the cube ops still apply it. LLVM says the
+  same for both conditions (`SIFoldOperands.cpp`: "omod is ignored by hardware if IEEE bit is enabled"; "If output
+  denormals are enabled, omod is ignored"). This supports
   the corpus inference (omod on 102,365 float instructions, so IEEE off and f32 denormals flushed in the game's shaders).
 - **f32 denormals (SHADER-35's MODE question).** With `denorm_mode_32 = 0` a denormal operand is read as a zero of its sign
   and a denormal result is written as a zero of its sign, for add/sub/mul/fma/fmac/fmaak, min/max/med3, rounding ops and
