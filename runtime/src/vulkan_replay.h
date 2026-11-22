@@ -972,7 +972,7 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     }
     if (!resource.rgba8_typeless && !resource.castable_view_formats)
         return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1 || resource.samples != 1)
+    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
 }
